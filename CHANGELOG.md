@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Changed
+
+- Stdio/MCP now retains a bounded set of project contexts keyed by native
+  workspace identity and immutable configuration, so A/B/A routing preserves
+  isolated per-project state without rereading process defaults.
+- Project tool calls join one runtime-owned staged activation operation;
+  compact status and `codestory://status` expose its stable stage, retry, and
+  failure snapshot without caching live progress, keep local navigation visible
+  while broad retrieval prepares or fails, and broad responses report the
+  complete retrieval publication served by the runtime-owned retry.
+- Ordinary CLI, HTTP, and stdio public JSON responses now share the
+  runtime-owned complete core/retrieval publication pin and one canonical
+  metadata envelope across packet, search, context, drill, and every
+  query-resolved graph surface; markdown and graph text remain unchanged.
+- Multi-project and fallback MCP routing now requires an explicit absolute,
+  available project root; projectless status reports `no_project`, and native
+  cache/storage identity is normalized before context or activation reuse.
+- Cold status and MCP resources are observational: they no longer create cache
+  directories or databases, migrate stores, initialize engines, or activate a
+  project. Dirty-marker freshness compares only committed database and WAL
+  state, so reader-owned SHM metadata cannot falsely clear a stale marker.
+- Fail-open MCP advertises only the diagnostic resources and methods it can
+  serve while the native runtime is provisioning or unavailable.
+- Skill command syntax is generated from Clap help instead of being maintained
+  as a second option source.
+
 ### Highlights
 
 - CodeStory now carries its search model and embedding engine inside the executable. There is no Docker service, helper server, model download, endpoint, port, or repair step to manage.

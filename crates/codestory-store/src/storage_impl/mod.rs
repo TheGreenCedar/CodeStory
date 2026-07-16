@@ -1651,6 +1651,65 @@ impl Storage {
         })
     }
 
+    /// Open a store for diagnostics without repairing, migrating, or
+    /// materializing SQLite sidecars. Recovery and schema changes belong to an
+    /// activating writer; an observer reports those states instead.
+    pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if promotion_artifacts_exist(path) {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} while promotion recovery is pending",
+                path.display()
+            )));
+        }
+        if !path.is_file() {
+            return Err(StorageError::Other(format!(
+                "Observational storage requires an existing database: {}",
+                path.display()
+            )));
+        }
+        let wal_path = sqlite_sidecar_path(path, "-wal");
+        let shm_path = sqlite_sidecar_path(path, "-shm");
+        let journal_path = sqlite_sidecar_path(path, "-journal");
+        if journal_path.exists() {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} while rollback recovery is pending",
+                path.display()
+            )));
+        }
+        let wal_exists = wal_path.is_file();
+        let shm_exists = shm_path.is_file();
+        if wal_exists != shm_exists {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} with an incomplete WAL sidecar pair",
+                path.display()
+            )));
+        }
+        // `immutable=1` guarantees that a standalone database cannot acquire
+        // locks or sidecars, but it intentionally ignores committed WAL state.
+        // When a complete WAL/SHM pair already exists, a normal read-only
+        // connection observes it without materializing either sidecar. SQLite
+        // may update transient reader marks inside the existing SHM wal-index;
+        // durable database and WAL bytes remain observationally unchanged.
+        let uri = observational_sqlite_uri(path, !wal_exists);
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Self {
+            conn,
+            cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
+        })
+    }
+
     pub fn read_snapshot(&self) -> Result<StorageReadSnapshot<'_>, StorageError> {
         self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
         Ok(StorageReadSnapshot {
@@ -7244,6 +7303,40 @@ impl Storage {
             show_utility_calls,
         )
     }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn observational_sqlite_uri(path: &Path, immutable: bool) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
+
+    let mut encoded = String::with_capacity(bytes.len() + 24);
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    #[cfg(windows)]
+    if encoded.len() >= 3 && encoded.as_bytes()[1] == b':' && encoded.as_bytes()[2] == b'/' {
+        encoded.insert(0, '/');
+    }
+    format!(
+        "file:{encoded}?mode=ro{}",
+        if immutable { "&immutable=1" } else { "" }
+    )
 }
 
 fn neighbor_for_direction(

@@ -13,9 +13,11 @@ use codestory_contracts::query::{
 };
 
 use crate::{
-    AppController, SymbolWorkflowOutcome, SymbolWorkflowRequest, TargetResolution, TargetSelection,
-    compare_ranked_hits, symbol_name_match_rank,
+    AppController, PublicOperationService, SymbolWorkflowOutcome, SymbolWorkflowRequest,
+    TargetResolution, TargetSelection, compare_ranked_hits, symbol_name_match_rank,
 };
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone)]
 pub struct BrowserQueryItem {
@@ -36,6 +38,7 @@ pub struct BrowserQueryItem {
 #[derive(Clone)]
 pub struct ReadOnlyBrowserService {
     controller: AppController,
+    public_operation: PublicOperationService,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -92,24 +95,37 @@ fn browser_resolution_kind_bucket(kind: NodeKind) -> u8 {
 }
 
 impl ReadOnlyBrowserService {
-    pub(crate) fn new(controller: AppController) -> Self {
-        Self { controller }
+    pub(crate) fn new(controller: AppController, public_operation: PublicOperationService) -> Self {
+        Self {
+            controller,
+            public_operation,
+        }
+    }
+
+    fn run_public<T>(
+        &self,
+        operation: &str,
+        build: impl FnMut() -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        self.public_operation
+            .run_with_cancel(operation, Arc::new(AtomicBool::new(false)), build)
+            .map(|operation| operation.value)
     }
 
     pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
-        self.controller.agent_ask(req)
+        self.run_public("context", || self.controller.agent_ask(req.clone()))
     }
 
     pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
-        self.controller.agent_packet(req)
+        self.run_public("packet", || self.controller.agent_packet(req.clone()))
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
-        self.controller.search(req)
+        self.run_public("search", || self.controller.search(req.clone()))
     }
 
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
-        self.controller.search_results(req)
+        self.run_public("search", || self.controller.search_results(req.clone()))
     }
 
     pub fn resolve_indexed_symbol_candidates(
@@ -117,8 +133,10 @@ impl ReadOnlyBrowserService {
         query: &str,
         max_results: usize,
     ) -> Result<Vec<SearchHit>, ApiError> {
-        self.controller
-            .resolve_indexed_symbol_candidates(query, max_results)
+        self.run_public("resolution", || {
+            self.controller
+                .resolve_indexed_symbol_candidates(query, max_results)
+        })
     }
 
     pub fn resolve_target(
@@ -126,25 +144,37 @@ impl ReadOnlyBrowserService {
         target: TargetSelection,
         file_filter: Option<&str>,
     ) -> Result<TargetResolution, ApiError> {
-        self.controller.resolve_target(target, file_filter)
+        let operation = match &target {
+            TargetSelection::Id(_) => "graph",
+            TargetSelection::Query { .. } => "resolution",
+        };
+        self.run_public(operation, || {
+            self.controller.resolve_target(target.clone(), file_filter)
+        })
     }
 
     pub fn symbol_workflow(
         &self,
         request: SymbolWorkflowRequest,
     ) -> Result<SymbolWorkflowOutcome, ApiError> {
-        self.controller.symbol_workflow(request)
+        let operation = match &request.target {
+            TargetSelection::Id(_) => "graph",
+            TargetSelection::Query { .. } => "graph_assisted",
+        };
+        self.run_public(operation, || {
+            self.controller.symbol_workflow(request.clone())
+        })
     }
 
     pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
-        self.controller.indexed_files(req)
+        self.run_public("graph", || self.controller.indexed_files(req.clone()))
     }
 
     pub fn affected_analysis(
         &self,
         req: AffectedAnalysisRequest,
     ) -> Result<AffectedAnalysisDto, ApiError> {
-        self.controller.affected_analysis(req)
+        self.run_public("graph", || self.controller.affected_analysis(req.clone()))
     }
 
     pub fn search_hybrid(
@@ -154,28 +184,36 @@ impl ReadOnlyBrowserService {
         max_results: Option<u32>,
         hybrid_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<Vec<SearchHit>, ApiError> {
-        self.controller
-            .search_hybrid(req, focus_node_id, max_results, hybrid_weights)
+        self.run_public("search", || {
+            self.controller.search_hybrid(
+                req.clone(),
+                focus_node_id.clone(),
+                max_results,
+                hybrid_weights.clone(),
+            )
+        })
     }
 
     pub fn symbol_context(&self, node_id: NodeId) -> Result<SymbolContextDto, ApiError> {
-        self.controller.symbol_context(node_id)
+        self.run_public("graph", || self.controller.symbol_context(node_id.clone()))
     }
 
     pub fn definition_context(&self, node_id: NodeId) -> Result<SymbolContextDto, ApiError> {
-        self.controller.symbol_context(node_id)
+        self.run_public("graph", || self.controller.symbol_context(node_id.clone()))
     }
 
     pub fn trail_context(&self, req: TrailConfigDto) -> Result<TrailContextDto, ApiError> {
-        self.controller.trail_context(req)
+        self.run_public("graph", || self.controller.trail_context(req.clone()))
     }
 
     pub fn references_context(&self, req: TrailConfigDto) -> Result<TrailContextDto, ApiError> {
-        self.controller.trail_context(req)
+        self.run_public("graph", || self.controller.trail_context(req.clone()))
     }
 
     pub fn direct_references_graph(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {
-        self.controller.graph_direct_references(req)
+        self.run_public("graph", || {
+            self.controller.graph_direct_references(req.clone())
+        })
     }
 
     pub fn snippet_context(
@@ -183,7 +221,9 @@ impl ReadOnlyBrowserService {
         node_id: NodeId,
         context: usize,
     ) -> Result<SnippetContextDto, ApiError> {
-        self.controller.snippet_context(node_id, context)
+        self.run_public("graph", || {
+            self.controller.snippet_context(node_id.clone(), context)
+        })
     }
 
     pub fn snippet_function_body_context(
@@ -191,36 +231,44 @@ impl ReadOnlyBrowserService {
         node_id: NodeId,
         context: usize,
     ) -> Result<SnippetContextDto, ApiError> {
-        self.controller
-            .snippet_function_body_context(node_id, context)
+        self.run_public("graph", || {
+            self.controller
+                .snippet_function_body_context(node_id.clone(), context)
+        })
     }
 
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
-        self.controller.node_details(req)
+        self.run_public("graph", || self.controller.node_details(req.clone()))
     }
 
     pub fn node_occurrences(
         &self,
         req: NodeOccurrencesRequest,
     ) -> Result<Vec<SourceOccurrenceDto>, ApiError> {
-        self.controller.node_occurrences(req)
+        self.run_public("graph", || self.controller.node_occurrences(req.clone()))
     }
 
     pub fn list_root_symbols(
         &self,
         req: ListRootSymbolsRequest,
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
-        self.controller.list_root_symbols(req)
+        self.run_public("graph", || self.controller.list_root_symbols(req.clone()))
     }
 
     pub fn list_children_symbols(
         &self,
         req: ListChildrenSymbolsRequest,
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
-        self.controller.list_children_symbols(req)
+        self.run_public("graph", || {
+            self.controller.list_children_symbols(req.clone())
+        })
     }
 
     pub fn query(&self, ast: &GraphQueryAst) -> Result<Vec<BrowserQueryItem>, ApiError> {
+        self.run_public("graph_assisted", || self.query_once(ast))
+    }
+
+    fn query_once(&self, ast: &GraphQueryAst) -> Result<Vec<BrowserQueryItem>, ApiError> {
         let mut items = Vec::<BrowserQueryItem>::new();
         for op in &ast.operations {
             match op {

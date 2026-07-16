@@ -24,6 +24,63 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function stopChildProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const closed = once(child, "close").catch(() => []);
+  try {
+    child.stdin?.end();
+  } catch {
+    // Continue to the bounded signal path.
+  }
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  await Promise.race([closed, delay(500)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      return;
+    }
+    await Promise.race([closed, delay(500)]);
+  }
+}
+
+test("fail-open tool schemas are the generated canonical MCP catalog", async () => {
+  const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
+  assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
+});
+
+test("fail-open handoff shutdown is bounded for a child that ignores stdin and SIGTERM", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGKILL") {
+      child.signalCode = signal;
+      child.emit("exit", null, signal);
+      child.emit("close", null, signal);
+    }
+    return true;
+  };
+
+  launcherTest.shutdownHandoffChild(child, {
+    handoffTerminationGraceMs: 1,
+    handoffForceKillGraceMs: 1,
+  });
+  await delay(25);
+
+  assert.equal(child.stdin.writableEnded, true);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
   return join(dataDir, `.codestory-active-thread-${key}.json`);
@@ -1505,7 +1562,7 @@ test("multi-project stdio ignores mutable active-workspace state", async () => {
   assert.match(launcher, /\['serve', '--stdio', '--multi-project', '--refresh', 'none'\]/u);
   assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
   assert.match(transport, /CODESTORY_PLUGIN_MULTI_PROJECT/u);
-  assert.match(transport, /project_required: pass the caller's repository root/u);
+  assert.match(transport, /project_required: `project` must be the caller's absolute repository root/u);
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
@@ -2235,6 +2292,10 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
       await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8"),
       "utf8",
     );
+    await copyFile(
+      join(pluginRoot, "generated-mcp-catalog.json"),
+      join(installRoot, "generated-mcp-catalog.json"),
+    );
     await writeFile(
       join(installRoot, "hooks", "codestory-runtime.cjs"),
       await readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8"),
@@ -2304,6 +2365,9 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
     JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "ground", arguments: { project: "." } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "ground", arguments: { project: join(dataDir, "missing") } } }),
   ].join("\n") + "\n";
 
   try {
@@ -2324,8 +2388,13 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 4, result.stdout);
+    assert.equal(responses.length, 7, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.project_root, null);
+    assert.equal(status.project_state, "no_project");
+    assert.equal(status.degraded_reason, "managed_cli_unavailable");
+    assert.equal(status.project_selection.code, "project_required");
+    assert.equal(status.project_selection.state, "no_project");
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
@@ -2357,10 +2426,15 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(coldGroundTool.annotations.readOnlyHint, false);
     assert.equal(coldGroundTool.annotations.openWorldHint, true);
     assert.equal(responses[3].result.isError, true);
-    assert.equal(responses[3].result.structuredContent.code, "codestory_unavailable");
+    assert.equal(responses[3].result.structuredContent.code, "project_required");
     assert.equal(responses[3].result.structuredContent.tool, "ground");
     assert.equal(responses[3].result.structuredContent.retry_tool, undefined);
-    assert.match(responses[3].result.structuredContent.message, /focused source inspection/u);
+    assert.match(responses[3].result.structuredContent.message, /absolute repository root/u);
+    assert.equal(responses[4].result.structuredContent.current_operation, null);
+    assert.equal(responses[5].result.isError, true);
+    assert.equal(responses[5].result.structuredContent.code, "project_required");
+    assert.equal(responses[6].result.isError, true);
+    assert.equal(responses[6].result.structuredContent.code, "project_unavailable");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2489,6 +2563,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     method: "resources/read",
     params: { uri: "codestory://status" },
   }) + "\n";
+  let child;
 
   try {
     await mkdir(cliDir, { recursive: true });
@@ -2511,7 +2586,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       "utf8",
     );
 
-    const child = spawn(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         PLUGIN_DATA: dataDir,
@@ -2560,6 +2635,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       version,
     );
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -2732,11 +2808,43 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       jsonrpc: "2.0",
       id: 2,
       method: "resources/read",
-      params: { uri: "codestory://status" },
+      params: { uri: "codestory://status", project: repoRoot },
     });
     const status = JSON.parse(statusResponse.result.contents[0].text);
+    assert.equal(status.project_root, repoRoot);
+    assert.equal(status.project_root_source, "request_argument");
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
     assert.equal(status.runtime.state, "preparing");
+    const coldResources = await request({
+      jsonrpc: "2.0",
+      id: "cold-resources",
+      method: "resources/list",
+    });
+    assert.deepEqual(
+      coldResources.result.resources.map(({ uri }) => uri),
+      ["codestory://status", "codestory://agent-guide"],
+    );
+    const coldGuideResponse = await request({
+      jsonrpc: "2.0",
+      id: "cold-guide",
+      method: "resources/read",
+      params: { uri: "codestory://agent-guide", project: repoRoot },
+    });
+    const coldGuide = JSON.parse(coldGuideResponse.result.contents[0].text);
+    assert.equal(coldGuide.project, repoRoot);
+    assert.equal(coldGuide.diagnostics_uri, "codestory://status");
+    const coldTemplates = await request({
+      jsonrpc: "2.0",
+      id: "cold-templates",
+      method: "resources/templates/list",
+    });
+    assert.deepEqual(coldTemplates.result.resourceTemplates, []);
+    const coldPrompts = await request({
+      jsonrpc: "2.0",
+      id: "cold-prompts",
+      method: "prompts/list",
+    });
+    assert.deepEqual(coldPrompts.result.prompts, []);
     const coldTools = await request({
       jsonrpc: "2.0",
       id: "cold-tools",
@@ -2754,7 +2862,14 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
     assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
     assert.equal(coldGround.result.structuredContent.project, repoRoot);
-    assert.equal(coldGround.result.structuredContent.operation.id, "managed-runtime-provisioning");
+    assert.deepEqual(coldGround.result.structuredContent.operation, {
+      operation_id: "managed-runtime-provisioning",
+      state: "preparing",
+      stage: "dense_preparation",
+      attempt: 1,
+      retry_after_ms: 1500,
+      failure: null,
+    });
     assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
 
     releaseAssets();
@@ -2766,7 +2881,8 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       if (metadata.source === "managed") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(JSON.parse(await readFile(runtimeMetadata, "utf8")).source, "managed");
+    const publishedRuntime = JSON.parse(await readFile(runtimeMetadata, "utf8"));
+    assert.equal(publishedRuntime.source, "managed", JSON.stringify(publishedRuntime));
     assert.equal(
       responses.some((response) => response.method === "notifications/tools/list_changed"),
       false,
@@ -2929,6 +3045,65 @@ test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async
   assert.equal(responses.find((response) => response.id === 2)?.error.code, -32000);
   const status = JSON.parse(responses.find((response) => response.id === 3).result.contents[0].text);
   assert.equal(status.degraded_reason, "managed_cli_handoff_unspawnable");
+});
+
+test("fail-open status tool preserves primary runtime failures and no-project precedence", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const failures = [
+    ["managed_cli_asset_fetch_failed", "asset archive checksum failed", 1],
+    ["managed_cli_probe_failed", "version probe exited with status 2", 2],
+    ["managed_cli_handoff_unspawnable", "spawn EACCES", null],
+    ["runtime_stdio_child_exit", "codestory-cli serve --stdio exited with status 17", 17],
+  ];
+  const statuses = failures.map(([reason, failure, status]) => ({
+    plugin_runtime: { plugin_version: "test" },
+    managed_retrieval: { state: "unavailable" },
+    degraded_reason: reason,
+    readiness: [{
+      reason,
+      summary: `runtime unavailable: ${reason}`,
+      setup: { probe_error: failure, probe_status: status },
+    }],
+    recommended_next_calls: [],
+  }));
+  statuses.push(statuses[0]);
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `const statuses=${JSON.stringify(statuses)};`,
+    "run(()=>statuses.shift()||statuses.at(-1));",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.end([
+    ...failures.map((_, index) => JSON.stringify({
+      jsonrpc: "2.0",
+      id: index + 1,
+      method: "tools/call",
+      params: { name: "status", arguments: { project: repoRoot } },
+    })),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: failures.length + 1,
+      method: "tools/call",
+      params: { name: "status", arguments: {} },
+    }),
+    "",
+  ].join("\n"));
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  failures.forEach(([reason, failure], index) => {
+    const structured = responses.find((response) => response.id === index + 1)?.result.structuredContent;
+    assert.equal(structured.degraded_reason, reason);
+    assert.equal(structured.failure, failure);
+    assert.equal(structured.current_operation, null);
+  });
+  const noProject = responses.find((response) => response.id === failures.length + 1)?.result.structuredContent;
+  assert.equal(noProject.code, "project_required");
+  assert.equal(noProject.state, "no_project");
+  assert.equal(noProject.degraded_reason, undefined);
 });
 
 test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
@@ -3376,9 +3551,10 @@ test("mcp launcher keeps managed provision failures primary", async () => {
     method: "resources/read",
     params: { uri: "codestory://status" },
   }) + "\n";
+  let child;
 
   try {
-    const child = spawn(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         CODESTORY_CLI: "",
@@ -3426,6 +3602,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       true,
     );
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
   }

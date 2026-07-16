@@ -23,6 +23,22 @@ project's immutable config and never rereads or mutates process environment.
 - `src/config.rs` and `src/runtime.rs`: startup config and project contexts
 - `src/stdio_catalog.rs`: MCP schema and safety metadata
 - `src/stdio_transport.rs`: project routing, activation, resources, and tools
+
+Multi-project stdio retains at most four hot contexts. A context key combines
+native workspace identity with a non-secret fingerprint of the immutable cache,
+retrieval, embedding, and summary configuration captured at process start.
+Equivalent path spellings converge on one context; configuration changes do
+not silently reuse another context. Project selection requires an absolute,
+existing repository root; projectless status reports `no_project`, while
+relative or unavailable roots fail closed.
+
+Status and resources use the runtime's observational summary path. They may
+read existing complete publications and operation snapshots, but they do not
+create storage or start activation. Product tool calls join the runtime-owned
+activation service and the runtime owns the single bounded retrieval-publication
+retry for a complete public response. The same whole-response service wraps
+ordinary CLI packet, search, context, drill, and graph-assisted reads, so stdio
+is not a stronger consistency boundary than the CLI.
 - `src/output.rs`: rendering
 
 Generated `--help` owns option syntax. User guides own workflows. This page owns

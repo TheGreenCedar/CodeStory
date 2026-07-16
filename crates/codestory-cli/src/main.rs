@@ -91,12 +91,13 @@ use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 #[cfg(test)]
 use http_transport::search_repo_text_mode_param;
 use output::{
-    REPO_CONTENT_BOUNDARY_LINE, context_packet_json, emit, emit_text, render_agent_citation,
-    render_context_markdown, render_doctor_markdown, render_drill_markdown, render_ground_markdown,
-    render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_ready_markdown, render_search_markdown, render_snippet_markdown, render_symbol_markdown,
-    render_symbol_mermaid, render_trail_dot, render_trail_markdown, render_trail_mermaid,
-    render_trail_story_markdown, validate_output_file_parent,
+    REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, context_packet_json, emit,
+    emit_public_operation, render_agent_citation, render_context_markdown, render_doctor_markdown,
+    render_drill_markdown, render_ground_markdown, render_index_dry_run_markdown,
+    render_index_markdown, render_query_markdown, render_ready_markdown, render_search_markdown,
+    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
+    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
+    validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -1195,44 +1196,56 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "context")?;
 
-    let resolved = resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
-    let target_prompt = context_target_prompt(&resolved);
-    let request = AgentAskRequest {
-        prompt: target_prompt,
-        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
-            preset: AgentRetrievalPresetDto::Investigate,
-        },
-        focus_node_id: Some(resolved.target.selected.node_id.clone()),
-        max_results: Some(cmd.max_results.clamp(1, 25)),
-        response_mode: AgentResponseModeDto::Markdown,
-        latency_budget_ms: None,
-        include_evidence: !cmd.no_evidence,
-        hybrid_weights: None,
-    };
+    let operation = runtime.run_public_operation("context", || {
+        let resolved =
+            resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
+        let target_prompt = context_target_prompt(&resolved);
+        let request = AgentAskRequest {
+            prompt: target_prompt,
+            retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+                preset: AgentRetrievalPresetDto::Investigate,
+            },
+            focus_node_id: Some(resolved.target.selected.node_id.clone()),
+            max_results: Some(cmd.max_results.clamp(1, 25)),
+            response_mode: AgentResponseModeDto::Markdown,
+            latency_budget_ms: None,
+            include_evidence: !cmd.no_evidence,
+            hybrid_weights: None,
+        };
 
-    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
-    answer
-        .retrieval_trace
-        .annotations
-        .push("mode=db_first".to_string());
-    annotate_answer_with_context_target(&mut answer, &resolved);
-    let markdown = render_context_markdown(&runtime.project_root, &answer);
-    let output = ContextJsonOutput {
-        target: ContextTargetOutput {
-            selector: resolved.selector,
-            requested: resolved.requested,
-            bookmark_id: resolved
-                .bookmark
-                .as_ref()
-                .map(|bookmark| bookmark.id.clone()),
-        },
-        resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
-        context: context_packet_json(&answer),
-    };
+        let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
+        answer
+            .retrieval_trace
+            .annotations
+            .push("mode=db_first".to_string());
+        annotate_answer_with_context_target(&mut answer, &resolved);
+        let markdown = render_context_markdown(&runtime.project_root, &answer);
+        let output = ContextJsonOutput {
+            target: ContextTargetOutput {
+                selector: resolved.selector,
+                requested: resolved.requested,
+                bookmark_id: resolved
+                    .bookmark
+                    .as_ref()
+                    .map(|bookmark| bookmark.id.clone()),
+            },
+            resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
+            context: context_packet_json(&answer),
+        };
+        let rendered = RenderedPublicOutput::structured(&output, markdown)?;
+        Ok((answer, rendered))
+    })?;
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
-        write_context_bundle(bundle_dir, &output, &answer.graphs, &markdown)?;
+        let (json, markdown) = operation
+            .value
+            .1
+            .structured_parts()
+            .expect("context always renders structured output");
+        let json = runtime::public_operation_json_value(&operation, json)?;
+        write_context_bundle(bundle_dir, &json, &operation.value.0.graphs, markdown)?;
     }
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime::map_public_operation(operation, |(_, rendered)| rendered);
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_packet(cmd: PacketCommand) -> Result<()> {
@@ -1246,23 +1259,35 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
         "packet",
     )?;
 
-    let packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question: cmd.question,
-            budget: cmd.budget.into(),
-            task_class: cmd.task_class.map(Into::into),
-            extra_probes: cmd.extra_probes,
-            include_evidence: !cmd.no_evidence,
-            latency_budget_ms: cmd.latency_budget_ms,
-        })
-        .map_err(map_api_error)?;
-    if let Some(path) = &cmd.step_trace_out {
-        let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
-        std::fs::write(path, serde_json::to_string_pretty(&trace)?)?;
+    let operation = runtime.run_public_operation("packet", || {
+        let packet = runtime
+            .browser
+            .packet(AgentPacketRequestDto {
+                question: cmd.question.clone(),
+                budget: cmd.budget.into(),
+                task_class: cmd.task_class.map(Into::into),
+                extra_probes: cmd.extra_probes.clone(),
+                include_evidence: !cmd.no_evidence,
+                latency_budget_ms: cmd.latency_budget_ms,
+            })
+            .map_err(map_api_error)?;
+        let step_trace = if cmd.step_trace_out.is_some() {
+            let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
+            Some(serde_json::to_string_pretty(&trace)?)
+        } else {
+            None
+        };
+        let markdown = render_packet_markdown(&runtime.project_root, &packet);
+        Ok((
+            RenderedPublicOutput::structured(&packet, markdown)?,
+            step_trace,
+        ))
+    })?;
+    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, &operation.value.1) {
+        std::fs::write(path, trace)?;
     }
-    let markdown = render_packet_markdown(&runtime.project_root, &packet);
-    emit(cmd.format, &packet, markdown, cmd.output_file.as_deref())
+    let operation = runtime::map_public_operation(operation, |(rendered, _)| rendered);
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_task(cmd: TaskCommand) -> Result<()> {
@@ -1277,20 +1302,23 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
-    let packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question: cmd.prompt,
-            budget: cmd.budget.into(),
-            task_class: Some(PacketTaskClassDto::EditPlanning),
-            extra_probes: cmd.extra_probes,
-            include_evidence: !cmd.no_evidence,
-            latency_budget_ms: cmd.latency_budget_ms,
-        })
-        .map_err(map_api_error)?;
-    let brief = build_task_brief_output(&runtime.project_root, &packet);
-    let markdown = render_task_brief_markdown(&brief);
-    emit(cmd.format, &brief, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("packet", || {
+        let packet = runtime
+            .browser
+            .packet(AgentPacketRequestDto {
+                question: cmd.prompt.clone(),
+                budget: cmd.budget.into(),
+                task_class: Some(PacketTaskClassDto::EditPlanning),
+                extra_probes: cmd.extra_probes.clone(),
+                include_evidence: !cmd.no_evidence,
+                latency_budget_ms: cmd.latency_budget_ms,
+            })
+            .map_err(map_api_error)?;
+        let brief = build_task_brief_output(&runtime.project_root, &packet);
+        let markdown = render_task_brief_markdown(&brief);
+        RenderedPublicOutput::structured(&brief, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2671,13 +2699,16 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         cmd.refresh,
         "search",
     )?;
-    let search_results = runtime
-        .browser
-        .search_results(search_request_from_command(&cmd))
-        .map_err(map_api_error)?;
-    let output = search_output_from_results(&runtime, &search_results, cmd.why);
-    let markdown = render_search_markdown(&runtime.project_root, &output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("search", || {
+        let search_results = runtime
+            .browser
+            .search_results(search_request_from_command(&cmd))
+            .map_err(map_api_error)?;
+        let output = search_output_from_results(&runtime, &search_results, cmd.why);
+        let markdown = render_search_markdown(&runtime.project_root, &output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
@@ -2693,13 +2724,13 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
 
 fn run_drill(cmd: DrillCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "drill")?;
-    let output = execute_drill(&cmd)?;
-    let contents = write_drill_outputs(cmd.format, &cmd.output_dir, &output)?;
+    let operation = execute_drill(&cmd)?;
+    let contents = write_drill_outputs(cmd.format, &cmd.output_dir, &operation)?;
     print!("{}", contents.selected);
     Ok(())
 }
 
-fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
+fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperation<DrillOutput>> {
     let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
     let total_timer = Instant::now();
     let setup_timer = Instant::now();
@@ -2719,13 +2750,6 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
     }
-    let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        runtime.sidecar.clone(),
-    )
-    .ok()
-    .map(|status| status.retrieval_mode);
     let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
     let setup_ms = elapsed_ms(setup_timer);
 
@@ -2743,75 +2767,88 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         include_evidence: true,
         latency_budget_ms: None,
     };
-    let evidence_packet =
-        execute_drill_packet(packet_request, |request| runtime.browser.packet(request))?;
-    let question_search_ms = elapsed_ms(packet_timer);
-    let evidence_assembly_timer = Instant::now();
-    let citations = drill_packet_citations(&evidence_packet);
-    let anchor_outputs = drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
-    let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
-    let mut all_verification_targets =
-        drill_packet_verification_targets(&runtime.project_root, &citations);
-    dedupe_verification_targets(&mut all_verification_targets);
-    let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
-    let question_search = Some(DrillCommandStatusOutput {
-        command: "packet".to_string(),
-        status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
-        duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
-        artifact: None,
-        error: None,
-    });
-    let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
-    let drill_timings = DrillRuntimeTimingsOutput {
-        total_ms: elapsed_ms(total_timer),
-        setup_ms,
-        question_search_ms,
-        anchor_resolution_ms: 0,
-        supplemental_search_ms: 0,
-        bridge_evidence_ms: 0,
-        evidence_assembly_ms,
-    };
-
-    Ok(DrillOutput {
-        project: display::clean_path_string(&opened.summary.root),
-        label: cmd.label.clone(),
-        question: cmd.question.clone(),
-        output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
-        mechanical: DrillMechanicalOutput {
-            before_files: before.stats.file_count,
-            before_nodes: before.stats.node_count,
-            before_edges: before.stats.edge_count,
-            before_errors: before.stats.error_count,
-            after_files: opened.summary.stats.file_count,
-            after_nodes: opened.summary.stats.node_count,
-            after_edges: opened.summary.stats.edge_count,
-            after_errors: opened.summary.stats.error_count,
-            refresh,
-            retrieval: opened.summary.retrieval.clone(),
-            sidecar_retrieval_mode,
-            freshness: opened.summary.freshness.clone(),
-            phase_timings: opened.phase_timings.clone(),
-            drill_timings,
-        },
-        question_search,
-        question_supplemental_searches: Vec::new(),
-        anchors: anchor_outputs,
-        bridges: bridge_outputs,
-        execution_boundaries: vec![DrillExecutionBoundaryOutput {
+    runtime.run_public_operation("drill", || {
+        let pinned_summary = runtime.active_project_summary()?;
+        let pinned_publication = runtime
+            .public_operation
+            .active_publication()
+            .context("drill public operation has active publication identity")?;
+        let sidecar_retrieval_mode = pinned_publication
+            .retrieval_publication
+            .as_ref()
+            .map(|_| "full".to_string());
+        let evidence_packet = execute_drill_packet(packet_request.clone(), |request| {
+            runtime.browser.packet(request)
+        })?;
+        let question_search_ms = elapsed_ms(packet_timer);
+        let evidence_assembly_timer = Instant::now();
+        let citations = drill_packet_citations(&evidence_packet);
+        let anchor_outputs =
+            drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
+        let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
+        let mut all_verification_targets =
+            drill_packet_verification_targets(&runtime.project_root, &citations);
+        dedupe_verification_targets(&mut all_verification_targets);
+        let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
+        let question_search = Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            flow: vec![
-                "plan question and explicit anchor probes".to_string(),
-                "execute one bounded batch retrieval".to_string(),
-                "adapt citations and sufficiency into drill reports".to_string(),
-            ],
-            source_files: vec![
-                "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
-                "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
-            ],
-        }],
-        verification_targets: all_verification_targets,
-        evidence_packet,
-        next_commands,
+            status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
+            duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
+            artifact: None,
+            error: None,
+        });
+        let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
+        let drill_timings = DrillRuntimeTimingsOutput {
+            total_ms: elapsed_ms(total_timer),
+            setup_ms,
+            question_search_ms,
+            anchor_resolution_ms: 0,
+            supplemental_search_ms: 0,
+            bridge_evidence_ms: 0,
+            evidence_assembly_ms,
+        };
+
+        Ok(DrillOutput {
+            project: display::clean_path_string(&pinned_summary.root),
+            label: cmd.label.clone(),
+            question: cmd.question.clone(),
+            output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
+            mechanical: DrillMechanicalOutput {
+                before_files: before.stats.file_count,
+                before_nodes: before.stats.node_count,
+                before_edges: before.stats.edge_count,
+                before_errors: before.stats.error_count,
+                after_files: pinned_summary.stats.file_count,
+                after_nodes: pinned_summary.stats.node_count,
+                after_edges: pinned_summary.stats.edge_count,
+                after_errors: pinned_summary.stats.error_count,
+                refresh: refresh.clone(),
+                retrieval: pinned_summary.retrieval.clone(),
+                sidecar_retrieval_mode,
+                freshness: pinned_summary.freshness.clone(),
+                phase_timings: opened.phase_timings.clone(),
+                drill_timings,
+            },
+            question_search,
+            question_supplemental_searches: Vec::new(),
+            anchors: anchor_outputs,
+            bridges: bridge_outputs,
+            execution_boundaries: vec![DrillExecutionBoundaryOutput {
+                command: "packet".to_string(),
+                flow: vec![
+                    "plan question and explicit anchor probes".to_string(),
+                    "execute one bounded batch retrieval".to_string(),
+                    "adapt citations and sufficiency into drill reports".to_string(),
+                ],
+                source_files: vec![
+                    "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+                    "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
+                ],
+            }],
+            verification_targets: all_verification_targets,
+            evidence_packet,
+            next_commands,
+        })
     })
 }
 
@@ -3045,15 +3082,16 @@ fn drill_packet_citations_share_graph_evidence(
 fn write_drill_outputs(
     format: args::OutputFormat,
     output_dir: &std::path::Path,
-    output: &DrillOutput,
+    operation: &codestory_runtime::PublicOperation<DrillOutput>,
 ) -> Result<DrillReportContents> {
+    let output = &operation.value;
     let report_ext = match format {
         args::OutputFormat::Markdown => "md",
         args::OutputFormat::Json => "json",
         args::OutputFormat::Dot => unreachable!("dot was rejected above"),
     };
     let markdown = render_drill_markdown(output);
-    let contents = render_drill_contents(format, output, &markdown)?;
+    let contents = render_drill_contents(format, operation, &markdown)?;
     let report_path = output_dir.join(format!("drill-report.{report_ext}"));
     write_drill_report_file(&report_path, &contents.selected)?;
     let markdown_path = output_dir.join("drill-report.md");
@@ -3065,6 +3103,7 @@ fn write_drill_outputs(
         write_drill_report_file(&json_path, &contents.json)?;
     }
     let summary = drill_summary(output);
+    let summary = runtime::public_operation_json_value(operation, &summary)?;
     let summary_json = ensure_trailing_newline(
         serde_json::to_string_pretty(&summary).context("Failed to serialize drill summary JSON")?,
     );
@@ -3315,9 +3354,9 @@ fn run_drill_suite_case(
         format: cmd.format,
         jobs: drill_jobs,
     };
-    match execute_drill(&drill_cmd).and_then(|drill_output| {
-        write_drill_outputs(cmd.format, &repo_output_dir, &drill_output)?;
-        Ok(drill_summary(&drill_output))
+    match execute_drill(&drill_cmd).and_then(|operation| {
+        write_drill_outputs(cmd.format, &repo_output_dir, &operation)?;
+        Ok(drill_summary(&operation.value))
     }) {
         Ok(summary) => {
             emit_drill_suite_progress(drill_suite_repo_progress_done_message(
@@ -3863,12 +3902,13 @@ struct DrillReportContents {
 
 fn render_drill_contents(
     format: args::OutputFormat,
-    output: &DrillOutput,
+    operation: &codestory_runtime::PublicOperation<DrillOutput>,
     markdown: &str,
 ) -> Result<DrillReportContents> {
     let markdown = ensure_trailing_newline(markdown.to_string());
+    let output = runtime::public_operation_json_value(operation, &operation.value)?;
     let json = ensure_trailing_newline(
-        serde_json::to_string_pretty(output).context("Failed to serialize drill JSON")?,
+        serde_json::to_string_pretty(&output).context("Failed to serialize drill JSON")?,
     );
     let selected = match format {
         args::OutputFormat::Markdown => markdown.clone(),
@@ -4588,34 +4628,42 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_index_ready(&opened, "symbol")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let context = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-    if cmd.mermaid {
-        return emit_text(render_symbol_mermaid(&context), cmd.output_file.as_deref());
-    }
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let verification_targets = resolution.resolved.verification_targets.clone();
-    let markdown = render_symbol_markdown(
-        &runtime.project_root,
-        &target,
-        &context,
-        &verification_targets,
-    );
-    let output = SymbolJsonOutput {
-        resolution,
-        symbol: &context,
-        verification_targets,
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
     };
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let context = runtime
+            .browser
+            .symbol_context(target.selected.node_id.clone())
+            .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        if cmd.mermaid {
+            return Ok(RenderedPublicOutput::text(render_symbol_mermaid(&context)));
+        }
+        let verification_targets = resolution.resolved.verification_targets.clone();
+        let markdown = render_symbol_markdown(
+            &runtime.project_root,
+            &target,
+            &context,
+            &verification_targets,
+        );
+        let output = SymbolJsonOutput {
+            resolution,
+            symbol: &context,
+            verification_targets,
+        };
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 #[derive(serde::Serialize)]
@@ -4648,64 +4696,73 @@ fn run_symbol_workflow(
     ensure_index_ready(&opened, mode.label())?;
 
     let file_filter = cmd.target.file_filter();
-    let target = match cmd.target.selection()? {
-        args::TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
-        args::TargetSelection::Query { query, choose } => {
-            codestory_runtime::TargetSelection::Query { query, choose }
-        }
+    let operation_name = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
     };
-    let response = match runtime
-        .browser
-        .symbol_workflow(codestory_runtime::SymbolWorkflowRequest {
-            mode,
-            target,
-            file_filter,
-            depth: cmd.depth,
-            max_nodes: cmd.max_nodes,
-            include_tests: cmd.include_tests,
-        }) {
-        Ok(codestory_runtime::SymbolWorkflowOutcome::Complete(response)) => *response,
-        Ok(codestory_runtime::SymbolWorkflowOutcome::Ambiguous(ambiguous)) => {
-            return structured_ambiguous_target_failure(
-                &runtime,
-                AmbiguousTargetError {
-                    query: ambiguous.query,
-                    file_filter: ambiguous.file_filter,
-                    alternatives: ambiguous.alternatives,
-                    message: ambiguous.message,
-                },
-                cmd.format,
-                cmd.output_file.as_deref(),
-            );
-        }
-        Ok(codestory_runtime::SymbolWorkflowOutcome::Rejected(message)) => bail!(message),
-        Err(error) => return Err(map_api_error(error)),
-    };
-    let resolution_target =
-        runtime::ResolvedTarget::from_runtime(response.resolution.target.clone());
-    let resolution = build_query_resolution_output_from_occurrences(
-        &runtime.project_root,
-        &resolution_target,
-        &response.resolution.occurrences,
-    );
-    let output = SymbolWorkflowOutput {
-        workflow: response.workflow,
-        project_root: &response.project_root,
-        resolution,
-        symbol: &response.symbol,
-        direct_callers: &response.direct_callers,
-        transitive_callers: &response.transitive_callers,
-        impacted_files: &response.impacted_files,
-        impacted_routes: &response.impacted_routes,
-        likely_tests: &response.likely_tests,
-        caps: &response.caps,
-        unknowns: &response.unknowns,
-        next_commands: &response.next_commands,
-        affected: response.affected.as_ref(),
-        trail: &response.trail,
-    };
-    let markdown = render_symbol_workflow_markdown(mode, &output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation(operation_name, || {
+        let target = match cmd.target.selection()? {
+            args::TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
+            args::TargetSelection::Query { query, choose } => {
+                codestory_runtime::TargetSelection::Query { query, choose }
+            }
+        };
+        let response = match runtime
+            .browser
+            .symbol_workflow(codestory_runtime::SymbolWorkflowRequest {
+                mode,
+                target,
+                file_filter: file_filter.clone(),
+                depth: cmd.depth,
+                max_nodes: cmd.max_nodes,
+                include_tests: cmd.include_tests,
+            })
+            .map_err(map_api_error)?
+        {
+            codestory_runtime::SymbolWorkflowOutcome::Complete(response) => *response,
+            codestory_runtime::SymbolWorkflowOutcome::Ambiguous(ambiguous) => {
+                return structured_ambiguous_target_failure(
+                    &runtime,
+                    AmbiguousTargetError {
+                        query: ambiguous.query,
+                        file_filter: ambiguous.file_filter,
+                        alternatives: ambiguous.alternatives,
+                        message: ambiguous.message,
+                    },
+                    cmd.format,
+                    cmd.output_file.as_deref(),
+                );
+            }
+            codestory_runtime::SymbolWorkflowOutcome::Rejected(message) => bail!(message),
+        };
+        let resolution_target =
+            runtime::ResolvedTarget::from_runtime(response.resolution.target.clone());
+        let resolution = build_query_resolution_output_from_occurrences(
+            &runtime.project_root,
+            &resolution_target,
+            &response.resolution.occurrences,
+        );
+        let output = SymbolWorkflowOutput {
+            workflow: response.workflow,
+            project_root: &response.project_root,
+            resolution,
+            symbol: &response.symbol,
+            direct_callers: &response.direct_callers,
+            transitive_callers: &response.transitive_callers,
+            impacted_files: &response.impacted_files,
+            impacted_routes: &response.impacted_routes,
+            likely_tests: &response.likely_tests,
+            caps: &response.caps,
+            unknowns: &response.unknowns,
+            next_commands: &response.next_commands,
+            affected: response.affected.as_ref(),
+            trail: &response.trail,
+        };
+        let markdown = render_symbol_workflow_markdown(mode, &output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn render_symbol_workflow_markdown(
@@ -4833,46 +4890,54 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     ensure_index_ready(&opened, "trail")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let request = build_trail_request(&target.selected.node_id, &cmd);
-    let context = runtime
-        .browser
-        .trail_context(request)
-        .map_err(map_api_error)?;
-    if cmd.mermaid {
-        return emit_text(render_trail_mermaid(&context), cmd.output_file.as_deref());
-    }
-    if cmd.format == args::OutputFormat::Dot {
-        return emit_text(
-            render_trail_dot(&runtime.project_root, &context),
-            cmd.output_file.as_deref(),
-        );
-    }
-    let notes = trail_guidance_notes(&context);
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let mut markdown = if let Some(story) = context.story.as_ref() {
-        render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
     } else {
-        render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
+        "graph"
     };
-    if !notes.is_empty() {
-        let _ = writeln!(markdown, "notes:");
-        for note in &notes {
-            let _ = writeln!(markdown, "- {note}");
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let request = build_trail_request(&target.selected.node_id, &cmd);
+        let context = runtime
+            .browser
+            .trail_context(request)
+            .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        if cmd.mermaid {
+            return Ok(RenderedPublicOutput::text(render_trail_mermaid(&context)));
         }
-    }
-    let output = TrailJsonOutput {
-        resolution,
-        trail: &context,
-        notes,
-    };
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+        if cmd.format == args::OutputFormat::Dot {
+            return Ok(RenderedPublicOutput::text(render_trail_dot(
+                &runtime.project_root,
+                &context,
+            )));
+        }
+        let notes = trail_guidance_notes(&context);
+        let mut markdown = if let Some(story) = context.story.as_ref() {
+            render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
+        } else {
+            render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
+        };
+        if !notes.is_empty() {
+            let _ = writeln!(markdown, "notes:");
+            for note in &notes {
+                let _ = writeln!(markdown, "- {note}");
+            }
+        }
+        let output = TrailJsonOutput {
+            resolution,
+            trail: &context,
+            notes,
+        };
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_callers(mut cmd: TrailCommand) -> Result<()> {
@@ -4987,46 +5052,54 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let target = if cmd.function_body {
-        prefer_function_body_target(&runtime.project_root, target)
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
     } else {
-        target
+        "graph"
     };
-    let context = if cmd.function_body {
-        runtime
-            .browser
-            .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
-    } else {
-        runtime
-            .browser
-            .snippet_context(target.selected.node_id.clone(), cmd.context)
-    }
-    .map_err(map_api_error)?;
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let verification_targets = resolution.resolved.verification_targets.clone();
-    let markdown = render_snippet_markdown(
-        &runtime.project_root,
-        &target,
-        &context,
-        colorize,
-        &verification_targets,
-    );
-    let output = SnippetJsonOutput {
-        resolution,
-        snippet: &context,
-        verification_targets,
-    };
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let target = if cmd.function_body {
+            prefer_function_body_target(&runtime.project_root, target)
+        } else {
+            target
+        };
+        let context = if cmd.function_body {
+            runtime
+                .browser
+                .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
+        } else {
+            runtime
+                .browser
+                .snippet_context(target.selected.node_id.clone(), cmd.context)
+        }
+        .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        let verification_targets = resolution.resolved.verification_targets.clone();
+        let markdown = render_snippet_markdown(
+            &runtime.project_root,
+            &target,
+            &context,
+            colorize,
+            &verification_targets,
+        );
+        let output = SnippetJsonOutput {
+            resolution,
+            snippet: &context,
+            verification_targets,
+        };
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_query(cmd: QueryCommand) -> Result<()> {
@@ -5054,20 +5127,23 @@ fn run_query(cmd: QueryCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "query")?;
-    let items = runtime
-        .browser
-        .query(&ast)
-        .map_err(map_api_error)?
-        .iter()
-        .map(|item| explore::browser_query_item_to_output(&runtime.project_root, item))
-        .collect();
-    let output = QueryOutput {
-        query: query.to_string(),
-        ast,
-        items,
-    };
-    let markdown = render_query_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("graph", || {
+        let items = runtime
+            .browser
+            .query(&ast)
+            .map_err(map_api_error)?
+            .iter()
+            .map(|item| explore::browser_query_item_to_output(&runtime.project_root, item))
+            .collect();
+        let output = QueryOutput {
+            query: query.to_string(),
+            ast: ast.clone(),
+            items,
+        };
+        let markdown = render_query_markdown(&output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_files(cmd: FilesCommand) -> Result<()> {
@@ -5080,17 +5156,20 @@ fn run_files(cmd: FilesCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "files")?;
-    let output = runtime
-        .browser
-        .indexed_files(IndexedFilesRequest {
-            path_contains: cmd.path,
-            language: cmd.language,
-            role: cmd.role.map(Into::into),
-            limit: Some(cmd.limit),
-        })
-        .map_err(map_api_error)?;
-    let markdown = render_files_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("graph", || {
+        let output = runtime
+            .browser
+            .indexed_files(IndexedFilesRequest {
+                path_contains: cmd.path.clone(),
+                language: cmd.language.clone(),
+                role: cmd.role.map(Into::into),
+                limit: Some(cmd.limit),
+            })
+            .map_err(map_api_error)?;
+        let markdown = render_files_markdown(&output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_affected(cmd: AffectedCommand) -> Result<()> {
@@ -5105,17 +5184,20 @@ fn run_affected(cmd: AffectedCommand) -> Result<()> {
         .iter()
         .map(|record| record.path.clone())
         .collect::<Vec<_>>();
-    let output = runtime
-        .browser
-        .affected_analysis(AffectedAnalysisRequest {
-            changed_paths,
-            change_records,
-            depth: Some(cmd.depth),
-            filter: cmd.filter,
-        })
-        .map_err(map_api_error)?;
-    let markdown = render_affected_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("graph", || {
+        let output = runtime
+            .browser
+            .affected_analysis(AffectedAnalysisRequest {
+                changed_paths: changed_paths.clone(),
+                change_records: change_records.clone(),
+                depth: Some(cmd.depth),
+                filter: cmd.filter.clone(),
+            })
+            .map_err(map_api_error)?;
+        let markdown = render_affected_markdown(&output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn affected_change_records(cmd: &AffectedCommand) -> Result<Vec<AffectedChangeRecordDto>> {
@@ -5746,10 +5828,10 @@ async fn run_serve(cmd: ServeCommand) -> Result<()> {
         return stdio_transport::run_stdio_server(None, cmd.refresh).await;
     }
     let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
         return stdio_transport::run_stdio_server(Some(runtime), cmd.refresh).await;
     }
+    let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
@@ -6791,10 +6873,15 @@ fn write_context_bundle<T: serde::Serialize>(
             "context.json details were omitted because the summary still exceeded the bundle byte cap."
                 .to_string(),
         );
+        let metadata = serde_json::to_value(output)
+            .ok()
+            .and_then(|value| value.get("_meta").cloned())
+            .unwrap_or(serde_json::Value::Null);
         context_json = serde_json::to_string_pretty(&serde_json::json!({
             "truncated": true,
             "reason": "context bundle output hit its byte cap",
             "action": "Narrow the target or use JSON output without --bundle for the full in-memory response.",
+            "_meta": metadata,
         }))
         .context("Failed to serialize minimal context bundle summary JSON")?;
     }
@@ -6905,6 +6992,7 @@ fn context_bundle_summary_json<T: serde::Serialize>(output: &T) -> Result<String
         "truncated": true,
         "reason": "context bundle output hit its byte cap",
         "action": "Narrow the target or use JSON output without --bundle for the full in-memory response.",
+        "_meta": value.get("_meta"),
         "target": value.get("target"),
         "resolution": value.get("resolution"),
         "context_summary": value.pointer("/context/summary"),
@@ -9020,6 +9108,12 @@ mod tests {
             ),
         });
         let output = serde_json::json!({
+            "_meta": {
+                "codestory_publication": {
+                    "served_from": "complete_publication",
+                    "operation": {"operation_id": "public-context", "attempt": 1}
+                }
+            },
             "target": {"selector": "id", "requested": "big-mermaid"},
             "context": crate::output::context_packet_json(&answer),
         });
@@ -9050,6 +9144,10 @@ mod tests {
             "{manifest}"
         );
         assert_eq!(context_json["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(
+            context_json.pointer("/_meta/codestory_publication/operation/operation_id"),
+            Some(&serde_json::json!("public-context"))
+        );
         assert!(
             !temp.path().join("big-mermaid.mmd").exists(),
             "oversized Mermaid artifact should be omitted"
@@ -9830,7 +9928,14 @@ mod tests {
             evidence_packet: packet,
         };
         let output_dir = tempdir().expect("output dir");
-        write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &output)
+        let operation = codestory_runtime::PublicOperation {
+            value: output,
+            core_publication: None,
+            retrieval_publication: None,
+            operation_id: "test-drill".to_string(),
+            attempt: 1,
+        };
+        write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &operation)
             .expect("write drill fixtures");
 
         let report: serde_json::Value = serde_json::from_slice(
@@ -10094,13 +10199,13 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_root_uses_project_hash() {
+    fn default_cache_root_uses_workspace_identity() {
         let root = Path::new("C:/repo");
         let cache_root = cache_root_for_project(root, None).expect("cache root");
         let cache_root = cache_root.to_string_lossy();
         assert!(
-            cache_root.ends_with(&fnv1a_hex(b"C:/repo")),
-            "default cache root should end with the project hash"
+            cache_root.ends_with(&codestory_workspace::workspace_id_v3_for_root(root)),
+            "default cache root should end with the workspace identity"
         );
     }
 

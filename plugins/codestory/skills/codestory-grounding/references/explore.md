@@ -5,27 +5,10 @@ context when applicable, symbol, trail, navigation, source packet, and snippet
 view. In an interactive terminal it can open the TUI; use `--no-tui` or
 `--format json` for stable agent output.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> explore [OPTIONS] <--id <ID>|--query <QUERY>>
-```
-
-## Key Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to query. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Reuse or isolate a specific cache. |
-| `--id <node_id>` | none | Resolve an exact node id from prior output. |
-| `--query <text>` | none | Resolve by symbol query. Required when using `--file`. |
-| `--file <fragment>` | none | Disambiguate a query by path fragment. |
-| `--profile <architecture|route|bug|refactor|test-impact>` | default | Tune depth, caller scope, and source packet evidence for the investigation type. |
-| `--depth <n>` | `2` | Neighborhood trail depth. |
-| `--max-nodes <n>` | `18` | Trail node cap, clamped to 1-120. |
-| `--no-tui` | off | Print Markdown instead of opening the terminal explorer. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
-| `--format <markdown|json>` | `markdown` | Human or structured output. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

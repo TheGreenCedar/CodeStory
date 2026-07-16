@@ -58,10 +58,13 @@ use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -128,8 +131,14 @@ use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
     semantic_symbol_role_aliases,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
-    AgentService, BookmarkService, GroundingService, IndexService, ProjectService, SearchService,
+    ActivationCapabilities, ActivationCapabilityState, ActivationOperation, ActivationRun,
+    ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
+    ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
+    IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
     TrailService,
 };
 pub use symbol_workflow::{
@@ -180,6 +189,48 @@ type GraphNodeId = codestory_contracts::graph::NodeId;
 type WeightedGraphMatches = Vec<(GraphNodeId, f32)>;
 type GraphNodeNameMap = HashMap<GraphNodeId, String>;
 type ExpandedSymbolMatches = Option<(WeightedGraphMatches, GraphNodeNameMap)>;
+
+#[derive(Clone)]
+struct ActiveCoreRead {
+    controller_identity: usize,
+    storage: Rc<Storage>,
+    publication: IndexPublicationRecord,
+}
+
+thread_local! {
+    /// One complete core snapshot for the entire public operation. Every
+    /// graph/source/target adapter opened through the controller borrows this
+    /// same SQLite read transaction instead of opening a second generation.
+    static ACTIVE_CORE_READ: RefCell<Option<ActiveCoreRead>> = const { RefCell::new(None) };
+}
+
+enum ReadStorage {
+    Pinned(Rc<Storage>),
+    Owned(Storage),
+}
+
+impl Deref for ReadStorage {
+    type Target = Storage;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pinned(storage) => storage,
+            Self::Owned(storage) => storage,
+        }
+    }
+}
+
+struct ActiveCoreReadGuard {
+    previous: Option<ActiveCoreRead>,
+}
+
+impl Drop for ActiveCoreReadGuard {
+    fn drop(&mut self) {
+        ACTIVE_CORE_READ.with(|active| {
+            active.replace(self.previous.take());
+        });
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct RouteEndpointCanonicalMetadata {
@@ -2734,18 +2785,26 @@ fn search_plan_has_unbound_repo_text_group(groups: &[SearchPlanAnchorGroupDto]) 
 #[derive(Clone)]
 pub struct Runtime {
     controller: AppController,
+    activation: ActivationService,
+    public_operation: PublicOperationService,
 }
 
 impl Runtime {
     pub fn new() -> Self {
+        let controller = AppController::new();
         Self {
-            controller: AppController::new(),
+            activation: ActivationService::new(controller.clone()),
+            public_operation: PublicOperationService::new(controller.clone()),
+            controller,
         }
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        let controller = AppController::new_with_config(config);
         Self {
-            controller: AppController::new_with_config(config),
+            activation: ActivationService::new(controller.clone()),
+            public_operation: PublicOperationService::new(controller.clone()),
+            controller,
         }
     }
 
@@ -2778,7 +2837,15 @@ impl Runtime {
     }
 
     pub fn browser_service(&self) -> ReadOnlyBrowserService {
-        ReadOnlyBrowserService::new(self.controller.clone())
+        ReadOnlyBrowserService::new(self.controller.clone(), self.public_operation.clone())
+    }
+
+    pub fn activation_service(&self) -> ActivationService {
+        self.activation.clone()
+    }
+
+    pub fn public_operation_service(&self) -> PublicOperationService {
+        self.public_operation.clone()
     }
 
     pub fn events(&self) -> Receiver<AppEventPayload> {
@@ -7949,6 +8016,28 @@ fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
     storage.map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
 }
 
+fn open_existing_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
+    if !path.is_file() {
+        return Err(ApiError::new(
+            "project_unavailable",
+            "no complete project storage is available",
+        ));
+    }
+    let schema = Storage::database_schema_version(path).map_err(|error| {
+        ApiError::internal(format!("Failed to inspect storage schema: {error}"))
+    })?;
+    if schema != CURRENT_SCHEMA_VERSION {
+        return Err(ApiError::new(
+            "project_unavailable",
+            format!(
+                "project storage schema {schema} is not readable by runtime schema {CURRENT_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    Storage::open_read_only(path)
+        .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
+}
+
 fn publish_search_engine(
     state: &mut AppState,
     engine: SearchEngine,
@@ -8094,7 +8183,7 @@ impl AppController {
     }
 
     pub fn browser_service(&self) -> ReadOnlyBrowserService {
-        ReadOnlyBrowserService::new(self.clone())
+        ReadOnlyBrowserService::new(self.clone(), PublicOperationService::new(self.clone()))
     }
 
     /// Subscribe to backend events. Intended to be consumed by a single pump
@@ -8119,15 +8208,114 @@ impl AppController {
             .ok_or_else(no_project_error)
     }
 
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
     fn open_storage(&self) -> Result<Storage, ApiError> {
         let storage_path = self.require_storage_path()?;
         Storage::open(&storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))
     }
 
-    fn open_storage_read_only(&self) -> Result<Storage, ApiError> {
+    fn open_storage_read_only(&self) -> Result<ReadStorage, ApiError> {
+        if let Some(storage) = ACTIVE_CORE_READ.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|active| active.controller_identity == self.identity())
+                .map(|active| Rc::clone(&active.storage))
+        }) {
+            return Ok(ReadStorage::Pinned(storage));
+        }
         let storage_path = self.require_storage_path()?;
-        open_storage_for_read(&storage_path)
+        open_existing_storage_for_read(&storage_path).map(ReadStorage::Owned)
+    }
+
+    fn active_core_publication(&self) -> Option<IndexPublicationRecord> {
+        ACTIVE_CORE_READ.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|active| active.controller_identity == self.identity())
+                .map(|active| active.publication.clone())
+        })
+    }
+
+    fn active_project_summary(&self) -> Result<ProjectSummary, ApiError> {
+        if self.active_core_publication().is_none() {
+            return Err(ApiError::internal(
+                "Active project summary requires a pinned public operation",
+            ));
+        }
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        let storage = self.open_storage_read_only()?;
+        self.project_summary_from_storage(&root, &storage_path, &storage)
+    }
+
+    fn with_complete_core_snapshot<T>(
+        &self,
+        build: impl FnOnce(&IndexPublicationRecord) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        if let Some(publication) = self.active_core_publication() {
+            return build(&publication);
+        }
+        let storage_path = self.require_storage_path()?;
+        let storage = Rc::new(open_existing_storage_for_read(&storage_path)?);
+        let installed_storage = Rc::clone(&storage);
+        let snapshot = storage.read_snapshot().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to begin public operation snapshot: {error}"
+            ))
+        })?;
+        let publication = snapshot
+            .storage()
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read public operation publication: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "project_unavailable",
+                    "no complete core publication is available",
+                )
+            })?;
+        let previous = ACTIVE_CORE_READ.with(|active| {
+            active.replace(Some(ActiveCoreRead {
+                controller_identity: self.identity(),
+                storage: installed_storage,
+                publication: publication.clone(),
+            }))
+        });
+        let guard = ActiveCoreReadGuard { previous };
+        let result = build(&publication);
+        drop(guard);
+        snapshot.finish().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finish public operation snapshot: {error}"
+            ))
+        })?;
+        let live = Store::database_complete_index_publication(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to revalidate public operation: {error}"))
+        })?;
+        if live.as_ref() != Some(&publication) {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the complete core publication changed during the public operation",
+            ));
+        }
+        result
+    }
+
+    fn index_freshness_uncached(&self) -> Result<IndexFreshnessDto, ApiError> {
+        let root = self.require_project_root()?;
+        let storage = self.open_storage_read_only()?;
+        let workspace = WorkspaceManifest::open(root.clone())
+            .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+        Ok(index_freshness_from_storage(&root, &workspace, &storage))
     }
 
     fn resolve_project_file_path(
@@ -8178,6 +8366,15 @@ impl AppController {
     }
 
     fn ensure_search_state(&self) -> Result<(), ApiError> {
+        let pinned_publication = self.active_core_publication();
+        if let Some(publication) = pinned_publication.as_ref() {
+            let state = self.state.lock();
+            if state.search_engine.is_some()
+                && state.search_publication.as_ref() == Some(publication)
+            {
+                return Ok(());
+            }
+        }
         let storage_path = self.require_storage_path()?;
         let current_publication = Store::database_complete_index_publication(&storage_path)
             .map_err(|error| {
@@ -8185,6 +8382,14 @@ impl AppController {
                     "Failed to read current search publication: {error}"
                 ))
             })?;
+        if pinned_publication.as_ref() != current_publication.as_ref()
+            && pinned_publication.is_some()
+        {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the pinned core publication is no longer the current lexical search generation",
+            ));
+        }
         {
             let s = self.state.lock();
             if s.search_engine.is_some() && s.search_publication == current_publication {
@@ -8205,6 +8410,14 @@ impl AppController {
                 Err(error) => return Err(error),
             }
         };
+        if pinned_publication.as_ref() != loaded.publication.as_ref()
+            && pinned_publication.is_some()
+        {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the pinned core publication does not match the loaded lexical search generation",
+            ));
+        }
 
         let mut s = self.state.lock();
         if s.search_engine.is_none() || s.search_publication != loaded.publication {
@@ -8773,11 +8986,12 @@ impl AppController {
         if !storage_path.is_file() {
             return Ok(None);
         }
-        Store::database_complete_index_publication(storage_path)
+        Store::open_observational(storage_path)
+            .and_then(|storage| storage.get_complete_index_publication())
             .map(|publication| publication.map(index_publication_dto))
             .map_err(|error| {
                 ApiError::internal(format!(
-                    "Failed to read complete index publication: {error}"
+                    "Failed to observe complete index publication: {error}"
                 ))
             })
     }
@@ -8919,6 +9133,61 @@ impl AppController {
         }
 
         self.open_project_summary_with_storage_inner(root, storage_path)
+    }
+
+    pub fn inspect_project_summary_with_storage_path(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<Option<ProjectSummary>, ApiError> {
+        if !root.exists() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist: {}",
+                root.display()
+            )));
+        }
+        if !root.is_dir() {
+            return Err(ApiError::invalid_argument(format!(
+                "Project path is not a directory: {}",
+                root.display()
+            )));
+        }
+        if !storage_path.is_file() {
+            return Ok(None);
+        }
+        let storage = Storage::open_observational(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to open storage observationally: {error}"))
+        })?;
+        let snapshot = storage.read_snapshot().map_err(|error| {
+            ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
+        })?;
+        let summary =
+            self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
+        snapshot.finish().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finish project summary snapshot: {error}"
+            ))
+        })?;
+        let changed = {
+            let mut state = self.state.lock();
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+            }
+            state.project_root = Some(root);
+            state.storage_path = Some(storage_path);
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
+        }
+        Ok(Some(summary))
     }
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {

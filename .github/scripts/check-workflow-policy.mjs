@@ -517,11 +517,22 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
     violations.push(`${rustFile} must exist`);
   } else {
     add(violations, trigger(rust, "push") === undefined, `${rustFile} draft checks must not run on push`);
-    add(violations, includesAll(at(rust, "on", "pull_request", "paths"), ["Cargo.lock", "Cargo.toml", "crates/**"]), `${rustFile} must cover workspace source changes`);
+    add(violations, includesAll(at(rust, "on", "pull_request", "paths"), [
+      "Cargo.lock",
+      "Cargo.toml",
+      "crates/**",
+      "plugins/codestory/generated-mcp-catalog.json",
+      "plugins/codestory/skills/codestory-grounding/**",
+      "scripts/generate-codestory-skill-syntax.mjs",
+    ]), `${rustFile} must cover workspace source and generated catalog changes`);
     const job = requireJob(violations, rustFile, rust, "linux-draft");
     add(violations, job["runs-on"] === "ubuntu-latest", `${rustFile} must use one Ubuntu lane`);
     requireStepRun(violations, rustFile, job, "Check formatting", ["cargo fmt --check"]);
     requireStepRun(violations, rustFile, job, "Check the workspace", ["cargo check --workspace --locked"]);
+    requireStepRun(violations, rustFile, job, "Check generated CodeStory syntax and MCP catalog", [
+      "cargo build --locked -p codestory-cli",
+      "node scripts/generate-codestory-skill-syntax.mjs --check",
+    ]);
     requireStepRun(violations, rustFile, job, "Lint workspace libraries", ["cargo clippy --workspace --lib --locked -- -D warnings"]);
     requireStepRun(violations, rustFile, job, "Prove focused publication contracts", [
       "cargo test --locked -p codestory-llama-sys --test model_staging",

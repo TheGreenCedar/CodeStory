@@ -2,33 +2,10 @@
 
 Builds a directed graph trail starting from a target symbol. Supports neighborhood exploration, outgoing-reference traversal, and incoming-reference traversal with configurable depth, direction, and filtering.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> trail [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--id` | string | — | Node ID of the root symbol (conflicts with `--query`) |
-| `--query` | string | — | Symbol name to resolve as root (conflicts with `--id`) |
-| `--mode` | enum | `neighborhood` | Trail mode: `neighborhood`, `referenced`, `referencing` |
-| `--depth` | integer | *auto* | Max traversal depth (default: 2 for neighborhood, 0 for referenced/referencing) |
-| `--direction` | enum | *auto* | Edge direction filter: `incoming`, `outgoing`, `both` |
-| `--max-nodes` | integer | `120` | Maximum nodes in the trail (clamped 1-200) |
-| `--include-tests` | flag | `false` | Include test and bench callers |
-| `--show-utility-calls` | flag | `false` | Include utility/helper call edges |
-| `--hide-speculative` | flag | `false` | Hide uncertain/speculative edges and remove nodes disconnected from the trail focus |
-| `--story` | flag | `false` | Render a readable narrative with entry points, grouped runtime/data/type flow, side effects, uncertainty, and test scope |
-| `--layout` | enum | `horizontal` | Layout direction: `horizontal` or `vertical` |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown`, `json`, or trail-only `dot` |
-| `--output-file` | path | *stdout* | Write command output to a file; the parent directory must already exist |
-| `--mermaid` | flag | `false` | Render a Mermaid flowchart instead of Markdown/JSON/DOT |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Trail Modes
 

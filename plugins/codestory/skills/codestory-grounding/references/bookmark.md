@@ -4,23 +4,10 @@ Saves node focuses for repeated investigations. Bookmark state lives in the
 project cache and is explicit: read commands do not use it unless you pass a
 bookmark flag.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> bookmark <add|list|remove> [OPTIONS]
-```
-
-## Key Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `bookmark add --id <node_id>` | none | Save an exact node id from `search`, `symbol`, `trail`, or `explore`. |
-| `bookmark add --query <text>` | none | Resolve a symbol query and save the selected node. |
-| `--category <name>` | `Investigation` | Group related investigation focuses. Missing categories are created on add. |
-| `--comment <text>` | none | Add a short investigation note. |
-| `bookmark list --category <name-or-id>` | all | List saved focuses, optionally scoped to a category. |
-| `bookmark remove <bookmark_id>` | none | Remove one saved focus. |
-| `--format <markdown|json>` | `markdown` | Human or structured output. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

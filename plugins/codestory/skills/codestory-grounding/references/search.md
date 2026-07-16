@@ -5,26 +5,10 @@ semantic candidates, and graph-neighborhood evidence. A product search requires
 `retrieval_mode=full`; stale, stubbed, or missing generations are
 fail-closed states.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> search [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--query` | string | **required** | Search term — symbol name or natural-language text |
-| `--limit` | integer | `10` | Maximum results per provenance group, capped at 50 |
-| `--repo-text` | enum | `auto` | Diagnostic repo-text scanning: `auto`, `on`, or `off`. Repo-text hits are navigation clues and must not replace exact retrieval evidence |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
-| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
-| `--why` | boolean | `false` | Include compact ranking, uncertainty, and next-action evidence |
-| `--plan-details` | boolean | `false` | With `--why`, include the full Search Plan in Markdown and JSON |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Query Behavior
 

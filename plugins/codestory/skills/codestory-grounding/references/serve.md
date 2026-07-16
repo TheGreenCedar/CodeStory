@@ -1,6 +1,10 @@
 # `serve` - Local Agent Integration Surface
 
-Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready. MCP runtime fields and surface gating: [status-contract.md](status-contract.md).
+Serves a project over either a small HTTP JSON API or an MCP-style JSON-lines
+stdio protocol. MCP product tools own project activation and managed
+preparation; the server does not require a separate doctor or manual retrieval
+index step first. MCP runtime fields and surface gating:
+[status-contract.md](status-contract.md).
 
 For direct MCP-style clients:
 
@@ -13,23 +17,10 @@ CLI when needed, and keeps diagnostic MCP available if startup fails. Once MCP
 is live, call the intended repository tool directly and pass the same absolute
 `project` path to every call.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> serve [OPTIONS]
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to serve. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Serve a specific cache directory. |
-| `--addr <host:port>` | `127.0.0.1:3917` | HTTP bind address. |
-| `--allow-non-loopback` | off | Required before HTTP serve can bind or answer wildcard/remote-facing addresses. Use only behind an intentional network boundary; HTTP routes do not require request authentication. |
-| `--stdio` | off | Use JSON-lines stdio instead of HTTP. |
-| `--multi-project` | off | In stdio mode, require each tool request to carry its own `project` instead of binding the server to `--project`. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## HTTP Routes
 
@@ -57,5 +48,11 @@ Stdio MCP status fields and allowed-surface rules: [status-contract.md](status-c
 
 - `serve` is local by default on `127.0.0.1`; non-loopback HTTP binds and non-loopback `Host`/`Origin` headers fail unless `--allow-non-loopback` is set. Do not bind wider unless the user explicitly needs remote access and the network boundary is intentional.
 - HTTP only accepts GET requests for the documented routes.
-- Start it after a successful index or with an intentional refresh mode.
-- In one `serve --stdio` process, identical successful `packet` and search-fragment requests are cached with small LRUs keyed by request arguments, the current SQLite/WAL fingerprint, and a mandatory retrieval-readiness fingerprint. The fingerprint binds engine identity, retrieval mode, degraded reason, manifest generation/input hash/backend/dimension, and status errors. This is for repeated agent calls only; changed index files, engine replacement, publication drift, and stale/unavailable readiness bypass the cache.
+- HTTP callers may start from an existing core publication or use an intentional
+  refresh mode. MCP callers should call the intended project-scoped tool and
+  follow its reported retry contract.
+- In one `serve --stdio` process, identical successful `packet` and
+  search-fragment requests use small LRUs keyed by request arguments plus the
+  exact pinned core and retrieval publication identities. Cache hits therefore
+  stay inside one evidence boundary; publication changes, engine replacement,
+  or unavailable readiness bypass the cached response.

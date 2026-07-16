@@ -12,6 +12,9 @@ on:
       - .github/scripts/route-ci-proof.mjs
       - .github/workflows/rust-ci.yml
       - .github/workflows/source-proof.yml
+      - plugins/codestory/generated-mcp-catalog.json
+      - plugins/codestory/skills/codestory-grounding/**
+      - scripts/generate-codestory-skill-syntax.mjs
   workflow_dispatch:
 
 permissions:
@@ -63,6 +66,11 @@ jobs:
 
       - name: Check the workspace
         run: cargo check --workspace --locked
+
+      - name: Check generated CodeStory syntax and MCP catalog
+        run: |
+          cargo build --locked -p codestory-cli
+          node scripts/generate-codestory-skill-syntax.mjs --check
 
       - name: Lint workspace libraries
         run: cargo clippy --workspace --lib --locked -- -D warnings

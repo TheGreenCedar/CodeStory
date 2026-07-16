@@ -51,7 +51,7 @@ thread_local! {
 }
 
 fn controller_identity(controller: &AppController) -> usize {
-    std::ptr::from_ref(controller).addr()
+    controller.identity()
 }
 
 fn active_pinned_retrieval_read(controller: &AppController) -> Option<Rc<PinnedRetrievalRead>> {
@@ -124,6 +124,35 @@ fn publication_dto(pinned: &PinnedRetrievalRead) -> EmbeddingVectorPublicationId
     }
 }
 
+fn ensure_pinned_core_publication(
+    pinned: &PinnedRetrievalRead,
+    expected_core_generation_id: &str,
+    expected_core_run_id: &str,
+) -> Result<(), ApiError> {
+    let publication = pinned.session.publication_identity();
+    if publication.core_generation_id == expected_core_generation_id
+        && publication.core_run_id == expected_core_run_id
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        "publication_changed",
+        format!(
+            "publication_changed: retrieval pin belongs to core generation {}/{} but the public operation pinned {}/{}; retry the complete operation",
+            publication.core_generation_id,
+            publication.core_run_id,
+            expected_core_generation_id,
+            expected_core_run_id,
+        ),
+    ))
+}
+
+pub(crate) fn active_pinned_retrieval_publication(
+    controller: &AppController,
+) -> Option<EmbeddingVectorPublicationIdentityDto> {
+    active_pinned_retrieval_read(controller).map(|pinned| publication_dto(&pinned))
+}
+
 impl PinnedRetrievalRead {
     fn begin(controller: &AppController) -> Result<Self, ApiError> {
         let project_root = controller.require_project_root()?;
@@ -176,13 +205,42 @@ pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>
     operation: &str,
     mut build: impl FnMut() -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
+    if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        let mut response = build()?;
+        response.attach_retrieval_publication(publication_dto(&pinned));
+        return Ok(response);
+    }
     if !sidecar_retrieval_primary_enabled(controller) {
         return build();
     }
-    if active_pinned_retrieval_read(controller).is_some() {
-        return build();
-    }
     with_stable_retrieval_publication_inner(controller, operation, build, |_| Ok(()))
+}
+
+pub(crate) fn with_pinned_retrieval_publication_value<T>(
+    controller: &AppController,
+    expected_core_generation_id: &str,
+    expected_core_run_id: &str,
+    build: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<(T, Option<EmbeddingVectorPublicationIdentityDto>), ApiError> {
+    if !sidecar_retrieval_primary_enabled(controller) {
+        return build().map(|value| (value, None));
+    }
+    if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
+        let publication = publication_dto(&pinned);
+        let value = build()?;
+        return Ok((value, Some(publication)));
+    }
+
+    let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
+    ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
+    let publication = publication_dto(&pinned);
+    with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
+        build().and_then(|value| {
+            pinned.revalidate()?;
+            Ok((value, Some(publication)))
+        })
+    })
 }
 
 fn with_stable_retrieval_publication_inner<T: RetrievalPublicationResponse>(
@@ -1024,7 +1082,7 @@ pub(crate) fn sidecar_rejection_diagnostic(
     max_candidates: usize,
 ) -> String {
     let project_root = controller.require_project_root().ok();
-    let storage = controller.open_storage().ok();
+    let storage = controller.open_storage_read_only().ok();
     let node_names = controller.state.lock().node_names.clone();
     let candidate_summaries: Vec<String> = query_result
         .hits
@@ -1034,7 +1092,7 @@ pub(crate) fn sidecar_rejection_diagnostic(
         .map(|(index, candidate)| {
             let resolution = candidate_resolution_label(
                 project_root.as_deref(),
-                storage.as_ref(),
+                storage.as_deref(),
                 &node_names,
                 candidate,
             );
@@ -1092,7 +1150,7 @@ fn sidecar_candidate_resolution_labels(
     attempted_candidate_indices: &HashSet<usize>,
 ) -> Vec<String> {
     let project_root = controller.require_project_root().ok();
-    let storage = controller.open_storage().ok();
+    let storage = controller.open_storage_read_only().ok();
     let node_names = controller.state.lock().node_names.clone();
     candidates
         .iter()
@@ -1103,7 +1161,7 @@ fn sidecar_candidate_resolution_labels(
             }
             candidate_resolution_label(
                 project_root.as_deref(),
-                storage.as_ref(),
+                storage.as_deref(),
                 &node_names,
                 candidate,
             )
@@ -1129,7 +1187,7 @@ fn sidecar_candidate_admission_labels(
     final_hits: &[SearchHit],
 ) -> Vec<SidecarCandidateAdmissionLabel> {
     let project_root = controller.require_project_root().ok();
-    let storage = controller.open_storage().ok();
+    let storage = controller.open_storage_read_only().ok();
     let node_names = controller.state.lock().node_names.clone();
     let search_nodes = ranked_hit_nodes(search_hits);
     let search_paths = project_root
@@ -2031,6 +2089,25 @@ mod tests {
         assert!(!publication.retrieval_input_hash.is_empty());
         assert!(!publication.semantic_generation.is_empty());
         assert!(active_pinned_retrieval_read(&fixture.controller).is_none());
+    }
+
+    #[test]
+    fn nested_complete_operation_attaches_the_outer_pinned_publication() {
+        let fixture = pinned_operation_fixture();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin(&fixture.controller).expect("begin outer retrieval pin"),
+        );
+        let expected = publication_dto(&pinned);
+
+        let response =
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                with_stable_retrieval_publication(&fixture.controller, "nested response", || {
+                    Ok(TestPublicationResponse::default())
+                })
+            })
+            .expect("nested operation");
+
+        assert_eq!(response.publication, Some(expected));
     }
 
     #[test]

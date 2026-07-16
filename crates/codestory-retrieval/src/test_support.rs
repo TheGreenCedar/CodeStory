@@ -96,6 +96,52 @@ pub fn publish_zero_dense_pinned_query_fixture(
     manifest.semantic_policy_version = input.semantic_policy_version;
     manifest.graph_artifact_hash = Some(input.graph_artifact_hash);
     manifest.dense_reason_counts_json = Some(input.dense_reason_counts_json);
+    let generation = manifest
+        .sidecar_generation
+        .as_deref()
+        .context("fixture sidecar generation")?;
+    crate::lexical_index::build_lexical_shard(
+        project_root,
+        Some(storage_path),
+        &runtime.layout.lexical_data_dir,
+        generation,
+        &crate::lexical_index::LexicalInputFingerprint {
+            file_count: input.lexical_file_count,
+            hash: input.lexical_hash.clone(),
+            coverage: input.lexical_coverage.clone(),
+        },
+        &input.hash,
+    )
+    .context("publish pinned query fixture lexical shard")?;
+    let revision = format!("fixture-{generation}");
+    let scip_dir = runtime.layout.scip_project_dir(generation);
+    std::fs::create_dir_all(&scip_dir).context("create pinned query fixture SCIP directory")?;
+    let symbol = crate::scip_index::ScipSymbolRecord {
+        node_id: None,
+        path: "fixture.rs".into(),
+        symbol: "fixture::symbol".into(),
+        start_line: 1,
+        end_line: 1,
+    };
+    let index = crate::scip_index::ScipSymbolsIndex {
+        revision: revision.clone(),
+        contract: crate::scip_index::ScipProofAdapterContract::graph_projection(&revision),
+        symbols: vec![symbol],
+        proofs: Vec::new(),
+    };
+    std::fs::write(
+        scip_dir.join(crate::scip_index::SCIP_SYMBOLS_FILE),
+        serde_json::to_vec_pretty(&index).context("serialize pinned query fixture SCIP index")?,
+    )
+    .context("write pinned query fixture SCIP index")?;
+    std::fs::write(
+        scip_dir.join(crate::scip_index::SCIP_INDEX_FILE),
+        format!("codestory-scip-v1\nrevision={revision}\n"),
+    )
+    .context("write pinned query fixture SCIP marker")?;
+    std::fs::write(scip_dir.join("revision.txt"), format!("{revision}\n"))
+        .context("write pinned query fixture SCIP revision")?;
+    manifest.scip_revision = Some(revision);
     storage
         .upsert_retrieval_index_manifest(&manifest)
         .context("publish pinned query fixture manifest")?;
@@ -103,6 +149,32 @@ pub fn publish_zero_dense_pinned_query_fixture(
 
     publish_zero_dense_vector_evidence(runtime, &manifest, &publication)?;
     Ok(manifest)
+}
+
+/// Publish a replacement core identity and its strict zero-dense retrieval
+/// fixture in the live SQLite database. Public-operation race tests use this to
+/// force a new connection to observe generation B while an older reader keeps
+/// generation A pinned in its transaction.
+pub fn publish_replacement_core_and_zero_dense_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &crate::SidecarRuntimeConfig,
+    generation: u64,
+    generation_id: &str,
+    run_id: &str,
+) -> Result<RetrievalIndexManifest> {
+    let storage = Store::open(storage_path).context("open replacement core fixture storage")?;
+    storage
+        .put_index_publication(&codestory_store::IndexPublicationRecord {
+            generation,
+            generation_id: generation_id.into(),
+            run_id: run_id.into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        })
+        .context("publish replacement core fixture identity")?;
+    drop(storage);
+    publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
 }
 
 fn publish_zero_dense_vector_evidence(

@@ -4,35 +4,25 @@ Checks whether a parent worktree cache is compatible with a child worktree,
 snapshots the SQLite cache, and rebases path-bound SQLite graph/search/doc rows
 so the child can use them under its own worktree path.
 
-## Usage
+## Syntax
 
-```text
-<codestory-cli> cache rehydrate --from-project <parent-worktree> --project <child-worktree>
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Target child worktree. |
-| `--cache-dir <path>` | auto | Target cache directory. Must be empty. |
-| `--from-project <path>` | required | Source worktree with an existing CodeStory cache. |
-| `--from-cache-dir <path>` | auto | Source cache directory when it is not the default for `--from-project`. |
-| `--dry-run` | off | Report whether the cache rehydrate is safe without copying. |
-| `--format <markdown|json>` | `markdown` | Human or automation output. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Path
 
 1. Run `cache rehydrate --from-project <parent> --project <child>` before the
    first child-thread index.
-2. If status is `rehydrated`, run the printed `doctor` command to inspect index
-   freshness under the child worktree path.
-3. Run the printed `retrieval index --refresh full` command before using
-   packet/search as agent-facing retrieval evidence. Retrieval manifests are
-   invalidated because retrieval generation ids are currently project-root
-   derived. Portable v2 index artifact cache rows are preserved; older artifact
-   rows are invalidated because they predate the portable-key contract.
-4. If status is `skipped`, use the printed normal rebuild commands.
+2. If status is `rehydrated`, call the intended `packet`, `search`, or `context`
+   tool next. That call owns activation, validates the rebased core publication,
+   and prepares a compatible retrieval publication when needed. If it reports
+   `preparing`, wait `retry_after_ms` and retry the same call.
+3. Rehydration invalidates root-bound retrieval generations while preserving
+   portable v2 index artifact rows. The next broad tool call must publish and
+   pin a retrieval generation for the child before its evidence is usable.
+4. If status is `skipped`, use the printed rebuild guidance. `doctor` and manual
+   index commands are maintainer diagnosis or proof surfaces after automatic
+   activation stops converging.
 
 ## Safety Contract
 

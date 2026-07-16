@@ -79,10 +79,15 @@ Blocked session steps: [Troubleshooting](../../docs/users/troubleshooting.md).
 ## Maintainer checks
 
 ```sh
+node scripts/generate-codestory-skill-syntax.mjs --check
 node --test plugins/codestory/tests/plugin-static.test.mjs
 node .github/scripts/check-doc-links.mjs
 git diff --check
 ```
+
+Build `codestory-cli` before checking generated syntax. When Clap syntax
+changes, run the generator with `--rewrite-references` to refresh the compact
+index and remove copied option matrices from the skill references.
 
 `plugin-static` checks adapter, manifest, skill, and runtime wiring. It does not
 assert prose.

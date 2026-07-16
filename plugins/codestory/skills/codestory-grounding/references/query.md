@@ -2,23 +2,10 @@
 
 Runs a compact pipeline over indexed CodeStory data. Use it when you want a short, scriptable answer without manually chaining `search`, `symbol`, and `trail` commands.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> query [OPTIONS] <QUERY>
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `<QUERY>` | string | required | Pipeline expression such as `search(query: 'Foo') | filter(kind: function) | limit(5)` |
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--sql` | string | none | Guardrail for agent mistakes. SQL is not supported; this emits graph-query DSL guidance. |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
-| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Operations
 

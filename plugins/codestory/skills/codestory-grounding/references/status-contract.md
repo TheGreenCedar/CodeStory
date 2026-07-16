@@ -15,6 +15,11 @@ across repositories.
 | `working_locally` | Local graph navigation is available while broad search prepares. | Continue with local tools and retry the original broad tool later. |
 | `unavailable` | CodeStory could not converge within the managed path. | Use focused source inspection and state the evidence gap. |
 
+`current_operation` is the runtime-owned activation snapshot. When present it
+contains one stable `operation_id`, `state`, `stage`, `attempt`, retry delay,
+and failure. Concurrent calls for the same native project/configuration key
+join that operation; they do not start another refresh or repair flow.
+
 When no complete publication exists yet, `ground`, `packet`, `search`, and
 `context` return `codestory_preparing` with `retry_tool` and
 `retry_after_ms`. Broad tools use the same response while managed search is
@@ -40,6 +45,7 @@ The most useful fields are:
 | `runtime_truth` | Compact references to the canonical readiness and runtime fields. |
 | `index_publication` | Complete core database generation currently being served. |
 | `local_refresh` | Local map state and the complete publication retained during refresh. |
+| `state`, `capabilities`, `current_operation`, `retry_after_ms`, `failure` | Uncached activation progress layered onto the observational status read, including one stable operation id, stage, attempt, retry delay, and terminal failure. |
 | `retrieval_mode` | Persisted broad-search classification; `full` is required for trustworthy broad results. |
 | `readiness_lanes.agent_packet_search` | Current broad-search capability state. |
 | `runtime_update` | Non-blocking installed-runtime update advisory. |
@@ -49,6 +55,11 @@ its references instead of treating duplicated nested payloads as separate
 truths.
 
 ## Evidence boundary
+
+Successful broad MCP responses include `_meta.codestory_publication` with the
+complete core and retrieval publication identities used by the runtime-owned
+operation. Treat that metadata as the response's evidence boundary rather than
+re-reading status around the call.
 
 Local navigation is useful while broad search prepares, but it is not full
 retrieval proof. Trust a broad result only when the requested tool succeeds

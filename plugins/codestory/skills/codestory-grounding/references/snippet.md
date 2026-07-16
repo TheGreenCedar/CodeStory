@@ -4,26 +4,10 @@ Resolves a symbol and returns its source code with surrounding context lines. Us
 
 Markdown output uses ANSI syntax highlighting when stdout is an interactive terminal. Output files, pipes, and JSON output stay uncolored for automation.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> snippet [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--id` | string | — | Node ID of the symbol (conflicts with `--query`) |
-| `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
-| `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
-| `--context` | integer | `4` | Number of surrounding context lines above and below the symbol. Alias: `--lines` |
-| `--function-body` | flag | `false` | Prefer the selected function/method implementation body when source ranges are available |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
-| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Output
 

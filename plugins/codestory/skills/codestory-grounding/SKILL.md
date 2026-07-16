@@ -76,6 +76,9 @@ contributors, not normal installation steps.
 
 ## References
 
+- [Generated CLI syntax](references/generated-cli-syntax.md) is produced from
+  Clap `--help`; use it instead of maintaining option matrices by hand.
+
 - [status contract](references/status-contract.md)
 - [repository map](references/ground.md)
 - [packet](references/packet.md)

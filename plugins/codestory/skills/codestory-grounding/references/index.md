@@ -4,25 +4,10 @@ Discovers project files, extracts symbols and edges, persists graph/search state
 to SQLite, writes graph-native symbol docs and component reports, and
 synchronizes selected dense anchors when embedding assets are available.
 
-## Usage
+## Syntax
 
-```text
-<codestory-cli> index [OPTIONS]
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` / `--path <path>` | `.` | Target repository root. Always pass this explicitly. |
-| `--cache-dir <path>` | auto | Override the per-project cache root. |
-| `--refresh <auto|full|incremental|none>` | `auto` | Choose the graph/snapshot/symbol-doc/dense-anchor refresh mode. |
-| `--format <markdown|json>` | `markdown` | Use JSON for automation and timing analysis. |
-| `--output-file <path>` | stdout | Write output to a file with an existing parent directory. |
-| `--dry-run` | off | Show workspace discovery and planned adds/removals without writing storage. |
-| `--summarize` | off | Generate cached symbol summaries; requires `CODESTORY_SUMMARY_ENDPOINT`, `local`, or `mock`. |
-| `--progress` | off | Print progress to stderr while preserving stdout output. |
-| `--watch` | off | Keep watching the project root and run incremental refreshes on changes. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Refresh Modes
 

@@ -4,26 +4,10 @@ Builds a bounded answer packet for a broad repository question. Use it before
 ordinary source-file reads when the task is explanation, planning, route
 tracing, ownership discovery, or change-impact analysis.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> packet [OPTIONS] --question <QUESTION>
-```
-
-## Key Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to query. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Reuse or isolate a specific cache. |
-| `--question <text>` | required | Broad repository question or task. |
-| `--budget <tiny|compact|standard|deep>` | `compact` | Output and retrieval budget. Start compact; deepen only when the packet reports gaps. |
-| `--task-class <class>` | auto | Optional retrieval hint: architecture explanation, bug localization, change impact, route tracing, symbol ownership, data flow, or edit planning. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
-| `--format <markdown|json>` | `markdown` | Human or structured output. |
-| `--output-file <path>` | none | Write output to a file. |
-| `--no-evidence` | off | Omit citation edge ids and score breakdowns. Avoid this for grounded claims. |
-| `--latency-budget-ms <n>` | none | Optional packet-level latency target for integrations. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

@@ -2,11 +2,10 @@
 
 Runs a repeatable agent-grounding drill suite from a manifest file. Use it to evaluate whether CodeStory helps an agent answer realistic architecture questions across real repositories.
 
-## Usage
+## Syntax
 
-```
-target/release/codestory-cli(.exe) drill-suite [OPTIONS] --case-file <FILE> --output-dir <DIR>
-```
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Case Manifest
 
@@ -70,18 +69,6 @@ record a source-truth ledger:
 
 Allowed claim classifications are `correct`, `partial`, `misleading`, and
 `unsupported`.
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | CodeStory owner checkout used to run the suite |
-| `--case-file` | path | **required** | JSON manifest describing suite cases |
-| `--cache-dir` | path | *auto* | Optional suite cache root; explicit roots are split into per-case sub-caches |
-| `--output-dir` | path | **required** | Directory for aggregate suite reports and per-case drill artifacts |
-| `--refresh` | enum | `full` | Refresh strategy passed to each per-case drill: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `json` | Primary aggregate output format: `json` or `markdown` |
-| `--jobs` | integer | `1` | Read-only workers for `--refresh none`; multiple cases run in parallel, a single case parallelizes anchors and bridge checks |
 
 ## Output
 

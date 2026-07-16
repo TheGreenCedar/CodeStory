@@ -82,7 +82,8 @@ fn status_with_runtime(
     let project_id = sidecar_project_id_for_runtime(project_root, &runtime)?;
 
     if let Some(path) = storage_path.filter(|path| path.exists()) {
-        let storage = Store::open(path).context("open storage for retrieval manifest")?;
+        let storage = Store::open_observational(path)
+            .context("open storage observationally for retrieval manifest")?;
         let manifest = storage
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
