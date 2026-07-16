@@ -5,6 +5,7 @@
   "commit": "2222222222222222222222222222222222222222",
   "git_state": "clean",
   "profile": "ci-contract-v1",
+  "release_key": "ci-contract-v1",
   "identity": {
     "corpus_id": "ci-contract-corpus-v1",
     "cache_id": "cold-full-retrieval-v1",
@@ -61,7 +62,7 @@
   },
   "release_claims": {
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "f8037ed9fec550c323f5056f813a265551cea4805fadc5d73190b928ed36af9e",
+    "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
     "observed_at": "2026-07-16T11:00:00.000Z",
     "expires_at": "2026-07-17T11:00:00.000Z",
     "requested_claims": [
@@ -90,25 +91,7 @@
         "type": "retrieval_readiness",
         "tier": "live_behavior",
         "status": "pass",
-        "graph_sha256": "f8037ed9fec550c323f5056f813a265551cea4805fadc5d73190b928ed36af9e",
-        "observed_at": "2026-07-16T11:00:00.000Z",
-        "expires_at": "2026-07-17T11:00:00.000Z",
-        "identity": {
-          "repository": "TheGreenCedar/CodeStory",
-          "commit": "2222222222222222222222222222222222222222",
-          "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
-          "profile": "ci-contract-v1",
-          "corpus_id": "ci-contract-corpus-v1",
-          "cache_id": "cold-full-retrieval-v1",
-          "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
-        }
-      },
-      {
-        "id": "performance-222222222222",
-        "type": "performance",
-        "tier": "live_behavior",
-        "status": "measured",
-        "graph_sha256": "f8037ed9fec550c323f5056f813a265551cea4805fadc5d73190b928ed36af9e",
+        "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
         "observed_at": "2026-07-16T11:00:00.000Z",
         "expires_at": "2026-07-17T11:00:00.000Z",
         "identity": {
@@ -119,6 +102,26 @@
           "corpus_id": "ci-contract-corpus-v1",
           "cache_id": "cold-full-retrieval-v1",
           "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
+          "release_key": "ci-contract-v1"
+        }
+      },
+      {
+        "id": "performance-222222222222",
+        "type": "performance",
+        "tier": "live_behavior",
+        "status": "measured",
+        "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
+        "observed_at": "2026-07-16T11:00:00.000Z",
+        "expires_at": "2026-07-17T11:00:00.000Z",
+        "identity": {
+          "repository": "TheGreenCedar/CodeStory",
+          "commit": "2222222222222222222222222222222222222222",
+          "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
+          "profile": "ci-contract-v1",
+          "corpus_id": "ci-contract-corpus-v1",
+          "cache_id": "cold-full-retrieval-v1",
+          "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
+          "release_key": "ci-contract-v1",
           "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
           "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1"
         }
@@ -128,7 +131,7 @@
         "type": "answer_quality",
         "tier": "answer_quality",
         "status": "pass",
-        "graph_sha256": "f8037ed9fec550c323f5056f813a265551cea4805fadc5d73190b928ed36af9e",
+        "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
         "observed_at": "2026-07-16T11:00:00.000Z",
         "expires_at": "2026-07-17T11:00:00.000Z",
         "identity": {
@@ -139,6 +142,8 @@
           "corpus_id": "ci-contract-corpus-v1",
           "cache_id": "cold-full-retrieval-v1",
           "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
+          "release_key": "ci-contract-v1",
+          "artifact_sha256": "36a58d73c707aa938169edee01cfe49e0a723144be9696f22adbe073a3ab593d",
           "evaluation_contract": "publishable-three-repeat-packet/v1"
         }
       }

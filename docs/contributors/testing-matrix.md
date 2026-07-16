@@ -248,10 +248,12 @@ those trusted values. Other required CLI identities and exceptions use
 `--expected-identity` and `--expected-exceptions` JSON files from separately
 trusted inputs; release-evidence library callers bind them from the approved
 candidate profile or graph constraints. Risk-bearing dependencies must be named
-as requested claims with their own accepted risks. An approved regression stays
-`pass_with_exception` through the evidence row, claim, evaluation, and report,
-with approval schema v3 candidate/baseline bindings, owner, rationale, approval
-and expiry dates, and rollback evidence. It never becomes an unqualified pass.
+as requested claims with their own accepted risks. Current full-product metrics
+and user-facing SLOs are non-waivable. Only a separately trusted, exact-artifact
+model microbenchmark regression over 5% and at least three repeats may remain
+`pass_with_exception`; it must cite passing same-run full-product benefit,
+bind the release key, owner, rationale, rollback, and expire within 14 days or
+when the next release key is selected. It never becomes an unqualified pass.
 
 Workflow syntax and repository semantics are separate gates. The actionlint
 wrapper checks every workflow with `.github/actionlint.yaml` using the declared

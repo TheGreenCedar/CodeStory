@@ -29,8 +29,30 @@
       "machine_fingerprint": "non_empty_text",
       "baseline_id": "baseline_id",
       "baseline_sha256": "sha256",
+      "candidate_sha256": "sha256",
+      "release_key": "identifier",
       "evaluation_contract": "versioned_contract"
     }
+  },
+  "exception_policy": {
+    "schema": "codestory.model-microbenchmark-exception/v1",
+    "eligible_evidence_type": "performance",
+    "regression_class": "model_microbenchmark",
+    "minimum_regression_percent": 5,
+    "minimum_repeats": 3,
+    "maximum_validity_days": 14,
+    "artifact_binding": "candidate_sha256",
+    "release_binding": "release_key",
+    "full_product_benefit_evidence_type": "answer_quality",
+    "non_waivable_metrics": [
+      "status_seconds",
+      "local_grounding_seconds",
+      "convergence_seconds",
+      "packet_seconds",
+      "search_seconds",
+      "indexing_seconds",
+      "storage_growth_ratio"
+    ]
   },
   "proof_tiers": [
     {
@@ -162,7 +184,8 @@
         "profile",
         "corpus_id",
         "cache_id",
-        "machine_fingerprint"
+        "machine_fingerprint",
+        "release_key"
       ],
       "validity": "expires_at",
       "maximum_validity_hours": 24
@@ -182,7 +205,8 @@
         "cache_id",
         "machine_fingerprint",
         "baseline_id",
-        "baseline_sha256"
+        "baseline_sha256",
+        "release_key"
       ],
       "validity": "expires_at",
       "maximum_validity_hours": 24
@@ -201,6 +225,8 @@
         "corpus_id",
         "cache_id",
         "machine_fingerprint",
+        "release_key",
+        "artifact_sha256",
         "evaluation_contract"
       ],
       "identity_constraints": {

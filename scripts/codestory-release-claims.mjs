@@ -182,6 +182,40 @@ export function validateReleaseClaimGraph(graph) {
     if (!identityFormats[key]) fail(`identity ${key} must declare a format`);
   }
 
+  const exceptionPolicy = object(graph.exception_policy, "release claim graph.exception_policy");
+  if (exceptionPolicy.schema !== "codestory.model-microbenchmark-exception/v1") {
+    fail("release claim graph exception policy uses an unsupported schema");
+  }
+  if (exceptionPolicy.eligible_evidence_type !== "performance") {
+    fail("release claim graph exceptions must be limited to performance evidence");
+  }
+  if (exceptionPolicy.regression_class !== "model_microbenchmark") {
+    fail("release claim graph exceptions must be limited to model_microbenchmark regressions");
+  }
+  if (exceptionPolicy.minimum_regression_percent !== 5) {
+    fail("release claim graph model exceptions must require regressions over 5 percent");
+  }
+  if (exceptionPolicy.minimum_repeats !== 3) {
+    fail("release claim graph model exceptions must require at least three repeats");
+  }
+  if (exceptionPolicy.maximum_validity_days !== 14) {
+    fail("release claim graph model exceptions must expire within 14 days");
+  }
+  if (exceptionPolicy.artifact_binding !== "candidate_sha256") {
+    fail("release claim graph model exceptions must bind the exact candidate_sha256 artifact");
+  }
+  if (exceptionPolicy.release_binding !== "release_key") {
+    fail("release claim graph model exceptions must bind the selected release_key");
+  }
+  if (exceptionPolicy.full_product_benefit_evidence_type !== "answer_quality") {
+    fail("release claim graph model exceptions must cite answer_quality full-product evidence");
+  }
+  stringArray(
+    exceptionPolicy.non_waivable_metrics,
+    "release claim graph.exception_policy.non_waivable_metrics",
+    { nonEmpty: true },
+  );
+
   const tiers = uniqueById(graph.proof_tiers, "release claim graph.proof_tiers");
   const ranks = new Set();
   for (const [id, tier] of tiers) {
@@ -191,6 +225,12 @@ export function validateReleaseClaimGraph(graph) {
   }
 
   const evidenceTypes = uniqueById(graph.evidence_types, "release claim graph.evidence_types");
+  for (const type of [
+    exceptionPolicy.eligible_evidence_type,
+    exceptionPolicy.full_product_benefit_evidence_type,
+  ]) {
+    if (!evidenceTypes.has(type)) fail(`release claim graph exception policy references unknown evidence type ${type}`);
+  }
   for (const [id, evidence] of evidenceTypes) {
     if (!tiers.has(evidence.tier)) fail(`evidence type ${id} references unknown tier ${evidence.tier}`);
     stringArray(evidence.proof_lanes, `evidence type ${id}.proof_lanes`, { nonEmpty: true });
@@ -364,6 +404,13 @@ function addFailure(failures, failureClass, claim, evidence, message) {
   });
 }
 
+function relativeChangePercent(baseline, measured, direction) {
+  if (!(baseline > 0) || !(measured > 0)) return null;
+  if (direction === "max") return ((measured - baseline) / baseline) * 100;
+  if (direction === "min") return ((baseline - measured) / baseline) * 100;
+  return null;
+}
+
 function exceptionProblems(
   exception,
   trustedException,
@@ -371,6 +418,10 @@ function exceptionProblems(
   expectedCommit,
   evaluatedAt,
   evidenceId,
+  evidenceRow,
+  evidenceByType,
+  requestedClaimIds,
+  policy,
 ) {
   const problems = [];
   if (exception === null || typeof exception !== "object" || Array.isArray(exception)) {
@@ -378,6 +429,14 @@ function exceptionProblems(
   }
   if (exception.schema !== "codestory.release-claim-exception/v1") {
     problems.push(`${evidenceId} exception uses an unsupported schema`);
+  }
+  if (evidenceRow.type !== policy.eligible_evidence_type) {
+    problems.push(`${evidenceId} is not eligible for a model microbenchmark exception`);
+  }
+  if (!requestedClaimIds.has(policy.full_product_benefit_evidence_type)) {
+    problems.push(
+      `${evidenceId} exception requires the ${policy.full_product_benefit_evidence_type} claim in the same evaluation`,
+    );
   }
   if (!Array.isArray(exception.approvals) || exception.approvals.length === 0) {
     problems.push(`${evidenceId} exception must contain at least one approval`);
@@ -388,34 +447,148 @@ function exceptionProblems(
         problems.push(`${label} must be an object`);
         continue;
       }
-      for (const key of ["profile", "baseline_id", "metric", "owner", "rationale", "rollback_evidence"]) {
+      for (const key of [
+        "profile",
+        "baseline_id",
+        "metric",
+        "owner",
+        "rationale",
+        "rollback_evidence",
+        "release_key",
+        "regression_class",
+      ]) {
         if (typeof value[key] !== "string" || value[key].trim() === "") {
           problems.push(`${label} must bind non-empty ${key}`);
         }
       }
-      for (const key of ["candidate_sha256", "baseline_sha256"]) {
+      for (const key of [policy.artifact_binding, "baseline_sha256"]) {
         if (!SHA256.test(String(value[key] ?? ""))) problems.push(`${label} ${key} must be SHA-256`);
       }
       if (value.commit !== expectedCommit) problems.push(`${label} commit does not match ${expectedCommit}`);
-      for (const key of ["profile", "baseline_id", "baseline_sha256"]) {
+      for (const key of [
+        "profile",
+        "baseline_id",
+        "baseline_sha256",
+        policy.artifact_binding,
+        policy.release_binding,
+      ]) {
         if (value[key] !== trustedIdentity[key]) {
           problems.push(`${label} ${key} does not match the evidence identity`);
         }
       }
-      if (typeof value.measured_value !== "number" || !Number.isFinite(value.measured_value)) {
-        problems.push(`${label} measured_value must be finite`);
+      if (value.regression_class !== policy.regression_class) {
+        problems.push(`${label} regression_class must be ${policy.regression_class}`);
       }
-      if (typeof value.threshold !== "number" || !Number.isFinite(value.threshold)) {
-        problems.push(`${label} threshold must be finite`);
+      if (policy.non_waivable_metrics.includes(value.metric)) {
+        problems.push(`${label} metric ${value.metric} is non-waivable`);
+      }
+      for (const key of ["baseline_value", "measured_value", "threshold", "regression_percent"]) {
+        if (typeof value[key] !== "number" || !Number.isFinite(value[key]) || value[key] <= 0) {
+          problems.push(`${label} ${key} must be finite and positive`);
+        }
+      }
+      if (!new Set(["max", "min"]).has(value.direction)) {
+        problems.push(`${label} direction must be max or min`);
+      }
+      const regressionPercent = relativeChangePercent(
+        value.baseline_value,
+        value.measured_value,
+        value.direction,
+      );
+      if (regressionPercent === null
+          || regressionPercent <= policy.minimum_regression_percent
+          || Math.abs(regressionPercent - value.regression_percent) > 1e-9) {
+        problems.push(
+          `${label} must bind a repeatable model regression over ${policy.minimum_regression_percent} percent`,
+        );
+      }
+      const breachesThreshold = value.direction === "max"
+        ? value.measured_value > value.threshold
+        : value.measured_value < value.threshold;
+      if (!breachesThreshold) problems.push(`${label} measured value does not breach its threshold`);
+      if (!Number.isInteger(value.repeats) || value.repeats < policy.minimum_repeats) {
+        problems.push(`${label} repeats must be at least ${policy.minimum_repeats}`);
       }
       if (!validIsoDate(value.approved_at) || !validIsoDate(value.expires_at)) {
         problems.push(`${label} approval and expiry must be valid ISO dates`);
       } else {
         const evaluatedDate = new Date(evaluatedAt).toISOString().slice(0, 10);
+        const approvedAt = Date.parse(`${value.approved_at}T00:00:00.000Z`);
+        const expiresAt = Date.parse(`${value.expires_at}T00:00:00.000Z`);
+        const maximumValidityMs = policy.maximum_validity_days * 24 * 60 * 60 * 1000;
         if (value.approved_at > evaluatedDate
             || value.expires_at < value.approved_at
             || value.expires_at < evaluatedDate) {
           problems.push(`${label} is future-dated, expired, or expires before approval`);
+        }
+        if (expiresAt - approvedAt > maximumValidityMs) {
+          problems.push(`${label} expires more than ${policy.maximum_validity_days} days after approval`);
+        }
+      }
+
+      const benefit = value.full_product_benefit;
+      if (benefit === null || typeof benefit !== "object" || Array.isArray(benefit)) {
+        problems.push(`${label} must bind structured same-run full_product_benefit evidence`);
+      } else {
+        for (const key of ["evidence_id", "metric", "direction", "observed_at"]) {
+          if (typeof benefit[key] !== "string" || benefit[key].trim() === "") {
+            problems.push(`${label} full_product_benefit must bind non-empty ${key}`);
+          }
+        }
+        if (!SHA256.test(String(benefit.artifact_sha256 ?? ""))) {
+          problems.push(`${label} full_product_benefit artifact_sha256 must be SHA-256`);
+        }
+        for (const key of ["baseline_value", "measured_value", "improvement_percent"]) {
+          if (typeof benefit[key] !== "number" || !Number.isFinite(benefit[key]) || benefit[key] <= 0) {
+            problems.push(`${label} full_product_benefit ${key} must be finite and positive`);
+          }
+        }
+        const improvementPercent = benefit.direction === "increase"
+          ? ((benefit.measured_value - benefit.baseline_value) / benefit.baseline_value) * 100
+          : benefit.direction === "decrease"
+            ? ((benefit.baseline_value - benefit.measured_value) / benefit.baseline_value) * 100
+            : null;
+        if (!new Set(["increase", "decrease"]).has(benefit.direction)
+            || improvementPercent === null
+            || improvementPercent <= 0
+            || Math.abs(improvementPercent - benefit.improvement_percent) > 1e-9) {
+          problems.push(`${label} full_product_benefit must bind a positive measured improvement`);
+        }
+
+        const benefitRows = (evidenceByType.get(policy.full_product_benefit_evidence_type) ?? [])
+          .filter((row) => String(row.id ?? `${row.type}[${row._index}]`) === benefit.evidence_id);
+        if (benefitRows.length !== 1) {
+          problems.push(
+            `${label} full_product_benefit must identify exactly one ${policy.full_product_benefit_evidence_type} row`,
+          );
+        } else {
+          const benefitRow = benefitRows[0];
+          const benefitIdentity = benefitRow.identity ?? {};
+          const regressionIdentity = evidenceRow.identity ?? {};
+          if (benefitRow.status !== "pass") {
+            problems.push(`${label} full_product_benefit evidence must pass without exception`);
+          }
+          if (benefit.observed_at !== evidenceRow.observed_at
+              || benefitRow.observed_at !== evidenceRow.observed_at) {
+            problems.push(`${label} full_product_benefit evidence is not from the same run`);
+          }
+          if (benefit.artifact_sha256 !== benefitIdentity.artifact_sha256) {
+            problems.push(`${label} full_product_benefit artifact does not match its evidence row`);
+          }
+          for (const key of [
+            "repository",
+            "commit",
+            "source_tree",
+            "profile",
+            "corpus_id",
+            "cache_id",
+            "machine_fingerprint",
+            policy.release_binding,
+          ]) {
+            if (benefitIdentity[key] !== regressionIdentity[key]) {
+              problems.push(`${label} full_product_benefit ${key} does not match the regression run`);
+            }
+          }
         }
       }
     }
@@ -598,6 +771,10 @@ export function evaluateReleaseClaims({ graph, requested_claims: requestedClaims
             expectedCommit,
             evaluatedAt,
             evidenceId,
+            row,
+            evidenceByType,
+            new Set(requests.keys()),
+            graph.exception_policy,
           );
           for (const problem of problems) {
             addFailure(failures, "failed_evidence", claimId, evidenceId, problem);

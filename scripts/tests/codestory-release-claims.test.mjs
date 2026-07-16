@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -61,14 +62,16 @@ function evaluate(fixture) {
 }
 
 function releaseEvidenceFixture() {
-  const candidate = JSON.parse(readFileSync(path.join(
+  const candidateBytes = readFileSync(path.join(
     root,
     "benchmarks/release-evidence/fixtures/candidate.json",
-  ), "utf8"));
+  ));
+  const candidate = JSON.parse(candidateBytes);
   const document = structuredClone(candidate.release_claims);
   for (const row of document.evidence) row.status = "pass";
   const common = document.evidence[0].identity;
   const performance = document.evidence.find(({ type }) => type === "performance").identity;
+  const answerQuality = document.evidence.find(({ type }) => type === "answer_quality").identity;
   return {
     expected_sha: candidate.commit,
     evaluated_at: document.observed_at,
@@ -81,6 +84,9 @@ function releaseEvidenceFixture() {
       machine_fingerprint: common.machine_fingerprint,
       baseline_id: performance.baseline_id,
       baseline_sha256: performance.baseline_sha256,
+      candidate_sha256: createHash("sha256").update(candidateBytes).digest("hex"),
+      release_key: common.release_key,
+      artifact_sha256: answerQuality.artifact_sha256,
     },
     requested_claims: document.requested_claims,
     evidence: document.evidence,
@@ -183,23 +189,43 @@ test("risk-bearing dependencies require their own explicit request and risk acce
   assert.equal(evaluate(fixture).status, "pass");
 });
 
-test("accepted regressions remain visible and require separately trusted rollback evidence", () => {
+test("only bounded, release-bound model microbenchmark exceptions remain visible", () => {
   const fixture = releaseEvidenceFixture();
   const performance = fixture.evidence.find(({ type }) => type === "performance");
+  const answerQuality = fixture.evidence.find(({ type }) => type === "answer_quality");
+  const approvedAt = fixture.evaluated_at.slice(0, 10);
+  const expiresAt = new Date(`${approvedAt}T00:00:00.000Z`);
+  expiresAt.setUTCDate(expiresAt.getUTCDate() + 14);
   const approval = {
-    candidate_sha256: "b".repeat(64),
+    candidate_sha256: fixture.expected_identity.candidate_sha256,
     commit: fixture.expected_sha,
     profile: fixture.expected_identity.profile,
     baseline_id: fixture.expected_identity.baseline_id,
     baseline_sha256: fixture.expected_identity.baseline_sha256,
-    metric: "status_seconds",
-    measured_value: 2,
-    threshold: 1,
+    metric: "model_bulk_docs_per_second",
+    regression_class: "model_microbenchmark",
+    baseline_value: 100,
+    measured_value: 90,
+    threshold: 95,
+    regression_percent: 10,
+    direction: "min",
+    repeats: 3,
+    release_key: fixture.expected_identity.release_key,
     owner: "release owner",
-    approved_at: "2026-07-16",
-    expires_at: "2099-07-16",
+    approved_at: approvedAt,
+    expires_at: expiresAt.toISOString().slice(0, 10),
     rationale: "Bound exception",
     rollback_evidence: "revert candidate and restore the accepted baseline",
+    full_product_benefit: {
+      evidence_id: answerQuality.id,
+      artifact_sha256: answerQuality.identity.artifact_sha256,
+      observed_at: answerQuality.observed_at,
+      metric: "packet_quality_score",
+      baseline_value: 0.5,
+      measured_value: 0.6,
+      direction: "increase",
+      improvement_percent: 20,
+    },
   };
   performance.status = "pass_with_exception";
   performance.exception = {
@@ -227,18 +253,75 @@ test("accepted regressions remain visible and require separately trusted rollbac
     "revert candidate and restore the accepted baseline",
   );
 
-  delete approval.rollback_evidence;
-  assert.equal(evaluateReleaseClaims({
-    graph,
-    requested_claims: fixture.requested_claims,
-    evidence: fixture.evidence,
-    expected: {
-      commit: fixture.expected_sha,
-      evaluated_at: fixture.evaluated_at,
-      identity: fixture.expected_identity,
-      exceptions: fixture.expected_exceptions,
-    },
-  }).status, "fail");
+  const rejection = (mutate) => {
+    const changed = structuredClone(approval);
+    mutate(changed);
+    performance.exception.approvals = [changed];
+    fixture.expected_exceptions[performance.id] = structuredClone(performance.exception);
+    return evaluateReleaseClaims({
+      graph,
+      requested_claims: fixture.requested_claims,
+      evidence: fixture.evidence,
+      expected: {
+        commit: fixture.expected_sha,
+        evaluated_at: fixture.evaluated_at,
+        identity: fixture.expected_identity,
+        exceptions: fixture.expected_exceptions,
+      },
+    });
+  };
+
+  assert.match(
+    rejection((changed) => { changed.metric = "status_seconds"; })
+      .failures.map(({ message }) => message).join("\n"),
+    /status_seconds is non-waivable/u,
+  );
+  assert.match(
+    rejection((changed) => {
+      changed.measured_value = 95;
+      changed.threshold = 97;
+      changed.regression_percent = 5;
+    }).failures.map(({ message }) => message).join("\n"),
+    /regression over 5 percent/u,
+  );
+  assert.match(
+    rejection((changed) => { changed.repeats = 2; })
+      .failures.map(({ message }) => message).join("\n"),
+    /repeats must be at least 3/u,
+  );
+  assert.match(
+    rejection((changed) => {
+      const tooLate = new Date(`${approvedAt}T00:00:00.000Z`);
+      tooLate.setUTCDate(tooLate.getUTCDate() + 15);
+      changed.expires_at = tooLate.toISOString().slice(0, 10);
+    }).failures.map(({ message }) => message).join("\n"),
+    /expires more than 14 days/u,
+  );
+  assert.match(
+    rejection((changed) => { changed.release_key = "next-release"; })
+      .failures.map(({ message }) => message).join("\n"),
+    /release_key does not match/u,
+  );
+  assert.match(
+    rejection((changed) => { changed.candidate_sha256 = "c".repeat(64); })
+      .failures.map(({ message }) => message).join("\n"),
+    /candidate_sha256 does not match/u,
+  );
+  assert.match(
+    rejection((changed) => { changed.full_product_benefit.observed_at = "2026-01-01T00:00:00.000Z"; })
+      .failures.map(({ message }) => message).join("\n"),
+    /not from the same run/u,
+  );
+  assert.match(
+    rejection((changed) => { changed.full_product_benefit.artifact_sha256 = "c".repeat(64); })
+      .failures.map(({ message }) => message).join("\n"),
+    /artifact does not match its evidence row/u,
+  );
+  assert.match(
+    rejection((changed) => { delete changed.rollback_evidence; })
+      .failures.map(({ message }) => message).join("\n"),
+    /rollback_evidence/u,
+  );
 });
 
 test("CLI derives repository and tree identity from repo and rejects nonexistent commits", () => {
