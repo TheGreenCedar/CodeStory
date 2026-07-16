@@ -160,6 +160,8 @@ jobs:
           rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
 
       - name: Prove managed plugin handoff
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
           --archive "${{ steps.asset.outputs.archive }}"
@@ -168,6 +170,9 @@ jobs:
           --project "${{ github.workspace }}"
           --plugin-root plugins/codestory
           --plugin-handoff
+          --engine-policy cpu_explicit
+          --expected-backend CPU
+          --offline
           --out-dir target/post-publish-managed-proof
 
       - name: Prove published Intel macOS explicit CPU policy

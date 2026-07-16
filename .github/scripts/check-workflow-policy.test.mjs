@@ -19,10 +19,14 @@ function managedJob() {
     steps: [
       {
         name: "Prove managed plugin handoff",
+        env: { CODESTORY_EMBED_ALLOW_CPU: "1" },
         run: [
           "python .github/scripts/check-packaged-agent-proof.py",
           "--archive package.tar.gz",
           "--plugin-handoff",
+          "--engine-policy cpu_explicit",
+          "--expected-backend CPU",
+          "--offline",
         ].join("\n"),
       },
     ],
@@ -137,6 +141,10 @@ test("managed proof rejects structural bypasses and decoy commands", () => {
     job => { job.strategy.matrix.exclude = [{ os: "ubuntu-latest" }]; },
     job => { job.if = "always()"; },
     job => { job.steps[0]["continue-on-error"] = true; },
+    job => { delete job.steps[0].env.CODESTORY_EMBED_ALLOW_CPU; },
+    job => { job.steps[0].run = job.steps[0].run.replace("--engine-policy cpu_explicit", ""); },
+    job => { job.steps[0].run = job.steps[0].run.replace("--expected-backend CPU", ""); },
+    job => { job.steps[0].run = job.steps[0].run.replace("--offline", ""); },
     job => {
       job.steps[0].run = "python .github/scripts/check-packaged-agent-proof.py\n--archive package.tar.gz\n# --plugin-handoff";
       job.steps.push({ name: "Decoy", run: "--plugin-handoff" });
