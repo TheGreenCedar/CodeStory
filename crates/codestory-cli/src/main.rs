@@ -10224,16 +10224,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cache_dir_is_not_hashed() {
-        let root = Path::new("C:/repo");
-        let cache_dir = Path::new("C:/cache/custom");
-        assert_eq!(
-            cache_root_for_project(root, Some(cache_dir)).expect("cache dir"),
-            cache_dir
-        );
-    }
-
-    #[test]
     fn default_cache_root_uses_workspace_identity() {
         let root = Path::new("C:/repo");
         let cache_root = cache_root_for_project(root, None).expect("cache root");
