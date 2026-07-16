@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "model": {
+    "file_name": "coderankembed.Q8_0.gguf",
+    "size_bytes": 146029792,
+    "sha256": "666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa",
+    "sources": [
+      {
+        "url": "https://huggingface.co/brandtcormorant/CodeRankEmbed-Q8_0-GGUF/resolve/33bd774d16ed49b07e79e89c192751d11f47fec0/coderankembed-q8_0.gguf",
+        "revision": "33bd774d16ed49b07e79e89c192751d11f47fec0"
+      },
+      {
+        "url": "https://huggingface.co/limcheekin/CodeRankEmbed-GGUF/resolve/c61af36e919a038f84e320e43523e8982f820c94/coderankembed.Q8_0.gguf",
+        "revision": "c61af36e919a038f84e320e43523e8982f820c94"
+      }
+    ]
+  },
+  "runtime": {
+    "embedding_family": "inprocess:coderank-embed:q8_0",
+    "llama_cpp_crate_version": "0.1.151",
+    "llama_cpp_source_commit": "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66"
+  },
+  "embedding": {
+    "dimension": 768,
+    "query_prefix": "Represent this query for searching relevant code: ",
+    "document_prefix": "",
+    "pooling": "cls",
+    "normalization": "l2",
+    "element_type": "f32_le",
+    "vector_schema_version": 2
+  },
+  "tokenizer_config": {
+    "container": "gguf",
+    "tokenizer_sha256": "7465b93c945b7a266481e6785aa13e505c625562c1c046c4b762bb4da4d46082",
+    "config_sha256": "2fe6b6821386499c65d436bfff2994008c1aa358dfce05c1c08fec2d2b05d4e5"
+  },
+  "producer": {
+    "name": "codestory-llama-sys",
+    "version": "0.16.0"
+  },
+  "license": {
+    "spdx_id": "MIT",
+    "source_url": "https://huggingface.co/brandtcormorant/CodeRankEmbed-Q8_0-GGUF/blob/33bd774d16ed49b07e79e89c192751d11f47fec0/README.md"
+  }
+}

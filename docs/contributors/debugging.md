@@ -187,15 +187,16 @@ Check:
 - whether JSON and markdown output still match the runtime DTO shape
 - whether the change belongs in runtime rather than the adapter layer
 
-## If A Release Build Cannot Prepare The Embedded Model
+## If A Release Build Cannot Find The Embedded Model
 
-`cargo build --release --locked -p codestory-cli` normally reuses the verified
-workspace build asset or runs `scripts/prepare-embedded-model.mjs`
-automatically. If preparation fails, check the emitted Node.js or network error
-and leave the partial file for the script's bounded cleanup path. For a
-hermetic or offline build, point `CODESTORY_EMBED_MODEL_SOURCE` at the exact
-checksum-pinned GGUF; an invalid override fails closed and is never replaced by
-a download.
+Release Cargo builds deliberately perform no acquisition or process launch. If
+`CODESTORY_EMBED_MODEL_SOURCE` is missing, run
+`scripts/prepare-embedded-model.mjs` explicitly and set the variable to its
+printed path before retrying Cargo. If preparation fails, check the emitted
+Node.js or network error; the script removes its bounded partial file. For a
+hermetic or offline build, use `--source <path> --offline`. The acquisition
+script and Cargo independently verify the same checked-in size and digest, and
+an invalid explicit source fails closed.
 
 ## Cache Reset Cookbook
 

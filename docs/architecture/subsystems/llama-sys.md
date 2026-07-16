@@ -6,14 +6,23 @@ CodeStory release executable. It has no public product or network surface.
 
 ## Build identity
 
-`build.rs` pins the model filename, size, SHA-256, llama source revision, and
-ggml build identity. Release builds invoke the checksum-pinned preparation
-script, which reuses or prepares the verified workspace build asset before Rust
-independently verifies and embeds its bytes.
-`CODESTORY_EMBED_MODEL_SOURCE` remains an optional explicit input for hermetic
-or offline builds and fails closed when invalid. Development builds may omit the
-model so source checks remain practical, but such a binary cannot claim full
-product retrieval.
+`model-contract.json` is the checked-in source of truth for acquisition,
+embedding dimension and prefixes, pooling and normalization, vector format,
+tokenizer/config identity, producer identity, license provenance, llama source
+revision, and ggml build identity. The explicit preparation script consumes
+that contract and publishes a verified workspace build asset. `build.rs`
+consumes the same contract, never starts a process or performs network access,
+and requires `CODESTORY_EMBED_MODEL_SOURCE` for release builds. It accepts only
+an explicit regular file, copies into a create-new temporary file, closes and
+re-verifies the bytes, then atomically publishes without replacing an existing
+path. Development builds may omit the model so source checks remain practical,
+but such a binary cannot claim full product retrieval.
+
+The producer name and version from that same contract are embedded in the
+product runtime ID and persisted vector-producer evidence. They participate in
+the vector compatibility digest, so changing either implementation identity or
+version makes an older vector generation ineligible for reuse and requires a
+complete rebuild.
 
 Native features select Metal on macOS and Vulkan on Windows/Linux. CPU
 execution remains available only through the caller's explicit

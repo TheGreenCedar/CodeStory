@@ -66,6 +66,10 @@ helper process. `retrieval_mode=full` still gates agent packet/search.
 
 Focused proof covers:
 
+- canonical model-contract parsing by both acquisition and Cargo build paths;
+- explicit offline acquisition, missing-source, and digest-mismatch failures;
+- a process-free Cargo build boundary that requires an explicit regular file
+  for release builds;
 - embedded-model digest and atomic materialization;
 - linked ggml build identity;
 - explicit `accelerated` or `cpu_explicit` policy;
@@ -76,6 +80,30 @@ Focused proof covers:
 - publication leases that retain one load generation through commit;
 - generation-coherent query reads and producer migration;
 - cleanup confined to proved owned generations.
+
+The activation-independent contract lane is:
+
+```sh
+node --test scripts/tests/prepare-embedded-model.test.mjs
+cargo test --locked -p codestory-llama-sys --test model_staging
+cargo check --locked -p codestory-llama-sys
+```
+
+The Node test uses synthetic model bytes and proves the build script has no
+process-launch surface. The Rust staging test executes deterministic short-copy,
+partial-write, and competing-destination faults against the same staging module
+used by `build.rs`; it proves partial bytes are never published and a racing
+destination is never replaced. Protected package and hardware lanes remain
+responsible for proving the real release model and accelerator runtime.
+
+The Linux x64 packaged-platform job additionally runs the named
+`Prove clean-cache Node-absent network-denied offline release build` lane. It
+seeds a new isolated Cargo home, mounts the source read-only into the pinned
+build image, removes Node from the execution contract, denies container network
+access, and runs both `cargo check --release --locked --offline` and
+`cargo build --release --locked --offline` from a fresh target. The container's
+`--network none` boundary is the network-denial proof; Cargo's offline flag
+alone is not treated as OS-level denial.
 
 Hosted source/package jobs may set:
 

@@ -499,12 +499,12 @@ fn tool_latency_stats<'a>(
 }
 
 #[test]
-#[ignore = "warm-loop stats harness; run with cargo test -p codestory-cli --test stdio_warm_loop_stats -- --ignored --nocapture after cargo build --release -p codestory-cli"]
+#[ignore = "warm-loop stats harness; set CODESTORY_EMBED_MODEL_SOURCE to the output of node scripts/prepare-embedded-model.mjs, build with cargo build --release -p codestory-cli, then run cargo test -p codestory-cli --test stdio_warm_loop_stats -- --ignored --nocapture"]
 fn warm_stdio_agent_loop_emits_stats_without_protocol_pollution() {
     let binary = release_cli_binary();
     assert!(
         binary.is_file(),
-        "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
+        "missing release binary at {}. Set CODESTORY_EMBED_MODEL_SOURCE to the output of `node scripts/prepare-embedded-model.mjs`, then run `cargo build --release -p codestory-cli`.",
         binary.display()
     );
 

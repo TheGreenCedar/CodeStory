@@ -59,6 +59,7 @@ configuration smoke check.
 The language-support promotion packet-runtime suite is:
 
 ```powershell
+$env:CODESTORY_EMBED_MODEL_SOURCE = (node scripts/prepare-embedded-model.mjs).Trim()
 cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs `
   --packet-runtime `

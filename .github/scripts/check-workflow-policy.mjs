@@ -371,9 +371,30 @@ function validateLockedSetupSurfaces(violations) {
         'retrieval-status = "run --locked -p codestory-cli',
       ],
     ],
-    [path.join("scripts", "codex-worktree-setup.mjs"), ['["build", "--release", "--locked", "-p", "codestory-cli"]']],
-    [path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"), ["cargo build --release --locked -p codestory-cli"]],
-    [path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.ps1"), ['@("build", "--release", "--locked", "-p", "codestory-cli"']],
+    [
+      path.join("scripts", "codex-worktree-setup.mjs"),
+      [
+        '["build", "--release", "--locked", "-p", "codestory-cli"]',
+        "prepare-embedded-model.mjs",
+        "CODESTORY_EMBED_MODEL_SOURCE",
+      ],
+    ],
+    [
+      path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"),
+      [
+        "cargo build --release --locked -p codestory-cli",
+        "prepare-embedded-model.mjs",
+        "CODESTORY_EMBED_MODEL_SOURCE",
+      ],
+    ],
+    [
+      path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.ps1"),
+      [
+        '@("build", "--release", "--locked", "-p", "codestory-cli"',
+        "prepare-embedded-model.mjs",
+        "CODESTORY_EMBED_MODEL_SOURCE",
+      ],
+    ],
   ]);
   for (const [file, fragments] of contracts) {
     const source = fs.readFileSync(file, "utf8");
@@ -444,6 +465,12 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "scripts/codex-worktree-setup.*",
       "scripts/install-codestory.ps1",
       "scripts/prepare-embedded-model.mjs",
+      "scripts/tests/prepare-embedded-model.test.mjs",
+      "crates/codestory-llama-sys/model-contract.json",
+      "crates/codestory-llama-sys/build.rs",
+      "crates/codestory-llama-sys/model_staging.rs",
+      "crates/codestory-llama-sys/Cargo.toml",
+      "crates/codestory-llama-sys/tests/model_staging.rs",
     ];
     for (const event of ["pull_request", "push"]) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
@@ -456,6 +483,7 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "node --test .github/scripts/check-workflow-policy.test.mjs",
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
+    requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check CI proof routing fixtures", ["node .github/scripts/route-ci-proof.mjs --self-test"]);
     requireStepRun(violations, pluginFile, job, "Check packaged proof harness", ["python .github/scripts/check-packaged-agent-proof.py --self-test"]);
   }
@@ -472,7 +500,10 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
     requireStepRun(violations, rustFile, job, "Check formatting", ["cargo fmt --check"]);
     requireStepRun(violations, rustFile, job, "Check the workspace", ["cargo check --workspace --locked"]);
     requireStepRun(violations, rustFile, job, "Lint workspace libraries", ["cargo clippy --workspace --lib --locked -- -D warnings"]);
-    requireStepRun(violations, rustFile, job, "Prove focused publication contracts", ["cargo test --locked"]);
+    requireStepRun(violations, rustFile, job, "Prove focused publication contracts", [
+      "cargo test --locked -p codestory-llama-sys --test model_staging",
+      "cargo test --locked",
+    ]);
   }
 
   const sourceFile = "source-proof.yml";
@@ -640,6 +671,22 @@ function validatePackagedProof(workflows, violations) {
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
     "CXXFLAGS=-std=c++17",
   ]);
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Prove clean-cache Node-absent network-denied offline release build",
+    [
+      "CARGO_HOME=\"$proof_root/cargo\"",
+      "cargo fetch --locked",
+      "--network none",
+      "--read-only",
+      "command -v node",
+      "test ! -e \"$CARGO_TARGET_DIR\"",
+      "cargo check --release --locked --offline -p codestory-llama-sys",
+      "cargo build --release --locked --offline -p codestory-llama-sys",
+    ],
+  );
   const signing = namedStep(job, "Sign and notarize macOS CLI");
   add(violations, signing !== undefined, `${file} must sign and notarize Mac binaries`);
   violations.push(...notaryStepViolations(signing).map(message => `${file} ${message}`));

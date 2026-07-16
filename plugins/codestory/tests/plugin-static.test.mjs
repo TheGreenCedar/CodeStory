@@ -410,6 +410,20 @@ test("plugin package version tracks the codestory-cli release version", async ()
   }
 });
 
+test("source setup adapters prepare and pass the canonical embedded model", async () => {
+  const [powershell, posix] = await Promise.all([
+    readFile(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.ps1"), "utf8"),
+    readFile(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"), "utf8"),
+  ]);
+
+  for (const source of [powershell, posix]) {
+    assert.match(source, /prepare-embedded-model\.mjs/u);
+    assert.match(source, /CODESTORY_EMBED_MODEL_SOURCE/u);
+    assert.match(source, /build[" ]*,?[" ]*--release/u);
+    assert.match(source, /--locked/u);
+  }
+});
+
 test("codestory repo ships plugin source, not marketplace catalog or server adapter runtime", async () => {
   await assert.rejects(
     access(join(repoRoot, ".agents", "plugins", "marketplace.json")),

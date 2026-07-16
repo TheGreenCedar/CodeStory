@@ -31,6 +31,12 @@ on:
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
       - scripts/prepare-embedded-model.mjs
+      - scripts/tests/prepare-embedded-model.test.mjs
+      - crates/codestory-llama-sys/model-contract.json
+      - crates/codestory-llama-sys/build.rs
+      - crates/codestory-llama-sys/model_staging.rs
+      - crates/codestory-llama-sys/Cargo.toml
+      - crates/codestory-llama-sys/tests/model_staging.rs
       - scripts/release-evidence/machine-contract.json
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
@@ -68,6 +74,12 @@ on:
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
       - scripts/prepare-embedded-model.mjs
+      - scripts/tests/prepare-embedded-model.test.mjs
+      - crates/codestory-llama-sys/model-contract.json
+      - crates/codestory-llama-sys/build.rs
+      - crates/codestory-llama-sys/model_staging.rs
+      - crates/codestory-llama-sys/Cargo.toml
+      - crates/codestory-llama-sys/tests/model_staging.rs
       - scripts/release-evidence/machine-contract.json
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
@@ -94,6 +106,9 @@ jobs:
 
       - name: Check plugin static wiring
         run: node --test plugins/codestory/tests/plugin-static.test.mjs
+
+      - name: Check embedded model preparation
+        run: node --test scripts/tests/prepare-embedded-model.test.mjs
 
       - name: Check workflow policy
         run: |

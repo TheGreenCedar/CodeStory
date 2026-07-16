@@ -7,8 +7,9 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use codestory_contracts::api::{
     EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION, EmbeddingEngineIdentityDto,
-    EmbeddingExecutionEvidenceDto, EmbeddingModelIdentityDto, EmbeddingVectorProducerEvidenceDto,
-    EmbeddingVectorPublicationIdentityDto, EmbeddingVectorSemanticsDto,
+    EmbeddingExecutionEvidenceDto, EmbeddingModelIdentityDto, EmbeddingProducerIdentityDto,
+    EmbeddingVectorProducerEvidenceDto, EmbeddingVectorPublicationIdentityDto,
+    EmbeddingVectorSemanticsDto,
 };
 use codestory_store::{FileRole, Store};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -21,7 +22,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const VECTOR_INDEX_SCHEMA_VERSION: i64 = 2;
+const VECTOR_INDEX_SCHEMA_VERSION: i64 =
+    codestory_llama_sys::EMBEDDING_VECTOR_SCHEMA_VERSION as i64;
 const VECTOR_INDEX_FILE: &str = "vectors.sqlite3";
 const VECTOR_GENERATION_MANIFEST_FILE: &str = "vector-generation-manifest.json";
 const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -144,6 +146,11 @@ pub(crate) fn build_vector_producer_evidence(
     publication: EmbeddingVectorPublicationIdentityDto,
 ) -> EmbeddingVectorProducerEvidenceDto {
     let vector_semantics = codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
+    assert_eq!(
+        embedding_dim,
+        vector_semantics.dimension() as u32,
+        "embedding evidence dimension must match the canonical model contract"
+    );
     let pooling = vector_semantics.pooling_id();
     let normalization = vector_semantics.normalization_id();
     let engine_build_id = live_identity
@@ -172,29 +179,24 @@ pub(crate) fn build_vector_producer_evidence(
 
     EmbeddingVectorProducerEvidenceDto {
         schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+        producer: EmbeddingProducerIdentityDto {
+            name: codestory_llama_sys::MODEL_PRODUCER_NAME.to_string(),
+            version: codestory_llama_sys::MODEL_PRODUCER_VERSION.to_string(),
+        },
         model: EmbeddingModelIdentityDto {
             model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
             model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
             model_size_bytes: codestory_llama_sys::MODEL_SIZE,
-            tokenizer_sha256: evidence_contract_digest(
-                "tokenizer",
-                codestory_llama_sys::MODEL_SHA256,
-            ),
-            config_sha256: evidence_contract_digest(
-                "config",
-                &format!(
-                    "{}:{embedding_dim}:{pooling}:{normalization}",
-                    codestory_llama_sys::MODEL_SHA256,
-                ),
-            ),
+            tokenizer_sha256: codestory_llama_sys::MODEL_TOKENIZER_SHA256.to_string(),
+            config_sha256: codestory_llama_sys::MODEL_CONFIG_SHA256.to_string(),
         },
         semantics: EmbeddingVectorSemanticsDto {
             dimension: embedding_dim,
             query_prefix: crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT.to_string(),
-            document_prefix: String::new(),
+            document_prefix: crate::embeddings::CODERANK_DOCUMENT_PREFIX_DEFAULT.to_string(),
             pooling: pooling.to_string(),
             normalization: normalization.to_string(),
-            element_type: "f32_le".to_string(),
+            element_type: codestory_llama_sys::EMBEDDING_ELEMENT_TYPE.to_string(),
             vector_schema_version: VECTOR_INDEX_SCHEMA_VERSION as u32,
         },
         engine: EmbeddingEngineIdentityDto {
@@ -495,6 +497,7 @@ pub(crate) fn vector_compatibility_identity(
 ) -> Result<String> {
     let compatible = (
         evidence.schema_version,
+        &evidence.producer,
         &evidence.model,
         &evidence.semantics,
         &evidence.engine,
@@ -1284,13 +1287,6 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn hash_len_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_le_bytes());
     digest.update(bytes);
-}
-
-fn evidence_contract_digest(domain: &str, value: &str) -> String {
-    let mut digest = Sha256::new();
-    hash_len_prefixed(&mut digest, domain.as_bytes());
-    hash_len_prefixed(&mut digest, value.as_bytes());
-    hex_digest(digest.finalize())
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
@@ -2272,6 +2268,33 @@ mod tests {
         assert_evidence_mismatch(&expected, "model", |evidence| {
             evidence.model.model_id.push_str("-changed");
         });
+        let expected_compatibility =
+            vector_compatibility_identity(&expected).expect("expected compatibility identity");
+        let mut changed_producer_name = expected.clone();
+        changed_producer_name.producer.name.push_str("-changed");
+        assert_evidence_mismatch(&expected, "producer", |evidence| {
+            evidence.producer.name.push_str("-changed");
+        });
+        assert_ne!(
+            vector_compatibility_identity(&changed_producer_name)
+                .expect("changed producer-name compatibility identity"),
+            expected_compatibility,
+            "producer implementation changes must invalidate persisted vector reuse"
+        );
+        let mut changed_producer_version = expected.clone();
+        changed_producer_version
+            .producer
+            .version
+            .push_str("-changed");
+        assert_evidence_mismatch(&expected, "producer", |evidence| {
+            evidence.producer.version.push_str("-changed");
+        });
+        assert_ne!(
+            vector_compatibility_identity(&changed_producer_version)
+                .expect("changed producer-version compatibility identity"),
+            expected_compatibility,
+            "producer version changes must invalidate persisted vector reuse"
+        );
         assert_evidence_mismatch(&expected, "semantics", |evidence| {
             evidence.semantics.document_prefix.push_str("changed: ");
         });

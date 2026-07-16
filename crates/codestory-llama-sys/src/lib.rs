@@ -83,7 +83,7 @@ impl ProductEmbeddingVectorSemantics {
 /// Canonical vector semantics for the linked product embedding engine.
 pub const PRODUCT_EMBEDDING_VECTOR_SEMANTICS: ProductEmbeddingVectorSemantics =
     ProductEmbeddingVectorSemantics {
-        dimension: 768,
+        dimension: EMBEDDING_DIMENSION,
         pooling: EmbeddingPooling::Cls,
         normalization: EmbeddingNormalization::L2,
     };
@@ -1187,9 +1187,9 @@ mod tests {
     #[test]
     fn vector_semantics_drive_engine_pooling_and_normalization() {
         let semantics = PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
-        assert_eq!(semantics.dimension(), 768);
-        assert_eq!(semantics.pooling_id(), "cls");
-        assert_eq!(semantics.normalization_id(), "l2");
+        assert_eq!(semantics.dimension(), EMBEDDING_DIMENSION);
+        assert_eq!(semantics.pooling_id(), EMBEDDING_POOLING_ID);
+        assert_eq!(semantics.normalization_id(), EMBEDDING_NORMALIZATION_ID);
         assert!(matches!(
             semantics.llama_pooling_type(),
             LlamaPoolingType::Cls
@@ -1199,6 +1199,13 @@ mod tests {
         semantics.normalize(&mut vector);
         assert!((vector[0] - 0.6).abs() < f32::EPSILON);
         assert!((vector[1] - 0.8).abs() < f32::EPSILON);
+        assert_eq!(MODEL_PRODUCER_NAME, env!("CARGO_PKG_NAME"));
+        assert_eq!(MODEL_PRODUCER_VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(PRODUCT_EMBEDDING_RUNTIME_ID.contains(&format!(
+            "producer-{MODEL_PRODUCER_NAME}@{MODEL_PRODUCER_VERSION}"
+        )));
+        assert_eq!(MODEL_LICENSE_SPDX_ID, "MIT");
+        assert!(MODEL_LICENSE_SOURCE_URL.starts_with("https://"));
     }
 
     #[test]
