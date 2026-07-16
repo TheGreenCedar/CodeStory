@@ -151,6 +151,7 @@ const draftRunCommands = new Map([
     "cargo clippy --workspace --lib --locked -- -D warnings",
   ]],
   ["Prove focused publication contracts", [
+    "cargo test --locked -p codestory-llama-sys --test native_staging",
     "cargo test --locked -p codestory-llama-sys --test model_staging",
     "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
     "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
