@@ -16,7 +16,8 @@ const UPSTREAM_BUILD_SUPPORT_LIBRARY_NAMES: &[&str] = &["libllama-common.so"];
 /// or staging libraries outside the runtime manifest. The pinned upstream build
 /// also places a dangling `libllama-common.so` link in these directories. That
 /// build-support library remains outside CodeStory's package manifest; this
-/// helper only repairs its link where upstream already created one.
+/// helper refreshes its entry where upstream already created one so a reused
+/// target directory cannot retain bytes from an older dependency build.
 pub(crate) fn stage_linux_shared_libraries(
     runtime_sources: &[&Path],
     upstream_build_support_sources: &[&Path],
@@ -84,7 +85,7 @@ pub(crate) fn stage_linux_shared_libraries(
             replace_with_real_hard_link(source, &destination_dir.join(name))?;
         }
         for source in upstream_build_support_sources {
-            repair_preexisting_dangling_link(source, &destination_dir)?;
+            refresh_preexisting_build_support_link(source, &destination_dir)?;
         }
     }
     Ok(())
@@ -97,17 +98,14 @@ fn is_linux_shared_library_name(path: &Path) -> bool {
     name.starts_with("lib") && (name.ends_with(".so") || name.contains(".so."))
 }
 
-fn repair_preexisting_dangling_link(source: &Path, destination_dir: &Path) -> io::Result<()> {
+fn refresh_preexisting_build_support_link(source: &Path, destination_dir: &Path) -> io::Result<()> {
     let destination = destination_dir.join(
         source
             .file_name()
             .expect("validated build-support source has a file name"),
     );
     match fs::symlink_metadata(&destination) {
-        Ok(metadata) if metadata.file_type().is_symlink() && !destination.exists() => {
-            replace_with_real_hard_link(source, &destination)
-        }
-        Ok(_) => Ok(()),
+        Ok(_) => replace_with_real_hard_link(source, &destination),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
@@ -181,11 +179,13 @@ mod tests {
             fs::create_dir_all(&destination_dir).expect("runtime directory");
             symlink("libggml.so.0", destination_dir.join("libggml.so"))
                 .expect("upstream dangling link");
-            symlink(
-                "libllama-common.so.0",
-                destination_dir.join("libllama-common.so"),
-            )
-            .expect("upstream non-runtime dangling link");
+            if destination_dir != profile_dir {
+                symlink(
+                    "libllama-common.so.0",
+                    destination_dir.join("libllama-common.so"),
+                )
+                .expect("upstream non-runtime dangling link");
+            }
             symlink("libextra.so.0", destination_dir.join("libextra.so"))
                 .expect("unowned dangling link");
             assert!(!destination_dir.join("libggml.so").exists());
@@ -233,17 +233,36 @@ mod tests {
                     .is_symlink(),
                 "unowned shared library must remain untouched"
             );
+            if destination_dir == profile_dir {
+                assert!(
+                    fs::symlink_metadata(destination_dir.join("libllama-common.so")).is_err(),
+                    "absent build-support entry must remain absent"
+                );
+            } else {
+                assert_eq!(
+                    fs::read(destination_dir.join("libllama-common.so"))
+                        .expect("repaired upstream build-support link"),
+                    b"common"
+                );
+                assert!(
+                    !fs::symlink_metadata(destination_dir.join("libllama-common.so"))
+                        .expect("build-support metadata")
+                        .file_type()
+                        .is_symlink(),
+                    "upstream build-support link must resolve to a regular file"
+                );
+            }
+        }
+
+        fs::remove_file(core_dir.join("libllama-common.so.0.0.0"))
+            .expect("replace build-support source inode");
+        fs::write(core_dir.join("libllama-common.so.0.0.0"), b"common-v2")
+            .expect("updated build-support library");
+        for destination_dir in [profile_dir.join("deps"), profile_dir.join("examples")] {
             assert_eq!(
                 fs::read(destination_dir.join("libllama-common.so"))
-                    .expect("repaired upstream build-support link"),
+                    .expect("stale build-support entry"),
                 b"common"
-            );
-            assert!(
-                !fs::symlink_metadata(destination_dir.join("libllama-common.so"))
-                    .expect("build-support metadata")
-                    .file_type()
-                    .is_symlink(),
-                "upstream build-support link must resolve to a regular file"
             );
         }
 
@@ -253,6 +272,17 @@ mod tests {
             &profile_dir,
         )
         .expect("repeated staging remains idempotent");
+        assert!(
+            fs::symlink_metadata(profile_dir.join("libllama-common.so")).is_err(),
+            "repeated staging must not introduce absent build support"
+        );
+        for destination_dir in [profile_dir.join("deps"), profile_dir.join("examples")] {
+            assert_eq!(
+                fs::read(destination_dir.join("libllama-common.so"))
+                    .expect("refreshed build-support entry"),
+                b"common-v2"
+            );
+        }
     }
 
     #[test]
