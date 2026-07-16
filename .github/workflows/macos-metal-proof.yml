@@ -139,3 +139,4 @@ jobs:
           name: macos-arm64-metal-proof-${{ inputs.version }}
           path: target/macos-metal-proof
           if-no-files-found: error
+          retention-days: 30

@@ -116,3 +116,4 @@ jobs:
           name: windows-x64-vulkan-proof-${{ inputs.version }}
           path: target/windows-vulkan-proof
           if-no-files-found: error
+          retention-days: 30

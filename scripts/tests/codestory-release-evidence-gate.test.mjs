@@ -193,6 +193,8 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   let result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--out", reportPath]);
   assert.equal(result.status, 1, result.stderr);
   const report = JSON.parse(readFileSync(reportPath));
+  assert.equal(report.release_claim_evaluation.status, "fail");
+  assert.ok(report.release_claim_evaluation.failures.some(({ class: failureClass, claim }) => failureClass === "failed_evidence" && claim === "performance"));
   const row = report.metrics.find(({ metric }) => metric === "status_seconds");
   const approval = {
     schema_version: 2,
@@ -217,6 +219,7 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(readFileSync(reportPath)).release_claim_evaluation.status, "pass");
   approval.metrics.status_seconds.expires_at = "2026-07-12";
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
@@ -288,6 +291,27 @@ test("failed packet quality and non-full stats cannot produce or evaluate a pass
   result = run("evaluate", ["--candidate", path.join(dir2, "candidate.json"), "--out", path.join(dir2, "report.json")]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /full-retrieval readiness contract/);
+});
+
+test("release evidence independently enforces the versioned claim graph", () => {
+  const dir = workspace();
+  produce(dir);
+  const candidatePath = path.join(dir, "candidate.json");
+  const reportPath = path.join(dir, "report.json");
+  let candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "answer_quality").tier = "live_behavior";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  let result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence[0].graph_sha256 = "0".repeat(64);
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stale_evidence/u);
 });
 
 test("forged provenance, duplicate repeats, and omitted repeat budgets fail", () => {

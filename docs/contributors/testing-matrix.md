@@ -226,10 +226,27 @@ Workflow edits run:
 
 ```sh
 npm ci --ignore-scripts
+node scripts/codestory-release-claims.mjs validate --repo .
+node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
+node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
 node --test .github/scripts/check-workflow-policy.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
+
+`release-claims.json` is the release claim and proof-tier source of truth. It
+binds each claim to its evidence identity, expiry, dependency, executable
+prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The
+release evidence gate evaluates that graph; workflow policy consumes its
+runner, target, promotion, retention, and proof-chain facts. Update the graph
+instead of copying those facts into contributor prose.
+
+Workflow syntax and repository semantics are separate gates. The actionlint
+wrapper checks every workflow with `.github/actionlint.yaml` using the declared
+v1.7.12 binary or a checksum-verified official archive. Workflow policy then
+checks CodeStory-specific exact-SHA, protected-environment, least-privilege,
+artifact-retention, matrix, and promotion contracts. Its controlled-invalid
+fixtures must retain their class-prefixed diagnostics.
 
 Draft pushes run focused checks and one Linux source check. Exact-head review
 runs the broad source gate once. Packaged matrices and protected hardware run
@@ -246,4 +263,6 @@ part of ordinary remediation or embedding-engine PRs.
 State the exact SHA, commands, machine/backend, cache state, and highest proof
 tier reached. Distinguish source, package, hardware, plugin, installed-runtime,
 and live behavior evidence. Include skipped work and platform evidence still
-owed; never upgrade a hosted CPU result into a Metal or Vulkan claim.
+owed; never upgrade a hosted CPU result into a Metal or Vulkan claim. A passing
+lower-tier row cannot satisfy a higher-tier claim, and one current row cannot
+hide stale historical evidence for the same requirement.

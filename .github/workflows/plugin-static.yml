@@ -11,6 +11,16 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/fixtures/workflow-policy-invalid.json
+      - .github/scripts/run-actionlint.mjs
+      - .github/actionlint.yaml
+      - release-claims.json
+      - scripts/codestory-release-claims.mjs
+      - scripts/codestory-release-evidence-gate.mjs
+      - scripts/tests/codestory-release-claims.test.mjs
+      - scripts/tests/codestory-release-evidence-gate.test.mjs
+      - scripts/tests/fixtures/release-claims/**
+      - benchmarks/release-evidence/**
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/docker/**
       - package.json
@@ -29,6 +39,7 @@ on:
       - .github/workflows/source-proof.yml
       - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
+      - .github/workflows/**
       - scripts/install-codestory.ps1
       - scripts/prepare-embedded-model.mjs
       - scripts/tests/prepare-embedded-model.test.mjs
@@ -54,6 +65,16 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/fixtures/workflow-policy-invalid.json
+      - .github/scripts/run-actionlint.mjs
+      - .github/actionlint.yaml
+      - release-claims.json
+      - scripts/codestory-release-claims.mjs
+      - scripts/codestory-release-evidence-gate.mjs
+      - scripts/tests/codestory-release-claims.test.mjs
+      - scripts/tests/codestory-release-evidence-gate.test.mjs
+      - scripts/tests/fixtures/release-claims/**
+      - benchmarks/release-evidence/**
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/docker/**
       - package.json
@@ -72,6 +93,7 @@ on:
       - .github/workflows/source-proof.yml
       - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
+      - .github/workflows/**
       - scripts/install-codestory.ps1
       - scripts/prepare-embedded-model.mjs
       - scripts/tests/prepare-embedded-model.test.mjs
@@ -109,6 +131,15 @@ jobs:
 
       - name: Check embedded model preparation
         run: node --test scripts/tests/prepare-embedded-model.test.mjs
+
+      - name: Check workflow syntax
+        run: node .github/scripts/run-actionlint.mjs
+
+      - name: Check release claim and evidence contracts
+        run: >-
+          node --test
+          scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-evidence-gate.test.mjs
 
       - name: Check workflow policy
         run: |

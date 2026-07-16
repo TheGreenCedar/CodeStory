@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "status": "pass",
   "decision": "accept_contract",
   "commit": "2222222222222222222222222222222222222222",
@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "cea7ce184e481744ac1f0386aca6e66d09573bb9f8865921b2cf380b0b9f9098",
+  "candidate_sha256": "575664a9ac267ca21fbfadfa3899d833688f7e543f8c4168808b88936ed0b5de",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -20,6 +20,72 @@
       "bytes": 5324
     }
   ],
+  "release_claim_evaluation": {
+    "schema": "codestory.release-claim-evaluation/v1",
+    "status": "pass",
+    "graph_schema": "codestory.release-claims/v1",
+    "graph_sha256": "14ff6a867996fb82c62852f9a89d2aa00806047f3854d859dd489fab7eed3d66",
+    "evidence_selection": "all_matching_rows_must_pass",
+    "expected_commit": "2222222222222222222222222222222222222222",
+    "evaluated_at": "2026-07-16T11:00:00.000Z",
+    "claims": [
+      {
+        "id": "answer_quality",
+        "minimum_tier": "answer_quality",
+        "status": "pass",
+        "evidence": [
+          {
+            "type": "answer_quality",
+            "status": "pass"
+          }
+        ],
+        "accepted_risks": [
+          "evaluation-task-set-is-bounded"
+        ],
+        "non_claims": [
+          "general quality for tasks outside the evaluation contract",
+          "benchmark-driven production steering"
+        ]
+      },
+      {
+        "id": "performance",
+        "minimum_tier": "live_behavior",
+        "status": "pass",
+        "evidence": [
+          {
+            "type": "performance",
+            "status": "pass"
+          }
+        ],
+        "accepted_risks": [
+          "performance-profile-is-bounded"
+        ],
+        "non_claims": [
+          "performance on other hardware or corpora",
+          "future-regression immunity"
+        ]
+      },
+      {
+        "id": "retrieval_readiness",
+        "minimum_tier": "live_behavior",
+        "status": "pass",
+        "evidence": [
+          {
+            "type": "retrieval_readiness",
+            "status": "pass"
+          }
+        ],
+        "accepted_risks": [
+          "measured-corpus-is-bounded"
+        ],
+        "non_claims": [
+          "answer sufficiency for an unmeasured task",
+          "performance outside the approved profile"
+        ]
+      }
+    ],
+    "failures": []
+  },
   "metrics": [
     {
       "status": "pass",
