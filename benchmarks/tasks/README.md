@@ -99,6 +99,7 @@ node scripts/codestory-agent-ab-benchmark.mjs `
 Run the promotion-eligible packet-runtime shape:
 
 ```powershell
+$env:CODESTORY_EMBED_MODEL_SOURCE = (node scripts/prepare-embedded-model.mjs).Trim()
 cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs `
   --packet-runtime `

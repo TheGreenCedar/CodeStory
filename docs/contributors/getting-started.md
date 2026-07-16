@@ -16,17 +16,22 @@ limit. On macOS, CodeStory development supports macOS 15 or later and requires
 the Xcode Command Line Tools. Apple Silicon is the protected Metal cell; Intel
 Mac development uses explicit CPU operation and never claims Metal.
 
-Debug Rust builds compile without embedding the release model. A release build
-automatically reuses or prepares the exact pinned model at build time:
+Debug Rust builds compile without embedding the release model. Prepare the
+checksum-pinned model explicitly before a release build, then pass the printed
+regular-file path to Cargo:
 
 ```sh
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
 cargo build --release --locked -p codestory-cli
 ```
 
-The preparation script verifies the declared size and digest before publishing
-the build input. Set `CODESTORY_EMBED_MODEL_SOURCE` only when a hermetic or
-offline build must provide an explicit preverified source. The resulting
-executable contains the model; product runtime does not download it.
+In PowerShell, use
+`$env:CODESTORY_EMBED_MODEL_SOURCE = node scripts/prepare-embedded-model.mjs`.
+For an offline build, add `--offline` to reuse an already verified destination,
+or supply `--source <path> --offline`. The script and Cargo build both verify
+the checked-in model contract. Cargo itself never starts Node.js or performs
+network access. The resulting executable contains the model; product runtime
+does not download it.
 
 ## Establish the proof target
 
@@ -124,6 +129,7 @@ Use the built binary rather than `cargo run` when the shipped command boundary
 is part of the claim:
 
 ```sh
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
 cargo build --release --locked -p codestory-cli
 ./target/release/codestory-cli index --project . --refresh auto
 ./target/release/codestory-cli ready --project . --goal local

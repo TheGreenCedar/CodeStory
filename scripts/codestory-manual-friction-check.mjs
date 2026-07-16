@@ -369,7 +369,7 @@ if (!existsSync(cliPath)) {
     "all",
     "cli_missing",
     0,
-    "release codestory-cli is missing; run cargo build --release --locked -p codestory-cli first",
+    "release codestory-cli is missing; run node scripts/prepare-embedded-model.mjs, set CODESTORY_EMBED_MODEL_SOURCE to its verified path, then run cargo build --release --locked -p codestory-cli",
     { cli_path: cliPath },
   );
 } else {

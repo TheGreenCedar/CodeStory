@@ -23,8 +23,8 @@ use std::time::Instant;
 pub const RETRIEVAL_EMBEDDING_DIM: usize =
     codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
 pub const CODERANK_EMBED_Q8_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
-pub const CODERANK_QUERY_PREFIX_DEFAULT: &str =
-    "Represent this query for searching relevant code: ";
+pub const CODERANK_QUERY_PREFIX_DEFAULT: &str = codestory_llama_sys::EMBEDDING_QUERY_PREFIX;
+pub const CODERANK_DOCUMENT_PREFIX_DEFAULT: &str = codestory_llama_sys::EMBEDDING_DOCUMENT_PREFIX;
 #[cfg(feature = "test-support")]
 pub const TEST_EMBEDDING_UNAVAILABLE_MARKER: &str = ".codestory-test-embedding-unavailable";
 
@@ -130,7 +130,14 @@ impl InProcessEmbeddingClient {
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.embed_prepared_texts(texts)
+        if CODERANK_DOCUMENT_PREFIX_DEFAULT.is_empty() {
+            return self.embed_prepared_texts(texts);
+        }
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{CODERANK_DOCUMENT_PREFIX_DEFAULT}{text}"))
+            .collect::<Vec<_>>();
+        self.embed_prepared_texts(&prepared)
     }
 
     pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {

@@ -11,10 +11,13 @@ Runtime status field glossary (agents): [status-contract](../../plugins/codestor
 Install: release binary from GitHub assets, or build from source:
 
 ```sh
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
 cargo build --release --locked -p codestory-cli
 ```
 
-Windows: `.\target\release\codestory-cli.exe`.
+In PowerShell, prepare with
+`$env:CODESTORY_EMBED_MODEL_SOURCE = node scripts/prepare-embedded-model.mjs`.
+Windows binary: `.\target\release\codestory-cli.exe`.
 
 Generated `codestory-cli --help` and subcommand help are the source of truth for
 flags. This page groups stable workflows and trust boundaries rather than

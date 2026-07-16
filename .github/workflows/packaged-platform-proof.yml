@@ -143,6 +143,44 @@ jobs:
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
 
+      - name: Prove clean-cache Node-absent network-denied offline release build
+        if: matrix.asset_target == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_root="$RUNNER_TEMP/codestory-hermetic-release"
+          rm -rf "$proof_root"
+          mkdir -p "$proof_root/cargo" "$proof_root/home"
+          CARGO_HOME="$proof_root/cargo" \
+            cargo fetch --locked --target "${{ matrix.rust_target }}"
+          model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
+          docker run --rm --platform linux/amd64 \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --env CARGO_HOME=/proof/cargo \
+            --env CARGO_NET_OFFLINE=true \
+            --env CARGO_TARGET_DIR=/proof/target \
+            --env CODESTORY_EMBED_MODEL_SOURCE="/workspace/$model_relative" \
+            --env CXXFLAGS=-std=c++17 \
+            --env HOME=/proof/home \
+            --tmpfs /tmp:rw,noexec,nosuid,size=1g \
+            --volume "$proof_root:/proof" \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            codestory-linux-glibc-build \
+            sh -ceu '
+              if command -v node >/dev/null 2>&1; then
+                echo "Node must be absent from the hermetic Cargo proof" >&2
+                exit 1
+              fi
+              test ! -e "$CARGO_TARGET_DIR"
+              cargo check --release --locked --offline -p codestory-llama-sys \
+                --target "${{ matrix.rust_target }}"
+              cargo build --release --locked --offline -p codestory-llama-sys \
+                --target "${{ matrix.rust_target }}"
+            '
+
       - name: Sign and notarize macOS CLI
         if: runner.os == 'macOS' && inputs.sign_macos
         shell: bash

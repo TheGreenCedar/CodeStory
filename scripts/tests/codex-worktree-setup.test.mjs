@@ -209,7 +209,10 @@ test("Cargo fallback is locked and still feeds the shared setup path", () => {
   const stale = writeExecutable(join(home, "stale-codestory-cli"));
   const binaryName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";
   const built = join(project, "target", "release", binaryName);
+  const modelSource = writeExecutable(join(home, "model.gguf"));
   let cargoArguments;
+  let cargoEnvironment;
+  const releaseBuildCalls = [];
   runSetup(parseArguments(["--project", project]), {
     env: { CODESTORY_CLI: stale, HOME: home, PATH: "" },
     log: () => {},
@@ -217,13 +220,22 @@ test("Cargo fallback is locked and still feeds the shared setup path", () => {
     installRelease() {
       throw new Error("release unavailable");
     },
-    spawnSync(command, args) {
+    spawnSync(command, args, options) {
       if (command === "git") return result(1);
       if (command === stale && args[0] === "--version") {
         return result(0, "codestory-cli 0.14.3\n");
       }
+      if (
+        command === process.execPath &&
+        args[0] === join(project, "scripts", "prepare-embedded-model.mjs")
+      ) {
+        releaseBuildCalls.push("prepare");
+        return result(0, `${modelSource}\n`);
+      }
       if (command === "cargo") {
+        releaseBuildCalls.push("cargo");
         cargoArguments = args;
+        cargoEnvironment = options.env;
         writeExecutable(built);
         return result();
       }
@@ -237,7 +249,9 @@ test("Cargo fallback is locked and still feeds the shared setup path", () => {
       return result(1);
     },
   });
+  assert.deepEqual(releaseBuildCalls, ["prepare", "cargo"]);
   assert.deepEqual(cargoArguments, ["build", "--release", "--locked", "-p", "codestory-cli"]);
+  assert.equal(cargoEnvironment.CODESTORY_EMBED_MODEL_SOURCE, modelSource);
 });
 
 test("maintainer proof flag is the only setup path that prepares full retrieval", () => {

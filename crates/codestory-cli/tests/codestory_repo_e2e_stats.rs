@@ -705,14 +705,14 @@ fn drill_repo_cases_from_manifest(manifest_path: &Path) -> Vec<DrillRepoCase> {
 }
 
 #[test]
-#[ignore = "repo-scale release e2e; run with cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture after cargo build --release -p codestory-cli"]
+#[ignore = "repo-scale release e2e; set CODESTORY_EMBED_MODEL_SOURCE to the output of node scripts/prepare-embedded-model.mjs, build with cargo build --release -p codestory-cli, then run cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture"]
 fn codestory_repo_release_e2e_emits_stats() {
     let project_root = repo_root();
     let binary = release_cli_binary();
     let sidecar_run_id = "release-e2e-stats";
     assert!(
         binary.is_file(),
-        "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
+        "missing release binary at {}. Set CODESTORY_EMBED_MODEL_SOURCE to the output of `node scripts/prepare-embedded-model.mjs`, then run `cargo build --release -p codestory-cli`.",
         binary.display()
     );
 
@@ -1301,12 +1301,12 @@ fn codestory_repo_release_e2e_emits_stats() {
 }
 
 #[test]
-#[ignore = "real-repo drill release gate; set CODESTORY_REAL_REPO_DRILL_CASES or CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 and run after cargo build --release -p codestory-cli"]
+#[ignore = "real-repo drill release gate; set CODESTORY_REAL_REPO_DRILL_CASES or CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1, set CODESTORY_EMBED_MODEL_SOURCE to the output of node scripts/prepare-embedded-model.mjs, build with cargo build --release -p codestory-cli, then run the ignored test"]
 fn real_repo_agent_grounding_drill_emits_verification_packets() {
     let binary = release_cli_binary();
     assert!(
         binary.is_file(),
-        "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
+        "missing release binary at {}. Set CODESTORY_EMBED_MODEL_SOURCE to the output of `node scripts/prepare-embedded-model.mjs`, then run `cargo build --release -p codestory-cli`.",
         binary.display()
     );
 

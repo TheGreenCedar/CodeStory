@@ -20,6 +20,7 @@ PLUGIN_MANIFESTS = (
     Path("plugins/codestory/.claude-plugin/plugin.json"),
     Path("plugins/codestory/.github/plugin/plugin.json"),
 )
+MODEL_CONTRACT = Path("crates/codestory-llama-sys/model-contract.json")
 
 
 def read_toml(path: Path) -> dict:
@@ -71,6 +72,27 @@ def plugin_versions(root: Path) -> dict[Path, str]:
     return versions
 
 
+def validate_model_producer(root: Path, expected: str) -> None:
+    contract_path = root / MODEL_CONTRACT
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{contract_path} does not exist") from exc
+    producer = contract.get("producer")
+    if not isinstance(producer, dict):
+        raise ValueError(f"{contract_path} must declare a producer object")
+    name = producer.get("name")
+    version = producer.get("version")
+    if name != "codestory-llama-sys":
+        raise ValueError(
+            f"{MODEL_CONTRACT} producer.name is {name!r}, expected 'codestory-llama-sys'"
+        )
+    if version != expected:
+        raise ValueError(
+            f"{MODEL_CONTRACT} producer.version is {version!r}, expected {expected}"
+        )
+
+
 def fail(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -99,6 +121,11 @@ def main() -> None:
         fail(f"{cli_manifest} package.name is {cli_name!r}, expected 'codestory-cli'")
     if cli_version != expected:
         fail(f"codestory-cli version is {cli_version}, expected {expected}")
+
+    try:
+        validate_model_producer(root, expected)
+    except ValueError as exc:
+        fail(str(exc))
 
     for manifest_path, current_plugin_version in plugin_versions(root).items():
         if current_plugin_version != expected:
@@ -138,7 +165,8 @@ def main() -> None:
     print(
         f"CodeStory release version {expected} is synchronized across "
         f"{len(workspace_versions)} workspace crates, Cargo.lock, and "
-        f"{len(PLUGIN_MANIFESTS)} codestory plugin manifests."
+        f"{len(PLUGIN_MANIFESTS)} codestory plugin manifests; the embedded-model "
+        "producer matches."
     )
 
 

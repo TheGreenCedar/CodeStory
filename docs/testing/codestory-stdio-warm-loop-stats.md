@@ -7,6 +7,7 @@ This log tracks the persistent `serve --stdio` path that agents should prefer on
 Run after building the release CLI:
 
 ```sh
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test stdio_warm_loop_stats -- --ignored --nocapture
 ```

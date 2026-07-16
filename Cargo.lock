@@ -575,6 +575,7 @@ dependencies = [
  "crossbeam-channel",
  "fs4",
  "llama-cpp-2",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",

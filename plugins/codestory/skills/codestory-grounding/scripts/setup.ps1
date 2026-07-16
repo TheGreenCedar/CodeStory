@@ -114,6 +114,7 @@ if ($DryRun) {
 
 Require-Command git
 Require-Command cargo
+Require-Command node
 
 New-Item -ItemType Directory -Force -Path $codestoryHome, $binDir | Out-Null
 
@@ -157,7 +158,31 @@ if (-not $useLocalCheckout) {
     }
 }
 
-Invoke-Checked cargo @("build", "--release", "--locked", "-p", "codestory-cli", "--manifest-path", (Join-Path $sourceDir "Cargo.toml"))
+Push-Location $sourceDir
+try {
+    $modelSource = & node "scripts\prepare-embedded-model.mjs"
+    $modelPreparationExitCode = $LASTEXITCODE
+} finally {
+    Pop-Location
+}
+if ($modelPreparationExitCode -ne 0) {
+    throw "Embedded model preparation failed with exit code $modelPreparationExitCode."
+}
+$modelSource = "$modelSource".Trim()
+if (-not $modelSource -or -not (Test-Path -LiteralPath $modelSource -PathType Leaf)) {
+    throw "Embedded model preparation did not return a regular file: $modelSource"
+}
+$previousModelSource = $env:CODESTORY_EMBED_MODEL_SOURCE
+try {
+    $env:CODESTORY_EMBED_MODEL_SOURCE = $modelSource
+    Invoke-Checked cargo @("build", "--release", "--locked", "-p", "codestory-cli", "--manifest-path", (Join-Path $sourceDir "Cargo.toml"))
+} finally {
+    if ($null -eq $previousModelSource) {
+        Remove-Item Env:CODESTORY_EMBED_MODEL_SOURCE -ErrorAction SilentlyContinue
+    } else {
+        $env:CODESTORY_EMBED_MODEL_SOURCE = $previousModelSource
+    }
+}
 
 $built = Join-Path (Join-Path (Join-Path $sourceDir "target") "release") $binaryName
 if (-not (Test-Path -LiteralPath $built)) {

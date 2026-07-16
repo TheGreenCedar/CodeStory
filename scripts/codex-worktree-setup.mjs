@@ -116,11 +116,11 @@ function outputText(value) {
   return Buffer.isBuffer(value) ? value.toString("utf8") : String(value);
 }
 
-function invoke(context, command, args, { cwd, capture = false } = {}) {
+function invoke(context, command, args, { cwd, capture = false, env = context.env } = {}) {
   const shell = context.platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
   return context.spawnSync(command, args, {
     cwd,
-    env: context.env,
+    env,
     encoding: "utf8",
     shell,
     stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
@@ -548,8 +548,16 @@ function resolveCli(context, projectPath, expectedVersion, resolveCliOnly) {
       `Current-release install failed: ${installError}.`,
       "Building release CLI with cargo.",
     ].join(" "));
+    const modelSource = runRequired(
+      context,
+      process.execPath,
+      [join(projectPath, "scripts", "prepare-embedded-model.mjs")],
+      { cwd: projectPath, capture: true },
+    ).trim();
+    if (!modelSource) throw new Error("Embedded model preparation returned no source path.");
     runRequired(context, "cargo", ["build", "--release", "--locked", "-p", "codestory-cli"], {
       cwd: projectPath,
+      env: { ...context.env, CODESTORY_EMBED_MODEL_SOURCE: modelSource },
     });
   });
   return findCli(projectPath, expectedVersion, context);

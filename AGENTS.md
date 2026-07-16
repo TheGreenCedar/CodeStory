@@ -184,7 +184,9 @@ adapter to compensate for incorrect upstream state.
 ## Release Rules
 
 - `crates/codestory-cli/Cargo.toml` is the release version source. Synchronize
-  every `codestory-*` workspace crate, `Cargo.lock`, and these plugin manifests:
+  every `codestory-*` workspace crate, `Cargo.lock`, the
+  `producer.version` in `crates/codestory-llama-sys/model-contract.json`, and
+  these plugin manifests:
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`

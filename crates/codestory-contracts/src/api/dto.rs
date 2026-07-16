@@ -243,7 +243,14 @@ pub struct EmbeddingProfileContractDto {
 }
 
 /// Current wire version for producer evidence attached to a vector publication.
-pub const EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION: u32 = 1;
+pub const EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION: u32 = 2;
+
+/// Versioned identity of the implementation that produced embedding vectors.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingProducerIdentityDto {
+    pub name: String,
+    pub version: String,
+}
 
 /// Immutable identity of the bytes that define an embedding model.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -307,6 +314,7 @@ pub struct EmbeddingVectorPublicationIdentityDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct EmbeddingVectorProducerEvidenceDto {
     pub schema_version: u32,
+    pub producer: EmbeddingProducerIdentityDto,
     pub model: EmbeddingModelIdentityDto,
     pub semantics: EmbeddingVectorSemanticsDto,
     pub engine: EmbeddingEngineIdentityDto,
@@ -340,6 +348,8 @@ impl EmbeddingVectorProducerEvidenceDto {
             errors.push("schema_version".to_string());
         }
         for (field, value) in [
+            ("producer.name", self.producer.name.as_str()),
+            ("producer.version", self.producer.version.as_str()),
             ("model.model_id", self.model.model_id.as_str()),
             ("engine.engine", self.engine.engine.as_str()),
             (
@@ -439,6 +449,7 @@ impl EmbeddingVectorProducerEvidenceDto {
             self.schema_version,
             observed.schema_version
         );
+        compare!("producer", self.producer, observed.producer);
         compare!("model", self.model, observed.model);
         compare!("semantics", self.semantics, observed.semantics);
         compare!("engine", self.engine, observed.engine);
@@ -2308,6 +2319,10 @@ mod packet_tests {
     fn producer_evidence() -> EmbeddingVectorProducerEvidenceDto {
         EmbeddingVectorProducerEvidenceDto {
             schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+            producer: EmbeddingProducerIdentityDto {
+                name: "codestory-llama-sys".to_string(),
+                version: "1.2.3".to_string(),
+            },
             model: EmbeddingModelIdentityDto {
                 model_id: "model-v1".to_string(),
                 model_sha256: "a".repeat(64),
@@ -2365,6 +2380,7 @@ mod packet_tests {
         let expected = producer_evidence();
         let mut evidence = expected.clone();
         evidence.schema_version += 1;
+        evidence.producer.version.clear();
         evidence.model.model_sha256 = "not-a-digest".to_string();
         evidence.publication.core_run_id.clear();
 
@@ -2372,6 +2388,7 @@ mod packet_tests {
             evidence.validation_errors(),
             vec![
                 "schema_version".to_string(),
+                "producer.version".to_string(),
                 "publication.core_run_id".to_string(),
                 "model.model_sha256".to_string(),
             ]
@@ -2407,12 +2424,17 @@ mod packet_tests {
         );
 
         observed.semantics.dimension += 1;
+        observed.producer.version = "1.2.4".to_string();
         observed.publication.semantic_generation = "semantic-2".to_string();
         let compatibility = expected.compatibility_with(&observed);
         assert!(!compatibility.compatible);
         assert_eq!(
             compatibility.mismatches,
-            vec!["semantics".to_string(), "publication".to_string()]
+            vec![
+                "producer".to_string(),
+                "semantics".to_string(),
+                "publication".to_string()
+            ]
         );
         assert!(compatibility.migration_required);
         assert_eq!(
