@@ -275,7 +275,8 @@ Every Windows source-build proof lane sets `CMAKE_GENERATOR=Ninja`. This keeps
 llama.cpp nested native builds serialized under the repository's supported
 generator instead of inheriting a hosted Visual Studio/MSBuild generator. The
 hosted package cache also binds that generator and its CMake/Ninja tool versions;
-the protected Vulkan lane pins the same generator before building its package.
+the protected Vulkan lane pins the same generator before building its package
+and records both tool versions in the retained host evidence.
 
 That Windows lane is source and protocol evidence on a hosted CPU runner. The
 SDK preserves the production-default native compile topology; it does not prove

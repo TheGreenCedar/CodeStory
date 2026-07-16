@@ -56,6 +56,14 @@ jobs:
             Select-Object Name, AdapterCompatibility, DriverVersion, VideoMemoryType |
             Format-List | Out-File -Append target/windows-vulkan-proof/host.txt
 
+      - name: Capture source build tool evidence
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        shell: pwsh
+        run: |
+          "CMAKE_GENERATOR=Ninja" | Out-File -Append target/windows-vulkan-proof/host.txt
+          cmake --version | Out-File -Append target/windows-vulkan-proof/host.txt
+          ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
+
       - name: Install pinned Rust
         if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: pwsh

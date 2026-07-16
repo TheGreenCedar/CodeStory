@@ -611,6 +611,10 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     "Restore Cargo registry, git sources, and build output",
   );
   const packagedBuild = workflow => draftStep(workflow.jobs.build, "Build codestory-cli");
+  const protectedSourceTools = workflow => draftStep(
+    workflow.jobs["packaged-vulkan"],
+    "Capture source build tool evidence",
+  );
   const protectedBuild = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Build and package native CLI",
@@ -629,6 +633,22 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
         .replace(/.*CMAKE_GENERATOR=Ninja.*\n/u, "");
     }, /native build identity must include CMAKE_GENERATOR=Ninja/u],
+    ["packaged identity made conditional", packagedFile, workflow => {
+      packagedIdentity(workflow).if = "runner.os != 'Windows'";
+    }, /native build identity must be unique, unconditional/u],
+    ["packaged identity made optional", packagedFile, workflow => {
+      packagedIdentity(workflow)["continue-on-error"] = true;
+    }, /native build identity must be unique, unconditional/u],
+    ["packaged identity cloned", packagedFile, workflow => {
+      workflow.jobs.build.steps.push(structuredClone(packagedIdentity(workflow)));
+    }, /native build identity must be unique, unconditional/u],
+    ["packaged identity moved after build", packagedFile, workflow => {
+      const steps = workflow.jobs.build.steps;
+      const identityIndex = steps.findIndex(step => step.name === "Capture Rust cache key");
+      const [identity] = steps.splice(identityIndex, 1);
+      const buildIndex = steps.findIndex(step => step.name === "Build codestory-cli");
+      steps.splice(buildIndex + 1, 0, identity);
+    }, /native build identity must run immediately after Rust selection/u],
     ["packaged generator-free cache", packagedFile, workflow => {
       packagedCache(workflow).with.key = packagedCache(workflow).with.key
         .replace("-${{ steps.rust-cache-key.outputs.generator }}", "");
@@ -653,6 +673,27 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     ["protected build adds a second generator surface", protectedFile, workflow => {
       protectedBuild(workflow).env.CMAKE_GENERATOR_PLATFORM = "x64";
     }, /source package build must use the Ninja native generator/u],
+    ["protected host omits generator selection", protectedFile, workflow => {
+      protectedSourceTools(workflow).run = protectedSourceTools(workflow).run
+        .replace(/.*CMAKE_GENERATOR=Ninja.*\n/u, "");
+    }, /Capture source build tool evidence/u],
+    ["protected host omits CMake version", protectedFile, workflow => {
+      protectedSourceTools(workflow).run = protectedSourceTools(workflow).run
+        .replace(/.*cmake --version.*\n/u, "");
+    }, /Capture source build tool evidence/u],
+    ["protected host omits Ninja version", protectedFile, workflow => {
+      protectedSourceTools(workflow).run = protectedSourceTools(workflow).run
+        .replace(/.*ninja --version.*\n/u, "");
+    }, /Capture source build tool evidence/u],
+    ["protected source evidence made unconditional", protectedFile, workflow => {
+      delete protectedSourceTools(workflow).if;
+    }, /source build tool evidence must remain source-only/u],
+    ["protected source evidence guard inverted", protectedFile, workflow => {
+      protectedSourceTools(workflow).if = "inputs.use_packaged_cli_artifact";
+    }, /source build tool evidence must remain source-only/u],
+    ["protected source evidence made optional", protectedFile, workflow => {
+      protectedSourceTools(workflow)["continue-on-error"] = true;
+    }, /source build tool evidence must remain source-only/u],
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {

@@ -1302,12 +1302,17 @@ function validatePackagedProof(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "build");
   validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"), graph);
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
-  const nativeIdentity = namedStep(job, "Capture Rust cache key");
+  const packageSteps = list(job.steps).map(object);
+  const nativeIdentitySteps = packageSteps.filter(step => step.name === "Capture Rust cache key");
+  const nativeIdentity = nativeIdentitySteps[0];
   const nativeIdentityRun = executableRunText(String(nativeIdentity?.run ?? ""));
   add(
     violations,
-    nativeIdentity?.id === "rust-cache-key" && nativeIdentity?.shell === "bash",
-    `${file} native build identity must keep its stable Bash output boundary`,
+    nativeIdentitySteps.length === 1
+      && hasExactKeys(nativeIdentity, ["name", "id", "shell", "run"])
+      && nativeIdentity?.id === "rust-cache-key"
+      && nativeIdentity?.shell === "bash",
+    `${file} native build identity must be unique, unconditional, and keep its exact Bash output boundary`,
   );
   for (const fragment of [
     'cmake=$(cmake --version',
@@ -1325,6 +1330,19 @@ function validatePackagedProof(workflows, violations, graph) {
     );
   }
   const packageRestore = namedStep(job, "Restore Cargo registry, git sources, and build output");
+  const installRustIndex = packageSteps.findIndex(step => step.name === "Install pinned Rust");
+  const nativeIdentityIndex = packageSteps.findIndex(step => step.name === "Capture Rust cache key");
+  const packageRestoreIndex = packageSteps.findIndex(step => step.name === "Restore Cargo registry, git sources, and build output");
+  const packageBuildIndex = packageSteps.findIndex(step => step.name === "Build codestory-cli");
+  const linuxBuildIndex = packageSteps.findIndex(step => step.name === "Build Linux x64 at the glibc 2.31 baseline");
+  add(
+    violations,
+    nativeIdentityIndex === installRustIndex + 1
+      && packageRestoreIndex === nativeIdentityIndex + 1
+      && nativeIdentityIndex < packageBuildIndex
+      && nativeIdentityIndex < linuxBuildIndex,
+    `${file} native build identity must run immediately after Rust selection and before cache restore or any native build`,
+  );
   add(
     violations,
     object(packageRestore?.with).key === "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v2-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock') }}",
@@ -1554,6 +1572,19 @@ function validateRemainingWorkflows(workflows, violations) {
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
+    const sourceBuildTools = namedStep(job, "Capture source build tool evidence");
+    add(
+      violations,
+      hasExactKeys(object(sourceBuildTools), ["name", "if", "shell", "run"])
+        && sourceBuildTools?.if === "${{ !inputs.use_packaged_cli_artifact }}"
+        && sourceBuildTools?.shell === "pwsh",
+      `${vulkanFile} source build tool evidence must remain source-only and fail closed`,
+    );
+    requireStepRun(violations, vulkanFile, job, "Capture source build tool evidence", [
+      "CMAKE_GENERATOR=Ninja",
+      "cmake --version",
+      "ninja --version",
+    ]);
     requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     const nativeBuild = namedStep(job, "Build and package native CLI");
     add(

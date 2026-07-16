@@ -14,8 +14,9 @@
   generator, and exact caches bind the generator plus CMake and Ninja versions
   alongside the hosted platform, Rust and target identities, default native
   feature and proof shape, workspace manifests, installer, and lockfile. The
-  hosted lane remains source/protocol evidence rather than a packaged or
-  Vulkan-hardware claim.
+  protected Windows artifact records the same native tool versions when that
+  lane builds from source. The hosted lane remains source/protocol evidence
+  rather than a packaged or Vulkan-hardware claim.
 - Draft source CI now restores exact-lock retrieval output or narrowly scoped
   prior-lock output before rebuilding. The base retrieval lane serially seeds
   the exact five test-profile targets used by draft proof, while a versioned
