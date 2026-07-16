@@ -4,10 +4,14 @@ version = "0.16.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["runtime-bench"]
+runtime-bench = ["dep:codestory-runtime"]
+
 [dependencies]
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
-codestory-runtime = { workspace = true }
+codestory-runtime = { workspace = true, optional = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 criterion = { workspace = true }
@@ -17,10 +21,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+sqlite-vec = { workspace = true }
+toml = { workspace = true }
+usearch = { workspace = true }
+
 [[bench]]
 name = "indexing"
 harness = false
 bench = false
+required-features = ["runtime-bench"]
 
 [[bench]]
 name = "graph_fidelity"
@@ -36,11 +48,13 @@ bench = false
 name = "ask_latency"
 harness = false
 bench = false
+required-features = ["runtime-bench"]
 
 [[bench]]
 name = "grounding"
 harness = false
 bench = false
+required-features = ["runtime-bench"]
 
 [[bench]]
 name = "incremental_cleanup"
@@ -51,3 +65,4 @@ bench = false
 name = "browser_stress"
 harness = false
 bench = false
+required-features = ["runtime-bench"]

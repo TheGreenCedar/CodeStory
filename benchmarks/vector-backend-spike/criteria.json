@@ -1,0 +1,81 @@
+{
+  "schema_version": 3,
+  "issue": 1202,
+  "decision_status": "blocked_pending_required_evidence",
+  "non_goal": "This spike does not adopt either backend.",
+  "candidates": {
+    "sqlite-vec": {
+      "crate_version": "0.1.9",
+      "mode": "vec0 float[768] distance_metric=cosine exact KNN"
+    },
+    "usearch": {
+      "crate_version": "2.26.0",
+      "mode": "HNSW cosine F32 with default features disabled"
+    }
+  },
+  "shared_workload": {
+    "dimensions": 768,
+    "vector_counts": [1000, 10000, 25000, 100000],
+    "top_k": 20,
+    "warmups": 5,
+    "queries": 30,
+    "inputs": "one complete immutable CodeStory vectors.sqlite3 with no unbound SQLite sidecars plus a predeclared production attestation containing its exact database SHA-256 and complete publication identity, and one attestation-bound fixture containing frozen representative and symbol query identities and frozen incremental records, reused byte-for-byte for both candidates; validation and sampling use one pinned read transaction and rehash after sampling"
+  },
+  "required_platforms": [
+    "windows-x86_64",
+    "linux-x86_64",
+    "macos-aarch64"
+  ],
+  "required_measurements": [
+    "build_ms",
+    "load_ms",
+    "first_query_after_open_ms",
+    "cold_query_ms",
+    "warm_query_p50_ms",
+    "warm_query_p95_ms",
+    "memory_bytes",
+    "disk_bytes",
+    "incremental_reuse_ms",
+    "concurrent_reader_consistency",
+    "pinned_old_reader_after_publication",
+    "new_current_reader_observed_incremental",
+    "old_generation_unchanged",
+    "atomic_publication_pointer_pair",
+    "referenced_generation_tamper_rejected",
+    "pinned_reader_after_referenced_tamper",
+    "rollback_pointer_readable",
+    "failed_candidate_preserved_current_pointer",
+    "corrupt_candidate_rejected"
+  ],
+  "quality_gates": {
+    "ann_recall_at_20_min": 0.99,
+    "expected_identity_hit_at_20": 1.0,
+    "representative_query_hit_at_20": 1.0,
+    "symbol_query_hit_at_20": 1.0,
+    "cancellation_p95_ms_max": 50,
+    "publication_contract": "complete immutable generation directories whose manifests bind exact index bytes and canonical directory contents, atomic current and rollback pointer swaps, pinned old-or-new readers, rollback through the pointer protocol, fail-closed corrupt candidates before pointer mutation, and fail-closed new readers after referenced-generation tamper while already-pinned readers remain usable"
+  },
+  "performance_gates": {
+    "query_p95_ms_max": {
+      "25000": 500,
+      "100000": 1500
+    },
+    "deep_validation_100000_ms_max": 5000,
+    "warm_rss_growth_mib_max": 96,
+    "replacement_speedup_100000_min_fraction": 0.30,
+    "current_repo_p95_regression_max_fraction": 0.05,
+    "memory_storage_and_package_regression_max_fraction": 0.10
+  },
+  "adoption_requires": [
+    "all required platform artifacts pass the same quality and publication gates",
+    "artifacts bind the criteria hash, predeclared source database SHA-256, complete source publication and evidence identity, fixture identity, exact Git tree, toolchain, build profile, target, CPU, RAM, and ISA envelope",
+    "comparative timing comes from isolated clean-host runs; same-process smoke timing is diagnostic only",
+    "the 100000-vector workload clears the replacement speedup gate",
+    "current-repository retrieval p95 does not regress beyond the declared limit",
+    "memory, storage, and packaged archive size remain within the declared limit",
+    "offline build and native packaging checks pass on every shipped architecture",
+    "license and native dependency review is complete",
+    "a reversible fallback to the existing embedded scan remains available"
+  ],
+  "synthetic_smoke_is_decision_evidence": false
+}
