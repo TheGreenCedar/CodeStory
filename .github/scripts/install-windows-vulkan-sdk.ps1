@@ -56,7 +56,7 @@ try {
     Invoke-WebRequest -Uri $downloadUrl -OutFile $installer
     $actualSha256 = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actualSha256 -ne $package.Sha256) {
-        throw "Vulkan SDK checksum mismatch for $architecture: expected $($package.Sha256), got $actualSha256."
+        throw "Vulkan SDK checksum mismatch for ${architecture}: expected $($package.Sha256), got $actualSha256."
     }
 
     $process = Start-Process -FilePath $installer -ArgumentList @(
