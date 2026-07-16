@@ -62,7 +62,7 @@
     "warm_rss_growth_mib_max": 96,
     "replacement_speedup_100000_min_fraction": 0.30,
     "current_repo_p95_regression_max_fraction": 0.05,
-    "memory_and_storage_regression_max_fraction": 0.10
+    "memory_storage_and_windows_package_regression_max_fraction": 0.10
   },
   "decision_requires": [
     "the approved Windows x64 production artifacts pass the declared quality and publication gates",
@@ -70,14 +70,14 @@
     "comparative timing comes from isolated clean-host runs; same-process smoke timing is diagnostic only",
     "the 100000-vector workload clears the replacement speedup gate",
     "current-repository retrieval p95 does not regress beyond the declared limit",
-    "Windows x64 memory and storage remain within the declared limit"
+    "Windows x64 memory, storage, and packaged archive size remain within the declared limit",
+    "the Windows x64 offline build and native dependency checks pass",
+    "license and native dependency review is complete for the Windows x64 comparison",
+    "a reversible fallback to the existing embedded scan is demonstrated"
   ],
   "non_blocking_adoption_follow_up": [
     "Linux x64 and macOS arm64 quality and publication proof",
-    "offline build and native packaging checks on every shipped architecture",
-    "packaged archive size measurement",
-    "license and native dependency review",
-    "a reversible fallback to the existing embedded scan in the adoption implementation"
+    "Linux x64 and macOS arm64 offline build and native packaging checks"
   ],
   "synthetic_smoke_is_decision_evidence": false
 }

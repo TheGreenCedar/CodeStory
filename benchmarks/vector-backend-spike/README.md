@@ -106,11 +106,12 @@ evidence. Isolated clean-host timing remains required.
 
 USearch's own lower-bound memory estimate is reported, while sqlite-vec memory
 is marked unmeasured. Cold-cache latency, isolated RSS, cancellation,
-deep-validation time, and the existing-scan regression baseline remain required
-Windows x64 decision evidence rather than inferred values.
+deep-validation time, the existing-scan regression baseline, Windows offline
+build and archive-size implications, license and native-dependency review, and
+reversible fallback proof remain required Windows x64 decision evidence rather
+than inferred values.
 
-Linux and macOS proof, cross-platform offline builds and native packaging,
-archive-size measurement, license review, and implementation fallback proof do
+Linux and macOS quality/publication proof and their offline/native packaging do
 not block this comparison PR. If the Windows x64 decision selects a candidate,
-track those items in the later adoption implementation. If neither candidate
-clears the Windows x64 criteria, keep the existing embedded scan.
+track those platform items in the later adoption implementation. If neither
+candidate clears the Windows x64 criteria, keep the existing embedded scan.

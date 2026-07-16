@@ -1053,6 +1053,26 @@ fn decision_criteria_are_predeclared() {
             .as_str()
             .is_some_and(|value| value.contains("macOS arm64"))
     }));
+    let decision_requires = criteria["decision_requires"]
+        .as_array()
+        .expect("blocking decision requirement list");
+    for required in [
+        "Windows x64 offline build",
+        "license and native dependency review",
+        "reversible fallback",
+        "packaged archive size",
+    ] {
+        assert!(
+            decision_requires
+                .iter()
+                .any(|value| { value.as_str().is_some_and(|value| value.contains(required)) })
+        );
+        assert!(
+            !adoption_follow_up
+                .iter()
+                .any(|value| { value.as_str().is_some_and(|value| value.contains(required)) })
+        );
+    }
     let required = criteria["required_measurements"]
         .as_array()
         .expect("required measurement list");
@@ -1337,8 +1357,8 @@ fn compare_vector_backends() -> Result<()> {
         runs,
         limitations: vec![
             "same-process smoke timings are diagnostic and not candidate-comparison evidence",
-            "cold-cache latency, isolated RSS, cancellation, deep validation, and current-scan regression remain required Windows x64 decision evidence",
-            "Linux/macOS proof, cross-platform offline/native packaging, archive size, license review, and implementation fallback proof are non-blocking adoption follow-up",
+            "cold-cache latency, isolated RSS, cancellation, deep validation, current-scan regression, Windows offline build/archive size, license/native review, and reversible fallback remain required Windows x64 decision evidence",
+            "Linux/macOS quality, publication, offline-build, and native-packaging proof are non-blocking adoption follow-up",
             "one artifact covers only its recorded host, source publication, fixture, and vector count",
         ],
     };
