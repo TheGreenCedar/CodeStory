@@ -38,6 +38,93 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
     ))
 }
 
+fn create_versioned_observation_fixture(path: &Path, version: u32) {
+    let connection = Connection::open(path).expect("create observation fixture");
+    connection
+        .pragma_update(None, "user_version", version)
+        .expect("set observation fixture schema");
+    drop(connection);
+}
+
+fn assert_no_sqlite_sidecars(path: &Path) {
+    assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+    assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+    assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
+}
+
+#[test]
+fn observational_open_preserves_current_database_bytes_without_sidecars() {
+    let path = unique_temp_db_path("observational-current");
+    create_versioned_observation_fixture(&path, SCHEMA_VERSION);
+    let before = fs::read(&path).expect("read current fixture before observation");
+    assert_no_sqlite_sidecars(&path);
+
+    let observed = Storage::open_observational(&path).expect("observe current database");
+    assert_eq!(
+        observed.schema_version().expect("read observed schema"),
+        SCHEMA_VERSION
+    );
+    drop(observed);
+
+    assert_eq!(
+        fs::read(&path).expect("read current fixture after observation"),
+        before
+    );
+    assert_no_sqlite_sidecars(&path);
+    fs::remove_file(path).expect("remove current fixture");
+}
+
+#[test]
+fn observational_open_reports_old_schema_without_migration_or_sidecars() {
+    let path = unique_temp_db_path("observational-old-schema");
+    create_versioned_observation_fixture(&path, SCHEMA_VERSION - 1);
+    let before = fs::read(&path).expect("read old-schema fixture before observation");
+    assert_no_sqlite_sidecars(&path);
+
+    let error = Storage::open_observational(&path)
+        .err()
+        .expect("old schema must fail closed");
+    assert!(
+        error.to_string().contains("requires schema version"),
+        "{error}"
+    );
+
+    assert_eq!(
+        fs::read(&path).expect("read old-schema fixture after observation"),
+        before
+    );
+    assert_no_sqlite_sidecars(&path);
+    fs::remove_file(path).expect("remove old-schema fixture");
+}
+
+#[test]
+fn observational_open_reports_pending_promotion_without_recovery() {
+    let path = unique_temp_db_path("observational-promotion");
+    create_versioned_observation_fixture(&path, SCHEMA_VERSION);
+    let prepared = promotion_prepared_journal_path(&path);
+    fs::write(&prepared, b"pending promotion evidence").expect("write pending promotion fixture");
+    let database_before = fs::read(&path).expect("read promotion database before observation");
+    let journal_before = fs::read(&prepared).expect("read promotion journal before observation");
+    assert_no_sqlite_sidecars(&path);
+
+    let error = Storage::open_observational(&path)
+        .err()
+        .expect("pending recovery must fail closed");
+    assert!(error.to_string().contains("recovery is pending"), "{error}");
+
+    assert_eq!(
+        fs::read(&path).expect("read promotion database after observation"),
+        database_before
+    );
+    assert_eq!(
+        fs::read(&prepared).expect("read promotion journal after observation"),
+        journal_before
+    );
+    assert_no_sqlite_sidecars(&path);
+    fs::remove_file(prepared).expect("remove promotion journal fixture");
+    fs::remove_file(path).expect("remove promotion database fixture");
+}
+
 #[test]
 fn write_transaction_commits_or_rolls_back_as_one_unit() {
     let path = unique_temp_db_path("write-transaction");

@@ -2053,6 +2053,13 @@ function selectExplicitProject(value) {
 
 function failOpenToolResult(tool, status, argumentsValue = {}) {
   const preparing = status.managed_retrieval?.state === 'preparing';
+  const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
+  const degradedReason = status.degraded_reason || readiness?.reason || (preparing ? 'managed_cli_provisioning' : 'runtime_unavailable');
+  const primaryFailure = readiness?.setup?.probe_error
+    || readiness?.setup?.probe_stderr
+    || readiness?.summary
+    || status.warnings?.find((warning) => String(warning || '').trim())
+    || degradedReason;
   const selection = selectExplicitProject(argumentsValue.project);
   if (!selection.ok) {
     const structuredContent = {
@@ -2080,6 +2087,7 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     const structuredContent = {
       project,
       state: preparing ? 'preparing' : 'unavailable',
+      degraded_reason: degradedReason,
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
       current_operation: preparing ? {
         operation_id: 'managed-runtime-provisioning',
@@ -2089,6 +2097,7 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
         retry_after_ms: 1500,
         failure: null,
       } : null,
+      failure: preparing ? null : primaryFailure,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
       retry_after_ms: preparing ? 1500 : null,
       diagnostics_uri: 'codestory://status',

@@ -1651,6 +1651,42 @@ impl Storage {
         })
     }
 
+    /// Open a store for diagnostics without repairing, migrating, locking, or
+    /// materializing SQLite sidecars. Recovery and schema changes belong to an
+    /// activating writer; an observer reports those states instead.
+    pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if promotion_artifacts_exist(path) {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} while promotion recovery is pending",
+                path.display()
+            )));
+        }
+        if !path.is_file() {
+            return Err(StorageError::Other(format!(
+                "Observational storage requires an existing database: {}",
+                path.display()
+            )));
+        }
+        let uri = immutable_sqlite_uri(path);
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Self {
+            conn,
+            cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
+        })
+    }
+
     pub fn read_snapshot(&self) -> Result<StorageReadSnapshot<'_>, StorageError> {
         self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
         Ok(StorageReadSnapshot {
@@ -7244,6 +7280,31 @@ impl Storage {
             show_utility_calls,
         )
     }
+}
+
+fn immutable_sqlite_uri(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
+
+    let mut encoded = String::with_capacity(bytes.len() + 24);
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    #[cfg(windows)]
+    if encoded.len() >= 3 && encoded.as_bytes()[1] == b':' && encoded.as_bytes()[2] == b'/' {
+        encoded.insert(0, '/');
+    }
+    format!("file:{encoded}?mode=ro&immutable=1")
 }
 
 fn neighbor_for_direction(

@@ -3017,6 +3017,65 @@ test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async
   assert.equal(status.degraded_reason, "managed_cli_handoff_unspawnable");
 });
 
+test("fail-open status tool preserves primary runtime failures and no-project precedence", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const failures = [
+    ["managed_cli_asset_fetch_failed", "asset archive checksum failed", 1],
+    ["managed_cli_probe_failed", "version probe exited with status 2", 2],
+    ["managed_cli_handoff_unspawnable", "spawn EACCES", null],
+    ["runtime_stdio_child_exit", "codestory-cli serve --stdio exited with status 17", 17],
+  ];
+  const statuses = failures.map(([reason, failure, status]) => ({
+    plugin_runtime: { plugin_version: "test" },
+    managed_retrieval: { state: "unavailable" },
+    degraded_reason: reason,
+    readiness: [{
+      reason,
+      summary: `runtime unavailable: ${reason}`,
+      setup: { probe_error: failure, probe_status: status },
+    }],
+    recommended_next_calls: [],
+  }));
+  statuses.push(statuses[0]);
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `const statuses=${JSON.stringify(statuses)};`,
+    "run(()=>statuses.shift()||statuses.at(-1));",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.end([
+    ...failures.map((_, index) => JSON.stringify({
+      jsonrpc: "2.0",
+      id: index + 1,
+      method: "tools/call",
+      params: { name: "status", arguments: { project: repoRoot } },
+    })),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: failures.length + 1,
+      method: "tools/call",
+      params: { name: "status", arguments: {} },
+    }),
+    "",
+  ].join("\n"));
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  failures.forEach(([reason, failure], index) => {
+    const structured = responses.find((response) => response.id === index + 1)?.result.structuredContent;
+    assert.equal(structured.degraded_reason, reason);
+    assert.equal(structured.failure, failure);
+    assert.equal(structured.current_operation, null);
+  });
+  const noProject = responses.find((response) => response.id === failures.length + 1)?.result.structuredContent;
+  assert.equal(noProject.code, "project_required");
+  assert.equal(noProject.state, "no_project");
+  assert.equal(noProject.degraded_reason, undefined);
+});
+
 test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
   const { createServer } = await import("node:http");
   const version = await readPluginVersion();

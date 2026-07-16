@@ -15,6 +15,8 @@ use crate::AppController;
 use codestory_indexer::CancellationToken;
 use codestory_store::IndexPublicationRecord;
 use serde::Serialize;
+#[cfg(any(test, feature = "test-support"))]
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -22,6 +24,30 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_ACTIVATION_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const ACTIVATION_WAIT_SLICE: Duration = Duration::from_millis(25);
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static BEFORE_RETRIEVAL_PIN_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        RefCell::new(None);
+}
+
+/// Install a one-shot hostile publication hook for deterministic pinning tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_before_retrieval_pin_test_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_RETRIEVAL_PIN_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_before_retrieval_pin_test_hook() {
+    BEFORE_RETRIEVAL_PIN_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_before_retrieval_pin_test_hook() {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,14 +123,17 @@ struct ActivationCoordinatorState {
 
 #[derive(Debug, Clone)]
 struct ActivationTarget {
-    project: codestory_workspace::ProjectIdentityV3,
+    project_id: String,
+    workspace_id: String,
     storage_path: PathBuf,
 }
 
 impl ActivationTarget {
     fn new(project_root: &Path, storage_path: &Path) -> Self {
+        let project = codestory_workspace::project_identity_v3(project_root);
         Self {
-            project: codestory_workspace::project_identity_v3(project_root),
+            project_id: project.project_id,
+            workspace_id: project.workspace_id,
             storage_path: storage_path
                 .canonicalize()
                 .unwrap_or_else(|_| storage_path.to_path_buf()),
@@ -112,7 +141,8 @@ impl ActivationTarget {
     }
 
     fn matches(&self, other: &Self) -> bool {
-        self.project == other.project
+        self.project_id == other.project_id
+            && self.workspace_id == other.workspace_id
             && codestory_workspace::same_workspace_path(&self.storage_path, &other.storage_path)
     }
 }
@@ -554,6 +584,12 @@ impl PublicOperationService {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn retrieval_primary_enabled_for_test(&self) -> bool {
+        crate::agent::retrieval_primary::sidecar_retrieval_primary_enabled(&self.controller)
+    }
+
     /// Return the exact publications pinned by the currently executing public
     /// operation. Product caches use this inside the response builder instead
     /// of inferring identity from file metadata or partial sidecar status.
@@ -622,8 +658,11 @@ impl PublicOperationService {
                     Ok(value)
                 };
                 let (value, retrieval_publication) = if operation_requires_retrieval(operation) {
+                    run_before_retrieval_pin_test_hook();
                     crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
                         &self.controller,
+                        &publication.generation_id,
+                        &publication.run_id,
                         run,
                     )?
                 } else {
@@ -692,8 +731,11 @@ impl PublicOperationService {
                     Ok(value)
                 };
                 let (value, retrieval_publication) = if operation_requires_retrieval(operation) {
+                    run_before_retrieval_pin_test_hook();
                     crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
                         &self.controller,
+                        &publication.generation_id,
+                        &publication.run_id,
                         run,
                     )?
                 } else {
@@ -1161,6 +1203,39 @@ mod activation_tests {
     use super::*;
     use crate::Runtime;
     use std::fs;
+    use std::process::Command;
+
+    fn git(project: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .status()
+            .expect("run git fixture command");
+        assert!(status.success(), "git fixture command failed: {args:?}");
+    }
+
+    fn initialize_identifiable_git_project(project: &Path) {
+        git(project, &["init", "-q"]);
+        git(
+            project,
+            &["config", "user.email", "codestory-tests@example.com"],
+        );
+        git(project, &["config", "user.name", "CodeStory Tests"]);
+        fs::write(project.join("fixture.rs"), "pub fn clean_fixture() {}\n")
+            .expect("write clean fixture");
+        git(project, &["add", "fixture.rs"]);
+        git(project, &["commit", "-qm", "fixture"]);
+        git(
+            project,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/codestory/fixture.git",
+            ],
+        );
+    }
 
     #[test]
     fn activation_target_matches_existing_storage_by_native_identity() {
@@ -1186,6 +1261,35 @@ mod activation_tests {
         let aliased = ActivationTarget::new(project.path(), &dotted);
 
         assert!(target.matches(&aliased));
+    }
+
+    #[test]
+    fn activation_target_ignores_mutable_artifact_eligibility() {
+        let project = tempfile::tempdir().expect("project");
+        initialize_identifiable_git_project(project.path());
+        let storage = project.path().join("cache").join("codestory.db");
+        let clean_identity = codestory_workspace::project_identity_v3(project.path());
+        let clean = ActivationTarget::new(project.path(), &storage);
+
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn dirty_fixture() {}\n",
+        )
+        .expect("make fixture dirty");
+        let dirty_identity = codestory_workspace::project_identity_v3(project.path());
+        let dirty = ActivationTarget::new(project.path(), &storage);
+
+        assert_ne!(
+            clean_identity.artifact_scope_id,
+            dirty_identity.artifact_scope_id
+        );
+        assert_ne!(
+            clean_identity.portable_reuse_eligible,
+            dirty_identity.portable_reuse_eligible
+        );
+        assert_eq!(clean_identity.project_id, dirty_identity.project_id);
+        assert_eq!(clean_identity.workspace_id, dirty_identity.workspace_id);
+        assert!(clean.matches(&dirty));
     }
 
     #[test]

@@ -49,13 +49,10 @@ pub(crate) struct RuntimeContext {
     pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
-    /// Immutable logical/workspace/artifact identity captured when this
-    /// project context is opened. These identities must never be reconstructed
-    /// from a later path spelling or environment read.
-    pub(crate) project_identity: codestory_workspace::ProjectIdentityV3,
-    /// Native project identity plus the immutable runtime configuration used
-    /// to build this context. Multi-project transports use this key instead
-    /// of a path spelling or mutable process environment.
+    /// Stable logical/workspace identity plus the immutable runtime
+    /// configuration used to build this context. Multi-project transports use
+    /// this key instead of a path spelling, mutable artifact eligibility, or a
+    /// later process-environment read.
     pub(crate) context_key: ProjectContextKey,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
@@ -64,6 +61,7 @@ pub(crate) struct RuntimeContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ProjectContextKey {
+    pub(crate) project_id: String,
     pub(crate) workspace_id: String,
     pub(crate) configuration_id: String,
 }
@@ -206,6 +204,7 @@ impl RuntimeContext {
             &config.runtime_overrides(),
         );
         let context_key = ProjectContextKey {
+            project_id: project_identity.project_id.clone(),
             workspace_id: project_identity.workspace_id.clone(),
             configuration_id: runtime_configuration_id(&cache_root, &sidecar),
         };
@@ -221,7 +220,6 @@ impl RuntimeContext {
             browser: runtime.browser_service(),
             events,
             project_root,
-            project_identity,
             context_key,
             cache_root,
             storage_path,
@@ -337,7 +335,7 @@ fn runtime_configuration_id(
     // diagnostic identifiers.
     let mut identity = format!(
         "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        clean_path_string(&cache_root.to_string_lossy()),
+        configuration_path_identity(cache_root),
         sidecar.profile,
         sidecar.namespace,
         sidecar.embedding.allow_cpu,
@@ -357,12 +355,89 @@ fn runtime_configuration_id(
         sidecar.summary.max_tokens,
         sidecar.summary.timeout,
         sidecar.run_id.as_deref().unwrap_or(""),
-        clean_path_string(&sidecar.layout.lexical_data_dir.to_string_lossy()),
-        clean_path_string(&sidecar.layout.semantic_data_dir.to_string_lossy()),
-        clean_path_string(&sidecar.layout.scip_artifacts_root.to_string_lossy()),
-        clean_path_string(&sidecar.layout.state_file.to_string_lossy()),
+        configuration_path_identity(&sidecar.layout.lexical_data_dir),
+        configuration_path_identity(&sidecar.layout.semantic_data_dir),
+        configuration_path_identity(&sidecar.layout.scip_artifacts_root),
+        configuration_path_identity(&sidecar.layout.state_file),
     ));
     fnv1a_hex(identity.as_bytes())
+}
+
+fn configuration_path_identity(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        windows_ordinal_configuration_path_identity(path)
+    }
+    #[cfg(not(windows))]
+    {
+        clean_path_string(&path.to_string_lossy())
+    }
+}
+
+#[cfg(windows)]
+fn windows_ordinal_configuration_path_identity(path: &Path) -> String {
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LCMapStringEx(
+            locale_name: *const u16,
+            map_flags: u32,
+            source: *const u16,
+            source_len: i32,
+            destination: *mut u16,
+            destination_len: i32,
+            version_information: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+            sort_handle: isize,
+        ) -> i32;
+    }
+
+    const LCMAP_UPPERCASE: u32 = 0x0000_0200;
+    let normalized = clean_path_string(&path.to_string_lossy()).replace('/', "\\");
+    let source = normalized.encode_utf16().collect::<Vec<_>>();
+    let Ok(source_len) = i32::try_from(source.len()) else {
+        return normalized.to_uppercase();
+    };
+    let invariant_locale = [0_u16];
+    // SAFETY: all pointers remain valid for the supplied lengths. The invariant
+    // locale uses the same language-independent uppercase table as Windows
+    // ordinal ignore-case comparison.
+    let required = unsafe {
+        LCMapStringEx(
+            invariant_locale.as_ptr(),
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if required <= 0 {
+        return normalized.to_uppercase();
+    }
+    let mut mapped = vec![0_u16; required as usize];
+    // SAFETY: `mapped` has the size returned by the preceding mapping query.
+    let written = unsafe {
+        LCMapStringEx(
+            invariant_locale.as_ptr(),
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            mapped.as_mut_ptr(),
+            required,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if written <= 0 {
+        return normalized.to_uppercase();
+    }
+    String::from_utf16_lossy(&mapped[..written as usize])
 }
 
 /// Resolve a CLI target selector into one graph-backed search hit.
@@ -911,6 +986,33 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_configuration_identity_converges_case_and_extended_aliases_before_and_after_creation()
+     {
+        let temp = tempdir().expect("temp dir");
+        let mixed = temp.path().join("MissingCache").join("Nested");
+        let folded = temp.path().join("missingcache").join("nested");
+        let extended = PathBuf::from(format!(r"\\?\{}", folded.display()));
+
+        let before_mixed = canonicalize_configuration_path(&mixed).expect("mixed missing path");
+        let before_folded = canonicalize_configuration_path(&folded).expect("folded missing path");
+        let before_extended =
+            canonicalize_configuration_path(&extended).expect("extended missing path");
+        let expected = configuration_path_identity(&before_mixed);
+        assert_eq!(configuration_path_identity(&before_folded), expected);
+        assert_eq!(configuration_path_identity(&before_extended), expected);
+
+        fs::create_dir_all(&mixed).expect("create mixed-case configuration path");
+        let after_mixed = canonicalize_configuration_path(&mixed).expect("mixed existing path");
+        let after_folded = canonicalize_configuration_path(&folded).expect("folded existing path");
+        let after_extended =
+            canonicalize_configuration_path(&extended).expect("extended existing path");
+        assert_eq!(configuration_path_identity(&after_mixed), expected);
+        assert_eq!(configuration_path_identity(&after_folded), expected);
+        assert_eq!(configuration_path_identity(&after_extended), expected);
+    }
+
     #[test]
     fn ordinary_cli_graph_response_retries_the_whole_operation_after_publication_change() {
         let _env_lock = crate::config::config_env_test_lock();
@@ -974,6 +1076,128 @@ mod tests {
         assert_eq!(served_generation, current_generation);
     }
 
+    #[test]
+    fn retrieval_pin_mismatch_retries_before_building_the_public_response() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
+        unsafe {
+            env::set_var("CODESTORY_EMBED_ALLOW_CPU", "1");
+        }
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(project.join("src")).expect("create source dir");
+        let source = project.join("src/lib.rs");
+        fs::write(&source, "// core generation A\n").expect("write source");
+        let args = ProjectArgs {
+            project: project.clone(),
+            cache_dir: Some(cache),
+        };
+        let reader = RuntimeContext::new_agent_sidecar_with_startup(
+            &args,
+            &crate::config::process_startup_config(),
+        )
+        .expect("reader runtime");
+        reader
+            .ensure_open(RefreshMode::Full)
+            .expect("publish core generation A");
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &project,
+            &reader.storage_path,
+            &reader.sidecar,
+        )
+        .expect("publish retrieval generation A");
+        let retrieval_a = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &project,
+            Some(&reader.storage_path),
+            reader.sidecar.clone(),
+        )
+        .expect("inspect retrieval generation A");
+        assert!(retrieval_a.is_live_ready(), "{retrieval_a:?}");
+        assert!(
+            reader.public_operation.retrieval_primary_enabled_for_test(),
+            "strict retrieval fixture must be selected by the public operation"
+        );
+        let generation_a = reader
+            .project
+            .complete_index_publication_at(&reader.storage_path)
+            .expect("read generation A")
+            .expect("generation A exists");
+
+        let replacement_generation = generation_a.generation + 1;
+        let replacement_generation_id = "22222222-2222-4222-8222-222222222222".to_string();
+        let replacement_run_id = "between-pins-run-b".to_string();
+        let publisher_project = project.clone();
+        let publisher_storage = reader.storage_path.clone();
+        let publisher_runtime = reader.sidecar.clone();
+        let publisher_generation_id = replacement_generation_id.clone();
+        let publisher_run_id = replacement_run_id.clone();
+        codestory_runtime::set_before_retrieval_pin_test_hook(move || {
+            codestory_retrieval::test_support::publish_replacement_core_and_zero_dense_fixture(
+                &publisher_project,
+                &publisher_storage,
+                &publisher_runtime,
+                replacement_generation,
+                &publisher_generation_id,
+                &publisher_run_id,
+            )
+            .expect("publish core and retrieval generation B between pins");
+        });
+
+        let mut builds = 0_u32;
+        let operation = reader
+            .run_public_operation("graph_assisted", || {
+                builds += 1;
+                reader
+                    .public_operation
+                    .active_publication()
+                    .context("public response has active publications")
+            })
+            .expect("mismatched first pins should retry the complete operation");
+        let served_core = operation
+            .core_publication
+            .as_ref()
+            .expect("served core publication");
+        assert_eq!(operation.attempt, 2);
+        assert_eq!(
+            builds, 1,
+            "the mismatched attempt must not enter the builder"
+        );
+        let retrieval_b = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &project,
+            Some(&reader.storage_path),
+            reader.sidecar.clone(),
+        )
+        .expect("inspect retrieval generation B");
+        assert!(retrieval_b.is_live_ready(), "{retrieval_b:?}");
+        assert!(reader.public_operation.retrieval_primary_enabled_for_test());
+        let served_retrieval = operation
+            .retrieval_publication
+            .as_ref()
+            .expect("served retrieval publication");
+
+        assert_eq!(served_core.generation_id, replacement_generation_id);
+        assert_eq!(served_core.run_id, replacement_run_id);
+        assert_eq!(
+            served_retrieval.core_generation_id,
+            served_core.generation_id
+        );
+        assert_eq!(served_retrieval.core_run_id, served_core.run_id);
+        assert_eq!(
+            operation.value.core_publication.generation_id,
+            served_core.generation_id
+        );
+        assert_eq!(
+            operation
+                .value
+                .retrieval_publication
+                .expect("active retrieval publication")
+                .core_generation_id,
+            served_core.generation_id
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn project_aliases_capture_one_native_workspace_context() {
@@ -1012,7 +1236,7 @@ mod tests {
             &canonical.project_root,
             &aliased.project_root
         ));
-        assert_eq!(canonical.project_identity, aliased.project_identity);
+        assert_eq!(canonical.context_key, aliased.context_key);
         assert_eq!(canonical.cache_root, aliased.cache_root);
         assert_eq!(canonical.storage_path, aliased.storage_path);
     }

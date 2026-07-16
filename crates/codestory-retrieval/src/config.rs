@@ -325,16 +325,20 @@ impl SidecarRuntimeConfig {
         let Some(retained) = self.project_identity.as_ref() else {
             return Ok(current);
         };
-        if retained != &current {
+        if retained.project_id != current.project_id
+            || retained.workspace_id != current.workspace_id
+        {
             anyhow::bail!(
-                "project identity changed after retrieval runtime selection: retained_workspace_id={} retained_artifact_scope_id={} current_workspace_id={} current_artifact_scope_id={}; rebuild the runtime before publishing or querying retrieval artifacts",
+                "stable project identity changed after retrieval runtime selection: retained_project_id={} retained_workspace_id={} current_project_id={} current_workspace_id={}; rebuild the runtime before publishing or querying retrieval artifacts",
+                retained.project_id,
                 retained.workspace_id,
-                retained.artifact_scope_id,
+                current.project_id,
                 current.workspace_id,
-                current.artifact_scope_id,
             );
         }
-        Ok(retained.clone())
+        // Artifact eligibility follows the current verified source state. It is
+        // intentionally not part of the immutable runtime/context identity.
+        Ok(current)
     }
 }
 

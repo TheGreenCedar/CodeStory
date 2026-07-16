@@ -524,24 +524,18 @@ impl StdioServerSession {
             },
             &self.startup,
         )?;
-        if self.active_project.as_ref().is_some_and(|active| {
-            active.runtime.context_key == candidate.context_key
-                && active.runtime.project_identity == candidate.project_identity
-                && codestory_workspace::same_workspace_path(
-                    &active.runtime.project_root,
-                    &project_root,
-                )
-        }) {
+        if self
+            .active_project
+            .as_ref()
+            .is_some_and(|active| same_stdio_project_context(&active.runtime, &candidate))
+        {
             return Ok(());
         }
-        if let Some(position) = self.retained_projects.iter().position(|retained| {
-            retained.runtime.context_key == candidate.context_key
-                && retained.runtime.project_identity == candidate.project_identity
-                && codestory_workspace::same_workspace_path(
-                    &retained.runtime.project_root,
-                    &project_root,
-                )
-        }) {
+        if let Some(position) = self
+            .retained_projects
+            .iter()
+            .position(|retained| same_stdio_project_context(&retained.runtime, &candidate))
+        {
             let retained = self
                 .retained_projects
                 .remove(position)
@@ -565,6 +559,12 @@ impl StdioServerSession {
         }
         Ok(())
     }
+}
+
+fn same_stdio_project_context(left: &RuntimeContext, right: &RuntimeContext) -> bool {
+    left.context_key == right.context_key
+        && codestory_workspace::same_workspace_path(&left.project_root, &right.project_root)
+        && codestory_workspace::same_workspace_path(&left.storage_path, &right.storage_path)
 }
 
 impl Drop for StdioServerSession {
@@ -4762,6 +4762,7 @@ fn read_stdio_template_resource(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::process::Command;
 
     #[test]
     fn query_resolved_graph_tools_use_the_complete_retrieval_operation() {
@@ -5868,6 +5869,145 @@ version = "0.11.20"
     }
 
     #[test]
+    fn multi_project_session_reuses_activation_across_clean_dirty_and_alias_transitions() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "codestory-tests@example.com"]);
+        git(&["config", "user.name", "CodeStory Tests"]);
+        std::fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn clean_fixture() {}\n",
+        )
+        .expect("write clean fixture");
+        git(&["add", "fixture.rs"]);
+        git(&["commit", "-qm", "fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/codestory/stdio-fixture.git",
+        ]);
+
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select clean project");
+        let active = session
+            .active_project
+            .as_mut()
+            .expect("clean project active");
+        active.state.status_cache = Some(StdioStatusCacheEntry {
+            key: "stable-context".into(),
+            value: json!({"project": "stable"}),
+            cached_at: Instant::now(),
+        });
+        let context_key = active.runtime.context_key.clone();
+        let project_root = active.runtime.project_root.clone();
+        let storage_path = active.runtime.storage_path.clone();
+        let activation = active.runtime.activation.clone();
+        let _ = activation.activate_project_with_foreground_budget(
+            &project_root,
+            &storage_path,
+            Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+        );
+        let first_operation = activation.snapshot().expect("activation snapshot");
+        let clean_identity = codestory_workspace::project_identity_v3(project.path());
+
+        std::fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn dirty_fixture() {}\n",
+        )
+        .expect("make project dirty");
+        let dirty_identity = codestory_workspace::project_identity_v3(project.path());
+        assert_ne!(
+            clean_identity.artifact_scope_id,
+            dirty_identity.artifact_scope_id
+        );
+        session
+            .select_project(project.path().join(".").to_str())
+            .expect("reselect dirty project through alias");
+
+        let active = session
+            .active_project
+            .as_ref()
+            .expect("dirty project active");
+        assert_eq!(active.runtime.context_key, context_key);
+        assert_eq!(
+            active
+                .state
+                .status_cache
+                .as_ref()
+                .map(|cached| cached.key.as_str()),
+            Some("stable-context")
+        );
+        assert!(
+            session.retained_projects.is_empty(),
+            "same project created a second context"
+        );
+        assert_eq!(
+            active
+                .runtime
+                .activation
+                .snapshot()
+                .expect("reused activation snapshot")
+                .operation_id,
+            first_operation.operation_id
+        );
+
+        if matches!(
+            active
+                .runtime
+                .activation
+                .snapshot()
+                .map(|snapshot| snapshot.state),
+            Some(
+                codestory_runtime::ActivationState::Preparing
+                    | codestory_runtime::ActivationState::Updating
+            )
+        ) {
+            let _ = active
+                .runtime
+                .activation
+                .activate_project_with_foreground_budget(
+                    &active.runtime.project_root,
+                    &active.runtime.storage_path,
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::ZERO,
+                );
+            assert_eq!(
+                active
+                    .runtime
+                    .activation
+                    .snapshot()
+                    .expect("joined activation snapshot")
+                    .operation_id,
+                first_operation.operation_id
+            );
+        }
+        active.runtime.activation.cancel_and_wait();
+    }
+
+    #[test]
     fn cold_status_is_observational_for_project_storage() {
         let project = tempfile::tempdir().expect("project");
         let parent = tempfile::tempdir().expect("cache parent");
@@ -5934,5 +6074,49 @@ version = "0.11.20"
             !cold_cache_root.exists(),
             "cold project resource must not create project cache storage"
         );
+    }
+
+    #[test]
+    fn published_status_preserves_database_and_sqlite_sidecar_bytes() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn status_fixture() {}\n",
+        )
+        .expect("write status fixture");
+        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("runtime context");
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish status fixture");
+        let observed_paths = [
+            runtime.storage_path.clone(),
+            PathBuf::from(format!("{}-wal", runtime.storage_path.display())),
+            PathBuf::from(format!("{}-shm", runtime.storage_path.display())),
+            PathBuf::from(format!("{}-journal", runtime.storage_path.display())),
+        ];
+        let snapshot = || {
+            observed_paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        path.exists()
+                            .then(|| std::fs::read(path).expect("read observed file")),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+
+        let status = read_stdio_status_resource_cached(&runtime, &mut StdioServerState::default())
+            .expect("read published status observationally");
+        assert!(status.get("index_publication").is_some());
+
+        assert_eq!(snapshot(), before, "status changed SQLite product state");
     }
 }

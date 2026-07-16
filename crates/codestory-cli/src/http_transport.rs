@@ -153,7 +153,7 @@ pub(crate) fn handle_http_request(
                     .definition_context(target.selected.node_id.clone())
                     .map_err(map_api_error)?;
                 Ok(serde_json::json!({
-                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
+                    "resolution": build_query_resolution_output(&runtime.project_root, target),
                     "definition": build_search_hit_output(&runtime.project_root, &target.selected, Some(&target.requested), false, &[]),
                     "symbol": context,
                 }))
@@ -174,7 +174,7 @@ pub(crate) fn handle_http_request(
                     .references_context(browser_references_config(target.selected.node_id.clone()))
                     .map_err(map_api_error)?;
                 Ok(serde_json::json!({
-                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
+                    "resolution": build_query_resolution_output(&runtime.project_root, target),
                     "references": context,
                 }))
             }) {

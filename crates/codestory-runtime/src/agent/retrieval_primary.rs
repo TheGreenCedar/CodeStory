@@ -124,6 +124,29 @@ fn publication_dto(pinned: &PinnedRetrievalRead) -> EmbeddingVectorPublicationId
     }
 }
 
+fn ensure_pinned_core_publication(
+    pinned: &PinnedRetrievalRead,
+    expected_core_generation_id: &str,
+    expected_core_run_id: &str,
+) -> Result<(), ApiError> {
+    let publication = pinned.session.publication_identity();
+    if publication.core_generation_id == expected_core_generation_id
+        && publication.core_run_id == expected_core_run_id
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        "publication_changed",
+        format!(
+            "publication_changed: retrieval pin belongs to core generation {}/{} but the public operation pinned {}/{}; retry the complete operation",
+            publication.core_generation_id,
+            publication.core_run_id,
+            expected_core_generation_id,
+            expected_core_run_id,
+        ),
+    ))
+}
+
 pub(crate) fn active_pinned_retrieval_publication(
     controller: &AppController,
 ) -> Option<EmbeddingVectorPublicationIdentityDto> {
@@ -195,18 +218,22 @@ pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>
 
 pub(crate) fn with_pinned_retrieval_publication_value<T>(
     controller: &AppController,
+    expected_core_generation_id: &str,
+    expected_core_run_id: &str,
     build: impl FnOnce() -> Result<T, ApiError>,
 ) -> Result<(T, Option<EmbeddingVectorPublicationIdentityDto>), ApiError> {
     if !sidecar_retrieval_primary_enabled(controller) {
         return build().map(|value| (value, None));
     }
     if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
         let publication = publication_dto(&pinned);
         let value = build()?;
         return Ok((value, Some(publication)));
     }
 
     let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
+    ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
     let publication = publication_dto(&pinned);
     with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
         build().and_then(|value| {

@@ -131,6 +131,9 @@ use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
     semantic_symbol_role_aliases,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
     ActivationCapabilities, ActivationCapabilityState, ActivationOperation, ActivationRun,
     ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
@@ -8971,11 +8974,12 @@ impl AppController {
         if !storage_path.is_file() {
             return Ok(None);
         }
-        Store::database_complete_index_publication(storage_path)
+        Store::open_observational(storage_path)
+            .and_then(|storage| storage.get_complete_index_publication())
             .map(|publication| publication.map(index_publication_dto))
             .map_err(|error| {
                 ApiError::internal(format!(
-                    "Failed to read complete index publication: {error}"
+                    "Failed to observe complete index publication: {error}"
                 ))
             })
     }
@@ -9139,14 +9143,9 @@ impl AppController {
         if !storage_path.is_file() {
             return Ok(None);
         }
-        let schema = Storage::database_schema_version(&storage_path).map_err(|error| {
-            ApiError::internal(format!("Failed to inspect storage schema: {error}"))
+        let storage = Storage::open_observational(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to open storage observationally: {error}"))
         })?;
-        if schema != CURRENT_SCHEMA_VERSION {
-            return Ok(None);
-        }
-        let storage = Storage::open_read_only(&storage_path)
-            .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))?;
         let snapshot = storage.read_snapshot().map_err(|error| {
             ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
         })?;
