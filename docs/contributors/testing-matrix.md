@@ -228,6 +228,7 @@ Workflow edits run:
 npm ci --ignore-scripts
 node scripts/codestory-release-claims.mjs validate --repo .
 node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
+node --test .github/scripts/run-actionlint.test.mjs
 node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
 node --test .github/scripts/check-workflow-policy.test.mjs
@@ -241,12 +242,28 @@ release evidence gate evaluates that graph; workflow policy consumes its
 runner, target, promotion, retention, and proof-chain facts. Update the graph
 instead of copying those facts into contributor prose.
 
+The command-line evaluator derives repository, commit, and source-tree identity
+from `--repo` and the full `--expected-sha`; evidence documents cannot supply
+those trusted values. Other required CLI identities and exceptions use
+`--expected-identity` and `--expected-exceptions` JSON files from separately
+trusted inputs; release-evidence library callers bind them from the approved
+candidate profile or graph constraints. Risk-bearing dependencies must be named
+as requested claims with their own accepted risks. An approved regression stays
+`pass_with_exception` through the evidence row, claim, evaluation, and report,
+with approval schema v3 candidate/baseline bindings, owner, rationale, approval
+and expiry dates, and rollback evidence. It never becomes an unqualified pass.
+
 Workflow syntax and repository semantics are separate gates. The actionlint
 wrapper checks every workflow with `.github/actionlint.yaml` using the declared
-v1.7.12 binary or a checksum-verified official archive. Workflow policy then
+v1.7.12 binary or a checksum-verified official archive, and must reject the
+controlled-invalid syntax fixture. Its unit tests cover every declared host
+platform, archive checksum failure, and cached-binary version/provenance.
+Workflow policy then
 checks CodeStory-specific exact-SHA, protected-environment, least-privilege,
-artifact-retention, matrix, and promotion contracts. Its controlled-invalid
-fixtures must retain their class-prefixed diagnostics.
+secret-forwarding, artifact-retention, matrix, and promotion contracts. Job
+permission overrides are part of the effective permission set; protected
+reusable callers cannot inherit secrets or forward undeclared names. Semantic
+controlled-invalid fixtures must retain their class-prefixed diagnostics.
 
 Draft pushes run focused checks and one Linux source check. Exact-head review
 runs the broad source gate once. Packaged matrices and protected hardware run

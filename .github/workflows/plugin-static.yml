@@ -12,7 +12,9 @@ on:
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
+      - .github/scripts/fixtures/actionlint-invalid.yml
       - .github/scripts/run-actionlint.mjs
+      - .github/scripts/run-actionlint.test.mjs
       - .github/actionlint.yaml
       - release-claims.json
       - scripts/codestory-release-claims.mjs
@@ -66,7 +68,9 @@ on:
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
+      - .github/scripts/fixtures/actionlint-invalid.yml
       - .github/scripts/run-actionlint.mjs
+      - .github/scripts/run-actionlint.test.mjs
       - .github/actionlint.yaml
       - release-claims.json
       - scripts/codestory-release-claims.mjs
@@ -133,7 +137,9 @@ jobs:
         run: node --test scripts/tests/prepare-embedded-model.test.mjs
 
       - name: Check workflow syntax
-        run: node .github/scripts/run-actionlint.mjs
+        run: |
+          node --test .github/scripts/run-actionlint.test.mjs
+          node .github/scripts/run-actionlint.mjs
 
       - name: Check release claim and evidence contracts
         run: >-

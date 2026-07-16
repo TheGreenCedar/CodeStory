@@ -35,6 +35,39 @@
       "op": "delete"
     },
     {
+      "id": "job-permissions-override",
+      "class_prefix": "[permissions_secrets]",
+      "workflow": "release-candidate-evidence.yml",
+      "job": "measure",
+      "field": [
+        "permissions"
+      ],
+      "value": {
+        "contents": "write"
+      }
+    },
+    {
+      "id": "protected-caller-secrets-inherit",
+      "class_prefix": "[permissions_secrets]",
+      "workflow": "packaged-platform-pr.yml",
+      "job": "release-evidence",
+      "field": [
+        "secrets"
+      ],
+      "value": "inherit"
+    },
+    {
+      "id": "protected-caller-undeclared-secret",
+      "class_prefix": "[permissions_secrets]",
+      "workflow": "release.yml",
+      "job": "release-evidence",
+      "field": [
+        "secrets",
+        "EXTRA_SECRET"
+      ],
+      "value": "${{ secrets.EXTRA_SECRET }}"
+    },
+    {
       "id": "artifact-retention",
       "class_prefix": "[artifact_retention]",
       "workflow": "release-candidate-evidence.yml",

@@ -136,8 +136,11 @@ unit or aggregation changes. The normalized report records the candidate and
 baseline hashes, full commits, artifact hashes and sizes, and every metric's
 status and decision. A regression exits nonzero. Each exception is bound to the
 exact candidate hash, baseline id/hash, full commit, profile, metric, measured
-value, threshold, owner, ISO approval date, rationale, and unexpired date.
-Approval never updates the pinned baseline.
+value, threshold, owner, ISO approval date, rationale, unexpired date, and
+rollback evidence under approval schema v3. Accepted exceptions remain
+`pass_with_exception` in the evidence row, claim, evaluation, and report.
+Approval never updates the pinned baseline or converts the regression to plain
+pass.
 
 Packet provenance is finalized only after publishable blockers are calculated.
 The evaluator does not trust its status label: it requires an empty blocker

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -8,6 +9,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/u;
+const IDENTITY_FORMATS = new Set([
+  "baseline_id",
+  "git_sha",
+  "github_repository",
+  "identifier",
+  "non_empty_text",
+  "release_target",
+  "semver",
+  "sha256",
+  "versioned_contract",
+]);
 const REQUIRED_CLAIMS = [
   "accelerator_execution",
   "answer_quality",
@@ -62,6 +75,59 @@ function stringArray(value, label, { nonEmpty = false } = {}) {
   return values;
 }
 
+function validIsoDate(value) {
+  if (typeof value !== "string" || !ISO_DATE.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function identityMatchesFormat(value, format) {
+  if (typeof value !== "string" || value.trim() !== value || value === "") return false;
+  switch (format) {
+    case "git_sha": return FULL_SHA.test(value);
+    case "sha256": return SHA256.test(value);
+    case "github_repository": return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value);
+    case "semver": return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(value);
+    case "identifier":
+    case "release_target": return /^[A-Za-z0-9][A-Za-z0-9._:/+-]*$/u.test(value);
+    case "baseline_id": return /^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$/u.test(value);
+    case "versioned_contract": return /^[A-Za-z0-9][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._+-]+)*\/v[1-9]\d*$/u.test(value);
+    case "non_empty_text": return value.length > 0;
+    default: return false;
+  }
+}
+
+function git(args, repoRoot) {
+  const result = spawnSync("git", args, { cwd: repoRoot, encoding: "utf8" });
+  if (result.status !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${String(result.status)}`;
+    fail(`git ${args.join(" ")} failed: ${detail}`);
+  }
+  return result.stdout.trim();
+}
+
+function githubRepositoryFromRemote(remote) {
+  const match = remote.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/u);
+  if (!match) fail(`cannot derive GitHub repository identity from origin ${remote}`);
+  return match[1];
+}
+
+export function deriveTrustedGitIdentity({ repoRoot, expectedSha }) {
+  const commit = nonEmptyText(expectedSha, "expectedSha").toLowerCase();
+  if (!FULL_SHA.test(commit)) fail("expectedSha must be a full lowercase Git SHA");
+  git(["cat-file", "-e", `${commit}^{commit}`], repoRoot);
+  const resolvedCommit = git(["rev-parse", `${commit}^{commit}`], repoRoot).toLowerCase();
+  if (resolvedCommit !== commit) fail("expectedSha must identify a commit object directly");
+  const sourceTree = git(["rev-parse", `${commit}^{tree}`], repoRoot).toLowerCase();
+  if (!FULL_SHA.test(sourceTree)) fail(`git returned invalid tree identity for ${commit}`);
+  const remote = git(["config", "--get", "remote.origin.url"], repoRoot);
+  return {
+    repository: githubRepositoryFromRemote(remote),
+    commit,
+    source_tree: sourceTree,
+  };
+}
+
 function uniqueById(values, label) {
   if (!Array.isArray(values) || values.length === 0) fail(`${label} must be a non-empty array`);
   const found = new Map();
@@ -107,6 +173,14 @@ export function validateReleaseClaimGraph(graph) {
   if (JSON.stringify(identityBinding) !== JSON.stringify(["repository", "commit", "source_tree"])) {
     fail("release claim graph evidence identity binding must be repository, commit, source_tree");
   }
+  const identityFormats = object(evidencePolicy.identity_formats, "release claim graph.evidence_policy.identity_formats");
+  for (const [key, format] of Object.entries(identityFormats)) {
+    nonEmptyText(key, "release claim graph evidence identity key");
+    if (!IDENTITY_FORMATS.has(format)) fail(`identity ${key} uses unknown format ${String(format)}`);
+  }
+  for (const key of identityBinding) {
+    if (!identityFormats[key]) fail(`identity ${key} must declare a format`);
+  }
 
   const tiers = uniqueById(graph.proof_tiers, "release claim graph.proof_tiers");
   const ranks = new Set();
@@ -127,6 +201,16 @@ export function validateReleaseClaimGraph(graph) {
     const identity = stringArray(evidence.required_identity, `evidence type ${id}.required_identity`, { nonEmpty: true });
     for (const required of ["repository", "commit", "source_tree"]) {
       if (!identity.includes(required)) fail(`evidence type ${id} must require ${required} identity`);
+    }
+    for (const key of identity) {
+      if (!identityFormats[key]) fail(`evidence type ${id} identity ${key} must declare a format`);
+    }
+    const constraints = object(evidence.identity_constraints ?? {}, `evidence type ${id}.identity_constraints`);
+    for (const [key, value] of Object.entries(constraints)) {
+      if (!identity.includes(key)) fail(`evidence type ${id} constrains non-required identity ${key}`);
+      if (!identityMatchesFormat(value, identityFormats[key])) {
+        fail(`evidence type ${id} constraint ${key} does not match ${identityFormats[key]}`);
+      }
     }
   }
 
@@ -280,6 +364,71 @@ function addFailure(failures, failureClass, claim, evidence, message) {
   });
 }
 
+function exceptionProblems(
+  exception,
+  trustedException,
+  trustedIdentity,
+  expectedCommit,
+  evaluatedAt,
+  evidenceId,
+) {
+  const problems = [];
+  if (exception === null || typeof exception !== "object" || Array.isArray(exception)) {
+    return [`${evidenceId} pass_with_exception requires structured exception evidence`];
+  }
+  if (exception.schema !== "codestory.release-claim-exception/v1") {
+    problems.push(`${evidenceId} exception uses an unsupported schema`);
+  }
+  if (!Array.isArray(exception.approvals) || exception.approvals.length === 0) {
+    problems.push(`${evidenceId} exception must contain at least one approval`);
+  } else {
+    for (const [index, value] of exception.approvals.entries()) {
+      const label = `${evidenceId} exception approval ${index}`;
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        problems.push(`${label} must be an object`);
+        continue;
+      }
+      for (const key of ["profile", "baseline_id", "metric", "owner", "rationale", "rollback_evidence"]) {
+        if (typeof value[key] !== "string" || value[key].trim() === "") {
+          problems.push(`${label} must bind non-empty ${key}`);
+        }
+      }
+      for (const key of ["candidate_sha256", "baseline_sha256"]) {
+        if (!SHA256.test(String(value[key] ?? ""))) problems.push(`${label} ${key} must be SHA-256`);
+      }
+      if (value.commit !== expectedCommit) problems.push(`${label} commit does not match ${expectedCommit}`);
+      for (const key of ["profile", "baseline_id", "baseline_sha256"]) {
+        if (value[key] !== trustedIdentity[key]) {
+          problems.push(`${label} ${key} does not match the evidence identity`);
+        }
+      }
+      if (typeof value.measured_value !== "number" || !Number.isFinite(value.measured_value)) {
+        problems.push(`${label} measured_value must be finite`);
+      }
+      if (typeof value.threshold !== "number" || !Number.isFinite(value.threshold)) {
+        problems.push(`${label} threshold must be finite`);
+      }
+      if (!validIsoDate(value.approved_at) || !validIsoDate(value.expires_at)) {
+        problems.push(`${label} approval and expiry must be valid ISO dates`);
+      } else {
+        const evaluatedDate = new Date(evaluatedAt).toISOString().slice(0, 10);
+        if (value.approved_at > evaluatedDate
+            || value.expires_at < value.approved_at
+            || value.expires_at < evaluatedDate) {
+          problems.push(`${label} is future-dated, expired, or expires before approval`);
+        }
+      }
+    }
+  }
+  if (trustedException === undefined) {
+    problems.push(`${evidenceId} exception is not present in separately trusted inputs`);
+  } else if (JSON.stringify(canonicalReleaseClaimValue(exception))
+      !== JSON.stringify(canonicalReleaseClaimValue(trustedException))) {
+    problems.push(`${evidenceId} exception does not match separately trusted approval evidence`);
+  }
+  return problems;
+}
+
 export function evaluateReleaseClaims({ graph, requested_claims: requestedClaims, evidence, expected }) {
   validateReleaseClaimGraph(graph);
   if (!Array.isArray(requestedClaims) || requestedClaims.length === 0) fail("requested_claims must be a non-empty array");
@@ -288,12 +437,16 @@ export function evaluateReleaseClaims({ graph, requested_claims: requestedClaims
   const expectedCommit = nonEmptyText(expected.commit, "expected.commit").toLowerCase();
   if (!FULL_SHA.test(expectedCommit)) fail("expected.commit must be a full lowercase Git SHA");
   const expectedIdentity = object(expected.identity ?? {}, "expected.identity");
+  if (expectedIdentity.commit !== undefined && expectedIdentity.commit !== expectedCommit) {
+    fail("expected.identity.commit conflicts with expected.commit");
+  }
   for (const key of ["repository", "source_tree"]) {
     nonEmptyText(expectedIdentity[key], `expected.identity.${key}`);
   }
   if (!FULL_SHA.test(expectedIdentity.source_tree)) {
     fail("expected.identity.source_tree must be a full lowercase Git tree SHA");
   }
+  const expectedExceptions = object(expected.exceptions ?? {}, "expected.exceptions");
   const evaluatedAtText = nonEmptyText(expected.evaluated_at ?? new Date().toISOString(), "expected.evaluated_at");
   const evaluatedAt = Date.parse(evaluatedAtText);
   if (!Number.isFinite(evaluatedAt) || new Date(evaluatedAt).toISOString() !== evaluatedAtText) {
@@ -347,11 +500,22 @@ export function evaluateReleaseClaims({ graph, requested_claims: requestedClaims
   }
   for (const claimId of orderedClaims) {
     const claim = claims.get(claimId);
+    const explicitlyRequested = requests.has(claimId);
     const request = requests.get(claimId) ?? { id: claimId, accepted_risks: [] };
     const acceptedRisks = new Set(request.accepted_risks);
-    for (const risk of claim.accepted_risks) {
-      if (!acceptedRisks.has(risk)) {
-        addFailure(failures, "accepted_risk", claimId, null, `claim ${claimId} requires explicit acceptance of ${risk}`);
+    if (!explicitlyRequested && claim.accepted_risks.length > 0) {
+      addFailure(
+        failures,
+        "accepted_risk",
+        claimId,
+        null,
+        `risk-bearing dependency ${claimId} must be explicitly requested with its own accepted_risks`,
+      );
+    } else {
+      for (const risk of claim.accepted_risks) {
+        if (!acceptedRisks.has(risk)) {
+          addFailure(failures, "accepted_risk", claimId, null, `claim ${claimId} requires explicit acceptance of ${risk}`);
+        }
       }
     }
     for (const unknownRisk of acceptedRisks) {
@@ -363,27 +527,37 @@ export function evaluateReleaseClaims({ graph, requested_claims: requestedClaims
     const requirementResults = [];
     for (const dependency of claim.depends_on_claims) {
       const dependencyResult = results.find((result) => result.id === dependency);
-      if (dependencyResult?.status !== "pass") {
+      if (!new Set(["pass", "pass_with_exception"]).has(dependencyResult?.status)) {
         addFailure(failures, "failed_evidence", claimId, `claim:${dependency}`, `claim ${claimId} dependency ${dependency} did not pass`);
       }
     }
     for (const requirement of claim.required_evidence) {
       const definition = evidenceTypes.get(requirement);
+      const trustedIdentity = { ...expectedIdentity, commit: expectedCommit };
+      for (const [key, value] of Object.entries(definition.identity_constraints ?? {})) {
+        if (expectedIdentity[key] !== undefined && expectedIdentity[key] !== value) {
+          fail(`expected.identity.${key} conflicts with the release claim graph`);
+        }
+        trustedIdentity[key] = value;
+      }
       const rows = evidenceByType.get(requirement) ?? [];
       if (rows.length === 0) {
         addFailure(failures, "missing", claimId, requirement, `claim ${claimId} is missing ${requirement} evidence`);
         requirementResults.push({ type: requirement, status: "missing" });
         continue;
       }
-      let anyPassing = false;
+      let allPassing = true;
+      let hasException = false;
+      const requirementExceptions = [];
       for (const row of rows) {
         const evidenceId = String(row.id ?? `${requirement}[${row._index}]`);
         const before = failures.length;
+        let boundException = null;
         if (row.graph_sha256 !== graphDigest) {
           addFailure(failures, "stale_evidence", claimId, evidenceId, `${evidenceId} is bound to a stale release claim graph`);
         }
         const identity = object(row.identity ?? {}, `${evidenceId}.identity`);
-        if (String(identity.commit ?? "").toLowerCase() !== expectedCommit) {
+        if (identity.commit !== expectedCommit) {
           addFailure(failures, "stale_sha", claimId, evidenceId, `${evidenceId} commit does not match ${expectedCommit}`);
         }
         if (!FULL_SHA.test(String(identity.source_tree ?? "")) || identity.source_tree !== expectedIdentity.source_tree) {
@@ -406,34 +580,82 @@ export function evaluateReleaseClaims({ graph, requested_claims: requestedClaims
           addFailure(failures, "incompatible_tier_identity", claimId, evidenceId, `${evidenceId} tier ${String(row.tier)} cannot satisfy ${claim.minimum_tier}`);
         }
         for (const key of definition.required_identity) {
-          if (identity[key] === undefined || identity[key] === null || identity[key] === "") {
-            addFailure(failures, "incompatible_tier_identity", claimId, evidenceId, `${evidenceId} is missing required identity ${key}`);
-          } else if (key !== "source_tree" && expectedIdentity[key] !== undefined && identity[key] !== expectedIdentity[key]) {
+          const format = graph.evidence_policy.identity_formats[key];
+          if (!identityMatchesFormat(trustedIdentity[key], format)) {
+            addFailure(failures, "incompatible_tier_identity", claimId, evidenceId, `${evidenceId} has no trusted ${key} identity matching ${format}`);
+          } else if (!identityMatchesFormat(identity[key], format)) {
+            addFailure(failures, "incompatible_tier_identity", claimId, evidenceId, `${evidenceId} identity ${key} does not match ${format}`);
+          } else if (identity[key] !== trustedIdentity[key]) {
             addFailure(failures, "incompatible_tier_identity", claimId, evidenceId, `${evidenceId} identity ${key} does not match the requested release`);
           }
         }
-        if (row.status !== "pass") {
+        if (row.status === "pass_with_exception") {
+          hasException = true;
+          const problems = exceptionProblems(
+            row.exception,
+            expectedExceptions[evidenceId],
+            trustedIdentity,
+            expectedCommit,
+            evaluatedAt,
+            evidenceId,
+          );
+          for (const problem of problems) {
+            addFailure(failures, "failed_evidence", claimId, evidenceId, problem);
+          }
+          if (problems.length === 0) {
+            boundException = { evidence: evidenceId, ...structuredClone(row.exception) };
+          }
+        } else if (row.status !== "pass") {
           addFailure(failures, "failed_evidence", claimId, evidenceId, `${evidenceId} status is ${String(row.status)}`);
         }
-        if (failures.length === before) anyPassing = true;
+        if (failures.length !== before) {
+          allPassing = false;
+        } else if (boundException) {
+          requirementExceptions.push(boundException);
+        }
       }
-      requirementResults.push({ type: requirement, status: anyPassing ? "pass" : "fail" });
+      const requirementStatus = !allPassing
+        ? "fail"
+        : hasException ? "pass_with_exception" : "pass";
+      requirementResults.push({
+        type: requirement,
+        status: requirementStatus,
+        ...(requirementExceptions.length > 0 ? { exceptions: requirementExceptions } : {}),
+      });
     }
     const claimFailures = failures.filter((failure) => failure.claim === claimId);
+    const carriesException = requirementResults.some(({ status }) => status === "pass_with_exception")
+      || claim.depends_on_claims.some((dependency) => results.find(({ id }) => id === dependency)?.status === "pass_with_exception");
+    const claimStatus = claimFailures.length > 0
+      ? "fail"
+      : carriesException ? "pass_with_exception" : "pass";
+    const directExceptions = requirementResults.flatMap(({ exceptions = [] }) => exceptions);
+    const inheritedExceptions = claim.depends_on_claims.flatMap((dependency) => {
+      const dependencyResult = results.find(({ id }) => id === dependency);
+      return (dependencyResult?.exceptions ?? []).map((exception) => ({
+        ...structuredClone(exception),
+        inherited_from_claim: dependency,
+      }));
+    });
+    const claimExceptions = [...directExceptions, ...inheritedExceptions];
     results.push({
       id: claimId,
       minimum_tier: claim.minimum_tier,
-      status: claimFailures.length === 0 ? "pass" : "fail",
+      status: claimStatus,
       evidence: requirementResults,
       accepted_risks: [...acceptedRisks].sort(),
       non_claims: [...claim.non_claims],
+      ...(claimExceptions.length > 0 ? { exceptions: claimExceptions } : {}),
     });
   }
   sortedFailures(failures);
   results.sort((left, right) => left.id.localeCompare(right.id));
+  const evaluationStatus = failures.length > 0
+    ? "fail"
+    : results.some(({ status }) => status === "pass_with_exception") ? "pass_with_exception" : "pass";
   return {
     schema: "codestory.release-claim-evaluation/v1",
-    status: failures.length === 0 ? "pass" : "fail",
+    status: evaluationStatus,
     graph_schema: graph.schema,
     graph_sha256: graphDigest,
     evidence_selection: graph.evidence_policy.selection,
@@ -466,18 +688,31 @@ function main() {
   }
   if (command === "evaluate") {
     const document = JSON.parse(readFileSync(nonEmptyText(values.evidence, "--evidence"), "utf8"));
+    const gitIdentity = deriveTrustedGitIdentity({ repoRoot, expectedSha: values["expected-sha"] });
+    const suppliedIdentity = values["expected-identity"]
+      ? object(JSON.parse(readFileSync(values["expected-identity"], "utf8")), "--expected-identity")
+      : {};
+    for (const key of ["repository", "commit", "source_tree"]) {
+      if (suppliedIdentity[key] !== undefined && suppliedIdentity[key] !== gitIdentity[key]) {
+        fail(`--expected-identity ${key} conflicts with Git identity derived from --repo`);
+      }
+    }
+    const suppliedExceptions = values["expected-exceptions"]
+      ? object(JSON.parse(readFileSync(values["expected-exceptions"], "utf8")), "--expected-exceptions")
+      : {};
     const evaluation = evaluateReleaseClaims({
       graph,
       requested_claims: document.requested_claims,
       evidence: document.evidence,
       expected: {
-        commit: values["expected-sha"],
+        commit: gitIdentity.commit,
         evaluated_at: values["evaluated-at"],
-        identity: document.expected_identity ?? {},
+        identity: { ...suppliedIdentity, ...gitIdentity },
+        exceptions: suppliedExceptions,
       },
     });
     console.log(JSON.stringify(evaluation, null, 2));
-    if (evaluation.status !== "pass") process.exitCode = 1;
+    if (evaluation.status === "fail") process.exitCode = 1;
     return;
   }
   fail("command must be validate or evaluate");

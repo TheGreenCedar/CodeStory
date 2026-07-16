@@ -150,6 +150,12 @@ artifact and evaluates it again without producing new measurements. Before the
 download, it requires a failed trusted evidence workflow from this repository
 whose head is the exact evidence SHA.
 
+The approval document uses schema v3. Each metric exception binds the candidate
+and baseline hashes, commit, profile, measured value, threshold, owner,
+approval and expiry dates, rationale, and concrete rollback evidence. An
+accepted candidate remains `pass_with_exception` in the claim evaluation and
+release report; approval does not turn the regression into a plain pass.
+
 GitHub does not expose environment-only secrets across a reusable-workflow
 call. Store the short-lived approval as the repository Actions secret
 `CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON`; `release.yml` passes only that named

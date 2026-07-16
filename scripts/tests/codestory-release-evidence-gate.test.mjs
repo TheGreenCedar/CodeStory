@@ -197,7 +197,7 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   assert.ok(report.release_claim_evaluation.failures.some(({ class: failureClass, claim }) => failureClass === "failed_evidence" && claim === "performance"));
   const row = report.metrics.find(({ metric }) => metric === "status_seconds");
   const approval = {
-    schema_version: 2,
+    schema_version: 3,
     metrics: {
       status_seconds: {
         candidate_sha256: report.candidate_sha256,
@@ -211,7 +211,8 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
         owner: "release owner",
         approved_at: "2026-07-11",
         expires_at: "2099-07-11",
-        rationale: "Bound contract exception"
+        rationale: "Bound contract exception",
+        rollback_evidence: "Revert the candidate and restore the accepted baseline"
       }
     }
   };
@@ -219,13 +220,36 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(readFileSync(reportPath)).release_claim_evaluation.status, "pass");
+  const approved = JSON.parse(readFileSync(reportPath));
+  assert.equal(approved.status, "pass_with_exception");
+  assert.equal(approved.decision, "accept_contract_with_exception");
+  assert.equal(approved.release_claim_evaluation.status, "pass_with_exception");
+  assert.equal(
+    approved.release_claim_evaluation.claims.find(({ id }) => id === "performance").status,
+    "pass_with_exception",
+  );
+  assert.equal(
+    approved.release_claim_evaluation.claims.find(({ id }) => id === "performance")
+      .evidence[0].status,
+    "pass_with_exception",
+  );
+  assert.equal(
+    approved.release_claim_evaluation.claims.find(({ id }) => id === "performance")
+      .exceptions[0].approvals[0].rollback_evidence,
+    "Revert the candidate and restore the accepted baseline",
+  );
   approval.metrics.status_seconds.expires_at = "2026-07-12";
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /approval is expired/);
+  assert.match(result.stderr, /expired/u);
   approval.metrics.status_seconds.expires_at = "2099-07-11";
+  approval.metrics.status_seconds.approved_at = "2099-07-10";
+  writeFileSync(approvalPath, JSON.stringify(approval));
+  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /future-dated/u);
+  approval.metrics.status_seconds.approved_at = "2026-07-11";
   approval.metrics.status_seconds.measured_value = 1.9;
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
@@ -237,6 +261,18 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /valid ISO date/);
+  approval.metrics.status_seconds.approved_at = "2026-07-11";
+  delete approval.metrics.status_seconds.rollback_evidence;
+  writeFileSync(approvalPath, JSON.stringify(approval));
+  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /rollback_evidence/u);
+  approval.metrics.status_seconds.rollback_evidence = "Revert the candidate";
+  approval.schema_version = 2;
+  writeFileSync(approvalPath, JSON.stringify(approval));
+  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /approval schema_version must be 3/u);
 });
 
 test("evaluation independently rejects reattested raw commit and packet provenance drift", () => {
@@ -312,6 +348,24 @@ test("release evidence independently enforces the versioned claim graph", () => 
   result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /stale_evidence/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "performance")
+    .identity.baseline_id = "fabricated@baseline";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "answer_quality")
+    .identity.evaluation_contract = "fabricated/v9";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
 });
 
 test("forged provenance, duplicate repeats, and omitted repeat budgets fail", () => {

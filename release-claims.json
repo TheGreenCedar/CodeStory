@@ -9,7 +9,28 @@
       "repository",
       "commit",
       "source_tree"
-    ]
+    ],
+    "identity_formats": {
+      "repository": "github_repository",
+      "commit": "git_sha",
+      "source_tree": "git_sha",
+      "artifact_sha256": "sha256",
+      "producer_version": "semver",
+      "target": "release_target",
+      "host_os": "identifier",
+      "host_arch": "identifier",
+      "runner": "identifier",
+      "backend": "identifier",
+      "installer": "identifier",
+      "runtime_version": "semver",
+      "profile": "identifier",
+      "corpus_id": "identifier",
+      "cache_id": "identifier",
+      "machine_fingerprint": "non_empty_text",
+      "baseline_id": "baseline_id",
+      "baseline_sha256": "sha256",
+      "evaluation_contract": "versioned_contract"
+    }
   },
   "proof_tiers": [
     {
@@ -182,6 +203,9 @@
         "machine_fingerprint",
         "evaluation_contract"
       ],
+      "identity_constraints": {
+        "evaluation_contract": "publishable-three-repeat-packet/v1"
+      },
       "validity": "expires_at",
       "maximum_validity_hours": 24
     }
@@ -416,7 +440,7 @@
       "id": "sidecar_runtime_mismatch",
       "claim": "retrieval_readiness",
       "control": "negative_gate",
-      "command": "cargo test --locked -p codestory-retrieval --test degraded_modes"
+      "command": "cargo test --locked -p codestory-contracts --lib package_runtime_sidecar_evidence_mismatch_requires_a_complete_rebuild"
     },
     {
       "id": "observational_read_mutation",

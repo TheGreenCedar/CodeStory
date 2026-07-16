@@ -80,8 +80,6 @@ function git(args, cwd) {
   return result.stdout.trim();
 }
 function repositoryIdentity(repoRoot) {
-  const configured = process.env.GITHUB_REPOSITORY?.trim();
-  if (configured) return configured;
   const remote = git(["config", "--get", "remote.origin.url"], repoRoot);
   const match = remote.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/u);
   if (!match) fail(`cannot derive GitHub repository identity from origin ${remote}`);
@@ -137,11 +135,21 @@ function releaseClaimDocument({ repoRoot, mode, commit, profileName, identity, b
     evidence: [
       row("retrieval_readiness", "live_behavior"),
       row("performance", "live_behavior", { baseline_id: baselineId, baseline_sha256: baselineSha256 }, "measured"),
-      row("answer_quality", "answer_quality", { evaluation_contract: "publishable-three-repeat-packet-v1" }),
+      row("answer_quality", "answer_quality", { evaluation_contract: "publishable-three-repeat-packet/v1" }),
     ],
   };
 }
-function evaluateClaimDocument({ document, repoRoot, mode, commit, profileName, identity }) {
+function evaluateClaimDocument({
+  document,
+  repoRoot,
+  mode,
+  commit,
+  profileName,
+  identity,
+  baselineId,
+  baselineSha256,
+  expectedExceptions,
+}) {
   const graph = loadReleaseClaimGraph(repoRoot);
   if (document.graph_schema !== graph.schema || document.graph_sha256 !== releaseClaimGraphDigest(graph)) {
     fail("release claim evaluation failed: stale_evidence graph schema or digest mismatch");
@@ -160,7 +168,12 @@ function evaluateClaimDocument({ document, repoRoot, mode, commit, profileName, 
         corpus_id: identity.corpus_id,
         cache_id: identity.cache_id,
         machine_fingerprint: identity.machine_fingerprint,
+        baseline_id: baselineId,
+        baseline_sha256: baselineSha256,
+        evaluation_contract: graph.evidence_types.find(({ id }) => id === "answer_quality")
+          .identity_constraints.evaluation_contract,
       },
+      exceptions: expectedExceptions,
     },
   });
   return evaluation;
@@ -436,9 +449,15 @@ function exceptionFor(approval, context) {
   }
   strictDate(approval.approved_at, "approval.approved_at");
   strictDate(approval.expires_at, "approval.expires_at");
-  if (approval.expires_at < approval.approved_at || approval.expires_at < new Date().toISOString().slice(0, 10)) fail("approval is expired or expires before approval date");
+  const today = new Date().toISOString().slice(0, 10);
+  if (approval.approved_at > today
+      || approval.expires_at < approval.approved_at
+      || approval.expires_at < today) {
+    fail("approval is future-dated, expired, or expires before approval date");
+  }
   text(approval.owner, "approval.owner");
   text(approval.rationale, "approval.rationale");
+  text(approval.rollback_evidence, "approval.rollback_evidence");
   return approval;
 }
 
@@ -466,7 +485,7 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
   const statsContract = statsContractFrom(repoRoot);
   validateRawProvenance(stats, packet, commit, candidate.profile, profile.identity, statsContract);
   const measured = metricsFrom(stats, packet, profile);
-  if (approvalDocument && approvalDocument.schema_version !== 2) fail("approval schema_version must be 2");
+  if (approvalDocument && approvalDocument.schema_version !== 3) fail("approval schema_version must be 3");
   const approvals = approvalDocument?.metrics ?? {};
   const rows = METRICS.map((metric) => {
     const recorded = object(candidate.metrics[metric], `candidate metric ${metric}`);
@@ -486,10 +505,30 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
       ...(exception ? { approval: exception } : {}) };
   });
   const claimDocument = structuredClone(object(candidate.release_claims, "candidate.release_claims"));
+  const approvedExceptions = rows
+    .filter(({ status }) => status === "approved_exception")
+    .map(({ approval }) => structuredClone(approval));
+  const expectedExceptions = {};
   for (const evidence of claimDocument.evidence ?? []) {
-    if (evidence.type === "retrieval_readiness" || evidence.type === "answer_quality") evidence.status = "pass";
+    if (evidence.type === "retrieval_readiness" || evidence.type === "answer_quality") {
+      evidence.status = "pass";
+      delete evidence.exception;
+    }
     if (evidence.type === "performance") {
-      evidence.status = rows.every((row) => row.decision !== "reject") ? "pass" : "fail";
+      if (rows.some((row) => row.decision === "reject")) {
+        evidence.status = "fail";
+        delete evidence.exception;
+      } else if (approvedExceptions.length > 0) {
+        evidence.status = "pass_with_exception";
+        evidence.exception = {
+          schema: "codestory.release-claim-exception/v1",
+          approvals: approvedExceptions,
+        };
+        expectedExceptions[evidence.id] = structuredClone(evidence.exception);
+      } else {
+        evidence.status = "pass";
+        delete evidence.exception;
+      }
     }
   }
   const claimEvaluation = evaluateClaimDocument({
@@ -499,9 +538,18 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
     commit,
     profileName: candidate.profile,
     identity: profile.identity,
+    baselineId: profile.baseline_id,
+    baselineSha256: baselineHash,
+    expectedExceptions,
   });
-  const rejected = rows.some((row) => row.decision === "reject") || claimEvaluation.status !== "pass";
-  const report = { schema_version: 3, status: rejected ? "fail" : "pass", decision: rejected ? "reject_release" : mode === "release" ? "accept_release" : "accept_contract",
+  const rejected = rows.some((row) => row.decision === "reject") || claimEvaluation.status === "fail";
+  const acceptedWithException = !rejected && claimEvaluation.status === "pass_with_exception";
+  const reportStatus = rejected ? "fail" : acceptedWithException ? "pass_with_exception" : "pass";
+  const acceptedDecision = mode === "release" ? "accept_release" : "accept_contract";
+  const decision = rejected
+    ? "reject_release"
+    : acceptedWithException ? `${acceptedDecision}_with_exception` : acceptedDecision;
+  const report = { schema_version: 3, status: reportStatus, decision,
     commit, profile: candidate.profile, baseline_id: profile.baseline_id, baseline_sha256: baselineHash,
     candidate_path: path.relative(repoRoot, path.resolve(candidatePath)).replaceAll(path.sep, "/"), candidate_sha256: candidateHash,
     artifact_paths: Object.values(candidate.artifacts), release_claim_evaluation: claimEvaluation, metrics: rows };

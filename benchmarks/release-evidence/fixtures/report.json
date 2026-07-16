@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "575664a9ac267ca21fbfadfa3899d833688f7e543f8c4168808b88936ed0b5de",
+  "candidate_sha256": "81fa6b2ce98ff0d538048460288545086bcb715f0af10e8e0348446cf98a2e70",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -24,7 +24,7 @@
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "14ff6a867996fb82c62852f9a89d2aa00806047f3854d859dd489fab7eed3d66",
+    "graph_sha256": "f8037ed9fec550c323f5056f813a265551cea4805fadc5d73190b928ed36af9e",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
     "evaluated_at": "2026-07-16T11:00:00.000Z",

@@ -455,7 +455,9 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       ".github/scripts/check-workflow-policy.mjs",
       ".github/scripts/check-workflow-policy.test.mjs",
       ".github/scripts/fixtures/workflow-policy-invalid.json",
+      ".github/scripts/fixtures/actionlint-invalid.yml",
       ".github/scripts/run-actionlint.mjs",
+      ".github/scripts/run-actionlint.test.mjs",
       ".github/actionlint.yaml",
       "release-claims.json",
       "scripts/codestory-release-claims.mjs",
@@ -497,7 +499,10 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
-    requireStepRun(violations, pluginFile, job, "Check workflow syntax", ["node .github/scripts/run-actionlint.mjs"]);
+    requireStepRun(violations, pluginFile, job, "Check workflow syntax", [
+      "node --test .github/scripts/run-actionlint.test.mjs",
+      "node .github/scripts/run-actionlint.mjs",
+    ]);
     requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
       "scripts/tests/codestory-release-claims.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
@@ -559,7 +564,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   }
   const policy = requireJob(violations, releaseFile, release, "workflow-policy");
   requireStepRun(violations, releaseFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
-  requireStepRun(violations, releaseFile, policy, "Check workflow syntax", ["node .github/scripts/run-actionlint.mjs"]);
+  requireStepRun(violations, releaseFile, policy, "Check workflow syntax", [
+    "node --test .github/scripts/run-actionlint.test.mjs",
+    "node .github/scripts/run-actionlint.mjs",
+  ]);
   requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
     "scripts/tests/codestory-release-claims.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
@@ -827,7 +835,10 @@ function validateRemainingWorkflows(workflows, violations) {
     ]), `${autoFile} must observe policy dependency and release-claim changes`);
     const policy = requireJob(violations, autoFile, auto, "workflow-policy");
     requireStepRun(violations, autoFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
-    requireStepRun(violations, autoFile, policy, "Check workflow syntax", ["node .github/scripts/run-actionlint.mjs"]);
+    requireStepRun(violations, autoFile, policy, "Check workflow syntax", [
+      "node --test .github/scripts/run-actionlint.test.mjs",
+      "node .github/scripts/run-actionlint.mjs",
+    ]);
     requireStepRun(violations, autoFile, policy, "Check release claim and evidence contracts", [
       "scripts/tests/codestory-release-claims.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
@@ -951,6 +962,7 @@ export function releaseWorkflowContractViolations(
   for (const contract of policy.protected_jobs) {
     const workflow = workflows.get(contract.workflow);
     const job = object(at(workflow, "jobs", contract.job));
+    const effectivePermissions = job.permissions === undefined ? workflow?.permissions : job.permissions;
     add(
       violations,
       JSON.stringify(job["runs-on"]) === JSON.stringify(contract.runner),
@@ -963,14 +975,35 @@ export function releaseWorkflowContractViolations(
     );
     add(
       violations,
-      permissionMapMatches(workflow?.permissions, contract.permissions),
-      `[permissions_secrets] ${contract.workflow} permissions must exactly match the release claim graph`,
+      permissionMapMatches(effectivePermissions, contract.permissions),
+      `[permissions_secrets] ${contract.workflow} job ${contract.job} effective permissions must exactly match the release claim graph`,
     );
     add(
       violations,
       sameMembers(Object.keys(object(at(workflow, "on", "workflow_call", "secrets"))), contract.secrets),
       `[permissions_secrets] ${contract.workflow} callable secrets must exactly match the release claim graph`,
     );
+    const reusableRef = `./.github/workflows/${contract.workflow}`;
+    for (const [callerFile, callerWorkflow] of workflows) {
+      for (const [callerJobName, callerJobValue] of Object.entries(object(callerWorkflow.jobs))) {
+        const callerJob = object(callerJobValue);
+        if (callerJob.uses !== reusableRef) continue;
+        add(
+          violations,
+          callerJob.secrets !== "inherit",
+          `[permissions_secrets] ${callerFile} job ${callerJobName} must not use secrets: inherit for ${contract.workflow}`,
+        );
+        if (callerJob.secrets !== undefined && callerJob.secrets !== "inherit") {
+          const forwarded = Object.keys(object(callerJob.secrets));
+          const undeclared = forwarded.filter((secret) => !contract.secrets.includes(secret));
+          add(
+            violations,
+            undeclared.length === 0,
+            `[permissions_secrets] ${callerFile} job ${callerJobName} forwards undeclared secrets to ${contract.workflow}: ${undeclared.join(", ")}`,
+          );
+        }
+      }
+    }
   }
 
   for (const file of policy.artifact_workflows) {
