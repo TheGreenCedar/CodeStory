@@ -6,6 +6,17 @@ pub(super) fn resolve_project_file_path(
     allow_missing_leaf: bool,
 ) -> Result<PathBuf, ApiError> {
     let root = controller.require_project_root()?;
+    resolve_project_file_path_from_root(&root, path, allow_missing_leaf)
+}
+
+/// Resolve one user-supplied file path against a project root without opening,
+/// activating, or otherwise mutating project state.
+#[doc(hidden)]
+pub fn resolve_project_file_path_from_root(
+    root: &Path,
+    path: &str,
+    allow_missing_leaf: bool,
+) -> Result<PathBuf, ApiError> {
     let root = root
         .canonicalize()
         .map_err(|e| ApiError::internal(format!("Failed to resolve project root: {e}")))?;

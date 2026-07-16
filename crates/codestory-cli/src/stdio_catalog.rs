@@ -840,7 +840,11 @@ static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
             "status",
             "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
         ),
-        SchemaProperty::string("previous_path", "Previous path for renames or copies.").nullable(),
+        SchemaProperty::string(
+            "previous_path",
+            "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
+        )
+        .nullable(),
     ],
     &["path", "kind"],
 );

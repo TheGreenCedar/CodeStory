@@ -2666,7 +2666,7 @@ fn affected_tool_preserves_rename_and_delete_status_evidence() {
         }),
     );
     let result = assert_tool_success(&response, json!("affected-rename-delete"));
-    assert_eq!(result["matched_file_count"], json!(2));
+    assert_eq!(result["matched_file_count"], json!(1));
     assert_eq!(result["change_records"][0]["kind"], json!("renamed"));
     assert_eq!(result["change_records"][0]["status"], json!("R100"));
     assert_eq!(
@@ -2678,12 +2678,7 @@ fn affected_tool_preserves_rename_and_delete_status_evidence() {
     let matched = result["matched_files"]
         .as_array()
         .expect("matched file evidence");
-    assert!(matched.iter().any(|file| {
-        file["path"] == "src/runtime.rs"
-            && file["change_kind"] == "renamed"
-            && file["change_status"] == "R100"
-            && file["previous_path"] == "src/runtime.rs"
-    }));
+    assert!(matched.iter().all(|file| file["path"] != "src/runtime.rs"));
     assert!(matched.iter().any(|file| {
         file["path"] == "src/beta.rs"
             && file["change_kind"] == "deleted"
@@ -2698,6 +2693,18 @@ fn affected_tool_preserves_rename_and_delete_status_evidence() {
                 .count()
                 == 2),
         "rename and delete must retain exact stale publication evidence: {result}"
+    );
+    assert!(
+        result["impacted_symbols"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| {
+                symbol["file_path"] == "src/runtime.rs"
+                    && symbol["confidence"] == "bounded"
+                    && symbol["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("previous indexed identity"))
+            })),
+        "rename previous identity should only supply bounded graph evidence: {result}"
     );
 }
 

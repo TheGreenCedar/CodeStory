@@ -751,7 +751,7 @@ fn handle_stdio_message(
                     "Invalid params: tool arguments must be an object",
                 ));
             }
-            let prepared = match prepare_stdio_tool_call(name, &request) {
+            let prepared = match prepare_stdio_tool_call(session, name, &request) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return Some(stdio_jsonrpc_success(
@@ -1617,11 +1617,16 @@ enum PreparedStdioToolCall {
 }
 
 fn prepare_stdio_tool_call(
+    session: &StdioServerSession,
     name: &str,
     request: &serde_json::Value,
 ) -> std::result::Result<PreparedStdioToolCall, ApiError> {
     match name {
-        "affected" => stdio_affected_request(request).map(PreparedStdioToolCall::Affected),
+        "affected" => {
+            let affected = stdio_affected_request(request)?;
+            stdio_preflight_affected_paths(session, request, &affected)?;
+            Ok(PreparedStdioToolCall::Affected(affected))
+        }
         _ => Ok(PreparedStdioToolCall::Raw),
     }
 }
@@ -1825,6 +1830,62 @@ fn stdio_affected_request(
     })
 }
 
+fn stdio_preflight_affected_paths(
+    session: &StdioServerSession,
+    request: &serde_json::Value,
+    affected: &AffectedAnalysisRequest,
+) -> std::result::Result<(), ApiError> {
+    let project_argument = request
+        .pointer("/params/arguments/project")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let project_root = if let Some(project) = project_argument {
+        if !Path::new(project).is_absolute() {
+            return Err(ApiError::new(
+                "project_required",
+                "`project` must be the caller's absolute repository root",
+            ));
+        }
+        Some(
+            crate::runtime::canonicalize_project_root(Path::new(project))
+                .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        )
+    } else {
+        session
+            .active_project
+            .as_ref()
+            .map(|active| active.runtime.project_root.clone())
+    };
+    let Some(project_root) = project_root else {
+        return Ok(());
+    };
+
+    match &affected.input {
+        AffectedAnalysisInput::Paths(paths) => {
+            for path in paths {
+                codestory_runtime::resolve_project_file_path_from_root(&project_root, path, true)?;
+            }
+        }
+        AffectedAnalysisInput::ChangeRecords(records) => {
+            for record in records {
+                codestory_runtime::resolve_project_file_path_from_root(
+                    &project_root,
+                    &record.path,
+                    true,
+                )?;
+                if let Some(previous_path) = record.previous_path.as_deref() {
+                    codestory_runtime::resolve_project_file_path_from_root(
+                        &project_root,
+                        previous_path,
+                        true,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Value {
     let limits = [
         ("changed_paths", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
@@ -1979,6 +2040,16 @@ fn stdio_affected_change_record(value: &serde_json::Value) -> Result<AffectedCha
         ),
         _ => None,
     };
+    if previous_path.is_some()
+        && !matches!(
+            &kind,
+            AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied
+        )
+    {
+        bail!(
+            "affected.change_records[].previous_path is valid only when kind is renamed or copied"
+        );
+    }
     Ok(AffectedChangeRecordDto {
         path: path.to_string(),
         kind,
@@ -6273,6 +6344,79 @@ version = "0.11.20"
                 Some(codestory_runtime::ActivationCapabilityState::Ready)
             );
         }
+    }
+
+    #[test]
+    fn affected_preflight_rejects_invalid_previous_kind_and_outside_paths_before_activation() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("create source dir");
+        std::fs::write(project.path().join("src/lib.rs"), "pub fn inside() {}\n")
+            .expect("write source");
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        let cases = [
+            json!({
+                "project": project.path(),
+                "change_records": [{
+                    "path": "src/lib.rs",
+                    "kind": "modified",
+                    "previous_path": "src/old.rs"
+                }]
+            }),
+            json!({
+                "project": project.path(),
+                "paths": ["../outside.rs"]
+            }),
+            json!({
+                "project": project.path(),
+                "change_records": [{
+                    "path": "src/lib.rs",
+                    "kind": "copied",
+                    "previous_path": "../outside.rs"
+                }]
+            }),
+        ];
+        for (index, arguments) in cases.into_iter().enumerate() {
+            let response = handle_stdio_message(
+                &mut session,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("invalid-preflight-{index}"),
+                    "method": "tools/call",
+                    "params": {
+                        "name": "affected",
+                        "arguments": arguments
+                    }
+                })
+                .to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect("invalid affected response");
+            assert_eq!(
+                response.pointer("/result/structuredContent/code"),
+                Some(&json!("invalid_argument")),
+                "{response}"
+            );
+            assert!(session.active_project.is_none());
+            assert!(session.retained_projects.is_empty());
+        }
+        assert_eq!(
+            std::fs::read_dir(cache.path())
+                .expect("read cache root")
+                .count(),
+            0,
+            "invalid affected preflight must not create project cache state"
+        );
     }
 
     #[test]

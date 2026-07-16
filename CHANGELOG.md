@@ -2,13 +2,19 @@
 
 ## Unreleased
 
-- Make `affected` validate one bounded MCP path input before activation, resolve paths by native identity, classify excluded and stale paths from one complete workspace inventory, preserve rename/delete evidence, propagate result caps into completeness, and recommend refresh only when a requested path has exact stale evidence.
-
 ### Changed
 
 - Affected analysis now resolves native workspace path identities once per
   bounded operation, preserving Unix device/inode and Windows volume/file
   identity without pairwise metadata scans or long-lived path caches.
+- Make `affected` validate and contain every current and previous MCP path
+  before activation, accept previous identity only for rename/copy records,
+  classify the current path from one complete workspace inventory, retain
+  bounded previous-identity graph seeds, propagate result caps into
+  completeness, and recommend refresh only when a requested path has exact
+  stale evidence.
+- Route tasks that already name an exact file, path, or static asset to direct
+  inspection instead of mechanically invoking broad repository grounding.
 - Direct CLI JSON failures now retain runtime API error codes and details across
   packet, search, activation, and retrieval indexing instead of collapsing
   typed failures into a generic `command_failed` envelope.

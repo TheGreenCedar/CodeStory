@@ -837,7 +837,7 @@
                   "type": "string"
                 },
                 "previous_path": {
-                  "description": "Previous path for renames or copies.",
+                  "description": "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
                   "type": [
                     "string",
                     "null"
@@ -999,7 +999,7 @@
                   "type": "string"
                 },
                 "previous_path": {
-                  "description": "Previous path for renames or copies.",
+                  "description": "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
                   "type": [
                     "string",
                     "null"

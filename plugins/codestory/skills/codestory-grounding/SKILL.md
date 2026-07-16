@@ -16,6 +16,15 @@ workspace.
 
 Call the tool that matches the task. Do not call `status` first.
 
+Using this skill does not require an MCP call when the requested work is fully
+local to an already named evidence surface—for example, inspecting or editing
+the content of `assets/desk.svg`. Inspect that surface directly. Naming a path
+does not make the evidence surface complete when the task asks about ownership,
+dependencies, runtime behavior, architecture, change impact, or another claim
+whose evidence extends beyond the file. For those tasks, select the narrowest
+CodeStory tool that can add evidence; do not call broad `ground` as a pre-edit
+ceremony.
+
 1. Resolve the target repository root.
 2. Call the intended tool with `project=<absolute-root>`.
 3. If the result says `state=preparing`, wait for `retry_after_ms` and retry the
@@ -40,6 +49,7 @@ plugin result unless the user explicitly asks.
 | Situation | Route |
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
+| Exact named file, path, or static asset with file-local evidence | Inspect it directly; if the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
 | Find a symbol | `symbol`, then `definition` or `snippet`. |
 | Follow a call path | `callers`, `callees`, `trace`, or `trail`. |
 | Review change impact | `affected` with explicit Git-changed paths, then focused symbol or trace evidence. |
@@ -48,6 +58,9 @@ plugin result unless the user explicitly asks.
 ## Evidence Rules
 
 - Treat CodeStory output as evidence, not omniscience.
+- An irrelevant CodeStory call adds no evidence. Skipping one for a complete,
+  file-local surface is a valid use of this router; do not report that as
+  plugin unavailability.
 - Local repository-map output is navigation evidence. Broad packet/search
   output is stronger only when the response reports full retrieval readiness.
 - When `packet` reports `sufficient`, answer from the packet and cited anchors.
