@@ -75,6 +75,190 @@ fn observational_open_preserves_current_database_bytes_without_sidecars() {
 }
 
 #[test]
+fn observational_open_reads_committed_wal_without_mutating_durable_sqlite_state() {
+    let path = unique_temp_db_path("observational-wal");
+    let storage = Storage::open(&path).expect("open WAL fixture storage");
+    let publication = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "22222222-2222-4222-8222-222222222222".into(),
+        run_id: "observational-wal-run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 2,
+    };
+    storage
+        .put_index_publication(&publication)
+        .expect("publish committed WAL fixture");
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let shm_path = sqlite_sidecar_path(&path, "-shm");
+    assert!(
+        wal_path.is_file(),
+        "fixture must retain committed WAL state"
+    );
+    assert!(shm_path.is_file(), "fixture must retain its WAL index");
+    let durable_paths = [&path, &wal_path];
+    let before = durable_paths
+        .iter()
+        .map(|path| fs::read(path).expect("read SQLite fixture before observation"))
+        .collect::<Vec<_>>();
+    let shm_len_before = fs::metadata(&shm_path)
+        .expect("inspect SHM before observation")
+        .len();
+
+    let observed = Storage::open_observational(&path).expect("observe WAL-backed database");
+    assert_eq!(
+        observed
+            .get_complete_index_publication()
+            .expect("read observed WAL publication"),
+        Some(publication)
+    );
+    drop(observed);
+
+    let after = durable_paths
+        .iter()
+        .map(|path| fs::read(path).expect("read SQLite fixture after observation"))
+        .collect::<Vec<_>>();
+    assert_eq!(after, before, "observation changed durable SQLite state");
+    assert_eq!(
+        fs::metadata(&shm_path)
+            .expect("SHM must remain after observation")
+            .len(),
+        shm_len_before,
+        "observation materialized or resized the existing SHM wal-index"
+    );
+    drop(storage);
+    if wal_path.exists() {
+        fs::remove_file(&wal_path).expect("remove WAL fixture");
+    }
+    if shm_path.exists() {
+        fs::remove_file(&shm_path).expect("remove SHM fixture");
+    }
+    fs::remove_file(path).expect("remove WAL database fixture");
+}
+
+#[test]
+fn observational_wal_snapshot_pins_frames_during_concurrent_checkpoint() {
+    let path = unique_temp_db_path("observational-wal-checkpoint");
+    let storage = Storage::open(&path).expect("open concurrent WAL fixture");
+    let first = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "11111111-1111-4111-8111-111111111111".into(),
+        run_id: "observational-wal-run-one".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    let second = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "22222222-2222-4222-8222-222222222222".into(),
+        run_id: "observational-wal-run-two".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 2,
+    };
+    storage
+        .put_index_publication(&first)
+        .expect("publish first WAL identity");
+    let observed = Storage::open_observational(&path).expect("open WAL observer");
+    let snapshot = observed.read_snapshot().expect("pin WAL snapshot");
+    assert_eq!(
+        snapshot
+            .storage()
+            .get_complete_index_publication()
+            .expect("read first pinned identity"),
+        Some(first.clone())
+    );
+
+    storage
+        .put_index_publication(&second)
+        .expect("publish concurrent WAL identity");
+    let (busy, _, _): (i64, i64, i64) = storage
+        .get_connection()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("attempt checkpoint while observer is pinned");
+    assert_ne!(busy, 0, "checkpoint truncated frames held by observer");
+    assert_eq!(
+        snapshot
+            .storage()
+            .get_complete_index_publication()
+            .expect("reread pinned identity"),
+        Some(first)
+    );
+    snapshot.finish().expect("release WAL snapshot");
+    drop(observed);
+
+    let (busy, _, _): (i64, i64, i64) = storage
+        .get_connection()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("checkpoint after observer release");
+    assert_eq!(busy, 0);
+    let current = Storage::open_observational(&path).expect("observe current checkpointed state");
+    assert_eq!(
+        current
+            .get_complete_index_publication()
+            .expect("read current identity"),
+        Some(second)
+    );
+    drop(current);
+    drop(storage);
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let shm_path = sqlite_sidecar_path(&path, "-shm");
+    if wal_path.exists() {
+        fs::remove_file(wal_path).expect("remove checkpoint WAL fixture");
+    }
+    if shm_path.exists() {
+        fs::remove_file(shm_path).expect("remove checkpoint SHM fixture");
+    }
+    fs::remove_file(path).expect("remove checkpoint database fixture");
+}
+
+#[test]
+fn observational_open_reports_incomplete_wal_pair_without_materializing_shm() {
+    let path = unique_temp_db_path("observational-incomplete-wal");
+    create_versioned_observation_fixture(&path, SCHEMA_VERSION);
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let shm_path = sqlite_sidecar_path(&path, "-shm");
+    fs::write(&wal_path, b"incomplete WAL fixture").expect("write WAL without SHM");
+    let database_before = fs::read(&path).expect("read incomplete-WAL database");
+    let wal_before = fs::read(&wal_path).expect("read incomplete WAL");
+
+    let error = Storage::open_observational(&path)
+        .err()
+        .expect("incomplete WAL pair must fail closed");
+    assert!(error.to_string().contains("incomplete WAL sidecar pair"));
+
+    assert_eq!(fs::read(&path).expect("reread database"), database_before);
+    assert_eq!(fs::read(&wal_path).expect("reread WAL"), wal_before);
+    assert!(!shm_path.exists(), "observation materialized missing SHM");
+    fs::remove_file(wal_path).expect("remove incomplete WAL");
+    fs::remove_file(path).expect("remove incomplete-WAL database");
+}
+
+#[test]
+fn observational_open_reports_rollback_journal_without_recovery() {
+    let path = unique_temp_db_path("observational-rollback-journal");
+    create_versioned_observation_fixture(&path, SCHEMA_VERSION);
+    let journal_path = sqlite_sidecar_path(&path, "-journal");
+    fs::write(&journal_path, b"pending rollback evidence").expect("write rollback journal");
+    let database_before = fs::read(&path).expect("read rollback database");
+    let journal_before = fs::read(&journal_path).expect("read rollback journal");
+
+    let error = Storage::open_observational(&path)
+        .err()
+        .expect("rollback recovery must fail closed");
+    assert!(error.to_string().contains("rollback recovery is pending"));
+
+    assert_eq!(fs::read(&path).expect("reread database"), database_before);
+    assert_eq!(
+        fs::read(&journal_path).expect("reread rollback journal"),
+        journal_before
+    );
+    fs::remove_file(journal_path).expect("remove rollback journal");
+    fs::remove_file(path).expect("remove rollback database");
+}
+
+#[test]
 fn observational_open_reports_old_schema_without_migration_or_sidecars() {
     let path = unique_temp_db_path("observational-old-schema");
     create_versioned_observation_fixture(&path, SCHEMA_VERSION - 1);

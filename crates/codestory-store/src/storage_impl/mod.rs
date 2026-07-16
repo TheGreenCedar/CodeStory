@@ -1651,7 +1651,7 @@ impl Storage {
         })
     }
 
-    /// Open a store for diagnostics without repairing, migrating, locking, or
+    /// Open a store for diagnostics without repairing, migrating, or
     /// materializing SQLite sidecars. Recovery and schema changes belong to an
     /// activating writer; an observer reports those states instead.
     pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
@@ -1668,7 +1668,30 @@ impl Storage {
                 path.display()
             )));
         }
-        let uri = immutable_sqlite_uri(path);
+        let wal_path = sqlite_sidecar_path(path, "-wal");
+        let shm_path = sqlite_sidecar_path(path, "-shm");
+        let journal_path = sqlite_sidecar_path(path, "-journal");
+        if journal_path.exists() {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} while rollback recovery is pending",
+                path.display()
+            )));
+        }
+        let wal_exists = wal_path.is_file();
+        let shm_exists = shm_path.is_file();
+        if wal_exists != shm_exists {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} with an incomplete WAL sidecar pair",
+                path.display()
+            )));
+        }
+        // `immutable=1` guarantees that a standalone database cannot acquire
+        // locks or sidecars, but it intentionally ignores committed WAL state.
+        // When a complete WAL/SHM pair already exists, a normal read-only
+        // connection observes it without materializing either sidecar. SQLite
+        // may update transient reader marks inside the existing SHM wal-index;
+        // durable database and WAL bytes remain observationally unchanged.
+        let uri = observational_sqlite_uri(path, !wal_exists);
         let conn = Connection::open_with_flags(
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -7282,7 +7305,13 @@ impl Storage {
     }
 }
 
-fn immutable_sqlite_uri(path: &Path) -> String {
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn observational_sqlite_uri(path: &Path, immutable: bool) -> String {
     #[cfg(unix)]
     let bytes = {
         use std::os::unix::ffi::OsStrExt;
@@ -7304,7 +7333,10 @@ fn immutable_sqlite_uri(path: &Path) -> String {
     if encoded.len() >= 3 && encoded.as_bytes()[1] == b':' && encoded.as_bytes()[2] == b'/' {
         encoded.insert(0, '/');
     }
-    format!("file:{encoded}?mode=ro&immutable=1")
+    format!(
+        "file:{encoded}?mode=ro{}",
+        if immutable { "&immutable=1" } else { "" }
+    )
 }
 
 fn neighbor_for_direction(

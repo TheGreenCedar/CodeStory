@@ -6077,7 +6077,7 @@ version = "0.11.20"
     }
 
     #[test]
-    fn published_status_preserves_database_and_sqlite_sidecar_bytes() {
+    fn published_status_preserves_durable_sqlite_bytes_and_sidecar_shape() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         std::fs::write(
@@ -6093,14 +6093,14 @@ version = "0.11.20"
         runtime
             .ensure_open(args::RefreshMode::Full)
             .expect("publish status fixture");
-        let observed_paths = [
+        let durable_paths = [
             runtime.storage_path.clone(),
             PathBuf::from(format!("{}-wal", runtime.storage_path.display())),
-            PathBuf::from(format!("{}-shm", runtime.storage_path.display())),
             PathBuf::from(format!("{}-journal", runtime.storage_path.display())),
         ];
-        let snapshot = || {
-            observed_paths
+        let shm_path = PathBuf::from(format!("{}-shm", runtime.storage_path.display()));
+        let durable_snapshot = || {
+            durable_paths
                 .iter()
                 .map(|path| {
                     (
@@ -6111,12 +6111,23 @@ version = "0.11.20"
                 })
                 .collect::<Vec<_>>()
         };
-        let before = snapshot();
+        let shm_shape = || shm_path.metadata().ok().map(|metadata| metadata.len());
+        let durable_before = durable_snapshot();
+        let shm_before = shm_shape();
 
         let status = read_stdio_status_resource_cached(&runtime, &mut StdioServerState::default())
             .expect("read published status observationally");
         assert!(status.get("index_publication").is_some());
 
-        assert_eq!(snapshot(), before, "status changed SQLite product state");
+        assert_eq!(
+            durable_snapshot(),
+            durable_before,
+            "status changed durable SQLite product state"
+        );
+        assert_eq!(
+            shm_shape(),
+            shm_before,
+            "status materialized or resized the SHM wal-index"
+        );
     }
 }
