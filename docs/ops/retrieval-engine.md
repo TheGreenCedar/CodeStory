@@ -5,9 +5,10 @@ executable contains the checksum-pinned CodeRankEmbed Q8 model and links the
 llama.cpp/ggml engine. There is no embedding server, network endpoint, backend
 download, port lease, PID supervisor, or user-controlled repair lifecycle.
 Each release archive also contains `codestory-native-manifest.json`, which binds
-the executable digest, native format and architecture, static linkage, compiled
-backend set, model, llama source, and producer. It records capability only;
-live accelerator execution still requires protected hardware evidence.
+the executable digest, native format and architecture, linkage/loading mode,
+inspected native dependencies, packaged runtime artifacts, compiled backend
+set, model, llama source, and producer. It records capability only; live
+accelerator execution still requires protected hardware evidence.
 
 This page is for maintainers collecting diagnostics or changing retrieval. The
 normal plugin contract is simpler: call the intended repository tool and retry
@@ -35,7 +36,17 @@ Retrieval chooses one explicit backend/device-class request and supplies model,
 pooling, dimension, batching, and smoke parameters to the native binding. The
 binding reports compiled/runtime capabilities and executes that request
 exactly. It never chooses a product fallback. Retrieval applies and validates
-the product's L2 vector normalization after native execution.
+the product's L2 vector normalization after native execution and owns the
+persisted model, prefix, pooling, normalization, dimension, batching, fallback,
+and vector-schema evidence. The binding retains only the compiled compatibility
+facts needed to execute the model.
+
+macOS keeps Metal built in. Windows and Linux packages place core, CPU, and
+Vulkan runtime modules beside the executable and load them at engine startup.
+The base executable does not depend on the Vulkan loader, so help, status, local
+navigation, and explicit CPU execution remain available when that loader is
+absent. Packaging verifies the actual PE import table, ELF `DT_NEEDED` entries,
+or Mach-O load commands rather than trusting build markers alone.
 
 When llama.cpp needs a path for memory mapping, CodeStory verifies the embedded
 bytes and atomically materializes them under a content-addressed cache name. A
@@ -76,7 +87,9 @@ Engine readiness binds:
 - the linked llama.cpp/ggml build identity;
 - the selected backend and physical adapter;
 - `accelerated` or explicit `cpu_explicit` policy;
-- a timed live embedding smoke; and
+- a timed live embedding smoke;
+- a successful encode counter and backend-observed execution device/backend,
+  nodes, resident accelerator tensor count/bytes, and layer placement; and
 - the process engine identity and model-load count.
 
 `retrieval_mode: "full"` additionally means the current core, lexical, vector,
@@ -127,8 +140,10 @@ codestory://diagnostics/retrieval-engine
 ```
 
 The resource is intentionally omitted from ordinary user routing. It reports
-backend, adapter, model/build identity, policy, smoke timing, layer offload,
-model loads, and materialization reuse.
+backend, adapter, model/build identity, policy, smoke timing, backend-observed
+execution and residency, successful encodes, model loads, and materialization
+reuse. Process-memory and GPU-memory deltas are diagnostics, not accelerator
+authorization.
 
 ## Failure isolation
 
@@ -136,6 +151,7 @@ model loads, and materialization reuse.
 | --- | --- | --- |
 | Engine still initializing | Same tool returns `preparing` with a retry delay | Let the owner finish; do not start another engine |
 | Unsupported or software adapter | Broad search returns unavailable; local map remains usable | Capture diagnostics and verify the packaged platform policy |
+| Process CPU/accelerator policy differs from the initialized engine | Request fails with `embedding_backend_policy_mismatch`; the existing engine remains loaded | Use one explicit policy for the process; do not replace the owner or infer fallback |
 | Model materialization mismatch | Engine fails closed before use | Preserve the path and digest evidence; let the next verified materialization replace only owned state |
 | Retrieval producer changed | Old semantic generation is not admitted | Run normal full retrieval publication and verify the new identity |
 | Core or retrieval publication changes during query | Query returns `cache_busy` | Retry once against the new complete publication |

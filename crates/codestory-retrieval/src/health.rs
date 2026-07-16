@@ -269,6 +269,18 @@ pub struct InfrastructureHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_execution_devices: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_execution_backends: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_execution_observation_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_encode_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_execution_node_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_resident_accelerator_tensor_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_resident_accelerator_tensor_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_engine_instance_id: Option<String>,
@@ -391,6 +403,22 @@ pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> Infrastruc
         embedding_execution_devices: identity
             .as_ref()
             .map(|identity| identity.execution_device_names.clone()),
+        embedding_execution_backends: identity
+            .as_ref()
+            .map(|identity| identity.execution_backend_names.clone()),
+        embedding_execution_observation_source: identity
+            .as_ref()
+            .map(|identity| identity.execution_observation_source.to_string()),
+        embedding_encode_count: identity.as_ref().map(|identity| identity.encode_count),
+        embedding_execution_node_count: identity
+            .as_ref()
+            .map(|identity| identity.execution_node_count),
+        embedding_resident_accelerator_tensor_count: identity
+            .as_ref()
+            .map(|identity| identity.resident_accelerator_tensor_count),
+        embedding_resident_accelerator_tensor_bytes: identity
+            .as_ref()
+            .map(|identity| identity.resident_accelerator_tensor_bytes),
         embedding_policy: identity
             .as_ref()
             .map(|identity| identity.policy.to_string()),

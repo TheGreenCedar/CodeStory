@@ -12,6 +12,8 @@ type ProcessEngineState = Option<Arc<ProcessEmbeddingEngine>>;
 static PROCESS_ENGINE: OnceLock<Mutex<ProcessEngineState>> = OnceLock::new();
 static PROCESS_EXIT_HOOK: OnceLock<Result<(), String>> = OnceLock::new();
 
+const BACKEND_POLICY_MISMATCH_REASON: &str = "embedding_backend_policy_mismatch";
+
 #[derive(Debug, Clone)]
 pub struct ProcessEmbeddingIdentity {
     pub instance_id: String,
@@ -34,6 +36,12 @@ pub struct ProcessEmbeddingIdentity {
     pub adapter_memory_total: usize,
     pub adapter_memory_used_by_load: usize,
     pub execution_device_names: Vec<String>,
+    pub execution_backend_names: Vec<String>,
+    pub execution_observation_source: &'static str,
+    pub encode_count: u64,
+    pub execution_node_count: u64,
+    pub resident_accelerator_tensor_count: u64,
+    pub resident_accelerator_tensor_bytes: u64,
     pub model_layer_count: u32,
     pub offloaded_layer_count: u32,
     pub accelerator_execution_verified: bool,
@@ -182,18 +190,23 @@ fn validate_process_selection(
     cache_root: &Path,
     allow_cpu: bool,
 ) -> Result<()> {
-    if process.allow_cpu != allow_cpu {
-        bail!(
-            "embedding engine policy changed after process initialization: initialized={} requested={}",
-            policy_name(process.allow_cpu),
-            policy_name(allow_cpu)
-        );
-    }
+    validate_process_policy(process.allow_cpu, allow_cpu)?;
     if process.cache_root != cache_root {
         bail!(
-            "embedding engine cache root changed after process initialization: initialized={} requested={}",
+            "embedding_cache_root_mismatch: initialized={} requested={}",
             process.cache_root.display(),
             cache_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_process_policy(initialized_allow_cpu: bool, requested_allow_cpu: bool) -> Result<()> {
+    if initialized_allow_cpu != requested_allow_cpu {
+        bail!(
+            "{BACKEND_POLICY_MISMATCH_REASON}: initialized={} requested={}",
+            policy_name(initialized_allow_cpu),
+            policy_name(requested_allow_cpu)
         );
     }
     Ok(())
@@ -236,6 +249,12 @@ fn identity_from_snapshot(
             .adapter_memory_free_before_load
             .saturating_sub(identity.adapter_memory_free_after_load),
         execution_device_names: identity.execution_device_names.clone(),
+        execution_backend_names: identity.execution_backend_names.clone(),
+        execution_observation_source: identity.execution_observation_source,
+        encode_count: identity.encode_count,
+        execution_node_count: identity.execution_node_count,
+        resident_accelerator_tensor_count: identity.resident_accelerator_tensor_count,
+        resident_accelerator_tensor_bytes: identity.resident_accelerator_tensor_bytes,
         model_layer_count: identity.model_layer_count,
         offloaded_layer_count: identity.offloaded_layer_count,
         accelerator_execution_verified: identity.accelerator_execution_verified,
@@ -295,4 +314,25 @@ fn native_engine_error(error: EngineError) -> anyhow::Error {
 
 fn duration_ms(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_policy_mismatch_has_a_stable_machine_reason() {
+        for (initialized, requested) in [(false, true), (true, false)] {
+            let error = validate_process_policy(initialized, requested)
+                .expect_err("changing process policy must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(BACKEND_POLICY_MISMATCH_REASON),
+                "unexpected policy error: {error:#}"
+            );
+        }
+        validate_process_policy(false, false).expect("stable accelerated policy");
+        validate_process_policy(true, true).expect("stable explicit CPU policy");
+    }
 }

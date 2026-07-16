@@ -142,6 +142,14 @@ jobs:
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
+          find "target/${{ matrix.rust_target }}/release" -maxdepth 1 -type f \
+            \( -name 'libllama.so*' -o -name 'libggml*.so*' \) -delete
+          find "target/glibc-2.31/${{ matrix.rust_target }}/release" -maxdepth 1 \
+            \( -type f -o -type l \) \
+            \( -name 'libllama.so*' -o -name 'libggml*.so*' \) \
+            -exec cp -L {} "target/${{ matrix.rust_target }}/release/" \;
+          cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt" \
+            "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
 
       - name: Prove clean-cache Node-absent network-denied offline release build
         if: matrix.asset_target == 'linux-x64'
@@ -402,9 +410,6 @@ jobs:
             "${{ env.LINUX_GLIBC_BASELINE_IMAGE }}" \
             bash -lc '
               set -euo pipefail
-              apt-get update >/dev/null
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                libvulkan1=1.2.131.2-1 >/dev/null
               bash .github/scripts/check-linux-glibc-baseline.sh "$@"
             ' bash \
               "target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz" \

@@ -7,6 +7,7 @@ build = "build.rs"
 [dependencies]
 crossbeam-channel = { workspace = true }
 fs4 = { workspace = true }
+llama-cpp-sys-2 = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
@@ -21,7 +22,7 @@ tempfile = { workspace = true }
 llama-cpp-2 = { workspace = true, features = ["metal"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-llama-cpp-2 = { workspace = true, features = ["vulkan"] }
+llama-cpp-2 = { workspace = true, features = ["dynamic-backends", "vulkan"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }

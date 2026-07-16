@@ -8,6 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 const MODEL_CONTRACT_FILE: &str = "model-contract.json";
+const NATIVE_RUNTIME_FILE_LIST: &str = "codestory-native-runtime-files-v1.txt";
 
 struct ModelContract {
     file_name: String,
@@ -33,7 +34,6 @@ struct ModelContract {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CODESTORY_EMBED_MODEL_SOURCE");
-    println!("cargo:rerun-if-env-changed=LLAMA_BUILD_SHARED_LIBS");
     println!("cargo:rerun-if-changed={MODEL_CONTRACT_FILE}");
     println!("cargo:rerun-if-changed=model_staging.rs");
 
@@ -46,16 +46,15 @@ fn main() {
         "windows" | "linux" => &["cpu", "vulkan"],
         _ => &["cpu"],
     };
-    let engine_linkage = if env::var("LLAMA_BUILD_SHARED_LIBS").as_deref() == Ok("1") {
-        "dynamic"
-    } else {
-        "static"
+    let (engine_linkage, backend_loading) = match target_os.as_str() {
+        "windows" | "linux" => ("dynamic", "runtime-modules"),
+        _ => ("static", "builtin"),
     };
     let model_source = resolve_model_source();
     let model_embedded = model_source.is_some();
     let embedding_contract_sha256 = embedding_contract_digest(&contract);
     let ggml_build_identity = format!(
-        "codestory-native-engine-v1|target={target}|os={target_os}|arch={target_arch}|linkage={engine_linkage}|backends={}|llama_cpp_crate={}|llama_cpp_commit={}|model_sha256={}|embedding_contract_sha256={embedding_contract_sha256}|model_embedded={model_embedded}|producer={}@{}|end",
+        "codestory-native-engine-v1|target={target}|os={target_os}|arch={target_arch}|linkage={engine_linkage}|backend_loading={backend_loading}|backends={}|llama_cpp_crate={}|llama_cpp_commit={}|model_sha256={}|embedding_contract_sha256={embedding_contract_sha256}|model_embedded={model_embedded}|producer={}@{}|end",
         compiled_backends.join(","),
         contract.llama_cpp_crate_version,
         contract.llama_cpp_source_commit,
@@ -73,6 +72,7 @@ fn main() {
     );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    stage_dynamic_runtime(&target_os, &out_dir);
     fs::write(
         out_dir.join("model_contract.rs"),
         format!(
@@ -81,24 +81,19 @@ fn main() {
              pub const MODEL_SHA256: &str = {:?};\n\
              pub const LLAMA_CPP_CRATE_VERSION: &str = {:?};\n\
              pub const LLAMA_CPP_SOURCE_COMMIT: &str = {:?};\n\
-             pub const EMBEDDING_DIMENSION: usize = {};\n\
-             pub const EMBEDDING_QUERY_PREFIX: &str = {:?};\n\
-             pub const EMBEDDING_DOCUMENT_PREFIX: &str = {:?};\n\
-             pub const EMBEDDING_POOLING_ID: &str = {:?};\n\
-             pub const EMBEDDING_NORMALIZATION_ID: &str = {:?};\n\
-             pub const EMBEDDING_ELEMENT_TYPE: &str = {:?};\n\
-             pub const EMBEDDING_VECTOR_SCHEMA_VERSION: u32 = {};\n\
+             const EMBEDDING_DIMENSION: usize = {};\n\
              pub const MODEL_TOKENIZER_SHA256: &str = {:?};\n\
              pub const MODEL_CONFIG_SHA256: &str = {:?};\n\
              pub const MODEL_PRODUCER_NAME: &str = {:?};\n\
              pub const MODEL_PRODUCER_VERSION: &str = {:?};\n\
              pub const MODEL_LICENSE_SPDX_ID: &str = {:?};\n\
              pub const MODEL_LICENSE_SOURCE_URL: &str = {:?};\n\
-             pub const NATIVE_ENGINE_BUILD_CONTRACT_SCHEMA_VERSION: u32 = 1;\n\
+             pub const NATIVE_ENGINE_BUILD_CONTRACT_SCHEMA_VERSION: u32 = 2;\n\
              pub const NATIVE_ENGINE_TARGET_TRIPLE: &str = {target:?};\n\
              pub const NATIVE_ENGINE_TARGET_OS: &str = {target_os:?};\n\
              pub const NATIVE_ENGINE_TARGET_ARCH: &str = {target_arch:?};\n\
              pub const NATIVE_ENGINE_LINKAGE: &str = {engine_linkage:?};\n\
+             pub const NATIVE_ENGINE_BACKEND_LOADING: &str = {backend_loading:?};\n\
              pub const NATIVE_ENGINE_COMPILED_BACKENDS: &[&str] = &{compiled_backends:?};\n\
              pub const NATIVE_ENGINE_EMBEDDING_CONTRACT_SHA256: &str = {embedding_contract_sha256:?};\n\
              pub const GGML_BUILD_IDENTITY: &str = {ggml_build_identity:?};\n\
@@ -109,12 +104,6 @@ fn main() {
             contract.llama_cpp_crate_version,
             contract.llama_cpp_source_commit,
             contract.dimension,
-            contract.query_prefix,
-            contract.document_prefix,
-            contract.pooling,
-            contract.normalization,
-            contract.element_type,
-            contract.vector_schema_version,
             contract.tokenizer_sha256,
             contract.config_sha256,
             contract.producer_name,
@@ -168,6 +157,98 @@ fn main() {
                 "cargo:warning=codestory-llama-sys development build has no embedded model; set CODESTORY_EMBED_MODEL_SOURCE to exercise it"
             );
         }
+    }
+}
+
+fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
+    if !matches!(target_os, "windows" | "linux") {
+        return;
+    }
+
+    let backend_dir = PathBuf::from(
+        env::var_os("DEP_LLAMA_BACKENDS_DIR")
+            .expect("dynamic llama.cpp build must export DEP_LLAMA_BACKENDS_DIR"),
+    );
+    let native_out = backend_dir
+        .parent()
+        .expect("llama.cpp backend directory must have an output parent");
+    let core_dir = native_out.join(if target_os == "windows" { "bin" } else { "lib" });
+    let profile_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .expect("Cargo OUT_DIR must be nested under a profile directory");
+    fs::create_dir_all(profile_dir).expect("create Cargo profile directory");
+
+    let mut runtime_files: Vec<(String, PathBuf, &'static str)> = Vec::new();
+    for directory in [&core_dir, &backend_dir] {
+        let entries = fs::read_dir(directory).unwrap_or_else(|error| {
+            panic!(
+                "failed to inspect native runtime directory {}: {error}",
+                directory.display()
+            )
+        });
+        for entry in entries {
+            let path = entry.expect("read native runtime entry").path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(role) = native_runtime_role(name, target_os) else {
+                continue;
+            };
+            assert!(
+                path.is_file(),
+                "native runtime artifact must be a file: {}",
+                path.display()
+            );
+            assert!(
+                !runtime_files
+                    .iter()
+                    .any(|(existing, _, _)| existing.eq_ignore_ascii_case(name)),
+                "duplicate native runtime artifact: {name}"
+            );
+            runtime_files.push((name.to_owned(), path, role));
+        }
+    }
+
+    for required in ["llama_core", "ggml_core", "ggml_base", "cpu", "vulkan"] {
+        assert!(
+            runtime_files.iter().any(|(_, _, role)| *role == required),
+            "dynamic native runtime is missing required {required} artifact"
+        );
+    }
+    runtime_files.sort_by_key(|entry| entry.0.to_lowercase());
+    for (name, source, _) in &runtime_files {
+        fs::copy(source, profile_dir.join(name)).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage native runtime artifact {}: {error}",
+                source.display()
+            )
+        });
+    }
+    let mut file_list = runtime_files
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    file_list.push('\n');
+    fs::write(profile_dir.join(NATIVE_RUNTIME_FILE_LIST), file_list)
+        .expect("write deterministic native runtime file list");
+}
+
+fn native_runtime_role(name: &str, target_os: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let stem = if target_os == "windows" {
+        lower.strip_suffix(".dll")?
+    } else {
+        lower.strip_prefix("lib")?.split_once(".so")?.0
+    };
+    match stem {
+        "llama" => Some("llama_core"),
+        "ggml" => Some("ggml_core"),
+        "ggml-base" => Some("ggml_base"),
+        value if value.starts_with("ggml-cpu") => Some("cpu"),
+        value if value.starts_with("ggml-vulkan") => Some("vulkan"),
+        _ => None,
     }
 }
 

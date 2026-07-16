@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const VECTOR_INDEX_SCHEMA_VERSION: i64 =
-    codestory_llama_sys::EMBEDDING_VECTOR_SCHEMA_VERSION as i64;
+    crate::embedding_contract::EMBEDDING_VECTOR_SCHEMA_VERSION as i64;
 const VECTOR_INDEX_FILE: &str = "vectors.sqlite3";
 const VECTOR_GENERATION_MANIFEST_FILE: &str = "vector-generation-manifest.json";
 const VECTOR_GENERATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -145,14 +145,13 @@ pub(crate) fn build_vector_producer_evidence(
     embedding_dim: u32,
     publication: EmbeddingVectorPublicationIdentityDto,
 ) -> EmbeddingVectorProducerEvidenceDto {
-    let vector_semantics = codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
     assert_eq!(
         embedding_dim,
-        vector_semantics.dimension() as u32,
-        "embedding evidence dimension must match the canonical model contract"
+        crate::embedding_contract::RETRIEVAL_EMBEDDING_DIM as u32,
+        "embedding evidence dimension must match retrieval policy"
     );
-    let pooling = vector_semantics.pooling_id();
-    let normalization = vector_semantics.normalization_id();
+    let pooling = crate::embedding_contract::EMBEDDING_POOLING;
+    let normalization = crate::embedding_contract::EMBEDDING_NORMALIZATION;
     let engine_build_id = live_identity
         .map(|identity| identity.ggml_build_identity.to_string())
         .unwrap_or_else(|| codestory_llama_sys::PRODUCT_EMBEDDING_RUNTIME_ID.to_string());
@@ -184,8 +183,8 @@ pub(crate) fn build_vector_producer_evidence(
             version: codestory_llama_sys::MODEL_PRODUCER_VERSION.to_string(),
         },
         model: EmbeddingModelIdentityDto {
-            model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
-            model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
+            model_id: crate::embedding_contract::EMBEDDING_MODEL_ID.to_string(),
+            model_sha256: crate::embedding_contract::EMBEDDING_MODEL_SHA256.to_string(),
             model_size_bytes: codestory_llama_sys::MODEL_SIZE,
             tokenizer_sha256: codestory_llama_sys::MODEL_TOKENIZER_SHA256.to_string(),
             config_sha256: codestory_llama_sys::MODEL_CONFIG_SHA256.to_string(),
@@ -196,7 +195,7 @@ pub(crate) fn build_vector_producer_evidence(
             document_prefix: crate::embeddings::CODERANK_DOCUMENT_PREFIX_DEFAULT.to_string(),
             pooling: pooling.to_string(),
             normalization: normalization.to_string(),
-            element_type: codestory_llama_sys::EMBEDDING_ELEMENT_TYPE.to_string(),
+            element_type: crate::embedding_contract::EMBEDDING_ELEMENT_TYPE.to_string(),
             vector_schema_version: VECTOR_INDEX_SCHEMA_VERSION as u32,
         },
         engine: EmbeddingEngineIdentityDto {
@@ -481,8 +480,14 @@ fn validate_execution_evidence_for_runtime(
             || identity.policy != evidence.execution.observed_state
             || (identity.policy == "accelerated"
                 && (!identity.accelerator_execution_verified
+                    || identity.execution_observation_source != "ggml_eval_callback"
+                    || identity.encode_count == 0
+                    || identity.execution_node_count == 0
                     || identity.execution_device_names.is_empty()
-                    || identity.offloaded_layer_count != identity.model_layer_count))
+                    || identity.execution_backend_names.is_empty()
+                    || identity.offloaded_layer_count != identity.model_layer_count
+                    || identity.resident_accelerator_tensor_count == 0
+                    || identity.resident_accelerator_tensor_bytes == 0))
         {
             bail!("live embedding engine does not satisfy persisted execution evidence");
         }
@@ -1538,6 +1543,12 @@ mod tests {
             adapter_memory_total: 1,
             adapter_memory_used_by_load: 1,
             execution_device_names: vec!["test accelerator".into()],
+            execution_backend_names: vec!["Metal".into()],
+            execution_observation_source: "ggml_eval_callback",
+            encode_count: 1,
+            execution_node_count: 1,
+            resident_accelerator_tensor_count: 1,
+            resident_accelerator_tensor_bytes: 1,
             model_layer_count: 13,
             offloaded_layer_count: 13,
             accelerator_execution_verified: true,
@@ -2247,15 +2258,15 @@ mod tests {
         );
         assert_eq!(
             expected.semantics.dimension as usize,
-            codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension()
+            crate::embedding_contract::RETRIEVAL_EMBEDDING_DIM
         );
         assert_eq!(
             expected.semantics.pooling,
-            codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.pooling_id()
+            crate::embedding_contract::EMBEDDING_POOLING
         );
         assert_eq!(
             expected.semantics.normalization,
-            codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.normalization_id()
+            crate::embedding_contract::EMBEDDING_NORMALIZATION
         );
         assert_eq!(expected.engine.device_class, identity.adapter_description);
         assert_ne!(expected.engine.device_class, device.observed_state);

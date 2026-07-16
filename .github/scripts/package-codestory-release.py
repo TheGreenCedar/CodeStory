@@ -13,10 +13,17 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from native_binary_contract import (
+    NativeBinaryError,
+    inspect_runtime_layout,
+    runtime_artifact_role,
+)
+
 NORMALIZED_MTIME = 315532800  # 1980-01-01T00:00:00Z, valid for zip and tar.
 NATIVE_ENGINE_MARKER_PREFIX = b"codestory-native-engine-v1|"
 NATIVE_ENGINE_MARKER_SUFFIX = b"|end"
 NATIVE_MANIFEST_FILE = "codestory-native-manifest.json"
+NATIVE_RUNTIME_FILE_LIST = "codestory-native-runtime-files-v1.txt"
 
 TARGET_CONTRACTS = {
     "linux-x64": {
@@ -26,6 +33,8 @@ TARGET_CONTRACTS = {
         "target_os": "linux",
         "target_arch": "x86_64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": None,
         "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
     },
@@ -36,6 +45,8 @@ TARGET_CONTRACTS = {
         "target_os": "linux",
         "target_arch": "aarch64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": None,
         "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
     },
@@ -46,6 +57,8 @@ TARGET_CONTRACTS = {
         "target_os": "windows",
         "target_arch": "x86_64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": "vulkan",
         "non_claim_reason": None,
     },
@@ -56,6 +69,8 @@ TARGET_CONTRACTS = {
         "target_os": "windows",
         "target_arch": "aarch64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": None,
         "non_claim_reason": "windows_arm64_accelerator_execution_is_not_protected",
     },
@@ -66,6 +81,8 @@ TARGET_CONTRACTS = {
         "target_os": "macos",
         "target_arch": "x86_64",
         "compiled_backends": ["cpu", "metal"],
+        "linkage": "static",
+        "backend_loading": "builtin",
         "expected_protected_backend": None,
         "non_claim_reason": "macos_x64_accelerator_execution_is_not_protected",
     },
@@ -76,6 +93,8 @@ TARGET_CONTRACTS = {
         "target_os": "macos",
         "target_arch": "aarch64",
         "compiled_backends": ["cpu", "metal"],
+        "linkage": "static",
+        "backend_loading": "builtin",
         "expected_protected_backend": "metal",
         "non_claim_reason": None,
     },
@@ -89,40 +108,6 @@ class PackageContractError(RuntimeError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise PackageContractError(message)
-
-
-def inspect_binary_format(path: Path) -> dict[str, str]:
-    with path.open("rb") as handle:
-        header = handle.read(4096)
-        if header.startswith(b"\x7fELF"):
-            require(len(header) >= 20, "ELF binary header is truncated")
-            require(header[4] == 2, "ELF binary is not 64-bit")
-            require(header[5] == 1, "ELF binary is not little-endian")
-            machine = struct.unpack_from("<H", header, 18)[0]
-            arch = {62: "x86_64", 183: "aarch64"}.get(machine)
-            require(arch is not None, f"unsupported ELF machine: {machine}")
-            return {"format": "elf", "arch": arch}
-
-        if header.startswith(b"MZ"):
-            require(len(header) >= 64, "PE binary header is truncated")
-            pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
-            handle.seek(pe_offset)
-            pe_header = handle.read(6)
-            require(pe_header.startswith(b"PE\0\0"), "PE signature is missing")
-            require(len(pe_header) == 6, "PE machine header is truncated")
-            machine = struct.unpack_from("<H", pe_header, 4)[0]
-            arch = {0x8664: "x86_64", 0xAA64: "aarch64"}.get(machine)
-            require(arch is not None, f"unsupported PE machine: {machine:#x}")
-            return {"format": "pe", "arch": arch}
-
-        if header.startswith(b"\xcf\xfa\xed\xfe"):
-            require(len(header) >= 8, "Mach-O binary header is truncated")
-            cpu_type = struct.unpack_from("<I", header, 4)[0]
-            arch = {0x01000007: "x86_64", 0x0100000C: "aarch64"}.get(cpu_type)
-            require(arch is not None, f"unsupported Mach-O CPU type: {cpu_type:#x}")
-            return {"format": "mach-o", "arch": arch}
-
-    raise PackageContractError("release binary is not a supported ELF, PE, or Mach-O executable")
 
 
 def native_engine_markers(path: Path) -> list[str]:
@@ -168,6 +153,7 @@ def parse_native_engine_marker(marker: str) -> dict[str, str]:
         "os",
         "arch",
         "linkage",
+        "backend_loading",
         "backends",
         "llama_cpp_crate",
         "llama_cpp_commit",
@@ -251,11 +237,60 @@ def embedding_contract_digest(model: dict, embedding: dict, tokenizer: dict) -> 
     )
 
 
+def runtime_artifacts_for(
+    binary: Path, target_os: str, backend_loading: str
+) -> list[Path]:
+    if backend_loading == "builtin":
+        return []
+    require(backend_loading == "runtime-modules", "unsupported native backend loading mode")
+    file_list = binary.parent / NATIVE_RUNTIME_FILE_LIST
+    require(file_list.is_file(), "dynamic native runtime file list is missing")
+    names = file_list.read_text(encoding="utf-8").splitlines()
+    require(bool(names), "dynamic native runtime file list is empty")
+    require(
+        names == sorted(set(names), key=str.lower),
+        "dynamic native runtime file list is not sorted and unique",
+    )
+    artifacts = []
+    for name in names:
+        require(
+            name not in {".", ".."}
+            and Path(name).name == name
+            and "/" not in name
+            and "\\" not in name,
+            f"unsafe native runtime artifact name: {name!r}",
+        )
+        require(
+            runtime_artifact_role(name, target_os) is not None,
+            f"unrecognized native runtime artifact in file list: {name}",
+        )
+        path = binary.parent / name
+        require(path.is_file(), f"listed native runtime artifact is missing: {name}")
+        artifacts.append(path)
+    return artifacts
+
+
 def native_release_manifest(version: str, target: str, binary: Path, root: Path) -> dict:
     target_contract = TARGET_CONTRACTS.get(target)
     require(target_contract is not None, f"unsupported release target: {target}")
 
-    binary_identity = inspect_binary_format(binary)
+    artifacts = runtime_artifacts_for(
+        binary,
+        target_contract["target_os"],
+        target_contract["backend_loading"],
+    )
+    try:
+        binary_identity, artifact_descriptors = inspect_runtime_layout(
+            binary,
+            artifacts,
+            target_os=target_contract["target_os"],
+            expected_format=target_contract["binary_format"],
+            expected_arch=target_contract["target_arch"],
+            linkage=target_contract["linkage"],
+            backend_loading=target_contract["backend_loading"],
+        )
+    except (OSError, NativeBinaryError) as exc:
+        raise PackageContractError(f"native runtime layout is invalid: {exc}") from exc
     require(
         binary_identity["format"] == target_contract["binary_format"],
         f"binary format {binary_identity['format']} does not match target {target}",
@@ -272,7 +307,11 @@ def native_release_manifest(version: str, target: str, binary: Path, root: Path)
     require(fields["target"] == target_contract["target_triple"], "native engine target triple does not match package target")
     require(fields["os"] == target_contract["target_os"], "native engine OS does not match package target")
     require(fields["arch"] == target_contract["target_arch"], "native engine architecture does not match package target")
-    require(fields["linkage"] == "static", "release packages require statically linked native engine artifacts")
+    require(fields["linkage"] == target_contract["linkage"], "native engine linkage does not match package target")
+    require(
+        fields["backend_loading"] == target_contract["backend_loading"],
+        "native backend loading mode does not match package target",
+    )
     compiled_backends = fields["backends"].split(",")
     require(
         compiled_backends == target_contract["compiled_backends"],
@@ -312,7 +351,7 @@ def native_release_manifest(version: str, target: str, binary: Path, root: Path)
     )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "release_version": version,
         "asset_target": target,
         "binary": {
@@ -320,14 +359,23 @@ def native_release_manifest(version: str, target: str, binary: Path, root: Path)
             "sha256": sha256_file(binary),
             "format": binary_identity["format"],
             "arch": binary_identity["arch"],
+            "needed": binary_identity["needed"],
         },
+        "runtime_artifacts": [
+            {
+                **descriptor,
+                "sha256": sha256_file(binary.parent / str(descriptor["name"])),
+            }
+            for descriptor in artifact_descriptors
+        ],
         "engine": {
-            "build_contract_schema_version": 1,
+            "build_contract_schema_version": 2,
             "build_identity": marker,
             "target_triple": fields["target"],
             "target_os": fields["os"],
             "target_arch": fields["arch"],
             "linkage": fields["linkage"],
+            "backend_loading": fields["backend_loading"],
             "compiled_backends": compiled_backends,
             "llama_cpp_crate_version": fields["llama_cpp_crate"],
             "llama_cpp_source_commit": fields["llama_cpp_commit"],
@@ -444,6 +492,9 @@ def package_release(
         binary_name = target_contract["binary_name"]
         manifest = native_release_manifest(version, target, binary, root)
         shutil.copy2(binary, stage_root / binary_name)
+        for descriptor in manifest["runtime_artifacts"]:
+            name = descriptor["name"]
+            shutil.copy2(binary.parent / name, stage_root / name)
         (stage_root / NATIVE_MANIFEST_FILE).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -475,11 +526,14 @@ def native_marker(
     backends: str,
     embedding_contract_sha256: str,
     linkage: str = "static",
+    backend_loading: str | None = None,
     model_embedded: str = "true",
 ) -> str:
+    backend_loading = backend_loading or ("runtime-modules" if linkage == "dynamic" else "builtin")
     return (
         "codestory-native-engine-v1|"
         f"target={target}|os={os_name}|arch={arch}|linkage={linkage}|"
+        f"backend_loading={backend_loading}|"
         f"backends={backends}|llama_cpp_crate=0.1.151|"
         "llama_cpp_commit=test-commit|"
         f"model_sha256={'a' * 64}|embedding_contract_sha256={embedding_contract_sha256}|"
@@ -487,24 +541,150 @@ def native_marker(
     )
 
 
-def synthetic_binary(binary_format: str, arch: str, marker: str) -> bytes:
+def synthetic_binary(
+    binary_format: str, arch: str, marker: str, needed: tuple[str, ...] = ()
+) -> bytes:
     if binary_format == "elf":
-        header = bytearray(64)
+        header = bytearray(4096)
         header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 16, 3)
         struct.pack_into("<H", header, 18, {"x86_64": 62, "aarch64": 183}[arch])
+        struct.pack_into("<I", header, 20, 1)
+        struct.pack_into("<Q", header, 32, 64)
+        struct.pack_into("<H", header, 52, 64)
+        struct.pack_into("<H", header, 54, 56)
+        struct.pack_into("<H", header, 56, 2)
+        dynamic_offset = 0x200
+        strings_offset = 0x400
+        strings = bytearray(b"\0")
+        name_offsets = []
+        for name in needed:
+            name_offsets.append(len(strings))
+            strings.extend(name.encode("utf-8") + b"\0")
+        dynamic_size = (len(needed) + 3) * 16
+        struct.pack_into("<IIQQQQQQ", header, 64, 1, 5, 0, 0x400000, 0, len(header), len(header), 4096)
+        struct.pack_into(
+            "<IIQQQQQQ",
+            header,
+            120,
+            2,
+            6,
+            dynamic_offset,
+            0x400000 + dynamic_offset,
+            0,
+            dynamic_size,
+            dynamic_size,
+            8,
+        )
+        cursor = dynamic_offset
+        for name_offset in name_offsets:
+            struct.pack_into("<qQ", header, cursor, 1, name_offset)
+            cursor += 16
+        struct.pack_into("<qQ", header, cursor, 5, 0x400000 + strings_offset)
+        struct.pack_into("<qQ", header, cursor + 16, 10, len(strings))
+        struct.pack_into("<qQ", header, cursor + 32, 0, 0)
+        header[strings_offset : strings_offset + len(strings)] = strings
     elif binary_format == "pe":
-        header = bytearray(256)
+        header = bytearray(4096)
         header[:2] = b"MZ"
         struct.pack_into("<I", header, 0x3C, 128)
         header[128:132] = b"PE\0\0"
-        struct.pack_into("<H", header, 132, {"x86_64": 0x8664, "aarch64": 0xAA64}[arch])
+        struct.pack_into(
+            "<HHIIIHH",
+            header,
+            132,
+            {"x86_64": 0x8664, "aarch64": 0xAA64}[arch],
+            1,
+            0,
+            0,
+            0,
+            240,
+            0x2022,
+        )
+        optional = 152
+        struct.pack_into("<H", header, optional, 0x20B)
+        struct.pack_into("<Q", header, optional + 24, 0x140000000)
+        struct.pack_into("<I", header, optional + 108, 16)
+        section = optional + 240
+        header[section : section + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", header, section + 8, 0xC00, 0x1000, 0xC00, 0x400)
+        if needed:
+            import_rva = 0x1000
+            import_offset = 0x400
+            names_offset = import_offset + (len(needed) + 1) * 20
+            cursor = names_offset
+            for index, name in enumerate(needed):
+                name_bytes = name.encode("utf-8") + b"\0"
+                name_rva = 0x1000 + cursor - import_offset
+                struct.pack_into("<IIIII", header, import_offset + index * 20, 1, 0, 0, name_rva, 1)
+                header[cursor : cursor + len(name_bytes)] = name_bytes
+                cursor += len(name_bytes)
+            struct.pack_into("<II", header, optional + 112 + 8, import_rva, cursor - import_offset)
     elif binary_format == "mach-o":
-        header = bytearray(64)
+        commands = bytearray()
+        for name in needed:
+            encoded = name.encode("utf-8") + b"\0"
+            size = (24 + len(encoded) + 7) & ~7
+            command = bytearray(size)
+            struct.pack_into("<IIIIII", command, 0, 0xC, size, 24, 0, 0, 0)
+            command[24 : 24 + len(encoded)] = encoded
+            commands.extend(command)
+        header = bytearray(32 + len(commands))
         header[:4] = b"\xcf\xfa\xed\xfe"
         struct.pack_into("<I", header, 4, {"x86_64": 0x01000007, "aarch64": 0x0100000C}[arch])
+        struct.pack_into("<I", header, 12, 2)
+        struct.pack_into("<II", header, 16, len(needed), len(commands))
+        header[32:] = commands
     else:
         raise AssertionError(f"unsupported synthetic binary format: {binary_format}")
     return bytes(header) + b"\0" + marker.encode("ascii") + b"\0"
+
+
+def write_synthetic_runtime(
+    binary: Path,
+    binary_format: str,
+    arch: str,
+    marker: str,
+    target_os: str,
+) -> None:
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    if target_os == "linux":
+        names = {
+            "core_llama": "libllama.so",
+            "core_ggml": "libggml.so",
+            "core_base": "libggml-base.so",
+            "cpu": "libggml-cpu.so",
+            "vulkan": "libggml-vulkan.so",
+            "loader": "libvulkan.so.1",
+        }
+    elif target_os == "windows":
+        names = {
+            "core_llama": "llama.dll",
+            "core_ggml": "ggml.dll",
+            "core_base": "ggml-base.dll",
+            "cpu": "ggml-cpu.dll",
+            "vulkan": "ggml-vulkan.dll",
+            "loader": "vulkan-1.dll",
+        }
+    else:
+        binary.write_bytes(synthetic_binary(binary_format, arch, marker))
+        return
+    binary.write_bytes(
+        synthetic_binary(binary_format, arch, marker, (names["core_llama"], names["core_ggml"]))
+    )
+    dependencies = {
+        names["core_llama"]: (names["core_ggml"],),
+        names["core_ggml"]: (names["core_base"],),
+        names["core_base"]: (),
+        names["cpu"]: (names["core_base"],),
+        names["vulkan"]: (names["core_base"], names["loader"]),
+    }
+    for name, needed in dependencies.items():
+        (binary.parent / name).write_bytes(synthetic_binary(binary_format, arch, "", needed))
+    runtime_names = sorted(dependencies, key=str.lower)
+    (binary.parent / NATIVE_RUNTIME_FILE_LIST).write_text(
+        "\n".join(runtime_names) + "\n", encoding="utf-8"
+    )
 
 
 def run_self_test() -> None:
@@ -561,63 +741,67 @@ def run_self_test() -> None:
             model_contract["tokenizer_config"],
         )
 
-        linux_binary = temp_root / "codestory-cli"
-        linux_binary.write_bytes(
-            synthetic_binary(
-                "elf",
-                "x86_64",
-                native_marker(
-                    target="x86_64-unknown-linux-gnu",
-                    os_name="linux",
-                    arch="x86_64",
-                    backends="cpu,vulkan",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                ),
-            )
+        linux_binary = temp_root / "linux-x64-runtime/codestory-cli"
+        write_synthetic_runtime(
+            linux_binary,
+            "elf",
+            "x86_64",
+            native_marker(
+                target="x86_64-unknown-linux-gnu",
+                os_name="linux",
+                arch="x86_64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "linux",
         )
         linux_binary.chmod(0o755)
-        linux_arm_binary = temp_root / "codestory-cli-linux-arm64"
-        linux_arm_binary.write_bytes(
-            synthetic_binary(
-                "elf",
-                "aarch64",
-                native_marker(
-                    target="aarch64-unknown-linux-gnu",
-                    os_name="linux",
-                    arch="aarch64",
-                    backends="cpu,vulkan",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                ),
-            )
+        linux_arm_binary = temp_root / "linux-arm64-runtime/codestory-cli"
+        write_synthetic_runtime(
+            linux_arm_binary,
+            "elf",
+            "aarch64",
+            native_marker(
+                target="aarch64-unknown-linux-gnu",
+                os_name="linux",
+                arch="aarch64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "linux",
         )
         linux_arm_binary.chmod(0o755)
-        windows_binary = temp_root / "codestory-cli.exe"
-        windows_binary.write_bytes(
-            synthetic_binary(
-                "pe",
-                "x86_64",
-                native_marker(
-                    target="x86_64-pc-windows-msvc",
-                    os_name="windows",
-                    arch="x86_64",
-                    backends="cpu,vulkan",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                ),
-            )
+        windows_binary = temp_root / "windows-x64-runtime/codestory-cli.exe"
+        write_synthetic_runtime(
+            windows_binary,
+            "pe",
+            "x86_64",
+            native_marker(
+                target="x86_64-pc-windows-msvc",
+                os_name="windows",
+                arch="x86_64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "windows",
         )
-        windows_arm_binary = temp_root / "codestory-cli-arm64.exe"
-        windows_arm_binary.write_bytes(
-            synthetic_binary(
-                "pe",
-                "aarch64",
-                native_marker(
-                    target="aarch64-pc-windows-msvc",
-                    os_name="windows",
-                    arch="aarch64",
-                    backends="cpu,vulkan",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                ),
-            )
+        windows_arm_binary = temp_root / "windows-arm64-runtime/codestory-cli.exe"
+        write_synthetic_runtime(
+            windows_arm_binary,
+            "pe",
+            "aarch64",
+            native_marker(
+                target="aarch64-pc-windows-msvc",
+                os_name="windows",
+                arch="aarch64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "windows",
         )
         macos_binary = temp_root / "codestory-cli-macos.exe"
         macos_binary.write_bytes(
@@ -683,7 +867,15 @@ def run_self_test() -> None:
                     manifest["binary"]["name"] == TARGET_CONTRACTS[target]["binary_name"],
                     "package did not canonicalize the target binary name",
                 )
-                require(manifest["engine"]["linkage"] == "static", "manifest lost linkage evidence")
+                require(
+                    manifest["engine"]["linkage"] == TARGET_CONTRACTS[target]["linkage"],
+                    "manifest lost linkage evidence",
+                )
+                require(
+                    manifest["engine"]["backend_loading"]
+                    == TARGET_CONTRACTS[target]["backend_loading"],
+                    "manifest lost backend loading evidence",
+                )
                 require(
                     manifest["accelerator"]["runtime_execution"] == "not_proven_by_package",
                     "package incorrectly claimed runtime accelerator execution",
@@ -706,7 +898,21 @@ def run_self_test() -> None:
             json.dumps(model_contract, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
-        hostile = temp_root / "hostile-codestory-cli"
+        hostile = temp_root / "hostile-runtime/codestory-cli"
+        write_synthetic_runtime(
+            hostile,
+            "elf",
+            "x86_64",
+            native_marker(
+                target="x86_64-unknown-linux-gnu",
+                os_name="linux",
+                arch="x86_64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "linux",
+        )
         hostile.write_bytes(
             synthetic_binary(
                 "elf",
@@ -719,6 +925,7 @@ def run_self_test() -> None:
                     embedding_contract_sha256=fixture_contract_sha256,
                     linkage="dynamic",
                 ),
+                ("libvulkan.so.1",),
             )
         )
         try:
@@ -726,7 +933,61 @@ def run_self_test() -> None:
         except PackageContractError:
             pass
         else:
-            raise AssertionError("dynamically linked native engine package was accepted")
+            raise AssertionError("base executable with mandatory Vulkan loader was accepted")
+
+        missing_cpu = temp_root / "missing-cpu-runtime/codestory-cli"
+        write_synthetic_runtime(
+            missing_cpu,
+            "elf",
+            "x86_64",
+            native_marker(
+                target="x86_64-unknown-linux-gnu",
+                os_name="linux",
+                arch="x86_64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "linux",
+        )
+        (missing_cpu.parent / "libggml-cpu.so").unlink()
+        try:
+            package_release(
+                "0.0.0", "linux-x64", missing_cpu, temp_root / "missing-cpu", repo_root
+            )
+        except PackageContractError:
+            pass
+        else:
+            raise AssertionError("dynamic package without its CPU backend was accepted")
+
+        poisoned_cpu = temp_root / "poisoned-cpu-runtime/codestory-cli"
+        write_synthetic_runtime(
+            poisoned_cpu,
+            "elf",
+            "x86_64",
+            native_marker(
+                target="x86_64-unknown-linux-gnu",
+                os_name="linux",
+                arch="x86_64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "linux",
+        )
+        (poisoned_cpu.parent / "libggml-cpu.so").write_bytes(
+            synthetic_binary(
+                "elf", "x86_64", "", ("libggml-base.so", "libvulkan.so.1")
+            )
+        )
+        try:
+            package_release(
+                "0.0.0", "linux-x64", poisoned_cpu, temp_root / "poisoned-cpu", repo_root
+            )
+        except PackageContractError:
+            pass
+        else:
+            raise AssertionError("CPU backend with a Vulkan-loader import was accepted")
 
         wrong_arch = temp_root / "wrong-arch-codestory-cli"
         wrong_arch.write_bytes(

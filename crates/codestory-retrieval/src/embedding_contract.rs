@@ -9,14 +9,13 @@ use codestory_llama_sys::{
 pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
 pub const CODERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code: ";
 pub const CODERANK_DOCUMENT_PREFIX: &str = "";
-#[cfg(test)]
-pub const EMBEDDING_POOLING: &str = "cls";
-#[cfg(test)]
-pub const EMBEDDING_NORMALIZATION: &str = "l2";
-#[cfg(test)]
-pub const EMBEDDING_ELEMENT_TYPE: &str = "f32_le";
-#[cfg(test)]
-pub const EMBEDDING_VECTOR_SCHEMA_VERSION: u32 = 2;
+pub(crate) const EMBEDDING_MODEL_ID: &str = "coderankembed.Q8_0.gguf";
+pub(crate) const EMBEDDING_MODEL_SHA256: &str =
+    "666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa";
+pub(crate) const EMBEDDING_POOLING: &str = "cls";
+pub(crate) const EMBEDDING_NORMALIZATION: &str = "l2";
+pub(crate) const EMBEDDING_ELEMENT_TYPE: &str = "f32_le";
+pub(crate) const EMBEDDING_VECTOR_SCHEMA_VERSION: u32 = 2;
 
 const CONTEXT_TOKENS: u32 = 4096;
 const MAX_INPUT_TOKENS: usize = 512;
@@ -39,11 +38,7 @@ pub(crate) fn native_engine_config(allow_cpu: bool) -> Result<EmbeddingEngineCon
         };
         (backend, NativeDeviceClass::Accelerator)
     };
-    if !capabilities
-        .backends
-        .iter()
-        .any(|compiled| *compiled == backend)
-    {
+    if !capabilities.backends.contains(&backend) {
         bail!(
             "embedding_backend_policy_uncompiled: requested={backend} compiled={}",
             capabilities.backends.join(",")
@@ -57,8 +52,8 @@ pub(crate) fn native_engine_config(allow_cpu: bool) -> Result<EmbeddingEngineCon
             reject_software_adapters: true,
         },
         embedding: NativeEmbeddingRequest {
-            model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
-            model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
+            model_id: EMBEDDING_MODEL_ID.to_string(),
+            model_sha256: EMBEDDING_MODEL_SHA256.to_string(),
             dimension: RETRIEVAL_EMBEDDING_DIM,
             pooling: NativeEmbeddingPooling::Cls,
             context_tokens: CONTEXT_TOKENS,
@@ -109,26 +104,15 @@ mod tests {
 
     #[test]
     fn retrieval_owns_the_product_semantics_and_matches_the_compiled_model() {
-        let compiled = codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
+        let compiled = codestory_llama_sys::COMPILED_MODEL_COMPATIBILITY;
+        assert_eq!(EMBEDDING_MODEL_ID, compiled.model_id());
+        assert_eq!(EMBEDDING_MODEL_SHA256, compiled.model_sha256());
         assert_eq!(RETRIEVAL_EMBEDDING_DIM, compiled.dimension());
-        assert_eq!(EMBEDDING_POOLING, compiled.pooling_id());
-        assert_eq!(EMBEDDING_NORMALIZATION, compiled.normalization_id());
-        assert_eq!(
-            CODERANK_QUERY_PREFIX,
-            codestory_llama_sys::EMBEDDING_QUERY_PREFIX
-        );
-        assert_eq!(
-            CODERANK_DOCUMENT_PREFIX,
-            codestory_llama_sys::EMBEDDING_DOCUMENT_PREFIX
-        );
-        assert_eq!(
-            EMBEDDING_ELEMENT_TYPE,
-            codestory_llama_sys::EMBEDDING_ELEMENT_TYPE
-        );
-        assert_eq!(
-            EMBEDDING_VECTOR_SCHEMA_VERSION,
-            codestory_llama_sys::EMBEDDING_VECTOR_SCHEMA_VERSION
-        );
+        assert_eq!(compiled.pooling(), NativeEmbeddingPooling::Cls);
+        assert_eq!(EMBEDDING_POOLING, "cls");
+        assert_eq!(EMBEDDING_NORMALIZATION, "l2");
+        assert_eq!(EMBEDDING_ELEMENT_TYPE, "f32_le");
+        assert_eq!(EMBEDDING_VECTOR_SCHEMA_VERSION, 2);
     }
 
     #[test]

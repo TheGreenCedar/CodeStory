@@ -1,10 +1,12 @@
-//! CodeStory-owned boundary around the statically linked llama.cpp runtime.
+//! CodeStory-owned boundary around the packaged llama.cpp runtime.
 
 use crossbeam_channel::{Receiver, Sender, after, bounded, select_biased, unbounded};
 use fs4::fs_std::FileExt;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use llama_cpp_2::llama_backend::load_backends_from_path;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
@@ -12,7 +14,10 @@ use llama_cpp_2::{
     LlamaBackendDevice, LlamaBackendDeviceType, LogOptions, list_llama_ggml_backend_devices,
     send_logs_to_tracing,
 };
+use llama_cpp_sys_2 as llama_sys;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashSet};
+use std::ffi::{CStr, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::num::NonZeroU32;
@@ -26,60 +31,33 @@ use thiserror::Error;
 include!(concat!(env!("OUT_DIR"), "/embedded_model.rs"));
 include!(concat!(env!("OUT_DIR"), "/model_contract.rs"));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingPooling {
-    Cls,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingNormalization {
-    L2,
-}
-
-/// Vector compatibility descriptor compiled beside the embedded model.
-///
-/// Retrieval consumes this descriptor when it records persisted evidence. The
-/// native boundary does not choose or apply pooling or normalization policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProductEmbeddingVectorSemantics {
-    dimension: usize,
-    pooling: EmbeddingPooling,
-    normalization: EmbeddingNormalization,
-}
-
-impl ProductEmbeddingVectorSemantics {
-    /// Width of every product embedding vector.
-    pub const fn dimension(self) -> usize {
-        self.dimension
-    }
-
-    /// Stable pooling identifier recorded in persisted producer evidence.
-    pub const fn pooling_id(self) -> &'static str {
-        match self.pooling {
-            EmbeddingPooling::Cls => "cls",
-        }
-    }
-
-    /// Stable normalization identifier recorded in persisted producer evidence.
-    pub const fn normalization_id(self) -> &'static str {
-        match self.normalization {
-            EmbeddingNormalization::L2 => "l2",
-        }
-    }
-}
-
-/// Compatibility semantics declared by the compiled model contract.
-pub const PRODUCT_EMBEDDING_VECTOR_SEMANTICS: ProductEmbeddingVectorSemantics =
-    ProductEmbeddingVectorSemantics {
-        dimension: EMBEDDING_DIMENSION,
-        pooling: EmbeddingPooling::Cls,
-        normalization: EmbeddingNormalization::L2,
-    };
-
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const EXECUTION_OBSERVATION_SOURCE: &str = "ggml_eval_callback";
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn load_packaged_backend_modules() -> Result<(), EngineError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        EngineError::Llama(format!(
+            "could not resolve the executable containing native backend modules: {error}"
+        ))
+    })?;
+    let directory = executable.parent().ok_or_else(|| {
+        EngineError::Llama(format!(
+            "native backend module directory is unavailable for {}",
+            executable.display()
+        ))
+    })?;
+    load_backends_from_path(directory);
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn load_packaged_backend_modules() -> Result<(), EngineError> {
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -162,6 +140,7 @@ pub struct CompiledEngineCapabilities {
     pub target_os: &'static str,
     pub target_arch: &'static str,
     pub linkage: &'static str,
+    pub backend_loading: &'static str,
     pub backends: &'static [&'static str],
     pub build_identity: &'static str,
 }
@@ -173,6 +152,7 @@ pub const fn compiled_engine_capabilities() -> CompiledEngineCapabilities {
         target_os: NATIVE_ENGINE_TARGET_OS,
         target_arch: NATIVE_ENGINE_TARGET_ARCH,
         linkage: NATIVE_ENGINE_LINKAGE,
+        backend_loading: NATIVE_ENGINE_BACKEND_LOADING,
         backends: NATIVE_ENGINE_COMPILED_BACKENDS,
         build_identity: GGML_BUILD_IDENTITY,
     }
@@ -192,6 +172,57 @@ pub enum NativeEmbeddingPooling {
     Last,
     Rank,
 }
+
+/// Raw compatibility facts enforced by the compiled model boundary.
+///
+/// Product policy such as normalization, prefixes, batching, and fallback is
+/// intentionally absent. Retrieval owns those choices and supplies a request
+/// that this descriptor can accept or reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledModelCompatibility {
+    model_id: &'static str,
+    model_sha256: &'static str,
+    dimension: usize,
+    pooling: NativeEmbeddingPooling,
+}
+
+impl CompiledModelCompatibility {
+    pub const fn model_id(self) -> &'static str {
+        self.model_id
+    }
+
+    pub const fn model_sha256(self) -> &'static str {
+        self.model_sha256
+    }
+
+    pub const fn dimension(self) -> usize {
+        self.dimension
+    }
+
+    pub const fn pooling(self) -> NativeEmbeddingPooling {
+        self.pooling
+    }
+
+    pub fn accepts(
+        self,
+        model_id: &str,
+        model_sha256: &str,
+        dimension: usize,
+        pooling: NativeEmbeddingPooling,
+    ) -> bool {
+        self.model_id == model_id
+            && self.model_sha256 == model_sha256
+            && self.dimension == dimension
+            && self.pooling as u8 == pooling as u8
+    }
+}
+
+pub const COMPILED_MODEL_COMPATIBILITY: CompiledModelCompatibility = CompiledModelCompatibility {
+    model_id: MODEL_FILE_NAME,
+    model_sha256: MODEL_SHA256,
+    dimension: EMBEDDING_DIMENSION,
+    pooling: NativeEmbeddingPooling::Cls,
+};
 
 impl NativeEmbeddingPooling {
     fn llama_pooling_type(self) -> LlamaPoolingType {
@@ -232,6 +263,227 @@ pub struct RuntimeBackendCapability {
     pub software_adapter: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct EncodeObservation {
+    encode_count: u64,
+    execution_device_names: Vec<String>,
+    execution_backend_names: Vec<String>,
+    observed_layer_count: u32,
+    resident_tensor_count: u64,
+    resident_tensor_bytes: u64,
+    execution_node_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct EvalTelemetryState {
+    encode_count: u64,
+    target_device_name: String,
+    execution_device_names: BTreeSet<String>,
+    execution_backend_names: BTreeSet<String>,
+    observed_layers: BTreeSet<u32>,
+    resident_tensors: HashSet<usize>,
+    resident_tensor_bytes: u64,
+    execution_node_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct EvalTelemetry {
+    state: Mutex<EvalTelemetryState>,
+}
+
+impl EvalTelemetry {
+    fn new(target_device_name: String) -> Self {
+        Self {
+            state: Mutex::new(EvalTelemetryState {
+                target_device_name,
+                ..EvalTelemetryState::default()
+            }),
+        }
+    }
+
+    fn begin_encode(&self) -> Result<(), EngineError> {
+        let mut state = self.state.lock().map_err(|_| {
+            EngineError::Llama("execution telemetry mutex was poisoned".to_string())
+        })?;
+        state.execution_device_names.clear();
+        state.execution_backend_names.clear();
+        state.observed_layers.clear();
+        state.resident_tensors.clear();
+        state.resident_tensor_bytes = 0;
+        state.execution_node_count = 0;
+        Ok(())
+    }
+
+    fn complete_encode(&self) -> Result<EncodeObservation, EngineError> {
+        let mut state = self.state.lock().map_err(|_| {
+            EngineError::Llama("execution telemetry mutex was poisoned".to_string())
+        })?;
+        state.encode_count = state.encode_count.saturating_add(1);
+        Ok(observation_from_state(&state))
+    }
+
+    fn observation(&self) -> Result<EncodeObservation, EngineError> {
+        let state = self.state.lock().map_err(|_| {
+            EngineError::Llama("execution telemetry mutex was poisoned".to_string())
+        })?;
+        Ok(observation_from_state(&state))
+    }
+}
+
+fn observation_from_state(state: &EvalTelemetryState) -> EncodeObservation {
+    EncodeObservation {
+        encode_count: state.encode_count,
+        execution_device_names: state.execution_device_names.iter().cloned().collect(),
+        execution_backend_names: state.execution_backend_names.iter().cloned().collect(),
+        observed_layer_count: state.observed_layers.len() as u32,
+        resident_tensor_count: state.resident_tensors.len() as u64,
+        resident_tensor_bytes: state.resident_tensor_bytes,
+        execution_node_count: state.execution_node_count,
+    }
+}
+
+unsafe extern "C" fn observe_eval_tensor(
+    tensor: *mut llama_sys::ggml_tensor,
+    ask: bool,
+    user_data: *mut c_void,
+) -> bool {
+    if ask {
+        return true;
+    }
+    if tensor.is_null() || user_data.is_null() {
+        return false;
+    }
+    // The callback pointer is installed from a boxed EvalTelemetry before the
+    // context is created. The box outlives and is dropped after the context.
+    let telemetry = unsafe { &*(user_data.cast::<EvalTelemetry>()) };
+    let Some((device_name, backend_name)) = (unsafe { tensor_device_identity(tensor) }) else {
+        return true;
+    };
+    let Ok(mut state) = telemetry.state.lock() else {
+        return false;
+    };
+    if device_name != state.target_device_name {
+        return true;
+    }
+    state.execution_device_names.insert(device_name);
+    state.execution_backend_names.insert(backend_name);
+    state.execution_node_count = state.execution_node_count.saturating_add(1);
+    unsafe { observe_tensor_sources(tensor, &mut state) };
+    true
+}
+
+unsafe fn tensor_device_identity(tensor: *mut llama_sys::ggml_tensor) -> Option<(String, String)> {
+    let mut current = tensor;
+    let buffer = (0..8).find_map(|_| {
+        if current.is_null() {
+            return None;
+        }
+        let value = unsafe { (*current).buffer };
+        if !value.is_null() {
+            return Some(value);
+        }
+        current = unsafe { (*current).view_src };
+        None
+    })?;
+    let buffer_type = unsafe { llama_sys::ggml_backend_buffer_get_type(buffer) };
+    if buffer_type.is_null() {
+        return None;
+    }
+    let device = unsafe { llama_sys::ggml_backend_buft_get_device(buffer_type) };
+    if device.is_null() {
+        return None;
+    }
+    let device_name = unsafe { c_string_lossy(llama_sys::ggml_backend_dev_name(device)) }?;
+    let registration = unsafe { llama_sys::ggml_backend_dev_backend_reg(device) };
+    if registration.is_null() {
+        return None;
+    }
+    let backend_name = unsafe { c_string_lossy(llama_sys::ggml_backend_reg_name(registration)) }?;
+    Some((device_name, backend_name))
+}
+
+unsafe fn c_string_lossy(pointer: *const std::ffi::c_char) -> Option<String> {
+    (!pointer.is_null()).then(|| {
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+unsafe fn observe_tensor_sources(
+    root: *mut llama_sys::ggml_tensor,
+    state: &mut EvalTelemetryState,
+) {
+    let mut pending = vec![root];
+    let mut traversed = HashSet::new();
+    while let Some(tensor) = pending.pop() {
+        if tensor.is_null() || !traversed.insert(tensor as usize) {
+            continue;
+        }
+        let raw = unsafe { &*tensor };
+        if let Some(layer) = layer_index_from_tensor_name(&raw.name) {
+            state.observed_layers.insert(layer);
+        }
+        if unsafe { tensor_device_identity(tensor) }
+            .is_some_and(|(device, _)| device == state.target_device_name)
+            && state.resident_tensors.insert(tensor as usize)
+        {
+            state.resident_tensor_bytes = state
+                .resident_tensor_bytes
+                .saturating_add(unsafe { llama_sys::ggml_nbytes(tensor) } as u64);
+        }
+        pending.extend(raw.src.iter().copied().filter(|source| !source.is_null()));
+        if !raw.view_src.is_null() {
+            pending.push(raw.view_src);
+        }
+    }
+}
+
+fn layer_index_from_tensor_name(name: &[std::ffi::c_char; 64]) -> Option<u32> {
+    let bytes = name
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .map(|byte| byte as u8)
+        .collect::<Vec<_>>();
+    let start = bytes
+        .windows(4)
+        .position(|candidate| candidate == b"blk.")?
+        + 4;
+    let end = bytes[start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .map_or(bytes.len(), |offset| start + offset);
+    if end == start {
+        return None;
+    }
+    std::str::from_utf8(&bytes[start..end]).ok()?.parse().ok()
+}
+
+fn install_eval_callback(
+    params: &mut LlamaContextParams,
+    telemetry: &EvalTelemetry,
+) -> Result<(), EngineError> {
+    if std::mem::size_of::<LlamaContextParams>()
+        != std::mem::size_of::<llama_sys::llama_context_params>()
+        || std::mem::align_of::<LlamaContextParams>()
+            != std::mem::align_of::<llama_sys::llama_context_params>()
+    {
+        return Err(EngineError::Llama(
+            "pinned llama-cpp context parameter layout changed".to_string(),
+        ));
+    }
+    // llama-cpp-2 0.1.151 wraps exactly one llama_context_params value. It does
+    // not expose cb_eval yet, so this exact-version boundary installs the C API
+    // callback after checking the wrapper and raw layouts remain identical.
+    let raw = std::ptr::from_mut(params).cast::<llama_sys::llama_context_params>();
+    unsafe {
+        (*raw).cb_eval = Some(observe_eval_tensor);
+        (*raw).cb_eval_user_data = std::ptr::from_ref(telemetry).cast_mut().cast();
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineIdentity {
     pub model_digest: &'static str,
@@ -250,9 +502,33 @@ pub struct EngineIdentity {
     pub adapter_memory_free_before_load: usize,
     pub adapter_memory_free_after_load: usize,
     pub execution_device_names: Vec<String>,
+    pub execution_backend_names: Vec<String>,
+    pub execution_observation_source: &'static str,
+    pub encode_count: u64,
+    pub execution_node_count: u64,
+    pub resident_accelerator_tensor_count: u64,
+    pub resident_accelerator_tensor_bytes: u64,
     pub model_layer_count: u32,
     pub offloaded_layer_count: u32,
     pub accelerator_execution_verified: bool,
+}
+
+fn apply_live_observation(identity: &mut EngineIdentity, observation: EncodeObservation) {
+    identity.execution_device_names = observation.execution_device_names;
+    identity.execution_backend_names = observation.execution_backend_names;
+    identity.encode_count = observation.encode_count;
+    identity.execution_node_count = observation.execution_node_count;
+    if identity.selected_device_class == NativeDeviceClass::Accelerator {
+        identity.offloaded_layer_count = observation.observed_layer_count;
+        identity.resident_accelerator_tensor_count = observation.resident_tensor_count;
+        identity.resident_accelerator_tensor_bytes = observation.resident_tensor_bytes;
+        identity.accelerator_execution_verified = identity.encode_count > 0
+            && identity.execution_node_count > 0
+            && !identity.execution_device_names.is_empty()
+            && identity.offloaded_layer_count == identity.model_layer_count
+            && identity.resident_accelerator_tensor_count > 0
+            && identity.resident_accelerator_tensor_bytes > 0;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,6 +937,7 @@ fn run_resident_generation(
         let started = Instant::now();
         let materialized = materialize_embedded_model(cache_root)?;
         send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
+        load_packaged_backend_modules()?;
         let backend = LlamaBackend::init().map_err(llama_error)?;
         let devices = list_llama_ggml_backend_devices();
         let runtime_capabilities = runtime_backend_capabilities(&devices);
@@ -684,9 +961,10 @@ fn run_resident_generation(
                 actual: model.n_embd() as usize,
             });
         }
-        let model_layer_count = model.n_layer() + 1;
+        let model_layer_count = model.n_layer();
 
-        let context_params = LlamaContextParams::default()
+        let telemetry = Box::new(EvalTelemetry::new(device.name.clone()));
+        let mut context_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(config.embedding.context_tokens))
             .with_n_batch(config.embedding.batch_tokens)
             .with_n_ubatch(config.embedding.batch_tokens)
@@ -694,6 +972,7 @@ fn run_resident_generation(
             .with_attention_type(LlamaAttentionType::NonCausal)
             .with_pooling_type(config.embedding.pooling.llama_pooling_type())
             .with_embeddings(true);
+        install_eval_callback(&mut context_params, &telemetry)?;
         let mut context = model
             .new_context(&backend, context_params)
             .map_err(llama_error)?;
@@ -701,28 +980,11 @@ fn run_resident_generation(
             .into_iter()
             .find(|candidate| candidate.index == device.index)
             .map_or(device.memory_free, |candidate| candidate.memory_free);
-        let accelerator_execution_verified = config.backend.device_class
-            == NativeDeviceClass::Accelerator
-            && free_before > free_after
-            && free_after > 0;
-        if config.backend.device_class == NativeDeviceClass::Accelerator
-            && !accelerator_execution_verified
-        {
-            return Err(EngineError::AcceleratorExecutionUnverified(format!(
-                "{} ({})",
-                device.name, device.description
-            )));
-        }
-        let offloaded_layer_count = if accelerator_execution_verified {
-            model_layer_count
-        } else {
-            0
-        };
-
         let smoke_started = Instant::now();
         let smoke = embed_inputs(
             &model,
             &mut context,
+            &telemetry,
             std::slice::from_ref(&config.embedding.smoke_input),
             RequestPriority::Query,
             query_receiver,
@@ -737,6 +999,46 @@ fn run_resident_generation(
                 actual: smoke.first().map_or(0, Vec::len),
             });
         }
+        let observation = telemetry.observation()?;
+        let accelerator_execution_verified = config.backend.device_class
+            == NativeDeviceClass::Accelerator
+            && observation.encode_count > 0
+            && observation.execution_node_count > 0
+            && !observation.execution_device_names.is_empty()
+            && observation.observed_layer_count == model_layer_count
+            && observation.resident_tensor_count > 0
+            && observation.resident_tensor_bytes > 0;
+        if config.backend.device_class == NativeDeviceClass::Accelerator
+            && !accelerator_execution_verified
+        {
+            return Err(EngineError::AcceleratorExecutionUnverified(format!(
+                "{} (devices={:?} layers={}/{} tensors={} bytes={} nodes={} encodes={})",
+                device.description,
+                observation.execution_device_names,
+                observation.observed_layer_count,
+                model_layer_count,
+                observation.resident_tensor_count,
+                observation.resident_tensor_bytes,
+                observation.execution_node_count,
+                observation.encode_count,
+            )));
+        }
+        let accelerated = config.backend.device_class == NativeDeviceClass::Accelerator;
+        let offloaded_layer_count = if accelerated {
+            observation.observed_layer_count
+        } else {
+            0
+        };
+        let resident_accelerator_tensor_count = if accelerated {
+            observation.resident_tensor_count
+        } else {
+            0
+        };
+        let resident_accelerator_tensor_bytes = if accelerated {
+            observation.resident_tensor_bytes
+        } else {
+            0
+        };
         let identity = EngineIdentity {
             model_digest: MODEL_SHA256,
             ggml_build_identity: GGML_BUILD_IDENTITY,
@@ -753,11 +1055,13 @@ fn run_resident_generation(
             adapter_memory_total: device.memory_total,
             adapter_memory_free_before_load: free_before,
             adapter_memory_free_after_load: free_after,
-            execution_device_names: if accelerator_execution_verified {
-                vec![device.name.clone()]
-            } else {
-                Vec::new()
-            },
+            execution_device_names: observation.execution_device_names,
+            execution_backend_names: observation.execution_backend_names,
+            execution_observation_source: EXECUTION_OBSERVATION_SOURCE,
+            encode_count: observation.encode_count,
+            execution_node_count: observation.execution_node_count,
+            resident_accelerator_tensor_count,
+            resident_accelerator_tensor_bytes,
             model_layer_count,
             offloaded_layer_count,
             accelerator_execution_verified,
@@ -778,6 +1082,7 @@ fn run_resident_generation(
             bulk: bulk_receiver,
             control: control_receiver,
         };
+        let mut live_snapshot = snapshot.clone();
         Ok(serve_resident_generation(
             pending_wake
                 .take()
@@ -791,9 +1096,14 @@ fn run_resident_generation(
                     priority,
                     &model,
                     &mut context,
+                    &telemetry,
                     query_receiver,
                     &config.embedding,
                 );
+                if let Ok(observation) = telemetry.observation() {
+                    apply_live_observation(&mut live_snapshot.identity, observation);
+                    let _ = publish_lifecycle(lifecycle, live_snapshot.clone());
+                }
             },
         ))
     })();
@@ -958,12 +1268,14 @@ fn handle_request(
     priority: RequestPriority,
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
+    telemetry: &EvalTelemetry,
     query_receiver: &Receiver<EmbeddingRequest>,
     config: &NativeEmbeddingRequest,
 ) {
     let result = embed_inputs(
         model,
         context,
+        telemetry,
         &request.inputs,
         priority,
         query_receiver,
@@ -975,6 +1287,7 @@ fn handle_request(
 fn embed_inputs(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
+    telemetry: &EvalTelemetry,
     inputs: &[String],
     priority: RequestPriority,
     query_receiver: &Receiver<EmbeddingRequest>,
@@ -1000,6 +1313,7 @@ fn embed_inputs(
                     RequestPriority::Query,
                     model,
                     context,
+                    telemetry,
                     query_receiver,
                     config,
                 );
@@ -1013,6 +1327,7 @@ fn embed_inputs(
         );
         embed_token_batch(
             context,
+            telemetry,
             &tokenized[offset..end],
             &mut output,
             config.dimension,
@@ -1043,6 +1358,7 @@ fn batch_end(
 
 fn embed_token_batch(
     context: &mut LlamaContext<'_>,
+    telemetry: &EvalTelemetry,
     sequences: &[Vec<llama_cpp_2::token::LlamaToken>],
     output: &mut Vec<Vec<f32>>,
     expected_dimension: usize,
@@ -1055,7 +1371,9 @@ fn embed_token_batch(
             .map_err(llama_error)?;
     }
     context.clear_kv_cache();
+    telemetry.begin_encode()?;
     context.encode(&mut batch).map_err(llama_error)?;
+    telemetry.complete_encode()?;
     for sequence_id in 0..sequences.len() {
         let vector = context
             .embeddings_seq_ith(sequence_id as i32)
@@ -1172,9 +1490,14 @@ fn validate_engine_config(config: &EmbeddingEngineConfig) -> Result<(), EngineEr
             compiled: format!("{MODEL_FILE_NAME}@{MODEL_SHA256}"),
         });
     }
-    if config.embedding.dimension == 0 {
+    if !COMPILED_MODEL_COMPATIBILITY.accepts(
+        &config.embedding.model_id,
+        &config.embedding.model_sha256,
+        config.embedding.dimension,
+        config.embedding.pooling,
+    ) {
         return Err(EngineError::InvalidConfiguration {
-            reason: "embedding_dimension_zero",
+            reason: "compiled_model_compatibility_mismatch",
         });
     }
     if config.embedding.context_tokens == 0 {
@@ -1395,10 +1718,23 @@ mod tests {
 
     #[test]
     fn compiled_model_descriptor_and_native_build_contract_are_inspectable() {
-        let semantics = PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
-        assert_eq!(semantics.dimension(), EMBEDDING_DIMENSION);
-        assert_eq!(semantics.pooling_id(), EMBEDDING_POOLING_ID);
-        assert_eq!(semantics.normalization_id(), EMBEDDING_NORMALIZATION_ID);
+        let compatibility = COMPILED_MODEL_COMPATIBILITY;
+        assert_eq!(compatibility.model_id(), MODEL_FILE_NAME);
+        assert_eq!(compatibility.model_sha256(), MODEL_SHA256);
+        assert_eq!(compatibility.dimension(), EMBEDDING_DIMENSION);
+        assert_eq!(compatibility.pooling(), NativeEmbeddingPooling::Cls);
+        assert!(compatibility.accepts(
+            MODEL_FILE_NAME,
+            MODEL_SHA256,
+            EMBEDDING_DIMENSION,
+            NativeEmbeddingPooling::Cls
+        ));
+        assert!(!compatibility.accepts(
+            MODEL_FILE_NAME,
+            MODEL_SHA256,
+            EMBEDDING_DIMENSION,
+            NativeEmbeddingPooling::Mean
+        ));
         assert_eq!(MODEL_PRODUCER_NAME, env!("CARGO_PKG_NAME"));
         assert_eq!(MODEL_PRODUCER_VERSION, env!("CARGO_PKG_VERSION"));
         assert!(PRODUCT_EMBEDDING_RUNTIME_ID.contains(&format!(
@@ -1408,7 +1744,7 @@ mod tests {
         assert!(MODEL_LICENSE_SOURCE_URL.starts_with("https://"));
 
         let capabilities = compiled_engine_capabilities();
-        assert_eq!(capabilities.schema_version, 1);
+        assert_eq!(capabilities.schema_version, 2);
         assert!(capabilities.backends.contains(&"cpu"));
         assert!(matches!(capabilities.linkage, "static" | "dynamic"));
         for fragment in [
@@ -1416,6 +1752,7 @@ mod tests {
             format!("os={}", capabilities.target_os),
             format!("arch={}", capabilities.target_arch),
             format!("linkage={}", capabilities.linkage),
+            format!("backend_loading={}", capabilities.backend_loading),
             format!("backends={}", capabilities.backends.join(",")),
             format!("model_sha256={MODEL_SHA256}"),
             format!("embedding_contract_sha256={NATIVE_ENGINE_EMBEDDING_CONTRACT_SHA256}"),
@@ -1450,6 +1787,59 @@ mod tests {
         config.backend.device_class = NativeDeviceClass::Accelerator;
         let error = validate_engine_config(&config).expect_err("CPU class drift must fail");
         assert_eq!(error.reason_code(), "native_engine_config_invalid");
+
+        let mut config = valid_config();
+        config.embedding.pooling = NativeEmbeddingPooling::Mean;
+        let error = validate_engine_config(&config).expect_err("pooling drift must fail");
+        assert_eq!(error.reason_code(), "native_engine_config_invalid");
+    }
+
+    #[test]
+    fn eval_telemetry_counter_advances_only_on_completed_encodes() {
+        let telemetry = EvalTelemetry::new("test-device".into());
+        telemetry.begin_encode().expect("begin first encode");
+        {
+            let mut state = telemetry.state.lock().expect("telemetry state");
+            state.execution_device_names.insert("test-device".into());
+            state.execution_backend_names.insert("test-backend".into());
+            state.execution_node_count = 3;
+        }
+        let first = telemetry.complete_encode().expect("complete first encode");
+        assert_eq!(first.encode_count, 1);
+        telemetry.begin_encode().expect("begin second encode");
+        assert_eq!(
+            telemetry
+                .observation()
+                .expect("pending observation")
+                .encode_count,
+            1
+        );
+        let second = telemetry.complete_encode().expect("complete second encode");
+        assert_eq!(second.encode_count, 2);
+    }
+
+    #[test]
+    fn pinned_context_params_accept_the_eval_callback_boundary() {
+        let telemetry = EvalTelemetry::new("test-device".into());
+        let mut params = LlamaContextParams::default();
+        install_eval_callback(&mut params, &telemetry).expect("install callback");
+        let raw = std::ptr::from_ref(&params).cast::<llama_sys::llama_context_params>();
+        assert!(unsafe { (*raw).cb_eval.is_some() });
+        assert_eq!(
+            unsafe { (*raw).cb_eval_user_data },
+            std::ptr::from_ref(&telemetry).cast_mut().cast()
+        );
+    }
+
+    #[test]
+    fn layer_observation_uses_backend_tensor_names() {
+        let mut name = [0 as std::ffi::c_char; 64];
+        for (target, source) in name.iter_mut().zip(b"blk.17.attn_q.weight") {
+            *target = *source as std::ffi::c_char;
+        }
+        assert_eq!(layer_index_from_tensor_name(&name), Some(17));
+        let unnamed = [0 as std::ffi::c_char; 64];
+        assert_eq!(layer_index_from_tensor_name(&unnamed), None);
     }
 
     #[test]
@@ -1672,6 +2062,12 @@ mod tests {
                 adapter_memory_free_before_load: 0,
                 adapter_memory_free_after_load: 0,
                 execution_device_names: Vec::new(),
+                execution_backend_names: Vec::new(),
+                execution_observation_source: EXECUTION_OBSERVATION_SOURCE,
+                encode_count: 0,
+                execution_node_count: 0,
+                resident_accelerator_tensor_count: 0,
+                resident_accelerator_tensor_bytes: 0,
                 model_layer_count: 13,
                 offloaded_layer_count: 0,
                 accelerator_execution_verified: false,

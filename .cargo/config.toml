@@ -2,3 +2,8 @@
 # Cross-platform retrieval dev setup (run from repository root).
 retrieval-setup = "run --locked -p codestory-cli -- retrieval bootstrap --project ."
 retrieval-status = "run --locked -p codestory-cli -- retrieval status --project ."
+
+# Windows and Linux release archives keep the dynamically linked llama.cpp
+# core and runtime-selected CPU/Vulkan modules beside the executable.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]

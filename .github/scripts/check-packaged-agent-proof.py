@@ -25,6 +25,12 @@ import time
 import zipfile
 from pathlib import Path
 
+from native_binary_contract import (
+    NativeBinaryError,
+    inspect_runtime_layout,
+    runtime_artifact_role,
+)
+
 
 STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
@@ -51,6 +57,8 @@ TARGET_CONTRACTS = {
         "target_os": "linux",
         "target_arch": "x86_64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": None,
         "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
     },
@@ -61,6 +69,8 @@ TARGET_CONTRACTS = {
         "target_os": "linux",
         "target_arch": "aarch64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": None,
         "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
     },
@@ -71,6 +81,8 @@ TARGET_CONTRACTS = {
         "target_os": "windows",
         "target_arch": "x86_64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": "vulkan",
         "non_claim_reason": None,
     },
@@ -81,6 +93,8 @@ TARGET_CONTRACTS = {
         "target_os": "windows",
         "target_arch": "aarch64",
         "compiled_backends": ["cpu", "vulkan"],
+        "linkage": "dynamic",
+        "backend_loading": "runtime-modules",
         "expected_protected_backend": None,
         "non_claim_reason": "windows_arm64_accelerator_execution_is_not_protected",
     },
@@ -91,6 +105,8 @@ TARGET_CONTRACTS = {
         "target_os": "macos",
         "target_arch": "x86_64",
         "compiled_backends": ["cpu", "metal"],
+        "linkage": "static",
+        "backend_loading": "builtin",
         "expected_protected_backend": None,
         "non_claim_reason": "macos_x64_accelerator_execution_is_not_protected",
     },
@@ -101,6 +117,8 @@ TARGET_CONTRACTS = {
         "target_os": "macos",
         "target_arch": "aarch64",
         "compiled_backends": ["cpu", "metal"],
+        "linkage": "static",
+        "backend_loading": "builtin",
         "expected_protected_backend": "metal",
         "non_claim_reason": None,
     },
@@ -174,36 +192,6 @@ def find_cli(root: Path) -> Path:
     cli = matches[0]
     cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
     return cli
-
-
-def inspect_binary_format(path: Path) -> dict[str, str]:
-    with path.open("rb") as handle:
-        header = handle.read(4096)
-        if header.startswith(b"\x7fELF"):
-            require(len(header) >= 20, "ELF binary header is truncated")
-            require(header[4] == 2, "ELF binary is not 64-bit")
-            require(header[5] == 1, "ELF binary is not little-endian")
-            machine = struct.unpack_from("<H", header, 18)[0]
-            arch = {62: "x86_64", 183: "aarch64"}.get(machine)
-            require(arch is not None, f"unsupported ELF machine: {machine}")
-            return {"format": "elf", "arch": arch}
-        if header.startswith(b"MZ"):
-            require(len(header) >= 64, "PE binary header is truncated")
-            pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
-            handle.seek(pe_offset)
-            pe_header = handle.read(6)
-            require(len(pe_header) == 6 and pe_header.startswith(b"PE\0\0"), "PE header is invalid")
-            machine = struct.unpack_from("<H", pe_header, 4)[0]
-            arch = {0x8664: "x86_64", 0xAA64: "aarch64"}.get(machine)
-            require(arch is not None, f"unsupported PE machine: {machine:#x}")
-            return {"format": "pe", "arch": arch}
-        if header.startswith(b"\xcf\xfa\xed\xfe"):
-            require(len(header) >= 8, "Mach-O binary header is truncated")
-            cpu_type = struct.unpack_from("<I", header, 4)[0]
-            arch = {0x01000007: "x86_64", 0x0100000C: "aarch64"}.get(cpu_type)
-            require(arch is not None, f"unsupported Mach-O CPU type: {cpu_type:#x}")
-            return {"format": "mach-o", "arch": arch}
-    raise ProofFailure("packaged executable is not a supported ELF, PE, or Mach-O binary")
 
 
 def native_engine_markers(path: Path) -> list[str]:
@@ -310,6 +298,7 @@ def parse_native_build_identity(identity: str) -> dict[str, str]:
         "os",
         "arch",
         "linkage",
+        "backend_loading",
         "backends",
         "llama_cpp_crate",
         "llama_cpp_commit",
@@ -334,7 +323,7 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     except json.JSONDecodeError as exc:
         raise ProofFailure(f"native engine manifest is not valid JSON: {exc}") from exc
     require(isinstance(manifest, dict), "native engine manifest is not an object")
-    require(manifest.get("schema_version") == 1, "native engine manifest schema is unsupported")
+    require(manifest.get("schema_version") == 2, "native engine manifest schema is unsupported")
     require(
         manifest.get("release_version") == expected_version,
         "native engine manifest version does not match expected release",
@@ -349,12 +338,14 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     embedding = manifest.get("embedding")
     tokenizer = manifest.get("tokenizer_config")
     accelerator = manifest.get("accelerator")
+    runtime_artifacts = manifest.get("runtime_artifacts")
     require(isinstance(binary, dict), "native engine manifest has no binary descriptor")
     require(isinstance(engine, dict), "native engine manifest has no engine descriptor")
     require(isinstance(model, dict), "native engine manifest has no model descriptor")
     require(isinstance(embedding, dict), "native engine manifest has no embedding descriptor")
     require(isinstance(tokenizer, dict), "native engine manifest has no tokenizer descriptor")
     require(isinstance(accelerator, dict), "native engine manifest has no accelerator descriptor")
+    require(isinstance(runtime_artifacts, list), "native engine manifest has no runtime artifact set")
     require(
         cli.name == target_contract["binary_name"],
         "packaged executable name does not match asset target",
@@ -362,12 +353,53 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     require(binary.get("name") == cli.name, "native engine manifest names a different binary")
     cli_sha256 = sha256(cli)
     require(binary.get("sha256") == cli_sha256, "packaged binary digest does not match native manifest")
-    binary_identity = inspect_binary_format(cli)
+    artifact_paths: list[Path] = []
+    for descriptor in runtime_artifacts:
+        require(isinstance(descriptor, dict), "native runtime artifact descriptor is invalid")
+        name = descriptor.get("name")
+        require(
+            isinstance(name, str) and name == Path(name).name,
+            "native runtime artifact name is not a basename",
+        )
+        path = cli.parent / name
+        require(path.is_file(), f"native runtime artifact is missing: {name}")
+        artifact_paths.append(path)
+    discovered = sorted(
+        [
+            path.name
+            for path in cli.parent.iterdir()
+            if path.is_file()
+            and runtime_artifact_role(path.name, target_contract["target_os"]) is not None
+        ],
+        key=str.lower,
+    )
+    require(
+        discovered == sorted([path.name for path in artifact_paths], key=str.lower),
+        "archive native runtime artifacts do not match the manifest",
+    )
+    try:
+        binary_identity, inspected_artifacts = inspect_runtime_layout(
+            cli,
+            artifact_paths,
+            target_os=target_contract["target_os"],
+            expected_format=target_contract["binary_format"],
+            expected_arch=target_contract["target_arch"],
+            linkage=target_contract["linkage"],
+            backend_loading=target_contract["backend_loading"],
+        )
+    except (OSError, NativeBinaryError) as exc:
+        raise ProofFailure(f"packaged native runtime layout is invalid: {exc}") from exc
+    inspected_artifacts = [
+        {**descriptor, "sha256": sha256(cli.parent / str(descriptor["name"]))}
+        for descriptor in inspected_artifacts
+    ]
+    require(runtime_artifacts == inspected_artifacts, "native runtime artifact evidence is stale")
     require(binary == {
         "name": cli.name,
         "sha256": cli_sha256,
         "format": binary_identity["format"],
         "arch": binary_identity["arch"],
+        "needed": binary_identity["needed"],
     }, "native manifest binary descriptor does not match the executable")
     require(
         binary_identity["format"] == target_contract["binary_format"],
@@ -377,7 +409,7 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
         binary_identity["arch"] == target_contract["target_arch"],
         "packaged executable architecture does not match asset target",
     )
-    require(engine.get("build_contract_schema_version") == 1, "native engine build contract is unsupported")
+    require(engine.get("build_contract_schema_version") == 2, "native engine build contract is unsupported")
     build_identity = engine.get("build_identity")
     require(
         isinstance(build_identity, str)
@@ -391,8 +423,16 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
         binary_markers == [build_identity],
         "packaged executable native engine marker does not match manifest",
     )
-    require(engine.get("linkage") == "static", "packaged native engine is not statically linked")
+    require(engine.get("linkage") == target_contract["linkage"], "packaged native engine linkage is wrong")
     require(build_fields["linkage"] == engine["linkage"], "native build linkage contradicts manifest")
+    require(
+        engine.get("backend_loading") == target_contract["backend_loading"],
+        "packaged native backend loading mode is wrong",
+    )
+    require(
+        build_fields["backend_loading"] == engine["backend_loading"],
+        "native backend loading mode contradicts manifest",
+    )
     compiled_backends = engine.get("compiled_backends")
     require(
         isinstance(compiled_backends, list)
@@ -623,6 +663,13 @@ def engine_identity(
             "embedding_materialized_path",
             "embedding_materialized_reused",
             "embedding_accelerator_execution_verified",
+            "embedding_execution_devices",
+            "embedding_execution_backends",
+            "embedding_execution_observation_source",
+            "embedding_encode_count",
+            "embedding_execution_node_count",
+            "embedding_resident_accelerator_tensor_count",
+            "embedding_resident_accelerator_tensor_bytes",
             "embedding_model_layer_count",
             "embedding_offloaded_layer_count",
         )
@@ -654,6 +701,40 @@ def engine_identity(
         require(matches, f"embedding backend is {fields['embedding_backend']!r}, expected {expected_backend!r}")
     if fields["embedding_policy"] == "accelerated":
         require(fields["embedding_accelerator_execution_verified"] is True, "accelerated policy lacks live accelerator execution proof")
+        require(
+            fields["embedding_execution_observation_source"] == "ggml_eval_callback",
+            "accelerator execution source is unknown or inferred",
+        )
+        require(
+            isinstance(fields["embedding_execution_devices"], list)
+            and bool(fields["embedding_execution_devices"]),
+            "status lacks an observed execution device",
+        )
+        require(
+            isinstance(fields["embedding_execution_backends"], list)
+            and bool(fields["embedding_execution_backends"]),
+            "status lacks an observed execution backend",
+        )
+        require(
+            isinstance(fields["embedding_encode_count"], int)
+            and fields["embedding_encode_count"] > 0,
+            "status lacks an advancing successful encode counter",
+        )
+        require(
+            isinstance(fields["embedding_execution_node_count"], int)
+            and fields["embedding_execution_node_count"] > 0,
+            "status lacks backend-observed execution nodes",
+        )
+        require(
+            isinstance(fields["embedding_resident_accelerator_tensor_count"], int)
+            and fields["embedding_resident_accelerator_tensor_count"] > 0,
+            "status lacks backend-observed resident accelerator tensors",
+        )
+        require(
+            isinstance(fields["embedding_resident_accelerator_tensor_bytes"], int)
+            and fields["embedding_resident_accelerator_tensor_bytes"] > 0,
+            "status lacks backend-observed resident accelerator tensor bytes",
+        )
         model_layers = fields["embedding_model_layer_count"]
         offloaded_layers = fields["embedding_offloaded_layer_count"]
         require(isinstance(model_layers, int) and model_layers > 0, "status lacks model layer count")
@@ -1144,11 +1225,27 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
         mcp.tool_until_ready(
             "packet", {"project": str(project), "question": args.question, "budget": "compact"}, "packet"
         )
+        final_status = mcp.engine_diagnostics(project, "diagnostics-final")
+        final_identity = engine_identity(
+            final_status, args.engine_policy, args.expected_backend
+        )
+        require(
+            isinstance(first_identity["embedding_encode_count"], int)
+            and isinstance(final_identity["embedding_encode_count"], int)
+            and final_identity["embedding_encode_count"]
+            > first_identity["embedding_encode_count"],
+            "successful encode counter did not advance across live retrieval requests",
+        )
+        require(
+            final_identity["embedding_engine_instance_id"]
+            == first_identity["embedding_engine_instance_id"],
+            "live retrieval requests replaced the process engine",
+        )
         transcript = mcp.transcript
     finally:
         mcp.close()
     write_json(out_dir / "multi-repository-mcp.json", transcript)
-    identity = first_identity
+    identity = final_identity
 
     materialized = Path(str(identity["embedding_materialized_path"] or ""))
     require(materialized.is_file(), f"materialized model is missing: {materialized}")
@@ -1218,14 +1315,15 @@ def self_test() -> None:
         contract_sha256 = embedding_contract_digest(model, embedding, tokenizer)
         build_identity = (
             "codestory-native-engine-v1|target=aarch64-apple-darwin|os=macos|"
-            "arch=aarch64|linkage=static|backends=cpu,metal|llama_cpp_crate=test|"
+            "arch=aarch64|linkage=static|backend_loading=builtin|"
+            "backends=cpu,metal|llama_cpp_crate=test|"
             f"llama_cpp_commit=test|model_sha256={'a' * 64}|"
             f"embedding_contract_sha256={contract_sha256}|model_embedded=true|"
             "producer=test@0.0.0|end"
         )
         binary_payload = bytes(binary_header) + b"\0" + build_identity.encode("ascii") + b"\0"
         valid_manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "release_version": "0.0.0",
             "asset_target": "macos-arm64",
             "binary": {
@@ -1233,14 +1331,17 @@ def self_test() -> None:
                 "sha256": hashlib.sha256(binary_payload).hexdigest(),
                 "format": "mach-o",
                 "arch": "aarch64",
+                "needed": [],
             },
+            "runtime_artifacts": [],
             "engine": {
-                "build_contract_schema_version": 1,
+                "build_contract_schema_version": 2,
                 "build_identity": build_identity,
                 "target_triple": "aarch64-apple-darwin",
                 "target_os": "macos",
                 "target_arch": "aarch64",
                 "linkage": "static",
+                "backend_loading": "builtin",
                 "compiled_backends": ["cpu", "metal"],
                 "llama_cpp_crate_version": "test",
                 "llama_cpp_source_commit": "test",
@@ -1294,6 +1395,13 @@ def self_test() -> None:
             "embedding_smoke_ms": 1.0,
             "embedding_initialization_ms": 2.0,
             "embedding_accelerator_execution_verified": True,
+            "embedding_execution_devices": ["Apple GPU"],
+            "embedding_execution_backends": ["Metal"],
+            "embedding_execution_observation_source": "ggml_eval_callback",
+            "embedding_encode_count": 1,
+            "embedding_execution_node_count": 1,
+            "embedding_resident_accelerator_tensor_count": 1,
+            "embedding_resident_accelerator_tensor_bytes": 1,
             "embedding_model_layer_count": 13,
             "embedding_offloaded_layer_count": 13,
         }
@@ -1308,6 +1416,13 @@ def self_test() -> None:
             pass
         else:
             raise ProofFailure("software adapter was accepted")
+        inferred = {**valid, "embedding_execution_observation_source": "inferred_from_request"}
+        try:
+            engine_identity(inferred, "accelerated", "Metal")
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("inferred accelerator execution was accepted")
 
         hostile_root = root / "hostile-manifest"
         hostile_root.mkdir()

@@ -1746,6 +1746,16 @@ mod tests {
             } else {
                 Vec::new()
             },
+            execution_backend_names: if accelerated {
+                vec!["Metal".into()]
+            } else {
+                Vec::new()
+            },
+            execution_observation_source: "ggml_eval_callback",
+            encode_count: 1,
+            execution_node_count: u64::from(accelerated),
+            resident_accelerator_tensor_count: u64::from(accelerated),
+            resident_accelerator_tensor_bytes: u64::from(accelerated),
             model_layer_count: 13,
             offloaded_layer_count: if accelerated { 13 } else { 0 },
             accelerator_execution_verified: accelerated,
