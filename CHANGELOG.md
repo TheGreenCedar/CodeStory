@@ -25,6 +25,7 @@
 - The packaged executable works offline after installation, reuses its verified model material across restarts, and does not start helper processes or open retrieval ports.
 - Everyday plugin messages say whether broader search is ready, preparing, or unavailable. Model, backend, adapter, and timing details stay in maintainer diagnostics.
 - Source release builds now use one checked-in contract for acquisition, embedding semantics, producer identity, and model-license provenance. Producer name/version bind both runtime and persisted vector compatibility, so implementation upgrades rebuild instead of reusing incompatible vectors. Model acquisition is an explicit pre-Cargo step; Cargo verifies only the supplied regular file, publishes it through a create-new/no-clobber staging path, and never starts Node.js or performs network access. Executable fault tests prove partial writes and racing destinations cannot publish or clobber model bytes.
+- The non-adopting Windows x64 vector-backend comparison now freezes production-attested inputs through a native-identity-pinned, create-new publication boundary. Parent replacement, SQLite sidecar drift, and incompatible query-engine evidence fail closed before an artifact can count toward the backend decision.
 
 ### Upgrade note
 

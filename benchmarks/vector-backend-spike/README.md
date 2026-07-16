@@ -134,7 +134,10 @@ cargo test --release --locked --no-default-features --features fixture-generator
 
 `CODESTORY_VECTOR_SPIKE_FIXTURE_JSON` must name a new file whose parent already
 exists outside both the source generation and `CODESTORY_CACHE_ROOT`. Fixture
-publication never replaces an existing destination.
+publication captures that parent's native filesystem identity before opening
+it, proves the retained directory handle names the same object, and never
+replaces an existing destination. The fixture fails closed if the parent is
+replaced before the handle is pinned or changes while preparation is running.
 
 Run each predeclared vector count from a clean, exact, release-built Git tree on
 the approved Windows x64 production host:

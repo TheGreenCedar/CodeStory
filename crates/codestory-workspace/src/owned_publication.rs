@@ -11,6 +11,23 @@ use std::{
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Native filesystem identity captured for a trusted publication directory.
+///
+/// The token is intentionally opaque. Callers capture it while making their
+/// trust decision, then require [`OwnedFilePublicationRoot::open_verified`] to
+/// prove that the opened directory handle names the same filesystem object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedFilePublicationIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+}
+
 /// A publication boundary pinned to one open directory handle.
 ///
 /// Callers establish the directory identity before opening this boundary, then
@@ -21,21 +38,49 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct OwnedFilePublicationRoot {
     root: File,
+    identity: OwnedFilePublicationIdentity,
     #[cfg(windows)]
     stable_path: std::path::PathBuf,
 }
 
 impl OwnedFilePublicationRoot {
-    /// Pin a directory that the caller has already established as trusted.
+    /// Capture the native identity used to establish a trusted directory.
+    pub fn capture_identity(root: &Path) -> io::Result<OwnedFilePublicationIdentity> {
+        let root = open_root(root)?;
+        identity_from_file(&root)
+    }
+
+    /// Capture and pin a directory without a separate caller trust decision.
     pub fn open(root: &Path) -> io::Result<Self> {
+        let identity = Self::capture_identity(root)?;
+        Self::open_verified(root, identity)
+    }
+
+    /// Pin a directory only when its handle matches a previously captured identity.
+    pub fn open_verified(
+        root: &Path,
+        expected_identity: OwnedFilePublicationIdentity,
+    ) -> io::Result<Self> {
         let root_handle = open_root(root)?;
+        let opened_identity = identity_from_file(&root_handle)?;
+        if opened_identity != expected_identity {
+            return Err(io::Error::other(
+                "owned publication root identity changed before it was pinned",
+            ));
+        }
         #[cfg(windows)]
         let stable_path = fs::canonicalize(root)?;
         Ok(Self {
             root: root_handle,
+            identity: opened_identity,
             #[cfg(windows)]
             stable_path,
         })
+    }
+
+    /// Return whether an existing path still names the pinned directory object.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        Ok(Self::capture_identity(path)? == self.identity)
     }
 
     /// Publish complete bytes at a new leaf name without replacing any entry.
@@ -187,6 +232,55 @@ fn verify_file_bytes(file: &mut File, expected: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn identity_from_file(file: &File) -> io::Result<OwnedFilePublicationIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    Ok(OwnedFilePublicationIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn identity_from_file(file: &File) -> io::Result<OwnedFilePublicationIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output points to correctly sized, writable storage.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            information.as_mut_ptr().cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO size fits u32"),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful `GetFileInformationByHandleEx` initializes all fields.
+    let information = unsafe { information.assume_init() };
+    Ok(OwnedFilePublicationIdentity {
+        volume_serial_number: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn identity_from_file(_file: &File) -> io::Result<OwnedFilePublicationIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owned publication identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
 fn invalid_name(error: std::ffi::NulError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
 }
@@ -272,6 +366,61 @@ mod tests {
                 .publish_new_bytes(name.as_ref(), "fixture", b"blocked")
                 .expect_err("non-leaf destination must be rejected");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rejects_a_replacement_between_identity_capture_and_open() {
+        let root = tempdir().expect("create test root");
+        let trusted = root.path().join("trusted");
+        let displaced = root.path().join("displaced");
+        fs::create_dir(&trusted).expect("create trusted root");
+        let identity =
+            OwnedFilePublicationRoot::capture_identity(&trusted).expect("capture trusted identity");
+
+        fs::rename(&trusted, &displaced).expect("displace trusted root");
+        fs::create_dir(&trusted).expect("create replacement root");
+        let error = OwnedFilePublicationRoot::open_verified(&trusted, identity)
+            .expect_err("replacement root must not satisfy captured identity");
+        assert!(error.to_string().contains("identity changed"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn publication_remains_bound_to_the_opened_directory() {
+        let root = tempdir().expect("create test root");
+        let trusted = root.path().join("trusted");
+        let displaced = root.path().join("displaced");
+        fs::create_dir(&trusted).expect("create trusted root");
+        let publication =
+            OwnedFilePublicationRoot::open(&trusted).expect("pin trusted publication root");
+
+        let rename = fs::rename(&trusted, &displaced);
+        #[cfg(unix)]
+        {
+            rename.expect("rename opened directory");
+            fs::create_dir(&trusted).expect("create replacement root");
+            publication
+                .publish_new_bytes("fixture.json".as_ref(), "fixture", b"pinned")
+                .expect("publish through retained directory handle");
+            assert_eq!(
+                fs::read(displaced.join("fixture.json")).expect("read pinned publication"),
+                b"pinned"
+            );
+            assert!(!trusted.join("fixture.json").exists());
+        }
+        #[cfg(windows)]
+        {
+            rename.expect_err("opened directory must reject replacement on Windows");
+            publication
+                .publish_new_bytes("fixture.json".as_ref(), "fixture", b"pinned")
+                .expect("publish through retained directory handle");
+            assert_eq!(
+                fs::read(trusted.join("fixture.json")).expect("read pinned publication"),
+                b"pinned"
+            );
+            assert!(!displaced.exists());
         }
     }
 }
