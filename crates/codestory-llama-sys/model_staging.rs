@@ -37,13 +37,7 @@ pub(crate) fn stage_model(
     destination: &Path,
     expected: ExpectedModel<'_>,
 ) -> Result<(), String> {
-    stage_model_with_faults(
-        source,
-        destination,
-        expected,
-        |input, output| io::copy(input, output),
-        |_, _| Ok(()),
-    )
+    stage_model_with_faults(source, destination, expected, io::copy, |_, _| Ok(()))
 }
 
 fn stage_model_with_faults<CopyModel, BeforePublish>(
