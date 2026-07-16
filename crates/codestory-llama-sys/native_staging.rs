@@ -198,6 +198,7 @@ mod tests {
             &profile_dir,
         )
         .expect("stage shared libraries");
+        assert_runtime_sources_unchanged(&runtime_sources);
 
         for destination_dir in [
             profile_dir.clone(),
@@ -272,6 +273,7 @@ mod tests {
             &profile_dir,
         )
         .expect("repeated staging remains idempotent");
+        assert_runtime_sources_unchanged(&runtime_sources);
         assert!(
             fs::symlink_metadata(profile_dir.join("libllama-common.so")).is_err(),
             "repeated staging must not introduce absent build support"
@@ -281,6 +283,18 @@ mod tests {
                 fs::read(destination_dir.join("libllama-common.so"))
                     .expect("refreshed build-support entry"),
                 b"common-v2"
+            );
+        }
+    }
+
+    fn assert_runtime_sources_unchanged(runtime_sources: &[&Path]) {
+        let expected: [&[u8]; 5] = [b"ggml", b"ggml", b"ggml", b"cpu", b"vulkan"];
+        for (source, expected) in runtime_sources.iter().zip(expected) {
+            assert_eq!(
+                fs::read(source).expect("upstream runtime source remains readable"),
+                expected,
+                "staging mutated upstream runtime source {}",
+                source.display()
             );
         }
     }

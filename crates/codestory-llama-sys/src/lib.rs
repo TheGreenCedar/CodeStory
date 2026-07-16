@@ -280,6 +280,8 @@ struct EvalTelemetryState {
     target_device_name: String,
     execution_device_names: BTreeSet<String>,
     execution_backend_names: BTreeSet<String>,
+    observed_tensors: HashSet<usize>,
+    execution_tensors: HashSet<usize>,
     observed_layers: BTreeSet<u32>,
     resident_tensors: HashSet<usize>,
     resident_tensor_bytes: u64,
@@ -307,6 +309,8 @@ impl EvalTelemetry {
         })?;
         state.execution_device_names.clear();
         state.execution_backend_names.clear();
+        state.observed_tensors.clear();
+        state.execution_tensors.clear();
         state.observed_layers.clear();
         state.resident_tensors.clear();
         state.resident_tensor_bytes = 0;
@@ -347,7 +351,12 @@ unsafe extern "C" fn observe_eval_tensor(
     ask: bool,
     user_data: *mut c_void,
 ) -> bool {
-    if ask {
+    // The callback's return value has two meanings in llama.cpp: during the
+    // ask phase, true requests that the scheduler compute and synchronize up
+    // to this tensor; during the observation phase, true lets execution
+    // continue. Placement metadata is available during ask, so telemetry never
+    // needs tensor data or a per-node synchronization.
+    if !ask {
         return true;
     }
     if tensor.is_null() || user_data.is_null() {
@@ -356,20 +365,11 @@ unsafe extern "C" fn observe_eval_tensor(
     // The callback pointer is installed from a boxed EvalTelemetry before the
     // context is created. The box outlives and is dropped after the context.
     let telemetry = unsafe { &*(user_data.cast::<EvalTelemetry>()) };
-    let Some((device_name, backend_name)) = (unsafe { tensor_device_identity(tensor) }) else {
-        return true;
-    };
     let Ok(mut state) = telemetry.state.lock() else {
         return false;
     };
-    if device_name != state.target_device_name {
-        return true;
-    }
-    state.execution_device_names.insert(device_name);
-    state.execution_backend_names.insert(backend_name);
-    state.execution_node_count = state.execution_node_count.saturating_add(1);
-    unsafe { observe_tensor_sources(tensor, &mut state) };
-    true
+    unsafe { observe_scheduled_tensor(tensor, &mut state) };
+    false
 }
 
 unsafe fn tensor_device_identity(tensor: *mut llama_sys::ggml_tensor) -> Option<(String, String)> {
@@ -410,32 +410,82 @@ unsafe fn c_string_lossy(pointer: *const std::ffi::c_char) -> Option<String> {
     })
 }
 
-unsafe fn observe_tensor_sources(
+unsafe fn observe_scheduled_tensor(
     root: *mut llama_sys::ggml_tensor,
     state: &mut EvalTelemetryState,
 ) {
-    let mut pending = vec![root];
-    let mut traversed = HashSet::new();
-    while let Some(tensor) = pending.pop() {
-        if tensor.is_null() || !traversed.insert(tensor as usize) {
+    let mut pending = vec![(root, true)];
+    while let Some((tensor, scheduled)) = pending.pop() {
+        if tensor.is_null() {
+            continue;
+        }
+        let tensor_id = tensor as usize;
+        let first_observation = state.observed_tensors.insert(tensor_id);
+        if !first_observation && !scheduled {
             continue;
         }
         let raw = unsafe { &*tensor };
-        if let Some(layer) = layer_index_from_tensor_name(&raw.name) {
-            state.observed_layers.insert(layer);
+        if let Some((device_name, backend_name)) = unsafe { tensor_device_identity(tensor) } {
+            let tensor_bytes = if first_observation {
+                (unsafe { llama_sys::ggml_nbytes(tensor) }) as u64
+            } else {
+                0
+            };
+            record_tensor_observation(
+                state,
+                tensor_id,
+                &raw.name,
+                &device_name,
+                &backend_name,
+                tensor_bytes,
+                scheduled,
+                first_observation,
+            );
         }
-        if unsafe { tensor_device_identity(tensor) }
-            .is_some_and(|(device, _)| device == state.target_device_name)
-            && state.resident_tensors.insert(tensor as usize)
-        {
-            state.resident_tensor_bytes = state
-                .resident_tensor_bytes
-                .saturating_add(unsafe { llama_sys::ggml_nbytes(tensor) } as u64);
+        if first_observation {
+            pending.extend(
+                raw.src
+                    .iter()
+                    .copied()
+                    .filter(|source| !source.is_null())
+                    .map(|source| (source, false)),
+            );
+            if !raw.view_src.is_null() {
+                pending.push((raw.view_src, false));
+            }
         }
-        pending.extend(raw.src.iter().copied().filter(|source| !source.is_null()));
-        if !raw.view_src.is_null() {
-            pending.push(raw.view_src);
-        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tensor_observation(
+    state: &mut EvalTelemetryState,
+    tensor_id: usize,
+    name: &[std::ffi::c_char; 64],
+    device_name: &str,
+    backend_name: &str,
+    tensor_bytes: u64,
+    scheduled: bool,
+    first_observation: bool,
+) {
+    if device_name != state.target_device_name {
+        return;
+    }
+    if scheduled && state.execution_tensors.insert(tensor_id) {
+        state.execution_device_names.insert(device_name.to_string());
+        state
+            .execution_backend_names
+            .insert(backend_name.to_string());
+        state.execution_node_count = state.execution_node_count.saturating_add(1);
+    }
+    if !first_observation {
+        return;
+    }
+    if let Some(layer) = layer_index_from_tensor_name(name) {
+        state.observed_layers.insert(layer);
+    }
+    if state.resident_tensors.insert(tensor_id) {
+        state.resident_tensor_bytes = state.resident_tensor_bytes.saturating_add(tensor_bytes);
     }
 }
 
@@ -1829,6 +1879,90 @@ mod tests {
             unsafe { (*raw).cb_eval_user_data },
             std::ptr::from_ref(&telemetry).cast_mut().cast()
         );
+    }
+
+    #[test]
+    fn eval_callback_observes_ask_without_requesting_per_node_synchronization() {
+        // In the pinned llama.cpp callback ABI, false during ask batches the
+        // node with the rest of its backend split. True during observation
+        // allows graph execution to continue.
+        let telemetry = EvalTelemetry::new("test-device".into());
+        // Bindgen represents ggml_tensor as plain C scalars, arrays, and
+        // pointers. An all-zero tensor is a valid metadata-only callback probe
+        // with no buffer, sources, or view.
+        let mut tensor = unsafe { std::mem::zeroed::<llama_sys::ggml_tensor>() };
+        let tensor_pointer = std::ptr::from_mut(&mut tensor);
+        let user_data = std::ptr::from_ref(&telemetry).cast_mut().cast();
+
+        assert!(!unsafe { observe_eval_tensor(tensor_pointer, true, user_data) });
+        assert!(
+            telemetry
+                .state
+                .lock()
+                .expect("telemetry state")
+                .observed_tensors
+                .contains(&(tensor_pointer as usize))
+        );
+        assert!(unsafe { observe_eval_tensor(tensor_pointer, false, user_data) });
+    }
+
+    #[test]
+    fn mixed_device_ancestors_only_count_target_resident_layers() {
+        fn name(value: &[u8]) -> [std::ffi::c_char; 64] {
+            let mut name = [0 as std::ffi::c_char; 64];
+            for (target, source) in name.iter_mut().zip(value) {
+                *target = *source as std::ffi::c_char;
+            }
+            name
+        }
+
+        let mut state = EvalTelemetryState {
+            target_device_name: "Apple GPU".into(),
+            ..EvalTelemetryState::default()
+        };
+        record_tensor_observation(
+            &mut state,
+            1,
+            &name(b"blk.0.attn_q"),
+            "CPU",
+            "CPU",
+            1_024,
+            true,
+            true,
+        );
+        record_tensor_observation(
+            &mut state,
+            2,
+            &name(b"blk.1.attn_q"),
+            "Apple GPU",
+            "Metal",
+            2_048,
+            true,
+            true,
+        );
+        record_tensor_observation(
+            &mut state,
+            3,
+            &name(b"blk.2.ffn_up.weight"),
+            "CPU",
+            "CPU",
+            4_096,
+            false,
+            true,
+        );
+
+        assert_eq!(state.observed_layers, BTreeSet::from([1]));
+        assert_eq!(state.execution_node_count, 1);
+        assert_eq!(
+            state.execution_device_names,
+            BTreeSet::from(["Apple GPU".into()])
+        );
+        assert_eq!(
+            state.execution_backend_names,
+            BTreeSet::from(["Metal".into()])
+        );
+        assert_eq!(state.resident_tensors, HashSet::from([2]));
+        assert_eq!(state.resident_tensor_bytes, 2_048);
     }
 
     #[test]

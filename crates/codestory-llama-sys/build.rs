@@ -220,15 +220,16 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
         );
     }
     runtime_files.sort_by_key(|entry| entry.0.to_lowercase());
-    for (name, source, _) in &runtime_files {
-        fs::copy(source, profile_dir.join(name)).unwrap_or_else(|error| {
-            panic!(
-                "failed to stage native runtime artifact {}: {error}",
-                source.display()
-            )
-        });
-    }
-    if target_os == "linux" {
+    if target_os == "windows" {
+        for (name, source, _) in &runtime_files {
+            fs::copy(source, profile_dir.join(name)).unwrap_or_else(|error| {
+                panic!(
+                    "failed to stage native runtime artifact {}: {error}",
+                    source.display()
+                )
+            });
+        }
+    } else {
         let runtime_sources = runtime_files
             .iter()
             .map(|(_, source, _)| source.as_path())
