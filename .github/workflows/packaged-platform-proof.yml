@@ -105,6 +105,11 @@ jobs:
       - name: Prepare checksum-pinned embedded model
         run: node scripts/prepare-embedded-model.mjs
 
+      - name: Install checksum-pinned Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/scripts/install-windows-vulkan-sdk.ps1
+
       - name: Install Linux Vulkan build dependencies
         if: runner.os == 'Linux'
         run: bash .github/scripts/install-linux-vulkan-build-deps.sh
@@ -471,6 +476,8 @@ jobs:
         run: pwsh -File scripts/install-codestory.ps1 -SelfTest
 
       - name: Prove managed plugin handoff
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
           --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"
@@ -479,6 +486,9 @@ jobs:
           --project "${{ github.workspace }}"
           --plugin-root plugins/codestory
           --plugin-handoff
+          --engine-policy cpu_explicit
+          --expected-backend CPU
+          --offline
           --out-dir target/packaged-managed-proof
 
       - name: Upload managed plugin proof

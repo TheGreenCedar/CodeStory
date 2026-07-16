@@ -46,6 +46,7 @@ RUN archive="cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
 COPY --from=glslc /opt/glslc-root /opt/glslc-root
 COPY --from=glslc /usr/include/spirv /usr/include/spirv
 COPY --from=glslc /usr/include/vulkan /usr/include/vulkan
+COPY --from=glslc /usr/include/vk_video /usr/include/vk_video
 COPY --from=glslc /usr/share/cmake/SPIRV-Headers /usr/share/cmake/SPIRV-Headers
 COPY glslc /usr/local/bin/glslc
 
