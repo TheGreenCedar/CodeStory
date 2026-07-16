@@ -25,9 +25,61 @@ const {
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function stopChildProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const closed = once(child, "close").catch(() => []);
+  try {
+    child.stdin?.end();
+  } catch {
+    // Continue to the bounded signal path.
+  }
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  await Promise.race([closed, delay(500)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      return;
+    }
+    await Promise.race([closed, delay(500)]);
+  }
+}
+
 test("fail-open tool schemas are the generated canonical MCP catalog", async () => {
   const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
   assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
+});
+
+test("fail-open handoff shutdown is bounded for a child that ignores stdin and SIGTERM", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGKILL") {
+      child.signalCode = signal;
+      child.emit("exit", null, signal);
+      child.emit("close", null, signal);
+    }
+    return true;
+  };
+
+  launcherTest.shutdownHandoffChild(child, {
+    handoffTerminationGraceMs: 1,
+    handoffForceKillGraceMs: 1,
+  });
+  await delay(25);
+
+  assert.equal(child.stdin.writableEnded, true);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
 });
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
@@ -2340,7 +2392,9 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.project_root, null);
     assert.equal(status.project_state, "no_project");
-    assert.equal(status.degraded_reason, "project_required");
+    assert.equal(status.degraded_reason, "managed_cli_unavailable");
+    assert.equal(status.project_selection.code, "project_required");
+    assert.equal(status.project_selection.state, "no_project");
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
@@ -2509,6 +2563,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     method: "resources/read",
     params: { uri: "codestory://status" },
   }) + "\n";
+  let child;
 
   try {
     await mkdir(cliDir, { recursive: true });
@@ -2531,7 +2586,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       "utf8",
     );
 
-    const child = spawn(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         PLUGIN_DATA: dataDir,
@@ -2580,6 +2635,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       version,
     );
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -3406,9 +3462,10 @@ test("mcp launcher keeps managed provision failures primary", async () => {
     method: "resources/read",
     params: { uri: "codestory://status" },
   }) + "\n";
+  let child;
 
   try {
-    const child = spawn(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         CODESTORY_CLI: "",
@@ -3456,6 +3513,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       true,
     );
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
   }

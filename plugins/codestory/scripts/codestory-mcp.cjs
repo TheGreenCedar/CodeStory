@@ -2130,6 +2130,47 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   };
 }
 
+const shuttingDownHandoffs = new WeakSet();
+
+function shutdownHandoffChild(child, options = {}) {
+  if (!child || typeof child !== 'object' || shuttingDownHandoffs.has(child)) return;
+  shuttingDownHandoffs.add(child);
+  try {
+    child.stdin?.end();
+  } catch {
+    // Continue to the bounded process shutdown below.
+  }
+  if (typeof child.kill !== 'function') return;
+  const isRunning = () => child.exitCode == null && child.signalCode == null;
+  const graceMs = options.handoffTerminationGraceMs ?? 500;
+  const forceGraceMs = options.handoffForceKillGraceMs ?? 500;
+  let forceTimer = null;
+  const terminateTimer = setTimeout(() => {
+    if (!isRunning()) return;
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      return;
+    }
+    forceTimer = setTimeout(() => {
+      if (!isRunning()) return;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // The child already left or the platform rejected the final signal.
+      }
+    }, forceGraceMs);
+    forceTimer.unref?.();
+  }, graceMs);
+  terminateTimer.unref?.();
+  const clearTimers = () => {
+    clearTimeout(terminateTimer);
+    if (forceTimer) clearTimeout(forceTimer);
+  };
+  child.once?.('exit', clearTimers);
+  child.once?.('close', clearTimers);
+}
+
 function runFailOpenMcp(status, options = {}) {
   const currentStatus = () => (typeof status === 'function' ? status() : status);
   let handoff = null;
@@ -2166,7 +2207,9 @@ function runFailOpenMcp(status, options = {}) {
     const failHandoff = (reason, details = {}) => {
       if (handoffFailureHandled) return;
       handoffFailureHandled = true;
+      const failedHandoff = handoff;
       handoff = null;
+      shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
         process.exit(details.code || 1);
         return;
@@ -2304,7 +2347,12 @@ function runFailOpenMcp(status, options = {}) {
             statusValue.project_root = null;
             statusValue.project_root_source = 'request_argument';
             statusValue.project_state = 'no_project';
-            statusValue.degraded_reason = 'project_required';
+            statusValue.project_selection = {
+              code: 'project_required',
+              state: 'no_project',
+              message: selection.message,
+            };
+            statusValue.degraded_reason ||= 'project_required';
           } else {
             response = jsonrpcError(request.id, -32602, selection.message);
           }
@@ -2331,7 +2379,7 @@ function runFailOpenMcp(status, options = {}) {
   });
   process.stdin.on('end', () => {
     stdinEnded = true;
-    handoff?.stdin.end();
+    shutdownHandoffChild(handoff, options);
   });
   return { notifyRuntimeReady };
 }
@@ -2557,6 +2605,7 @@ if (require.main === module) {
       resolveManagedCli,
       runFailOpenMcp,
       sameFilesystemPath,
+      shutdownHandoffChild,
       managedCliRetentionReport,
       managedCliVersionEntries,
       removeManagedCliVersion,
