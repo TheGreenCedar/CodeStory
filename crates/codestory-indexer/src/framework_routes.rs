@@ -1374,10 +1374,9 @@ fn last_identifier(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn node_has_direct_anonymous_token(node: Node<'_>, expected: &[&str]) -> bool {
-    (0..node.child_count()).any(|index| {
-        node.child(index)
-            .is_some_and(|child| !child.is_named() && expected.contains(&child.kind()))
-    })
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && expected.contains(&child.kind()))
 }
 
 fn commonjs_router_bindings(node: Node<'_>, source: &str) -> HashSet<String> {

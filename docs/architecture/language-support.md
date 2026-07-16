@@ -118,10 +118,10 @@ fidelity coverage land.
 
 Workspace parser policy:
 
-- `tree-sitter = "0.25.10"`
+- `tree-sitter = "0.26.11"`
 - `tree-sitter-rust = "0.24.2"`
 - `tree-sitter-graph = "0.12.0"`, vendored from upstream commit
-  `b930fb59c2177a90b3a6a68e1feeca6918ceb58b` with only the Tree-sitter 0.25
+  `b930fb59c2177a90b3a6a68e1feeca6918ceb58b` with only the Tree-sitter 0.26
   compatibility and current lint adjustments recorded in
   `vendor/tree-sitter-graph/UPSTREAM.md`
 
@@ -132,14 +132,14 @@ paths, not parser-backed runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |
 | --- | --- | ---: | --- |
-| Go | `tree-sitter-go` | `0.23.4` | wired |
+| Go | `tree-sitter-go` | `0.25.0` | wired |
 | Ruby | `tree-sitter-ruby` | `0.23.1` | wired |
-| PHP | `tree-sitter-php` | `0.23.11` | wired |
-| C# | `tree-sitter-c-sharp` | `=0.23.0` | wired |
+| PHP | `tree-sitter-php` | `0.24.2` | wired |
+| C# | `tree-sitter-c-sharp` | `0.23.5` | wired |
 | Kotlin | `tree-sitter-kotlin-ng` | `1.1.0` | wired |
-| Swift | `tree-sitter-swift` | `0.7.0` | wired |
-| Dart | `tree-sitter-dart-orchard` | `0.3.2` | wired |
-| Bash | `tree-sitter-bash` | `0.23.3` | wired |
+| Swift | `tree-sitter-swift` | `0.7.3` | wired |
+| Dart | `tree-sitter-dart-orchard` | `0.4.0` | wired |
+| Bash | `tree-sitter-bash` | `0.25.1` | wired |
 | HTML | `tree-sitter-html` | `0.23.2` | candidate only |
 | CSS | `tree-sitter-css` | `0.25.0` | candidate only |
 | SQL | `tree-sitter-sequel` | `0.3.11` | candidate only |
