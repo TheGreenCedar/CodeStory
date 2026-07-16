@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   basicWorkflowViolations,
+  draftSourcePolicyViolations,
   loadWorkflows,
   macosCliDistributionViolations,
   managedPluginViolations,
@@ -18,6 +19,20 @@ import {
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+function draftSourceJob() {
+  return structuredClone(loadWorkflows().get("rust-ci.yml").jobs["linux-draft"]);
+}
+
+function retrievalSourceJob() {
+  return structuredClone(loadWorkflows().get("retrieval-engine-smoke.yml").jobs["linux-contracts"]);
+}
+
+function draftStep(job, name) {
+  const matches = job.steps.filter(step => step.name === name);
+  assert.equal(matches.length, 1, `expected one ${name} step`);
+  return matches[0];
+}
 
 function managedJob() {
   return {
@@ -137,6 +152,119 @@ jobs:
 
   workflow.jobs.check.steps[0].run += "\ncargo check --workspace\n";
   assert.match(basicWorkflowViolations("fixture.yml", workflow).join("\n"), /must use --locked/u);
+});
+
+test("draft source cache reuse preserves exact serial proof structure", async (t) => {
+  assert.deepEqual(draftSourcePolicyViolations(draftSourceJob(), retrievalSourceJob()), []);
+
+  const mutations = [
+    ["unversioned primary", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with.key = step.with.key.replace("-draft-v2-", "-draft-");
+    }],
+    ["lock-only primary", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with.key = step.with.key.replace(
+        "hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml')",
+        "hashFiles('Cargo.lock')",
+      );
+    }],
+    ["fallback order reversal", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with["restore-keys"] = step.with["restore-keys"].trim().split("\n").reverse().join("\n");
+    }],
+    ["overbroad draft fallback", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      const keys = step.with["restore-keys"].trim().split("\n");
+      keys[1] = "${{ runner.os }}-draft-v2-";
+      step.with["restore-keys"] = keys.join("\n");
+    }],
+    ["cross-platform fallback", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with["restore-keys"] = step.with["restore-keys"].replace("${{ runner.os }}-cargo-stable-", "Windows-cargo-stable-");
+    }],
+    ["all-feature fallback", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with["restore-keys"] = step.with["restore-keys"].replace("retrieval-contracts-default-features", "retrieval-contracts-all-features");
+    }],
+    ["source-proof fallback", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with["restore-keys"] = step.with["restore-keys"].replace("retrieval-contracts-default-features", "source-proof-all-targets-all-features");
+    }],
+    ["different restore path", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with.path = step.with.path.replace("target", "target/release");
+    }],
+    ["blocking restore", job => {
+      draftStep(job, "Restore Cargo inputs and output")["continue-on-error"] = false;
+    }],
+    ["matched-key save", job => {
+      draftStep(job, "Save Cargo inputs and output").with.key = "${{ steps.cargo-cache-restore.outputs.cache-matched-key }}";
+    }],
+    ["promotion before complete proof", job => {
+      draftStep(job, "Save Cargo inputs and output").if = "steps.cargo-cache-restore.outputs.cache-hit != 'true'";
+    }],
+    ["removed proof command", job => {
+      const step = draftStep(job, "Prove focused publication contracts");
+      step.run = step.run.trim().split("\n").slice(0, -1).join("\n");
+    }],
+    ["reordered proof commands", job => {
+      const step = draftStep(job, "Prove focused publication contracts");
+      const commands = step.run.trim().split("\n");
+      [commands[0], commands[1]] = [commands[1], commands[0]];
+      step.run = commands.join("\n");
+    }],
+    ["backgrounded Cargo command", job => {
+      const step = draftStep(job, "Check the workspace");
+      step.run = `${step.run} &`;
+    }],
+    ["parallel Cargo commands", job => {
+      const step = draftStep(job, "Check the workspace");
+      step.run = `${step.run} &\nwait`;
+    }],
+    ["reordered proof steps", job => {
+      const left = job.steps.findIndex(step => step.name === "Check the workspace");
+      const right = job.steps.findIndex(step => step.name === "Lint workspace libraries");
+      [job.steps[left], job.steps[right]] = [job.steps[right], job.steps[left]];
+    }],
+    ["optional proof step", job => {
+      draftStep(job, "Lint workspace libraries")["continue-on-error"] = true;
+    }],
+    ["decoy cache step", job => {
+      const restore = draftStep(job, "Restore Cargo inputs and output");
+      const decoy = structuredClone(restore);
+      decoy.name = "Decoy cache contract";
+      restore.with.key = "decoy-primary";
+      job.steps.push(decoy);
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const candidate = draftSourceJob();
+      mutate(candidate);
+      assert.notDeepEqual(draftSourcePolicyViolations(candidate, retrievalSourceJob()), []);
+    });
+  }
+
+  for (const [name, mutate] of [
+    ["incompatible retrieval path", job => {
+      draftStep(job, "Restore Cargo registry, git sources, and build output").with.path = "~/.cargo/registry\ntarget/retrieval\n";
+    }],
+    ["incompatible retrieval key", job => {
+      const step = draftStep(job, "Restore Cargo registry, git sources, and build output");
+      step.with.key = step.with.key.replace("retrieval-contracts-default-features", "retrieval-contracts-all-features");
+    }],
+    ["incompatible retrieval action", job => {
+      draftStep(job, "Restore Cargo registry, git sources, and build output").uses = "actions/cache/restore@v4";
+    }],
+  ]) {
+    await t.test(name, () => {
+      const candidate = retrievalSourceJob();
+      mutate(candidate);
+      assert.notDeepEqual(draftSourcePolicyViolations(draftSourceJob(), candidate), []);
+    });
+  }
 });
 
 test("managed proof rejects structural bypasses and decoy commands", () => {

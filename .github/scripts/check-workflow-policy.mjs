@@ -101,6 +101,136 @@ function requireJob(violations, file, workflow, name) {
   return object(found);
 }
 
+const draftCachePaths = [
+  "~/.cargo/registry",
+  "~/.cargo/git",
+  "target",
+];
+const draftCachePrimary = "${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
+const draftCacheRestoreKeys = [
+  "${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}",
+  "${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-",
+  "${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-",
+];
+const draftStepSequence = [
+  { uses: "actions/checkout@v5" },
+  { name: "Install Rust stable" },
+  { name: "Install Linux Vulkan build dependencies" },
+  { name: "Capture Rust cache identity" },
+  { name: "Restore Cargo inputs and output" },
+  { name: "Check formatting" },
+  { name: "Check immutable runtime configuration boundary" },
+  { name: "Check the workspace" },
+  { name: "Check generated CodeStory syntax and MCP catalog" },
+  { name: "Lint workspace libraries" },
+  { name: "Prove focused publication contracts" },
+  { name: "Save Cargo inputs and output" },
+];
+const draftRunCommands = new Map([
+  ["Install Rust stable", [
+    "rustup toolchain install stable --profile minimal --component clippy --component rustfmt",
+    "rustup default stable",
+  ]],
+  ["Install Linux Vulkan build dependencies", [
+    "bash .github/scripts/install-linux-vulkan-build-deps.sh",
+  ]],
+  ["Capture Rust cache identity", [
+    `echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"`,
+    `echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"`,
+  ]],
+  ["Check formatting", ["cargo fmt --check"]],
+  ["Check immutable runtime configuration boundary", [
+    "node .github/scripts/check-runtime-config-boundary.mjs",
+  ]],
+  ["Check the workspace", ["cargo check --workspace --locked"]],
+  ["Check generated CodeStory syntax and MCP catalog", [
+    "cargo build --locked -p codestory-cli",
+    "node scripts/generate-codestory-skill-syntax.mjs --check",
+  ]],
+  ["Lint workspace libraries", [
+    "cargo clippy --workspace --lib --locked -- -D warnings",
+  ]],
+  ["Prove focused publication contracts", [
+    "cargo test --locked -p codestory-llama-sys --test model_staging",
+    "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+    "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
+    "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
+  ]],
+]);
+
+function nonCommentLines(value) {
+  return String(value ?? "")
+    .split(/\r?\n/u)
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !line.startsWith("#"));
+}
+
+function sameStrings(actual, expected) {
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
+  const violations = [];
+  const job = object(jobValue);
+  const retrievalJob = object(retrievalJobValue);
+  const steps = list(job.steps).map(object);
+
+  add(violations, job["runs-on"] === "ubuntu-latest", "draft source job must use ubuntu-latest");
+  add(violations, job["timeout-minutes"] === 45, "draft source job timeout must remain 45 minutes");
+  add(violations, job.env === undefined && job.defaults === undefined, "draft source job must not override the proof environment or defaults");
+  add(violations, job["continue-on-error"] === undefined && job.strategy === undefined, "draft source job must remain one required serial lane");
+  add(violations, steps.length === draftStepSequence.length, "draft source job must keep its exact serialized step count");
+  for (const [index, expected] of draftStepSequence.entries()) {
+    const step = steps[index];
+    const matches = expected.name === undefined
+      ? step?.uses === expected.uses
+      : step?.name === expected.name;
+    add(violations, matches, `draft source step ${index + 1} must remain ${expected.name ?? expected.uses}`);
+  }
+
+  for (const [name, commands] of draftRunCommands) {
+    const step = namedStep(job, name);
+    add(violations, step !== undefined, `draft source job must contain one ${name} step`);
+    add(violations, sameStrings(nonCommentLines(step?.run), commands), `draft source step ${name} must keep its exact serial command sequence`);
+    add(violations, step?.["continue-on-error"] === undefined && step?.if === undefined, `draft source step ${name} must remain required`);
+    add(violations, step?.env === undefined && step?.["working-directory"] === undefined, `draft source step ${name} must use the shared default build environment`);
+  }
+
+  const identity = namedStep(job, "Capture Rust cache identity");
+  add(violations, identity?.id === "rust-cache-key" && identity?.shell === "bash", "draft source cache identity must keep its stable bash output contract");
+
+  const restore = namedStep(job, "Restore Cargo inputs and output");
+  const restoreWith = object(restore?.with);
+  add(violations, restore?.id === "cargo-cache-restore", "draft source cache restore must keep its stable step id");
+  add(violations, restore?.uses === "actions/cache/restore@v5", "draft source cache restore must use actions/cache/restore@v5");
+  add(violations, restore?.["continue-on-error"] === true && restore?.if === undefined, "draft source cache restore must remain optional without conditional bypasses");
+  add(violations, sameStrings(nonCommentLines(restoreWith.path), draftCachePaths), "draft source cache restore must use only the Cargo registry, git, and default target paths");
+  add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, feature, lock, and manifest identity");
+  add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact retrieval, prior draft, then prior retrieval order");
+
+  const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
+  const retrievalRestoreWith = object(retrievalRestore?.with);
+  add(violations, retrievalRestore?.id === "cargo-cache-restore", "retrieval cache producer must keep its stable restore id");
+  add(violations, retrievalRestore?.uses === "actions/cache/restore@v5", "retrieval cache producer must use actions/cache/restore@v5");
+  add(violations, retrievalRestore?.["continue-on-error"] === true, "retrieval cache producer restore must remain non-blocking");
+  add(violations, sameStrings(nonCommentLines(retrievalRestoreWith.path), draftCachePaths), "retrieval cache producer must retain the proof-compatible path set");
+  add(violations, retrievalRestoreWith.key === draftCacheRestoreKeys[0], "retrieval cache producer key must match the draft exact-lock fallback");
+
+  const save = namedStep(job, "Save Cargo inputs and output");
+  const saveWith = object(save?.with);
+  add(violations, save?.uses === "actions/cache/save@v5", "draft source cache promotion must use actions/cache/save@v5");
+  add(violations, save?.["continue-on-error"] === true, "draft source cache promotion must remain non-blocking");
+  add(
+    violations,
+    save?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''",
+    "draft source cache promotion must require complete proof and a partial or missing primary",
+  );
+  add(violations, sameStrings(nonCommentLines(saveWith.path), draftCachePaths), "draft source cache promotion must use the exact restore path set");
+  add(violations, saveWith.key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}", "draft source cache promotion must save the exact primary rather than a matched fallback");
+
+  return violations;
+}
+
 export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
 
 export function macosCliDistributionViolations(assessmentStep, executionStep, quarantinedPath) {
@@ -526,18 +656,14 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "scripts/generate-codestory-skill-syntax.mjs",
     ]), `${rustFile} must cover workspace source and generated catalog changes`);
     const job = requireJob(violations, rustFile, rust, "linux-draft");
-    add(violations, job["runs-on"] === "ubuntu-latest", `${rustFile} must use one Ubuntu lane`);
-    requireStepRun(violations, rustFile, job, "Check formatting", ["cargo fmt --check"]);
-    requireStepRun(violations, rustFile, job, "Check the workspace", ["cargo check --workspace --locked"]);
-    requireStepRun(violations, rustFile, job, "Check generated CodeStory syntax and MCP catalog", [
-      "cargo build --locked -p codestory-cli",
-      "node scripts/generate-codestory-skill-syntax.mjs --check",
-    ]);
-    requireStepRun(violations, rustFile, job, "Lint workspace libraries", ["cargo clippy --workspace --lib --locked -- -D warnings"]);
-    requireStepRun(violations, rustFile, job, "Prove focused publication contracts", [
-      "cargo test --locked -p codestory-llama-sys --test model_staging",
-      "cargo test --locked",
-    ]);
+    const retrievalJob = object(at(
+      workflows.get("retrieval-engine-smoke.yml"),
+      "jobs",
+      "linux-contracts",
+    ));
+    for (const violation of draftSourcePolicyViolations(job, retrievalJob)) {
+      violations.push(`${rustFile} ${violation}`);
+    }
   }
 
   const sourceFile = "source-proof.yml";
