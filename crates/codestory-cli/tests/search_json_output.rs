@@ -245,19 +245,24 @@ fn search_json_fails_closed_without_full_sidecars() {
     let failure: Value = serde_json::from_slice(&search.stdout).expect("parse failure envelope");
     let failure_text = failure.to_string();
     assert_eq!(failure["schema_version"], 1);
-    assert_eq!(failure["error"]["code"], "command_failed");
+    assert_eq!(failure["error"]["code"], "retrieval_unavailable");
+    assert_eq!(
+        failure["error"]["details"]["failed_layer"],
+        "retrieval_engine"
+    );
     assert!(
-        failure_text.contains("retrieval_unavailable: retrieval is unavailable or degraded")
+        failure_text.contains("retrieval is unavailable or degraded")
             && failure_text.contains("expected profile=agent mode=full"),
         "search should report the mandatory full-retrieval boundary: {failure:#}"
     );
     assert!(
-        failure_text.contains("Minimum next:")
-            && failure_text.contains("Additional checks:")
+        failure["error"]["details"]["minimum_next"]
+            .as_array()
+            .is_some_and(|commands| commands.len() == 1)
             && failure_text.contains("codestory-cli retrieval index")
             && failure_text.contains("codestory-cli retrieval status")
             && failure_text.contains("codestory-cli doctor"),
-        "search should include retrieval activation and diagnostic commands: {failure:#}"
+        "search should retain typed retrieval activation and diagnostic commands: {failure:#}"
     );
 }
 

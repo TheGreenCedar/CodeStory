@@ -198,6 +198,11 @@ async fn main() -> ExitCode {
             if json {
                 let envelope = structured
                     .map(|failure| failure.envelope.clone())
+                    .or_else(|| {
+                        runtime::api_error_in_chain(&error)
+                            .cloned()
+                            .map(CommandFailureEnvelope::new)
+                    })
                     .unwrap_or_else(|| generic_command_failure(&error));
                 let output_file = structured
                     .and_then(|failure| failure.output_file.as_deref())
@@ -212,7 +217,7 @@ async fn main() -> ExitCode {
                     eprintln!("Error: failed to write {}: {write_error}", path.display());
                     return ExitCode::FAILURE;
                 }
-                eprintln!("Error: {}", error);
+                eprintln!("Error: {}", command_failure_message(&error));
             }
             ExitCode::FAILURE
         }
@@ -325,6 +330,14 @@ fn generic_command_failure(error: &anyhow::Error) -> CommandFailureEnvelope {
             "causes": error.chain().skip(1).map(ToString::to_string).collect::<Vec<_>>()
         }),
     )
+}
+
+fn command_failure_message(error: &anyhow::Error) -> String {
+    if runtime::api_error_in_chain(error).is_some() {
+        format!("{error:#}")
+    } else {
+        error.to_string()
+    }
 }
 
 fn json_output_requested(args: &[OsString]) -> bool {
@@ -7979,6 +7992,28 @@ mod tests {
             first_index < second_index,
             "expected `{first}` before `{second}` in:\n{markdown}"
         );
+    }
+
+    #[test]
+    fn command_failure_message_keeps_typed_guidance_through_outer_context() {
+        let error = map_api_error(ApiError::retrieval_unavailable(
+            "retrieval is unavailable",
+            "/tmp/project",
+            vec!["codestory-cli retrieval index --project /tmp/project".to_string()],
+        ))
+        .context("retrieval index finalize");
+
+        let message = command_failure_message(&error);
+        assert!(message.starts_with("retrieval index finalize:"));
+        assert!(message.contains("retrieval_unavailable: retrieval is unavailable"));
+        assert!(message.contains("Minimum next:"));
+    }
+
+    #[test]
+    fn command_failure_message_leaves_untyped_errors_unchanged() {
+        let error = anyhow::anyhow!("storage unavailable").context("open project");
+
+        assert_eq!(command_failure_message(&error), "open project");
     }
 
     #[test]
