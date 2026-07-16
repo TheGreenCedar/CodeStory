@@ -90,6 +90,15 @@ jobs:
         shell: bash
         run: |
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "cmake=$(cmake --version | sed -n 's/^cmake version //p')" >> "$GITHUB_OUTPUT"
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "generator=ninja" >> "$GITHUB_OUTPUT"
+            echo "ninja=$(ninja --version)" >> "$GITHUB_OUTPUT"
+            echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          else
+            echo "generator=platform-default" >> "$GITHUB_OUTPUT"
+            echo "ninja=not-applicable" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
@@ -100,7 +109,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v2-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock') }}
 
       - name: Prepare checksum-pinned embedded model
         run: node scripts/prepare-embedded-model.mjs

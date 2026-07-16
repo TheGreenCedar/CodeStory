@@ -9,10 +9,13 @@
   typed failures into a generic `command_failed` envelope.
 - The manual Windows manifest-missing readiness lane now installs the
   checksum-pinned Vulkan SDK before running the real locked `ready_command`
-  contract with explicit CPU runtime permission. Its exact-only cache binds the
-  hosted platform, Rust and target identities, default native feature and proof
-  shape, workspace manifests, installer, and lockfile; this remains
-  source/protocol evidence rather than a packaged or Vulkan-hardware claim.
+  contract with explicit CPU runtime permission. Windows source-build proof
+  pins the Ninja generator instead of inheriting the hosted Visual Studio
+  generator, and exact caches bind the generator plus CMake and Ninja versions
+  alongside the hosted platform, Rust and target identities, default native
+  feature and proof shape, workspace manifests, installer, and lockfile. The
+  hosted lane remains source/protocol evidence rather than a packaged or
+  Vulkan-hardware claim.
 - Draft source CI now restores exact-lock retrieval output or narrowly scoped
   prior-lock output before rebuilding. The base retrieval lane serially seeds
   the exact five test-profile targets used by draft proof, while a versioned

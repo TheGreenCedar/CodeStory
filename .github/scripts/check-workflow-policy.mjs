@@ -183,11 +183,12 @@ const retrievalProducerTriggerPaths = [
   ".github/workflows/rust-ci.yml",
 ];
 const windowsVulkanInstaller = ".github/scripts/install-windows-vulkan-sdk.ps1";
+const windowsNativeGenerator = "Ninja";
 const windowsReadyCommand = "cargo test --locked -p codestory-cli --test ready_command";
 const windowsReadyProofTopologyDigest = createHash("sha256")
-  .update(windowsReadyCommand)
+  .update(`${windowsReadyCommand}\nCMAKE_GENERATOR=${windowsNativeGenerator}`)
   .digest("hex");
-const windowsReadyProofTopology = `ready-command-v1-${windowsReadyProofTopologyDigest}`;
+const windowsReadyProofTopology = `ready-command-v2-${windowsReadyProofTopologyDigest}`;
 const windowsInstallerHash = `\${{ hashFiles('${windowsVulkanInstaller}') }}`;
 const windowsCachePrimary = [
   cacheRunner,
@@ -196,6 +197,12 @@ const windowsCachePrimary = [
   cacheTarget,
   "windows",
   windowsReadyProofTopology,
+  "generator",
+  windowsNativeGenerator.toLowerCase(),
+  "cmake",
+  "${{ steps.rust-cache-key.outputs.cmake }}",
+  "ninja",
+  "${{ steps.rust-cache-key.outputs.ninja }}",
   "default-features",
   cacheManifests,
   windowsInstallerHash,
@@ -231,8 +238,12 @@ const windowsRunCommands = new Map([
   ["Capture Rust cache identity", [
     "$release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }",
     "$target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }",
+    "$cmake = (cmake --version | Select-Object -First 1) -replace '^cmake version ', ''",
+    "$ninja = (ninja --version).Trim()",
     `"version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
     `"target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+    `"cmake=$cmake" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+    `"ninja=$ninja" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
   ]],
   ["Prove Windows ready_command manifest-missing contract", [windowsReadyCommand]],
 ]);
@@ -428,9 +439,10 @@ export function windowsManifestProofPolicyViolations(workflowValue) {
   add(violations, job["timeout-minutes"] === 30, "Windows manifest proof timeout must remain 30 minutes");
   add(
     violations,
-    hasExactKeys(job.env, ["CODESTORY_EMBED_ALLOW_CPU"])
-      && job.env.CODESTORY_EMBED_ALLOW_CPU === "1",
-    "Windows manifest proof must explicitly permit only CPU runtime execution",
+    hasExactKeys(job.env, ["CODESTORY_EMBED_ALLOW_CPU", "CMAKE_GENERATOR"])
+      && job.env.CODESTORY_EMBED_ALLOW_CPU === "1"
+      && job.env.CMAKE_GENERATOR === windowsNativeGenerator,
+    "Windows manifest proof must explicitly permit CPU runtime execution and use the Ninja native generator",
   );
   add(
     violations,
@@ -1290,6 +1302,40 @@ function validatePackagedProof(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "build");
   validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"), graph);
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
+  const nativeIdentity = namedStep(job, "Capture Rust cache key");
+  const nativeIdentityRun = executableRunText(String(nativeIdentity?.run ?? ""));
+  add(
+    violations,
+    nativeIdentity?.id === "rust-cache-key" && nativeIdentity?.shell === "bash",
+    `${file} native build identity must keep its stable Bash output boundary`,
+  );
+  for (const fragment of [
+    'cmake=$(cmake --version',
+    'if [ "$RUNNER_OS" = Windows ]',
+    'generator=ninja',
+    'ninja=$(ninja --version)',
+    'CMAKE_GENERATOR=Ninja',
+    'generator=platform-default',
+    'ninja=not-applicable',
+  ]) {
+    add(
+      violations,
+      nativeIdentityRun.includes(fragment),
+      `${file} native build identity must include ${fragment}`,
+    );
+  }
+  const packageRestore = namedStep(job, "Restore Cargo registry, git sources, and build output");
+  add(
+    violations,
+    object(packageRestore?.with).key === "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v2-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock') }}",
+    `${file} native build cache must bind generator, CMake, Ninja, target, features, and lock identity`,
+  );
+  const packageBuild = namedStep(job, "Build codestory-cli");
+  add(
+    violations,
+    packageBuild?.env === undefined,
+    `${file} native package build must not override the selected generator`,
+  );
   requireStepRun(violations, file, job, "Prepare checksum-pinned embedded model", [
     "node scripts/prepare-embedded-model.mjs",
   ]);
@@ -1509,6 +1555,17 @@ function validateRemainingWorkflows(workflows, violations) {
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
     requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
+    const nativeBuild = namedStep(job, "Build and package native CLI");
+    add(
+      violations,
+      hasExactKeys(object(nativeBuild?.env), ["VERSION", "CMAKE_GENERATOR"])
+        && object(nativeBuild?.env).CMAKE_GENERATOR === windowsNativeGenerator,
+      `${vulkanFile} source package build must use the Ninja native generator`,
+    );
+    requireStepRun(violations, vulkanFile, job, "Build and package native CLI", [
+      "cargo build --release --locked -p codestory-cli",
+      "package-codestory-release.py",
+    ]);
     const engine = namedStep(job, "Prove offline Vulkan and multi-repository reuse");
     requireStepRun(violations, vulkanFile, job, "Prove offline Vulkan and multi-repository reuse", ["--engine-policy accelerated", "--expected-backend Vulkan", "--offline"]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);

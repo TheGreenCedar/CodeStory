@@ -266,9 +266,16 @@ The workflow-dispatch-only Windows manifest-missing lane installs the repository
 checksum-pinned Vulkan SDK before it compiles and runs the real locked
 `ready_command` integration target with explicit CPU runtime permission. Its
 exact-only cache binds the hosted OS, Rust release, host target, versioned proof
-shape, default feature topology, workspace and vendor manifests, installer
-script, and lockfile. It has no fallback prefixes, reruns the full contract on
-an exact hit, and saves the exact primary only after the proof succeeds.
+shape, Ninja generator, CMake and Ninja versions, default feature topology,
+workspace and vendor manifests, installer script, and lockfile. It has no
+fallback prefixes, reruns the full contract on an exact hit, and saves the
+exact primary only after the proof succeeds.
+
+Every Windows source-build proof lane sets `CMAKE_GENERATOR=Ninja`. This keeps
+llama.cpp nested native builds serialized under the repository's supported
+generator instead of inheriting a hosted Visual Studio/MSBuild generator. The
+hosted package cache also binds that generator and its CMake/Ninja tool versions;
+the protected Vulkan lane pins the same generator before building its package.
 
 That Windows lane is source and protocol evidence on a hosted CPU runner. The
 SDK preserves the production-default native compile topology; it does not prove

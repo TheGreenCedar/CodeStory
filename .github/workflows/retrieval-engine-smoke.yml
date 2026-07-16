@@ -156,6 +156,7 @@ jobs:
     timeout-minutes: 30
     env:
       CODESTORY_EMBED_ALLOW_CPU: "1"
+      CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v5
 
@@ -175,8 +176,12 @@ jobs:
         run: |
           $release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }
           $target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }
+          $cmake = (cmake --version | Select-Object -First 1) -replace '^cmake version ', ''
+          $ninja = (ninja --version).Trim()
           "version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "cmake=$cmake" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ninja=$ninja" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Restore Windows Cargo inputs and output
         id: cargo-cache-restore
@@ -187,7 +192,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-windows-ready-command-v1-a9a54e40da9e875648c2b10dd12a0d6a1bc8ae50fb7bf2f9fc6ce989a5ba5b81-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('.github/scripts/install-windows-vulkan-sdk.ps1') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-windows-ready-command-v2-a6923d8bb320ad402d87ba9fa9cd27449db876f2c15eac25b865ed25a63ac790-generator-ninja-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('.github/scripts/install-windows-vulkan-sdk.ps1') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Prove Windows ready_command manifest-missing contract
         shell: pwsh

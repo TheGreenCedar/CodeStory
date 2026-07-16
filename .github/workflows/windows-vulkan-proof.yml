@@ -72,6 +72,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ inputs.version }}
+          CMAKE_GENERATOR: Ninja
         run: |
           $version = $env:VERSION.TrimStart('v')
           cargo build --release --locked -p codestory-cli

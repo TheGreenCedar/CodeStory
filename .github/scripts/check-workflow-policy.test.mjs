@@ -451,6 +451,16 @@ test("Windows manifest-missing proof freezes routing, native topology, and exact
     ["CPU permission disabled", workflow => {
       windowsManifestJob(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
     }],
+    ["native generator removed", workflow => {
+      delete windowsManifestJob(workflow).env.CMAKE_GENERATOR;
+    }],
+    ["native generator changed to Visual Studio", workflow => {
+      windowsManifestJob(workflow).env.CMAKE_GENERATOR = "Visual Studio 18 2026";
+    }],
+    ["native generator moved to proof-step override", workflow => {
+      delete windowsManifestJob(workflow).env.CMAKE_GENERATOR;
+      proofStep(workflow).env = { CMAKE_GENERATOR: "Ninja" };
+    }],
     ["extra product feature environment", workflow => {
       windowsManifestJob(workflow).env.CARGO_FEATURES = "cpu-only";
     }],
@@ -476,9 +486,33 @@ test("Windows manifest-missing proof freezes routing, native topology, and exact
       const proof = job.steps.findIndex(step => step.name === "Prove Windows ready_command manifest-missing contract");
       [job.steps[installer], job.steps[proof]] = [job.steps[proof], job.steps[installer]];
     }],
+    ["CMake cache identity capture removed", workflow => {
+      const identity = windowsManifestStep(workflow, "Capture Rust cache identity");
+      identity.run = identity.run.replace(/.*cmake.*\n/gu, "");
+    }],
+    ["Ninja cache identity capture removed", workflow => {
+      const identity = windowsManifestStep(workflow, "Capture Rust cache identity");
+      identity.run = identity.run.replace(/.*ninja.*\n/gu, "");
+    }],
     ["unversioned proof topology", workflow => {
       keyStep(workflow).with.key = keyStep(workflow).with.key
-        .replace(/ready-command-v1-[0-9a-f]{64}/u, "ready-command");
+        .replace(/ready-command-v2-[0-9a-f]{64}/u, "ready-command");
+    }],
+    ["stale proof topology", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("ready-command-v2-", "ready-command-v1-");
+    }],
+    ["generator-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("-generator-ninja", "");
+    }],
+    ["CMake-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("-cmake-${{ steps.rust-cache-key.outputs.cmake }}", "");
+    }],
+    ["Ninja-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("-ninja-${{ steps.rust-cache-key.outputs.ninja }}", "");
     }],
     ["OS-free cache", workflow => {
       keyStep(workflow).with.key = keyStep(workflow).with.key.replace("${{ runner.os }}-", "");
@@ -562,6 +596,72 @@ test("Windows manifest-missing proof freezes routing, native topology, and exact
         validateWorkflows(workflows).join("\n"),
         expectedReason,
       );
+    });
+  }
+});
+
+test("Windows source package builds pin Ninja and bind native tool identity", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const packagedFile = "packaged-platform-proof.yml";
+  const protectedFile = "windows-vulkan-proof.yml";
+  const packagedIdentity = workflow => draftStep(workflow.jobs.build, "Capture Rust cache key");
+  const packagedCache = workflow => draftStep(
+    workflow.jobs.build,
+    "Restore Cargo registry, git sources, and build output",
+  );
+  const packagedBuild = workflow => draftStep(workflow.jobs.build, "Build codestory-cli");
+  const protectedBuild = workflow => draftStep(
+    workflow.jobs["packaged-vulkan"],
+    "Build and package native CLI",
+  );
+
+  const mutations = [
+    ["packaged CMake identity removed", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(/.*cmake --version.*\n/u, "");
+    }, /native build identity must include cmake/u],
+    ["packaged Ninja identity removed", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(/.*ninja --version.*\n/u, "");
+    }, /native build identity must include ninja/u],
+    ["packaged Ninja selection removed", packagedFile, workflow => {
+      packagedIdentity(workflow).run = packagedIdentity(workflow).run
+        .replace(/.*CMAKE_GENERATOR=Ninja.*\n/u, "");
+    }, /native build identity must include CMAKE_GENERATOR=Ninja/u],
+    ["packaged generator-free cache", packagedFile, workflow => {
+      packagedCache(workflow).with.key = packagedCache(workflow).with.key
+        .replace("-${{ steps.rust-cache-key.outputs.generator }}", "");
+    }, /native build cache must bind generator, CMake, Ninja/u],
+    ["packaged CMake-free cache", packagedFile, workflow => {
+      packagedCache(workflow).with.key = packagedCache(workflow).with.key
+        .replace("-cmake-${{ steps.rust-cache-key.outputs.cmake }}", "");
+    }, /native build cache must bind generator, CMake, Ninja/u],
+    ["packaged Ninja-free cache", packagedFile, workflow => {
+      packagedCache(workflow).with.key = packagedCache(workflow).with.key
+        .replace("-ninja-${{ steps.rust-cache-key.outputs.ninja }}", "");
+    }, /native build cache must bind generator, CMake, Ninja/u],
+    ["packaged build overrides generator", packagedFile, workflow => {
+      packagedBuild(workflow).env = { CMAKE_GENERATOR: "Visual Studio 18 2026" };
+    }, /native package build must not override the selected generator/u],
+    ["protected generator removed", protectedFile, workflow => {
+      delete protectedBuild(workflow).env.CMAKE_GENERATOR;
+    }, /source package build must use the Ninja native generator/u],
+    ["protected generator changed", protectedFile, workflow => {
+      protectedBuild(workflow).env.CMAKE_GENERATOR = "Visual Studio 18 2026";
+    }, /source package build must use the Ninja native generator/u],
+    ["protected build adds a second generator surface", protectedFile, workflow => {
+      protectedBuild(workflow).env.CMAKE_GENERATOR_PLATFORM = "x64";
+    }, /source package build must use the Ninja native generator/u],
+  ];
+
+  for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
     });
   }
 });
