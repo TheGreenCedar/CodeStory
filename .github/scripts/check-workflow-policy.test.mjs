@@ -19,6 +19,7 @@ import {
   retrievalFile,
   retrievalProducerTriggerPolicyViolations,
   validateWorkflows,
+  windowsManifestProofPolicyViolations,
 } from "./check-workflow-policy.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
@@ -42,10 +43,22 @@ function retrievalSourceWorkflow() {
   return structuredClone(loadWorkflows().get(retrievalFile));
 }
 
+function windowsManifestWorkflow() {
+  return retrievalSourceWorkflow();
+}
+
 function draftStep(job, name) {
   const matches = job.steps.filter(step => step.name === name);
   assert.equal(matches.length, 1, `expected one ${name} step`);
   return matches[0];
+}
+
+function windowsManifestJob(workflow) {
+  return workflow.jobs["windows-manifest-missing"];
+}
+
+function windowsManifestStep(workflow, name) {
+  return draftStep(windowsManifestJob(workflow), name);
 }
 
 function managedJob() {
@@ -373,6 +386,184 @@ test("retrieval cache producer triggers cover every draft manifest consumer", as
       /retrieval cache producer must run on dev\/codestory-next pushes/u,
     );
   });
+});
+
+test("Windows manifest-missing proof freezes routing, native topology, and exact cache identity", async (t) => {
+  assert.deepEqual(windowsManifestProofPolicyViolations(windowsManifestWorkflow()), []);
+
+  const keyStep = workflow => windowsManifestStep(
+    workflow,
+    "Restore Windows Cargo inputs and output",
+  );
+  const proofStep = workflow => windowsManifestStep(
+    workflow,
+    "Prove Windows ready_command manifest-missing contract",
+  );
+  const saveStep = workflow => windowsManifestStep(
+    workflow,
+    "Save Windows Cargo inputs and output",
+  );
+  const installerHash = "${{ hashFiles('.github/scripts/install-windows-vulkan-sdk.ps1') }}";
+  const lockHash = "${{ hashFiles('Cargo.lock') }}";
+
+  const mutations = [
+    ["cloned Windows job routed on pull requests", workflow => {
+      const clone = structuredClone(windowsManifestJob(workflow));
+      clone.if = "github.event_name == 'pull_request'";
+      clone["continue-on-error"] = true;
+      workflow.jobs["windows-manifest-decoy"] = clone;
+    }, /must contain exactly linux-contracts and windows-manifest-missing jobs/u],
+    ["top-level build target", workflow => {
+      workflow.env = { CARGO_BUILD_TARGET: "x86_64-pc-windows-gnu" };
+    }, /must not define top-level env/u],
+    ["top-level shell default", workflow => {
+      workflow.defaults = { run: { shell: "bash" } };
+    }, /must not define top-level defaults/u],
+    ["top-level working-directory default", workflow => {
+      workflow.defaults = { run: { "working-directory": "crates/codestory-cli" } };
+    }, /must not define top-level defaults/u],
+    ["pull request omits installer", workflow => {
+      workflow.on.pull_request.paths = workflow.on.pull_request.paths
+        .filter(triggerPath => triggerPath !== ".github/scripts/install-windows-vulkan-sdk.ps1");
+    }],
+    ["push omits installer", workflow => {
+      workflow.on.push.paths = workflow.on.push.paths
+        .filter(triggerPath => triggerPath !== ".github/scripts/install-windows-vulkan-sdk.ps1");
+    }],
+    ["dispatch inputs", workflow => {
+      workflow.on.workflow_dispatch = { inputs: { ref: { required: false, type: "string" } } };
+    }],
+    ["pull-request job routing", workflow => {
+      windowsManifestJob(workflow).if = "github.event_name == 'pull_request'";
+    }],
+    ["label routing", workflow => {
+      windowsManifestJob(workflow).if = "contains(github.event.pull_request.labels.*.name, 'proof')";
+    }],
+    ["older runner", workflow => {
+      windowsManifestJob(workflow)["runs-on"] = "windows-2022";
+    }],
+    ["longer timeout", workflow => {
+      windowsManifestJob(workflow)["timeout-minutes"] = 60;
+    }],
+    ["CPU permission removed", workflow => {
+      delete windowsManifestJob(workflow).env.CODESTORY_EMBED_ALLOW_CPU;
+    }],
+    ["CPU permission disabled", workflow => {
+      windowsManifestJob(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
+    }],
+    ["extra product feature environment", workflow => {
+      windowsManifestJob(workflow).env.CARGO_FEATURES = "cpu-only";
+    }],
+    ["job made optional", workflow => {
+      windowsManifestJob(workflow)["continue-on-error"] = true;
+    }],
+    ["checkout alternate ref", workflow => {
+      windowsManifestJob(workflow).steps[0].with = { ref: "main" };
+    }],
+    ["installer removed", workflow => {
+      windowsManifestJob(workflow).steps = windowsManifestJob(workflow).steps
+        .filter(step => step.name !== "Install checksum-pinned Windows Vulkan SDK");
+    }],
+    ["installer replaced", workflow => {
+      windowsManifestStep(workflow, "Install checksum-pinned Windows Vulkan SDK").run = "choco install vulkan-sdk";
+    }],
+    ["installer made optional", workflow => {
+      windowsManifestStep(workflow, "Install checksum-pinned Windows Vulkan SDK")["continue-on-error"] = true;
+    }],
+    ["installer moved after proof", workflow => {
+      const job = windowsManifestJob(workflow);
+      const installer = job.steps.findIndex(step => step.name === "Install checksum-pinned Windows Vulkan SDK");
+      const proof = job.steps.findIndex(step => step.name === "Prove Windows ready_command manifest-missing contract");
+      [job.steps[installer], job.steps[proof]] = [job.steps[proof], job.steps[installer]];
+    }],
+    ["unversioned proof topology", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace(/ready-command-v1-[0-9a-f]{64}/u, "ready-command");
+    }],
+    ["OS-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key.replace("${{ runner.os }}-", "");
+    }],
+    ["Rust-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("-${{ steps.rust-cache-key.outputs.version }}", "");
+    }],
+    ["target-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("-${{ steps.rust-cache-key.outputs.target }}", "");
+    }],
+    ["all-feature cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace("-default-features-", "-all-features-");
+    }],
+    ["manifest-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key
+        .replace(`${cacheManifestIdentity}-`, "");
+    }],
+    ["installer-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key.replace(`${installerHash}-`, "");
+    }],
+    ["lock-free cache", workflow => {
+      keyStep(workflow).with.key = keyStep(workflow).with.key.replace(lockHash, "unlocked");
+    }],
+    ["fallback cache prefix", workflow => {
+      keyStep(workflow).with["restore-keys"] = "Windows-cargo-stable-";
+    }],
+    ["alternate cache output", workflow => {
+      keyStep(workflow).with.path = "target/windows";
+    }],
+    ["cache restore bypass", workflow => {
+      keyStep(workflow).if = "always()";
+    }],
+    ["unlocked proof", workflow => {
+      proofStep(workflow).run = proofStep(workflow).run.replace(" --locked", "");
+    }],
+    ["supplied-binary substitute", workflow => {
+      proofStep(workflow).run = "cargo test --locked -p codestory-cli --test ready_command --features supplied-binary";
+    }],
+    ["proof made optional", workflow => {
+      proofStep(workflow)["continue-on-error"] = true;
+    }],
+    ["save before proof", workflow => {
+      const job = windowsManifestJob(workflow);
+      const proof = job.steps.findIndex(step => step.name === "Prove Windows ready_command manifest-missing contract");
+      const save = job.steps.findIndex(step => step.name === "Save Windows Cargo inputs and output");
+      [job.steps[proof], job.steps[save]] = [job.steps[save], job.steps[proof]];
+    }],
+    ["save after failed proof", workflow => {
+      saveStep(workflow).if = "steps.cargo-cache-restore.outputs.cache-hit != 'true'";
+    }],
+    ["save exact hit", workflow => {
+      saveStep(workflow).if = "success()";
+    }],
+    ["save matched key", workflow => {
+      saveStep(workflow).with.key = "${{ steps.cargo-cache-restore.outputs.cache-matched-key }}";
+    }],
+    ["save fallback input", workflow => {
+      saveStep(workflow).with["restore-keys"] = "Windows-cargo-stable-";
+    }],
+    ["decoy proof", workflow => {
+      const decoy = structuredClone(proofStep(workflow));
+      proofStep(workflow).run = "Write-Output skipped";
+      decoy.name = "Decoy ready_command proof";
+      windowsManifestJob(workflow).steps.push(decoy);
+    }],
+  ];
+
+  for (const [name, mutate, expectedReason = /Windows manifest proof/u] of mutations) {
+    await t.test(name, () => {
+      const candidate = windowsManifestWorkflow();
+      mutate(candidate);
+      const violations = windowsManifestProofPolicyViolations(candidate);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+      const workflows = loadWorkflows();
+      workflows.set(retrievalFile, candidate);
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        expectedReason,
+      );
+    });
+  }
 });
 
 test("draft source workflow freezes its complete top-level contract", async (t) => {

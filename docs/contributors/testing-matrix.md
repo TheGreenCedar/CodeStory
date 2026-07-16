@@ -262,6 +262,20 @@ retrieval-key match is a compatible seed. A prior-lock prefix match is partial
 Cargo reuse even though both are reported as `cache-hit=false` against the draft
 primary, so evidence must use the reported matched key to distinguish them.
 
+The workflow-dispatch-only Windows manifest-missing lane installs the repository's
+checksum-pinned Vulkan SDK before it compiles and runs the real locked
+`ready_command` integration target with explicit CPU runtime permission. Its
+exact-only cache binds the hosted OS, Rust release, host target, versioned proof
+shape, default feature topology, workspace and vendor manifests, installer
+script, and lockfile. It has no fallback prefixes, reruns the full contract on
+an exact hit, and saves the exact primary only after the proof succeeds.
+
+That Windows lane is source and protocol evidence on a hosted CPU runner. The
+SDK preserves the production-default native compile topology; it does not prove
+Vulkan execution, a packaged archive, an installed runtime, or protected
+hardware behavior. Those claims remain with the package and protected Windows
+Vulkan proof lanes.
+
 `release-claims.json` is the release claim and proof-tier source of truth. It
 binds each claim to its evidence identity, expiry, dependency, executable
 prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The

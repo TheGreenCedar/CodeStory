@@ -179,8 +179,63 @@ const draftWorkflowPaths = [
 const retrievalProducerTriggerPaths = [
   "crates/**/Cargo.toml",
   "vendor/**/Cargo.toml",
+  ".github/scripts/install-windows-vulkan-sdk.ps1",
   ".github/workflows/rust-ci.yml",
 ];
+const windowsVulkanInstaller = ".github/scripts/install-windows-vulkan-sdk.ps1";
+const windowsReadyCommand = "cargo test --locked -p codestory-cli --test ready_command";
+const windowsReadyProofTopologyDigest = createHash("sha256")
+  .update(windowsReadyCommand)
+  .digest("hex");
+const windowsReadyProofTopology = `ready-command-v1-${windowsReadyProofTopologyDigest}`;
+const windowsInstallerHash = `\${{ hashFiles('${windowsVulkanInstaller}') }}`;
+const windowsCachePrimary = [
+  cacheRunner,
+  "cargo-stable",
+  cacheRustVersion,
+  cacheTarget,
+  "windows",
+  windowsReadyProofTopology,
+  "default-features",
+  cacheManifests,
+  windowsInstallerHash,
+  cacheLock,
+].join("-");
+const windowsStepSequence = [
+  { uses: "actions/checkout@v5", keys: ["uses"] },
+  { name: "Install Rust stable", keys: ["name", "shell", "run"] },
+  {
+    name: "Install checksum-pinned Windows Vulkan SDK",
+    keys: ["name", "shell", "run"],
+  },
+  { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
+  {
+    name: "Restore Windows Cargo inputs and output",
+    keys: ["name", "id", "uses", "continue-on-error", "with"],
+  },
+  {
+    name: "Prove Windows ready_command manifest-missing contract",
+    keys: ["name", "shell", "run"],
+  },
+  {
+    name: "Save Windows Cargo inputs and output",
+    keys: ["name", "if", "uses", "continue-on-error", "with"],
+  },
+];
+const windowsRunCommands = new Map([
+  ["Install Rust stable", [
+    "rustup toolchain install stable --profile minimal",
+    "rustup default stable",
+  ]],
+  ["Install checksum-pinned Windows Vulkan SDK", [windowsVulkanInstaller]],
+  ["Capture Rust cache identity", [
+    "$release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }",
+    "$target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }",
+    `"version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+    `"target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+  ]],
+  ["Prove Windows ready_command manifest-missing contract", [windowsReadyCommand]],
+]);
 const draftStepSequence = [
   { uses: "actions/checkout@v5", keys: ["uses"] },
   { name: "Install Rust stable", keys: ["name", "run"] },
@@ -317,6 +372,191 @@ export function retrievalProducerTriggerPolicyViolations(workflowValue) {
     includesAll(at(workflow, "on", "push", "paths"), retrievalProducerTriggerPaths),
     "retrieval cache producer dev push paths must cover every manifest and draft consumer change",
   );
+  return violations;
+}
+
+export function windowsManifestProofPolicyViolations(workflowValue) {
+  const violations = [];
+  const workflow = object(workflowValue);
+  const triggers = object(workflow.on);
+  const job = object(at(workflow, "jobs", "windows-manifest-missing"));
+  const steps = list(job.steps).map(object);
+
+  add(
+    violations,
+    hasExactKeys(workflow.jobs, ["linux-contracts", "windows-manifest-missing"]),
+    "Windows manifest proof workflow must contain exactly linux-contracts and windows-manifest-missing jobs",
+  );
+  add(
+    violations,
+    workflow.env === undefined,
+    "Windows manifest proof workflow must not define top-level env",
+  );
+  add(
+    violations,
+    workflow.defaults === undefined,
+    "Windows manifest proof workflow must not define top-level defaults",
+  );
+  for (const event of ["pull_request", "push"]) {
+    add(
+      violations,
+      includesAll(at(triggers, event, "paths"), [windowsVulkanInstaller]),
+      `Windows manifest proof ${event} paths must cover the Vulkan installer`,
+    );
+  }
+  add(
+    violations,
+    triggers.workflow_dispatch === null,
+    "Windows manifest proof workflow_dispatch must remain input-free",
+  );
+  add(
+    violations,
+    hasExactKeys(job, ["if", "runs-on", "timeout-minutes", "env", "steps"]),
+    "Windows manifest proof job must keep its exact required serial shape",
+  );
+  add(
+    violations,
+    job.if === "github.event_name == 'workflow_dispatch'",
+    "Windows manifest proof must be workflow-dispatch only",
+  );
+  add(
+    violations,
+    !scalarStrings(job).some(value => value.includes("labels")),
+    "Windows manifest proof must not be label-triggered",
+  );
+  add(violations, job["runs-on"] === "windows-latest", "Windows manifest proof must use windows-latest");
+  add(violations, job["timeout-minutes"] === 30, "Windows manifest proof timeout must remain 30 minutes");
+  add(
+    violations,
+    hasExactKeys(job.env, ["CODESTORY_EMBED_ALLOW_CPU"])
+      && job.env.CODESTORY_EMBED_ALLOW_CPU === "1",
+    "Windows manifest proof must explicitly permit only CPU runtime execution",
+  );
+  add(
+    violations,
+    steps.length === windowsStepSequence.length,
+    "Windows manifest proof must keep its exact serialized step count",
+  );
+  for (const [index, expected] of windowsStepSequence.entries()) {
+    const step = steps[index];
+    const matches = expected.name === undefined
+      ? step?.uses === expected.uses
+      : step?.name === expected.name;
+    add(
+      violations,
+      matches,
+      `Windows manifest proof step ${index + 1} must remain ${expected.name ?? expected.uses}`,
+    );
+    add(
+      violations,
+      hasExactKeys(step, expected.keys),
+      `Windows manifest proof step ${index + 1} must keep the exact ${expected.name ?? expected.uses} key shape`,
+    );
+  }
+
+  for (const [name, commands] of windowsRunCommands) {
+    const step = namedStep(job, name);
+    add(violations, step !== undefined, `Windows manifest proof must contain one ${name} step`);
+    add(
+      violations,
+      sameStrings(nonCommentLines(step?.run), commands),
+      `Windows manifest proof step ${name} must keep its exact required command sequence`,
+    );
+    add(
+      violations,
+      step?.shell === "pwsh",
+      `Windows manifest proof step ${name} must use pwsh`,
+    );
+  }
+
+  const identity = namedStep(job, "Capture Rust cache identity");
+  add(
+    violations,
+    identity?.id === "rust-cache-key",
+    "Windows manifest proof cache identity must keep its stable output id",
+  );
+
+  const restore = namedStep(job, "Restore Windows Cargo inputs and output");
+  const restoreWith = object(restore?.with);
+  add(
+    violations,
+    restore?.id === "cargo-cache-restore",
+    "Windows manifest proof cache restore must keep its stable step id",
+  );
+  add(
+    violations,
+    restore?.uses === "actions/cache/restore@v5",
+    "Windows manifest proof cache restore must use actions/cache/restore@v5",
+  );
+  add(
+    violations,
+    restore?.["continue-on-error"] === true && restore?.if === undefined,
+    "Windows manifest proof cache restore must remain optional without conditional bypasses",
+  );
+  add(
+    violations,
+    hasExactKeys(restoreWith, ["path", "key"]),
+    "Windows manifest proof cache restore must use an exact primary without fallbacks",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(restoreWith.path), draftCachePaths),
+    "Windows manifest proof cache restore must use only Cargo registry, git, and default target paths",
+  );
+  add(
+    violations,
+    restoreWith.key === windowsCachePrimary,
+    "Windows manifest proof cache key must bind OS, Rust, target, proof topology, default features, manifests, installer, and lock identities",
+  );
+
+  const proof = namedStep(job, "Prove Windows ready_command manifest-missing contract");
+  const install = namedStep(job, "Install checksum-pinned Windows Vulkan SDK");
+  const restoreIndex = steps.indexOf(restore);
+  const proofIndex = steps.indexOf(proof);
+  add(
+    violations,
+    steps.indexOf(install) < proofIndex && restoreIndex < proofIndex,
+    "Windows manifest proof must install the SDK and restore only compatible output before the Cargo proof",
+  );
+
+  const save = namedStep(job, "Save Windows Cargo inputs and output");
+  const saveWith = object(save?.with);
+  add(
+    violations,
+    save?.uses === "actions/cache/save@v5",
+    "Windows manifest proof cache save must use actions/cache/save@v5",
+  );
+  add(
+    violations,
+    save?.["continue-on-error"] === true,
+    "Windows manifest proof cache save must remain non-blocking",
+  );
+  add(
+    violations,
+    save?.if === cacheSaveCondition,
+    "Windows manifest proof cache save must require full proof success and skip exact hits",
+  );
+  add(
+    violations,
+    hasExactKeys(saveWith, ["path", "key"]),
+    "Windows manifest proof cache save inputs must keep their exact shape",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(saveWith.path), draftCachePaths),
+    "Windows manifest proof cache save must use the exact restore path set",
+  );
+  add(
+    violations,
+    saveWith.key === cacheSaveKey,
+    "Windows manifest proof cache save must use the exact primary rather than a matched key",
+  );
+  add(
+    violations,
+    proofIndex + 1 === steps.indexOf(save),
+    "Windows manifest proof cache save must immediately follow the successful Cargo proof",
+  );
+
   return violations;
 }
 
@@ -1290,9 +1530,9 @@ function validateRemainingWorkflows(workflows, violations) {
   if (!retrieval) {
     violations.push(`${retrievalFile} must exist`);
   } else {
-    const windows = requireJob(violations, retrievalFile, retrieval, "windows-manifest-missing");
-    add(violations, windows.if === "github.event_name == 'workflow_dispatch'", `${retrievalFile} Windows proof must be workflow-dispatch only`);
-    add(violations, !scalarStrings(windows).some(value => value.includes("labels")), `${retrievalFile} Windows proof must not be label-triggered`);
+    for (const violation of windowsManifestProofPolicyViolations(retrieval)) {
+      violations.push(`${retrievalFile} ${violation}`);
+    }
   }
 
   const guardFile = "main-branch-source-guard.yml";
