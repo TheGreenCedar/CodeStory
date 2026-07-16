@@ -7,11 +7,12 @@
 - Direct CLI JSON failures now retain runtime API error codes and details across
   packet, search, activation, and retrieval indexing instead of collapsing
   typed failures into a generic `command_failed` envelope.
-- Draft source CI now restores proof-compatible exact-lock retrieval output or
-  narrowly scoped prior-lock output before rebuilding, with a versioned cache
-  identity that covers the lockfile and workspace manifests. The existing
-  serial source checks still promote a partial restore only after every proof
-  succeeds.
+- Draft source CI now restores exact-lock retrieval output or narrowly scoped
+  prior-lock output before rebuilding. The base retrieval lane serially seeds
+  the exact five test-profile targets used by draft proof, while a versioned
+  cache identity binds the runner, Rust toolchain, target, feature and proof
+  topology, workspace manifests, and lockfile. Partial restores are promoted
+  only after every unchanged serial proof succeeds.
 - Stdio/MCP now retains a bounded set of project contexts keyed by native
   workspace identity and immutable configuration, so A/B/A routing preserves
   isolated per-project state without rereading process defaults.

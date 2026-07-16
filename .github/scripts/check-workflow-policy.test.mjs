@@ -16,10 +16,13 @@ import {
   releaseEvidenceApprovalViolations,
   releaseEvidenceWorkflowRef,
   releaseWorkflowContractViolations,
+  retrievalProducerTriggerPolicyViolations,
   validateWorkflows,
 } from "./check-workflow-policy.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
+const proofTopology = "proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5";
+const cacheManifestIdentity = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 function draftSourceJob() {
@@ -32,6 +35,10 @@ function draftSourceWorkflow() {
 
 function retrievalSourceJob() {
   return structuredClone(loadWorkflows().get("retrieval-engine-smoke.yml").jobs["linux-contracts"]);
+}
+
+function retrievalSourceWorkflow() {
+  return structuredClone(loadWorkflows().get("retrieval-engine-smoke.yml"));
 }
 
 function draftStep(job, name) {
@@ -170,10 +177,11 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
     }],
     ["lock-only primary", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
-      step.with.key = step.with.key.replace(
-        "hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml')",
-        "hashFiles('Cargo.lock')",
-      );
+      step.with.key = step.with.key.replace(`${cacheManifestIdentity}-`, "");
+    }],
+    ["mismatched proof topology", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      step.with.key = step.with.key.replace(proofTopology, proofTopology.replace("-v1-", "-v2-"));
     }],
     ["fallback order reversal", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
@@ -191,11 +199,23 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
     }],
     ["all-feature fallback", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
-      step.with["restore-keys"] = step.with["restore-keys"].replace("retrieval-contracts-default-features", "retrieval-contracts-all-features");
+      step.with["restore-keys"] = step.with["restore-keys"].replace("-default-features-", "-all-features-");
     }],
     ["source-proof fallback", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
-      step.with["restore-keys"] = step.with["restore-keys"].replace("retrieval-contracts-default-features", "source-proof-all-targets-all-features");
+      step.with["restore-keys"] = step.with["restore-keys"].replace("-retrieval-contracts-", "-source-proof-");
+    }],
+    ["manifest-free prior retrieval fallback", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      const keys = step.with["restore-keys"].trim().split("\n");
+      keys[2] = keys[2].replace(`${cacheManifestIdentity}-`, "");
+      step.with["restore-keys"] = keys.join("\n");
+    }],
+    ["target-free prior draft fallback", job => {
+      const step = draftStep(job, "Restore Cargo inputs and output");
+      const keys = step.with["restore-keys"].trim().split("\n");
+      keys[1] = keys[1].replace("-${{ steps.rust-cache-key.outputs.target }}-", "-");
+      step.with["restore-keys"] = keys.join("\n");
     }],
     ["different restore path", job => {
       const step = draftStep(job, "Restore Cargo inputs and output");
@@ -259,10 +279,43 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
     }],
     ["incompatible retrieval key", job => {
       const step = draftStep(job, "Restore Cargo registry, git sources, and build output");
-      step.with.key = step.with.key.replace("retrieval-contracts-default-features", "retrieval-contracts-all-features");
+      step.with.key = step.with.key.replace("-default-features-", "-all-features-");
+    }],
+    ["mismatched retrieval topology version", job => {
+      const step = draftStep(job, "Restore Cargo registry, git sources, and build output");
+      step.with.key = step.with.key.replace(proofTopology, proofTopology.replace("-v1-", "-v2-"));
+    }],
+    ["manifest-free retrieval key", job => {
+      const step = draftStep(job, "Restore Cargo registry, git sources, and build output");
+      step.with.key = step.with.key.replace(`${cacheManifestIdentity}-`, "");
     }],
     ["incompatible retrieval action", job => {
       draftStep(job, "Restore Cargo registry, git sources, and build output").uses = "actions/cache/restore@v4";
+    }],
+    ["omitted seed target", job => {
+      const step = draftStep(job, "Seed draft proof test-profile artifacts");
+      step.run = step.run.trim().split("\n").slice(1).join("\n");
+    }],
+    ["reordered seed targets", job => {
+      const step = draftStep(job, "Seed draft proof test-profile artifacts");
+      const commands = step.run.trim().split("\n");
+      [commands[0], commands[1]] = [commands[1], commands[0]];
+      step.run = commands.join("\n");
+    }],
+    ["executable seed target", job => {
+      const step = draftStep(job, "Seed draft proof test-profile artifacts");
+      step.run = step.run.replace(" --no-run", "");
+    }],
+    ["optional seed step", job => {
+      draftStep(job, "Seed draft proof test-profile artifacts")["continue-on-error"] = true;
+    }],
+    ["save before seed", job => {
+      const seed = job.steps.findIndex(step => step.name === "Seed draft proof test-profile artifacts");
+      const save = job.steps.findIndex(step => step.name === "Save Cargo registry, git sources, and build output");
+      [job.steps[seed], job.steps[save]] = [job.steps[save], job.steps[seed]];
+    }],
+    ["producer matched-key save", job => {
+      draftStep(job, "Save Cargo registry, git sources, and build output").with.key = "${{ steps.cargo-cache-restore.outputs.cache-matched-key }}";
     }],
   ]) {
     await t.test(name, () => {
@@ -271,6 +324,54 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
       assert.notDeepEqual(draftSourcePolicyViolations(draftSourceJob(), candidate), []);
     });
   }
+});
+
+test("retrieval cache producer triggers cover every draft manifest consumer", async (t) => {
+  assert.deepEqual(retrievalProducerTriggerPolicyViolations(retrievalSourceWorkflow()), []);
+
+  const reordered = retrievalSourceWorkflow();
+  reordered.on.pull_request.paths.reverse();
+  reordered.on.push.paths.reverse();
+  assert.deepEqual(
+    retrievalProducerTriggerPolicyViolations(reordered),
+    [],
+    "required trigger membership is order-insensitive",
+  );
+
+  const requiredPaths = [
+    "crates/**/Cargo.toml",
+    "vendor/**/Cargo.toml",
+    ".github/workflows/rust-ci.yml",
+  ];
+  for (const event of ["pull_request", "push"]) {
+    for (const requiredPath of requiredPaths) {
+      await t.test(`${event} rejects removal of ${requiredPath}`, () => {
+        const candidate = retrievalSourceWorkflow();
+        candidate.on[event].paths = candidate.on[event].paths
+          .filter(triggerPath => triggerPath !== requiredPath);
+        assert.notDeepEqual(retrievalProducerTriggerPolicyViolations(candidate), []);
+        const workflows = loadWorkflows();
+        workflows.set("retrieval-engine-smoke.yml", candidate);
+        assert.match(
+          validateWorkflows(workflows).join("\n"),
+          /retrieval cache producer .* paths must cover/u,
+        );
+      });
+    }
+  }
+
+  await t.test("push must retain the dev branch", () => {
+    const candidate = retrievalSourceWorkflow();
+    candidate.on.push.branches = candidate.on.push.branches
+      .filter(branch => branch !== "dev/codestory-next");
+    assert.notDeepEqual(retrievalProducerTriggerPolicyViolations(candidate), []);
+    const workflows = loadWorkflows();
+    workflows.set("retrieval-engine-smoke.yml", candidate);
+    assert.match(
+      validateWorkflows(workflows).join("\n"),
+      /retrieval cache producer must run on dev\/codestory-next pushes/u,
+    );
+  });
 });
 
 test("draft source workflow freezes its complete top-level contract", async (t) => {

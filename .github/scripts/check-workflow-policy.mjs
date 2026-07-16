@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -106,12 +107,58 @@ const draftCachePaths = [
   "~/.cargo/git",
   "target",
 ];
-const draftCachePrimary = "${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
-const draftCacheRestoreKeys = [
-  "${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}",
-  "${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-",
-  "${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-",
+const draftProofCommands = [
+  "cargo test --locked -p codestory-llama-sys --test native_staging",
+  "cargo test --locked -p codestory-llama-sys --test model_staging",
+  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+  "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
+  "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
 ];
+const draftSeedCommands = [
+  "cargo test --locked -p codestory-llama-sys --test native_staging --no-run",
+  "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
+  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+  "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
+  "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
+];
+const draftProofTopologyDigest = createHash("sha256")
+  .update(draftSeedCommands.join("\n"))
+  .digest("hex");
+const draftProofTopology = `proof5-v1-${draftProofTopologyDigest}`;
+const cacheRunner = "${{ runner.os }}";
+const cacheRustVersion = "${{ steps.rust-cache-key.outputs.version }}";
+const cacheTarget = "${{ steps.rust-cache-key.outputs.target }}";
+const cacheManifests = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
+const cacheLock = "${{ hashFiles('Cargo.lock') }}";
+const draftCachePrefix = [
+  cacheRunner,
+  "draft-v2",
+  cacheRustVersion,
+  cacheTarget,
+  "workspace",
+  draftProofTopology,
+  "default-features",
+  cacheManifests,
+].join("-");
+const retrievalCachePrefix = [
+  cacheRunner,
+  "cargo-stable",
+  cacheRustVersion,
+  cacheTarget,
+  "retrieval-contracts",
+  draftProofTopology,
+  "default-features",
+  cacheManifests,
+].join("-");
+const draftCachePrimary = `${draftCachePrefix}-${cacheLock}`;
+const retrievalCachePrimary = `${retrievalCachePrefix}-${cacheLock}`;
+const draftCacheRestoreKeys = [
+  retrievalCachePrimary,
+  `${draftCachePrefix}-`,
+  `${retrievalCachePrefix}-`,
+];
+const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
+const cacheSaveKey = "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}";
 const draftWorkflowPaths = [
   "Cargo.lock",
   "Cargo.toml",
@@ -125,6 +172,11 @@ const draftWorkflowPaths = [
   "plugins/codestory/generated-mcp-catalog.json",
   "plugins/codestory/skills/codestory-grounding/**",
   "scripts/generate-codestory-skill-syntax.mjs",
+];
+const retrievalProducerTriggerPaths = [
+  "crates/**/Cargo.toml",
+  "vendor/**/Cargo.toml",
+  ".github/workflows/rust-ci.yml",
 ];
 const draftStepSequence = [
   { uses: "actions/checkout@v5", keys: ["uses"] },
@@ -170,13 +222,7 @@ const draftRunCommands = new Map([
   ["Lint workspace libraries", [
     "cargo clippy --workspace --lib --locked -- -D warnings",
   ]],
-  ["Prove focused publication contracts", [
-    "cargo test --locked -p codestory-llama-sys --test native_staging",
-    "cargo test --locked -p codestory-llama-sys --test model_staging",
-    "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
-    "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
-    "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
-  ]],
+  ["Prove focused publication contracts", draftProofCommands],
 ]);
 
 function nonCommentLines(value) {
@@ -250,6 +296,27 @@ export function draftWorkflowPolicyViolations(workflowValue) {
   return violations;
 }
 
+export function retrievalProducerTriggerPolicyViolations(workflowValue) {
+  const violations = [];
+  const workflow = object(workflowValue);
+  add(
+    violations,
+    includesAll(at(workflow, "on", "pull_request", "paths"), retrievalProducerTriggerPaths),
+    "retrieval cache producer pull_request paths must cover every manifest and draft consumer change",
+  );
+  add(
+    violations,
+    includesAll(at(workflow, "on", "push", "branches"), ["dev/codestory-next"]),
+    "retrieval cache producer must run on dev/codestory-next pushes",
+  );
+  add(
+    violations,
+    includesAll(at(workflow, "on", "push", "paths"), retrievalProducerTriggerPaths),
+    "retrieval cache producer dev push paths must cover every manifest and draft consumer change",
+  );
+  return violations;
+}
+
 export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   const violations = [];
   const job = object(jobValue);
@@ -306,16 +373,62 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
     "draft source cache restore inputs must keep their exact key shape",
   );
   add(violations, sameStrings(nonCommentLines(restoreWith.path), draftCachePaths), "draft source cache restore must use only the Cargo registry, git, and default target paths");
-  add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, feature, lock, and manifest identity");
-  add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact retrieval, prior draft, then prior retrieval order");
+  add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, target, proof topology, feature, manifest, and lock identity");
+  add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact seeded retrieval, prior draft, then prior retrieval order and omit only the lock identity from prior prefixes");
 
   const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
   const retrievalRestoreWith = object(retrievalRestore?.with);
+  add(
+    violations,
+    hasExactKeys(retrievalRestore, ["name", "id", "uses", "continue-on-error", "with"]),
+    "retrieval cache producer restore must keep its exact step shape",
+  );
   add(violations, retrievalRestore?.id === "cargo-cache-restore", "retrieval cache producer must keep its stable restore id");
   add(violations, retrievalRestore?.uses === "actions/cache/restore@v5", "retrieval cache producer must use actions/cache/restore@v5");
-  add(violations, retrievalRestore?.["continue-on-error"] === true, "retrieval cache producer restore must remain non-blocking");
+  add(violations, retrievalRestore?.["continue-on-error"] === true && retrievalRestore?.if === undefined, "retrieval cache producer restore must remain non-blocking without conditional bypasses");
+  add(
+    violations,
+    hasExactKeys(retrievalRestoreWith, ["path", "key"]),
+    "retrieval cache producer restore inputs must keep their exact key shape",
+  );
   add(violations, sameStrings(nonCommentLines(retrievalRestoreWith.path), draftCachePaths), "retrieval cache producer must retain the proof-compatible path set");
-  add(violations, retrievalRestoreWith.key === draftCacheRestoreKeys[0], "retrieval cache producer key must match the draft exact-lock fallback");
+  add(violations, retrievalRestoreWith.key === retrievalCachePrimary, "retrieval cache producer key must match the draft exact-lock, manifest, feature, and proof-topology fallback");
+
+  const retrievalSeed = namedStep(retrievalJob, "Seed draft proof test-profile artifacts");
+  add(
+    violations,
+    hasExactKeys(retrievalSeed, ["name", "run"]),
+    "retrieval cache producer seed must keep its exact required step shape",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(retrievalSeed?.run), draftSeedCommands),
+    "retrieval cache producer must seed the exact five test-profile targets in serial order",
+  );
+
+  const retrievalSave = namedStep(retrievalJob, "Save Cargo registry, git sources, and build output");
+  const retrievalSaveWith = object(retrievalSave?.with);
+  add(
+    violations,
+    hasExactKeys(retrievalSave, ["name", "if", "uses", "continue-on-error", "with"]),
+    "retrieval cache producer save must keep its exact post-proof step shape",
+  );
+  add(violations, retrievalSave?.uses === "actions/cache/save@v5", "retrieval cache producer must use actions/cache/save@v5");
+  add(violations, retrievalSave?.["continue-on-error"] === true, "retrieval cache producer save must remain non-blocking");
+  add(violations, retrievalSave?.if === cacheSaveCondition, "retrieval cache producer must save only after every retrieval and seed proof succeeds");
+  add(
+    violations,
+    hasExactKeys(retrievalSaveWith, ["path", "key"]),
+    "retrieval cache producer save inputs must keep their exact key shape",
+  );
+  add(violations, sameStrings(nonCommentLines(retrievalSaveWith.path), draftCachePaths), "retrieval cache producer save must retain the proof-compatible path set");
+  add(violations, retrievalSaveWith.key === cacheSaveKey, "retrieval cache producer must save its exact primary rather than a matched key");
+  const retrievalSteps = list(retrievalJob.steps).map(object);
+  add(
+    violations,
+    retrievalSteps.indexOf(retrievalSeed) + 1 === retrievalSteps.indexOf(retrievalSave),
+    "retrieval cache producer must seed the exact proof targets immediately before saving",
+  );
 
   const save = namedStep(job, "Save Cargo inputs and output");
   const saveWith = object(save?.with);
@@ -328,11 +441,11 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   );
   add(
     violations,
-    save?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''",
+    save?.if === cacheSaveCondition,
     "draft source cache promotion must require complete proof and a partial or missing primary",
   );
   add(violations, sameStrings(nonCommentLines(saveWith.path), draftCachePaths), "draft source cache promotion must use the exact restore path set");
-  add(violations, saveWith.key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}", "draft source cache promotion must save the exact primary rather than a matched fallback");
+  add(violations, saveWith.key === cacheSaveKey, "draft source cache promotion must save the exact primary rather than a matched fallback");
 
   return violations;
 }
@@ -765,8 +878,12 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "scripts/generate-codestory-skill-syntax.mjs",
     ]), `${rustFile} must cover workspace source and generated catalog changes`);
     const job = requireJob(violations, rustFile, rust, "linux-draft");
+    const retrievalWorkflow = workflows.get("retrieval-engine-smoke.yml");
+    for (const violation of retrievalProducerTriggerPolicyViolations(retrievalWorkflow)) {
+      violations.push(`retrieval-engine-smoke.yml ${violation}`);
+    }
     const retrievalJob = object(at(
-      workflows.get("retrieval-engine-smoke.yml"),
+      retrievalWorkflow,
       "jobs",
       "linux-contracts",
     ));

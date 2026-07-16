@@ -252,6 +252,16 @@ node --test .github/scripts/check-workflow-policy.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
 
+The base-branch retrieval lane seeds the five draft publication-proof test
+targets with serial `cargo test --no-run` commands before it saves its cache.
+Draft CI first requests the complete retrieval key, then same-topology prior-lock
+draft and retrieval prefixes. Those prefixes retain runner, Rust version, host
+target, feature topology, proof-topology version and command digest, and the
+complete workspace-manifest hash; only the lockfile hash is omitted. A full
+retrieval-key match is a compatible seed. A prior-lock prefix match is partial
+Cargo reuse even though both are reported as `cache-hit=false` against the draft
+primary, so evidence must use the reported matched key to distinguish them.
+
 `release-claims.json` is the release claim and proof-tier source of truth. It
 binds each claim to its evidence identity, expiry, dependency, executable
 prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The

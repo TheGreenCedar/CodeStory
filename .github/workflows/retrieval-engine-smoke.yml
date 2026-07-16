@@ -9,6 +9,8 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - crates/**/Cargo.toml
+      - vendor/**/Cargo.toml
       - crates/codestory-llama-sys/**
       - crates/codestory-retrieval/src/embeddings.rs
       - crates/codestory-retrieval/src/health.rs
@@ -20,6 +22,7 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/workflows/retrieval-engine-smoke.yml
+      - .github/workflows/rust-ci.yml
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -32,6 +35,8 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - crates/**/Cargo.toml
+      - vendor/**/Cargo.toml
       - crates/codestory-llama-sys/**
       - crates/codestory-retrieval/src/embeddings.rs
       - crates/codestory-retrieval/src/health.rs
@@ -43,6 +48,7 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/workflows/retrieval-engine-smoke.yml
+      - .github/workflows/rust-ci.yml
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -97,7 +103,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Generalization lint regression contracts
         run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
@@ -122,6 +128,14 @@ jobs:
 
       - name: Retrieval crate unit tests
         run: cargo test --locked -p codestory-retrieval
+
+      - name: Seed draft proof test-profile artifacts
+        run: |
+          cargo test --locked -p codestory-llama-sys --test native_staging --no-run
+          cargo test --locked -p codestory-llama-sys --test model_staging --no-run
+          cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture
+          cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture
+          cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture
 
       - name: Save Cargo registry, git sources, and build output
         if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
