@@ -76,11 +76,6 @@ pub(crate) fn local() -> SidecarRuntimeConfig {
 }
 
 #[cfg(test)]
-pub(crate) fn embedding_runtime_id() -> String {
-    codestory_retrieval::embedding_runtime_id_for_runtime(&local())
-}
-
-#[cfg(test)]
 pub(crate) fn for_project_with_run_id(
     project_root: &Path,
     profile: SidecarProfile,
