@@ -924,6 +924,8 @@ mod tests {
         let home = temp.path().join("home");
         let project = temp.path().join("repo");
         let cache = temp.path().join("trusted-cache");
+        let expected_cache =
+            canonicalize_configuration_path(&cache).expect("trusted cache identity");
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(&project).expect("create project");
         fs::write(
@@ -941,8 +943,11 @@ mod tests {
         })
         .expect("runtime context");
 
-        assert_eq!(runtime.cache_root, cache);
-        assert_eq!(runtime.storage_path, cache.join("codestory.db"));
+        assert_eq!(runtime.cache_root, expected_cache);
+        assert_eq!(
+            runtime.storage_path,
+            runtime.cache_root.join("codestory.db")
+        );
     }
 
     #[test]
@@ -955,6 +960,8 @@ mod tests {
         let project = temp.path().join("repo");
         let home_cache = temp.path().join("home-cache");
         let cli_cache = temp.path().join("cli-cache");
+        let expected_cli_cache =
+            canonicalize_configuration_path(&cli_cache).expect("CLI cache identity");
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(&project).expect("create project");
         fs::write(
@@ -972,8 +979,11 @@ mod tests {
         })
         .expect("runtime context");
 
-        assert_eq!(runtime.cache_root, cli_cache);
-        assert_eq!(runtime.storage_path, cli_cache.join("codestory.db"));
+        assert_eq!(runtime.cache_root, expected_cli_cache);
+        assert_eq!(
+            runtime.storage_path,
+            runtime.cache_root.join("codestory.db")
+        );
     }
 
     #[test]
@@ -985,6 +995,11 @@ mod tests {
         let second_cache = temp.path().join("second-cache");
         fs::create_dir_all(&first_project).expect("create first project");
         fs::create_dir_all(&second_project).expect("create second project");
+        let first_cache =
+            canonicalize_configuration_path(&first_cache).expect("first cache identity");
+        let second_cache =
+            canonicalize_configuration_path(&second_cache).expect("second cache identity");
+        assert_ne!(first_cache, second_cache);
         let startup = |cache_root: &Path| crate::config::CliStartupConfig {
             user_home: None,
             project_network_config_allowed: true,
@@ -1024,10 +1039,42 @@ mod tests {
             )
         });
 
-        assert!(first.storage_path.starts_with(&first_cache));
-        assert!(second.storage_path.starts_with(&second_cache));
-        assert!(first.sidecar.layout.state_file.starts_with(&first_cache));
-        assert!(second.sidecar.layout.state_file.starts_with(&second_cache));
+        let assert_isolated_paths =
+            |runtime: &RuntimeContext, expected_root: &Path, other_root: &Path| {
+                assert_eq!(runtime.sidecar.cache_root.as_path(), expected_root);
+                assert_eq!(
+                    runtime.storage_path,
+                    runtime.cache_root.join("codestory.db")
+                );
+                for path in [
+                    runtime.cache_root.as_path(),
+                    runtime.storage_path.as_path(),
+                    runtime.sidecar.cache_root.as_path(),
+                    runtime.sidecar.layout.lexical_data_dir.as_path(),
+                    runtime.sidecar.layout.semantic_data_dir.as_path(),
+                    runtime.sidecar.layout.scip_artifacts_root.as_path(),
+                    runtime.sidecar.layout.state_file.as_path(),
+                ] {
+                    assert!(
+                        path.starts_with(expected_root),
+                        "{} must remain under {}",
+                        path.display(),
+                        expected_root.display()
+                    );
+                    assert!(
+                        !path.starts_with(other_root),
+                        "{} must not use {}",
+                        path.display(),
+                        other_root.display()
+                    );
+                }
+            };
+        assert_isolated_paths(&first, &first_cache, &second_cache);
+        assert_isolated_paths(&second, &second_cache, &first_cache);
+        assert_ne!(
+            first.context_key.configuration_id,
+            second.context_key.configuration_id
+        );
     }
 
     #[test]
@@ -1069,12 +1116,16 @@ mod tests {
     fn missing_configuration_path_identity_is_stable_after_creation() {
         let temp = tempdir().expect("temp dir");
         let missing = temp.path().join("cache").join("nested");
+        let existing_ancestor =
+            canonicalize_configuration_path(temp.path()).expect("existing ancestor identity");
+        let expected = existing_ancestor.join("cache").join("nested");
 
         let before = canonicalize_configuration_path(&missing).expect("missing path identity");
+        assert_eq!(before, expected);
         fs::create_dir_all(&missing).expect("create configuration path");
         let after = canonicalize_configuration_path(&missing).expect("existing path identity");
 
-        assert_eq!(before, after);
+        assert_eq!(after, expected);
     }
 
     #[cfg(windows)]
