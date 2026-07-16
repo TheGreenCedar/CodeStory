@@ -19558,6 +19558,8 @@ mod tests {
     struct RawGraphContract {
         nodes: HashSet<(String, String)>,
         edges: HashSet<(String, String, String)>,
+        call_counts: HashMap<(String, Option<String>), usize>,
+        has_parse_error: bool,
     }
 
     fn execute_raw_graph_contract(
@@ -19572,6 +19574,7 @@ mod tests {
         let tree = parser
             .parse(source, None)
             .ok_or_else(|| anyhow!("parser did not produce a tree"))?;
+        let has_parse_error = tree.root_node().has_error();
         let variables = Variables::new();
         let functions = Functions::stdlib();
         let config = ExecutionConfig::new(&functions, &variables)
@@ -19603,6 +19606,7 @@ mod tests {
         }
 
         let mut edges = HashSet::new();
+        let mut call_counts = HashMap::new();
         for source_ref in graph.iter_nodes() {
             let Some(source_name) = node_names.get(&source_ref).cloned() else {
                 continue;
@@ -19613,20 +19617,35 @@ mod tests {
                     continue;
                 };
                 let mut kind = None;
+                let mut call_syntax = None;
                 for (attr, val) in edge.attributes.iter() {
-                    if attr.as_str() == "kind" {
-                        kind = val.as_str().ok().map(str::to_string);
+                    match attr.as_str() {
+                        "kind" => kind = val.as_str().ok().map(str::to_string),
+                        "call_syntax" => {
+                            call_syntax = val.as_str().ok().map(str::to_string);
+                        }
+                        _ => {}
                     }
                 }
                 let Some(kind) = kind else {
                     continue;
                 };
+                if kind == "CALL" {
+                    *call_counts
+                        .entry((target_name.clone(), call_syntax))
+                        .or_insert(0) += 1;
+                }
                 edges.insert((source_name.clone(), target_name, kind));
             }
         }
 
         let _ = path;
-        Ok(RawGraphContract { nodes, edges })
+        Ok(RawGraphContract {
+            nodes,
+            edges,
+            call_counts,
+            has_parse_error,
+        })
     }
 
     fn parser_node_kinds(language: Language) -> HashSet<String> {
@@ -21409,6 +21428,168 @@ class Test {
             first, second,
             "compiled rules should be cached per language"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_dart_graph_query_tracks_grammar_0_4_call_shapes_without_duplicates() -> Result<()> {
+        let config = get_language_for_ext("dart").expect("dart config");
+        let direct = execute_raw_graph_contract(
+            Path::new("direct.dart"),
+            r#"
+void bareHelper() {}
+void genericHelper<T>() {}
+void repeatedHelper() {}
+
+void calls() {
+  bareHelper();
+  genericHelper<int>();
+  repeatedHelper(); repeatedHelper();
+}
+"#,
+            &config,
+        )?;
+        assert!(
+            !direct.has_parse_error,
+            "direct-call fixture must parse cleanly"
+        );
+        for (target, expected, shape) in [
+            ("bareHelper", 1, "bare"),
+            ("genericHelper", 1, "generic"),
+            ("repeatedHelper", 2, "repeated same-line"),
+        ] {
+            assert_eq!(
+                direct.call_counts.get(&(target.to_string(), None)).copied(),
+                Some(expected),
+                "{shape} calls should each emit exactly one direct placeholder"
+            );
+        }
+
+        let member = execute_raw_graph_contract(
+            Path::new("member.dart"),
+            r#"
+class Worker {
+  void runPlain() {}
+  void runGeneric<T>() {}
+}
+
+void calls(Worker worker) {
+  worker.runPlain();
+  worker.runGeneric<int>();
+}
+"#,
+            &config,
+        )?;
+        assert!(
+            !member.has_parse_error,
+            "member-call fixture must parse cleanly"
+        );
+        for (target, shape) in [("runPlain", "plain"), ("runGeneric", "generic")] {
+            assert_eq!(
+                member
+                    .call_counts
+                    .get(&(target.to_string(), Some("dart_member".to_string())))
+                    .copied(),
+                Some(1),
+                "{shape} selector-based member call should stay on the member path"
+            );
+            assert_eq!(
+                member
+                    .call_counts
+                    .get(&(target.to_string(), None))
+                    .copied()
+                    .unwrap_or_default(),
+                0,
+                "{shape} member call must not also emit a direct placeholder"
+            );
+        }
+
+        let unsupported_selectors = execute_raw_graph_contract(
+            Path::new("selectors.dart"),
+            r#"
+class Worker {
+  void run() {}
+  void save() {}
+}
+
+void calls(Worker? worker) {
+  worker?.run();
+  worker?..run()..save();
+}
+"#,
+            &config,
+        )?;
+        assert!(
+            !unsupported_selectors.has_parse_error,
+            "null-aware and cascade fixture must parse cleanly"
+        );
+        for target in ["run", "save"] {
+            assert_eq!(
+                unsupported_selectors
+                    .call_counts
+                    .get(&(target.to_string(), None))
+                    .copied()
+                    .unwrap_or_default(),
+                0,
+                "null-aware and cascade selectors must never be misclassified as direct calls"
+            );
+            assert_eq!(
+                unsupported_selectors
+                    .call_counts
+                    .get(&(target.to_string(), Some("dart_member".to_string()),))
+                    .copied()
+                    .unwrap_or_default(),
+                0,
+                "the graph query makes no null-aware or cascade member-call claim"
+            );
+        }
+
+        let chained = execute_raw_graph_contract(
+            Path::new("chained.dart"),
+            r#"
+class Worker {
+  void run() {}
+}
+
+Worker factory() => Worker();
+
+void calls() {
+  factory().run();
+}
+"#,
+            &config,
+        )?;
+        assert!(
+            !chained.has_parse_error,
+            "chained-call fixture must parse cleanly"
+        );
+        assert_eq!(
+            chained
+                .call_counts
+                .get(&("factory".to_string(), None))
+                .copied(),
+            Some(1),
+            "the inner bare factory call should remain visible"
+        );
+        assert_eq!(
+            chained
+                .call_counts
+                .get(&("run".to_string(), None))
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the chained receiver method must not be stolen by the direct-call rule"
+        );
+        assert_eq!(
+            chained
+                .call_counts
+                .get(&("run".to_string(), Some("dart_member".to_string())))
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the graph query makes no chained-receiver member-call claim"
+        );
+
         Ok(())
     }
 
