@@ -209,14 +209,27 @@ impl SchemaSpec {
 #[derive(Debug, Clone, Copy)]
 enum SchemaItems {
     Object(&'static SchemaObject),
-    Type(SchemaType),
+    Type {
+        schema_type: SchemaType,
+        min_length: Option<u64>,
+    },
 }
 
 impl SchemaItems {
     fn to_json(self) -> Value {
         match self {
             Self::Object(object) => object.to_json(),
-            Self::Type(schema_type) => json!({ "type": schema_type.as_str() }),
+            Self::Type {
+                schema_type,
+                min_length,
+            } => {
+                let mut schema =
+                    Map::from_iter([("type".to_string(), json!(schema_type.as_str()))]);
+                if let Some(min_length) = min_length {
+                    schema.insert("minLength".to_string(), json!(min_length));
+                }
+                Value::Object(schema)
+            }
         }
     }
 }
@@ -231,7 +244,10 @@ pub(crate) struct SchemaProperty {
     minimum: Option<u64>,
     maximum: Option<u64>,
     min_length: Option<u64>,
+    min_items: Option<u64>,
+    max_items: Option<u64>,
     items: Option<SchemaItems>,
+    object_schema: Option<&'static SchemaObject>,
     nullable: bool,
 }
 
@@ -246,7 +262,10 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            min_items: None,
+            max_items: None,
             items: None,
+            object_schema: None,
             nullable: false,
         }
     }
@@ -265,7 +284,10 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            min_items: None,
+            max_items: None,
             items: None,
+            object_schema: None,
             nullable: false,
         }
     }
@@ -280,7 +302,10 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            min_items: None,
+            max_items: None,
             items: None,
+            object_schema: None,
             nullable: false,
         }
     }
@@ -295,7 +320,10 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            min_items: None,
+            max_items: None,
             items: None,
+            object_schema: None,
             nullable: false,
         }
     }
@@ -310,7 +338,10 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            min_items: None,
+            max_items: None,
             items: None,
+            object_schema: None,
             nullable: false,
         }
     }
@@ -329,7 +360,10 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            min_items: None,
+            max_items: None,
             items: Some(SchemaItems::Object(items)),
+            object_schema: None,
             nullable: false,
         }
     }
@@ -344,7 +378,13 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
-            items: Some(SchemaItems::Type(SchemaType::String)),
+            min_items: None,
+            max_items: None,
+            items: Some(SchemaItems::Type {
+                schema_type: SchemaType::String,
+                min_length: None,
+            }),
+            object_schema: None,
             nullable: false,
         }
     }
@@ -367,6 +407,28 @@ impl SchemaProperty {
 
     const fn with_min_length(mut self, min_length: u64) -> Self {
         self.min_length = Some(min_length);
+        self
+    }
+
+    const fn with_item_bounds(mut self, min_items: u64, max_items: u64) -> Self {
+        self.min_items = Some(min_items);
+        self.max_items = Some(max_items);
+        self
+    }
+
+    const fn with_item_min_length(mut self, min_length: u64) -> Self {
+        self.items = match self.items {
+            Some(SchemaItems::Type { schema_type, .. }) => Some(SchemaItems::Type {
+                schema_type,
+                min_length: Some(min_length),
+            }),
+            items => items,
+        };
+        self
+    }
+
+    const fn with_object_schema(mut self, object_schema: &'static SchemaObject) -> Self {
+        self.object_schema = Some(object_schema);
         self
     }
 
@@ -400,8 +462,24 @@ impl SchemaProperty {
         if let Some(min_length) = self.min_length {
             schema.insert("minLength".to_string(), json!(min_length));
         }
+        if let Some(min_items) = self.min_items {
+            schema.insert("minItems".to_string(), json!(min_items));
+        }
+        if let Some(max_items) = self.max_items {
+            schema.insert("maxItems".to_string(), json!(max_items));
+        }
         if let Some(items) = self.items {
             schema.insert("items".to_string(), items.to_json());
+        }
+        if let Some(object_schema) = self.object_schema {
+            let nested_schema = object_schema.to_json();
+            if let Some(nested) = nested_schema.as_object() {
+                for (key, value) in nested {
+                    if key != "type" && key != "description" {
+                        schema.insert(key.clone(), value.clone());
+                    }
+                }
+            }
         }
         Value::Object(schema)
     }
@@ -430,6 +508,7 @@ pub(crate) struct SchemaObject {
     properties: &'static [SchemaProperty],
     required: &'static [&'static str],
     any_of_required: &'static [&'static [&'static str]],
+    one_of_required: &'static [&'static [&'static str]],
     additional_properties: bool,
 }
 
@@ -444,6 +523,7 @@ impl SchemaObject {
             properties,
             required,
             any_of_required: &[],
+            one_of_required: &[],
             additional_properties: false,
         }
     }
@@ -454,6 +534,7 @@ impl SchemaObject {
             properties: &[],
             required: &[],
             any_of_required: &[],
+            one_of_required: &[],
             additional_properties: true,
         }
     }
@@ -463,6 +544,14 @@ impl SchemaObject {
         any_of_required: &'static [&'static [&'static str]],
     ) -> Self {
         self.any_of_required = any_of_required;
+        self
+    }
+
+    const fn with_one_of_required(
+        mut self,
+        one_of_required: &'static [&'static [&'static str]],
+    ) -> Self {
+        self.one_of_required = one_of_required;
         self
     }
 
@@ -495,6 +584,17 @@ impl SchemaObject {
                 ),
             );
         }
+        if !self.one_of_required.is_empty() {
+            schema.insert(
+                "oneOf".to_string(),
+                Value::Array(
+                    self.one_of_required
+                        .iter()
+                        .map(|required| json!({ "required": required }))
+                        .collect(),
+                ),
+            );
+        }
         Value::Object(schema)
     }
 }
@@ -513,6 +613,15 @@ const AFFECTED_CHANGE_KINDS: &[&str] = &[
     "copied",
     "untracked",
     "unknown",
+];
+const AFFECTED_INPUT_CLASSIFICATIONS: &[&str] = &[
+    "valid_uncovered",
+    "missing",
+    "expected_deleted",
+    "rename_unresolved",
+    "stale_index",
+    "malformed",
+    "unavailable_evidence",
 ];
 const PACKET_TASK_CLASSES: &[&str] = &[
     "architecture_explanation",
@@ -731,7 +840,11 @@ static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
             "status",
             "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
         ),
-        SchemaProperty::string("previous_path", "Previous path for renames or copies.").nullable(),
+        SchemaProperty::string(
+            "previous_path",
+            "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
+        )
+        .nullable(),
     ],
     &["path", "kind"],
 );
@@ -747,13 +860,128 @@ static AFFECTED_MATCHED_FILE_SCHEMA: SchemaObject = SchemaObject::object(
             .with_enum(AFFECTED_CHANGE_KINDS)
             .nullable(),
         SchemaProperty::string("change_status", "Matched raw change status.").nullable(),
+        SchemaProperty::string("previous_path", "Previous rename/copy path.").nullable(),
         SchemaProperty::integer("error_count", "File-level index error count."),
     ],
     &["path", "role", "indexed", "complete", "error_count"],
 );
 
+static AFFECTED_UNMATCHED_PATH_SCHEMA: SchemaObject = SchemaObject::object(
+    "Input path that did not match indexed file identity.",
+    &[
+        SchemaProperty::string("path", "Submitted project-relative path."),
+        SchemaProperty::string(
+            "classification",
+            "Positive-evidence coverage classification.",
+        )
+        .with_enum(AFFECTED_INPUT_CLASSIFICATIONS),
+        SchemaProperty::string("reason", "Human-readable classification reason."),
+        SchemaProperty::string_array("evidence", "Evidence supporting the classification."),
+        SchemaProperty::string("change_kind", "Submitted change kind.")
+            .with_enum(AFFECTED_CHANGE_KINDS)
+            .nullable(),
+        SchemaProperty::string("change_status", "Submitted raw change status.").nullable(),
+        SchemaProperty::string("previous_path", "Previous rename/copy path.").nullable(),
+    ],
+    &["path", "classification", "reason", "evidence"],
+);
+
+static AFFECTED_UNCOVERED_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Input without complete graph evidence.",
+    &[
+        SchemaProperty::string("path", "Submitted project-relative path."),
+        SchemaProperty::string("classification", "Evidence-backed coverage classification.")
+            .with_enum(AFFECTED_INPUT_CLASSIFICATIONS),
+        SchemaProperty::string("reason", "Human-readable classification reason."),
+        SchemaProperty::string_array("evidence", "Evidence supporting the classification."),
+    ],
+    &["path", "classification", "reason", "evidence"],
+);
+
+static AFFECTED_BOUNDS_SCHEMA: SchemaObject = SchemaObject::object(
+    "Applied traversal and result bounds.",
+    &[
+        SchemaProperty::integer("requested_depth", "Applied dependent graph walk depth."),
+        SchemaProperty::integer("maximum_depth", "Maximum allowed graph walk depth."),
+        SchemaProperty::integer("visited_node_count", "Visited graph node count."),
+        SchemaProperty::integer("visited_edge_count", "Visited graph edge count."),
+        SchemaProperty::integer("impacted_symbol_limit", "Runtime impacted-symbol limit."),
+        SchemaProperty::integer("impacted_route_limit", "Runtime impacted-route limit."),
+    ],
+    &[
+        "requested_depth",
+        "maximum_depth",
+        "visited_node_count",
+        "visited_edge_count",
+        "impacted_symbol_limit",
+        "impacted_route_limit",
+    ],
+);
+
+static AFFECTED_COMPLETENESS_SCHEMA: SchemaObject = SchemaObject::object(
+    "Completeness and truncation evidence for this response.",
+    &[
+        SchemaProperty::boolean("complete", "Whether a complete impact claim is supported."),
+        SchemaProperty::string("confidence", "Completeness confidence."),
+        SchemaProperty::integer("direct_impact_count", "Direct impacted-symbol count."),
+        SchemaProperty::integer(
+            "propagated_impact_count",
+            "Graph-propagated impacted-symbol count.",
+        ),
+        SchemaProperty::integer("candidate_test_count", "Candidate impacted-test count."),
+        SchemaProperty::integer(
+            "uncovered_input_count",
+            "Inputs without complete graph evidence.",
+        ),
+        SchemaProperty::integer(
+            "unavailable_evidence_count",
+            "Inputs whose absence could not be classified more strongly.",
+        ),
+        SchemaProperty::boolean(
+            "truncated",
+            "Whether runtime or transport bounds capped evidence.",
+        ),
+        SchemaProperty::string_array(
+            "truncation_reasons",
+            "Field-specific runtime and transport truncation reasons.",
+        ),
+    ],
+    &[
+        "complete",
+        "confidence",
+        "direct_impact_count",
+        "propagated_impact_count",
+        "candidate_test_count",
+        "uncovered_input_count",
+        "unavailable_evidence_count",
+        "truncated",
+        "truncation_reasons",
+    ],
+);
+
+static AFFECTED_FOLLOW_UP_INVOCATION_SCHEMA: SchemaObject = SchemaObject::object(
+    "Structured follow-up invocation rendered only by a client.",
+    &[
+        SchemaProperty::string("program", "Executable name."),
+        SchemaProperty::string_array("args", "Unquoted argument vector."),
+    ],
+    &["program", "args"],
+);
+
+static AFFECTED_FOLLOW_UP_SCHEMA: SchemaObject = SchemaObject::object(
+    "Evidence-derived follow-up action.",
+    &[
+        SchemaProperty::string("action", "Stable follow-up action label."),
+        SchemaProperty::string("reason", "Evidence-backed reason for the follow-up."),
+        SchemaProperty::string("confidence", "Follow-up confidence."),
+        SchemaProperty::object("invocation", "Optional structured command invocation.")
+            .with_object_schema(&AFFECTED_FOLLOW_UP_INVOCATION_SCHEMA),
+    ],
+    &["action", "reason", "confidence"],
+);
+
 static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Changed-file impact analysis DTO from the existing local index.",
+    "Changed-file impact analysis DTO from the last complete local index.",
     &[
         SchemaProperty::string("project_root", "Project root."),
         SchemaProperty::string_array("changed_paths", "Changed repo-relative paths."),
@@ -769,8 +997,13 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         ),
         SchemaProperty::array(
             "unmatched_paths",
-            "Changed paths that did not match indexed files.",
-            &GENERIC_OBJECT_SCHEMA,
+            "Changed paths that did not match indexed file identity.",
+            &AFFECTED_UNMATCHED_PATH_SCHEMA,
+        ),
+        SchemaProperty::array(
+            "uncovered_inputs",
+            "All inputs without complete graph evidence, including malformed indexed files.",
+            &AFFECTED_UNCOVERED_INPUT_SCHEMA,
         ),
         SchemaProperty::integer("matched_file_count", "Number of matched indexed files."),
         SchemaProperty::integer("depth", "Applied dependent graph walk depth."),
@@ -789,8 +1022,19 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
             "Likely impacted test file DTOs.",
             &GENERIC_OBJECT_SCHEMA,
         ),
+        SchemaProperty::object("bounds", "Applied traversal and result bounds.")
+            .with_object_schema(&AFFECTED_BOUNDS_SCHEMA),
+        SchemaProperty::object(
+            "completeness",
+            "Completeness, direct/propagated counts, confidence, and truncation evidence.",
+        )
+        .with_object_schema(&AFFECTED_COMPLETENESS_SCHEMA),
         SchemaProperty::string_array("blind_spots", "Known impact-analysis blind spots."),
-        SchemaProperty::string_array("next_commands", "Suggested follow-up commands."),
+        SchemaProperty::array(
+            "follow_ups",
+            "Evidence-derived follow-up actions with optional structured invocations.",
+            &AFFECTED_FOLLOW_UP_SCHEMA,
+        ),
         SchemaProperty::string_array("notes", "Additional analysis notes."),
         SchemaProperty::object("counts", "Original result counts before response caps."),
         SchemaProperty::object("limits", "Applied response caps."),
@@ -807,10 +1051,13 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         "changed_paths",
         "change_records",
         "matched_files",
+        "uncovered_inputs",
         "matched_file_count",
         "depth",
         "impacted_symbols",
         "impacted_tests",
+        "bounds",
+        "completeness",
     ],
     &["code", "message"],
 ]);
@@ -1230,14 +1477,26 @@ static FILES_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 static AFFECTED_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Analyze explicit changed paths or change records against the existing local index.",
+    "Analyze exactly one explicit path source against the last complete local index.",
     &[
-        SchemaProperty::string_array("changed_paths", "Changed repo-relative paths to analyze."),
+        SchemaProperty::string_array(
+            "paths",
+            "Preferred simple input: project-relative paths to analyze.",
+        )
+        .with_item_min_length(1)
+        .with_item_bounds(1, 200),
+        SchemaProperty::string_array(
+            "changed_paths",
+            "Compatibility alias for project-relative paths to analyze.",
+        )
+        .with_item_min_length(1)
+        .with_item_bounds(1, 200),
         SchemaProperty::array(
             "change_records",
             "Changed file records with path, kind, optional status, and optional previous_path.",
             &AFFECTED_CHANGE_RECORD_SCHEMA,
-        ),
+        )
+        .with_item_bounds(1, 200),
         SchemaProperty::integer("depth", "Dependent graph walk depth.")
             .with_default(ValueLiteral::Integer(2))
             .with_bounds(1, 8),
@@ -1248,7 +1507,7 @@ static AFFECTED_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
     &[],
 )
-.with_any_of_required(&[&["changed_paths"], &["change_records"]]);
+.with_one_of_required(&[&["paths"], &["changed_paths"], &["change_records"]]);
 
 static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Build a deep evidence packet for one concrete retrieval target.",
@@ -1345,7 +1604,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "affected",
-        description: "Analyze explicit changed paths against a locally fresh index; uses provided paths only, refreshes the repository map before dispatch, never discovers git changes, and does not wait for broad search.",
+        description: "Analyze one explicit path source against the last complete local index while preserving bounded stale and error evidence. Cold or partial state may trigger managed indexing before dispatch. Prefer paths, use changed_paths for compatibility or change_records for status-rich input. Never discovers git changes and does not wait for broad search.",
         input_schema: AFFECTED_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AFFECTED_ANALYSIS_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),

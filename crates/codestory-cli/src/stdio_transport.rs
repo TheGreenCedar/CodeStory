@@ -7,8 +7,8 @@
 
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
-    AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAskRequest,
-    AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, ApiError, EmbeddingVectorPublicationIdentityDto,
     GraphResponse, GroundingBudgetDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
@@ -751,6 +751,15 @@ fn handle_stdio_message(
                     "Invalid params: tool arguments must be an object",
                 ));
             }
+            let prepared = match prepare_stdio_tool_call(session, name, &request) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Some(stdio_jsonrpc_success(
+                        id,
+                        stdio_tool_call_error(&stdio_api_error_value(error)),
+                    ));
+                }
+            };
             if let Err(error) = session.select_tool_project(&request) {
                 let message = error.to_string();
                 let code = if message.starts_with("project_required:") {
@@ -767,6 +776,7 @@ fn handle_stdio_message(
             }
             let (runtime, state) = session.active_project_mut();
             let public_operation = stdio_public_operation_name(name, &request);
+            let observes_complete_core = stdio_tool_observes_complete_core(name);
             if stdio_tool_reads_publication(name) {
                 if let Some(mismatch) = stdio_workspace_mismatch(runtime) {
                     let error = serde_json::json!({
@@ -780,16 +790,29 @@ fn handle_stdio_message(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
                 }
-                if let Err(error) = runtime.activation.activate_project(
-                    &runtime.project_root,
-                    &runtime.storage_path,
-                    Arc::clone(cancelled),
-                ) {
+                let activation = if observes_complete_core {
+                    runtime.activation.ensure_complete_core_for_observation(
+                        &runtime.project_root,
+                        &runtime.storage_path,
+                        Arc::clone(cancelled),
+                    )
+                } else {
+                    runtime
+                        .activation
+                        .activate_project(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            Arc::clone(cancelled),
+                        )
+                        .map(|_| ())
+                };
+                if let Err(error) = activation {
                     state.status_cache = None;
                     let operation = runtime.activation.snapshot();
-                    let allowed = operation
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.allows_operation(name));
+                    let allowed = !observes_complete_core
+                        && operation
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.allows_operation(name));
                     if error.code == "cancelled" || !allowed {
                         let preparing = matches!(
                             error.code.as_str(),
@@ -832,11 +855,20 @@ fn handle_stdio_message(
             // and only renders the identity attached by that owner.
             let (response, core_publication, retrieval_publication, operation_id, attempt) =
                 if stdio_tool_reads_publication(name) {
-                    match runtime.public_operation.run_with_cancel(
-                        public_operation,
-                        Arc::clone(cancelled),
-                        || Ok(handle_stdio_tool_call(runtime, state, &request)),
-                    ) {
+                    let operation = if observes_complete_core {
+                        runtime.public_operation.run_observational_with_cancel(
+                            public_operation,
+                            Arc::clone(cancelled),
+                            || Ok(handle_stdio_tool_call(runtime, state, &request, &prepared)),
+                        )
+                    } else {
+                        runtime.public_operation.run_with_cancel(
+                            public_operation,
+                            Arc::clone(cancelled),
+                            || Ok(handle_stdio_tool_call(runtime, state, &request, &prepared)),
+                        )
+                    };
+                    match operation {
                         Ok(operation) => (
                             operation.value,
                             operation.core_publication,
@@ -857,7 +889,7 @@ fn handle_stdio_message(
                     }
                 } else {
                     (
-                        handle_stdio_tool_call(runtime, state, &request),
+                        handle_stdio_tool_call(runtime, state, &request, &prepared),
                         None,
                         None,
                         None,
@@ -982,6 +1014,10 @@ fn stdio_jsonrpc_tool_call_from_legacy(
 
 fn stdio_tool_reads_publication(name: &str) -> bool {
     name != "status"
+}
+
+fn stdio_tool_observes_complete_core(name: &str) -> bool {
+    name == "affected"
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
@@ -1574,10 +1610,32 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
     })
 }
 
+#[derive(Debug)]
+enum PreparedStdioToolCall {
+    Raw,
+    Affected(AffectedAnalysisRequest),
+}
+
+fn prepare_stdio_tool_call(
+    session: &StdioServerSession,
+    name: &str,
+    request: &serde_json::Value,
+) -> std::result::Result<PreparedStdioToolCall, ApiError> {
+    match name {
+        "affected" => {
+            let affected = stdio_affected_request(request)?;
+            stdio_preflight_affected_paths(session, request, &affected)?;
+            Ok(PreparedStdioToolCall::Affected(affected))
+        }
+        _ => Ok(PreparedStdioToolCall::Raw),
+    }
+}
+
 fn handle_stdio_tool_call(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
     request: &serde_json::Value,
+    prepared: &PreparedStdioToolCall,
 ) -> serde_json::Value {
     let name = request
         .pointer("/params/name")
@@ -1596,7 +1654,14 @@ fn handle_stdio_tool_call(
         "search" => handle_stdio_search(runtime, state, request, query),
         "ground" => handle_stdio_ground(runtime, request),
         "files" => handle_stdio_files(runtime, request),
-        "affected" => handle_stdio_affected(runtime, request),
+        "affected" => match prepared {
+            PreparedStdioToolCall::Affected(affected) => handle_stdio_affected(runtime, affected),
+            PreparedStdioToolCall::Raw => serde_json::json!({
+                "error": stdio_api_error_value(ApiError::invalid_argument(
+                    "affected request was not prepared"
+                ))
+            }),
+        },
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request, false),
         "callers" => handle_stdio_neighbors(
@@ -1673,15 +1738,11 @@ fn handle_stdio_files(runtime: &RuntimeContext, request: &serde_json::Value) -> 
 
 fn handle_stdio_affected(
     runtime: &RuntimeContext,
-    request: &serde_json::Value,
+    request: &AffectedAnalysisRequest,
 ) -> serde_json::Value {
-    let affected = match stdio_affected_request(request) {
-        Ok(request) => request,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
-    };
     runtime
         .browser
-        .affected_analysis(affected)
+        .affected_analysis(request.clone())
         .map(|result| {
             let value = serde_json::to_value(result)
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
@@ -1708,28 +1769,121 @@ fn stdio_file_role(request: &serde_json::Value) -> Result<Option<IndexedFileRole
     }
 }
 
-fn stdio_affected_request(request: &serde_json::Value) -> Result<AffectedAnalysisRequest> {
-    let changed_paths = stdio_affected_changed_paths(request)?;
-    let change_records = stdio_affected_change_records(request)?;
-    if changed_paths.is_empty() && change_records.is_empty() {
-        bail!("affected.changed_paths or affected.change_records is required");
+fn stdio_affected_request(
+    request: &serde_json::Value,
+) -> std::result::Result<AffectedAnalysisRequest, ApiError> {
+    let source_count = ["paths", "changed_paths", "change_records"]
+        .into_iter()
+        .filter(|field| {
+            request
+                .pointer(&format!("/params/arguments/{field}"))
+                .is_some()
+        })
+        .count();
+    if source_count == 0 {
+        return Err(ApiError::invalid_argument(
+            "affected.paths, affected.changed_paths, or affected.change_records is required",
+        ));
     }
-    let authoritative_count = if change_records.is_empty() {
-        changed_paths.len()
+    if source_count > 1 {
+        return Err(ApiError::new(
+            "affected_input_conflict",
+            "affected accepts exactly one input property: paths, changed_paths, or change_records",
+        ));
+    }
+    let input = if request.pointer("/params/arguments/paths").is_some() {
+        AffectedAnalysisInput::Paths(
+            stdio_affected_paths(request)
+                .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        )
+    } else if request.pointer("/params/arguments/changed_paths").is_some() {
+        AffectedAnalysisInput::Paths(
+            stdio_affected_changed_paths(request)
+                .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        )
     } else {
-        change_records.len()
+        AffectedAnalysisInput::ChangeRecords(
+            stdio_affected_change_records(request)
+                .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        )
     };
+    let authoritative_count = match &input {
+        AffectedAnalysisInput::Paths(paths) => paths.len(),
+        AffectedAnalysisInput::ChangeRecords(records) => records.len(),
+    };
+    if authoritative_count == 0 {
+        return Err(ApiError::invalid_argument(
+            "affected input arrays must contain at least one path record",
+        ));
+    }
     if authoritative_count > STDIO_AFFECTED_INPUT_PATH_LIMIT {
-        bail!(
+        return Err(ApiError::invalid_argument(format!(
             "affected accepts at most {STDIO_AFFECTED_INPUT_PATH_LIMIT} changed path records per call"
-        );
+        )));
     }
     Ok(AffectedAnalysisRequest {
-        changed_paths,
-        change_records,
-        depth: stdio_affected_depth(request)?,
-        filter: stdio_affected_filter(request)?,
+        input,
+        depth: stdio_affected_depth(request)
+            .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        filter: stdio_affected_filter(request)
+            .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
     })
+}
+
+fn stdio_preflight_affected_paths(
+    session: &StdioServerSession,
+    request: &serde_json::Value,
+    affected: &AffectedAnalysisRequest,
+) -> std::result::Result<(), ApiError> {
+    let project_argument = request
+        .pointer("/params/arguments/project")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let project_root = if let Some(project) = project_argument {
+        if !Path::new(project).is_absolute() {
+            return Err(ApiError::new(
+                "project_required",
+                "`project` must be the caller's absolute repository root",
+            ));
+        }
+        Some(
+            crate::runtime::canonicalize_project_root(Path::new(project))
+                .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        )
+    } else {
+        session
+            .active_project
+            .as_ref()
+            .map(|active| active.runtime.project_root.clone())
+    };
+    let Some(project_root) = project_root else {
+        return Ok(());
+    };
+
+    match &affected.input {
+        AffectedAnalysisInput::Paths(paths) => {
+            for path in paths {
+                codestory_runtime::resolve_project_file_path_from_root(&project_root, path, true)?;
+            }
+        }
+        AffectedAnalysisInput::ChangeRecords(records) => {
+            for record in records {
+                codestory_runtime::resolve_project_file_path_from_root(
+                    &project_root,
+                    &record.path,
+                    true,
+                )?;
+                if let Some(previous_path) = record.previous_path.as_deref() {
+                    codestory_runtime::resolve_project_file_path_from_root(
+                        &project_root,
+                        previous_path,
+                        true,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Value {
@@ -1738,12 +1892,14 @@ fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Va
         ("change_records", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
         ("matched_files", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
         ("unmatched_paths", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
+        ("uncovered_inputs", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
         ("impacted_symbols", STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT),
         ("impacted_routes", STDIO_AFFECTED_ROUTE_OUTPUT_LIMIT),
         ("impacted_tests", STDIO_AFFECTED_TEST_OUTPUT_LIMIT),
+        ("follow_ups", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
     ];
     let mut counts = serde_json::Map::new();
-    let mut truncated = false;
+    let mut transport_truncation_reasons = Vec::new();
     for (field, limit) in limits {
         let Some(items) = value
             .get_mut(field)
@@ -1751,13 +1907,36 @@ fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Va
         else {
             continue;
         };
-        counts.insert(field.to_string(), serde_json::json!(items.len()));
-        if items.len() > limit {
+        let total = items.len();
+        counts.insert(field.to_string(), serde_json::json!(total));
+        if total > limit {
             items.truncate(limit);
-            truncated = true;
+            transport_truncation_reasons.push(format!(
+                "{field} response total {total} exceeded stdio limit {limit}"
+            ));
         }
     }
+    let truncated = !transport_truncation_reasons.is_empty();
     if let Some(object) = value.as_object_mut() {
+        if truncated
+            && let Some(completeness) = object
+                .get_mut("completeness")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            completeness.insert("complete".to_string(), serde_json::json!(false));
+            completeness.insert("confidence".to_string(), serde_json::json!("bounded"));
+            completeness.insert("truncated".to_string(), serde_json::json!(true));
+            let reasons = completeness
+                .entry("truncation_reasons".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(reasons) = reasons.as_array_mut() {
+                for reason in &transport_truncation_reasons {
+                    if !reasons.iter().any(|value| value.as_str() == Some(reason)) {
+                        reasons.push(serde_json::json!(reason));
+                    }
+                }
+            }
+        }
         object.insert("counts".to_string(), serde_json::Value::Object(counts));
         object.insert("truncated".to_string(), serde_json::json!(truncated));
         object.insert(
@@ -1791,6 +1970,26 @@ fn stdio_affected_changed_paths(request: &serde_json::Value) -> Result<Vec<Strin
                 .with_context(|| {
                     "affected.changed_paths must be an array of non-empty strings".to_string()
                 })
+        })
+        .collect()
+}
+
+fn stdio_affected_paths(request: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(value) = request.pointer("/params/arguments/paths") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!("affected.paths must be an array of non-empty strings");
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .with_context(|| "affected.paths must be an array of non-empty strings".to_string())
         })
         .collect()
 }
@@ -1841,6 +2040,16 @@ fn stdio_affected_change_record(value: &serde_json::Value) -> Result<AffectedCha
         ),
         _ => None,
     };
+    if previous_path.is_some()
+        && !matches!(
+            &kind,
+            AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied
+        )
+    {
+        bail!(
+            "affected.change_records[].previous_path is valid only when kind is renamed or copied"
+        );
+    }
     Ok(AffectedChangeRecordDto {
         path: path.to_string(),
         kind,
@@ -4826,6 +5035,83 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn affected_transport_truncation_downgrades_stronger_nested_completeness_with_field_totals() {
+        let impacted_symbols = (0..=STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT)
+            .map(|index| json!({"node_id": index}))
+            .collect::<Vec<_>>();
+        let result = compact_stdio_affected_result(json!({
+            "changed_paths": ["src/lib.rs"],
+            "change_records": [],
+            "matched_files": [],
+            "unmatched_paths": [],
+            "uncovered_inputs": [],
+            "impacted_symbols": impacted_symbols,
+            "impacted_routes": [],
+            "impacted_tests": [],
+            "follow_ups": [],
+            "completeness": {
+                "complete": true,
+                "confidence": "complete",
+                "truncated": false,
+                "truncation_reasons": []
+            }
+        }));
+
+        assert_eq!(
+            result["counts"]["impacted_symbols"],
+            json!(STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT + 1)
+        );
+        assert_eq!(
+            result["impacted_symbols"].as_array().map(Vec::len),
+            Some(STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT)
+        );
+        assert_eq!(result["truncated"], json!(true));
+        assert_eq!(result["completeness"]["complete"], json!(false));
+        assert_eq!(result["completeness"]["confidence"], json!("bounded"));
+        assert_eq!(result["completeness"]["truncated"], json!(true));
+        assert!(
+            result["completeness"]["truncation_reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| {
+                    reason
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("impacted_symbols response total 51"))
+                })),
+            "transport truncation should identify the capped field and original total: {result}"
+        );
+    }
+
+    #[test]
+    fn affected_transport_compaction_preserves_existing_incompleteness() {
+        let result = compact_stdio_affected_result(json!({
+            "changed_paths": [],
+            "change_records": [],
+            "matched_files": [],
+            "unmatched_paths": [],
+            "uncovered_inputs": [],
+            "impacted_symbols": [],
+            "impacted_routes": [],
+            "impacted_tests": [],
+            "follow_ups": [],
+            "completeness": {
+                "complete": false,
+                "confidence": "bounded",
+                "truncated": true,
+                "truncation_reasons": ["runtime bound"]
+            }
+        }));
+
+        assert_eq!(result["truncated"], json!(false));
+        assert_eq!(result["completeness"]["complete"], json!(false));
+        assert_eq!(result["completeness"]["confidence"], json!("bounded"));
+        assert_eq!(result["completeness"]["truncated"], json!(true));
+        assert_eq!(
+            result["completeness"]["truncation_reasons"],
+            json!(["runtime bound"])
+        );
+    }
+
+    #[test]
     fn storage_freshness_uses_durable_db_and_wal_but_ignores_shm() {
         let temp = tempfile::tempdir().expect("storage tempdir");
         let storage = temp.path().join("codestory.db");
@@ -5898,6 +6184,275 @@ version = "0.11.20"
                 .iter()
                 .any(|retained| retained.runtime.context_key == a_key),
             "recently reused native project identity must stay retained"
+        );
+    }
+
+    #[test]
+    fn malformed_affected_fifth_project_preserves_retained_state_before_valid_aliases_activate() {
+        let cache = tempfile::tempdir().expect("cache");
+        let projects = (0..6)
+            .map(|index| {
+                let project = tempfile::tempdir().expect("project");
+                std::fs::create_dir_all(project.path().join("src")).expect("create source dir");
+                std::fs::write(
+                    project.path().join("Cargo.toml"),
+                    format!(
+                        "[package]\nname = \"affected-capacity-{index}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+                    ),
+                )
+                .expect("write Cargo manifest");
+                std::fs::write(
+                    project.path().join("src/lib.rs"),
+                    format!("pub fn project_{index}() {{}}\n"),
+                )
+                .expect("write source");
+                project
+            })
+            .collect::<Vec<_>>();
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        for (index, project) in projects
+            .iter()
+            .take(STDIO_PROJECT_CONTEXT_CAPACITY)
+            .enumerate()
+        {
+            session
+                .select_project(project.path().to_str())
+                .expect("select retained project");
+            let active = session.active_project.as_mut().expect("active project");
+            active.state.status_cache = Some(StdioStatusCacheEntry {
+                key: format!("retained-{index}"),
+                value: json!({"project": index}),
+                cached_at: Instant::now(),
+            });
+            active.runtime.activation.set_snapshot_for_test(Some(
+                codestory_runtime::ActivationSnapshot {
+                    operation_id: format!("activation-{index}"),
+                    state: codestory_runtime::ActivationState::Unavailable,
+                    stage: codestory_runtime::ActivationStage::Validation,
+                    attempt: 1,
+                    retry_after_ms: None,
+                    failure: Some(format!("retained-{index}")),
+                    capabilities: codestory_runtime::ActivationCapabilities {
+                        local_navigation: codestory_runtime::ActivationCapabilityState::Unavailable,
+                        broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,
+                    },
+                },
+            ));
+        }
+        assert!(session.active_project.is_some());
+        assert_eq!(
+            session.retained_projects.len(),
+            STDIO_PROJECT_CONTEXT_CAPACITY - 1
+        );
+
+        let retained_state = |session: &StdioServerSession| {
+            let mut state = session
+                .active_project
+                .iter()
+                .chain(session.retained_projects.iter())
+                .map(|project| {
+                    (
+                        project.runtime.project_root.clone(),
+                        project
+                            .state
+                            .status_cache
+                            .as_ref()
+                            .map(|cached| cached.key.clone()),
+                        project.runtime.activation.snapshot(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            state.sort_by(|left, right| left.0.cmp(&right.0));
+            state
+        };
+        let before = retained_state(&session);
+        let malformed = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "malformed-fifth",
+                "method": "tools/call",
+                "params": {
+                    "name": "affected",
+                    "arguments": {
+                        "project": projects[4].path(),
+                        "paths": [""]
+                    }
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("malformed affected response");
+        assert_eq!(
+            malformed.pointer("/result/structuredContent/code"),
+            Some(&json!("invalid_argument"))
+        );
+        assert_eq!(
+            retained_state(&session),
+            before,
+            "malformed fifth-project input must not select, evict, or cancel retained state"
+        );
+
+        for (id, project, field) in [
+            ("valid-legacy-fifth", &projects[4], "changed_paths"),
+            ("valid-current-sixth", &projects[5], "paths"),
+        ] {
+            let mut arguments = json!({"project": project.path()});
+            arguments[field] = json!(["src/lib.rs"]);
+            let response = handle_stdio_message(
+                &mut session,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "affected",
+                        "arguments": arguments
+                    }
+                })
+                .to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect("valid affected response");
+            assert_eq!(response.pointer("/result/isError"), None, "{response}");
+            assert_eq!(
+                response.pointer("/result/structuredContent/changed_paths"),
+                Some(&json!(["src/lib.rs"]))
+            );
+            let active = session.active_project.as_ref().expect("selected project");
+            assert!(codestory_workspace::same_workspace_path(
+                &active.runtime.project_root,
+                project.path()
+            ));
+            assert_eq!(
+                active
+                    .runtime
+                    .activation
+                    .snapshot()
+                    .map(|snapshot| snapshot.capabilities.local_navigation),
+                Some(codestory_runtime::ActivationCapabilityState::Ready)
+            );
+        }
+    }
+
+    #[test]
+    fn affected_preflight_rejects_invalid_previous_kind_and_outside_paths_before_activation() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(project.path().join("src")).expect("create source dir");
+        std::fs::write(project.path().join("src/lib.rs"), "pub fn inside() {}\n")
+            .expect("write source");
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        let mut cases = vec![
+            json!({
+                "project": project.path(),
+                "change_records": [{
+                    "path": "src/lib.rs",
+                    "kind": "modified",
+                    "previous_path": "src/old.rs"
+                }]
+            }),
+            json!({
+                "project": project.path(),
+                "paths": ["../outside.rs"]
+            }),
+            json!({
+                "project": project.path(),
+                "change_records": [{
+                    "path": "src/lib.rs",
+                    "kind": "copied",
+                    "previous_path": "../outside.rs"
+                }]
+            }),
+            json!({
+                "project": project.path(),
+                "paths": [outside.path().join("absolute-outside.rs")]
+            }),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), project.path().join("escape"))
+                .expect("create escaping symlink ancestor");
+            std::os::unix::fs::symlink("absent-target", project.path().join("dangling"))
+                .expect("create dangling symlink ancestor");
+            std::os::unix::fs::symlink("loop-b", project.path().join("loop-a"))
+                .expect("create first loop link");
+            std::os::unix::fs::symlink("loop-a", project.path().join("loop-b"))
+                .expect("create second loop link");
+            cases.push(json!({
+                "project": project.path(),
+                "change_records": [{
+                    "path": "src/new/parent/current.rs",
+                    "kind": "renamed",
+                    "previous_path": "escape/deleted/parent/old.rs"
+                }]
+            }));
+            for previous_path in [
+                "dangling/deleted/parent/old.rs",
+                "loop-a/deleted/parent/old.rs",
+            ] {
+                cases.push(json!({
+                    "project": project.path(),
+                    "change_records": [{
+                        "path": "src/new/parent/current.rs",
+                        "kind": "renamed",
+                        "previous_path": previous_path
+                    }]
+                }));
+            }
+        }
+        for (index, arguments) in cases.into_iter().enumerate() {
+            let response = handle_stdio_message(
+                &mut session,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("invalid-preflight-{index}"),
+                    "method": "tools/call",
+                    "params": {
+                        "name": "affected",
+                        "arguments": arguments
+                    }
+                })
+                .to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect("invalid affected response");
+            assert_eq!(
+                response.pointer("/result/structuredContent/code"),
+                Some(&json!("invalid_argument")),
+                "{response}"
+            );
+            assert!(session.active_project.is_none());
+            assert!(session.retained_projects.is_empty());
+        }
+        assert_eq!(
+            std::fs::read_dir(cache.path())
+                .expect("read cache root")
+                .count(),
+            0,
+            "invalid affected preflight must not create project cache state"
         );
     }
 

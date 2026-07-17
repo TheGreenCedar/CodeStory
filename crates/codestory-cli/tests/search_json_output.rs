@@ -151,7 +151,8 @@ fn assert_route_explore_context(explore: &Value) {
 
 fn assert_affected_route_evidence(affected: &Value) {
     assert_eq!(affected["matched_files"][0]["path"], "src/routes.ts");
-    assert_eq!(affected["unmatched_paths"][0]["path"], "missing/file.ts");
+    assert_eq!(affected["unmatched_paths"][0]["path"], "src/missing.ts");
+    assert_eq!(affected["unmatched_paths"][0]["classification"], "missing");
     assert_eq!(
         affected["impacted_routes"][0]["route"]["framework"],
         "express"
@@ -184,12 +185,21 @@ fn assert_affected_route_evidence(affected: &Value) {
             .is_some_and(|items| !items.is_empty()),
         "affected should expose blind spots for unmatched paths: {affected:#}"
     );
+    assert!(affected.get("next_commands").is_none());
     assert!(
-        affected["next_commands"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "affected should expose next commands: {affected:#}"
+        affected["follow_ups"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["action"] == "locate_input_path"
+                    && item["invocation"]["program"] == "codestory-cli"
+                    && item["invocation"]["args"]
+                        .as_array()
+                        .is_some_and(|args| args.iter().any(|arg| arg == "src/missing.ts"))
+            })
+        }),
+        "affected should expose a focused structured missing-path follow-up: {affected:#}"
     );
+    assert_eq!(affected["completeness"]["complete"], false);
+    assert!(affected["bounds"]["visited_node_count"].is_number());
 }
 
 fn assert_openapi_route_metadata(openapi: &Value) {
@@ -201,6 +211,71 @@ fn assert_openapi_route_metadata(openapi: &Value) {
     assert_eq!(route["confidence"], "schema");
     assert_eq!(route["source_convention"], "openapi");
     assert_eq!(route["provenance"][0], "openapi");
+}
+
+#[test]
+fn affected_json_distinguishes_complete_source_from_valid_uncovered_asset() {
+    let workspace = tempdir().expect("workspace dir");
+    write_retrieval_fixture(workspace.path());
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let complete = run_cli(
+        workspace.path(),
+        &[
+            "affected",
+            "src/lib.rs",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        complete.status.success(),
+        "affected source command failed: {}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    let complete: Value =
+        serde_json::from_slice(&complete.stdout).expect("parse complete affected json");
+    assert_eq!(complete["completeness"]["complete"], true);
+    assert!(complete.get("next_commands").is_none());
+
+    fs::write(workspace.path().join("desk.svg"), "<svg/>").expect("write SVG");
+    let uncovered = run_cli(
+        workspace.path(),
+        &[
+            "affected",
+            "desk.svg",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        uncovered.status.success(),
+        "affected SVG command failed: {}",
+        String::from_utf8_lossy(&uncovered.stderr)
+    );
+    let uncovered: Value =
+        serde_json::from_slice(&uncovered.stdout).expect("parse uncovered affected json");
+    assert_eq!(
+        uncovered["unmatched_paths"][0]["classification"],
+        "valid_uncovered"
+    );
+    assert!(uncovered.get("next_commands").is_none());
+    assert_eq!(
+        uncovered["follow_ups"][0]["action"],
+        "inspect_graph_boundary"
+    );
 }
 
 #[test]
@@ -1014,7 +1089,7 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
         &[
             "affected",
             "src/routes.ts",
-            "missing/file.ts",
+            "src/missing.ts",
             "--refresh",
             "none",
             "--format",

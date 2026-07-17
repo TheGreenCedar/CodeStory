@@ -790,10 +790,16 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Analyze explicit changed paths against a locally fresh index; uses provided paths only, refreshes the repository map before dispatch, never discovers git changes, and does not wait for broad search.",
+      "description": "Analyze one explicit path source against the last complete local index while preserving bounded stale and error evidence. Cold or partial state may trigger managed indexing before dispatch. Prefer paths, use changed_paths for compatibility or change_records for status-rich input. Never discovers git changes and does not wait for broad search.",
       "inputSchema": {
         "additionalProperties": false,
-        "anyOf": [
+        "description": "Analyze exactly one explicit path source against the last complete local index.",
+        "oneOf": [
+          {
+            "required": [
+              "paths"
+            ]
+          },
           {
             "required": [
               "changed_paths"
@@ -805,7 +811,6 @@
             ]
           }
         ],
-        "description": "Analyze explicit changed paths or change records against the existing local index.",
         "properties": {
           "change_records": {
             "description": "Changed file records with path, kind, optional status, and optional previous_path.",
@@ -832,7 +837,7 @@
                   "type": "string"
                 },
                 "previous_path": {
-                  "description": "Previous path for renames or copies.",
+                  "description": "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
                   "type": [
                     "string",
                     "null"
@@ -849,13 +854,18 @@
               ],
               "type": "object"
             },
+            "maxItems": 200,
+            "minItems": 1,
             "type": "array"
           },
           "changed_paths": {
-            "description": "Changed repo-relative paths to analyze.",
+            "description": "Compatibility alias for project-relative paths to analyze.",
             "items": {
+              "minLength": 1,
               "type": "string"
             },
+            "maxItems": 200,
+            "minItems": 1,
             "type": "array"
           },
           "depth": {
@@ -868,6 +878,16 @@
           "filter": {
             "description": "Optional impacted-symbol filter by path or display-name substring.",
             "type": "string"
+          },
+          "paths": {
+            "description": "Preferred simple input: project-relative paths to analyze.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 200,
+            "minItems": 1,
+            "type": "array"
           },
           "project": {
             "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
@@ -890,10 +910,13 @@
               "changed_paths",
               "change_records",
               "matched_files",
+              "uncovered_inputs",
               "matched_file_count",
               "depth",
               "impacted_symbols",
-              "impacted_tests"
+              "impacted_tests",
+              "bounds",
+              "completeness"
             ]
           },
           {
@@ -903,7 +926,7 @@
             ]
           }
         ],
-        "description": "Changed-file impact analysis DTO from the existing local index.",
+        "description": "Changed-file impact analysis DTO from the last complete local index.",
         "properties": {
           "blind_spots": {
             "description": "Known impact-analysis blind spots.",
@@ -911,6 +934,45 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "bounds": {
+            "additionalProperties": false,
+            "description": "Applied traversal and result bounds.",
+            "properties": {
+              "impacted_route_limit": {
+                "description": "Runtime impacted-route limit.",
+                "type": "integer"
+              },
+              "impacted_symbol_limit": {
+                "description": "Runtime impacted-symbol limit.",
+                "type": "integer"
+              },
+              "maximum_depth": {
+                "description": "Maximum allowed graph walk depth.",
+                "type": "integer"
+              },
+              "requested_depth": {
+                "description": "Applied dependent graph walk depth.",
+                "type": "integer"
+              },
+              "visited_edge_count": {
+                "description": "Visited graph edge count.",
+                "type": "integer"
+              },
+              "visited_node_count": {
+                "description": "Visited graph node count.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "requested_depth",
+              "maximum_depth",
+              "visited_node_count",
+              "visited_edge_count",
+              "impacted_symbol_limit",
+              "impacted_route_limit"
+            ],
+            "type": "object"
           },
           "change_records": {
             "description": "Normalized changed file records.",
@@ -937,7 +999,7 @@
                   "type": "string"
                 },
                 "previous_path": {
-                  "description": "Previous path for renames or copies.",
+                  "description": "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
                   "type": [
                     "string",
                     "null"
@@ -967,6 +1029,63 @@
             "description": "Typed API error code.",
             "type": "string"
           },
+          "completeness": {
+            "additionalProperties": false,
+            "description": "Completeness, direct/propagated counts, confidence, and truncation evidence.",
+            "properties": {
+              "candidate_test_count": {
+                "description": "Candidate impacted-test count.",
+                "type": "integer"
+              },
+              "complete": {
+                "description": "Whether a complete impact claim is supported.",
+                "type": "boolean"
+              },
+              "confidence": {
+                "description": "Completeness confidence.",
+                "type": "string"
+              },
+              "direct_impact_count": {
+                "description": "Direct impacted-symbol count.",
+                "type": "integer"
+              },
+              "propagated_impact_count": {
+                "description": "Graph-propagated impacted-symbol count.",
+                "type": "integer"
+              },
+              "truncated": {
+                "description": "Whether runtime or transport bounds capped evidence.",
+                "type": "boolean"
+              },
+              "truncation_reasons": {
+                "description": "Field-specific runtime and transport truncation reasons.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "unavailable_evidence_count": {
+                "description": "Inputs whose absence could not be classified more strongly.",
+                "type": "integer"
+              },
+              "uncovered_input_count": {
+                "description": "Inputs without complete graph evidence.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "complete",
+              "confidence",
+              "direct_impact_count",
+              "propagated_impact_count",
+              "candidate_test_count",
+              "uncovered_input_count",
+              "unavailable_evidence_count",
+              "truncated",
+              "truncation_reasons"
+            ],
+            "type": "object"
+          },
           "counts": {
             "description": "Original result counts before response caps.",
             "type": "object"
@@ -981,6 +1100,56 @@
               "object",
               "null"
             ]
+          },
+          "follow_ups": {
+            "description": "Evidence-derived follow-up actions with optional structured invocations.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Evidence-derived follow-up action.",
+              "properties": {
+                "action": {
+                  "description": "Stable follow-up action label.",
+                  "type": "string"
+                },
+                "confidence": {
+                  "description": "Follow-up confidence.",
+                  "type": "string"
+                },
+                "invocation": {
+                  "additionalProperties": false,
+                  "description": "Optional structured command invocation.",
+                  "properties": {
+                    "args": {
+                      "description": "Unquoted argument vector.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "program": {
+                      "description": "Executable name.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "program",
+                    "args"
+                  ],
+                  "type": "object"
+                },
+                "reason": {
+                  "description": "Evidence-backed reason for the follow-up.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action",
+                "reason",
+                "confidence"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "impacted_routes": {
             "description": "Impacted route or endpoint DTOs.",
@@ -1068,6 +1237,13 @@
                   "description": "Project-relative file path.",
                   "type": "string"
                 },
+                "previous_path": {
+                  "description": "Previous rename/copy path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "role": {
                   "description": "Inferred file role.",
                   "enum": [
@@ -1095,13 +1271,6 @@
             "description": "Human-readable API error message.",
             "type": "string"
           },
-          "next_commands": {
-            "description": "Suggested follow-up commands.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
           "notes": {
             "description": "Additional analysis notes.",
             "items": {
@@ -1117,13 +1286,122 @@
             "description": "Whether any result collection was capped.",
             "type": "boolean"
           },
-          "unmatched_paths": {
-            "description": "Changed paths that did not match indexed files.",
+          "uncovered_inputs": {
+            "description": "All inputs without complete graph evidence, including malformed indexed files.",
             "items": {
-              "additionalProperties": true,
-              "description": "Generic JSON object.",
-              "properties": {},
-              "required": [],
+              "additionalProperties": false,
+              "description": "Input without complete graph evidence.",
+              "properties": {
+                "classification": {
+                  "description": "Evidence-backed coverage classification.",
+                  "enum": [
+                    "valid_uncovered",
+                    "missing",
+                    "expected_deleted",
+                    "rename_unresolved",
+                    "stale_index",
+                    "malformed",
+                    "unavailable_evidence"
+                  ],
+                  "type": "string"
+                },
+                "evidence": {
+                  "description": "Evidence supporting the classification.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "description": "Submitted project-relative path.",
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "Human-readable classification reason.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "classification",
+                "reason",
+                "evidence"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "unmatched_paths": {
+            "description": "Changed paths that did not match indexed file identity.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Input path that did not match indexed file identity.",
+              "properties": {
+                "change_kind": {
+                  "description": "Submitted change kind.",
+                  "enum": [
+                    "added",
+                    "modified",
+                    "deleted",
+                    "renamed",
+                    "copied",
+                    "untracked",
+                    "unknown"
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "change_status": {
+                  "description": "Submitted raw change status.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "classification": {
+                  "description": "Positive-evidence coverage classification.",
+                  "enum": [
+                    "valid_uncovered",
+                    "missing",
+                    "expected_deleted",
+                    "rename_unresolved",
+                    "stale_index",
+                    "malformed",
+                    "unavailable_evidence"
+                  ],
+                  "type": "string"
+                },
+                "evidence": {
+                  "description": "Evidence supporting the classification.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "description": "Submitted project-relative path.",
+                  "type": "string"
+                },
+                "previous_path": {
+                  "description": "Previous rename/copy path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "description": "Human-readable classification reason.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "classification",
+                "reason",
+                "evidence"
+              ],
               "type": "object"
             },
             "type": "array"

@@ -13,7 +13,7 @@ use codestory_contracts::api::{
 
 use crate::AppController;
 use codestory_indexer::CancellationToken;
-use codestory_store::IndexPublicationRecord;
+use codestory_store::{IndexPublicationRecord, Store};
 use serde::Serialize;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::RefCell;
@@ -163,6 +163,13 @@ pub struct ActivationService {
     controller: AppController,
 }
 
+enum CompleteCoreAdmission {
+    Complete,
+    Cold,
+    Fenced,
+    Corrupt(ApiError),
+}
+
 impl ActivationService {
     pub(crate) fn new(controller: AppController) -> Self {
         Self {
@@ -203,6 +210,80 @@ impl ActivationService {
             cancelled,
             DEFAULT_ACTIVATION_FOREGROUND_BUDGET,
         )
+    }
+
+    /// Configure the controller around an existing complete core publication
+    /// without repairing source freshness. This admission path is for
+    /// operations that explain drift from that publication. Cold or partial
+    /// state still runs normal activation; corrupt observational reads fail
+    /// directly and are never reclassified as a cold cache.
+    pub fn ensure_complete_core_for_observation(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<(), ApiError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                "request cancelled before observational activation",
+            ));
+        }
+        match self.classify_complete_core_admission(project_root, storage_path) {
+            CompleteCoreAdmission::Complete => return Ok(()),
+            CompleteCoreAdmission::Corrupt(error) => return Err(error),
+            CompleteCoreAdmission::Cold | CompleteCoreAdmission::Fenced => {}
+        }
+
+        match self.activate_project(project_root, storage_path, cancelled) {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error.code != "cancelled"
+                    && self.snapshot().is_some_and(|snapshot| {
+                        snapshot.capabilities.local_navigation == ActivationCapabilityState::Ready
+                    }) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn classify_complete_core_admission(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> CompleteCoreAdmission {
+        if !storage_path.is_file() {
+            return CompleteCoreAdmission::Cold;
+        }
+        let freshness = match Store::open_freshness_observational(storage_path) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
+                    "Failed to inspect storage admission state: {error}"
+                )));
+            }
+        };
+        match freshness.has_incomplete_incremental_run() {
+            Ok(true) => return CompleteCoreAdmission::Fenced,
+            Ok(false) => {}
+            Err(error) => {
+                return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
+                    "Failed to inspect incomplete-run admission fence: {error}"
+                )));
+            }
+        }
+        drop(freshness);
+
+        match self.controller.inspect_project_summary_with_storage_path(
+            project_root.to_path_buf(),
+            storage_path.to_path_buf(),
+        ) {
+            Ok(Some(summary)) if summary.publication.is_some() => CompleteCoreAdmission::Complete,
+            Ok(_) => CompleteCoreAdmission::Cold,
+            Err(error) => CompleteCoreAdmission::Corrupt(error),
+        }
     }
 
     pub fn activate_project_with_foreground_budget(
@@ -1463,6 +1544,153 @@ mod activation_tests {
 
         assert_eq!(error.code, "cancelled");
         assert!(!entered);
+    }
+
+    #[test]
+    fn observational_admission_preserves_an_existing_stale_complete_publication() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let source = project.path().join("fixture.rs");
+        fs::write(&source, "pub fn fixture() -> u32 { 1 }\n").expect("write fixture");
+        let runtime = Runtime::new();
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = runtime
+            .project_service()
+            .complete_index_publication_at(&storage_path)
+            .expect("read publication")
+            .expect("complete publication");
+
+        fs::write(&source, "pub fn fixture() -> u32 { 2 }\n").expect("make source stale");
+        runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("admit stale complete publication");
+
+        let summary = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("inspect stale publication")
+            .expect("existing project summary");
+        assert_eq!(summary.publication.as_ref(), Some(&before));
+        assert_eq!(
+            summary.freshness.as_ref().map(|freshness| freshness.status),
+            Some(IndexFreshnessStatusDto::Stale)
+        );
+        assert!(
+            runtime.activation_service().snapshot().is_none(),
+            "existing complete state must not start managed activation"
+        );
+    }
+
+    #[test]
+    fn observational_admission_routes_a_durable_incomplete_fence_to_recovery() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        fs::write(project.path().join("fixture.rs"), "pub fn fixture() {}\n")
+            .expect("write fixture");
+        let runtime = Runtime::new();
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        {
+            let storage = Store::open(&storage_path).expect("open published storage");
+            storage
+                .begin_incremental_run()
+                .expect("install durable incomplete fence");
+        }
+
+        runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("the fenced sentinel must enter and complete managed core recovery");
+        let snapshot = runtime
+            .activation_service()
+            .snapshot()
+            .expect("fenced admission must attempt managed recovery");
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready
+        );
+        assert!(
+            !Store::database_has_incomplete_incremental_run(&storage_path)
+                .expect("inspect recovered storage"),
+            "managed core recovery must clear the durable incomplete fence"
+        );
+        runtime.activation_service().cancel_and_wait();
+    }
+
+    #[test]
+    fn observational_admission_propagates_corrupt_storage_instead_of_treating_it_as_cold() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        fs::create_dir_all(storage_path.parent().expect("cache parent")).expect("create cache");
+        fs::write(&storage_path, b"not a sqlite database").expect("write corrupt storage");
+        let runtime = Runtime::new();
+
+        let error = runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("corrupt storage must fail observational admission");
+
+        assert_eq!(error.code, "internal");
+        assert!(runtime.activation_service().snapshot().is_none());
+        assert_eq!(
+            fs::read(&storage_path).expect("read corrupt storage"),
+            b"not a sqlite database"
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_observational_admission_does_not_create_cold_storage() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let runtime = Runtime::new();
+
+        let error = runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect_err("pre-cancelled admission must fail");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(!storage_path.exists());
+        assert!(runtime.activation_service().snapshot().is_none());
     }
 
     #[test]

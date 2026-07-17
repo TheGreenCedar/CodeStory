@@ -1075,6 +1075,60 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     assert_eq!(first_snapshot["root"], first_again["root"]);
     assert_ne!(first_snapshot["root"], second_snapshot["root"]);
 
+    let affected_request = |id: &str, project: &Path, path: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"project": project, "paths": [path]}
+            }
+        })
+    };
+    let read_affected = |server: &mut StdioServer, id: &str, project: &Path, path: &str| {
+        let response = send_json(server, affected_request(id, project, path));
+        assert_tool_success(&response, json!(id)).clone()
+    };
+    let first_affected = read_affected(
+        &mut server,
+        "multi-first-affected",
+        first.path(),
+        "src/first_only.rs",
+    );
+    let second_affected = read_affected(
+        &mut server,
+        "multi-second-affected",
+        second.path(),
+        "src/second_only.rs",
+    );
+    let first_affected_again = read_affected(
+        &mut server,
+        "multi-first-affected-again",
+        first.path(),
+        "src/first_only.rs",
+    );
+    assert_eq!(
+        first_affected["project_root"],
+        first_affected_again["project_root"]
+    );
+    assert_ne!(
+        first_affected["project_root"],
+        second_affected["project_root"]
+    );
+    assert_eq!(
+        first_affected["changed_paths"],
+        json!(["src/first_only.rs"])
+    );
+    assert_eq!(
+        second_affected["changed_paths"],
+        json!(["src/second_only.rs"])
+    );
+    assert_eq!(
+        first_affected_again["changed_paths"],
+        json!(["src/first_only.rs"])
+    );
+
     let status_request = |id: &str, project: &Path| {
         json!({
             "jsonrpc": "2.0",
@@ -1206,12 +1260,12 @@ fn tool_catalog_keeps_stable_product_tool_names() {
         .as_str()
         .expect("affected description");
     assert!(
-        affected_description.contains("changed paths")
-            && affected_description.contains("locally fresh index")
-            && affected_description.contains("never discovers git changes")
-            && affected_description.contains("refreshes the repository map")
+        affected_description.contains("last complete local index")
+            && affected_description.contains("preserving bounded stale and error evidence")
+            && affected_description.contains("Cold or partial state may trigger managed indexing")
+            && affected_description.contains("Never discovers git changes")
             && affected_description.contains("does not wait for broad search"),
-        "affected description should make the explicit-path local-refresh boundary clear: {affected_description}"
+        "affected description should state its last-complete and activation boundary: {affected_description}"
     );
     let snippet_description = tool_by_name(&tools, "snippet")["description"]
         .as_str()
@@ -1367,6 +1421,36 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
 
     let affected = tool_input_schema(&tools, "affected");
     assert_eq!(
+        schema_property(affected, "paths")["type"],
+        "array",
+        "affected.paths should be the preferred array input: {affected}"
+    );
+    assert_eq!(
+        schema_property(affected, "paths")["items"]["type"],
+        "string",
+        "affected.paths should contain strings: {affected}"
+    );
+    for field in ["paths", "changed_paths"] {
+        assert_eq!(
+            schema_property(affected, field)["items"]["minLength"],
+            json!(1),
+            "affected.{field} items should reject empty strings in the exposed contract: {affected}"
+        );
+    }
+    for field in ["paths", "changed_paths", "change_records"] {
+        let property = schema_property(affected, field);
+        assert_eq!(
+            property.get("minItems"),
+            Some(&json!(1)),
+            "affected.{field} should require at least one entry: {affected}"
+        );
+        assert_eq!(
+            property.get("maxItems"),
+            Some(&json!(200)),
+            "affected.{field} should expose the adapter hard cap: {affected}"
+        );
+    }
+    assert_eq!(
         schema_property(affected, "changed_paths")["type"],
         "array",
         "affected.changed_paths should be an array: {affected}"
@@ -1423,17 +1507,24 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "string",
         "affected.filter should be a string: {affected}"
     );
-    let affected_any_of = affected["anyOf"].as_array().unwrap_or_else(|| {
-        panic!("affected should require paths or records via anyOf: {affected}")
+    assert!(
+        affected.get("anyOf").is_none(),
+        "affected exact-one input contract should not be described as anyOf: {affected}"
+    );
+    let affected_one_of = affected["oneOf"].as_array().unwrap_or_else(|| {
+        panic!("affected should require exactly one path source via oneOf: {affected}")
     });
     assert!(
-        affected_any_of
+        affected_one_of
             .iter()
-            .any(|branch| required_fields(branch).contains("changed_paths"))
-            && affected_any_of
+            .any(|branch| required_fields(branch).contains("paths"))
+            && affected_one_of
+                .iter()
+                .any(|branch| required_fields(branch).contains("changed_paths"))
+            && affected_one_of
                 .iter()
                 .any(|branch| required_fields(branch).contains("change_records")),
-        "affected should require explicit changed_paths or change_records: {affected}"
+        "affected should require exactly one of paths, changed_paths, or change_records: {affected}"
     );
 
     for name in ["symbol", "definition", "references", "snippet"] {
@@ -1706,10 +1797,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "changed_paths",
                 "change_records",
                 "matched_files",
+                "uncovered_inputs",
                 "matched_file_count",
                 "depth",
                 "impacted_symbols",
                 "impacted_tests",
+                "bounds",
+                "completeness",
             ] {
                 assert!(
                     output_schema["anyOf"]
@@ -1742,6 +1836,48 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                     "untracked",
                     "unknown",
                 ],
+            );
+            let unmatched_schema = output_schema
+                .pointer("/properties/unmatched_paths/items")
+                .unwrap_or_else(|| {
+                    panic!("affected outputSchema should describe unmatched paths: {tool}")
+                });
+            assert_schema_enum_values(
+                unmatched_schema,
+                "/properties/classification/enum",
+                &[
+                    "valid_uncovered",
+                    "missing",
+                    "expected_deleted",
+                    "rename_unresolved",
+                    "stale_index",
+                    "malformed",
+                    "unavailable_evidence",
+                ],
+            );
+            assert!(
+                output_schema.pointer("/properties/next_commands").is_none(),
+                "affected outputSchema should not duplicate structured follow-ups as command strings: {tool}"
+            );
+            let follow_up_schema = output_schema
+                .pointer("/properties/follow_ups/items")
+                .unwrap_or_else(|| panic!("affected should describe follow-up actions: {tool}"));
+            let invocation_schema = schema_property(follow_up_schema, "invocation");
+            assert_eq!(
+                schema_property(invocation_schema, "program")["type"],
+                "string",
+                "affected follow-up invocations should expose a program: {tool}"
+            );
+            assert_eq!(
+                schema_property(invocation_schema, "args")["items"]["type"],
+                "string",
+                "affected follow-up invocations should expose an argv array: {tool}"
+            );
+            let completeness_schema = schema_property(output_schema, "completeness");
+            assert_eq!(
+                schema_property(completeness_schema, "truncation_reasons")["items"]["type"],
+                "string",
+                "affected completeness should describe field-specific truncation reasons: {tool}"
             );
         }
     }
@@ -2150,11 +2286,11 @@ fn files_tool_lists_indexed_files_without_sidecars() {
 }
 
 #[test]
-fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
+fn affected_tool_maps_preferred_paths_without_sidecars() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
     let mut changed_paths = vec!["src/runtime.rs".to_string()];
-    changed_paths.extend((0..60).map(|index| format!("unmatched/generated-{index}.rs")));
+    changed_paths.extend((0..60).map(|index| format!("src/generated-{index}.rs")));
 
     let response = send_json(
         &mut server,
@@ -2165,14 +2301,7 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
             "params": {
                 "name": "affected",
                 "arguments": {
-                    "changed_paths": changed_paths,
-                    "change_records": [
-                        {
-                            "path": "src/runtime.rs",
-                            "kind": "modified",
-                            "status": "M"
-                        }
-                    ],
+                    "paths": changed_paths,
                     "depth": 2
                 }
             }
@@ -2187,10 +2316,23 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
     );
     assert_eq!(result["changed_paths"].as_array().map(Vec::len), Some(50));
     assert_eq!(result["truncated"], json!(true));
+    assert_eq!(result["completeness"]["complete"], json!(false));
+    assert_eq!(result["completeness"]["truncated"], json!(true));
+    assert!(
+        result["completeness"]["truncation_reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|reason| {
+                reason.as_str().is_some_and(|reason| {
+                    reason.contains("changed_paths response total 61")
+                        && reason.contains("stdio limit 50")
+                })
+            })),
+        "transport truncation should degrade nested completeness with field totals: {result}"
+    );
     assert_eq!(
         result["change_records"][0]["kind"],
-        json!("modified"),
-        "affected should preserve explicit change records: {result}"
+        json!("unknown"),
+        "affected should normalize simple paths into change records: {result}"
     );
     assert_eq!(
         result["matched_file_count"],
@@ -2208,6 +2350,8 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
             .is_some_and(|symbols| !symbols.is_empty()),
         "affected should expand matched files to impacted symbols: {result}"
     );
+    assert!(result["bounds"]["visited_node_count"].is_number());
+    assert!(result["completeness"]["complete"].is_boolean());
     let text = response
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
@@ -2260,7 +2404,7 @@ fn affected_tool_matches_existing_alias_by_native_file_identity() {
 }
 
 #[test]
-fn affected_tool_matches_rename_by_previous_path_identity() {
+fn affected_tool_uses_previous_rename_identity_as_bounded_graph_seed() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -2286,9 +2430,373 @@ fn affected_tool_matches_rename_by_previous_path_identity() {
     );
 
     let result = assert_tool_success(&response, json!("affected-rename-previous"));
+    assert_eq!(result["matched_file_count"], json!(0));
+    assert_eq!(result["matched_files"], json!([]));
+    assert_eq!(
+        result["unmatched_paths"][0]["classification"],
+        json!("rename_unresolved")
+    );
+    assert_eq!(
+        result["unmatched_paths"][0]["change_kind"],
+        json!("renamed")
+    );
+    assert!(
+        result["unmatched_paths"][0]["evidence"]
+            .as_array()
+            .is_some_and(|evidence| evidence.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|text| text.contains("previous indexed identity"))
+            })),
+        "previous identity should stay bounded evidence rather than current-path coverage: {result}"
+    );
+    assert!(
+        result["impacted_symbols"]
+            .as_array()
+            .is_some_and(|symbols| !symbols.is_empty()),
+        "previous rename identity should still seed bounded graph impact: {result}"
+    );
+}
+
+#[test]
+fn affected_tool_emits_no_generic_follow_up_for_complete_fresh_analysis() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-complete",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["src/runtime.rs"]}
+            }
+        }),
+    );
+    let result = assert_tool_success(&response, json!("affected-complete"));
+    assert_eq!(result["completeness"]["complete"], json!(true));
+    assert_eq!(result["completeness"]["truncated"], json!(false));
+    assert!(result.get("next_commands").is_none());
+    assert_eq!(result["follow_ups"], json!([]));
+}
+
+#[test]
+fn affected_tool_classifies_existing_svg_as_valid_uncovered_without_reindex() {
+    let fixture = indexed_fixture();
+    fs::write(
+        fixture.workspace.path().join("desk-asset.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>"#,
+    )
+    .expect("write SVG asset");
+    let mut server = spawn_stdio_server(&fixture);
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-svg",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["desk-asset.svg"]}
+            }
+        }),
+    );
+    let result = assert_tool_success(&response, json!("affected-svg"));
+    assert_eq!(
+        result["unmatched_paths"][0]["classification"],
+        json!("valid_uncovered")
+    );
+    assert_eq!(
+        result["uncovered_inputs"][0]["classification"],
+        json!("valid_uncovered")
+    );
+    assert!(result.get("next_commands").is_none());
+    assert_eq!(
+        result["follow_ups"][0]["action"],
+        json!("inspect_graph_boundary")
+    );
+    assert!(result["follow_ups"][0].get("invocation").is_none());
+    assert!(
+        !result.to_string().contains("--refresh full")
+            && !result.to_string().contains("doctor --project"),
+        "valid uncovered assets should not recommend reindex or doctor: {result}"
+    );
+}
+
+#[test]
+fn affected_tool_classifies_directory_as_malformed() {
+    let fixture = indexed_fixture();
+    fs::create_dir(fixture.workspace.path().join("asset-directory"))
+        .expect("create directory input");
+    let mut server = spawn_stdio_server(&fixture);
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-directory",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["asset-directory"]}
+            }
+        }),
+    );
+    let result = assert_tool_success(&response, json!("affected-directory"));
+    assert_eq!(
+        result["unmatched_paths"][0]["classification"],
+        json!("malformed")
+    );
+    assert!(
+        result["unmatched_paths"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("regular file")),
+        "directories must not become positive valid_uncovered evidence: {result}"
+    );
+}
+
+#[test]
+fn affected_tool_aborts_outside_root_resolution_before_classification() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-outside-root",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["../outside.rs"]}
+            }
+        }),
+    );
+    let error = assert_tool_error(&response, json!("affected-outside-root"));
+    assert_eq!(error["code"], json!("invalid_argument"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outside project root")),
+        "outside-root resolution should abort instead of producing an input class: {response}"
+    );
+}
+
+#[test]
+fn affected_tool_observes_stale_source_without_refreshing_away_the_evidence() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let fresh_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-before-stale",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["src/runtime.rs"]}
+            }
+        }),
+    );
+    let fresh = assert_tool_success(&fresh_response, json!("affected-before-stale"));
+    assert_eq!(fresh["completeness"]["complete"], json!(true));
+
+    fs::write(
+        fixture.workspace.path().join("src/runtime.rs"),
+        "pub fn changed_after_publication() -> bool { true }\n",
+    )
+    .expect("modify indexed source");
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-stale",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["src/runtime.rs"]}
+            }
+        }),
+    );
+    let result = assert_tool_success(&response, json!("affected-stale"));
+    assert_eq!(result["completeness"]["complete"], json!(false));
+    assert!(
+        result["uncovered_inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs.iter().any(|input| {
+                input["path"] == "src/runtime.rs" && input["classification"] == "stale_index"
+            })),
+        "affected must retain and explain exact stale-source evidence: {result}"
+    );
+    assert!(result.get("next_commands").is_none());
+    assert!(
+        result["follow_ups"].as_array().is_some_and(|follow_ups| {
+            follow_ups.iter().any(|follow_up| {
+                follow_up["action"] == "refresh_stale_index"
+                    && follow_up["invocation"]["program"] == "codestory-cli"
+                    && follow_up["invocation"]["args"]
+                        .as_array()
+                        .is_some_and(|args| {
+                            args.windows(2)
+                                .any(|pair| pair[0] == "--refresh" && pair[1] == "incremental")
+                        })
+            })
+        }),
+        "stale source evidence should produce one structured incremental repair: {result}"
+    );
+    assert!(
+        !result.to_string().contains("--refresh full")
+            && !result.to_string().contains("doctor --project"),
+        "stale source evidence must not produce generic repair commands: {result}"
+    );
+}
+
+#[test]
+fn affected_tool_preserves_rename_and_delete_status_evidence() {
+    let fixture = indexed_fixture();
+    fs::rename(
+        fixture.workspace.path().join("src/runtime.rs"),
+        fixture.workspace.path().join("src/renamed_runtime.rs"),
+    )
+    .expect("rename indexed source");
+    fs::remove_file(fixture.workspace.path().join("src/beta.rs")).expect("remove indexed source");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-rename-delete",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "change_records": [
+                        {
+                            "path": "src/renamed_runtime.rs",
+                            "previous_path": "src/runtime.rs",
+                            "kind": "renamed",
+                            "status": "R100"
+                        },
+                        {
+                            "path": "src/beta.rs",
+                            "kind": "deleted",
+                            "status": "D"
+                        }
+                    ],
+                    "depth": 2
+                }
+            }
+        }),
+    );
+    let result = assert_tool_success(&response, json!("affected-rename-delete"));
     assert_eq!(result["matched_file_count"], json!(1));
-    assert_eq!(result["matched_files"][0]["path"], json!("src/runtime.rs"));
-    assert_eq!(result["matched_files"][0]["change_kind"], json!("renamed"));
+    assert_eq!(result["change_records"][0]["kind"], json!("renamed"));
+    assert_eq!(result["change_records"][0]["status"], json!("R100"));
+    assert_eq!(
+        result["change_records"][0]["previous_path"],
+        json!("src/runtime.rs")
+    );
+    assert_eq!(result["change_records"][1]["kind"], json!("deleted"));
+    assert_eq!(result["change_records"][1]["status"], json!("D"));
+    let matched = result["matched_files"]
+        .as_array()
+        .expect("matched file evidence");
+    assert!(matched.iter().all(|file| file["path"] != "src/runtime.rs"));
+    assert!(matched.iter().any(|file| {
+        file["path"] == "src/beta.rs"
+            && file["change_kind"] == "deleted"
+            && file["change_status"] == "D"
+    }));
+    assert!(
+        result["uncovered_inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs
+                .iter()
+                .filter(|input| { input["classification"] == "stale_index" })
+                .count()
+                == 2),
+        "rename and delete must retain exact stale publication evidence: {result}"
+    );
+    assert!(
+        result["impacted_symbols"]
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| {
+                symbol["file_path"] == "src/runtime.rs"
+                    && symbol["confidence"] == "bounded"
+                    && symbol["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("previous indexed identity"))
+            })),
+        "rename previous identity should only supply bounded graph evidence: {result}"
+    );
+}
+
+#[test]
+fn affected_tool_does_not_recommend_refresh_for_unrelated_staleness() {
+    let fixture = indexed_fixture();
+    let excluded = fixture.workspace.path().join("target/excluded.rs");
+    fs::create_dir_all(excluded.parent().expect("excluded parent")).expect("create target");
+    fs::write(&excluded, "pub fn excluded() {}\n").expect("write excluded source");
+    fs::write(
+        fixture.workspace.path().join("desk-asset.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
+    )
+    .expect("write SVG asset");
+    fs::write(
+        fixture.workspace.path().join("src/alpha.rs"),
+        "pub fn unrelated_stale_change() {}\n",
+    )
+    .expect("modify unrelated indexed source");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-unrelated-stale",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "paths": [
+                        "target/excluded.rs",
+                        "desk-asset.svg",
+                        "missing-asset.svg"
+                    ]
+                }
+            }
+        }),
+    );
+    let result = assert_tool_success(&response, json!("affected-unrelated-stale"));
+    let classifications = result["uncovered_inputs"]
+        .as_array()
+        .expect("uncovered classifications");
+    assert!(classifications.iter().any(|input| {
+        input["path"] == "target/excluded.rs" && input["classification"] == "valid_uncovered"
+    }));
+    assert!(classifications.iter().any(|input| {
+        input["path"] == "desk-asset.svg" && input["classification"] == "valid_uncovered"
+    }));
+    assert!(classifications.iter().any(|input| {
+        input["path"] == "missing-asset.svg" && input["classification"] == "missing"
+    }));
+    assert!(
+        result["follow_ups"].as_array().is_some_and(|follow_ups| {
+            follow_ups
+                .iter()
+                .all(|follow_up| follow_up["action"] != "refresh_stale_index")
+        }),
+        "unrelated workspace staleness must not recommend refreshing requested inputs: {result}"
+    );
+    assert!(
+        result["blind_spots"]
+            .as_array()
+            .is_some_and(|blind_spots| blind_spots.iter().any(|blind_spot| {
+                blind_spot
+                    .as_str()
+                    .is_some_and(|text| text.contains("unrelated stale index state"))
+            })),
+        "unrelated staleness should remain visible without becoming a repair action: {result}"
+    );
 }
 
 #[test]
@@ -2316,6 +2824,92 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
         "affected should fail closed on malformed path input: {bad_paths}"
     );
 
+    let conflict = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-input-conflict",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "paths": ["src/runtime.rs"],
+                    "changed_paths": ["src/runtime.rs"]
+                }
+            }
+        }),
+    );
+    let error = assert_tool_error(&conflict, json!("affected-input-conflict"));
+    assert_eq!(error["code"], json!("affected_input_conflict"));
+
+    let empty_property_conflict = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-empty-property-conflict",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "paths": [],
+                    "changed_paths": ["src/runtime.rs"]
+                }
+            }
+        }),
+    );
+    let error = assert_tool_error(
+        &empty_property_conflict,
+        json!("affected-empty-property-conflict"),
+    );
+    assert_eq!(
+        error["code"],
+        json!("affected_input_conflict"),
+        "input exclusivity must use property presence, not non-empty arrays"
+    );
+
+    let empty_input = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-empty-input",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": []}
+            }
+        }),
+    );
+    let error = assert_tool_error(&empty_input, json!("affected-empty-input"));
+    assert_eq!(error["code"], json!("invalid_argument"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("at least one")),
+        "empty affected input should fail the adapter minimum: {empty_input}"
+    );
+
+    let too_many_paths = vec!["src/runtime.rs"; 201];
+    let oversized_input = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-oversized-input",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": too_many_paths}
+            }
+        }),
+    );
+    let error = assert_tool_error(&oversized_input, json!("affected-oversized-input"));
+    assert_eq!(error["code"], json!("invalid_argument"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("at most 200")),
+        "oversized affected input should fail the adapter maximum: {oversized_input}"
+    );
+
     let bad_record = send_json(
         &mut server,
         json!({
@@ -2339,6 +2933,67 @@ fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
             .is_some_and(|message| message.contains("affected.change_records")),
         "affected should fail closed on malformed change records: {bad_record}"
     );
+}
+
+#[test]
+fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
+    let fixture = unindexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let malformed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-cold-malformed",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": [""]}
+            }
+        }),
+    );
+    let error = assert_tool_error(&malformed, json!("affected-cold-malformed"));
+    assert_eq!(error["code"], json!("invalid_argument"));
+
+    let cold_status = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-cold-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let cold_status = json_resource_content(
+        assert_success_envelope(&cold_status, json!("affected-cold-status")),
+        "codestory://status",
+    );
+    assert!(cold_status["index_publication"].is_null());
+    assert!(cold_status["current_operation"].is_null());
+    let storage_path = cold_status["storage_path"]
+        .as_str()
+        .expect("cold status storage path");
+    assert!(
+        !Path::new(storage_path).exists(),
+        "malformed affected input must not create storage before activation: {cold_status}"
+    );
+
+    let legacy = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-cold-legacy",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"changed_paths": ["src/runtime.rs"]}
+            }
+        }),
+    );
+    let result = assert_tool_success(&legacy, json!("affected-cold-legacy"));
+    assert_eq!(result["changed_paths"], json!(["src/runtime.rs"]));
+    assert_eq!(result["matched_file_count"], json!(1));
+    assert!(Path::new(storage_path).exists());
 }
 
 #[test]
@@ -3787,7 +4442,6 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
             "params": {
                 "name": "affected",
                 "arguments": {
-                    "changed_paths": ["src/live_tool_added.rs"],
                     "change_records": [
                         {
                             "path": "src/live_tool_added.rs",

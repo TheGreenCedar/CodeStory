@@ -13,11 +13,13 @@ mod ids;
 mod types;
 
 pub use dto::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
-    AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest, AgentCitationDto,
-    AgentCustomRetrievalConfigDto, AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto,
-    AgentResponseBlockDto, AgentResponseModeDto, AgentResponseSectionDto,
+    AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
+    AgentCitationDto, AgentCustomRetrievalConfigDto, AgentHybridWeightsDto, AgentPacketDto,
+    AgentPacketRequestDto, AgentResponseBlockDto, AgentResponseModeDto, AgentResponseSectionDto,
     AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
     AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
     AgentRetrievalSummaryFieldDto, AgentRetrievalTraceDto, BookmarkCategoryDto, BookmarkDto,
