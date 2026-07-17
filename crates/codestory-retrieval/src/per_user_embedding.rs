@@ -450,6 +450,54 @@ pub struct EmbeddingServerFailureSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingQualificationWatchdogClock {
+    pub domain: String,
+    pub api: String,
+    pub boot_id: String,
+    pub observed_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingQualificationWatchdogMarker {
+    pub schema_version: u32,
+    pub nonce_sha256: String,
+    pub server_instance_id: String,
+    pub pid: u32,
+    pub process_start_id: String,
+    pub executable_sha256: String,
+    pub executable_version: String,
+    pub reason: String,
+    pub clock: EmbeddingQualificationWatchdogClock,
+    pub progress_sequence: u64,
+    pub last_progress_ns: u64,
+    pub hard_native_no_progress_ms: u64,
+    pub watchdog_cadence_ms: u64,
+}
+
+pub fn embedding_qualification_watchdog_marker_filename(
+    nonce_sha256: &str,
+    server_instance_id: &str,
+) -> Result<String> {
+    if nonce_sha256.len() != 64
+        || !nonce_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || server_instance_id.is_empty()
+        || server_instance_id.len() > 128
+        || !server_instance_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("embedding_qualification_watchdog_marker_identity_invalid");
+    }
+    Ok(format!(
+        "{nonce_sha256}.{server_instance_id}.watchdog-fail-stop.json"
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingServerSnapshot {
     pub schema_version: u32,
     pub event_sequence: u64,
@@ -787,7 +835,25 @@ pub struct EmbeddingQualificationOperationResult {
     pub server_instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<EmbeddingQualificationAttemptResult>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingQualificationAttemptResult {
+    pub ordinal: u32,
+    pub request_id: String,
+    pub server_instance_id: String,
+    pub submitted_ns: u64,
+    pub completed_ns: u64,
+    pub outcome: String,
+}
+
+type EmbeddingQualificationAttemptExchange = (
+    (EmbeddingResult, Vec<u8>),
+    Vec<EmbeddingQualificationAttemptResult>,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -890,26 +956,32 @@ fn qualification_operation(
     let correlation_id = Uuid::new_v4().to_string();
     let submitted_ns = clock.now_ns();
     let result = match class {
-        "query" => client.embed_query(&query).map(|_| None),
-        "bulk" => client.embed_documents(&bulk).map(|_| None),
+        "query" => client
+            .embed_query_with_qualification_attempts(&query)
+            .map(|(_, attempts)| (None, attempts)),
+        "bulk" => client
+            .embed_documents_with_qualification_attempts(&bulk)
+            .map(|(_, attempts)| (None, attempts)),
         "lease" => client.acquire_residency_lease().and_then(|mut lease| {
             if !hold.is_zero() {
                 clock.sleep(hold);
             }
             let identity = lease.revalidate()?;
             lease.release()?;
-            Ok(Some(identity))
+            Ok((Some(identity), Vec::new()))
         }),
-        "observe" => client.observe().map(|_| None),
+        "observe" => client.observe().map(|_| (None, Vec::new())),
         "incompatible" => {
             client.compatibility.config_sha256 = "qualification-incompatible".into();
-            client.ensure_resident().map(Some)
+            client
+                .ensure_resident()
+                .map(|identity| (Some(identity), Vec::new()))
         }
         _ => unreachable!("qualification scenarios are validated before dispatch"),
     };
     let completed_ns = clock.now_ns();
     match result {
-        Ok(identity) => EmbeddingQualificationOperationResult {
+        Ok((identity, attempts)) => EmbeddingQualificationOperationResult {
             correlation_id,
             class: class.into(),
             submitted_ns,
@@ -920,6 +992,7 @@ fn qualification_operation(
                 .as_ref()
                 .map(|identity| identity.server_instance_id.clone()),
             load_generation: identity.as_ref().map(|identity| identity.load_generation),
+            attempts,
         },
         Err(error) => EmbeddingQualificationOperationResult {
             correlation_id,
@@ -930,6 +1003,7 @@ fn qualification_operation(
             error_code: Some(qualification_error_code(&error)),
             server_instance_id: None,
             load_generation: None,
+            attempts: Vec::new(),
         },
     }
 }
@@ -1013,30 +1087,49 @@ impl PerUserEmbeddingClient {
         maximum_timeout: Option<Duration>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<f32>> {
+        self.embed_query_with_control_and_attempts(text, maximum_timeout, cancelled)
+            .map(|(vector, _)| vector)
+    }
+
+    fn embed_query_with_qualification_attempts(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<f32>, Vec<EmbeddingQualificationAttemptResult>)> {
+        self.embed_query_with_control_and_attempts(text, None, &|| false)
+    }
+
+    fn embed_query_with_control_and_attempts(
+        &self,
+        text: &str,
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(Vec<f32>, Vec<EmbeddingQualificationAttemptResult>)> {
         validate_raw_inputs(std::slice::from_ref(&text.to_string()))?;
         let budgets = self.transport.budgets();
         let timeout = maximum_timeout
             .unwrap_or(budgets.query_request)
             .min(budgets.query_request);
-        let result =
-            self.call_pure_with_replay_controlled(timeout, cancelled, |deadline_ms, token| {
-                EmbeddingOperation::EmbedQuery {
-                    scope_id: self.scope_id.clone(),
-                    deadline_ms,
-                    retry_after_ms: duration_ms(budgets.retry_after),
-                    cancel_token: Some(token),
-                    input: text.to_string(),
-                }
-            })?;
+        let (result, attempts) = self.call_pure_with_replay_controlled_and_attempts(
+            timeout,
+            cancelled,
+            |deadline_ms, token| EmbeddingOperation::EmbedQuery {
+                scope_id: self.scope_id.clone(),
+                deadline_ms,
+                retry_after_ms: duration_ms(budgets.retry_after),
+                cancel_token: Some(token),
+                input: text.to_string(),
+            },
+        )?;
         let (rows, columns, identity, payload) = vectors_result(result)?;
         if rows != 1 {
             bail!("embedding_vector_row_count_mismatch: expected=1 observed={rows}");
         }
         let mut vectors = decode_vectors(rows, columns, &payload)?;
         validate_engine_identity(&identity, &self.compatibility)?;
-        normalize_and_validate_vectors(std::mem::take(&mut vectors))?
+        let vector = normalize_and_validate_vectors(std::mem::take(&mut vectors))?
             .pop()
-            .ok_or_else(|| anyhow!("embedding_vector_missing"))
+            .ok_or_else(|| anyhow!("embedding_vector_missing"))?;
+        Ok((vector, attempts))
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -1049,24 +1142,42 @@ impl PerUserEmbeddingClient {
         maximum_timeout: Option<Duration>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<Vec<f32>>> {
+        self.embed_documents_with_control_and_attempts(texts, maximum_timeout, cancelled)
+            .map(|(vectors, _)| vectors)
+    }
+
+    fn embed_documents_with_qualification_attempts(
+        &self,
+        texts: &[String],
+    ) -> Result<(Vec<Vec<f32>>, Vec<EmbeddingQualificationAttemptResult>)> {
+        self.embed_documents_with_control_and_attempts(texts, None, &|| false)
+    }
+
+    fn embed_documents_with_control_and_attempts(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(Vec<Vec<f32>>, Vec<EmbeddingQualificationAttemptResult>)> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         validate_raw_inputs(texts)?;
         let budgets = self.transport.budgets();
         let timeout = maximum_timeout
             .unwrap_or(budgets.bulk_request)
             .min(budgets.bulk_request);
-        let result =
-            self.call_pure_with_replay_controlled(timeout, cancelled, |deadline_ms, token| {
-                EmbeddingOperation::EmbedDocuments {
-                    scope_id: self.scope_id.clone(),
-                    deadline_ms,
-                    retry_after_ms: duration_ms(budgets.retry_after),
-                    cancel_token: Some(token),
-                    inputs: texts.to_vec(),
-                }
-            })?;
+        let (result, attempts) = self.call_pure_with_replay_controlled_and_attempts(
+            timeout,
+            cancelled,
+            |deadline_ms, token| EmbeddingOperation::EmbedDocuments {
+                scope_id: self.scope_id.clone(),
+                deadline_ms,
+                retry_after_ms: duration_ms(budgets.retry_after),
+                cancel_token: Some(token),
+                inputs: texts.to_vec(),
+            },
+        )?;
         let (rows, columns, identity, payload) = vectors_result(result)?;
         if rows as usize != texts.len() {
             bail!(
@@ -1075,7 +1186,10 @@ impl PerUserEmbeddingClient {
             );
         }
         validate_engine_identity(&identity, &self.compatibility)?;
-        normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)
+        Ok((
+            normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)?,
+            attempts,
+        ))
     }
 
     pub fn ensure_resident(&self) -> Result<EmbeddingEngineIdentity> {
@@ -1173,48 +1287,61 @@ impl PerUserEmbeddingClient {
         Ok(Some((*snapshot, identity.map(|identity| *identity))))
     }
 
-    fn call_pure_with_replay_controlled<B>(
+    fn call_pure_with_replay_controlled_and_attempts<B>(
         &self,
         timeout: Duration,
         cancelled: &(dyn Fn() -> bool + Sync),
         operation: B,
-    ) -> Result<(EmbeddingResult, Vec<u8>)>
+    ) -> Result<EmbeddingQualificationAttemptExchange>
     where
         B: Fn(u64, String) -> EmbeddingOperation,
     {
         let control = EmbeddingCallControl::new(timeout, cancelled)?;
+        let clock = self.transport.clock();
         let mut replayed = false;
+        let mut attempts = Vec::with_capacity(2);
         loop {
             control.check()?;
-            let call = (|| {
-                let mut connection = self.connect_with_control(
-                    EmbeddingConnectIntent::Activate,
-                    true,
-                    Some(&control),
-                )?;
-                control.check()?;
-                let request_id = Uuid::new_v4().to_string();
-                let cancel_token = Uuid::new_v4().to_string();
-                let remaining = control.remaining(timeout)?;
-                let operation = operation(positive_duration_ms(remaining), cancel_token.clone());
-                configure_exchange_timeout(&*connection.stream, remaining)?;
-                let completed = AtomicBool::new(false);
-                let exchange_result = thread::scope(|scope| {
-                    scope.spawn(|| {
-                        self.watch_controlled_cancellation(
-                            &control,
-                            &completed,
-                            &request_id,
-                            &cancel_token,
-                        );
-                    });
-                    let result = exchange(
-                        &mut *connection.stream,
-                        request(&request_id, self.compatibility.clone(), operation),
+            let mut connection = match self.connect_with_control(
+                EmbeddingConnectIntent::Activate,
+                true,
+                Some(&control),
+            ) {
+                Ok(connection) => connection,
+                Err(error) if !replayed && is_server_loss(&error) => {
+                    control.check()?;
+                    replayed = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            control.check()?;
+            let request_id = Uuid::new_v4().to_string();
+            let cancel_token = Uuid::new_v4().to_string();
+            let remaining = control.remaining(timeout)?;
+            let request_operation =
+                operation(positive_duration_ms(remaining), cancel_token.clone());
+            configure_exchange_timeout(&*connection.stream, remaining)?;
+            let server_instance_id = connection.snapshot.process.server_instance_id.clone();
+            let submitted_ns = clock.now_ns();
+            let completed = AtomicBool::new(false);
+            let exchange_result = thread::scope(|scope| {
+                scope.spawn(|| {
+                    self.watch_controlled_cancellation(
+                        &control,
+                        &completed,
+                        &request_id,
+                        &cancel_token,
                     );
-                    completed.store(true, Ordering::Release);
-                    result
                 });
+                let result = exchange(
+                    &mut *connection.stream,
+                    request(&request_id, self.compatibility.clone(), request_operation),
+                );
+                completed.store(true, Ordering::Release);
+                result
+            });
+            let call = (|| {
                 control.check()?;
                 let (response, payload) = exchange_result?;
                 let result = response_result(response)?;
@@ -1223,8 +1350,22 @@ impl PerUserEmbeddingClient {
                 }
                 Ok::<_, anyhow::Error>((result, payload))
             })();
+            let completed_ns = clock.now_ns();
+            let outcome = match &call {
+                Ok(_) => "completed",
+                Err(error) if is_server_loss(error) => "server_loss",
+                Err(_) => "failed",
+            };
+            attempts.push(EmbeddingQualificationAttemptResult {
+                ordinal: attempts.len() as u32 + 1,
+                request_id,
+                server_instance_id,
+                submitted_ns,
+                completed_ns,
+                outcome: outcome.into(),
+            });
             match call {
-                Ok(result) => return Ok(result),
+                Ok(result) => return Ok((result, attempts)),
                 Err(error) if !replayed && is_server_loss(&error) => {
                     control.check()?;
                     replayed = true;
@@ -1362,7 +1503,7 @@ impl PerUserEmbeddingClient {
                     return Err(PerUserEmbeddingError {
                         code: "embedding_server_owner_unresponsive".into(),
                         message: error.message,
-                        retry_class: "server_instance_change".into(),
+                        retry_class: "after_server_change".into(),
                         retry_after_ms: duration_ms(budgets.retry_after),
                         retry_condition: "the lifetime authority changes".into(),
                         capacity: None,
@@ -1532,12 +1673,15 @@ impl ServerRequestAdmission {
     fn try_acquire(
         self: &Arc<Self>,
         request_class: EmbeddingRequestClass,
+        active_execution: bool,
     ) -> std::result::Result<ServerRequestAdmissionPermit, ServerRequestAdmissionDepths> {
         let mut depths = self
             .depths
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if depths.depth(request_class) >= ServerRequestAdmissionDepths::capacity(request_class) {
+        let in_flight_capacity = ServerRequestAdmissionDepths::capacity(request_class)
+            .saturating_add(usize::from(active_execution));
+        if depths.depth(request_class) >= in_flight_capacity {
             return Err(*depths);
         }
         depths.increment(request_class);
@@ -1784,8 +1928,12 @@ impl PerUserEmbeddingServerState {
         request_class: EmbeddingRequestClass,
         retry_after_ms: u64,
     ) -> std::result::Result<ServerRequestAdmissionPermit, Box<EmbeddingProtocolError>> {
+        let active_execution = self
+            .try_initialized_engine()
+            .and_then(|engine| engine.admission_snapshot().active_request)
+            .is_some_and(|active| active.request_class == request_class);
         self.request_admission
-            .try_acquire(request_class)
+            .try_acquire(request_class, active_execution)
             .map_err(|depths| {
                 let active = self
                     .active
@@ -1800,7 +1948,10 @@ impl PerUserEmbeddingServerState {
                     reason: EmbeddingCapacityReason::QueueFull.as_str().into(),
                     queue_class: request_class.as_str().into(),
                     capacity: ServerRequestAdmissionDepths::capacity(request_class) as u64,
-                    depth: depths.depth(request_class) as u64,
+                    depth: depths
+                        .depth(request_class)
+                        .saturating_sub(usize::from(active_execution))
+                        as u64,
                     retry_after_ms,
                     retry_condition: "an admitted request completes or is cancelled".into(),
                     owner_state: owner_state.as_str().into(),
@@ -2073,11 +2224,27 @@ impl PerUserEmbeddingServerState {
         let lifecycle = engine.as_ref().and_then(|engine| engine.snapshot().ok());
         let admission = engine.as_ref().map(EmbeddingEngine::admission_snapshot);
         let front_admission = self.request_admission.snapshot();
-        let active = self
-            .active
-            .lock()
-            .ok()
-            .and_then(|active| active.values().next().cloned());
+        let active = self.active.lock().ok().and_then(|active| {
+            admission
+                .as_ref()
+                .and_then(|admission| admission.active_request.as_ref())
+                .and_then(|native| {
+                    active
+                        .values()
+                        .find(|candidate| {
+                            candidate.request_id == native.request_id
+                                && candidate.scope_id == native.scope_id
+                                && candidate.request_class == native.request_class
+                        })
+                        .cloned()
+                })
+                .or_else(|| {
+                    admission
+                        .is_none()
+                        .then(|| active.values().next().cloned())
+                        .flatten()
+                })
+        });
         let scheduler = match admission.as_ref() {
             Some(admission) => scheduler_snapshot(
                 admission,
@@ -2672,7 +2839,21 @@ fn poll_server_qualification_command(
                     Ok(())
                 }
                 "snapshot" => {
-                    snapshot = Some(state.snapshot());
+                    let current = state.snapshot();
+                    details = Some(std::collections::BTreeMap::from([
+                        (
+                            "idle_epoch_ns".into(),
+                            state.last_work_ended_ns.load(Ordering::Acquire).to_string(),
+                        ),
+                        ("true_idle".into(), state.true_idle().to_string()),
+                        ("clock_domain".into(), current.clock.domain.clone()),
+                        ("clock_boot_id".into(), current.clock.boot_id.clone()),
+                        (
+                            "server_instance_id".into(),
+                            current.process.server_instance_id.clone(),
+                        ),
+                    ]));
+                    snapshot = Some(current);
                     Ok(())
                 }
                 "freeze_owner" => {
@@ -3011,6 +3192,20 @@ fn spawn_server_watchdog(
                         retry_after_ms: 0,
                         retry_condition: "the server instance changes".into(),
                     });
+                    if let Some(control) = state.qualification.as_ref()
+                        && let Err(error) = publish_watchdog_fail_stop_marker(
+                            control,
+                            &state,
+                            budgets,
+                            last_progress,
+                            last_progress_at,
+                        )
+                    {
+                        tracing::error!(
+                            error = %error,
+                            "failed to publish embedding qualification watchdog marker"
+                        );
+                    }
                     transport.fail_stop("embedding_engine_stalled");
                     state.draining.store(true, Ordering::Release);
                     state.stopped.store(true, Ordering::Release);
@@ -3019,6 +3214,97 @@ fn spawn_server_watchdog(
             }
         })
         .context("spawn embedding server watchdog")
+}
+
+fn publish_watchdog_fail_stop_marker(
+    control: &ServerQualificationControl,
+    state: &PerUserEmbeddingServerState,
+    budgets: EmbeddingServerBudgets,
+    progress_sequence: u64,
+    last_progress_ns: u64,
+) -> Result<()> {
+    control.directory.revalidate()?;
+    let filename = embedding_qualification_watchdog_marker_filename(
+        &control.nonce_sha256,
+        &state.process.server_instance_id,
+    )?;
+    let destination = control.directory.join(&filename);
+    match fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => bail!("embedding_qualification_watchdog_marker_exists"),
+        Err(error) => return Err(error).context("inspect watchdog marker destination"),
+    }
+    let clock = state.clock.snapshot();
+    let marker = EmbeddingQualificationWatchdogMarker {
+        schema_version: 1,
+        nonce_sha256: control.nonce_sha256.clone(),
+        server_instance_id: state.process.server_instance_id.clone(),
+        pid: state.process.pid,
+        process_start_id: state.process.process_start_id.clone(),
+        executable_sha256: state.process.executable_sha256.clone(),
+        executable_version: state.process.executable_version.clone(),
+        reason: "embedding_engine_stalled".into(),
+        clock: EmbeddingQualificationWatchdogClock {
+            domain: clock.domain,
+            api: clock.api,
+            boot_id: clock.boot_id,
+            observed_ns: state.clock.now_ns(),
+        },
+        progress_sequence,
+        last_progress_ns,
+        hard_native_no_progress_ms: duration_ms(budgets.native_no_progress),
+        watchdog_cadence_ms: duration_ms(budgets.watchdog_poll),
+    };
+    let mut encoded = serde_json::to_vec(&marker).context("encode watchdog fail-stop marker")?;
+    encoded.push(b'\n');
+    let temporary = control.directory.join(format!(
+        ".{filename}.{}.{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create watchdog fail-stop marker temp file")?;
+    let publish = (|| -> Result<()> {
+        file.write_all(&encoded)
+            .context("write watchdog fail-stop marker")?;
+        file.flush().context("flush watchdog fail-stop marker")?;
+        file.sync_all().context("sync watchdog fail-stop marker")?;
+        drop(file);
+        control.directory.revalidate()?;
+        fs::rename(&temporary, &destination).context("publish watchdog fail-stop marker")?;
+        sync_qualification_directory(&control.directory.path)?;
+        let metadata = fs::symlink_metadata(&destination)
+            .context("inspect published watchdog fail-stop marker")?;
+        validate_private_qualification_file_metadata(&metadata, 64 * 1024)?;
+        if metadata.len() != encoded.len() as u64 {
+            bail!("embedding_qualification_watchdog_marker_truncated");
+        }
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    publish
+}
+
+#[cfg(unix)]
+fn sync_qualification_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .context("sync embedding qualification directory")
+}
+
+#[cfg(not(unix))]
+fn sync_qualification_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn serve_embedding_connection(
@@ -4400,7 +4686,7 @@ fn map_bounded_exchange_error(error: anyhow::Error) -> anyhow::Error {
         return PerUserEmbeddingError {
             code: "embedding_server_owner_unresponsive".into(),
             message: "the embedding server did not complete a bounded exchange".into(),
-            retry_class: "server_instance_change".into(),
+            retry_class: "after_server_change".into(),
             retry_after_ms: duration_ms(EmbeddingClientBudgets::current().retry_after),
             retry_condition: "the lifetime authority or server instance changes".into(),
             capacity: None,
@@ -4692,7 +4978,7 @@ fn exchange_timeout_configuration_error(error: io::Error) -> anyhow::Error {
     PerUserEmbeddingError {
         code: "embedding_server_owner_unresponsive".into(),
         message: format!("could not bound the embedding server exchange: {error}"),
-        retry_class: "server_instance_change".into(),
+        retry_class: "after_server_change".into(),
         retry_after_ms: duration_ms(EmbeddingClientBudgets::current().retry_after),
         retry_condition: "the lifetime authority or server instance changes".into(),
         capacity: None,
@@ -5344,9 +5630,17 @@ mod tests {
     fn pure_rpc_replays_once_and_only_once_on_typed_loss() {
         let transport = ClientTestTransport::new(1, false);
         let client = test_client(transport.clone());
-        let vector = client.embed_query("x").expect("one replay succeeds");
+        let (vector, attempts) = client
+            .embed_query_with_qualification_attempts("x")
+            .expect("one replay succeeds");
         assert_eq!(vector.len(), RETRIEVAL_EMBEDDING_DIM);
         assert_eq!(transport.connect_count.load(Ordering::Acquire), 2);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].ordinal, 1);
+        assert_eq!(attempts[0].outcome, "server_loss");
+        assert_eq!(attempts[1].ordinal, 2);
+        assert_eq!(attempts[1].outcome, "completed");
+        assert_ne!(attempts[0].request_id, attempts[1].request_id);
 
         let transport = ClientTestTransport::new(usize::MAX, false);
         let client = test_client(transport.clone());
@@ -5970,6 +6264,30 @@ mod tests {
     }
 
     #[test]
+    fn front_admission_reserves_the_documented_queue_behind_one_active_request() {
+        let admission = Arc::new(ServerRequestAdmission::default());
+        let permits = (0..=EMBEDDING_BULK_QUEUE_CAPACITY)
+            .map(|_| {
+                admission
+                    .try_acquire(EmbeddingRequestClass::Bulk, true)
+                    .expect("one active request plus the full queue remains bounded")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(admission.snapshot().bulk, EMBEDDING_BULK_QUEUE_CAPACITY + 1);
+        assert!(
+            admission
+                .try_acquire(EmbeddingRequestClass::Bulk, true)
+                .is_err(),
+            "the request after the active slot and full queue must be rejected"
+        );
+        drop(permits);
+        assert_eq!(
+            admission.snapshot(),
+            ServerRequestAdmissionDepths::default()
+        );
+    }
+
+    #[test]
     fn hostile_idle_connections_are_bounded_and_product_rejection_is_correlated() {
         let state = test_server_state();
         let idle_before = state.last_work_ended_ns.load(Ordering::Acquire);
@@ -6280,6 +6598,60 @@ mod tests {
         .expect("reopen qualification control")
         .expect("qualification control remains enabled");
         assert_eq!(restarted.last_sequence.load(Ordering::Acquire), 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_marker_is_private_durable_and_never_reuses_stale_evidence() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (temporary, control) = test_qualification_control();
+        let marker_path = control.directory.join(
+            embedding_qualification_watchdog_marker_filename(
+                &control.nonce_sha256,
+                &test_snapshot().process.server_instance_id,
+            )
+            .expect("marker filename"),
+        );
+        let state = test_server_state();
+        publish_watchdog_fail_stop_marker(
+            &control,
+            &state,
+            EmbeddingServerBudgets {
+                idle_timeout: Duration::from_secs(60),
+                native_no_progress: Duration::from_millis(4),
+                watchdog_poll: Duration::from_millis(1),
+            },
+            7,
+            1,
+        )
+        .expect("publish marker");
+        let metadata = fs::symlink_metadata(&marker_path).expect("marker metadata");
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.mode() & 0o077, 0);
+        let marker: EmbeddingQualificationWatchdogMarker =
+            serde_json::from_slice(&fs::read(&marker_path).expect("read marker"))
+                .expect("parse marker");
+        assert_eq!(marker.reason, "embedding_engine_stalled");
+        assert_eq!(marker.nonce_sha256, control.nonce_sha256);
+        assert_eq!(marker.progress_sequence, 7);
+        assert!(
+            publish_watchdog_fail_stop_marker(
+                &control,
+                &state,
+                EmbeddingServerBudgets {
+                    idle_timeout: Duration::from_secs(60),
+                    native_no_progress: Duration::from_millis(4),
+                    watchdog_poll: Duration::from_millis(1),
+                },
+                8,
+                1,
+            )
+            .expect_err("stale marker is rejected")
+            .to_string()
+            .contains("embedding_qualification_watchdog_marker_exists")
+        );
+        drop(temporary);
     }
 
     #[test]

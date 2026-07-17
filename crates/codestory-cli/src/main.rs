@@ -272,9 +272,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
         Command::InternalEmbeddingQualification(cmd) => {
             embedding_qualification::run_internal_embedding_qualification(cmd)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
         }
         Command::InternalEmbeddingQualificationWorker(cmd) => {
             embedding_qualification::run_internal_embedding_qualification_worker(cmd)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
         }
     }
 }

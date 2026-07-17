@@ -726,7 +726,6 @@ fn embedding_retry_api_error(retry: codestory_retrieval::EmbeddingRetryStateWire
             | "after_delay"
             | "after_owner_idle"
             | "after_server_change"
-            | "server_instance_change"
             | "same_rpc_once"
     ) {
         "embedding_retryable"
@@ -1909,7 +1908,7 @@ mod activation_tests {
         let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
             code: "embedding_server_owner_unresponsive".into(),
             message: "the owner did not respond".into(),
-            retry_class: "server_instance_change".into(),
+            retry_class: "after_server_change".into(),
             retry_after_ms: 25,
             retry_condition: "the lifetime authority changes".into(),
             capacity: None,
@@ -1917,14 +1916,16 @@ mod activation_tests {
 
         let mapped = map_activation_error(source);
         assert_eq!(mapped.code, "activation_retryable");
-        assert_eq!(
-            mapped
-                .details
-                .as_deref()
-                .and_then(|details| details.embedding_retry.as_ref())
-                .map(|retry| retry.retry_condition.as_str()),
-            Some("the lifetime authority changes")
-        );
+        let retry = mapped
+            .details
+            .as_deref()
+            .and_then(|details| details.embedding_retry.as_ref())
+            .expect("retry details");
+        assert_eq!(retry.code, "embedding_server_owner_unresponsive");
+        assert_eq!(retry.retry_class, "after_server_change");
+        assert_eq!(retry.retry_after_ms, 25);
+        assert_eq!(retry.retry_condition, "the lifetime authority changes");
+        assert!(retry.capacity.is_none());
     }
 
     #[test]

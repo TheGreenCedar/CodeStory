@@ -45,6 +45,10 @@ pub use cache::{RetrievalCache, RetrievalCacheKey};
 pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
+pub use codestory_llama_sys::{
+    PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS,
+    PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS,
+};
 pub use config::{
     DEFAULT_AGENT_RUN_ID, EmbeddingRuntimeConfig, RetrievalRuntimeConfig, SidecarLayout,
     SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeDefaults,
@@ -95,9 +99,11 @@ pub use per_user_embedding::{
     EmbeddingClientTransport, EmbeddingCompatibility, EmbeddingConnectIntent,
     EmbeddingConnectOutcome, EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity,
     EmbeddingExecutableIdentity, EmbeddingOperation, EmbeddingProtocolError,
-    EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingQualificationOperationResult,
-    EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
-    EmbeddingResult, EmbeddingRetryStateWire, EmbeddingServerActiveRequestSnapshot,
+    EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingQualificationAttemptResult,
+    EmbeddingQualificationOperationResult, EmbeddingQualificationParameters,
+    EmbeddingQualificationRequest, EmbeddingQualificationResult,
+    EmbeddingQualificationWatchdogClock, EmbeddingQualificationWatchdogMarker, EmbeddingResult,
+    EmbeddingRetryStateWire, EmbeddingServerActiveRequestSnapshot,
     EmbeddingServerAuthoritySnapshot, EmbeddingServerBindOutcome, EmbeddingServerBudgets,
     EmbeddingServerClockSnapshot, EmbeddingServerEngineSnapshot, EmbeddingServerFailureSnapshot,
     EmbeddingServerListener, EmbeddingServerProcessSnapshot, EmbeddingServerProtocolSnapshot,
@@ -112,7 +118,8 @@ pub use per_user_embedding::{
     PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PER_USER_EMBEDDING_SERVER_PROOF_MARKER,
     PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION, PerUserEmbeddingClient,
     PerUserEmbeddingError, PerUserEmbeddingResidencyLease, PerUserEmbeddingServerConfig,
-    embedding_capacity_pressure, embedding_retry_state, install_embedding_client_transport,
+    embedding_capacity_pressure, embedding_qualification_watchdog_marker_filename,
+    embedding_retry_state, install_embedding_client_transport,
     run_per_user_embedding_qualification, run_per_user_embedding_server,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};

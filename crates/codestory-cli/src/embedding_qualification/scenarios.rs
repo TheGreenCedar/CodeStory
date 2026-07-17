@@ -1,13 +1,16 @@
 use super::*;
 use codestory_retrieval::{
-    AwakeMonotonicClock, EmbeddingClientTransport, EmbeddingCompatibility, EmbeddingEngineIdentity,
-    EmbeddingOperation, EmbeddingProtocolRequest, EmbeddingProtocolResponse,
+    AwakeMonotonicClock, EmbeddingCapacityPressureWire, EmbeddingClientTransport,
+    EmbeddingCompatibility, EmbeddingEngineIdentity, EmbeddingOperation, EmbeddingProtocolRequest,
+    EmbeddingProtocolResponse, EmbeddingQualificationAttemptResult,
     EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
-    EmbeddingResult, EmbeddingServerSnapshot, EmbeddingServerStream, EmbeddingTransportIdentity,
-    PER_USER_EMBEDDING_MAX_METADATA_BYTES, PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES,
-    PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_V1,
-    PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS, PerUserEmbeddingClient, PerUserEmbeddingError,
-    ProcessStartProbe,
+    EmbeddingQualificationWatchdogMarker, EmbeddingResult, EmbeddingServerSnapshot,
+    EmbeddingServerStream, EmbeddingTransportIdentity, PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS,
+    PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
+    PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES, PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
+    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+    PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS, PerUserEmbeddingClient, ProcessStartProbe,
+    embedding_retry_state,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,8 +25,6 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 const QUEUE_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 const NORMAL_WORKER_TIMEOUT: Duration = Duration::from_secs(240);
 const FROZEN_WORKER_TIMEOUT: Duration = Duration::from_secs(8);
-const STALL_WORKER_TIMEOUT: Duration = Duration::from_secs(325);
-const STALL_PROTOCOL_DEADLINE_MS: u64 = 315_000;
 const ANTI_IDLE_PROTOCOL_DEADLINE_MS: u64 = 90_000;
 const CLIENT_DEATH_LEASE_HOLD_MS: u64 = 600_000;
 const DEAD_CLIENT_QUERY_COUNT: usize = 16;
@@ -365,6 +366,8 @@ struct WorkerRequest {
     parameters: EmbeddingQualificationParameters,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     start_gate: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_gate_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -398,6 +401,8 @@ struct WorkerProtocolExchange {
     transport_identity: EmbeddingTransportIdentity,
     hello_snapshot: EmbeddingServerSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_snapshot: Option<EmbeddingServerSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     response: Option<EmbeddingProtocolResponse>,
     response_payload_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +414,11 @@ struct WorkerProtocolExchange {
 struct WorkerError {
     code: String,
     message_head: String,
+    retry_class: String,
+    retry_after_ms: u64,
+    retry_condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capacity: Option<EmbeddingCapacityPressureWire>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -450,35 +460,60 @@ struct RunningWorker {
     output_path: PathBuf,
 }
 
+impl Drop for RunningWorker {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        cleanup_worker_files(self);
+    }
+}
+
 struct ScenarioRunner<'a> {
     context: ScenarioContext<'a>,
     executable: crate::embedding_server_transport::ExactExecutable,
     clock: Arc<dyn AwakeMonotonicClock>,
     artifact: ScenarioArtifact,
     evidence: ScenarioEvidence,
+    active_controls: BTreeSet<String>,
+    active_gates: BTreeSet<PathBuf>,
     next_sequence: u64,
     next_worker: u64,
 }
 
 pub(super) fn run_scenario(context: ScenarioContext<'_>) -> Result<ScenarioArtifact> {
     let mut runner = ScenarioRunner::new(context)?;
-    match runner.context.scenario {
-        "client_death" => runner.client_death()?,
-        "cold_race" => runner.cold_race()?,
-        "frozen_owner" => runner.frozen_owner()?,
-        "incompatible_owner" => runner.incompatible_owner()?,
-        "mixed_queue" => runner.mixed_queue()?,
-        "server_crash" => runner.server_crash()?,
-        "true_idle_respawn" => runner.true_idle_respawn()?,
-        "worker_stall" => runner.worker_stall()?,
-        _ => bail!("embedding_qualification_scenario_unknown"),
+    let result = match runner.context.scenario {
+        "client_death" => runner.client_death(),
+        "cold_race" => runner.cold_race(),
+        "frozen_owner" => runner.frozen_owner(),
+        "incompatible_owner" => runner.incompatible_owner(),
+        "mixed_queue" => runner.mixed_queue(),
+        "server_crash" => runner.server_crash(),
+        "true_idle_respawn" => runner.true_idle_respawn(),
+        "worker_stall" => runner.worker_stall(),
+        _ => Err(anyhow::anyhow!("embedding_qualification_scenario_unknown")),
+    };
+    if let Err(error) = result {
+        runner.cleanup_after_failure();
+        return Err(error);
     }
     runner.finish()
 }
 
 pub(super) fn run_measurements(context: ScenarioContext<'_>) -> Result<MeasurementArtifact> {
     let mut runner = ScenarioRunner::new(context)?;
-    runner.measurements()
+    let mut result = runner.measurements();
+    if result.is_ok() && !runner.active_controls.is_empty() {
+        result = Err(anyhow::anyhow!(
+            "embedding_qualification_controls_not_released"
+        ));
+    }
+    if result.is_err() {
+        runner.cleanup_after_failure();
+    }
+    result
 }
 
 fn push_metric(
@@ -554,15 +589,44 @@ impl<'a> ScenarioRunner<'a> {
             },
             context,
             evidence: ScenarioEvidence::default(),
+            active_controls: BTreeSet::new(),
+            active_gates: BTreeSet::new(),
             next_sequence,
             next_worker: 0,
         })
     }
 
     fn finish(mut self) -> Result<ScenarioArtifact> {
-        validate_named_evidence(self.context.scenario, &self.evidence)?;
+        if !self.active_controls.is_empty() {
+            self.cleanup_after_failure();
+            bail!("embedding_qualification_controls_not_released");
+        }
+        if !self.active_gates.is_empty() {
+            self.cleanup_after_failure();
+            bail!("embedding_qualification_gates_not_cleaned");
+        }
+        if let Err(error) = validate_named_evidence(self.context.scenario, &self.evidence) {
+            self.cleanup_after_failure();
+            return Err(error);
+        }
         self.artifact.orchestration.finished_ns = self.clock.now_ns();
         Ok(self.artifact)
+    }
+
+    fn cleanup_after_failure(&mut self) {
+        if !self.active_controls.is_empty() {
+            let _ = self.control("crash_server", None);
+            self.active_controls.clear();
+        }
+        if let Ok(nonce) = qualification_nonce() {
+            let _ = fs::remove_file(qualification_command_path(
+                self.context.output_directory,
+                &nonce,
+            ));
+        }
+        for gate in std::mem::take(&mut self.active_gates) {
+            let _ = fs::remove_file(gate);
+        }
     }
 
     fn measurement_sample_id(&self, metric: &str, repeat: u32) -> String {
@@ -1143,6 +1207,107 @@ impl<'a> ScenarioRunner<'a> {
         }
     }
 
+    fn wait_for_control_snapshot(
+        &mut self,
+        phase: &str,
+        timeout: Duration,
+        predicate: impl Fn(&EmbeddingServerSnapshot) -> bool,
+    ) -> Result<EmbeddingServerSnapshot> {
+        let started = self.clock.now_ns();
+        loop {
+            if let Some(snapshot) = self.control("snapshot", None)?.snapshot
+                && predicate(&snapshot)
+            {
+                self.artifact
+                    .process_observations
+                    .push(ProcessObservation::from_snapshot(
+                        phase,
+                        self.clock.now_ns(),
+                        Some(snapshot.clone()),
+                    ));
+                return Ok(snapshot);
+            }
+            if elapsed(self.clock.as_ref(), started) >= timeout {
+                bail!("embedding_qualification_control_snapshot_timeout:{phase}");
+            }
+            self.clock.sleep(POLL);
+        }
+    }
+
+    fn wait_for_true_idle_epoch(
+        &mut self,
+        phase: &str,
+        timeout: Duration,
+    ) -> Result<(EmbeddingServerSnapshot, u64, ControlEvent)> {
+        let started = self.clock.now_ns();
+        loop {
+            let event = self.control("snapshot", None)?;
+            if let Some(snapshot) = event.snapshot.as_ref()
+                && snapshot.scheduler.lease_count == 0
+                && snapshot.scheduler.active_request_count == 0
+                && snapshot.scheduler.query_depth == 0
+                && snapshot.scheduler.bulk_depth == 0
+            {
+                let idle_epoch_ns = validated_idle_epoch(&event, snapshot)?;
+                self.artifact
+                    .process_observations
+                    .push(ProcessObservation::from_snapshot(
+                        phase,
+                        self.clock.now_ns(),
+                        Some(snapshot.clone()),
+                    ));
+                return Ok((snapshot.clone(), idle_epoch_ns, event));
+            }
+            if elapsed(self.clock.as_ref(), started) >= timeout {
+                bail!("embedding_qualification_idle_epoch_timeout:{phase}");
+            }
+            self.clock.sleep(POLL);
+        }
+    }
+
+    /// Wait using only a server-clock delta to determine the remaining interval, then
+    /// a fresh local-clock origin to spend that interval.  The two clock origins are
+    /// deliberately never subtracted from one another.
+    fn wait_for_server_idle_elapsed(
+        &mut self,
+        _phase: &str,
+        before: &EmbeddingServerSnapshot,
+        idle_epoch_ns: u64,
+        target: Duration,
+    ) -> Result<(EmbeddingServerSnapshot, ControlEvent, Duration)> {
+        loop {
+            let event = self.control("snapshot", None)?;
+            let snapshot = event.snapshot.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_idle_epoch_snapshot_missing")
+            })?;
+            if !same_server_authority(before, snapshot) {
+                bail!("embedding_qualification_true_idle_owner_changed");
+            }
+            let epoch = validated_idle_epoch(&event, snapshot)?;
+            if epoch != idle_epoch_ns {
+                bail!("embedding_qualification_true_idle_epoch_changed");
+            }
+            let server_elapsed = Duration::from_nanos(
+                event
+                    .clock
+                    .observed_ns
+                    .checked_sub(idle_epoch_ns)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("embedding_qualification_idle_epoch_in_future")
+                    })?,
+            );
+            if server_elapsed >= target {
+                return Ok((snapshot.clone(), event, server_elapsed));
+            }
+
+            let remaining = target.saturating_sub(server_elapsed);
+            let client_wait_origin_ns = self.clock.now_ns();
+            while elapsed(self.clock.as_ref(), client_wait_origin_ns) < remaining {
+                self.clock.sleep(POLL);
+            }
+        }
+    }
+
     fn wait_for_absence(&mut self, phase: &str, timeout: Duration) -> Result<()> {
         let started = self.clock.now_ns();
         loop {
@@ -1177,9 +1342,8 @@ impl<'a> ScenarioRunner<'a> {
     fn reset_owner(&mut self, phase: &str) -> Result<()> {
         if self.observe(&format!("{phase}_before"))?.is_some() {
             self.control("crash_server", None)?;
-            self.wait_for_absence(phase, SNAPSHOT_TIMEOUT)?;
         }
-        Ok(())
+        self.wait_for_absence(phase, SNAPSHOT_TIMEOUT)
     }
 
     fn control(&mut self, action: &str, class: Option<&str>) -> Result<ControlEvent> {
@@ -1238,6 +1402,7 @@ impl<'a> ScenarioRunner<'a> {
         }
         event.authenticated_nonce_sha256 = self.context.nonce_sha256.into();
         self.evidence.controls.insert(control_key(action, class));
+        self.update_active_controls(action, class);
         self.event(
             "server_control",
             action,
@@ -1246,6 +1411,39 @@ impl<'a> ScenarioRunner<'a> {
         );
         self.artifact.control_events.push(event.clone());
         Ok(event)
+    }
+
+    fn update_active_controls(&mut self, action: &str, class: Option<&str>) {
+        match (action, class) {
+            ("hold_class", Some(class)) => {
+                self.active_controls
+                    .insert(control_key("hold_class", Some(class)));
+            }
+            ("release_class", Some(class)) => {
+                self.active_controls
+                    .remove(&control_key("hold_class", Some(class)));
+            }
+            ("freeze_owner", None) => {
+                self.active_controls.insert("freeze_owner".into());
+            }
+            ("release_owner", None) => {
+                self.active_controls.remove("freeze_owner");
+            }
+            ("force_incompatible", None) => {
+                self.active_controls.insert("force_incompatible".into());
+            }
+            ("clear_incompatible", None) => {
+                self.active_controls.remove("force_incompatible");
+            }
+            ("stall_native", None) => {
+                self.active_controls.insert("stall_native".into());
+            }
+            ("release_native", None) => {
+                self.active_controls.remove("stall_native");
+            }
+            ("crash_server", None) => self.active_controls.clear(),
+            _ => {}
+        }
     }
 
     fn spawn_worker(
@@ -1297,8 +1495,18 @@ impl<'a> ScenarioRunner<'a> {
             project: project.clone(),
             operation: operation.into(),
             parameters,
-            start_gate,
+            start_gate: start_gate.clone(),
+            start_gate_timeout_ms: start_gate.as_ref().map(|_| {
+                if self.context.scenario == "worker_stall" {
+                    stall_worker_timeout().as_millis() as u64
+                } else {
+                    QUEUE_SETUP_TIMEOUT.as_millis() as u64
+                }
+            }),
         };
+        if let Some(gate) = start_gate.as_ref() {
+            self.active_gates.insert(gate.clone());
+        }
         write_atomic_json(&request_path, &request)?;
         let started_ns = self.clock.now_ns();
         let child = Command::new(self.executable.path())
@@ -1341,6 +1549,11 @@ impl<'a> ScenarioRunner<'a> {
             request_path,
             output_path,
         })
+    }
+
+    fn cleanup_gate(&mut self, gate: &Path) {
+        let _ = fs::remove_file(gate);
+        self.active_gates.remove(gate);
     }
 
     fn primary_runtime(&self) -> &SidecarRuntimeConfig {
@@ -1427,10 +1640,12 @@ impl<'a> ScenarioRunner<'a> {
             .as_ref()
             .and_then(|result| result.final_snapshot.clone())
             .or_else(|| {
-                output
-                    .protocol_exchange
-                    .as_ref()
-                    .map(|exchange| exchange.hello_snapshot.clone())
+                output.protocol_exchange.as_ref().map(|exchange| {
+                    exchange
+                        .final_snapshot
+                        .clone()
+                        .unwrap_or_else(|| exchange.hello_snapshot.clone())
+                })
             })
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_worker_snapshot_missing"))?;
         self.artifact
@@ -1529,13 +1744,13 @@ impl<'a> ScenarioRunner<'a> {
             .join(format!(".{}.cold-race-gate.json", self.context.scenario));
         let first = self.spawn_worker_for(
             0,
-            "long_protocol_query",
+            "cold_race_query",
             query_parameters(1),
             Some(gate.clone()),
         )?;
         let second = self.spawn_worker_for(
             1,
-            "long_protocol_query",
+            "cold_race_query",
             query_parameters(1),
             Some(gate.clone()),
         )?;
@@ -1551,7 +1766,7 @@ impl<'a> ScenarioRunner<'a> {
         );
         let first_output = self.finish_worker(first, NORMAL_WORKER_TIMEOUT)?;
         let second_output = self.finish_worker(second, NORMAL_WORKER_TIMEOUT)?;
-        let _ = fs::remove_file(&gate);
+        self.cleanup_gate(&gate);
         require_protocol_success(&first_output, "cold_race_first")?;
         require_protocol_success(&second_output, "cold_race_second")?;
         let first_snapshot = self.record_worker_snapshot("cold_race_first", &first_output)?;
@@ -1637,11 +1852,26 @@ impl<'a> ScenarioRunner<'a> {
                     "error_code",
                     json!(output.error.as_ref().map(|error| &error.code)),
                 ),
+                (
+                    "retry",
+                    serde_json::to_value(output.error.as_ref().expect("error required above"))?,
+                ),
+                ("timeout_ms", json!(8_000)),
+                ("clock_domain", json!(output.clock.domain)),
+                ("clock_boot_id", json!(output.clock.boot_id)),
             ]),
         );
         let after = self.wait_for_snapshot("frozen_owner_released", SNAPSHOT_TIMEOUT, |_| true)?;
         if !same_server_authority(&before, &after) {
             bail!("embedding_qualification_frozen_owner_takeover_detected");
+        }
+        let probe = self.spawn_worker("query", query_parameters(1), None)?;
+        let probe_output = self.finish_worker(probe, NORMAL_WORKER_TIMEOUT)?;
+        require_worker_success(&probe_output, "frozen_owner_post_release_query")?;
+        let connected =
+            self.record_worker_snapshot("frozen_owner_post_release_query", &probe_output)?;
+        if !same_server_authority(&before, &connected) {
+            bail!("embedding_qualification_frozen_owner_post_release_changed");
         }
         self.transition(
             "owner_identity_stable",
@@ -1652,8 +1882,15 @@ impl<'a> ScenarioRunner<'a> {
                 ),
                 (
                     "lifetime_authority_id",
-                    json!(after.authority.lifetime_authority_id),
+                    json!(connected.authority.lifetime_authority_id),
                 ),
+                ("listener_id", json!(connected.authority.listener_id)),
+                ("pid", json!(connected.process.pid)),
+                (
+                    "process_start_id",
+                    json!(connected.process.process_start_id),
+                ),
+                ("post_release_query_succeeded", json!(true)),
             ]),
         );
         Ok(())
@@ -1676,7 +1913,7 @@ impl<'a> ScenarioRunner<'a> {
             snapshot.scheduler.lease_count > 0
         })?;
         self.control("force_incompatible", None)?;
-        let active = self.spawn_worker("query", query_parameters(1), None)?;
+        let active = self.spawn_worker("activate_probe", query_parameters(1), None)?;
         let active_output = self.finish_worker(active, FROZEN_WORKER_TIMEOUT)?;
         require_worker_error(
             &active_output,
@@ -1699,13 +1936,19 @@ impl<'a> ScenarioRunner<'a> {
                             .map(|error| error.code.as_str())
                     ),
                 ),
+                (
+                    "retry",
+                    serde_json::to_value(
+                        active_output.error.as_ref().expect("error required above"),
+                    )?,
+                ),
             ]),
         );
         self.terminate_worker(lease)?;
-        self.wait_for_snapshot("incompatible_owner_idle", SNAPSHOT_TIMEOUT, |snapshot| {
+        self.wait_for_control_snapshot("incompatible_owner_idle", SNAPSHOT_TIMEOUT, |snapshot| {
             snapshot.scheduler.lease_count == 0 && snapshot.scheduler.active_request_count == 0
         })?;
-        let idle = self.spawn_worker("query", query_parameters(1), None)?;
+        let idle = self.spawn_worker("activate_probe", query_parameters(1), None)?;
         let idle_output = self.finish_worker(idle, FROZEN_WORKER_TIMEOUT)?;
         require_worker_error(
             &idle_output,
@@ -1723,6 +1966,12 @@ impl<'a> ScenarioRunner<'a> {
                     "error_code",
                     json!(idle_output.error.as_ref().map(|error| error.code.as_str())),
                 ),
+                (
+                    "retry",
+                    serde_json::to_value(
+                        idle_output.error.as_ref().expect("error required above"),
+                    )?,
+                ),
             ]),
         );
         self.wait_for_absence("incompatible_owner_exited", SNAPSHOT_TIMEOUT)?;
@@ -1734,6 +1983,7 @@ impl<'a> ScenarioRunner<'a> {
         if before.process.server_instance_id == after.process.server_instance_id {
             bail!("embedding_qualification_incompatible_owner_not_replaced");
         }
+        self.control("clear_incompatible", None)?;
         self.transition(
             "compatible_replacement",
             btree([
@@ -1825,8 +2075,8 @@ impl<'a> ScenarioRunner<'a> {
         let seed_output = self.finish_worker(seed, NORMAL_WORKER_TIMEOUT)?;
         let first_output = self.finish_worker(first, NORMAL_WORKER_TIMEOUT)?;
         let second_output = self.finish_worker(second, NORMAL_WORKER_TIMEOUT)?;
-        let _ = fs::remove_file(&first_gate);
-        let _ = fs::remove_file(&second_gate);
+        self.cleanup_gate(&first_gate);
+        self.cleanup_gate(&second_gate);
         require_protocol_success(&seed_output, "mixed_queue_seed")?;
         if first_output.clock != second_output.clock {
             bail!("embedding_qualification_queue_clock_domain_mismatch");
@@ -1906,22 +2156,27 @@ impl<'a> ScenarioRunner<'a> {
                 ),
             ]),
         );
-        let operation_count = output
+        let operations = &output
             .result
             .as_ref()
-            .map_or(0, |result| result.operations.len());
+            .ok_or_else(|| anyhow::anyhow!("embedding_qualification_crash_result_missing"))?
+            .operations;
+        if operations.len() != 1 {
+            bail!("embedding_qualification_crash_logical_operation_count");
+        }
+        let attempts = &operations[0].attempts;
+        validate_replay_attempts(
+            attempts,
+            &before.process.server_instance_id,
+            &after.process.server_instance_id,
+            "server_crash",
+        )?;
         self.transition(
             "query_replayed",
             btree([
-                ("submitted_operation_count", json!(operation_count)),
-                ("completed_operation_count", json!(operation_count)),
-                (
-                    "observed_server_instance_ids",
-                    json!([
-                        before.process.server_instance_id,
-                        after.process.server_instance_id
-                    ]),
-                ),
+                ("logical_operation_count", json!(operations.len())),
+                ("wire_attempt_count", json!(attempts.len())),
+                ("wire_attempts", serde_json::to_value(attempts)?),
             ]),
         );
         Ok(())
@@ -2010,30 +2265,131 @@ impl<'a> ScenarioRunner<'a> {
         require_protocol_success(&query_output, "true_idle_queued_query")?;
         require_protocol_success(&bulk_output, "true_idle_queued_bulk")?;
         self.terminate_worker(lease)?;
-        let reclaimed =
-            self.wait_for_snapshot("true_idle_work_reclaimed", SNAPSHOT_TIMEOUT, |snapshot| {
-                snapshot.scheduler.lease_count == 0
-                    && snapshot.scheduler.active_request_count == 0
-                    && snapshot.scheduler.query_depth == 0
-                    && snapshot.scheduler.bulk_depth == 0
-            })?;
+        let (reclaimed, idle_epoch_ns, _) =
+            self.wait_for_true_idle_epoch("true_idle_work_reclaimed", SNAPSHOT_TIMEOUT)?;
         self.transition("anti_idle_work_reclaimed", scheduler_values(&reclaimed));
-        let started_ns = self.clock.now_ns();
-        self.clock.sleep(wait);
+        let client_idle_observed_ns = self.clock.now_ns();
+        let mut diagnostic_count = 0_u64;
+        let mut idle_connection_close_count = 0_u64;
+        let mut last_diagnostic_client_elapsed_ns = 0_u64;
+        let mut last_idle_connection_close_client_elapsed_ns = 0_u64;
+        let mut final_server_idle_elapsed = None;
+        for target_offset in [
+            Duration::ZERO,
+            Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS / 2),
+        ] {
+            self.wait_for_server_idle_elapsed(
+                "true_idle_diagnostic_wait",
+                &before,
+                idle_epoch_ns,
+                target_offset,
+            )?;
+            let phase = format!("true_idle_diagnostic_{diagnostic_count}");
+            let diagnostic = self.observe(&phase)?.ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_true_idle_owner_exited_before_probe")
+            })?;
+            if !same_server_authority(&before, &diagnostic) {
+                bail!("embedding_qualification_true_idle_owner_changed");
+            }
+            diagnostic_count = diagnostic_count.saturating_add(1);
+            last_diagnostic_client_elapsed_ns =
+                elapsed(self.clock.as_ref(), client_idle_observed_ns)
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+            match observe_idle_connection_close(self.primary_runtime(), self.clock.as_ref())? {
+                Some(close) => {
+                    if !same_server_authority(&before, &close.snapshot)
+                        || close.started_ns > close.finished_ns
+                        || close.error_head.trim().is_empty()
+                    {
+                        bail!("embedding_qualification_idle_connection_close_invalid");
+                    }
+                    idle_connection_close_count = idle_connection_close_count.saturating_add(1);
+                    last_idle_connection_close_client_elapsed_ns =
+                        elapsed(self.clock.as_ref(), client_idle_observed_ns)
+                            .as_nanos()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                }
+                None => bail!("embedding_qualification_idle_connection_owner_absent"),
+            }
+            let event = self.control("snapshot", None)?;
+            let confirmation = event.snapshot.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_idle_epoch_snapshot_missing")
+            })?;
+            if validated_idle_epoch(&event, confirmation)? != idle_epoch_ns
+                || !same_server_authority(&before, confirmation)
+            {
+                bail!("embedding_qualification_true_idle_epoch_changed");
+            }
+            final_server_idle_elapsed = Some(Duration::from_nanos(
+                event
+                    .clock
+                    .observed_ns
+                    .checked_sub(idle_epoch_ns)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("embedding_qualification_idle_epoch_in_future")
+                    })?,
+            ));
+        }
+        let final_server_idle_elapsed = final_server_idle_elapsed.ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_idle_epoch_final_snapshot_missing")
+        })?;
+        let contract_idle_timeout =
+            Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS);
+        let client_wait_required = contract_idle_timeout.saturating_sub(final_server_idle_elapsed);
+        let client_wait_origin_ns = self.clock.now_ns();
+        while elapsed(self.clock.as_ref(), client_wait_origin_ns) < client_wait_required {
+            self.clock.sleep(POLL);
+        }
+        let client_wait_elapsed = elapsed(self.clock.as_ref(), client_wait_origin_ns);
+        self.wait_for_absence(
+            "true_idle_after_wait",
+            Duration::from_millis(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS / 2)
+                .saturating_add(Duration::from_secs(15)),
+        )?;
         self.observation(
             "true_idle_wait",
             btree([
-                ("started_ns", json!(started_ns)),
-                ("finished_ns", json!(self.clock.now_ns())),
+                ("server_idle_epoch_ns", json!(idle_epoch_ns)),
+                (
+                    "server_idle_elapsed_before_client_wait_ns",
+                    json!(final_server_idle_elapsed.as_nanos()),
+                ),
+                (
+                    "client_wait_required_ns",
+                    json!(client_wait_required.as_nanos()),
+                ),
+                (
+                    "client_wait_elapsed_ns",
+                    json!(client_wait_elapsed.as_nanos()),
+                ),
                 (
                     "contract_idle_timeout_ms",
                     json!(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS),
                 ),
+                ("clock_boot_id", json!(reclaimed.clock.boot_id)),
             ]),
         );
-        if self.observe("true_idle_after_wait")?.is_some() {
-            bail!("embedding_qualification_true_idle_owner_still_present");
-        }
+        self.transition(
+            "idle_surfaces_exercised",
+            btree([
+                ("diagnostic_count", json!(diagnostic_count)),
+                (
+                    "idle_connection_close_count",
+                    json!(idle_connection_close_count),
+                ),
+                (
+                    "last_diagnostic_client_elapsed_ns",
+                    json!(last_diagnostic_client_elapsed_ns),
+                ),
+                (
+                    "last_idle_connection_close_client_elapsed_ns",
+                    json!(last_idle_connection_close_client_elapsed_ns),
+                ),
+            ]),
+        );
         self.transition(
             "owner_absent_after_true_idle",
             btree([(
@@ -2060,9 +2416,28 @@ impl<'a> ScenarioRunner<'a> {
 
     fn worker_stall(&mut self) -> Result<()> {
         let before = self.ensure_owner("worker_stall_before")?;
+        let survivor_gate = self
+            .context
+            .output_directory
+            .join(".worker-stall-survivor-gate.json");
+        let survivor = self.spawn_worker(
+            "query",
+            EmbeddingQualificationParameters {
+                query_count: 1,
+                bulk_count: 0,
+                documents_per_bulk: 0,
+                input_bytes: 64,
+                hold_ms: 325_000,
+            },
+            Some(survivor_gate.clone()),
+        )?;
+        let survivor_invocation =
+            &self.artifact.orchestration.process_invocations[survivor.invocation_index];
+        let survivor_pid = survivor_invocation.pid;
+        let survivor_process_start_id = survivor_invocation.process_start_id.clone();
         self.control("stall_native", None)?;
         let worker = self.spawn_worker(
-            "stall_protocol_bulk",
+            "bulk",
             EmbeddingQualificationParameters {
                 query_count: 0,
                 bulk_count: 1,
@@ -2081,33 +2456,92 @@ impl<'a> ScenarioRunner<'a> {
                     .is_some_and(|active| active.class == "bulk")
             })?;
         self.transition("stalled_request_observed", scheduler_values(&active));
-        let output = self.finish_worker(worker, STALL_WORKER_TIMEOUT)?;
-        let exchange = output
-            .protocol_exchange
+        let output = self.finish_worker(worker, stall_worker_timeout())?;
+        require_worker_success(&output, "worker_stall_replay")?;
+        let operation = output
+            .result
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("embedding_qualification_stall_exchange_missing"))?;
-        if exchange.response.is_some() || exchange.terminal_transport_error.is_none() {
-            bail!("embedding_qualification_watchdog_fail_stop_missing");
-        }
+            .and_then(|result| (result.operations.len() == 1).then(|| &result.operations[0]))
+            .ok_or_else(|| anyhow::anyhow!("embedding_qualification_stall_operation_missing"))?;
         wait_for_process_exit(&*self.clock, before.process.pid, SNAPSHOT_TIMEOUT)?;
-        self.wait_for_absence("worker_stall_owner_absent", SNAPSHOT_TIMEOUT)?;
+        let (watchdog_marker, watchdog_marker_sha256) = consume_watchdog_marker(
+            self.context.output_directory,
+            self.context.nonce_sha256,
+            &before,
+        )?;
+        let after = self.record_worker_snapshot("worker_stall_replacement", &output)?;
+        if before.process.server_instance_id == after.process.server_instance_id {
+            bail!("embedding_qualification_stalled_owner_not_replaced");
+        }
+        validate_replay_attempts(
+            &operation.attempts,
+            &before.process.server_instance_id,
+            &after.process.server_instance_id,
+            "worker_stall",
+        )?;
         self.transition(
             "watchdog_fail_stop_observed",
             btree([
                 ("old_pid", json!(before.process.pid)),
                 (
-                    "terminal_transport_error",
-                    json!(exchange.terminal_transport_error),
+                    "old_server_instance_id",
+                    json!(before.process.server_instance_id),
+                ),
+                ("wire_attempt_count", json!(operation.attempts.len())),
+                ("wire_attempts", serde_json::to_value(&operation.attempts)?),
+                ("watchdog_marker_sha256", json!(watchdog_marker_sha256)),
+                ("watchdog_reason", json!(watchdog_marker.reason)),
+                (
+                    "watchdog_observed_ns",
+                    json!(watchdog_marker.clock.observed_ns),
+                ),
+                (
+                    "watchdog_last_progress_ns",
+                    json!(watchdog_marker.last_progress_ns),
+                ),
+                (
+                    "watchdog_progress_sequence",
+                    json!(watchdog_marker.progress_sequence),
+                ),
+                (
+                    "hard_native_no_progress_ms",
+                    json!(watchdog_marker.hard_native_no_progress_ms),
+                ),
+                (
+                    "watchdog_cadence_ms",
+                    json!(watchdog_marker.watchdog_cadence_ms),
                 ),
             ]),
         );
-        let replacement = self.spawn_worker("query", query_parameters(1), None)?;
-        let replacement_output = self.finish_worker(replacement, NORMAL_WORKER_TIMEOUT)?;
-        require_worker_success(&replacement_output, "worker_stall_replacement")?;
-        let after = self.record_worker_snapshot("worker_stall_replacement", &replacement_output)?;
-        if before.process.server_instance_id == after.process.server_instance_id {
-            bail!("embedding_qualification_stalled_owner_not_replaced");
+        match codestory_retrieval::probe_process_start_identity(survivor_pid) {
+            ProcessStartProbe::Running { start_identity }
+                if start_identity == survivor_process_start_id => {}
+            _ => bail!("embedding_qualification_unrelated_worker_did_not_survive"),
         }
+        write_atomic_json(
+            &survivor_gate,
+            &json!({"schema_version": 1, "released_ns": self.clock.now_ns()}),
+        )?;
+        let survivor_output = self.finish_worker(survivor, NORMAL_WORKER_TIMEOUT)?;
+        self.cleanup_gate(&survivor_gate);
+        require_worker_success(&survivor_output, "worker_stall_survivor_query")?;
+        let survivor_after =
+            self.record_worker_snapshot("worker_stall_survivor_query", &survivor_output)?;
+        if !same_server_authority(&after, &survivor_after) {
+            bail!("embedding_qualification_survivor_used_wrong_replacement");
+        }
+        self.control("release_native", None)?;
+        self.transition(
+            "unrelated_process_survived",
+            btree([
+                ("pid", json!(survivor_pid)),
+                ("process_start_id", json!(survivor_process_start_id)),
+                (
+                    "new_server_instance_id",
+                    json!(survivor_after.process.server_instance_id),
+                ),
+            ]),
+        );
         self.transition(
             "post_stall_replacement",
             btree([(
@@ -2157,6 +2591,16 @@ fn validated_hello(
     runtime: &SidecarRuntimeConfig,
     clock: &dyn AwakeMonotonicClock,
 ) -> Result<EmbeddingServerSnapshot> {
+    validated_hello_with_intent(stream, transport, runtime, clock, "activate")
+}
+
+fn validated_hello_with_intent(
+    stream: &mut crate::embedding_server_transport::NativeEmbeddingStream,
+    transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+    intent: &str,
+) -> Result<EmbeddingServerSnapshot> {
     EmbeddingServerStream::set_read_timeout(stream, Some(Duration::from_secs(2)))?;
     EmbeddingServerStream::set_write_timeout(stream, Some(Duration::from_secs(2)))?;
     let compatibility = EmbeddingCompatibility::current(runtime.embedding.allow_cpu);
@@ -2168,7 +2612,7 @@ fn validated_hello(
             schema_version: PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
             request_id: request_id.clone(),
             compatibility: compatibility.clone(),
-            operation: client_hello_operation("activate", transport),
+            operation: client_hello_operation(intent, transport),
         },
         &[],
     )?;
@@ -2193,6 +2637,43 @@ fn validated_hello(
     }
     authenticate_snapshot(&snapshot, stream.identity())?;
     Ok(snapshot)
+}
+
+struct IdleConnectionClose {
+    snapshot: EmbeddingServerSnapshot,
+    started_ns: u64,
+    finished_ns: u64,
+    error_head: String,
+}
+
+fn observe_idle_connection_close(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+) -> Result<Option<IdleConnectionClose>> {
+    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let mut stream = match transport.connect(Duration::from_secs(2))? {
+        crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
+        crate::embedding_server_transport::NativeConnectOutcome::NoOwner => return Ok(None),
+        crate::embedding_server_transport::NativeConnectOutcome::OwnerUnresponsive => {
+            bail!("embedding_server_owner_unresponsive")
+        }
+    };
+    let snapshot = validated_hello_with_intent(&mut stream, &transport, runtime, clock, "observe")?;
+    let timeout = codestory_retrieval::EmbeddingClientBudgets::current()
+        .connect
+        .saturating_add(Duration::from_secs(1));
+    EmbeddingServerStream::set_read_timeout(&stream, Some(timeout))?;
+    let started_ns = clock.now_ns();
+    let error = match read_protocol_frame::<EmbeddingProtocolResponse>(&mut stream) {
+        Ok(_) => bail!("embedding_qualification_idle_connection_received_response"),
+        Err(error) => error,
+    };
+    Ok(Some(IdleConnectionClose {
+        snapshot,
+        started_ns,
+        finished_ns: clock.now_ns(),
+        error_head: error_head(&error),
+    }))
 }
 
 fn client_hello_operation(
@@ -2451,7 +2932,12 @@ pub(super) fn run_worker(command: InternalEmbeddingQualificationCommand) -> Resu
     let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
     let clock = EmbeddingClientTransport::clock(&transport);
     if let Some(gate) = request.start_gate.as_deref() {
-        wait_for_gate(clock.as_ref(), gate)?;
+        let timeout_ms = request
+            .start_gate_timeout_ms
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("embedding_qualification_gate_timeout_missing"))?;
+        let timeout = Duration::from_millis(timeout_ms);
+        wait_for_gate(clock.as_ref(), gate, timeout)?;
     }
     let process_start_id = current_process_start_identity()?;
     let started_ns = clock.now_ns();
@@ -2464,41 +2950,51 @@ pub(super) fn run_worker(command: InternalEmbeddingQualificationCommand) -> Resu
     if request.operation == "dead_client_load" {
         return run_dead_client_load(&runtime, request.parameters, clock.as_ref());
     }
-    let (result, protocol_exchange, queue_operations, error) = if request.operation == "queue_load"
-    {
-        match run_queue_load(&runtime, request.parameters, Arc::clone(&clock)) {
-            Ok(operations) => (None, None, Some(operations), None),
-            Err(error) => (None, None, None, Some(worker_error(&error))),
-        }
-    } else if matches!(
-        request.operation.as_str(),
-        "stall_protocol_bulk" | "long_protocol_query" | "long_protocol_bulk"
-    ) {
-        let (class, deadline_ms) = match request.operation.as_str() {
-            "stall_protocol_bulk" => ("bulk", STALL_PROTOCOL_DEADLINE_MS),
-            "long_protocol_query" => ("query", ANTI_IDLE_PROTOCOL_DEADLINE_MS),
-            "long_protocol_bulk" => ("bulk", ANTI_IDLE_PROTOCOL_DEADLINE_MS),
-            _ => unreachable!("matched exact protocol operations"),
+    let (result, protocol_exchange, queue_operations, error) =
+        if request.operation == "activate_probe" {
+            match run_activate_probe(&runtime, clock.as_ref()) {
+                Ok(error) => (None, None, None, Some(error)),
+                Err(error) => (None, None, None, Some(worker_error(&error))),
+            }
+        } else if request.operation == "queue_load" {
+            match run_queue_load(&runtime, request.parameters, Arc::clone(&clock)) {
+                Ok(operations) => (None, None, Some(operations), None),
+                Err(error) => (None, None, None, Some(worker_error(&error))),
+            }
+        } else if request.operation == "cold_race_query" {
+            match run_cold_race_protocol_exchange(&runtime, clock.as_ref()) {
+                Ok(exchange) => (None, Some(exchange), None, None),
+                Err(error) => (None, None, None, Some(worker_error(&error))),
+            }
+        } else if matches!(
+            request.operation.as_str(),
+            "stall_protocol_bulk" | "long_protocol_query" | "long_protocol_bulk"
+        ) {
+            let (class, deadline_ms) = match request.operation.as_str() {
+                "stall_protocol_bulk" => ("bulk", PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS),
+                "long_protocol_query" => ("query", ANTI_IDLE_PROTOCOL_DEADLINE_MS),
+                "long_protocol_bulk" => ("bulk", ANTI_IDLE_PROTOCOL_DEADLINE_MS),
+                _ => unreachable!("matched exact protocol operations"),
+            };
+            match run_raw_protocol_exchange(&runtime, clock.as_ref(), class, deadline_ms) {
+                Ok(exchange) => (None, Some(exchange), None, None),
+                Err(error) => (None, None, None, Some(worker_error(&error))),
+            }
+        } else {
+            let qualification = codestory_retrieval::run_per_user_embedding_qualification(
+                &runtime,
+                EmbeddingQualificationRequest {
+                    schema_version: 1,
+                    nonce_sha256: request.nonce_sha256,
+                    scenario: request.operation,
+                    parameters: request.parameters,
+                },
+            );
+            match qualification {
+                Ok(result) => (Some(result), None, None, None),
+                Err(error) => (None, None, None, Some(worker_error(&error))),
+            }
         };
-        match run_raw_protocol_exchange(&runtime, clock.as_ref(), class, deadline_ms) {
-            Ok(exchange) => (None, Some(exchange), None, None),
-            Err(error) => (None, None, None, Some(worker_error(&error))),
-        }
-    } else {
-        let qualification = codestory_retrieval::run_per_user_embedding_qualification(
-            &runtime,
-            EmbeddingQualificationRequest {
-                schema_version: 1,
-                nonce_sha256: request.nonce_sha256,
-                scenario: request.operation,
-                parameters: request.parameters,
-            },
-        );
-        match qualification {
-            Ok(result) => (Some(result), None, None, None),
-            Err(error) => (None, None, None, Some(worker_error(&error))),
-        }
-    };
     let output = WorkerOutput {
         schema_version: 1,
         pid: std::process::id(),
@@ -2579,6 +3075,22 @@ fn run_queue_load(
     let runtime = runtime.clone();
     let project_identity = project_identity_sha256(&runtime);
     let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let observer = PerUserEmbeddingClient::for_runtime(&runtime)?;
+    let baseline = observer
+        .observe()?
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_queue_owner_absent"))?;
+    let mut expected_query_depth = baseline.scheduler.query_depth;
+    let mut expected_bulk_depth = baseline.scheduler.bulk_depth;
+    let query_success_limit = baseline
+        .scheduler
+        .query_capacity
+        .saturating_sub(expected_query_depth);
+    let bulk_success_limit = baseline
+        .scheduler
+        .bulk_capacity
+        .saturating_sub(expected_bulk_depth);
+    let mut query_attempts = 0_u64;
+    let mut bulk_attempts = 0_u64;
     let mut workers = Vec::new();
     let maximum = parameters.query_count.max(parameters.bulk_count);
     for ordinal in 0..maximum {
@@ -2592,7 +3104,7 @@ fn run_queue_load(
                 continue;
             }
             let runtime = runtime.clone();
-            let clock = Arc::clone(&clock);
+            let worker_clock = Arc::clone(&clock);
             let transport = transport.clone();
             let project_identity = project_identity.clone();
             let correlation_id = format!(
@@ -2607,7 +3119,7 @@ fn run_queue_load(
                     run_queue_operation(
                         &runtime,
                         transport,
-                        clock.as_ref(),
+                        worker_clock.as_ref(),
                         &project_identity,
                         class,
                         ordinal,
@@ -2618,6 +3130,26 @@ fn run_queue_load(
             submitted_rx
                 .recv_timeout(CONTROL_TIMEOUT)
                 .context("wait for qualification queue submission")?;
+            let expected_depth = if class == "query" {
+                query_attempts = query_attempts.saturating_add(1);
+                if query_attempts > query_success_limit {
+                    None
+                } else {
+                    expected_query_depth = expected_query_depth.saturating_add(1);
+                    Some(expected_query_depth)
+                }
+            } else {
+                bulk_attempts = bulk_attempts.saturating_add(1);
+                if bulk_attempts > bulk_success_limit {
+                    None
+                } else {
+                    expected_bulk_depth = expected_bulk_depth.saturating_add(1);
+                    Some(expected_bulk_depth)
+                }
+            };
+            if let Some(expected_depth) = expected_depth {
+                wait_for_queue_admission(&observer, clock.as_ref(), class, expected_depth)?;
+            }
             workers.push(worker);
         }
     }
@@ -2629,6 +3161,32 @@ fn run_queue_load(
                 .map_err(|_| anyhow::anyhow!("embedding_qualification_queue_worker_panicked"))?
         })
         .collect()
+}
+
+fn wait_for_queue_admission(
+    observer: &PerUserEmbeddingClient,
+    clock: &dyn AwakeMonotonicClock,
+    class: &str,
+    expected_depth: u64,
+) -> Result<()> {
+    let started = clock.now_ns();
+    loop {
+        let snapshot = observer
+            .observe()?
+            .ok_or_else(|| anyhow::anyhow!("embedding_qualification_queue_owner_absent"))?;
+        let actual_depth = match class {
+            "query" => snapshot.scheduler.query_depth,
+            "bulk" => snapshot.scheduler.bulk_depth,
+            _ => bail!("embedding_qualification_queue_class_invalid"),
+        };
+        if actual_depth >= expected_depth {
+            return Ok(());
+        }
+        if elapsed(clock, started) >= QUEUE_SETUP_TIMEOUT {
+            bail!("embedding_qualification_queue_admission_timeout:{class}");
+        }
+        clock.sleep(POLL);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2756,13 +3314,10 @@ fn run_raw_protocol_exchange(
     run_raw_protocol_exchange_with_input(runtime, clock, class, deadline_ms, None)
 }
 
-fn run_raw_protocol_exchange_with_input(
+fn run_activate_probe(
     runtime: &SidecarRuntimeConfig,
     clock: &dyn AwakeMonotonicClock,
-    class: &str,
-    deadline_ms: u64,
-    measured_input: Option<String>,
-) -> Result<WorkerProtocolExchange> {
+) -> Result<WorkerError> {
     let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
     let mut stream = match transport.connect(Duration::from_secs(2))? {
         crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
@@ -2773,6 +3328,113 @@ fn run_raw_protocol_exchange_with_input(
             bail!("embedding_server_owner_unresponsive")
         }
     };
+    let identity = stream.identity();
+    if !identity.peer_verified
+        || identity.peer_pid.is_none()
+        || identity
+            .peer_process_start_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        bail!("embedding_qualification_activate_peer_unverified");
+    }
+    EmbeddingServerStream::set_read_timeout(&stream, Some(Duration::from_secs(2)))?;
+    EmbeddingServerStream::set_write_timeout(&stream, Some(Duration::from_secs(2)))?;
+    let request_id = qualification_request_id("activate-probe", clock.now_ns());
+    write_protocol_frame(
+        &mut stream,
+        &EmbeddingProtocolRequest {
+            protocol: PER_USER_EMBEDDING_PROTOCOL_V1.into(),
+            schema_version: PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
+            request_id: request_id.clone(),
+            compatibility: EmbeddingCompatibility::current(runtime.embedding.allow_cpu),
+            operation: client_hello_operation("activate", &transport),
+        },
+        &[],
+    )?;
+    let (response, payload): (EmbeddingProtocolResponse, Vec<u8>) =
+        read_protocol_frame(&mut stream)?;
+    if !payload.is_empty()
+        || response.request_id != request_id
+        || response.protocol != PER_USER_EMBEDDING_PROTOCOL_V1
+        || response.schema_version != PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION
+        || response.result.is_some()
+    {
+        bail!("embedding_qualification_activate_response_invalid");
+    }
+    let error = response
+        .error
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_activate_error_missing"))?;
+    Ok(WorkerError {
+        code: error.code,
+        message_head: error.message.chars().take(128).collect(),
+        retry_class: error.retry_class,
+        retry_after_ms: error.retry_after_ms,
+        retry_condition: error.retry_condition,
+        capacity: error.capacity,
+    })
+}
+
+fn run_raw_protocol_exchange_with_input(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+    class: &str,
+    deadline_ms: u64,
+    measured_input: Option<String>,
+) -> Result<WorkerProtocolExchange> {
+    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let stream = match transport.connect(Duration::from_secs(2))? {
+        crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
+        crate::embedding_server_transport::NativeConnectOutcome::NoOwner => {
+            bail!("embedding_server_absent")
+        }
+        crate::embedding_server_transport::NativeConnectOutcome::OwnerUnresponsive => {
+            bail!("embedding_server_owner_unresponsive")
+        }
+    };
+    run_protocol_exchange_on_stream(
+        runtime,
+        clock,
+        class,
+        deadline_ms,
+        measured_input,
+        &transport,
+        stream,
+    )
+}
+
+fn run_cold_race_protocol_exchange(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+) -> Result<WorkerProtocolExchange> {
+    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let spawn_attempt = transport.spawn_exact_current_exe()?;
+    let stream = connect_until(
+        &transport,
+        clock,
+        Duration::from_secs(15),
+        Some(&spawn_attempt),
+    )?;
+    run_protocol_exchange_on_stream(
+        runtime,
+        clock,
+        "query",
+        ANTI_IDLE_PROTOCOL_DEADLINE_MS,
+        None,
+        &transport,
+        stream,
+    )
+}
+
+fn run_protocol_exchange_on_stream(
+    runtime: &SidecarRuntimeConfig,
+    clock: &dyn AwakeMonotonicClock,
+    class: &str,
+    deadline_ms: u64,
+    measured_input: Option<String>,
+    transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
+    mut stream: crate::embedding_server_transport::NativeEmbeddingStream,
+) -> Result<WorkerProtocolExchange> {
     let transport_identity = stream.identity().clone();
     if !transport_identity.peer_verified
         || transport_identity.peer_pid.is_none()
@@ -2794,7 +3456,7 @@ fn run_raw_protocol_exchange_with_input(
             schema_version: PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
             request_id: hello_id.clone(),
             compatibility: compatibility.clone(),
-            operation: client_hello_operation("activate", &transport),
+            operation: client_hello_operation("activate", transport),
         },
         &[],
     )?;
@@ -2855,12 +3517,36 @@ fn run_raw_protocol_exchange_with_input(
             Ok((response, payload)) => (Some(response), payload.len() as u64, None),
             Err(error) => (None, 0, Some(error_head(&error))),
         };
+    let final_snapshot = if terminal_transport_error.is_none()
+        && response
+            .as_ref()
+            .is_some_and(|response| response.error.is_none())
+    {
+        drop(stream);
+        let mut snapshot_stream = match transport.connect(Duration::from_secs(2))? {
+            crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => stream,
+            crate::embedding_server_transport::NativeConnectOutcome::NoOwner => {
+                bail!("embedding_server_absent")
+            }
+            crate::embedding_server_transport::NativeConnectOutcome::OwnerUnresponsive => {
+                bail!("embedding_server_owner_unresponsive")
+            }
+        };
+        let snapshot = validated_hello(&mut snapshot_stream, transport, runtime, clock)?;
+        if !same_server_authority(&hello_snapshot, &snapshot) {
+            bail!("embedding_qualification_protocol_owner_changed");
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
     Ok(WorkerProtocolExchange {
         request_id,
         submitted_ns,
         finished_ns: clock.now_ns(),
         transport_identity,
         hello_snapshot,
+        final_snapshot,
         response,
         response_payload_bytes,
         terminal_transport_error,
@@ -2959,7 +3645,7 @@ fn validate_named_evidence(scenario: &str, evidence: &ScenarioEvidence) -> Resul
             &["bounded_owner_unresponsive", "owner_identity_stable"],
         ),
         "incompatible_owner" => (
-            &["force_incompatible"],
+            &["force_incompatible", "clear_incompatible"],
             &[
                 "active_owner_rejected",
                 "idle_owner_draining",
@@ -3003,15 +3689,17 @@ fn validate_named_evidence(scenario: &str, evidence: &ScenarioEvidence) -> Resul
                 "anti_idle_work_observed",
                 "owner_preserved_across_idle_boundary",
                 "anti_idle_work_reclaimed",
+                "idle_surfaces_exercised",
                 "owner_absent_after_true_idle",
                 "server_respawned",
             ],
         ),
         "worker_stall" => (
-            &["stall_native"],
+            &["stall_native", "release_native"],
             &[
                 "stalled_request_observed",
                 "watchdog_fail_stop_observed",
+                "unrelated_process_survived",
                 "post_stall_replacement",
             ],
         ),
@@ -3085,7 +3773,7 @@ fn validate_gate_path(path: &Path, directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_gate(clock: &dyn AwakeMonotonicClock, path: &Path) -> Result<()> {
+fn wait_for_gate(clock: &dyn AwakeMonotonicClock, path: &Path, timeout: Duration) -> Result<()> {
     let started = clock.now_ns();
     loop {
         match fs::symlink_metadata(path) {
@@ -3096,7 +3784,7 @@ fn wait_for_gate(clock: &dyn AwakeMonotonicClock, path: &Path) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("inspect embedding qualification start gate"),
         }
-        if elapsed(clock, started) >= CONTROL_TIMEOUT {
+        if elapsed(clock, started) >= timeout {
             bail!("embedding_qualification_start_gate_timeout");
         }
         clock.sleep(POLL);
@@ -3214,6 +3902,30 @@ fn require_worker_success(output: &WorkerOutput, phase: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_replay_attempts(
+    attempts: &[EmbeddingQualificationAttemptResult],
+    old_server_instance_id: &str,
+    new_server_instance_id: &str,
+    phase: &str,
+) -> Result<()> {
+    if attempts.len() != 2
+        || attempts[0].ordinal != 1
+        || attempts[1].ordinal != 2
+        || attempts[0].request_id == attempts[1].request_id
+        || attempts[0].server_instance_id != old_server_instance_id
+        || attempts[0].outcome != "server_loss"
+        || attempts[1].server_instance_id != new_server_instance_id
+        || attempts[1].outcome != "completed"
+        || attempts.iter().any(|attempt| {
+            attempt.request_id.trim().is_empty() || attempt.submitted_ns > attempt.completed_ns
+        })
+        || attempts[0].submitted_ns > attempts[1].submitted_ns
+    {
+        bail!("embedding_qualification_replay_attempt_contract:{phase}");
+    }
+    Ok(())
+}
+
 fn require_worker_error(output: &WorkerOutput, expected: &str, phase: &str) -> Result<()> {
     if output.error.as_ref().map(|error| error.code.as_str()) != Some(expected) {
         bail!("embedding_qualification_worker_error_missing:{phase}:{expected}");
@@ -3238,17 +3950,24 @@ fn require_protocol_success(output: &WorkerOutput, phase: &str) -> Result<()> {
 }
 
 fn worker_error(error: &anyhow::Error) -> WorkerError {
-    let code = error
-        .chain()
-        .find_map(|cause| {
-            cause
-                .downcast_ref::<PerUserEmbeddingError>()
-                .map(|error| error.code.clone())
-        })
-        .unwrap_or_else(|| error_head(error));
+    if let Some(retry) = embedding_retry_state(error) {
+        return WorkerError {
+            code: retry.code,
+            message_head: retry.message.chars().take(128).collect(),
+            retry_class: retry.retry_class,
+            retry_after_ms: retry.retry_after_ms,
+            retry_condition: retry.retry_condition,
+            capacity: retry.capacity,
+        };
+    }
+    let message_head = error_head(error);
     WorkerError {
-        code,
-        message_head: error_head(error),
+        code: message_head.clone(),
+        message_head,
+        retry_class: "terminal".into(),
+        retry_after_ms: 0,
+        retry_condition: "the qualification request is corrected".into(),
+        capacity: None,
     }
 }
 
@@ -3271,6 +3990,14 @@ fn query_parameters(count: u32) -> EmbeddingQualificationParameters {
         input_bytes: 64,
         hold_ms: 0,
     }
+}
+
+fn stall_worker_timeout() -> Duration {
+    Duration::from_millis(
+        PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS
+            .saturating_add(SNAPSHOT_TIMEOUT.as_millis() as u64)
+            .saturating_add(CONTROL_TIMEOUT.as_millis() as u64),
+    )
 }
 
 fn workload_input(workload_id: &str, repeat: u32, ordinal: u32, bytes: usize) -> String {
@@ -3320,6 +4047,7 @@ fn scheduler_values(snapshot: &EmbeddingServerSnapshot) -> BTreeMap<String, Valu
             "active_request_count",
             json!(snapshot.scheduler.active_request_count),
         ),
+        ("lease_count", json!(snapshot.scheduler.lease_count)),
         (
             "active_request_class",
             json!(
@@ -3497,6 +4225,79 @@ fn control_key(action: &str, class: Option<&str>) -> String {
     class.map_or_else(|| action.into(), |class| format!("{action}:{class}"))
 }
 
+fn validated_idle_epoch(event: &ControlEvent, snapshot: &EmbeddingServerSnapshot) -> Result<u64> {
+    let details = event
+        .details
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_idle_epoch_missing"))?;
+    let expected = BTreeSet::from([
+        "idle_epoch_ns",
+        "true_idle",
+        "clock_domain",
+        "clock_boot_id",
+        "server_instance_id",
+    ]);
+    if details.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected
+        || details.get("true_idle").map(String::as_str) != Some("true")
+        || details.get("clock_domain") != Some(&snapshot.clock.domain)
+        || details.get("clock_boot_id") != Some(&snapshot.clock.boot_id)
+        || details.get("server_instance_id") != Some(&snapshot.process.server_instance_id)
+        || event.clock.domain != snapshot.clock.domain
+        || event.clock.boot_id != snapshot.clock.boot_id
+    {
+        bail!("embedding_qualification_idle_epoch_invalid");
+    }
+    let idle_epoch_ns = details
+        .get("idle_epoch_ns")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("embedding_qualification_idle_epoch_invalid"))?;
+    if idle_epoch_ns > event.clock.observed_ns {
+        bail!("embedding_qualification_idle_epoch_in_future");
+    }
+    Ok(idle_epoch_ns)
+}
+
+fn consume_watchdog_marker(
+    directory: &Path,
+    nonce_sha256: &str,
+    expected: &EmbeddingServerSnapshot,
+) -> Result<(EmbeddingQualificationWatchdogMarker, String)> {
+    let filename = codestory_retrieval::embedding_qualification_watchdog_marker_filename(
+        nonce_sha256,
+        &expected.process.server_instance_id,
+    )?;
+    let path = directory.join(filename);
+    validate_direct_child(&path, directory, true)?;
+    let bytes = read_private_request(&path)?;
+    let digest = sha256_bytes(&bytes);
+    let marker: EmbeddingQualificationWatchdogMarker =
+        serde_json::from_slice(&bytes).context("parse watchdog fail-stop marker")?;
+    if marker.schema_version != 1
+        || marker.nonce_sha256 != nonce_sha256
+        || marker.server_instance_id != expected.process.server_instance_id
+        || marker.pid != expected.process.pid
+        || marker.process_start_id != expected.process.process_start_id
+        || marker.executable_sha256 != expected.process.executable_sha256
+        || marker.executable_version != expected.process.executable_version
+        || marker.reason != "embedding_engine_stalled"
+        || marker.clock.domain != "awake_monotonic"
+        || marker.clock.boot_id != expected.clock.boot_id
+        || marker.last_progress_ns > marker.clock.observed_ns
+        || marker.clock.observed_ns - marker.last_progress_ns
+            < marker.hard_native_no_progress_ms.saturating_mul(1_000_000)
+        || marker.hard_native_no_progress_ms != PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS
+        || marker.watchdog_cadence_ms != PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS
+    {
+        bail!("embedding_qualification_watchdog_marker_invalid");
+    }
+    fs::remove_file(&path).context("consume watchdog fail-stop marker")?;
+    #[cfg(unix)]
+    File::open(directory)
+        .and_then(|parent| parent.sync_all())
+        .context("sync consumed watchdog marker directory")?;
+    Ok((marker, digest))
+}
+
 fn qualification_request_id(prefix: &str, now_ns: u64) -> String {
     format!("{prefix}-{}-{now_ns}", std::process::id())
 }
@@ -3635,7 +4436,7 @@ mod tests {
                 &["bounded_owner_unresponsive", "owner_identity_stable"],
             ),
             "incompatible_owner" => (
-                &["force_incompatible"],
+                &["force_incompatible", "clear_incompatible"],
                 &[
                     "active_owner_rejected",
                     "idle_owner_draining",
@@ -3668,10 +4469,11 @@ mod tests {
                 ],
             ),
             "worker_stall" => (
-                &["stall_native"],
+                &["stall_native", "release_native"],
                 &[
                     "stalled_request_observed",
                     "watchdog_fail_stop_observed",
+                    "unrelated_process_survived",
                     "post_stall_replacement",
                 ],
             ),

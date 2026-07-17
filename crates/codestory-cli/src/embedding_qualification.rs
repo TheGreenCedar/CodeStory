@@ -150,7 +150,7 @@ pub(crate) fn run_internal_embedding_qualification(
     let request_bytes = read_private_request(&command.request)?;
     let request: QualificationSuiteRequest =
         serde_json::from_slice(&request_bytes).context("parse embedding qualification request")?;
-    let validation = validate_request(&request, &command.request, &command.output)?;
+    let validation = validate_request(&request, &request_bytes, &command.request, &command.output)?;
     let defaults = crate::sidecar_runtime::process_defaults();
     let overrides = SidecarRuntimeOverrides::default();
     let runtimes = request
@@ -224,6 +224,7 @@ pub(crate) fn run_internal_embedding_qualification_worker(
 
 fn validate_request(
     request: &QualificationSuiteRequest,
+    request_bytes: &[u8],
     request_path: &Path,
     output_path: &Path,
 ) -> Result<QualificationValidation> {
@@ -249,12 +250,10 @@ fn validate_request(
     validate_package_and_contracts(request)?;
     validate_runtime(&request.runtime)?;
     validate_projects(&request.projects)?;
-    let canonical_request =
-        serde_json::to_vec(request).context("serialize canonical qualification request")?;
     Ok(QualificationValidation {
         output_directory: qualification_directory,
         nonce_sha256,
-        request_sha256: sha256_bytes(&canonical_request),
+        request_sha256: sha256_bytes(request_bytes),
     })
 }
 

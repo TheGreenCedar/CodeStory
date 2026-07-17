@@ -1732,14 +1732,15 @@ impl Storage {
                 )));
             }
             NonmutatingOpenPolicy::FreshnessFence
-                if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION =>
+                if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+                    && !has_incomplete_incremental_marker(&conn)? =>
             {
-                if !has_incomplete_incremental_marker(&conn)? {
-                    return Err(StorageError::Other(format!(
-                        "Freshness observation requires the durable incomplete-run marker for schema sentinel {version}"
-                    )));
-                }
+                return Err(StorageError::Other(format!(
+                    "Freshness observation requires the durable incomplete-run marker for schema sentinel {version}"
+                )));
             }
+            NonmutatingOpenPolicy::FreshnessFence
+                if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION => {}
             NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
                 return Err(StorageError::Other(format!(
                     "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"

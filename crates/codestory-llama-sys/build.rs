@@ -46,6 +46,7 @@ struct EmbeddingServerConstants {
     spawn_convergence_timeout_ms: u64,
     retry_after_ms: u64,
     query_request_deadline_ms: u64,
+    bulk_replay_success_budget_ms: u64,
     bulk_request_deadline_ms: u64,
     hard_native_no_progress_ms: u64,
     watchdog_cadence_ms: u64,
@@ -158,6 +159,7 @@ fn main() {
              pub const PER_USER_EMBEDDING_SPAWN_CONVERGENCE_TIMEOUT_MS: u64 = {spawn_convergence_timeout_ms};\n\
              pub const PER_USER_EMBEDDING_RETRY_AFTER_MS: u64 = {retry_after_ms};\n\
              pub const PER_USER_EMBEDDING_QUERY_REQUEST_DEADLINE_MS: u64 = {query_request_deadline_ms};\n\
+             pub const PER_USER_EMBEDDING_BULK_REPLAY_SUCCESS_BUDGET_MS: u64 = {bulk_replay_success_budget_ms};\n\
              pub const PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS: u64 = {bulk_request_deadline_ms};\n\
              pub const PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS: u64 = {hard_native_no_progress_ms};\n\
              pub const PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS: u64 = {watchdog_cadence_ms};\n\
@@ -172,6 +174,8 @@ fn main() {
             retry_after_ms = embedding_server_constants.retry_after_ms,
             query_request_deadline_ms =
                 embedding_server_constants.query_request_deadline_ms,
+            bulk_replay_success_budget_ms =
+                embedding_server_constants.bulk_replay_success_budget_ms,
             bulk_request_deadline_ms =
                 embedding_server_constants.bulk_request_deadline_ms,
             hard_native_no_progress_ms =
@@ -279,6 +283,7 @@ fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
         spawn_convergence_timeout_ms,
         retry_after_ms,
         query_request_deadline_ms,
+        bulk_replay_success_budget_ms,
         bulk_request_deadline_ms,
         hard_native_no_progress_ms,
         watchdog_cadence_ms,
@@ -307,6 +312,7 @@ fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
             positive(selected, "spawn_convergence_timeout_ms"),
             positive(capacity, "retry_after_ms"),
             positive(deadlines, "query_request_deadline_ms"),
+            positive(deadlines, "bulk_replay_success_budget_ms"),
             positive(deadlines, "bulk_request_deadline_ms"),
             positive(selected, "hard_native_no_progress_ms"),
             positive(selected, "watchdog_cadence_ms"),
@@ -319,6 +325,7 @@ fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
             positive(selected, "spawn_convergence_timeout_ms"),
             positive(selected, "retry_after_ms"),
             positive(selected, "query_request_deadline_ms"),
+            positive(selected, "bulk_replay_success_budget_ms"),
             positive(selected, "bulk_request_deadline_ms"),
             positive(selected, "hard_native_no_progress_ms"),
             positive(selected, "watchdog_cadence_ms"),
@@ -329,6 +336,15 @@ fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
     assert!(
         query_request_deadline_ms <= bulk_request_deadline_ms,
         "query request deadline must not exceed the bulk deadline"
+    );
+    let required_bulk_deadline_ms = hard_native_no_progress_ms
+        .checked_add(watchdog_cadence_ms)
+        .and_then(|value| value.checked_add(spawn_convergence_timeout_ms))
+        .and_then(|value| value.checked_add(bulk_replay_success_budget_ms))
+        .expect("embedding server bulk replay deadline calculation overflowed");
+    assert!(
+        bulk_request_deadline_ms >= required_bulk_deadline_ms,
+        "bulk request deadline must cover watchdog detection, replacement convergence, and one successful replay"
     );
     assert!(
         watchdog_cadence_ms < hard_native_no_progress_ms,
@@ -348,6 +364,7 @@ fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
         spawn_convergence_timeout_ms,
         retry_after_ms,
         query_request_deadline_ms,
+        bulk_replay_success_budget_ms,
         bulk_request_deadline_ms,
         hard_native_no_progress_ms,
         watchdog_cadence_ms,

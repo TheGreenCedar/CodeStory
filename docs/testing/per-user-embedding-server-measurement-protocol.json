@@ -4,6 +4,7 @@
   "clock_policy": {
     "domain": "awake_monotonic",
     "cross_process_timestamp_subtraction": false,
+    "server_idle_deadline_proof": "server_event_elapsed_then_client_local_remaining_wait",
     "os_suspend_consumes_product_timers": false,
     "platform_apis": {
       "linux": [
@@ -498,14 +499,14 @@
     }
   },
   "constant_selection": {
-    "selection_order": [
-      "connect_timeout_ms",
-      "spawn_convergence_timeout_ms",
-      "request_deadlines_ms",
-      "capacity_retry_policy",
-      "election_backoff_policy",
-      "hard_native_no_progress_ms",
-      "watchdog_cadence_ms"
+      "selection_order": [
+        "connect_timeout_ms",
+        "spawn_convergence_timeout_ms",
+        "hard_native_no_progress_ms",
+        "watchdog_cadence_ms",
+        "request_deadlines_ms",
+        "capacity_retry_policy",
+        "election_backoff_policy"
     ],
     "raw_source_cells": {
       "existing_owner_connect_duration": {
@@ -586,7 +587,8 @@
           "source_cells": [
             "bulk_request_duration"
           ],
-          "formula": "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+          "replay_success_budget_formula": "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))",
+          "formula": "hard_native_no_progress_ms+watchdog_cadence_ms+spawn_convergence_timeout_ms+bulk_replay_success_budget_ms"
         }
       },
       "capacity_retry_policy": {

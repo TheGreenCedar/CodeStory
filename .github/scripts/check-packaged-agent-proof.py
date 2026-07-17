@@ -231,6 +231,91 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def retained_mcp_transcript(transcript: list[dict]) -> dict:
+    entries = []
+    for item in transcript:
+        request = item.get("request") if isinstance(item, dict) else None
+        response = item.get("response") if isinstance(item, dict) else None
+        require(
+            isinstance(request, dict) and isinstance(response, dict),
+            "MCP transcript entry is malformed",
+        )
+        entries.append(
+            {
+                "request_id_sha256": canonical_sha256(request.get("id")),
+                "method": require_nonempty_string(
+                    request.get("method"), "MCP transcript method"
+                ),
+                "response_status": "error" if "error" in response else "ok",
+            }
+        )
+    return {
+        "schema_version": 1,
+        "entry_count": len(entries),
+        "raw_transcript_sha256": canonical_sha256(transcript),
+        "entries": entries,
+    }
+
+
+def retained_runtime_evidence(runtime: dict) -> dict:
+    return json.loads(
+        json.dumps(
+            {key: value for key, value in runtime.items() if not key.startswith("_")}
+        )
+    )
+
+
+def assert_retained_json_privacy(target: Path, forbidden_values: list[str]) -> None:
+    forbidden = sorted(
+        {value for value in forbidden_values if isinstance(value, str) and value}
+    )
+    paths = [target] if target.is_file() else sorted(target.rglob("*.json"))
+    for path in paths:
+        require(path.is_file() and not path.is_symlink(), f"retained JSON is unsafe: {path}")
+        payload = path.read_bytes()
+        for value in forbidden:
+            require(
+                value.encode("utf-8") not in payload,
+                f"retained evidence {path.name} leaked private runtime material",
+            )
+        try:
+            document = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ProofFailure(f"retained evidence {path.name} is not valid JSON: {exc}") from exc
+
+        def scan(value: object, field_path: str = "$") -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    require(isinstance(key, str), f"retained evidence {path.name} has a non-string field")
+                    normalized = key.lower()
+                    require(
+                        normalized
+                        not in {
+                            "directory",
+                            "output_directory",
+                            "project_path",
+                            "project_root",
+                            "repository_path",
+                            "request_text",
+                            "query_text",
+                            "question_text",
+                            "qualification_nonce",
+                        },
+                        f"retained evidence {path.name} leaked private field {field_path}.{key}",
+                    )
+                    scan(child, f"{field_path}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    scan(child, f"{field_path}[{index}]")
+            elif isinstance(value, str):
+                require(
+                    not Path(value).is_absolute(),
+                    f"retained evidence {path.name} leaked an absolute path at {field_path}",
+                )
+
+        scan(document)
+
+
 def require_sha256(value: object, field: str) -> str:
     require(
         isinstance(value, str)
@@ -530,11 +615,11 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
     expected_constant_order = [
         "connect_timeout_ms",
         "spawn_convergence_timeout_ms",
+        "hard_native_no_progress_ms",
+        "watchdog_cadence_ms",
         "request_deadlines_ms",
         "capacity_retry_policy",
         "election_backoff_policy",
-        "hard_native_no_progress_ms",
-        "watchdog_cadence_ms",
     ]
     require(
         constant_selection["selection_order"] == expected_constant_order,
@@ -598,9 +683,13 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
         )
         == "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
         and formulas["request_deadlines_ms"].get("bulk_request_deadline_ms", {}).get(
+            "replay_success_budget_formula"
+        )
+        == "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        and formulas["request_deadlines_ms"].get("bulk_request_deadline_ms", {}).get(
             "formula"
         )
-        == "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))",
+        == "hard_native_no_progress_ms+watchdog_cadence_ms+spawn_convergence_timeout_ms+bulk_replay_success_budget_ms",
         "request-deadline selection formulas changed",
     )
     require(
@@ -690,6 +779,13 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
     )
     clock_policy = protocol.get("clock_policy")
     suspend = clock_policy.get("suspend_detection") if isinstance(clock_policy, dict) else None
+    require(
+        isinstance(clock_policy, dict)
+        and clock_policy.get("cross_process_timestamp_subtraction") is False
+        and clock_policy.get("server_idle_deadline_proof")
+        == "server_event_elapsed_then_client_local_remaining_wait",
+        "measurement clock policy permits cross-process idle-deadline arithmetic",
+    )
     require(
         isinstance(suspend, dict)
         and suspend.get("maximum_inclusive_minus_awake_ns") == 50_000_000
@@ -1480,7 +1576,22 @@ def run(command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> 
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
-    require(completed.returncode == 0, f"command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr[-2000:]}")
+    if completed.returncode != 0:
+        stdout_tail = completed.stdout[-2000:].strip()
+        stderr_tail = completed.stderr[-2000:].strip()
+        details = "\n".join(
+            part
+            for part in (
+                f"stdout:\n{stdout_tail}" if stdout_tail else "",
+                f"stderr:\n{stderr_tail}" if stderr_tail else "",
+            )
+            if part
+        )
+        detail_suffix = f"\n{details}" if details else ""
+        raise ProofFailure(
+            f"command failed ({completed.returncode}): {' '.join(command)}"
+            f"{detail_suffix}"
+        )
     return result
 
 
@@ -3196,7 +3307,8 @@ def verified_live_executable(
 
 def current_account_identity() -> str:
     if os.name != "nt":
-        return f"uid:{os.geteuid()}"
+        raw = f"uid:{os.geteuid()}"
+        return "account:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
     completed = subprocess.run(
         ["whoami", "/user", "/fo", "csv", "/nh"],
         text=True,
@@ -3206,7 +3318,8 @@ def current_account_identity() -> str:
     require(completed.returncode == 0, "could not read current Windows account SID")
     match = re.search(r'"(S-[0-9-]+)"\s*$', completed.stdout.strip())
     require(match is not None, "Windows account command omitted SID")
-    return f"sid:{match.group(1)}"
+    raw = f"sid:{match.group(1)}"
+    return "account:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def opaque_repository_id(project: Path) -> str:
@@ -3630,7 +3743,6 @@ def qualification_environment(root: Path, env: dict[str, str]) -> tuple[dict[str
     qualified["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
     return qualified, {
         "schema_version": QUALIFICATION_SCHEMA_VERSION,
-        "directory": str(proof_root),
         "nonce_sha256": hashlib.sha256(nonce.encode("ascii")).hexdigest(),
     }
 
@@ -3924,7 +4036,10 @@ def prove_runtime(
                 "new plugin host did not join the existing server",
             )
         finally:
-            write_json(out_dir / "plugin-host-c-mcp.json", host_c.transcript)
+            write_json(
+                out_dir / "plugin-host-c-mcp.json",
+                retained_mcp_transcript(host_c.transcript),
+            )
             host_c.close()
 
         cold_models = list(embedded_models.rglob("*.gguf"))
@@ -3980,6 +4095,23 @@ def prove_runtime(
             ),
             "_qualification_projects": [str(project_a), str(project_b)],
             "_memory_observations": memory_observations,
+            "_qualification_forbidden_values": [
+                str(project_a),
+                str(project_b),
+                str(plugin_root),
+                str(cli.resolve()),
+                str(root.resolve()),
+                qualified_env["CODESTORY_EMBED_QUALIFICATION_DIR"],
+                qualified_env["CODESTORY_EMBED_QUALIFICATION_NONCE"],
+                args.query,
+                args.question,
+                query_b,
+                *(
+                    [str(managed_binary_path)]
+                    if args.proof_tier == "installed_runtime"
+                    else []
+                ),
+            ],
             "nonclaims": {
                 claim: {
                     "claimed": False,
@@ -3989,12 +4121,27 @@ def prove_runtime(
             },
         }
     finally:
-        write_json(out_dir / "plugin-host-a-mcp.json", host_a.transcript)
-        write_json(out_dir / "plugin-host-b-mcp.json", host_b.transcript)
+        write_json(
+            out_dir / "plugin-host-a-mcp.json",
+            retained_mcp_transcript(host_a.transcript),
+        )
+        write_json(
+            out_dir / "plugin-host-b-mcp.json",
+            retained_mcp_transcript(host_b.transcript),
+        )
         host_a.close()
         host_b.close()
     assert_no_legacy_state(Path(qualified_env["CODESTORY_CACHE_ROOT"]))
-    write_json(out_dir / "two-host-server-proof.json", result)
+    public_runtime_evidence = out_dir / "two-host-server-proof.json"
+    write_json(public_runtime_evidence, retained_runtime_evidence(result))
+    forbidden_runtime_values = result.get("_qualification_forbidden_values", [])
+    for public_artifact in (
+        out_dir / "plugin-host-a-mcp.json",
+        out_dir / "plugin-host-b-mcp.json",
+        out_dir / "plugin-host-c-mcp.json",
+        public_runtime_evidence,
+    ):
+        assert_retained_json_privacy(public_artifact, forbidden_runtime_values)
     return result
 
 
@@ -4129,18 +4276,58 @@ def server_observation_from_control_event(event: dict, phase: str) -> dict:
 
 def publication_identity_from_status(status: dict) -> str:
     require(status.get("retrieval_mode") == "full", "qualification status is not full")
+    contract = status.get("manifest_contract")
+    manifest = status.get("manifest")
+    require(
+        isinstance(contract, dict),
+        "qualification status omitted its manifest contract",
+    )
+    require(
+        isinstance(manifest, dict),
+        "qualification status omitted its published manifest",
+    )
     generation = require_nonempty_string(
-        status.get("manifest_generation"), "qualification manifest generation"
+        contract.get("generation"), "qualification manifest contract generation"
     )
     input_hash = require_sha256(
-        status.get("manifest_input_hash"), "qualification manifest input hash"
+        contract.get("input_hash"), "qualification manifest contract input hash"
+    )
+    project_id = require_opaque_identifier(
+        contract.get("project_id"), "qualification manifest contract project"
+    )
+    schema_version = require_positive_int(
+        contract.get("schema_version"), "qualification manifest contract schema"
+    )
+    graph_hash = require_sha256(
+        contract.get("graph_hash"), "qualification manifest contract graph hash"
+    )
+    require(
+        manifest.get("project_id") == project_id
+        and manifest.get("sidecar_generation") == generation
+        and manifest.get("sidecar_input_hash") == input_hash
+        and manifest.get("sidecar_schema_version") == schema_version
+        and manifest.get("graph_artifact_hash") == graph_hash,
+        "qualification manifest report disagrees with its manifest contract",
     )
     return canonical_sha256(
         {
-            "manifest_generation": generation,
-            "manifest_input_hash": input_hash,
-            "profile": status.get("profile"),
-            "run_id": status.get("run_id"),
+            "project_id": project_id,
+            "generation": generation,
+            "input_hash": input_hash,
+            "schema_version": schema_version,
+            "graph_hash": graph_hash,
+            "lexical_version": require_nonempty_string(
+                manifest.get("lexical_version"),
+                "qualification manifest lexical version",
+            ),
+            "semantic_generation": require_nonempty_string(
+                manifest.get("semantic_generation"),
+                "qualification manifest semantic generation",
+            ),
+            "scip_revision": require_nonempty_string(
+                manifest.get("scip_revision"),
+                "qualification manifest SCIP revision",
+            ),
         }
     )
 
@@ -4197,6 +4384,78 @@ def run_quality_search(
     return rank, output_sha256
 
 
+def run_publication_replacement_worker(
+    cli: Path,
+    env: dict[str, str],
+    project: Path,
+    private_root: Path,
+    nonce: str,
+    *,
+    timeout: int,
+) -> None:
+    request_path = private_root / "publication-replacement-worker-request.json"
+    output_path = private_root / "publication-replacement-worker-output.json"
+    write_private_json(
+        request_path,
+        {
+            "schema_version": 1,
+            "nonce_sha256": hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+            "executable_sha256": sha256(cli),
+            "project": str(project.resolve()),
+            "operation": "query",
+            "parameters": {
+                "query_count": 1,
+                "bulk_count": 0,
+                "documents_per_bulk": 0,
+                "input_bytes": 64,
+                "hold_ms": 0,
+            },
+        },
+    )
+    run(
+        [
+            str(cli),
+            "internal-embedding-qualification-worker",
+            "--request",
+            str(request_path),
+            "--output",
+            str(output_path),
+        ],
+        env=env,
+        cwd=project,
+        timeout=timeout,
+    )
+    require(
+        output_path.is_file() and not output_path.is_symlink(),
+        "publication replacement worker omitted its output",
+    )
+    try:
+        output = json.loads(output_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(
+            f"publication replacement worker output is not valid JSON: {exc}"
+        ) from exc
+    require(
+        isinstance(output, dict)
+        and output.get("schema_version") == 1
+        and output.get("executable_sha256") == sha256(cli)
+        and output.get("error") is None,
+        "publication replacement worker failed",
+    )
+    result = output.get("result")
+    operations = result.get("operations") if isinstance(result, dict) else None
+    require(
+        isinstance(result, dict)
+        and result.get("schema_version") == 1
+        and result.get("scenario") == "query"
+        and isinstance(operations, list)
+        and len(operations) == 1
+        and operations[0].get("status") == "ok"
+        and operations[0].get("error_code") is None,
+        "publication replacement worker did not complete its query",
+    )
+
+
 def produce_product_publication_fault_evidence(
     cli: Path,
     env: dict[str, str],
@@ -4226,6 +4485,11 @@ def produce_product_publication_fault_evidence(
     lexical_file = project / "README.md"
     baseline_lexical = "# Publication qualification baseline\n"
     lexical_file.write_text(baseline_lexical, encoding="utf-8")
+    baseline_file_times = {
+        path: (metadata.st_atime_ns, metadata.st_mtime_ns)
+        for path in (source_file, lexical_file)
+        for metadata in (path.stat(),)
+    }
     run_id = "publication-qualification"
     index_command = [
         str(cli),
@@ -4321,8 +4585,13 @@ def produce_product_publication_fault_evidence(
         send_server_qualification_control(
             private_root, nonce, sequence=2, action="crash_server", timeout=timeout
         )
-        run_quality_search(
-            cli, env, project, run_id, anchors[0], anchors[0], timeout=timeout
+        run_publication_replacement_worker(
+            cli,
+            env,
+            project,
+            private_root,
+            nonce,
+            timeout=timeout,
         )
         snapshot_after = send_server_qualification_control(
             private_root, nonce, sequence=3, action="snapshot", timeout=timeout
@@ -4345,6 +4614,8 @@ def produce_product_publication_fault_evidence(
     finally:
         source_file.write_text(baseline_source, encoding="utf-8")
         lexical_file.write_text(baseline_lexical, encoding="utf-8")
+        for path, times in baseline_file_times.items():
+            os.utime(path, ns=times)
     require(
         candidate.returncode is not None and candidate.returncode != 0,
         "publication candidate did not fail after losing its server lease",
@@ -5050,6 +5321,7 @@ def derive_scenario_assertions(
                 "bulk_capacity",
                 "bulk_depth",
                 "active_request_count",
+                "lease_count",
                 "active_request_class",
             },
         )
@@ -5059,6 +5331,7 @@ def derive_scenario_assertions(
             "bulk_capacity",
             "bulk_depth",
             "active_request_count",
+            "lease_count",
         ):
             require_nonnegative_int(values[field], f"qualification transition {kind}.{field}")
         require(
@@ -5066,6 +5339,87 @@ def derive_scenario_assertions(
             f"qualification transition {kind} has an invalid active request class",
         )
         return values
+
+    def replay_attempts(
+        values: dict,
+        *,
+        old_server_instance_id: str,
+        new_server_instance_id: str,
+    ) -> list[dict]:
+        attempts = values["wire_attempts"]
+        require(
+            values["wire_attempt_count"] == 2
+            and isinstance(attempts, list)
+            and len(attempts) == 2,
+            "replay evidence must contain exactly the original RPC and one replay",
+        )
+        for index, attempt in enumerate(attempts, start=1):
+            require(isinstance(attempt, dict), "replay attempt is malformed")
+            require_exact_keys(
+                attempt,
+                {
+                    "ordinal",
+                    "request_id",
+                    "server_instance_id",
+                    "submitted_ns",
+                    "completed_ns",
+                    "outcome",
+                },
+                f"replay attempt {index}",
+            )
+            require(attempt["ordinal"] == index, "replay attempt ordinal is not exact")
+            require(
+                isinstance(attempt["request_id"], str) and bool(attempt["request_id"]),
+                "replay attempt request ID is missing",
+            )
+            submitted = require_nonnegative_int(
+                attempt["submitted_ns"], f"replay attempt {index} submitted_ns"
+            )
+            completed = require_nonnegative_int(
+                attempt["completed_ns"], f"replay attempt {index} completed_ns"
+            )
+            require(completed >= submitted, "replay attempt clock moved backwards")
+        require(
+            attempts[0]["request_id"] != attempts[1]["request_id"]
+            and attempts[0]["server_instance_id"] == old_server_instance_id
+            and attempts[0]["outcome"] == "server_loss"
+            and attempts[1]["server_instance_id"] == new_server_instance_id
+            and attempts[1]["outcome"] == "completed",
+            "replay attempts do not bind the old loss and exact replacement completion",
+        )
+        return attempts
+
+    def retry_state(value: object, field: str) -> dict:
+        require(isinstance(value, dict), f"{field} is malformed")
+        expected = {
+            "code",
+            "message_head",
+            "retry_class",
+            "retry_after_ms",
+            "retry_condition",
+        }
+        if "capacity" in value:
+            expected.add("capacity")
+        require_exact_keys(value, expected, field)
+        require_nonempty_string(value["code"], f"{field}.code")
+        require_nonempty_string(value["message_head"], f"{field}.message_head")
+        require_nonempty_string(value["retry_class"], f"{field}.retry_class")
+        require_nonnegative_int(value["retry_after_ms"], f"{field}.retry_after_ms")
+        require_nonempty_string(value["retry_condition"], f"{field}.retry_condition")
+        require(
+            value["retry_class"]
+            in {
+                "after_capacity_change",
+                "after_delay",
+                "after_owner_idle",
+                "after_server_change",
+                "none",
+                "same_rpc_once",
+                "terminal",
+            },
+            f"{field}.retry_class is outside the protocol contract",
+        )
+        return value
 
     snapshots = [
         observation["snapshot"]
@@ -5105,9 +5459,11 @@ def derive_scenario_assertions(
                 active["query_depth"] > 0
                 and active["bulk_depth"] > 0
                 and active["active_request_count"] > 0
+                and active["lease_count"] > 0
                 and reclaimed["query_depth"] == 0
                 and reclaimed["bulk_depth"] == 0
                 and reclaimed["active_request_count"] == 0
+                and reclaimed["lease_count"] == 0
                 and terminated["termination"] == "terminated"
             ),
             "other_client_continues": (
@@ -5176,39 +5532,74 @@ def derive_scenario_assertions(
     elif scenario_id == "frozen_owner":
         bounded = transition(
             "bounded_owner_unresponsive",
-            {"started_ns", "finished_ns", "error_code"},
+            {
+                "started_ns",
+                "finished_ns",
+                "error_code",
+                "timeout_ms",
+                "clock_domain",
+                "clock_boot_id",
+                "retry",
+            },
         )
         stable = transition(
             "owner_identity_stable",
-            {"server_instance_id", "lifetime_authority_id"},
+            {
+                "server_instance_id",
+                "lifetime_authority_id",
+                "listener_id",
+                "pid",
+                "process_start_id",
+                "post_release_query_succeeded",
+            },
         )
         started = require_nonnegative_int(bounded["started_ns"], "frozen owner started_ns")
         finished = require_nonnegative_int(bounded["finished_ns"], "frozen owner finished_ns")
+        timeout_ms = require_positive_int(bounded["timeout_ms"], "frozen owner timeout_ms")
+        stable_pid = require_positive_int(stable["pid"], "frozen owner stable pid")
+        retry = retry_state(bounded["retry"], "frozen owner retry")
         stable_identity = (
             len(snapshot_instances) == 1
             and stable["server_instance_id"] == next(iter(snapshot_instances))
             and len(snapshot_authorities) == 1
-            and stable["lifetime_authority_id"] == next(iter(snapshot_authorities))[0]
+            and (
+                stable["lifetime_authority_id"],
+                stable["listener_id"],
+            )
+            == next(iter(snapshot_authorities))
+            and all(
+                snapshot["process"]["pid"] == stable_pid
+                and snapshot["process"]["process_start_id"]
+                == stable["process_start_id"]
+                for snapshot in snapshots
+            )
+            and stable["post_release_query_succeeded"] is True
         )
         assertions = {
             "owner_unresponsive_is_bounded": (
                 finished >= started
+                and finished - started <= timeout_ms * 1_000_000
+                and bounded["clock_domain"] == "awake_monotonic"
+                and bool(bounded["clock_boot_id"])
                 and bounded["error_code"] == "embedding_server_owner_unresponsive"
+                and retry["code"] == bounded["error_code"]
+                and retry["retry_class"] == "after_server_change"
+                and bool(retry["retry_condition"])
             ),
             "authority_retained": stable_identity,
-            "no_unlink": "crash_server" not in control_actions,
-            "no_pid_kill": "crash_server" not in control_actions,
+            "no_unlink": stable_identity,
+            "no_pid_kill": stable_identity,
             "no_takeover": stable_identity,
             "no_second_engine": len(snapshot_engines) == 1,
         }
     elif scenario_id == "incompatible_owner":
         active = transition(
             "active_owner_rejected",
-            {"compatibility_evidence", "error_code"},
+            {"compatibility_evidence", "error_code", "retry"},
         )
         idle = transition(
             "idle_owner_draining",
-            {"compatibility_evidence", "error_code"},
+            {"compatibility_evidence", "error_code", "retry"},
         )
         replacement = transition(
             "compatible_replacement",
@@ -5222,15 +5613,27 @@ def derive_scenario_assertions(
             }
             <= snapshot_instances
         )
+        active_retry = retry_state(active["retry"], "incompatible active retry")
+        idle_retry = retry_state(idle["retry"], "incompatible idle retry")
         assertions = {
             "idle_owner_drains": (
                 idle["compatibility_evidence"] == "injected_contract_mismatch"
                 and idle["error_code"] == "embedding_server_draining"
+                and idle_retry["code"] == idle["error_code"]
+                and idle_retry["retry_class"] == "after_owner_idle"
+                and idle_retry["retry_after_ms"] == 0
+                and idle_retry["retry_condition"]
+                == "the incompatible server exits while fully idle"
                 and replaced
             ),
             "active_owner_returns_typed_retry": (
                 active["compatibility_evidence"] == "injected_contract_mismatch"
                 and active["error_code"] == "embedding_server_incompatible_active_owner"
+                and active_retry["code"] == active["error_code"]
+                and active_retry["retry_class"] == "after_owner_idle"
+                and active_retry["retry_after_ms"] == 0
+                and active_retry["retry_condition"]
+                == "the incompatible server exits while fully idle"
             ),
             "one_authority": len(snapshot_authorities) <= 2 and replaced,
             "one_engine_maximum": len(snapshot_instances) == 2 and replaced,
@@ -5334,27 +5737,31 @@ def derive_scenario_assertions(
         replay = transition(
             "query_replayed",
             {
-                "submitted_operation_count",
-                "completed_operation_count",
-                "observed_server_instance_ids",
+                "logical_operation_count",
+                "wire_attempt_count",
+                "wire_attempts",
             },
         )
-        observed_ids = replay["observed_server_instance_ids"]
+        attempts = replay_attempts(
+            replay,
+            old_server_instance_id=replacement["old_server_instance_id"],
+            new_server_instance_id=replacement["new_server_instance_id"],
+        )
         assertions = {
             "one_replacement_server": (
                 active["active_request_class"] == "query"
                 and replacement["old_server_instance_id"]
                 != replacement["new_server_instance_id"]
-                and observed_ids
+                and [attempt["server_instance_id"] for attempt in attempts]
                 == [
                     replacement["old_server_instance_id"],
                     replacement["new_server_instance_id"],
                 ]
             ),
             "pure_embedding_rpc_replayed_at_most_once": (
-                replay["submitted_operation_count"]
-                == replay["completed_operation_count"]
-                == 1
+                replay["logical_operation_count"] == 1
+                and replay["wire_attempt_count"] <= 2
+                and sum(attempt["outcome"] == "completed" for attempt in attempts) == 1
             ),
         }
     elif scenario_id == "true_idle_respawn":
@@ -5371,7 +5778,23 @@ def derive_scenario_assertions(
         reclaimed = scheduler("anti_idle_work_reclaimed")
         waited = transition(
             "true_idle_wait",
-            {"started_ns", "finished_ns", "contract_idle_timeout_ms"},
+            {
+                "server_idle_epoch_ns",
+                "server_idle_elapsed_before_client_wait_ns",
+                "client_wait_required_ns",
+                "client_wait_elapsed_ns",
+                "contract_idle_timeout_ms",
+                "clock_boot_id",
+            },
+        )
+        idle_surfaces = transition(
+            "idle_surfaces_exercised",
+            {
+                "diagnostic_count",
+                "idle_connection_close_count",
+                "last_diagnostic_client_elapsed_ns",
+                "last_idle_connection_close_client_elapsed_ns",
+            },
         )
         absent = transition("owner_absent_after_true_idle", {"old_server_instance_id"})
         respawned = transition("server_respawned", {"new_server_instance_id"})
@@ -5379,28 +5802,70 @@ def derive_scenario_assertions(
             waited["contract_idle_timeout_ms"],
             "true idle contract timeout",
         )
+        diagnostic_count = require_positive_int(
+            idle_surfaces["diagnostic_count"],
+            "true idle diagnostic count",
+        )
+        idle_connection_close_count = require_positive_int(
+            idle_surfaces["idle_connection_close_count"],
+            "true idle connection close count",
+        )
+        last_diagnostic_client_elapsed_ns = require_nonnegative_int(
+            idle_surfaces["last_diagnostic_client_elapsed_ns"],
+            "true idle last diagnostic ns",
+        )
+        last_idle_connection_close_client_elapsed_ns = require_nonnegative_int(
+            idle_surfaces["last_idle_connection_close_client_elapsed_ns"],
+            "true idle last connection close ns",
+        )
         absent_observed = any(
             observation.get("phase") == "true_idle_after_wait"
             and observation.get("snapshot") is None
             for observation in process_observations
+        )
+        require_nonnegative_int(
+            waited["server_idle_epoch_ns"], "true idle server epoch"
+        )
+        server_idle_elapsed_before_client_wait_ns = require_nonnegative_int(
+            waited["server_idle_elapsed_before_client_wait_ns"],
+            "true idle server elapsed before local wait",
+        )
+        client_wait_required_ns = require_nonnegative_int(
+            waited["client_wait_required_ns"], "true idle client wait required"
+        )
+        client_wait_elapsed_ns = require_nonnegative_int(
+            waited["client_wait_elapsed_ns"], "true idle client wait elapsed"
         )
         assertions = {
             "queued_active_and_leased_work_prevent_exit": (
                 active["query_depth"] > 0
                 and active["bulk_depth"] > 0
                 and active["active_request_count"] > 0
+                and active["lease_count"] > 0
                 and preserved["server_instance_id"] == absent["old_server_instance_id"]
                 and preserved["held_observed_ns"] - preserved["held_started_ns"]
                 >= preserved["contract_idle_timeout_ms"] * 1_000_000
             ),
-            "idle_connections_and_diagnostics_do_not_extend_idle": absent_observed,
+            "idle_connections_and_diagnostics_do_not_extend_idle": (
+                diagnostic_count >= 2
+                and idle_connection_close_count >= 2
+                and last_diagnostic_client_elapsed_ns
+                >= timeout_ms * 500_000
+                and last_idle_connection_close_client_elapsed_ns
+                >= timeout_ms * 500_000
+                and bool(waited["clock_boot_id"])
+                and absent_observed
+            ),
             "exit_after_60000_awake_ms": (
                 timeout_ms == 60_000
-                and waited["finished_ns"] - waited["started_ns"]
+                and server_idle_elapsed_before_client_wait_ns
+                + client_wait_required_ns
                 >= timeout_ms * 1_000_000
+                and client_wait_elapsed_ns >= client_wait_required_ns
                 and reclaimed["query_depth"] == 0
                 and reclaimed["bulk_depth"] == 0
                 and reclaimed["active_request_count"] == 0
+                and reclaimed["lease_count"] == 0
                 and absent_observed
             ),
             "next_product_operation_respawns_without_consent": (
@@ -5417,13 +5882,55 @@ def derive_scenario_assertions(
         active = scheduler("stalled_request_observed")
         fail_stop = transition(
             "watchdog_fail_stop_observed",
-            {"old_pid", "terminal_transport_error"},
+            {
+                "old_pid",
+                "old_server_instance_id",
+                "wire_attempt_count",
+                "wire_attempts",
+                "watchdog_marker_sha256",
+                "watchdog_reason",
+                "watchdog_observed_ns",
+                "watchdog_last_progress_ns",
+                "watchdog_progress_sequence",
+                "hard_native_no_progress_ms",
+                "watchdog_cadence_ms",
+            },
         )
         replacement = transition(
             "post_stall_replacement",
             {"new_server_instance_id"},
         )
+        survivor = transition(
+            "unrelated_process_survived",
+            {"pid", "process_start_id", "new_server_instance_id"},
+        )
         old_pid = require_positive_int(fail_stop["old_pid"], "worker stall old pid")
+        marker_sha256 = require_sha256(
+            fail_stop["watchdog_marker_sha256"], "worker stall watchdog marker"
+        )
+        watchdog_observed_ns = require_nonnegative_int(
+            fail_stop["watchdog_observed_ns"], "worker stall watchdog observed_ns"
+        )
+        watchdog_last_progress_ns = require_nonnegative_int(
+            fail_stop["watchdog_last_progress_ns"],
+            "worker stall watchdog last progress",
+        )
+        hard_no_progress_ms = require_positive_int(
+            fail_stop["hard_native_no_progress_ms"],
+            "worker stall hard no-progress bound",
+        )
+        watchdog_cadence_ms = require_positive_int(
+            fail_stop["watchdog_cadence_ms"], "worker stall watchdog cadence"
+        )
+        require_nonnegative_int(
+            fail_stop["watchdog_progress_sequence"],
+            "worker stall watchdog progress sequence",
+        )
+        attempts = replay_attempts(
+            fail_stop,
+            old_server_instance_id=fail_stop["old_server_instance_id"],
+            new_server_instance_id=replacement["new_server_instance_id"],
+        )
         replacement_observed = (
             replacement["new_server_instance_id"] in snapshot_instances
             and all(snapshot["process"]["pid"] != old_pid for snapshot in snapshots[-1:])
@@ -5431,23 +5938,34 @@ def derive_scenario_assertions(
         assertions = {
             "independent_watchdog_fail_stops_server": (
                 active["active_request_class"] == "bulk"
-                and bool(fail_stop["terminal_transport_error"])
+                and bool(marker_sha256)
+                and fail_stop["watchdog_reason"] == "embedding_engine_stalled"
+                and watchdog_observed_ns >= watchdog_last_progress_ns
+                and watchdog_observed_ns - watchdog_last_progress_ns
+                >= hard_no_progress_ms * 1_000_000
+                and watchdog_cadence_ms < hard_no_progress_ms
+                and attempts[0]["outcome"] == "server_loss"
                 and replacement_observed
             ),
             "unrelated_process_survives": (
                 replacement_observed
+                and require_positive_int(survivor["pid"], "worker stall survivor pid")
+                != old_pid
+                and bool(survivor["process_start_id"])
+                and survivor["new_server_instance_id"]
+                == replacement["new_server_instance_id"]
                 and any(
-                    invocation.get("operation") == "query"
+                    invocation.get("pid") == survivor["pid"]
+                    and invocation.get("process_start_id")
+                    == survivor["process_start_id"]
+                    and invocation.get("operation") == "query"
                     and invocation.get("termination") == "exited"
                     for invocation in invocations
                 )
             ),
             "pure_embedding_rpc_replayed_at_most_once": (
-                sum(
-                    invocation.get("operation") == "stall_protocol_bulk"
-                    for invocation in invocations
-                )
-                == 1
+                fail_stop["wire_attempt_count"] <= 2
+                and sum(attempt["outcome"] == "completed" for attempt in attempts) == 1
             ),
         }
     failed = sorted(name for name, value in assertions.items() if value is not True)
@@ -5965,12 +6483,14 @@ def qualification_artifact(
             "owner_preserved_across_idle_boundary",
             "anti_idle_work_reclaimed",
             "true_idle_wait",
+            "idle_surfaces_exercised",
             "owner_absent_after_true_idle",
             "server_respawned",
         },
         "worker_stall": {
             "stalled_request_observed",
             "watchdog_fail_stop_observed",
+            "unrelated_process_survived",
             "post_stall_replacement",
         },
     }[scenario_id]
@@ -5982,11 +6502,13 @@ def qualification_artifact(
         "client_death": Counter({"hold_class": 2, "release_class": 2}),
         "cold_race": Counter(),
         "frozen_owner": Counter({"freeze_owner": 1, "release_owner": 1}),
-        "incompatible_owner": Counter({"force_incompatible": 1}),
+        "incompatible_owner": Counter(
+            {"force_incompatible": 1, "clear_incompatible": 1}
+        ),
         "mixed_queue": Counter({"hold_class": 2, "release_class": 2}),
         "server_crash": Counter({"hold_class": 1, "crash_server": 1}),
         "true_idle_respawn": Counter({"hold_class": 2, "release_class": 2}),
-        "worker_stall": Counter({"stall_native": 1}),
+        "worker_stall": Counter({"stall_native": 1, "release_native": 1}),
     }[scenario_id]
     actual_controls = Counter(control_actions)
     require(
@@ -7240,7 +7762,7 @@ def verify_calibration_bundle(
     query_deadline_ms = max(
         1, math.ceil(max(raw_duration_values_ms["query_request_duration"]) * 1.50)
     )
-    bulk_deadline_ms = max(
+    bulk_replay_success_budget_ms = max(
         query_deadline_ms,
         math.ceil(max(raw_duration_values_ms["bulk_request_duration"]) * 1.50),
     )
@@ -7262,11 +7784,18 @@ def verify_calibration_bundle(
         math.ceil(max(raw_duration_values_ms["successful_operation_duration"]) * 4.00),
     )
     watchdog_cadence_ms = max(1, math.floor(hard_no_progress_ms / 20))
+    bulk_deadline_ms = (
+        hard_no_progress_ms
+        + watchdog_cadence_ms
+        + spawn_timeout_ms
+        + bulk_replay_success_budget_ms
+    )
     selected_constants = {
         "connect_timeout_ms": connect_timeout_ms,
         "spawn_convergence_timeout_ms": spawn_timeout_ms,
         "request_deadlines_ms": {
             "query_request_deadline_ms": query_deadline_ms,
+            "bulk_replay_success_budget_ms": bulk_replay_success_budget_ms,
             "bulk_request_deadline_ms": bulk_deadline_ms,
         },
         "capacity_retry_policy": {
@@ -7545,6 +8074,7 @@ def produce_qualification_evidence(
     qualification_env.pop("CODESTORY_CLI", None)
     qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(private_root.resolve())
     qualification_env["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
+    qualification_env["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] = archive_sha256
     fault_recovery_consistency_evidence = None
     if args.publication_fault_evidence is None:
         (
@@ -7626,8 +8156,11 @@ def produce_qualification_evidence(
         ),
         "output_directory": str(artifact_root.resolve()),
     }
-    request_path = private_root / "request.json"
-    output_path = private_root / "output.json"
+    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(
+        artifact_root.resolve()
+    )
+    request_path = artifact_root / "request.json"
+    output_path = artifact_root / "output.json"
     write_private_json(request_path, request)
     run(
         [
@@ -7676,45 +8209,7 @@ def produce_qualification_evidence(
     require(output["package"] == package, "qualification runner package identity is stale")
     require(output["contracts"] == contracts, "qualification runner contract identity is stale")
     require(output["runtime"] == request["runtime"], "qualification runner runtime identity is stale")
-    serialized_request = {
-        "schema_version": request["schema_version"],
-        "qualification_nonce": request["qualification_nonce"],
-        "qualification_nonce_sha256": request["qualification_nonce_sha256"],
-        "proof_tier": request["proof_tier"],
-        "source": {
-            "commit": request["source"]["commit"],
-            "tree": request["source"]["tree"],
-            "tracked_dirty": request["source"]["tracked_dirty"],
-        },
-        "package": {
-            "archive_sha256": request["package"]["archive_sha256"],
-            "executable_sha256": request["package"]["executable_sha256"],
-            "asset_target": request["package"]["asset_target"],
-            "release_version": request["package"]["release_version"],
-        },
-        "contracts": {
-            "protocol_sha256": request["contracts"]["protocol_sha256"],
-            "constant_set_sha256": request["contracts"]["constant_set_sha256"],
-            "measurement_protocol_sha256": request["contracts"][
-                "measurement_protocol_sha256"
-            ],
-        },
-        "runtime": {
-            "engine_policy": request["runtime"]["engine_policy"],
-            "expected_backend": request["runtime"]["expected_backend"],
-            "offline": request["runtime"]["offline"],
-            "matrix_cell_id": request["runtime"]["matrix_cell_id"],
-            "cache_state": request["runtime"]["cache_state"],
-            "residency_state": request["runtime"]["residency_state"],
-        },
-        "projects": request["projects"],
-        "required_scenarios": request["required_scenarios"],
-        "required_metrics": request["required_metrics"],
-        "output_directory": request["output_directory"],
-    }
-    expected_request_sha256 = hashlib.sha256(
-        json.dumps(serialized_request, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    expected_request_sha256 = hashlib.sha256(request_path.read_bytes()).hexdigest()
     require(
         output["request_sha256"] == expected_request_sha256,
         "qualification runner output is not bound to the exact private request",
@@ -7984,6 +8479,10 @@ def produce_qualification_evidence(
         retained["installed_plugin"] = runtime["installed_plugin"]
         retained["managed_runtime"] = runtime["managed_runtime"]
     write_json(args.qualification_evidence, retained)
+    assert_retained_json_privacy(
+        args.qualification_evidence,
+        [*forbidden_values, *runtime.get("_qualification_forbidden_values", [])],
+    )
     if args.proof_tier == "calibration" and args.calibration_run_output is not None:
         run_index = require_positive_int(
             args.calibration_run_index,
@@ -8285,7 +8784,8 @@ def build_calibration_self_test_bundle(
         "spawn_convergence_timeout_ms": 2,
         "request_deadlines_ms": {
             "query_request_deadline_ms": 2,
-            "bulk_request_deadline_ms": 2,
+            "bulk_replay_success_budget_ms": 2,
+            "bulk_request_deadline_ms": 9,
         },
         "capacity_retry_policy": {
             "retry_after_ms": 1,
@@ -8387,6 +8887,37 @@ def self_test() -> None:
         )
     else:
         raise ProofFailure("parallel qualification failures were ignored")
+
+    publication_status = {
+        "retrieval_mode": "full",
+        "manifest_contract": {
+            "project_id": "repo-v2-self-test",
+            "input_hash": "1" * 64,
+            "generation": "repo-v2-self-test-generation",
+            "schema_version": 6,
+            "graph_hash": "2" * 64,
+        },
+        "manifest": {
+            "project_id": "repo-v2-self-test",
+            "sidecar_input_hash": "1" * 64,
+            "sidecar_generation": "repo-v2-self-test-generation",
+            "sidecar_schema_version": 6,
+            "graph_artifact_hash": "2" * 64,
+            "lexical_version": "sqlite-fts5-v1",
+            "semantic_generation": "semantic-self-test",
+            "scip_revision": "graph-self-test",
+        },
+    }
+    publication_identity = publication_identity_from_status(publication_status)
+    require_sha256(publication_identity, "publication identity self-test")
+    hostile_publication_status = json.loads(json.dumps(publication_status))
+    hostile_publication_status["manifest"]["sidecar_generation"] = "stale-generation"
+    try:
+        publication_identity_from_status(hostile_publication_status)
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("manifest report/contract drift was accepted")
 
     require(
         require_native_process_start_identity(
@@ -8596,6 +9127,19 @@ def self_test() -> None:
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
+        retained_privacy_path = root / "retained-privacy.json"
+        write_json(
+            retained_privacy_path,
+            {"account_id": "account:" + "a" * 64, "transcript_sha256": "b" * 64},
+        )
+        assert_retained_json_privacy(retained_privacy_path, [str(root), "private query"])
+        write_json(retained_privacy_path, {"request_text": "private query"})
+        try:
+            assert_retained_json_privacy(retained_privacy_path, [str(root), "private query"])
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("retained evidence private request text was accepted")
         payload = root / "artifact.zip"
         binary_header = bytearray(64)
         binary_header[:4] = b"\xcf\xfa\xed\xfe"
@@ -9050,6 +9594,7 @@ def self_test() -> None:
                         "bulk_capacity": 64,
                         "bulk_depth": 0,
                         "active_request_count": 1,
+                        "lease_count": 0,
                         "active_request_class": "query",
                     }
                 }
@@ -9065,11 +9610,25 @@ def self_test() -> None:
             "query_replayed": [
                 {
                     "values": {
-                        "submitted_operation_count": 1,
-                        "completed_operation_count": 1,
-                        "observed_server_instance_ids": [
-                            "server-before",
-                            "server-after",
+                        "logical_operation_count": 1,
+                        "wire_attempt_count": 2,
+                        "wire_attempts": [
+                            {
+                                "ordinal": 1,
+                                "request_id": "request-before",
+                                "server_instance_id": "server-before",
+                                "submitted_ns": 1,
+                                "completed_ns": 2,
+                                "outcome": "server_loss",
+                            },
+                            {
+                                "ordinal": 2,
+                                "request_id": "request-after",
+                                "server_instance_id": "server-after",
+                                "submitted_ns": 3,
+                                "completed_ns": 4,
+                                "outcome": "completed",
+                            },
                         ],
                     }
                 }
@@ -9093,7 +9652,9 @@ def self_test() -> None:
             "scenario assertion self-test did not derive exact raw claims",
         )
         hostile_scenario = json.loads(json.dumps(scenario_observations))
-        hostile_scenario["query_replayed"][0]["values"]["completed_operation_count"] = 2
+        hostile_scenario["query_replayed"][0]["values"]["wire_attempts"][1][
+            "outcome"
+        ] = "server_loss"
         try:
             derive_scenario_assertions(
                 "server_crash",

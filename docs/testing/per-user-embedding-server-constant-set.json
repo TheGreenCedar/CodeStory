@@ -6,7 +6,8 @@
     "connect_timeout_ms": 2000,
     "hard_native_no_progress_ms": 300000,
     "query_request_deadline_ms": 10000,
-    "bulk_request_deadline_ms": 180000,
+    "bulk_replay_success_budget_ms": 180000,
+    "bulk_request_deadline_ms": 495250,
     "retry_after_ms": 100,
     "spawn_convergence_timeout_ms": 15000,
     "watchdog_cadence_ms": 250

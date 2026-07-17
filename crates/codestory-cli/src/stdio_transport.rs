@@ -3176,7 +3176,7 @@ fn read_stdio_retrieval_engine_diagnostics(runtime: &RuntimeContext) -> Result<s
             "lifecycle": "unavailable",
             "failure": {
                 "code": "embedding_server_observation_failed",
-                "retry_class": "server_instance_change",
+                "retry_class": "after_server_change",
                 "retry_after_ms": 0,
                 "retry_condition": "the per-user server lifetime authority changes",
                 "message": error.to_string(),
