@@ -1563,12 +1563,12 @@ struct ServerQualificationEventLog {
     identity: NativeFileIdentity,
     bytes: u64,
     records: u64,
+    last_sequence: u64,
 }
 
 #[derive(Debug)]
 struct ServerQualificationCommandFile {
     bytes: Vec<u8>,
-    identity: NativeFileIdentity,
 }
 
 #[derive(Debug)]
@@ -1578,8 +1578,26 @@ struct ServerQualificationControl {
     nonce: String,
     nonce_sha256: String,
     last_sequence: AtomicU64,
+    processed_command_sha256: Mutex<Option<String>>,
     force_incompatible: AtomicBool,
     freeze_owner: AtomicBool,
+}
+
+impl ServerQualificationControl {
+    fn command_was_processed(&self, command_sha256: &str) -> bool {
+        self.processed_command_sha256
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_deref()
+            == Some(command_sha256)
+    }
+
+    fn mark_command_processed(&self, command_sha256: String) {
+        *self
+            .processed_command_sha256
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(command_sha256);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1619,6 +1637,12 @@ struct ServerQualificationEvent {
     snapshot: Option<EmbeddingServerSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingServerQualificationEvent {
+    schema_version: u32,
+    sequence: u64,
 }
 
 struct PerUserEmbeddingServerState {
@@ -2159,12 +2183,14 @@ fn server_qualification_control_from_values(
         {
             let directory = PinnedQualificationDirectory::open(&PathBuf::from(directory))?;
             let events = ServerQualificationEventLog::open(&directory, &nonce)?;
+            let last_sequence = events.last_sequence;
             Ok(Some(ServerQualificationControl {
                 directory,
                 events: Mutex::new(events),
                 nonce_sha256: hex_sha256(nonce.as_bytes()),
                 nonce,
-                last_sequence: AtomicU64::new(0),
+                last_sequence: AtomicU64::new(last_sequence),
+                processed_command_sha256: Mutex::new(None),
                 force_incompatible: AtomicBool::new(false),
                 freeze_owner: AtomicBool::new(false),
             }))
@@ -2315,7 +2341,20 @@ impl ServerQualificationEventLog {
         {
             bail!("embedding_qualification_event_log_untrusted");
         }
-        let records = bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+        let mut records = 0_u64;
+        let mut last_sequence = 0_u64;
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let event = serde_json::from_slice::<ExistingServerQualificationEvent>(line)
+                .context("parse existing embedding qualification event")?;
+            if event.schema_version != 1 {
+                bail!("embedding_qualification_event_log_untrusted");
+            }
+            records = records.saturating_add(1);
+            last_sequence = last_sequence.max(event.sequence);
+        }
         if records > SERVER_QUALIFICATION_MAX_EVENT_RECORDS {
             bail!("embedding_qualification_event_log_record_limit");
         }
@@ -2325,6 +2364,7 @@ impl ServerQualificationEventLog {
             identity,
             bytes: bytes.len() as u64,
             records,
+            last_sequence,
         })
     }
 
@@ -2385,6 +2425,7 @@ impl ServerQualificationEventLog {
         }
         self.bytes = next_bytes;
         self.records += 1;
+        self.last_sequence = self.last_sequence.max(event.sequence);
         Ok(())
     }
 }
@@ -2502,28 +2543,7 @@ fn read_server_qualification_command(
         bail!("embedding_qualification_command_replaced");
     }
     control.directory.revalidate()?;
-    Ok(Some(ServerQualificationCommandFile { bytes, identity }))
-}
-
-fn remove_server_qualification_command(
-    control: &ServerQualificationControl,
-    expected_identity: NativeFileIdentity,
-) -> Result<()> {
-    control.directory.revalidate()?;
-    let path = control
-        .directory
-        .join(format!("{}.command.json", control.nonce));
-    let metadata = fs::symlink_metadata(&path)
-        .context("reinspect processed embedding qualification command")?;
-    validate_private_qualification_file_metadata(
-        &metadata,
-        SERVER_QUALIFICATION_MAX_COMMAND_BYTES,
-    )?;
-    if native_metadata_identity(&metadata)? != expected_identity {
-        bail!("embedding_qualification_command_replaced");
-    }
-    fs::remove_file(&path).context("remove processed embedding qualification command")?;
-    control.directory.revalidate()
+    Ok(Some(ServerQualificationCommandFile { bytes }))
 }
 
 fn poll_server_qualification_command(
@@ -2536,7 +2556,19 @@ fn poll_server_qualification_command(
     let Some(command_file) = read_server_qualification_command(control)? else {
         return Ok(());
     };
+    let command_sha256 = hex_sha256(&command_file.bytes);
+    if control.command_was_processed(&command_sha256) {
+        return Ok(());
+    }
     let parsed = serde_json::from_slice::<ServerQualificationCommand>(&command_file.bytes);
+    if parsed.as_ref().is_ok_and(|command| {
+        command.schema_version == 1
+            && command.nonce_sha256 == control.nonce_sha256
+            && command.sequence <= control.last_sequence.load(Ordering::Acquire)
+    }) {
+        control.mark_command_processed(command_sha256);
+        return Ok(());
+    }
     let (sequence, action) = parsed
         .as_ref()
         .map(|command| (command.sequence, command.action.clone()))
@@ -2594,11 +2626,10 @@ fn poll_server_qualification_command(
             if let Err(error) = result {
                 status = "failed";
                 details = Some(opaque_qualification_details(&error));
-            } else {
-                control
-                    .last_sequence
-                    .store(command.sequence, Ordering::Release);
             }
+            control
+                .last_sequence
+                .store(command.sequence, Ordering::Release);
         }
         Ok(_) => {
             status = "failed";
@@ -2637,7 +2668,7 @@ fn poll_server_qualification_command(
             details,
         },
     )?;
-    remove_server_qualification_command(control, command_file.identity)?;
+    control.mark_command_processed(command_sha256);
     if crash {
         transport.fail_stop("embedding_qualification_crash");
         state.draining.store(true, Ordering::Release);
@@ -6077,15 +6108,25 @@ mod tests {
         let command = read_server_qualification_command(&control)
             .expect("read bounded command")
             .expect("command exists");
+        let command_sha256 = hex_sha256(&command.bytes);
+        control.mark_command_processed(command_sha256.clone());
+        assert!(control.command_was_processed(&command_sha256));
+        assert!(
+            command_path.exists(),
+            "the server leaves qualification command cleanup to its writer"
+        );
+
         fs::remove_file(&command_path).expect("remove read command");
         fs::write(&command_path, b"{\"replacement\":true}").expect("replacement command");
         fs::set_permissions(&command_path, fs::Permissions::from_mode(0o600))
             .expect("private replacement command");
+        let replacement = read_server_qualification_command(&control)
+            .expect("read replacement command")
+            .expect("replacement command exists");
+        let replacement_sha256 = hex_sha256(&replacement.bytes);
         assert!(
-            remove_server_qualification_command(&control, command.identity)
-                .expect_err("a replacement command is never removed")
-                .to_string()
-                .contains("embedding_qualification_command_replaced")
+            !control.command_was_processed(&replacement_sha256),
+            "replacement content is never mistaken for the processed command"
         );
         assert!(
             command_path.exists(),
@@ -6144,6 +6185,30 @@ mod tests {
                 .to_string()
                 .contains("embedding_qualification_directory_replaced")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualification_restart_restores_the_last_durable_command_sequence() {
+        let (_temporary, control) = test_qualification_control();
+        let directory = control.directory.path.clone();
+        let mut event = test_qualification_event();
+        event.sequence = 7;
+        control
+            .events
+            .lock()
+            .expect("event log")
+            .record(&control.directory, &event)
+            .expect("durable qualification event");
+        drop(control);
+
+        let restarted = server_qualification_control_from_values(
+            Some(directory.into_os_string()),
+            Some("test-nonce".into()),
+        )
+        .expect("reopen qualification control")
+        .expect("qualification control remains enabled");
+        assert_eq!(restarted.last_sequence.load(Ordering::Acquire), 7);
     }
 
     #[test]

@@ -4085,18 +4085,21 @@ def send_server_qualification_control(
             "parameters": {"class": None},
         },
     )
-    event_path = directory / f"{nonce}.events.jsonl"
-    event = wait_for_jsonl_event(
-        event_path,
-        lambda candidate: candidate.get("sequence") == sequence
-        and candidate.get("action") == action,
-        timeout=timeout,
-    )
-    require(
-        event.get("status") in {"completed", "accepted"},
-        f"embedding qualification control {action} failed",
-    )
-    return event
+    try:
+        event_path = directory / f"{nonce}.events.jsonl"
+        event = wait_for_jsonl_event(
+            event_path,
+            lambda candidate: candidate.get("sequence") == sequence
+            and candidate.get("action") == action,
+            timeout=timeout,
+        )
+        require(
+            event.get("status") in {"completed", "accepted"},
+            f"embedding qualification control {action} failed",
+        )
+        return event
+    finally:
+        command_path.unlink(missing_ok=True)
 
 
 def server_observation_from_control_event(event: dict, phase: str) -> dict:

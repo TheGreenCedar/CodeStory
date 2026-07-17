@@ -1195,18 +1195,32 @@ impl<'a> ScenarioRunner<'a> {
             },
         };
         write_atomic_json(&command_path, &command)?;
-        let started = self.clock.now_ns();
-        let mut event = loop {
-            if let Some(event) = existing_control_events(self.context.output_directory)?
-                .into_iter()
-                .find(|event| event.sequence == self.next_sequence)
-            {
-                break event;
+        let event_result = (|| -> Result<ControlEvent> {
+            let started = self.clock.now_ns();
+            loop {
+                if let Some(event) = existing_control_events(self.context.output_directory)?
+                    .into_iter()
+                    .find(|event| event.sequence == self.next_sequence)
+                {
+                    return Ok(event);
+                }
+                if elapsed(self.clock.as_ref(), started) >= CONTROL_TIMEOUT {
+                    bail!("embedding_qualification_control_event_timeout:{action}");
+                }
+                self.clock.sleep(POLL);
             }
-            if elapsed(self.clock.as_ref(), started) >= CONTROL_TIMEOUT {
-                bail!("embedding_qualification_control_event_timeout:{action}");
+        })();
+        let cleanup_result =
+            fs::remove_file(&command_path).context("remove owned embedding qualification command");
+        let mut event = match event_result {
+            Ok(event) => {
+                cleanup_result?;
+                event
             }
-            self.clock.sleep(POLL);
+            Err(error) => {
+                let _ = cleanup_result;
+                return Err(error);
+            }
         };
         if event.action != action
             || !matches!(event.status.as_str(), "completed" | "accepted")

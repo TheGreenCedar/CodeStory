@@ -132,12 +132,12 @@ jobs:
             }
           fi
           if [ "$mode" = "calibration" ]; then
-            test -z "$INPUT_SOURCE_RUN_ID" \
-              && test -z "$INPUT_CALIBRATION_ARTIFACT" \
-              && test -z "$INPUT_CALIBRATION_RUN_ID" || {
-                echo "::error::Calibration collection does not consume prior proof artifacts."
-                exit 1
-              }
+            if [ -n "$INPUT_SOURCE_RUN_ID" ] \
+              || [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
+              || [ -n "$INPUT_CALIBRATION_RUN_ID" ]; then
+              echo "::error::Calibration collection does not consume prior proof artifacts."
+              exit 1
+            fi
           fi
           {
             echo "head_sha=$current_head"
