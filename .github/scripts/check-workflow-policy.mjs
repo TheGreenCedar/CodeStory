@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,9 +7,12 @@ import { LineCounter, parseDocument } from "yaml";
 import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
+const retrievalFile = "retrieval-engine-smoke.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
+
+export { retrievalFile };
 
 function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -99,6 +103,606 @@ function requireJob(violations, file, workflow, name) {
   const found = object(workflow.jobs)[name];
   add(violations, found !== undefined, `${file} must contain job ${name}`);
   return object(found);
+}
+
+const draftCachePaths = [
+  "~/.cargo/registry",
+  "~/.cargo/git",
+  "target",
+];
+const draftProofCommands = [
+  "cargo test --locked -p codestory-llama-sys --test native_staging",
+  "cargo test --locked -p codestory-llama-sys --test model_staging",
+  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+  "cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture",
+  "cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
+];
+const draftSeedCommands = [
+  "cargo test --locked -p codestory-llama-sys --test native_staging --no-run",
+  "cargo test --locked -p codestory-llama-sys --test model_staging --no-run",
+  "cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture",
+  "cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture",
+  "cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture",
+];
+const draftProofTopologyDigest = createHash("sha256")
+  .update(draftSeedCommands.join("\n"))
+  .digest("hex");
+const draftProofTopology = `proof5-v1-${draftProofTopologyDigest}`;
+const cacheRunner = "${{ runner.os }}";
+const cacheRustVersion = "${{ steps.rust-cache-key.outputs.version }}";
+const cacheTarget = "${{ steps.rust-cache-key.outputs.target }}";
+const cacheManifests = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
+const cacheLock = "${{ hashFiles('Cargo.lock') }}";
+const draftCachePrefix = [
+  cacheRunner,
+  "draft-v2",
+  cacheRustVersion,
+  cacheTarget,
+  "workspace",
+  draftProofTopology,
+  "default-features",
+  cacheManifests,
+].join("-");
+const retrievalCachePrefix = [
+  cacheRunner,
+  "cargo-stable",
+  cacheRustVersion,
+  cacheTarget,
+  "retrieval-contracts",
+  draftProofTopology,
+  "default-features",
+  cacheManifests,
+].join("-");
+const draftCachePrimary = `${draftCachePrefix}-${cacheLock}`;
+const retrievalCachePrimary = `${retrievalCachePrefix}-${cacheLock}`;
+const draftCacheRestoreKeys = [
+  retrievalCachePrimary,
+  `${draftCachePrefix}-`,
+  `${retrievalCachePrefix}-`,
+];
+const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
+const cacheSaveKey = "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}";
+const draftWorkflowPaths = [
+  "Cargo.lock",
+  "Cargo.toml",
+  "crates/**",
+  ".github/scripts/check-runtime-config-boundary.mjs",
+  ".github/scripts/install-linux-vulkan-build-deps.sh",
+  ".github/scripts/check-workflow-policy.mjs",
+  ".github/scripts/route-ci-proof.mjs",
+  ".github/workflows/rust-ci.yml",
+  ".github/workflows/source-proof.yml",
+  "plugins/codestory/generated-mcp-catalog.json",
+  "plugins/codestory/skills/codestory-grounding/**",
+  "scripts/generate-codestory-skill-syntax.mjs",
+];
+const retrievalProducerTriggerPaths = [
+  "crates/**/Cargo.toml",
+  "vendor/**/Cargo.toml",
+  ".github/scripts/install-windows-vulkan-sdk.ps1",
+  ".github/workflows/rust-ci.yml",
+];
+const windowsVulkanInstaller = ".github/scripts/install-windows-vulkan-sdk.ps1";
+const windowsNativeGenerator = "Ninja";
+const windowsReadyCommand = "cargo test --locked -p codestory-cli --test ready_command";
+const windowsReadyProofTopologyDigest = createHash("sha256")
+  .update(`${windowsReadyCommand}\nCMAKE_GENERATOR=${windowsNativeGenerator}`)
+  .digest("hex");
+const windowsReadyProofTopology = `ready-command-v2-${windowsReadyProofTopologyDigest}`;
+const windowsInstallerHash = `\${{ hashFiles('${windowsVulkanInstaller}') }}`;
+const windowsCachePrimary = [
+  cacheRunner,
+  "cargo-stable",
+  cacheRustVersion,
+  cacheTarget,
+  "windows",
+  windowsReadyProofTopology,
+  "generator",
+  windowsNativeGenerator.toLowerCase(),
+  "cmake",
+  "${{ steps.rust-cache-key.outputs.cmake }}",
+  "ninja",
+  "${{ steps.rust-cache-key.outputs.ninja }}",
+  "default-features",
+  cacheManifests,
+  windowsInstallerHash,
+  cacheLock,
+].join("-");
+const windowsStepSequence = [
+  { uses: "actions/checkout@v5", keys: ["uses"] },
+  { name: "Install Rust stable", keys: ["name", "shell", "run"] },
+  {
+    name: "Install checksum-pinned Windows Vulkan SDK",
+    keys: ["name", "shell", "run"],
+  },
+  { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
+  {
+    name: "Restore Windows Cargo inputs and output",
+    keys: ["name", "id", "uses", "continue-on-error", "with"],
+  },
+  {
+    name: "Prove Windows ready_command manifest-missing contract",
+    keys: ["name", "shell", "run"],
+  },
+  {
+    name: "Save Windows Cargo inputs and output",
+    keys: ["name", "if", "uses", "continue-on-error", "with"],
+  },
+];
+const windowsRunCommands = new Map([
+  ["Install Rust stable", [
+    "rustup toolchain install stable --profile minimal",
+    "rustup default stable",
+  ]],
+  ["Install checksum-pinned Windows Vulkan SDK", [windowsVulkanInstaller]],
+  ["Capture Rust cache identity", [
+    "$release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }",
+    "$target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }",
+    "$cmake = (cmake --version | Select-Object -First 1) -replace '^cmake version ', ''",
+    "$ninja = (ninja --version).Trim()",
+    `"version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+    `"target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+    `"cmake=$cmake" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+    `"ninja=$ninja" | Out-File -FilePath $env:GITHUB_OUTPUT -Append`,
+  ]],
+  ["Prove Windows ready_command manifest-missing contract", [windowsReadyCommand]],
+]);
+const draftStepSequence = [
+  { uses: "actions/checkout@v5", keys: ["uses"] },
+  { name: "Install Rust stable", keys: ["name", "run"] },
+  { name: "Install Linux Vulkan build dependencies", keys: ["name", "run"] },
+  { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
+  {
+    name: "Restore Cargo inputs and output",
+    keys: ["name", "id", "uses", "continue-on-error", "with"],
+  },
+  { name: "Check formatting", keys: ["name", "run"] },
+  { name: "Check immutable runtime configuration boundary", keys: ["name", "run"] },
+  { name: "Check the workspace", keys: ["name", "run"] },
+  { name: "Check generated CodeStory syntax and MCP catalog", keys: ["name", "run"] },
+  { name: "Lint workspace libraries", keys: ["name", "run"] },
+  { name: "Prove focused publication contracts", keys: ["name", "run"] },
+  {
+    name: "Save Cargo inputs and output",
+    keys: ["name", "if", "uses", "continue-on-error", "with"],
+  },
+];
+const draftRunCommands = new Map([
+  ["Install Rust stable", [
+    "rustup toolchain install stable --profile minimal --component clippy --component rustfmt",
+    "rustup default stable",
+  ]],
+  ["Install Linux Vulkan build dependencies", [
+    "bash .github/scripts/install-linux-vulkan-build-deps.sh",
+  ]],
+  ["Capture Rust cache identity", [
+    `echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"`,
+    `echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"`,
+  ]],
+  ["Check formatting", ["cargo fmt --check"]],
+  ["Check immutable runtime configuration boundary", [
+    "node .github/scripts/check-runtime-config-boundary.mjs",
+  ]],
+  ["Check the workspace", ["cargo check --workspace --locked"]],
+  ["Check generated CodeStory syntax and MCP catalog", [
+    "cargo build --locked -p codestory-cli",
+    "node scripts/generate-codestory-skill-syntax.mjs --check",
+  ]],
+  ["Lint workspace libraries", [
+    "cargo clippy --workspace --lib --locked -- -D warnings",
+  ]],
+  ["Prove focused publication contracts", draftProofCommands],
+]);
+
+function nonCommentLines(value) {
+  return String(value ?? "")
+    .split(/\r?\n/u)
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !line.startsWith("#"));
+}
+
+function sameStrings(actual, expected) {
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+function hasExactKeys(value, expected) {
+  return sameMembers(Object.keys(object(value)), expected);
+}
+
+export function draftWorkflowPolicyViolations(workflowValue) {
+  const violations = [];
+  const workflow = object(workflowValue);
+  const triggers = object(workflow.on);
+  const pullRequest = object(triggers.pull_request);
+  const permissions = object(workflow.permissions);
+  const concurrency = object(workflow.concurrency);
+  const jobs = object(workflow.jobs);
+
+  add(
+    violations,
+    hasExactKeys(workflow, ["name", "on", "permissions", "concurrency", "jobs"]),
+    "draft source workflow must keep its exact top-level policy shape",
+  );
+  add(
+    violations,
+    workflow.name === "Draft source checks",
+    "draft source workflow name must remain Draft source checks",
+  );
+  add(
+    violations,
+    hasExactKeys(triggers, ["pull_request", "workflow_dispatch"]),
+    "draft source workflow must use only pull_request and workflow_dispatch",
+  );
+  add(
+    violations,
+    hasExactKeys(pullRequest, ["paths"])
+      && list(pullRequest.paths).length === draftWorkflowPaths.length
+      && sameMembers(pullRequest.paths, draftWorkflowPaths),
+    "draft source pull_request trigger must keep the exact path set",
+  );
+  add(
+    violations,
+    triggers.workflow_dispatch === null,
+    "draft source workflow_dispatch trigger must remain input-free",
+  );
+  add(
+    violations,
+    hasExactKeys(permissions, ["contents"]) && permissions.contents === "read",
+    "draft source workflow permissions must remain contents: read only",
+  );
+  add(
+    violations,
+    hasExactKeys(concurrency, ["group", "cancel-in-progress"])
+      && concurrency.group === "rust-ci-${{ github.event.pull_request.number || github.ref }}"
+      && concurrency["cancel-in-progress"] === true,
+    "draft source workflow concurrency must keep its exact PR/ref cancellation contract",
+  );
+  add(
+    violations,
+    hasExactKeys(jobs, ["linux-draft"]),
+    "draft source workflow must contain exactly the linux-draft job",
+  );
+  return violations;
+}
+
+export function retrievalProducerTriggerPolicyViolations(workflowValue) {
+  const violations = [];
+  const workflow = object(workflowValue);
+  add(
+    violations,
+    includesAll(at(workflow, "on", "pull_request", "paths"), retrievalProducerTriggerPaths),
+    "retrieval cache producer pull_request paths must cover every manifest and draft consumer change",
+  );
+  add(
+    violations,
+    includesAll(at(workflow, "on", "push", "branches"), ["dev/codestory-next"]),
+    "retrieval cache producer must run on dev/codestory-next pushes",
+  );
+  add(
+    violations,
+    includesAll(at(workflow, "on", "push", "paths"), retrievalProducerTriggerPaths),
+    "retrieval cache producer dev push paths must cover every manifest and draft consumer change",
+  );
+  return violations;
+}
+
+export function windowsManifestProofPolicyViolations(workflowValue) {
+  const violations = [];
+  const workflow = object(workflowValue);
+  const triggers = object(workflow.on);
+  const job = object(at(workflow, "jobs", "windows-manifest-missing"));
+  const steps = list(job.steps).map(object);
+
+  add(
+    violations,
+    hasExactKeys(workflow.jobs, ["linux-contracts", "windows-manifest-missing"]),
+    "Windows manifest proof workflow must contain exactly linux-contracts and windows-manifest-missing jobs",
+  );
+  add(
+    violations,
+    workflow.env === undefined,
+    "Windows manifest proof workflow must not define top-level env",
+  );
+  add(
+    violations,
+    workflow.defaults === undefined,
+    "Windows manifest proof workflow must not define top-level defaults",
+  );
+  for (const event of ["pull_request", "push"]) {
+    add(
+      violations,
+      includesAll(at(triggers, event, "paths"), [windowsVulkanInstaller]),
+      `Windows manifest proof ${event} paths must cover the Vulkan installer`,
+    );
+  }
+  add(
+    violations,
+    triggers.workflow_dispatch === null,
+    "Windows manifest proof workflow_dispatch must remain input-free",
+  );
+  add(
+    violations,
+    hasExactKeys(job, ["if", "runs-on", "timeout-minutes", "env", "steps"]),
+    "Windows manifest proof job must keep its exact required serial shape",
+  );
+  add(
+    violations,
+    job.if === "github.event_name == 'workflow_dispatch'",
+    "Windows manifest proof must be workflow-dispatch only",
+  );
+  add(
+    violations,
+    !scalarStrings(job).some(value => value.includes("labels")),
+    "Windows manifest proof must not be label-triggered",
+  );
+  add(violations, job["runs-on"] === "windows-latest", "Windows manifest proof must use windows-latest");
+  add(violations, job["timeout-minutes"] === 30, "Windows manifest proof timeout must remain 30 minutes");
+  add(
+    violations,
+    hasExactKeys(job.env, ["CODESTORY_EMBED_ALLOW_CPU", "CMAKE_GENERATOR"])
+      && job.env.CODESTORY_EMBED_ALLOW_CPU === "1"
+      && job.env.CMAKE_GENERATOR === windowsNativeGenerator,
+    "Windows manifest proof must explicitly permit CPU runtime execution and use the Ninja native generator",
+  );
+  add(
+    violations,
+    steps.length === windowsStepSequence.length,
+    "Windows manifest proof must keep its exact serialized step count",
+  );
+  for (const [index, expected] of windowsStepSequence.entries()) {
+    const step = steps[index];
+    const matches = expected.name === undefined
+      ? step?.uses === expected.uses
+      : step?.name === expected.name;
+    add(
+      violations,
+      matches,
+      `Windows manifest proof step ${index + 1} must remain ${expected.name ?? expected.uses}`,
+    );
+    add(
+      violations,
+      hasExactKeys(step, expected.keys),
+      `Windows manifest proof step ${index + 1} must keep the exact ${expected.name ?? expected.uses} key shape`,
+    );
+  }
+
+  for (const [name, commands] of windowsRunCommands) {
+    const step = namedStep(job, name);
+    add(violations, step !== undefined, `Windows manifest proof must contain one ${name} step`);
+    add(
+      violations,
+      sameStrings(nonCommentLines(step?.run), commands),
+      `Windows manifest proof step ${name} must keep its exact required command sequence`,
+    );
+    add(
+      violations,
+      step?.shell === "pwsh",
+      `Windows manifest proof step ${name} must use pwsh`,
+    );
+  }
+
+  const identity = namedStep(job, "Capture Rust cache identity");
+  add(
+    violations,
+    identity?.id === "rust-cache-key",
+    "Windows manifest proof cache identity must keep its stable output id",
+  );
+
+  const restore = namedStep(job, "Restore Windows Cargo inputs and output");
+  const restoreWith = object(restore?.with);
+  add(
+    violations,
+    restore?.id === "cargo-cache-restore",
+    "Windows manifest proof cache restore must keep its stable step id",
+  );
+  add(
+    violations,
+    restore?.uses === "actions/cache/restore@v5",
+    "Windows manifest proof cache restore must use actions/cache/restore@v5",
+  );
+  add(
+    violations,
+    restore?.["continue-on-error"] === true && restore?.if === undefined,
+    "Windows manifest proof cache restore must remain optional without conditional bypasses",
+  );
+  add(
+    violations,
+    hasExactKeys(restoreWith, ["path", "key"]),
+    "Windows manifest proof cache restore must use an exact primary without fallbacks",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(restoreWith.path), draftCachePaths),
+    "Windows manifest proof cache restore must use only Cargo registry, git, and default target paths",
+  );
+  add(
+    violations,
+    restoreWith.key === windowsCachePrimary,
+    "Windows manifest proof cache key must bind OS, Rust, target, proof topology, default features, manifests, installer, and lock identities",
+  );
+
+  const proof = namedStep(job, "Prove Windows ready_command manifest-missing contract");
+  const install = namedStep(job, "Install checksum-pinned Windows Vulkan SDK");
+  const restoreIndex = steps.indexOf(restore);
+  const proofIndex = steps.indexOf(proof);
+  add(
+    violations,
+    steps.indexOf(install) < proofIndex && restoreIndex < proofIndex,
+    "Windows manifest proof must install the SDK and restore only compatible output before the Cargo proof",
+  );
+
+  const save = namedStep(job, "Save Windows Cargo inputs and output");
+  const saveWith = object(save?.with);
+  add(
+    violations,
+    save?.uses === "actions/cache/save@v5",
+    "Windows manifest proof cache save must use actions/cache/save@v5",
+  );
+  add(
+    violations,
+    save?.["continue-on-error"] === true,
+    "Windows manifest proof cache save must remain non-blocking",
+  );
+  add(
+    violations,
+    save?.if === cacheSaveCondition,
+    "Windows manifest proof cache save must require full proof success and skip exact hits",
+  );
+  add(
+    violations,
+    hasExactKeys(saveWith, ["path", "key"]),
+    "Windows manifest proof cache save inputs must keep their exact shape",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(saveWith.path), draftCachePaths),
+    "Windows manifest proof cache save must use the exact restore path set",
+  );
+  add(
+    violations,
+    saveWith.key === cacheSaveKey,
+    "Windows manifest proof cache save must use the exact primary rather than a matched key",
+  );
+  add(
+    violations,
+    proofIndex + 1 === steps.indexOf(save),
+    "Windows manifest proof cache save must immediately follow the successful Cargo proof",
+  );
+
+  return violations;
+}
+
+export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
+  const violations = [];
+  const job = object(jobValue);
+  const retrievalJob = object(retrievalJobValue);
+  const steps = list(job.steps).map(object);
+
+  add(
+    violations,
+    hasExactKeys(job, ["name", "runs-on", "timeout-minutes", "steps"]),
+    "draft source job must keep its exact required serial shape",
+  );
+  add(
+    violations,
+    job.name === "Ubuntu draft source checks",
+    "draft source job name must remain Ubuntu draft source checks",
+  );
+  add(violations, job["runs-on"] === "ubuntu-latest", "draft source job must use ubuntu-latest");
+  add(violations, job["timeout-minutes"] === 45, "draft source job timeout must remain 45 minutes");
+  add(violations, job.env === undefined && job.defaults === undefined, "draft source job must not override the proof environment or defaults");
+  add(violations, job["continue-on-error"] === undefined && job.strategy === undefined, "draft source job must remain one required serial lane");
+  add(violations, steps.length === draftStepSequence.length, "draft source job must keep its exact serialized step count");
+  for (const [index, expected] of draftStepSequence.entries()) {
+    const step = steps[index];
+    const matches = expected.name === undefined
+      ? step?.uses === expected.uses
+      : step?.name === expected.name;
+    add(violations, matches, `draft source step ${index + 1} must remain ${expected.name ?? expected.uses}`);
+    add(
+      violations,
+      hasExactKeys(step, expected.keys),
+      `draft source step ${index + 1} must keep the exact ${expected.name ?? expected.uses} key shape`,
+    );
+  }
+
+  for (const [name, commands] of draftRunCommands) {
+    const step = namedStep(job, name);
+    add(violations, step !== undefined, `draft source job must contain one ${name} step`);
+    add(violations, sameStrings(nonCommentLines(step?.run), commands), `draft source step ${name} must keep its exact serial command sequence`);
+    add(violations, step?.["continue-on-error"] === undefined && step?.if === undefined, `draft source step ${name} must remain required`);
+    add(violations, step?.env === undefined && step?.["working-directory"] === undefined, `draft source step ${name} must use the shared default build environment`);
+  }
+
+  const identity = namedStep(job, "Capture Rust cache identity");
+  add(violations, identity?.id === "rust-cache-key" && identity?.shell === "bash", "draft source cache identity must keep its stable bash output contract");
+
+  const restore = namedStep(job, "Restore Cargo inputs and output");
+  const restoreWith = object(restore?.with);
+  add(violations, restore?.id === "cargo-cache-restore", "draft source cache restore must keep its stable step id");
+  add(violations, restore?.uses === "actions/cache/restore@v5", "draft source cache restore must use actions/cache/restore@v5");
+  add(violations, restore?.["continue-on-error"] === true && restore?.if === undefined, "draft source cache restore must remain optional without conditional bypasses");
+  add(
+    violations,
+    hasExactKeys(restoreWith, ["path", "key", "restore-keys"]),
+    "draft source cache restore inputs must keep their exact key shape",
+  );
+  add(violations, sameStrings(nonCommentLines(restoreWith.path), draftCachePaths), "draft source cache restore must use only the Cargo registry, git, and default target paths");
+  add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, target, proof topology, feature, manifest, and lock identity");
+  add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact seeded retrieval, prior draft, then prior retrieval order and omit only the lock identity from prior prefixes");
+
+  const retrievalRestore = namedStep(retrievalJob, "Restore Cargo registry, git sources, and build output");
+  const retrievalRestoreWith = object(retrievalRestore?.with);
+  add(
+    violations,
+    hasExactKeys(retrievalRestore, ["name", "id", "uses", "continue-on-error", "with"]),
+    "retrieval cache producer restore must keep its exact step shape",
+  );
+  add(violations, retrievalRestore?.id === "cargo-cache-restore", "retrieval cache producer must keep its stable restore id");
+  add(violations, retrievalRestore?.uses === "actions/cache/restore@v5", "retrieval cache producer must use actions/cache/restore@v5");
+  add(violations, retrievalRestore?.["continue-on-error"] === true && retrievalRestore?.if === undefined, "retrieval cache producer restore must remain non-blocking without conditional bypasses");
+  add(
+    violations,
+    hasExactKeys(retrievalRestoreWith, ["path", "key"]),
+    "retrieval cache producer restore inputs must keep their exact key shape",
+  );
+  add(violations, sameStrings(nonCommentLines(retrievalRestoreWith.path), draftCachePaths), "retrieval cache producer must retain the proof-compatible path set");
+  add(violations, retrievalRestoreWith.key === retrievalCachePrimary, "retrieval cache producer key must match the draft exact-lock, manifest, feature, and proof-topology fallback");
+
+  const retrievalSeed = namedStep(retrievalJob, "Seed draft proof test-profile artifacts");
+  add(
+    violations,
+    hasExactKeys(retrievalSeed, ["name", "run"]),
+    "retrieval cache producer seed must keep its exact required step shape",
+  );
+  add(
+    violations,
+    sameStrings(nonCommentLines(retrievalSeed?.run), draftSeedCommands),
+    "retrieval cache producer must seed the exact five test-profile targets in serial order",
+  );
+
+  const retrievalSave = namedStep(retrievalJob, "Save Cargo registry, git sources, and build output");
+  const retrievalSaveWith = object(retrievalSave?.with);
+  add(
+    violations,
+    hasExactKeys(retrievalSave, ["name", "if", "uses", "continue-on-error", "with"]),
+    "retrieval cache producer save must keep its exact post-proof step shape",
+  );
+  add(violations, retrievalSave?.uses === "actions/cache/save@v5", "retrieval cache producer must use actions/cache/save@v5");
+  add(violations, retrievalSave?.["continue-on-error"] === true, "retrieval cache producer save must remain non-blocking");
+  add(violations, retrievalSave?.if === cacheSaveCondition, "retrieval cache producer must save only after every retrieval and seed proof succeeds");
+  add(
+    violations,
+    hasExactKeys(retrievalSaveWith, ["path", "key"]),
+    "retrieval cache producer save inputs must keep their exact key shape",
+  );
+  add(violations, sameStrings(nonCommentLines(retrievalSaveWith.path), draftCachePaths), "retrieval cache producer save must retain the proof-compatible path set");
+  add(violations, retrievalSaveWith.key === cacheSaveKey, "retrieval cache producer must save its exact primary rather than a matched key");
+  const retrievalSteps = list(retrievalJob.steps).map(object);
+  add(
+    violations,
+    retrievalSteps.indexOf(retrievalSeed) + 1 === retrievalSteps.indexOf(retrievalSave),
+    "retrieval cache producer must seed the exact proof targets immediately before saving",
+  );
+
+  const save = namedStep(job, "Save Cargo inputs and output");
+  const saveWith = object(save?.with);
+  add(violations, save?.uses === "actions/cache/save@v5", "draft source cache promotion must use actions/cache/save@v5");
+  add(violations, save?.["continue-on-error"] === true, "draft source cache promotion must remain non-blocking");
+  add(
+    violations,
+    hasExactKeys(saveWith, ["path", "key"]),
+    "draft source cache promotion inputs must keep their exact key shape",
+  );
+  add(
+    violations,
+    save?.if === cacheSaveCondition,
+    "draft source cache promotion must require complete proof and a partial or missing primary",
+  );
+  add(violations, sameStrings(nonCommentLines(saveWith.path), draftCachePaths), "draft source cache promotion must use the exact restore path set");
+  add(violations, saveWith.key === cacheSaveKey, "draft source cache promotion must save the exact primary rather than a matched fallback");
+
+  return violations;
 }
 
 export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
@@ -516,6 +1120,9 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
   if (!rust) {
     violations.push(`${rustFile} must exist`);
   } else {
+    for (const violation of draftWorkflowPolicyViolations(rust)) {
+      violations.push(`${rustFile} ${violation}`);
+    }
     add(violations, trigger(rust, "push") === undefined, `${rustFile} draft checks must not run on push`);
     add(violations, includesAll(at(rust, "on", "pull_request", "paths"), [
       "Cargo.lock",
@@ -526,18 +1133,18 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "scripts/generate-codestory-skill-syntax.mjs",
     ]), `${rustFile} must cover workspace source and generated catalog changes`);
     const job = requireJob(violations, rustFile, rust, "linux-draft");
-    add(violations, job["runs-on"] === "ubuntu-latest", `${rustFile} must use one Ubuntu lane`);
-    requireStepRun(violations, rustFile, job, "Check formatting", ["cargo fmt --check"]);
-    requireStepRun(violations, rustFile, job, "Check the workspace", ["cargo check --workspace --locked"]);
-    requireStepRun(violations, rustFile, job, "Check generated CodeStory syntax and MCP catalog", [
-      "cargo build --locked -p codestory-cli",
-      "node scripts/generate-codestory-skill-syntax.mjs --check",
-    ]);
-    requireStepRun(violations, rustFile, job, "Lint workspace libraries", ["cargo clippy --workspace --lib --locked -- -D warnings"]);
-    requireStepRun(violations, rustFile, job, "Prove focused publication contracts", [
-      "cargo test --locked -p codestory-llama-sys --test model_staging",
-      "cargo test --locked",
-    ]);
+    const retrievalWorkflow = workflows.get(retrievalFile);
+    for (const violation of retrievalProducerTriggerPolicyViolations(retrievalWorkflow)) {
+      violations.push(`${retrievalFile} ${violation}`);
+    }
+    const retrievalJob = object(at(
+      retrievalWorkflow,
+      "jobs",
+      "linux-contracts",
+    ));
+    for (const violation of draftSourcePolicyViolations(job, retrievalJob)) {
+      violations.push(`${rustFile} ${violation}`);
+    }
   }
 
   const sourceFile = "source-proof.yml";
@@ -695,6 +1302,58 @@ function validatePackagedProof(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "build");
   validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"), graph);
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
+  const packageSteps = list(job.steps).map(object);
+  const nativeIdentitySteps = packageSteps.filter(step => step.name === "Capture Rust cache key");
+  const nativeIdentity = nativeIdentitySteps[0];
+  const nativeIdentityRun = executableRunText(String(nativeIdentity?.run ?? ""));
+  add(
+    violations,
+    nativeIdentitySteps.length === 1
+      && hasExactKeys(nativeIdentity, ["name", "id", "shell", "run"])
+      && nativeIdentity?.id === "rust-cache-key"
+      && nativeIdentity?.shell === "bash",
+    `${file} native build identity must be unique, unconditional, and keep its exact Bash output boundary`,
+  );
+  for (const fragment of [
+    'cmake=$(cmake --version',
+    'if [ "$RUNNER_OS" = Windows ]',
+    'generator=ninja',
+    'ninja=$(ninja --version)',
+    'CMAKE_GENERATOR=Ninja',
+    'generator=platform-default',
+    'ninja=not-applicable',
+  ]) {
+    add(
+      violations,
+      nativeIdentityRun.includes(fragment),
+      `${file} native build identity must include ${fragment}`,
+    );
+  }
+  const packageRestore = namedStep(job, "Restore Cargo registry, git sources, and build output");
+  const installRustIndex = packageSteps.findIndex(step => step.name === "Install pinned Rust");
+  const nativeIdentityIndex = packageSteps.findIndex(step => step.name === "Capture Rust cache key");
+  const packageRestoreIndex = packageSteps.findIndex(step => step.name === "Restore Cargo registry, git sources, and build output");
+  const packageBuildIndex = packageSteps.findIndex(step => step.name === "Build codestory-cli");
+  const linuxBuildIndex = packageSteps.findIndex(step => step.name === "Build Linux x64 at the glibc 2.31 baseline");
+  add(
+    violations,
+    nativeIdentityIndex === installRustIndex + 1
+      && packageRestoreIndex === nativeIdentityIndex + 1
+      && nativeIdentityIndex < packageBuildIndex
+      && nativeIdentityIndex < linuxBuildIndex,
+    `${file} native build identity must run immediately after Rust selection and before cache restore or any native build`,
+  );
+  add(
+    violations,
+    object(packageRestore?.with).key === "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v2-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock') }}",
+    `${file} native build cache must bind generator, CMake, Ninja, target, features, and lock identity`,
+  );
+  const packageBuild = namedStep(job, "Build codestory-cli");
+  add(
+    violations,
+    packageBuild?.env === undefined,
+    `${file} native package build must not override the selected generator`,
+  );
   requireStepRun(violations, file, job, "Prepare checksum-pinned embedded model", [
     "node scripts/prepare-embedded-model.mjs",
   ]);
@@ -913,7 +1572,31 @@ function validateRemainingWorkflows(workflows, violations) {
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
+    const sourceBuildTools = namedStep(job, "Capture source build tool evidence");
+    add(
+      violations,
+      hasExactKeys(object(sourceBuildTools), ["name", "if", "shell", "run"])
+        && sourceBuildTools?.if === "${{ !inputs.use_packaged_cli_artifact }}"
+        && sourceBuildTools?.shell === "pwsh",
+      `${vulkanFile} source build tool evidence must remain source-only and fail closed`,
+    );
+    requireStepRun(violations, vulkanFile, job, "Capture source build tool evidence", [
+      "CMAKE_GENERATOR=Ninja",
+      "cmake --version",
+      "ninja --version",
+    ]);
     requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
+    const nativeBuild = namedStep(job, "Build and package native CLI");
+    add(
+      violations,
+      hasExactKeys(object(nativeBuild?.env), ["VERSION", "CMAKE_GENERATOR"])
+        && object(nativeBuild?.env).CMAKE_GENERATOR === windowsNativeGenerator,
+      `${vulkanFile} source package build must use the Ninja native generator`,
+    );
+    requireStepRun(violations, vulkanFile, job, "Build and package native CLI", [
+      "cargo build --release --locked -p codestory-cli",
+      "package-codestory-release.py",
+    ]);
     const engine = namedStep(job, "Prove offline Vulkan and multi-repository reuse");
     requireStepRun(violations, vulkanFile, job, "Prove offline Vulkan and multi-repository reuse", ["--engine-policy accelerated", "--expected-backend Vulkan", "--offline"]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
@@ -931,14 +1614,13 @@ function validateRemainingWorkflows(workflows, violations) {
     requireStepUses(violations, statsFile, job, "Upload repo-scale stats output", "actions/upload-artifact@v7.0.1");
   }
 
-  const retrievalFile = "retrieval-engine-smoke.yml";
   const retrieval = workflows.get(retrievalFile);
   if (!retrieval) {
     violations.push(`${retrievalFile} must exist`);
   } else {
-    const windows = requireJob(violations, retrievalFile, retrieval, "windows-manifest-missing");
-    add(violations, windows.if === "github.event_name == 'workflow_dispatch'", `${retrievalFile} Windows proof must be workflow-dispatch only`);
-    add(violations, !scalarStrings(windows).some(value => value.includes("labels")), `${retrievalFile} Windows proof must not be label-triggered`);
+    for (const violation of windowsManifestProofPolicyViolations(retrieval)) {
+      violations.push(`${retrievalFile} ${violation}`);
+    }
   }
 
   const guardFile = "main-branch-source-guard.yml";

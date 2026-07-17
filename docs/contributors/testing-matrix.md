@@ -252,6 +252,38 @@ node --test .github/scripts/check-workflow-policy.test.mjs
 node .github/scripts/route-ci-proof.mjs --self-test
 ```
 
+The base-branch retrieval lane seeds the five draft publication-proof test
+targets with serial `cargo test --no-run` commands before it saves its cache.
+Draft CI first requests the complete retrieval key, then same-topology prior-lock
+draft and retrieval prefixes. Those prefixes retain runner, Rust version, host
+target, feature topology, proof-topology version and command digest, and the
+complete workspace-manifest hash; only the lockfile hash is omitted. A full
+retrieval-key match is a compatible seed. A prior-lock prefix match is partial
+Cargo reuse even though both are reported as `cache-hit=false` against the draft
+primary, so evidence must use the reported matched key to distinguish them.
+
+The workflow-dispatch-only Windows manifest-missing lane installs the repository's
+checksum-pinned Vulkan SDK before it compiles and runs the real locked
+`ready_command` integration target with explicit CPU runtime permission. Its
+exact-only cache binds the hosted OS, Rust release, host target, versioned proof
+shape, Ninja generator, CMake and Ninja versions, default feature topology,
+workspace and vendor manifests, installer script, and lockfile. It has no
+fallback prefixes, reruns the full contract on an exact hit, and saves the
+exact primary only after the proof succeeds.
+
+Every Windows source-build proof lane sets `CMAKE_GENERATOR=Ninja`. This keeps
+llama.cpp nested native builds serialized under the repository's supported
+generator instead of inheriting a hosted Visual Studio/MSBuild generator. The
+hosted package cache also binds that generator and its CMake/Ninja tool versions;
+the protected Vulkan lane pins the same generator before building its package
+and records both tool versions in the retained host evidence.
+
+That Windows lane is source and protocol evidence on a hosted CPU runner. The
+SDK preserves the production-default native compile topology; it does not prove
+Vulkan execution, a packaged archive, an installed runtime, or protected
+hardware behavior. Those claims remain with the package and protected Windows
+Vulkan proof lanes.
+
 `release-claims.json` is the release claim and proof-tier source of truth. It
 binds each claim to its evidence identity, expiry, dependency, executable
 prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The

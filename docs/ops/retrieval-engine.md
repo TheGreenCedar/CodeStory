@@ -110,6 +110,12 @@ branch.
 | Windows | Vulkan | Physical adapter, software-adapter rejection, full layer offload, timed live smoke |
 | Linux | Vulkan-capable package | No GPU claim without protected real-hardware evidence |
 
+Windows source and package proof builds pin `CMAKE_GENERATOR=Ninja`; hosted
+native-build caches include the selected generator and CMake/Ninja versions.
+When protected Windows proof builds from source, it records those tool versions
+in its host artifact. This is build determinism evidence and does not upgrade a
+hosted CPU result into a Vulkan runtime claim.
+
 WARP, llvmpipe, lavapipe, and other software adapters cannot satisfy an
 accelerated policy. Production never silently falls back to CPU. Hosted CI may
 set:

@@ -10,6 +10,22 @@
 - Direct CLI JSON failures now retain runtime API error codes and details across
   packet, search, activation, and retrieval indexing instead of collapsing
   typed failures into a generic `command_failed` envelope.
+- The manual Windows manifest-missing readiness lane now installs the
+  checksum-pinned Vulkan SDK before running the real locked `ready_command`
+  contract with explicit CPU runtime permission. Windows source-build proof
+  pins the Ninja generator instead of inheriting the hosted Visual Studio
+  generator, and exact caches bind the generator plus CMake and Ninja versions
+  alongside the hosted platform, Rust and target identities, default native
+  feature and proof shape, workspace manifests, installer, and lockfile. The
+  protected Windows artifact records the same native tool versions when that
+  lane builds from source. The hosted lane remains source/protocol evidence
+  rather than a packaged or Vulkan-hardware claim.
+- Draft source CI now restores exact-lock retrieval output or narrowly scoped
+  prior-lock output before rebuilding. The base retrieval lane serially seeds
+  the exact five test-profile targets used by draft proof, while a versioned
+  cache identity binds the runner, Rust toolchain, target, feature and proof
+  topology, workspace manifests, and lockfile. Partial restores are promoted
+  only after every unchanged serial proof succeeds.
 - Stdio/MCP now retains a bounded set of project contexts keyed by native
   workspace identity and immutable configuration, so A/B/A routing preserves
   isolated per-project state without rereading process defaults.

@@ -9,6 +9,8 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - crates/**/Cargo.toml
+      - vendor/**/Cargo.toml
       - crates/codestory-llama-sys/**
       - crates/codestory-retrieval/src/embeddings.rs
       - crates/codestory-retrieval/src/health.rs
@@ -19,7 +21,9 @@ on:
       - crates/codestory-cli/src/stdio_transport.rs
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/scripts/install-windows-vulkan-sdk.ps1
       - .github/workflows/retrieval-engine-smoke.yml
+      - .github/workflows/rust-ci.yml
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -32,6 +36,8 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - crates/**/Cargo.toml
+      - vendor/**/Cargo.toml
       - crates/codestory-llama-sys/**
       - crates/codestory-retrieval/src/embeddings.rs
       - crates/codestory-retrieval/src/health.rs
@@ -42,7 +48,9 @@ on:
       - crates/codestory-cli/src/stdio_transport.rs
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/scripts/install-windows-vulkan-sdk.ps1
       - .github/workflows/retrieval-engine-smoke.yml
+      - .github/workflows/rust-ci.yml
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
@@ -97,7 +105,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Generalization lint regression contracts
         run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
@@ -123,6 +131,14 @@ jobs:
       - name: Retrieval crate unit tests
         run: cargo test --locked -p codestory-retrieval
 
+      - name: Seed draft proof test-profile artifacts
+        run: |
+          cargo test --locked -p codestory-llama-sys --test native_staging --no-run
+          cargo test --locked -p codestory-llama-sys --test model_staging --no-run
+          cargo test --locked -p codestory-cli --test stdio_protocol_contracts --no-run two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture
+          cargo test --locked -p codestory-runtime --no-run publication_transitions_fail_or_cancel_atomically -- --nocapture
+          cargo test --locked -p codestory-store --no-run staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture
+
       - name: Save Cargo registry, git sources, and build output
         if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
@@ -140,23 +156,34 @@ jobs:
     timeout-minutes: 30
     env:
       CODESTORY_EMBED_ALLOW_CPU: "1"
+      CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Rust stable
+        shell: pwsh
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Capture Rust cache key
+      - name: Install checksum-pinned Windows Vulkan SDK
+        shell: pwsh
+        run: .github/scripts/install-windows-vulkan-sdk.ps1
+
+      - name: Capture Rust cache identity
         id: rust-cache-key
+        shell: pwsh
         run: |
           $release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }
           $target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }
+          $cmake = (cmake --version | Select-Object -First 1) -replace '^cmake version ', ''
+          $ninja = (ninja --version).Trim()
           "version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "cmake=$cmake" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ninja=$ninja" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Restore Cargo registry, git sources, and build output
+      - name: Restore Windows Cargo inputs and output
         id: cargo-cache-restore
         uses: actions/cache/restore@v5
         continue-on-error: true
@@ -165,12 +192,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-windows-ready-command-v2-a6923d8bb320ad402d87ba9fa9cd27449db876f2c15eac25b865ed25a63ac790-generator-ninja-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('.github/scripts/install-windows-vulkan-sdk.ps1') }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Retrieval readiness manifest-missing contract
+      - name: Prove Windows ready_command manifest-missing contract
+        shell: pwsh
         run: cargo test --locked -p codestory-cli --test ready_command
 
-      - name: Save Cargo registry, git sources, and build output
+      - name: Save Windows Cargo inputs and output
         if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
