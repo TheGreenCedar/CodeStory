@@ -738,7 +738,8 @@ pub struct PerUserEmbeddingClient {
 }
 
 struct EmbeddingCallControl<'a> {
-    deadline: Instant,
+    timeout: Duration,
+    deadline: OnceLock<Instant>,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
@@ -747,19 +748,31 @@ impl<'a> EmbeddingCallControl<'a> {
         if timeout.is_zero() {
             bail!("embedding_server_deadline_invalid");
         }
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| anyhow!("embedding_server_deadline_invalid"))?;
         let control = Self {
-            deadline,
+            timeout,
+            deadline: OnceLock::new(),
             cancelled,
         };
         control.check()?;
         Ok(control)
     }
 
+    fn arm(&self) -> Result<()> {
+        if self.deadline.get().is_none() {
+            let deadline = Instant::now()
+                .checked_add(self.timeout)
+                .ok_or_else(|| anyhow!("embedding_server_deadline_invalid"))?;
+            let _ = self.deadline.set(deadline);
+        }
+        self.check()
+    }
+
     fn triggered(&self) -> bool {
-        (self.cancelled)() || Instant::now() >= self.deadline
+        (self.cancelled)()
+            || self
+                .deadline
+                .get()
+                .is_some_and(|deadline| Instant::now() >= *deadline)
     }
 
     fn check(&self) -> Result<()> {
@@ -774,7 +787,11 @@ impl<'a> EmbeddingCallControl<'a> {
             }
             .into());
         }
-        if Instant::now() >= self.deadline {
+        if self
+            .deadline
+            .get()
+            .is_some_and(|deadline| Instant::now() >= *deadline)
+        {
             return Err(PerUserEmbeddingError {
                 code: "embedding_deadline_exceeded".into(),
                 message: "the caller deadline elapsed during the embedding request".into(),
@@ -790,10 +807,11 @@ impl<'a> EmbeddingCallControl<'a> {
 
     fn remaining(&self, maximum: Duration) -> Result<Duration> {
         self.check()?;
-        let remaining = self
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .min(maximum);
+        let remaining = self.deadline.get().map_or(maximum, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(maximum)
+        });
         if remaining.is_zero() {
             self.check()?;
             bail!("embedding_server_deadline_invalid");
@@ -1317,7 +1335,7 @@ impl PerUserEmbeddingClient {
                 }
                 Err(error) => return Err(error),
             };
-            control.check()?;
+            control.arm()?;
             let request_id = Uuid::new_v4().to_string();
             let cancel_token = Uuid::new_v4().to_string();
             let remaining = control.remaining(timeout)?;
@@ -5190,6 +5208,11 @@ mod tests {
         Loss,
         HelloLoss,
         Capacity,
+        TimedBulk {
+            hello_delay: Duration,
+            exchange_delay: Duration,
+            lose_exchange: bool,
+        },
         Blocking {
             request_started: Arc<AtomicBool>,
             cancelled: Arc<AtomicBool>,
@@ -5226,6 +5249,9 @@ mod tests {
                     if matches!(self.outcome, ScriptOutcome::HelloLoss) {
                         self.reads = Cursor::new(Vec::new());
                         return Ok(());
+                    }
+                    if let ScriptOutcome::TimedBulk { hello_delay, .. } = self.outcome {
+                        thread::sleep(hello_delay);
                     }
                     (
                         success_response(
@@ -5300,7 +5326,44 @@ mod tests {
                     ScriptOutcome::HelloLoss => {
                         return Err(io::Error::other("query reached hello-loss stream"));
                     }
+                    ScriptOutcome::TimedBulk { .. } => {
+                        return Err(io::Error::other("query reached timed bulk stream"));
+                    }
                 },
+                EmbeddingOperation::EmbedDocuments { inputs, .. } => {
+                    let ScriptOutcome::TimedBulk {
+                        exchange_delay,
+                        lose_exchange,
+                        ..
+                    } = self.outcome
+                    else {
+                        return Err(io::Error::other("documents reached non-bulk stream"));
+                    };
+                    thread::sleep(exchange_delay);
+                    if lose_exchange {
+                        self.reads = Cursor::new(Vec::new());
+                        return Ok(());
+                    }
+                    let vectors = (0..inputs.len())
+                        .map(|_| {
+                            let mut vector = vec![0.0_f32; RETRIEVAL_EMBEDDING_DIM];
+                            vector[0] = 1.0;
+                            vector
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        success_response(
+                            &request.request_id,
+                            EmbeddingResult::Vectors {
+                                rows: inputs.len() as u32,
+                                columns: RETRIEVAL_EMBEDDING_DIM as u32,
+                                encoding: "f32_le".into(),
+                                identity: Box::new(test_engine_identity()),
+                            },
+                        ),
+                        encode_vectors(&vectors).map_err(io::Error::other)?,
+                    )
+                }
                 EmbeddingOperation::Cancel { .. } => {
                     let ScriptOutcome::Blocking { cancelled, .. } = self.outcome.clone() else {
                         return Err(io::Error::other("unexpected cancellation request"));
@@ -5524,6 +5587,86 @@ mod tests {
         fallback: BootstrapConnectOutcome,
         budgets: EmbeddingClientBudgets,
         compatibility: EmbeddingCompatibility,
+    }
+
+    struct DeadlineBudgetTransport {
+        clock: Arc<TestClock>,
+        connect_count: AtomicUsize,
+        spawn_count: AtomicUsize,
+        compatibility: EmbeddingCompatibility,
+    }
+
+    impl DeadlineBudgetTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                clock: TestClock::new(),
+                connect_count: AtomicUsize::new(0),
+                spawn_count: AtomicUsize::new(0),
+                compatibility: EmbeddingCompatibility::current(true),
+            })
+        }
+    }
+
+    impl EmbeddingClientTransport for DeadlineBudgetTransport {
+        fn connect(
+            &self,
+            _intent: EmbeddingConnectIntent,
+            _budget: Duration,
+            _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
+        ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
+            let attempt = self.connect_count.fetch_add(1, Ordering::AcqRel) + 1;
+            Ok(match attempt {
+                1 => EmbeddingConnectOutcome::Connected(Box::new(ScriptStream::new(
+                    ScriptOutcome::TimedBulk {
+                        hello_delay: Duration::from_millis(200),
+                        exchange_delay: Duration::from_millis(100),
+                        lose_exchange: true,
+                    },
+                    self.compatibility.clone(),
+                ))),
+                2 => EmbeddingConnectOutcome::NoOwner,
+                3 => {
+                    thread::sleep(Duration::from_millis(75));
+                    EmbeddingConnectOutcome::OwnerUnresponsive(EmbeddingTransportFailure {
+                        code: "embedding_server_owner_unresponsive".into(),
+                        message: "the fail-stopped owner is releasing authority".into(),
+                    })
+                }
+                _ => EmbeddingConnectOutcome::Connected(Box::new(ScriptStream::new(
+                    ScriptOutcome::TimedBulk {
+                        hello_delay: Duration::ZERO,
+                        exchange_delay: Duration::from_millis(100),
+                        lose_exchange: false,
+                    },
+                    self.compatibility.clone(),
+                ))),
+            })
+        }
+
+        fn spawn_exact_current_exe(
+            &self,
+        ) -> std::result::Result<EmbeddingSpawnAttempt, EmbeddingTransportFailure> {
+            let generation = self.spawn_count.fetch_add(1, Ordering::AcqRel) as u64 + 1;
+            Ok(EmbeddingSpawnAttempt::new(generation))
+        }
+
+        fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
+            self.clock.clone()
+        }
+
+        fn executable_identity(&self) -> EmbeddingExecutableIdentity {
+            test_executable()
+        }
+
+        fn budgets(&self) -> EmbeddingClientBudgets {
+            EmbeddingClientBudgets {
+                connect: Duration::from_millis(10),
+                spawn: Duration::from_millis(100),
+                retry_after: Duration::from_millis(1),
+                query_request: Duration::from_millis(400),
+                bulk_request: Duration::from_millis(400),
+            }
+        }
     }
 
     impl BootstrapTestTransport {
@@ -5760,6 +5903,35 @@ mod tests {
         assert_ne!(attempts[0].request_id, attempts[1].request_id);
         assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
         assert_eq!(transport.connect_count.load(Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn bulk_replay_budget_preserves_the_full_replay_window_after_initial_bootstrap() {
+        // The frozen bulk deadline is the sum of the stalled-native window,
+        // replacement convergence, and replay-success budget. Keep those
+        // phases comfortably inside the 400 ms test deadline, then add 200 ms
+        // of initial Hello work that the frozen formula does not account for.
+        // The old accounting takes about 475 ms and the repaired accounting
+        // about 275 ms, leaving wide real-time margins around the same 400 ms
+        // deadline despite ordinary scheduler jitter.
+        let transport = DeadlineBudgetTransport::new();
+        let client = test_client(transport.clone());
+        let result = client.embed_documents_with_qualification_attempts(&["x".into()]);
+        let observed = result
+            .as_ref()
+            .err()
+            .and_then(embedding_retry_state)
+            .map(|retry| retry.code);
+
+        assert!(
+            result.is_ok(),
+            "a contract-sized recovery must retain its full replay window; observed_code={observed:?}, result={result:?}"
+        );
+        let (_, attempts) = result.expect("successful replay");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, "server_loss");
+        assert_eq!(attempts[1].outcome, "completed");
+        assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
