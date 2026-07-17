@@ -163,6 +163,29 @@ hardware-bound release-evidence gate separately re-evaluates repeat graph,
 semantic, and full-refresh limits from `repo-stats-contract.json` before an
 artifact can become release-eligible.
 
+### Linux ARM64 v2 baseline preregistration
+
+The `codestory-release-evidence-linux-arm64-v2` baseline is measured from the
+clean pre-server-change product tree at
+`54c8d51928e99b993a37afb21cfb9a79d6468fe3`. Record the exact measurement
+commit in the approved profile; changes made afterward cannot define or move
+the reference values used to evaluate them.
+
+Before observing the v2 measurements, its operational budgets are fixed as
+follows:
+
+- status, local grounding, search, and cold indexing: reference multiplied by
+  `1.25`;
+- unchanged-corpus convergence: reference multiplied by `1.15`;
+- worst quality-gated packet median: reference multiplied by `1.10`;
+- same-corpus storage growth: reference bytes multiplied by `1.10`; and
+- second-based thresholds round upward to the next `0.01` seconds.
+
+These multipliers are release budgets, not confidence intervals. The baseline
+is one identity-bound observation except for the required three publishable
+packet repeats. Do not tune a multiplier after reading the run, substitute v1
+values, or rerun a valid measurement to seek a more favorable sample.
+
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
 reported hashes and values in the short-lived repository Actions secret
