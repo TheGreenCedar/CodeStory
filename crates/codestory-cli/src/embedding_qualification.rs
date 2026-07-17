@@ -140,6 +140,7 @@ struct QualificationScenarioSummary {
 
 struct QualificationValidation {
     output_directory: PathBuf,
+    output_path: PathBuf,
     nonce_sha256: String,
     request_sha256: String,
 }
@@ -213,7 +214,7 @@ pub(crate) fn run_internal_embedding_qualification(
         measurements,
         scenarios,
     };
-    write_atomic_json(&command.output, &output).context("write raw qualification output")
+    write_atomic_json(&validation.output_path, &output).context("write raw qualification output")
 }
 
 pub(crate) fn run_internal_embedding_qualification_worker(
@@ -237,7 +238,7 @@ fn validate_request(
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_gate_closed"))?;
-    let (qualification_directory, nonce_sha256) = validate_gate_and_paths(
+    let (qualification_directory, output_path, nonce_sha256) = validate_gate_and_paths(
         request,
         qualification_directory,
         &nonce,
@@ -252,6 +253,7 @@ fn validate_request(
     validate_projects(&request.projects)?;
     Ok(QualificationValidation {
         output_directory: qualification_directory,
+        output_path,
         nonce_sha256,
         request_sha256: sha256_bytes(request_bytes),
     })
@@ -263,7 +265,7 @@ fn validate_gate_and_paths(
     nonce: &str,
     request_path: &Path,
     output_path: &Path,
-) -> Result<(PathBuf, String)> {
+) -> Result<(PathBuf, PathBuf, String)> {
     if request.qualification_nonce != nonce {
         bail!("embedding_qualification_nonce_mismatch");
     }
@@ -275,11 +277,11 @@ fn validate_gate_and_paths(
         bail!("embedding_qualification_output_directory_mismatch");
     }
     validate_direct_child(request_path, &qualification_directory, true)?;
-    validate_direct_child(output_path, &qualification_directory, false)?;
+    let output_path = validate_direct_child(output_path, &qualification_directory, false)?;
     if output_path.exists() {
         bail!("embedding_qualification_output_exists");
     }
-    Ok((qualification_directory, nonce_sha256))
+    Ok((qualification_directory, output_path, nonce_sha256))
 }
 
 fn validate_source(source: &QualificationSource) -> Result<()> {
@@ -467,18 +469,24 @@ fn read_private_request(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn validate_direct_child(path: &Path, directory: &Path, must_exist: bool) -> Result<()> {
-    if !path.is_absolute()
-        || path.parent() != Some(directory)
-        || path.file_name().is_none()
-        || path.extension().and_then(|value| value.to_str()) != Some("json")
-    {
+fn validate_direct_child(path: &Path, directory: &Path, must_exist: bool) -> Result<PathBuf> {
+    let Some(parent) = path.parent() else {
+        bail!("embedding_qualification_path_untrusted");
+    };
+    let Some(file_name) = path.file_name() else {
+        bail!("embedding_qualification_path_untrusted");
+    };
+    if !path.is_absolute() || path.extension().and_then(|value| value.to_str()) != Some("json") {
         bail!("embedding_qualification_path_untrusted");
     }
-    if must_exist && canonical_existing(path.parent().expect("checked above"))? != directory {
+    if canonical_existing(parent)? != directory {
         bail!("embedding_qualification_parent_replaced");
     }
-    Ok(())
+    let canonical_path = directory.join(file_name);
+    if must_exist && canonical_existing(path)? != canonical_path {
+        bail!("embedding_qualification_path_untrusted");
+    }
+    Ok(canonical_path)
 }
 
 fn required_absolute_directory(name: &str) -> Result<PathBuf> {
@@ -702,8 +710,9 @@ mod tests {
         let canonical = fs::canonicalize(directory.path()).expect("canonical directory");
         let request_path = canonical.join("request.json");
         let output_path = canonical.join("output.json");
+        fs::write(&request_path, b"{}").expect("write request placeholder");
         let request = gated_request(&canonical, "private-nonce");
-        let (_, digest) = validate_gate_and_paths(
+        let (_, validated_output, digest) = validate_gate_and_paths(
             &request,
             canonical.clone(),
             "private-nonce",
@@ -711,6 +720,7 @@ mod tests {
             &output_path,
         )
         .expect("valid dual gate");
+        assert_eq!(validated_output, output_path);
         assert_eq!(digest, sha256_bytes(b"private-nonce"));
 
         let mut wrong_raw = request.clone();
@@ -747,5 +757,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualification_gate_accepts_an_equivalent_native_parent_spelling() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().expect("create qualification directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure qualification directory");
+        let canonical = fs::canonicalize(directory.path()).expect("canonical directory");
+        let request_path = canonical.join("request.json");
+        fs::write(&request_path, b"{}").expect("write request placeholder");
+
+        let aliases = tempfile::tempdir().expect("create alias parent");
+        let alias = aliases.path().join("qualification-alias");
+        symlink(&canonical, &alias).expect("create directory alias");
+        let request = gated_request(&canonical, "private-nonce");
+        let (_, output_path, _) = validate_gate_and_paths(
+            &request,
+            canonical.clone(),
+            "private-nonce",
+            &alias.join("request.json"),
+            &alias.join("output.json"),
+        )
+        .expect("equivalent native parent is accepted");
+
+        assert_eq!(output_path, canonical.join("output.json"));
     }
 }
