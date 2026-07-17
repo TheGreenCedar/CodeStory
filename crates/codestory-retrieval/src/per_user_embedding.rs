@@ -1385,11 +1385,12 @@ impl PerUserEmbeddingClient {
         while !completed.load(Ordering::Acquire) && !control.triggered() {
             thread::sleep(CONNECTION_POLL);
         }
-        while !completed.load(Ordering::Acquire) {
-            if self.send_cancel(request_id, cancel_token).unwrap_or(false) {
-                return;
-            }
-            thread::sleep(CONNECTION_POLL);
+        if !completed.load(Ordering::Acquire) {
+            // The server has the same finite request deadline, so cancellation
+            // is best effort rather than a retry loop. Retrying every poll
+            // after a full handler admission would turn timed-out callers into
+            // an unbounded control-connection storm.
+            let _ = self.send_cancel(request_id, cancel_token);
         }
     }
 

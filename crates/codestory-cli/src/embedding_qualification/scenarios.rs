@@ -3189,24 +3189,50 @@ fn run_dead_client_load(
         .collect::<Vec<_>>();
     let mut workers = Vec::new();
     for _ in 0..parameters.query_count {
-        let client = client.clone();
+        let runtime = runtime.clone();
         let input = input.clone();
         workers.push(
             std::thread::Builder::new()
                 .name("codestory-dead-client-query".into())
                 .spawn(move || {
-                    let _ = client.embed_query(&input);
+                    // Keep an admitted request alive until this process is
+                    // terminated. The product client's short deadline would
+                    // otherwise start cancellation watchers and make their
+                    // retry traffic the pressure under test.
+                    let transport = match crate::embedding_server_transport::NativeEmbeddingClientTransport::capture() {
+                        Ok(transport) => transport,
+                        Err(_) => return,
+                    };
+                    let clock = EmbeddingClientTransport::clock(&transport);
+                    let _ = run_raw_protocol_exchange_with_input(
+                        &runtime,
+                        clock.as_ref(),
+                        "query",
+                        ANTI_IDLE_PROTOCOL_DEADLINE_MS,
+                        Some(input),
+                    );
                 })?,
         );
     }
     for _ in 0..parameters.bulk_count {
-        let client = client.clone();
-        let documents = documents.clone();
+        let runtime = runtime.clone();
+        let input = documents.join("\n");
         workers.push(
             std::thread::Builder::new()
                 .name("codestory-dead-client-bulk".into())
                 .spawn(move || {
-                    let _ = client.embed_documents(&documents);
+                    let transport = match crate::embedding_server_transport::NativeEmbeddingClientTransport::capture() {
+                        Ok(transport) => transport,
+                        Err(_) => return,
+                    };
+                    let clock = EmbeddingClientTransport::clock(&transport);
+                    let _ = run_raw_protocol_exchange_with_input(
+                        &runtime,
+                        clock.as_ref(),
+                        "bulk",
+                        ANTI_IDLE_PROTOCOL_DEADLINE_MS,
+                        Some(input),
+                    );
                 })?,
         );
     }
