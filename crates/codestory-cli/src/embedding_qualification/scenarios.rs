@@ -1025,7 +1025,7 @@ impl<'a> ScenarioRunner<'a> {
 
     fn measure_busy_retry(
         &mut self,
-        _transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
+        transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
         runtime: &SidecarRuntimeConfig,
         repeat: u32,
     ) -> Result<MeasurementInterval> {
@@ -1044,7 +1044,7 @@ impl<'a> ScenarioRunner<'a> {
                     ANTI_IDLE_PROTOCOL_DEADLINE_MS,
                 )
             })?;
-        self.wait_for_snapshot(
+        let seed_active = self.wait_for_snapshot(
             "measurement_busy_seed_active",
             SNAPSHOT_TIMEOUT,
             |snapshot| {
@@ -1055,25 +1055,49 @@ impl<'a> ScenarioRunner<'a> {
                     .is_some_and(|active| active.class == "bulk")
             },
         )?;
+        let query_capacity = usize::try_from(seed_active.scheduler.query_capacity)
+            .context("convert qualification query capacity")?;
+        let project_identity = project_identity_sha256(runtime);
 
         let mut queued = Vec::new();
-        for ordinal in 0..64 {
+        for ordinal in 0..query_capacity {
             let runtime = runtime.clone();
             let clock = Arc::clone(&self.clock);
+            let transport = transport.clone();
+            let project_identity = project_identity.clone();
+            let ordinal = u32::try_from(ordinal).context("convert qualification query ordinal")?;
             let input = workload_input("saturated_query_65th_retry_v1", repeat, ordinal + 1, 256);
+            let correlation_id = format!(
+                "measurement-busy-{repeat}-{ordinal}-{}",
+                &project_identity[..12]
+            );
+            let (submitted_tx, submitted_rx) = std::sync::mpsc::sync_channel(1);
             queued.push(
                 std::thread::Builder::new()
                     .name(format!("codestory-measurement-busy-query-{ordinal}"))
                     .spawn(move || {
-                        run_raw_protocol_exchange_with_input(
+                        run_queue_operation(
                             &runtime,
+                            transport,
                             clock.as_ref(),
+                            &project_identity,
                             "query",
-                            ANTI_IDLE_PROTOCOL_DEADLINE_MS,
+                            ordinal,
+                            correlation_id,
                             Some(input),
+                            submitted_tx,
                         )
                     })?,
             );
+            submitted_rx
+                .recv_timeout(CONTROL_TIMEOUT)
+                .context("wait for busy retry queue submission")?;
+            let expected_depth = u64::from(ordinal).saturating_add(1);
+            self.wait_for_snapshot(
+                "measurement_busy_query_enqueued",
+                QUEUE_SETUP_TIMEOUT,
+                |snapshot| snapshot.scheduler.query_depth >= expected_depth,
+            )?;
         }
         let saturated = self.wait_for_snapshot(
             "measurement_busy_saturated",
@@ -1124,10 +1148,12 @@ impl<'a> ScenarioRunner<'a> {
             .map_err(|_| anyhow::anyhow!("embedding_qualification_busy_seed_panicked"))??;
         require_protocol_exchange_success(&seed, "busy_retry_seed")?;
         for worker in queued {
-            let exchange = worker
+            let operation = worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("embedding_qualification_busy_query_panicked"))??;
-            require_protocol_exchange_success(&exchange, "busy_retry_query")?;
+            if operation.status != "ok" || operation.error.is_some() {
+                bail!("embedding_qualification_busy_retry_query_failed");
+            }
         }
         self.wait_for_snapshot(
             "measurement_busy_drained",
@@ -3124,6 +3150,7 @@ fn run_queue_load(
                         class,
                         ordinal,
                         correlation_id,
+                        None,
                         submitted_tx,
                     )
                 })?;
@@ -3198,6 +3225,7 @@ fn run_queue_operation(
     class: &str,
     ordinal: u32,
     correlation_id: String,
+    measured_input: Option<String>,
     submitted_tx: std::sync::mpsc::SyncSender<u64>,
 ) -> Result<WorkerQueueOperation> {
     let mut stream = match transport.connect(Duration::from_secs(2))? {
@@ -3248,14 +3276,18 @@ fn run_queue_operation(
             deadline_ms,
             retry_after_ms: 100,
             cancel_token: None,
-            input: format!("qualification-queue-{ordinal}"),
+            input: measured_input
+                .clone()
+                .unwrap_or_else(|| format!("qualification-queue-{ordinal}")),
         },
         "bulk" => EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
             cancel_token: None,
-            inputs: vec![format!("qualification-queue-{ordinal}")],
+            inputs: vec![
+                measured_input.unwrap_or_else(|| format!("qualification-queue-{ordinal}")),
+            ],
         },
         _ => bail!("embedding_qualification_queue_class_invalid"),
     };
