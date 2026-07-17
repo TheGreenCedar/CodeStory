@@ -17,16 +17,17 @@
     "query_count": 30,
     "top_k": 20,
     "warmups": 5,
+    "latency_scope": "first_query_after_load_ms is measured after opening the candidate generation in its fresh candidate process; it is not a cold-cache claim because build and source-truth work may already have touched filesystem pages",
     "paired_counterbalanced_blocks_per_workload": 6,
     "clean_evidence_roots": 2,
     "selection": "seeded nested real anchors; all catalog targets are force-included before the seeded fill",
-    "input_contract": "one complete immutable CodeStory retrieval publication admitted through a pinned product query session; its vectors.sqlite3, vector-generation-manifest.json, core publication identity, live query-embedder identity, independently reviewable vector-free source-truth query catalog, and frozen query vectors generated before candidate timing",
-    "execution_contract": "the orchestrator snapshots source, generation manifest, and fixture into one immutable evidence bundle; every child verifies that bundle, the exact binary digest, and macOS-arm64 host evidence before and after work"
+    "input_contract": "one complete immutable CodeStory retrieval publication admitted through a pinned product query session; its vectors.sqlite3, vector-generation-manifest.json, core publication identity, live query-embedder identity, independently reviewable vector-free source-truth query catalog bound to the clean exact Git checkout it names, and frozen query vectors generated before candidate timing",
+    "execution_contract": "the orchestrator snapshots source, generation manifest, and fixture into one immutable fsynced evidence bundle; every child verifies that bundle, the exact binary digest, and macOS-arm64 host evidence before and after work; completed journals replay the full counterbalanced matrix and validate every artifact digest and input binding before completion markers are written"
   },
   "required_measurements": [
     "build_ms",
     "load_ms",
-    "cold_query_ms",
+    "first_query_after_load_ms",
     "warm_query_p50_ms",
     "warm_query_p95_ms",
     "rss_baseline_after_input_verification_bytes",
@@ -37,7 +38,7 @@
     "incremental_reuse_ms",
     "ann_recall_at_20_against_embedded_scan",
     "source_truth_hit_at_20",
-    "concurrent_readers",
+    "barrier_controlled_reader_publish_overlap",
     "rollback_and_corrupt_generation_rejection"
   ],
   "decision_rules": {

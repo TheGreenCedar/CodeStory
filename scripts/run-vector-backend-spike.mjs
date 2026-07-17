@@ -35,6 +35,7 @@ const sourceManifest = realpathSync(sourceManifestInput);
 const output = resolve(required("CODESTORY_VECTOR_SPIKE_OUTPUT_ROOT"));
 const counts = [1000, 10000, 25000, 100000];
 const blocks = 6;
+const cleanRoots = ["clean-a", "clean-b"];
 const timeoutMs = Number(process.env.CODESTORY_VECTOR_SPIKE_TIMEOUT_MS ?? 20 * 60_000);
 
 if (existsSync(output)) throw new Error(`evidence root must be new: ${output}`);
@@ -45,6 +46,7 @@ const hostEvidence = approvedHostEvidence(binary);
 mkdirSync(output, { recursive: true });
 assertDirectoryWithoutSymlinks(output, "evidence root");
 atomicJson(join(output, "host-evidence.json"), hostEvidence);
+sealFrozenArtifact(join(output, "host-evidence.json"));
 
 const frozenRoot = join(output, "inputs");
 mkdirSync(frozenRoot, { recursive: true });
@@ -64,21 +66,48 @@ const input = {
 };
 const inputPath = join(output, "input.json");
 atomicJson(inputPath, input);
+sealFrozenArtifact(inputPath);
 const inputSha256 = sha256(readFileSync(inputPath));
 assertFrozenInputs(input, inputPath, inputSha256);
 
-for (const cleanRoot of ["clean-a", "clean-b"]) {
+for (const cleanRoot of cleanRoots) {
   const clean = join(output, cleanRoot);
   mkdirSync(clean, { recursive: true });
+  fsyncDirectory(clean);
   const journal = join(clean, "journal.jsonl");
   for (const count of counts) {
     const oracle = join(clean, `oracle-${count}.json`);
-    atomicJson(oracle, await invoke(["oracle", "--count", String(count)]));
+    const oracleEvent = {
+      kind: "oracle",
+      clean_root: cleanRoot,
+      count,
+      input_manifest_sha256: inputSha256,
+      started_at: new Date().toISOString(),
+    };
+    appendJournal(journal, { ...oracleEvent, status: "started" });
+    try {
+      atomicJson(oracle, await invoke(["oracle", "--count", String(count)]));
+      appendJournal(journal, {
+        ...oracleEvent,
+        status: "complete",
+        artifact: oracle,
+        result_sha256: sha256(readFileSync(oracle)),
+      });
+    } catch (error) {
+      appendJournal(journal, {
+        ...oracleEvent,
+        status: "failed",
+        error: String(error),
+        failed_at: new Date().toISOString(),
+      });
+      throw error;
+    }
     for (let block = 0; block < blocks; block += 1) {
-      const order = block % 2 === 0 ? ["sqlite-vec", "usearch"] : ["usearch", "sqlite-vec"];
+      const order = counterbalancedOrder(block + 1);
       for (const [position, backend] of order.entries()) {
         const workdir = join(clean, "work", `${count}`, `block-${block + 1}`, backend);
         const event = {
+          kind: "candidate",
           clean_root: cleanRoot,
           count,
           block: block + 1,
@@ -107,19 +136,23 @@ for (const cleanRoot of ["clean-a", "clean-b"]) {
     }
   }
   assertFrozenInputs(input, inputPath, inputSha256);
+  const replay = validateCleanEvidence(cleanRoot, clean, journal, inputSha256);
   atomicJson(join(clean, "complete.json"), {
     clean_root: cleanRoot,
     completed_at: new Date().toISOString(),
     input_manifest_sha256: inputSha256,
     journal_sha256: sha256(readFileSync(journal)),
+    replay,
   });
 }
 
 assertFrozenInputs(input, inputPath, inputSha256);
+const completedCleanRoots = cleanRoots.map(cleanRoot => validateCompletedCleanEvidence(cleanRoot, inputSha256));
 atomicJson(join(output, "complete.json"), {
   completed_at: new Date().toISOString(),
   input_manifest_sha256: inputSha256,
   host_evidence_sha256: sha256(readFileSync(hostEvidencePath)),
+  clean_roots: completedCleanRoots,
   disposition: "measurements complete; backend selection remains prohibited until all #1202 acceptance evidence is independently reviewed",
 });
 
@@ -223,11 +256,19 @@ function freezeArtifact(sourcePath, destination) {
   const before = sha256(readFileSync(sourcePath));
   copyFileSync(sourcePath, destination, 0);
   assertRegularFileWithoutSymlinks(destination, "frozen artifact");
+  fsyncFile(destination);
   const frozen = sha256(readFileSync(destination));
   const after = sha256(readFileSync(sourcePath));
   if (before !== frozen || before !== after) throw new Error(`source changed while freezing ${sourcePath}`);
-  chmodSync(destination, 0o444);
+  sealFrozenArtifact(destination);
   return destination;
+}
+
+function sealFrozenArtifact(path) {
+  assertRegularFileWithoutSymlinks(path, "frozen artifact");
+  chmodSync(path, 0o444);
+  fsyncFile(path);
+  fsyncDirectory(dirname(path));
 }
 
 function relativeArtifact(rootPath, artifactPath) {
@@ -271,15 +312,175 @@ function atomicJson(path, value) {
   fsyncSync(fd);
   closeSync(fd);
   renameSync(temporary, path);
-  const parent = openSync(dirname(path), "r");
-  fsyncSync(parent);
-  closeSync(parent);
+  fsyncDirectory(dirname(path));
 }
 
 function appendJournal(path, value) {
   mkdirSync(dirname(path), { recursive: true });
   const fd = openSync(path, "a");
   writeFileSync(fd, `${JSON.stringify(value)}\n`);
+  fsyncSync(fd);
+  closeSync(fd);
+  fsyncDirectory(dirname(path));
+}
+
+function counterbalancedOrder(block) {
+  if (!Number.isInteger(block) || block < 1 || block > blocks) {
+    throw new Error(`invalid paired block ${block}`);
+  }
+  return block % 2 === 1 ? ["sqlite-vec", "usearch"] : ["usearch", "sqlite-vec"];
+}
+
+function expectedJournalRows(cleanRoot, inputManifestSha256) {
+  const rows = new Map();
+  for (const count of counts) {
+    rows.set(`oracle/${count}`, {
+      kind: "oracle",
+      clean_root: cleanRoot,
+      count,
+      input_manifest_sha256: inputManifestSha256,
+    });
+    for (let block = 1; block <= blocks; block += 1) {
+      for (const [position, backend] of counterbalancedOrder(block).entries()) {
+        rows.set(`candidate/${count}/${block}/${position + 1}/${backend}`, {
+          kind: "candidate",
+          clean_root: cleanRoot,
+          count,
+          block,
+          order_position: position + 1,
+          backend,
+          input_manifest_sha256: inputManifestSha256,
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+function journalKey(event) {
+  if (event.kind === "oracle") return `oracle/${event.count}`;
+  if (event.kind === "candidate") {
+    return `candidate/${event.count}/${event.block}/${event.order_position}/${event.backend}`;
+  }
+  throw new Error(`journal event has unsupported kind: ${event.kind}`);
+}
+
+function validateCleanEvidence(cleanRoot, clean, journal, inputManifestSha256) {
+  assertFrozenInputs(input, inputPath, inputSha256);
+  assertDirectoryWithoutSymlinks(clean, `clean evidence root ${cleanRoot}`);
+  assertRegularFileWithoutSymlinks(journal, `journal for ${cleanRoot}`);
+  const expected = expectedJournalRows(cleanRoot, inputManifestSha256);
+  const observed = new Map([...expected.keys()].map(key => [key, { started: [], complete: [] }]));
+  const lines = readFileSync(journal, "utf8").split("\n").filter(Boolean);
+  if (lines.length === 0) throw new Error(`journal for ${cleanRoot} is empty`);
+  for (const [index, line] of lines.entries()) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch (error) {
+      throw new Error(`journal for ${cleanRoot} has malformed JSON at row ${index + 1}: ${error}`);
+    }
+    const key = journalKey(event);
+    const expectedEvent = expected.get(key);
+    if (!expectedEvent) throw new Error(`journal for ${cleanRoot} has unexpected row ${key}`);
+    for (const [field, expectedValue] of Object.entries(expectedEvent)) {
+      if (event[field] !== expectedValue) {
+        throw new Error(`journal row ${key} has invalid ${field}: ${event[field]}`);
+      }
+    }
+    if (event.status === "failed") throw new Error(`journal row ${key} recorded a failed child`);
+    if (event.status !== "started" && event.status !== "complete") {
+      throw new Error(`journal row ${key} has unsupported status: ${event.status}`);
+    }
+    observed.get(key)[event.status].push({ event, index });
+  }
+  for (const [key, expectedEvent] of expected) {
+    const rows = observed.get(key);
+    if (rows.started.length !== 1 || rows.complete.length !== 1) {
+      throw new Error(`journal for ${cleanRoot} is missing or duplicates ${key}`);
+    }
+    if (rows.started[0].index >= rows.complete[0].index) {
+      throw new Error(`journal for ${cleanRoot} completed ${key} before it started`);
+    }
+    validateJournalArtifact(clean, rows.complete[0].event, expectedEvent, inputManifestSha256);
+  }
+  return {
+    schema_version: 1,
+    expected_rows: expected.size,
+    completed_rows: expected.size,
+    journal_sha256: sha256(readFileSync(journal)),
+  };
+}
+
+function validateJournalArtifact(clean, event, expectedEvent, inputManifestSha256) {
+  if (typeof event.artifact !== "string" || typeof event.result_sha256 !== "string") {
+    throw new Error(`journal ${journalKey(event)} has no artifact digest binding`);
+  }
+  const cleanReal = realpathSync(clean);
+  const artifact = resolve(event.artifact);
+  if (!artifact.startsWith(`${cleanReal}/`)) {
+    throw new Error(`journal ${journalKey(event)} artifact escapes its clean evidence root`);
+  }
+  assertRegularFileWithoutSymlinks(artifact, `journal artifact ${journalKey(event)}`);
+  const bytes = readFileSync(artifact);
+  if (sha256(bytes) !== event.result_sha256) {
+    throw new Error(`journal ${journalKey(event)} artifact digest no longer matches`);
+  }
+  let result;
+  try {
+    result = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    throw new Error(`journal ${journalKey(event)} artifact is not JSON: ${error}`);
+  }
+  if (result.schema_version !== 2 || result.input_manifest_sha256 !== inputManifestSha256 || result.count !== expectedEvent.count) {
+    throw new Error(`journal ${journalKey(event)} artifact does not bind the frozen input/count`);
+  }
+  if (expectedEvent.kind === "candidate") {
+    if (result.backend !== expectedEvent.backend
+      || result.clean_root !== expectedEvent.clean_root
+      || result.block !== expectedEvent.block
+      || result.order_position !== expectedEvent.order_position) {
+      throw new Error(`journal ${journalKey(event)} candidate artifact does not match its matrix row`);
+    }
+  }
+}
+
+function validateCompletedCleanEvidence(cleanRoot, inputManifestSha256) {
+  const clean = join(output, cleanRoot);
+  const journal = join(clean, "journal.jsonl");
+  const replay = validateCleanEvidence(cleanRoot, clean, journal, inputManifestSha256);
+  const markerPath = join(clean, "complete.json");
+  assertRegularFileWithoutSymlinks(markerPath, `complete marker for ${cleanRoot}`);
+  let marker;
+  try {
+    marker = JSON.parse(readFileSync(markerPath, "utf8"));
+  } catch (error) {
+    throw new Error(`complete marker for ${cleanRoot} is not JSON: ${error}`);
+  }
+  if (marker.clean_root !== cleanRoot
+    || marker.input_manifest_sha256 !== inputManifestSha256
+    || marker.journal_sha256 !== replay.journal_sha256
+    || marker.replay?.schema_version !== replay.schema_version
+    || marker.replay?.expected_rows !== replay.expected_rows
+    || marker.replay?.completed_rows !== replay.completed_rows
+    || marker.replay?.journal_sha256 !== replay.journal_sha256) {
+    throw new Error(`complete marker for ${cleanRoot} does not match replayed evidence`);
+  }
+  return {
+    clean_root: cleanRoot,
+    complete_sha256: sha256(readFileSync(markerPath)),
+    journal_sha256: replay.journal_sha256,
+  };
+}
+
+function fsyncFile(path) {
+  const fd = openSync(path, "r");
+  fsyncSync(fd);
+  closeSync(fd);
+}
+
+function fsyncDirectory(path) {
+  const fd = openSync(path, "r");
   fsyncSync(fd);
   closeSync(fd);
 }

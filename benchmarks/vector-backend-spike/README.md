@@ -4,16 +4,18 @@ This is the evidence harness for #1202. It admits one real, complete CodeStory
 retrieval publication before it freezes a vector-free source-truth catalog with
 the linked CodeRank query embedder, then compares `sqlite-vec` and USearch in
 separate processes. It does not route, package, or select a production backend.
+The catalog is accepted only when its full `corpus_commit` matches the clean
+Git `HEAD` of the supplied project root; the frozen fixture records that commit
+and tree identity.
 
 ## Current disposition
 
-No candidate measurement has been recorded. The approved Linux corpus cannot
-yet create the required immutable source publication: its full index exceeds
-SQLite's bind-variable limit in the file-identity lookup. The separate
-current-source control passes, which makes this a large-project indexing
-defect tracked in [#1237](https://github.com/TheGreenCedar/CodeStory/issues/1237),
-not evidence for either vector backend. Until that publication exists, #1202
-is **inconclusive** and #1196 must not choose a backend from this work.
+No candidate measurement has been recorded. The original large-corpus indexing
+blocker tracked in [#1237](https://github.com/TheGreenCedar/CodeStory/issues/1237)
+is repaired, but its retained proof established the core publication only. It
+did not create the full-retrieval `vectors.sqlite3` input required here. Until
+an exact current source publication and both clean paired evidence roots exist,
+#1202 is **inconclusive** and #1196 must not choose a backend from this work.
 
 The runner uses six counterbalanced paired blocks for each declared nested
 real-anchor workload in two fresh evidence roots. It snapshots the admitted
@@ -21,9 +23,13 @@ real-anchor workload in two fresh evidence roots. It snapshots the admitted
 the evidence root before any child starts. Every oracle, candidate, and fresh
 memory-reader child checks that frozen input manifest, the binary digest, and
 the recorded host evidence before and after its work. Its journal is fsynced
-after each child result, and each candidate publishes staged immutable
-generations with a digest-bound manifest and atomic current/rollback pointer.
-The bundle accepts ordinary files only; symlinked input paths fail closed.
+after each child result. Before either completion marker is written, the runner
+replays the declared counterbalanced matrix and validates every result artifact,
+digest, and frozen-input binding. Each candidate publishes staged immutable
+generations with a digest-bound manifest and atomic current/rollback pointer;
+barrier-held readers open the old generation before publication and query only
+after it, while a new reader must match exact incremental source truth. The
+bundle accepts ordinary files only; symlinked input paths fail closed.
 
 Create a fixture only after retrieval indexing produced an immutable
 publication. Keep query embedding outside candidate timing:
@@ -60,3 +66,7 @@ after loading and warming the published candidate generation. Its baseline is
 taken after frozen-input verification, and the output keeps that baseline plus
 the post-load and post-warm values so it cannot be mistaken for startup memory
 or a process-lifetime peak.
+
+`first_query_after_load_ms` is deliberately a first-query-after-load measure,
+not a cold-cache claim: building and the source-truth work may already have
+touched filesystem pages. The runner keeps warm-query percentiles separately.

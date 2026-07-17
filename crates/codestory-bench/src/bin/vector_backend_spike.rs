@@ -4,9 +4,9 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use codestory_retrieval::{
-    CODERANK_QUERY_PREFIX_DEFAULT, InProcessEmbeddingClient, PinnedQuerySession,
-    RetrievalPublicationIdentity, SidecarRuntimeConfig, embedding_runtime_id_for_runtime,
-    process_embedding_identity, semantic_vector_dim,
+    CODERANK_QUERY_PREFIX_DEFAULT, PerUserEmbeddingClient, PinnedQuerySession,
+    ProductEmbeddingClient, RetrievalPublicationIdentity, SidecarRuntimeConfig,
+    embedding_runtime_id_for_runtime, semantic_vector_dim,
 };
 use codestory_store::RetrievalIndexManifest;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -17,6 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -216,6 +217,19 @@ struct CatalogQuery {
     symbol: String,
 }
 
+/// Git identity of the source tree from which the catalog was resolved.
+///
+/// The catalog is source truth only when it is resolved against the exact,
+/// clean checkout it names. Recording both the commit and tree makes that
+/// identity independently inspectable without treating a path spelling as a
+/// source identity.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct VerifiedCorpusIdentity {
+    commit: String,
+    tree: String,
+    worktree_clean: bool,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct FrozenQuery {
     id: String,
@@ -234,6 +248,7 @@ struct Fixture {
     query_embedder: QueryEmbedderIdentity,
     source_database_path: String,
     corpus_commit: String,
+    verified_corpus: VerifiedCorpusIdentity,
     catalog_sha256: String,
     selection_seed: String,
     selected_node_ids: Vec<String>,
@@ -250,7 +265,6 @@ struct Oracle {
     fixture_sha256: String,
     query_embedder: QueryEmbedderIdentity,
     count: usize,
-    cold_query_ms: f64,
     warm_query_p50_ms: f64,
     warm_query_p95_ms: f64,
     top_k_ordinals: Vec<Vec<u64>>,
@@ -271,7 +285,7 @@ struct CandidateResult {
     query_embedder: QueryEmbedderIdentity,
     build_ms: f64,
     load_ms: f64,
-    cold_query_ms: f64,
+    first_query_after_load_ms: f64,
     warm_query_p50_ms: f64,
     warm_query_p95_ms: f64,
     rss_baseline_after_input_verification_bytes: u64,
@@ -284,9 +298,9 @@ struct CandidateResult {
     incremental_reuse_ms: f64,
     ann_recall_at_20: f64,
     source_truth_hit_at_20: f64,
-    concurrent_reader_consistency: bool,
+    reader_publish_barrier_old_readers_pinned: bool,
+    reader_publish_barrier_post_publish_reader_matches_truth: bool,
     pinned_old_reader_after_publication: bool,
-    new_current_reader_observed_incremental: bool,
     old_generation_unchanged: bool,
     corrupt_candidate_rejected: bool,
     failed_candidate_preserved_current_pointer: bool,
@@ -432,6 +446,19 @@ fn prepare(
     let storage_path = storage_path
         .canonicalize()
         .context("canonicalize production storage")?;
+    let catalog_bytes = fs::read(catalog_path)
+        .with_context(|| format!("read catalog {}", catalog_path.display()))?;
+    let catalog: Catalog =
+        serde_json::from_slice(&catalog_bytes).context("parse source-truth catalog")?;
+    ensure!(
+        catalog.schema_version == 1,
+        "unsupported source-truth catalog schema"
+    );
+    ensure!(
+        catalog.queries.len() == 30,
+        "catalog needs exactly 30 queries"
+    );
+    let verified_corpus = verify_catalog_corpus_identity(&project_root, &catalog.corpus_commit)?;
     let runtime = SidecarRuntimeConfig::for_project_auto(&project_root);
     let session = PinnedQuerySession::begin(&project_root, &storage_path, &runtime)
         .context("admit the production retrieval publication before freezing vector evidence")?;
@@ -445,18 +472,6 @@ fn prepare(
     ensure!(
         attestation.point_count > 100_000 + INCREMENTAL_COUNT,
         "production publication needs more than 100100 dense anchors"
-    );
-    let catalog_bytes = fs::read(catalog_path)
-        .with_context(|| format!("read catalog {}", catalog_path.display()))?;
-    let catalog: Catalog =
-        serde_json::from_slice(&catalog_bytes).context("parse source-truth catalog")?;
-    ensure!(
-        catalog.schema_version == 1,
-        "unsupported source-truth catalog schema"
-    );
-    ensure!(
-        catalog.queries.len() == 30,
-        "catalog needs exactly 30 queries"
     );
     let identities = resolve_catalog(&source, &catalog)?;
     let all_ids = list_node_ids(&source)?;
@@ -478,7 +493,7 @@ fn prepare(
         "not enough real anchors for nested fixture"
     );
     let incremental_node_ids = selected.split_off(100_000);
-    let embedder = InProcessEmbeddingClient::new(&runtime);
+    let embedder = ProductEmbeddingClient::new(&runtime);
     let queries = identities
         .into_iter()
         .map(|mut query| {
@@ -517,13 +532,18 @@ fn prepare(
     final_session
         .revalidate()
         .context("production retrieval publication changed while freezing the fixture")?;
+    ensure!(
+        verify_catalog_corpus_identity(&project_root, &catalog.corpus_commit)? == verified_corpus,
+        "catalog source checkout changed while freezing the fixture"
+    );
     let fixture = Fixture {
-        schema_version: 2,
+        schema_version: 3,
         source: attestation,
         publication,
         query_embedder,
         source_database_path: source.display().to_string(),
         corpus_commit: catalog.corpus_commit,
+        verified_corpus,
         catalog_sha256: sha256_bytes(&catalog_bytes),
         selection_seed: SELECTION_SEED.into(),
         selected_node_ids: selected,
@@ -536,9 +556,7 @@ fn prepare(
 fn run_oracle(inputs: &Path, expected_input_sha256: &str, count: usize) -> Result<Oracle> {
     let verified = verified_inputs(inputs, expected_input_sha256)?;
     let selected = selected_ordinals(&verified.fixture, count)?;
-    let started = Instant::now();
     let top_k_ordinals = exact_scan(&verified.paths.source, &selected, &verified.fixture.queries)?;
-    let cold_query_ms = elapsed_ms(started);
     let mut warm = Vec::new();
     for query in &verified.fixture.queries {
         let started = Instant::now();
@@ -564,7 +582,6 @@ fn run_oracle(inputs: &Path, expected_input_sha256: &str, count: usize) -> Resul
         fixture_sha256: verified.fixture_sha256,
         query_embedder: verified.fixture.query_embedder.clone(),
         count,
-        cold_query_ms,
         warm_query_p50_ms: percentile(&mut warm.clone(), 0.50),
         warm_query_p95_ms: percentile(&mut warm, 0.95),
         top_k_ordinals,
@@ -619,9 +636,9 @@ fn run_candidate(
     let started = Instant::now();
     let pinned_old = open_generation(backend, workdir, "generation-1", binding)?;
     let load_ms = elapsed_ms(started);
-    let cold_started = Instant::now();
+    let first_query_started = Instant::now();
     let cold = pinned_old.search(&verified.fixture.queries[0].vector)?;
-    let cold_query_ms = elapsed_ms(cold_started);
+    let first_query_after_load_ms = elapsed_ms(first_query_started);
     for query in &verified.fixture.queries {
         for _ in 0..warmups {
             let _ = pinned_old.search(&query.vector)?;
@@ -647,10 +664,18 @@ fn run_candidate(
     let ann_recall_at_20 = recall(&candidate_hits, &oracle.top_k_ordinals);
     let source_truth_hit_at_20 =
         source_truth_hit(&verified.fixture.queries, &candidate_hits, &selected);
-    let concurrent_reader_consistency = concurrent_reader_consistency(
+    let incremental_selected = selected_ordinals_after_incremental(&verified.fixture, count)?;
+    let post_publish_expected = exact_scan(
+        &verified.paths.source,
+        &incremental_selected,
+        std::slice::from_ref(&verified.fixture.queries[0]),
+    )?
+    .into_iter()
+    .next()
+    .context("incremental source-truth scan did not return the declared query")?;
+    let reader_publish_barrier = open_readers_before_publish(
         backend,
         workdir,
-        "generation-1",
         binding,
         &verified.fixture.queries[0].vector,
         &cold,
@@ -668,10 +693,14 @@ fn run_candidate(
     )?;
     publish_pointer(workdir, "generation-2", Some("generation-1"))?;
     let incremental_reuse_ms = elapsed_ms(started);
+    let current = open_current_generation(backend, workdir, binding)?;
+    let reader_publish_barrier_post_publish_reader_matches_truth = current.count()
+        == count + INCREMENTAL_COUNT
+        && current.search(&verified.fixture.queries[0].vector)? == post_publish_expected;
+    let reader_publish_barrier_old_readers_pinned =
+        reader_publish_barrier.release_after_publish()?;
     let pinned_old_reader_after_publication =
         pinned_old.search(&verified.fixture.queries[0].vector)? == cold;
-    let current = open_current_generation(backend, workdir, binding)?;
-    let new_current_reader_observed_incremental = current.count() == count + INCREMENTAL_COUNT;
     let old_generation_unchanged = directory_hash(&generation_one)? == old_hash;
     let pointer_before_corrupt = fs::read(workdir.join("publication.json"))?;
     let corrupt = workdir.join("generations").join("generation-corrupt");
@@ -706,7 +735,7 @@ fn run_candidate(
         query_embedder: verified.fixture.query_embedder.clone(),
         build_ms,
         load_ms,
-        cold_query_ms,
+        first_query_after_load_ms,
         warm_query_p50_ms: percentile(&mut warm.clone(), 0.50),
         warm_query_p95_ms: percentile(&mut warm, 0.95),
         rss_baseline_after_input_verification_bytes: resident_rss
@@ -720,9 +749,9 @@ fn run_candidate(
         incremental_reuse_ms,
         ann_recall_at_20,
         source_truth_hit_at_20,
-        concurrent_reader_consistency,
+        reader_publish_barrier_old_readers_pinned,
+        reader_publish_barrier_post_publish_reader_matches_truth,
         pinned_old_reader_after_publication,
-        new_current_reader_observed_incremental,
         old_generation_unchanged,
         corrupt_candidate_rejected,
         failed_candidate_preserved_current_pointer,
@@ -882,7 +911,7 @@ fn frozen_fixture(paths: &FrozenInputPaths) -> Result<(Fixture, String)> {
 }
 
 fn verify_fixture_contract(fixture: &Fixture) -> Result<()> {
-    ensure!(fixture.schema_version == 2, "unsupported fixture schema");
+    ensure!(fixture.schema_version == 3, "unsupported fixture schema");
     ensure!(
         fixture.source.embedding_dim == DIMENSIONS && fixture.queries.len() == 30,
         "fixture does not meet the declared profile"
@@ -901,6 +930,23 @@ fn verify_fixture_contract(fixture: &Fixture) -> Result<()> {
             && !fixture.query_embedder.backend.is_empty()
             && !fixture.query_embedder.policy.is_empty(),
         "fixture query embedder identity is incomplete or incompatible with the source publication"
+    );
+    ensure!(
+        fixture.corpus_commit == fixture.verified_corpus.commit
+            && fixture.verified_corpus.commit.len() == 40
+            && fixture
+                .verified_corpus
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && fixture.verified_corpus.tree.len() == 40
+            && fixture
+                .verified_corpus
+                .tree
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && fixture.verified_corpus.worktree_clean,
+        "fixture catalog source identity is incomplete or was not frozen from a clean checkout"
     );
     for query in &fixture.queries {
         validate_vector(&query.id, &query.vector)?;
@@ -1138,7 +1184,9 @@ fn verify_source_matches_pinned_publication(
 fn current_query_embedder_identity(
     runtime: &SidecarRuntimeConfig,
 ) -> Result<QueryEmbedderIdentity> {
-    let identity = process_embedding_identity(&runtime.cache_root, runtime.embedding.allow_cpu)
+    let identity = PerUserEmbeddingClient::for_runtime(runtime)
+        .context("connect to the live query embedder")?
+        .ensure_resident()
         .context("observe live query embedder identity")?;
     ensure!(
         identity.worker_alive && identity.load_error.is_none(),
@@ -1148,10 +1196,10 @@ fn current_query_embedder_identity(
         runtime_id: embedding_runtime_id_for_runtime(runtime),
         embedding_dim: semantic_vector_dim(),
         query_prefix: CODERANK_QUERY_PREFIX_DEFAULT.into(),
-        model_digest: identity.model_digest.into(),
-        ggml_build_identity: identity.ggml_build_identity.into(),
+        model_digest: identity.model_digest,
+        ggml_build_identity: identity.ggml_build_identity,
         backend: identity.backend,
-        policy: identity.policy.into(),
+        policy: identity.policy,
         execution_device_names: identity.execution_device_names,
         execution_backend_names: identity.execution_backend_names,
         accelerator_execution_verified: identity.accelerator_execution_verified,
@@ -1164,6 +1212,66 @@ fn require_approved_execution_target() -> Result<()> {
         "vector backend spike is approved only on a native macOS arm64 executable"
     );
     Ok(())
+}
+
+fn verify_catalog_corpus_identity(
+    project_root: &Path,
+    catalog_commit: &str,
+) -> Result<VerifiedCorpusIdentity> {
+    ensure!(
+        catalog_commit.len() == 40 && catalog_commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "catalog corpus_commit must be a full Git object id"
+    );
+    let repository_root = git_output(project_root, ["rev-parse", "--show-toplevel"])?;
+    let repository_root = PathBuf::from(repository_root)
+        .canonicalize()
+        .context("canonicalize Git repository root")?;
+    ensure!(
+        repository_root == project_root,
+        "project root must be the Git checkout root for catalog source identity"
+    );
+    let commit = git_output(project_root, ["rev-parse", "HEAD"])?;
+    ensure!(
+        commit == catalog_commit,
+        "catalog corpus_commit {catalog_commit} does not match project HEAD {commit}"
+    );
+    let status = git_output(
+        project_root,
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )?;
+    ensure!(
+        status.is_empty(),
+        "catalog source checkout must be clean before collection"
+    );
+    Ok(VerifiedCorpusIdentity {
+        commit,
+        tree: git_output(project_root, ["rev-parse", "HEAD^{tree}"])?,
+        worktree_clean: true,
+    })
+}
+
+fn git_output<const N: usize>(project_root: &Path, args: [&str; N]) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git in {}", project_root.display()))?;
+    ensure!(
+        output.status.success(),
+        "git {} failed in {}: {}",
+        args.join(" "),
+        project_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout)
+        .context("Git output was not UTF-8")
+        .map(|value| value.trim().to_owned())
 }
 
 fn resolve_catalog(source: &Path, catalog: &Catalog) -> Result<Vec<FrozenQuery>> {
@@ -1228,6 +1336,22 @@ fn selected_ordinals(fixture: &Fixture, count: usize) -> Result<HashMap<String, 
         );
     }
     Ok(output)
+}
+
+fn selected_ordinals_after_incremental(
+    fixture: &Fixture,
+    count: usize,
+) -> Result<HashMap<String, u64>> {
+    let mut selected = selected_ordinals(fixture, count)?;
+    for (offset, node_id) in fixture.incremental_node_ids.iter().enumerate() {
+        ensure!(
+            selected
+                .insert(node_id.clone(), count as u64 + offset as u64 + 1)
+                .is_none(),
+            "incremental fixture node {node_id} was already present in the base selection"
+        );
+    }
+    Ok(selected)
 }
 
 fn exact_scan(
@@ -1313,6 +1437,7 @@ fn build_incremental_generation(
         }
         Backend::Usearch => {
             let index_handle = Index::restore(&source_index.to_string_lossy())?;
+            index_handle.reserve(base_count + tail.len())?;
             let tail_map = tail
                 .iter()
                 .enumerate()
@@ -1518,16 +1643,54 @@ fn publish_pointer(root: &Path, current: &str, rollback: Option<&str>) -> Result
     )
 }
 
-fn concurrent_reader_consistency(
+/// A two-phase reader/publish barrier.
+///
+/// Each worker reads the current pointer and opens its handle before it reports
+/// ready. The publisher only proceeds once every worker is holding the old
+/// generation, and the workers do not issue their query until the publisher
+/// releases them after atomically replacing the pointer.
+struct ReaderPublishBarrier {
+    releases: Vec<mpsc::SyncSender<()>>,
+    results: Vec<mpsc::Receiver<std::result::Result<bool, String>>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ReaderPublishBarrier {
+    fn release_after_publish(self) -> Result<bool> {
+        for release in &self.releases {
+            release.send(()).map_err(|_| {
+                anyhow::anyhow!("reader exited before the publish barrier released")
+            })?;
+        }
+        let mut all_pinned = true;
+        for result in self.results {
+            let result = result.recv().map_err(|_| {
+                anyhow::anyhow!("reader exited without reporting its pinned result")
+            })?;
+            all_pinned &= result.map_err(anyhow::Error::msg)?;
+        }
+        for worker in self.workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("reader panicked during publish overlap"))?;
+        }
+        Ok(all_pinned)
+    }
+}
+
+fn open_readers_before_publish(
     backend: Backend,
     root: &Path,
-    generation: &str,
     binding: FixtureBinding<'_>,
     query: &[f32],
     expected: &[u64],
-) -> Result<bool> {
+) -> Result<ReaderPublishBarrier> {
+    const READER_COUNT: usize = 2;
+    let mut opened = Vec::with_capacity(READER_COUNT);
+    let mut releases = Vec::with_capacity(READER_COUNT);
+    let mut results = Vec::with_capacity(READER_COUNT);
     let mut workers = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..READER_COUNT {
         let root = root.to_path_buf();
         let query = query.to_vec();
         let expected = expected.to_vec();
@@ -1537,12 +1700,13 @@ fn concurrent_reader_consistency(
             binding.source_generation_manifest_sha256.to_owned();
         let fixture_sha256 = binding.fixture_sha256.to_owned();
         let query_embedder = binding.query_embedder.clone();
-        let generation = generation.to_owned();
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
         workers.push(std::thread::spawn(move || {
-            open_generation(
+            let handle = match open_current_generation(
                 backend,
                 &root,
-                &generation,
                 FixtureBinding {
                     input_manifest_sha256: &input_manifest_sha256,
                     source_database_sha256: &source_database_sha256,
@@ -1550,13 +1714,43 @@ fn concurrent_reader_consistency(
                     fixture_sha256: &fixture_sha256,
                     query_embedder: &query_embedder,
                 },
-            )
-            .and_then(|handle| Ok(handle.search(&query)? == expected))
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let _ = opened_tx.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            if opened_tx.send(Ok(())).is_err() {
+                return;
+            }
+            if release_rx.recv().is_err() {
+                return;
+            }
+            let result = handle
+                .search(&query)
+                .map(|hits| hits == expected)
+                .map_err(|error| error.to_string());
+            let _ = result_tx.send(result);
         }));
+        opened.push(opened_rx);
+        releases.push(release_tx);
+        results.push(result_rx);
     }
-    Ok(workers
-        .into_iter()
-        .all(|worker| worker.join().ok().and_then(Result::ok) == Some(true)))
+    for reader in opened {
+        match reader
+            .recv()
+            .map_err(|_| anyhow::anyhow!("reader exited before opening the current generation"))?
+        {
+            Ok(()) => {}
+            Err(error) => anyhow::bail!("reader could not pin the old generation: {error}"),
+        }
+    }
+    Ok(ReaderPublishBarrier {
+        releases,
+        results,
+        workers,
+    })
 }
 
 fn attest_source(source: &Path) -> Result<SourceAttestation> {
@@ -1865,6 +2059,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_corpus_identity_requires_the_clean_named_checkout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        git_output(&root, ["init"])?;
+        git_output(
+            &root,
+            ["config", "user.email", "vector-spike@example.invalid"],
+        )?;
+        git_output(&root, ["config", "user.name", "Vector Spike"])?;
+        fs::write(root.join("tracked.txt"), b"source truth")?;
+        git_output(&root, ["add", "tracked.txt"])?;
+        git_output(&root, ["commit", "-m", "fixture source"])?;
+        let head = git_output(&root, ["rev-parse", "HEAD"])?;
+
+        let identity = verify_catalog_corpus_identity(&root, &head)?;
+        assert_eq!(identity.commit, head);
+        assert_eq!(identity.tree.len(), 40);
+        assert!(identity.worktree_clean);
+        let wrong_commit = "0".repeat(40);
+        assert!(verify_catalog_corpus_identity(&root, &wrong_commit).is_err());
+
+        fs::write(root.join("tracked.txt"), b"changed source")?;
+        assert!(verify_catalog_corpus_identity(&root, &head).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn candidate_backends_build_and_bind_the_source_manifest() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("source.sqlite3");
@@ -1875,7 +2096,7 @@ mod tests {
         )?;
         for ordinal in 1..=32u64 {
             let mut vector = vec![0.0; DIMENSIONS];
-            vector[ordinal as usize - 1] = 1.0;
+            vector[0] = if ordinal <= 24 { 1.0 } else { -1.0 };
             conn.execute(
                 "INSERT INTO vectors(node_id, vector) VALUES (?1, ?2)",
                 params![format!("node-{ordinal:04}"), vector_bytes(&vector)],
@@ -1883,9 +2104,12 @@ mod tests {
         }
         drop(conn);
 
-        let selection = (1..=32u64)
+        let base_selection = (1..=24u64)
             .map(|ordinal| (format!("node-{ordinal:04}"), ordinal))
             .collect::<HashMap<_, _>>();
+        let incremental = (25..=32u64)
+            .map(|ordinal| format!("node-{ordinal:04}"))
+            .collect::<Vec<_>>();
         let source_sha = sha256_file(&source)?;
         let query_embedder = QueryEmbedderIdentity {
             runtime_id: "runtime-test".into(),
@@ -1914,16 +2138,35 @@ mod tests {
 
         for backend in [Backend::SqliteVec, Backend::Usearch] {
             let root = temp.path().join(backend.label());
-            let generation = root.join("generations").join("generation-1");
-            build_generation(backend, &source, &selection, &generation, binding)?;
+            let generation_one = root.join("generations").join("generation-1");
+            build_generation(backend, &source, &base_selection, &generation_one, binding)?;
             publish_pointer(&root, "generation-1", None)?;
 
             let handle = open_current_generation(backend, &root, binding)?;
-            assert_eq!(handle.count(), selection.len());
-            assert_eq!(handle.search(&query)?.first(), Some(&1));
-            drop(handle);
+            assert_eq!(handle.count(), base_selection.len());
+            let expected = handle.search(&query)?;
+            assert_eq!(expected.len(), TOP_K);
 
-            tamper_file(&generation.join(backend.index_name()))?;
+            let readers = open_readers_before_publish(backend, &root, binding, &query, &expected)?;
+            let generation_two = root.join("generations").join("generation-2");
+            build_incremental_generation(
+                backend,
+                &generation_one,
+                &generation_two,
+                base_selection.len(),
+                &source,
+                &incremental,
+                binding,
+            )?;
+            publish_pointer(&root, "generation-2", Some("generation-1"))?;
+            let post_publish = open_current_generation(backend, &root, binding)?;
+            assert_eq!(post_publish.count(), 32);
+            assert_eq!(post_publish.search(&query)?, expected);
+            assert!(readers.release_after_publish()?);
+            assert_eq!(handle.search(&query)?, expected);
+            drop(post_publish);
+
+            tamper_file(&generation_two.join(backend.index_name()))?;
             assert!(open_current_generation(backend, &root, binding).is_err());
         }
         Ok(())
