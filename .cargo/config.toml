@@ -3,6 +3,11 @@
 retrieval-setup = "run --locked -p codestory-cli -- retrieval bootstrap --project ."
 retrieval-status = "run --locked -p codestory-cli -- retrieval status --project ."
 
+[env]
+# llama-cpp-sys 0.1.151 selects both a fixed ARM baseline and dynamic CPU
+# variants on Linux ARM64. CMake rejects that combination before compiling.
+CMAKE_PROJECT_INCLUDE_BEFORE = { value = ".cargo/llama-dynamic-backends.cmake", relative = true }
+
 # Windows and Linux release archives keep the dynamically linked llama.cpp
 # core and runtime-selected CPU/Vulkan modules beside the executable.
 [target.'cfg(target_os = "linux")']

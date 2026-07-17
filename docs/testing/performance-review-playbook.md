@@ -167,9 +167,12 @@ artifact can become release-eligible.
 
 The `codestory-release-evidence-linux-arm64-v2` baseline is measured from the
 clean pre-server-change product tree at
-`54c8d51928e99b993a37afb21cfb9a79d6468fe3`. Record the exact measurement
-commit in the approved profile; changes made afterward cannot define or move
-the reference values used to evaluate them.
+`54c8d51928e99b993a37afb21cfb9a79d6468fe3`, plus the source-bound Linux ARM64
+build compatibility shim in this baseline PR. The first protected attempt
+failed during CMake configuration before any metric producer ran; it did not
+observe candidate measurements. Record the exact successful measurement commit
+in the approved profile; changes made afterward cannot define or move the
+reference values used to evaluate them.
 
 Before observing the v2 measurements, its operational budgets are fixed as
 follows:
