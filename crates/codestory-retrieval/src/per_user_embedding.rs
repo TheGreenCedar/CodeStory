@@ -1473,13 +1473,22 @@ impl PerUserEmbeddingClient {
                     configure_exchange_timeout(&*stream, connect_budget)?;
                     let transport_identity = stream.transport_identity().clone();
                     let executable = self.transport.executable_identity();
-                    let snapshot = hello(
+                    let snapshot = match hello(
                         &mut *stream,
                         intent,
                         self.compatibility.clone(),
                         &transport_identity,
                         &executable,
-                    )?;
+                    ) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) if recover_after_server_loss && is_server_loss(&error) => {
+                            let recovery_started_at_ns = owner_recovery_started_at_ns
+                                .get_or_insert_with(|| self.transport.clock().now_ns());
+                            wait_for_convergence(*recovery_started_at_ns)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if let Some(control) = control {
                         control.check()?;
                     }
@@ -5179,6 +5188,7 @@ mod tests {
     enum ScriptOutcome {
         Success,
         Loss,
+        HelloLoss,
         Capacity,
         Blocking {
             request_started: Arc<AtomicBool>,
@@ -5212,19 +5222,25 @@ mod tests {
                 decode_test_frame(&self.writes).map_err(io::Error::other)?;
             self.writes.clear();
             let (response, payload) = match request.operation {
-                EmbeddingOperation::Hello { .. } => (
-                    success_response(
-                        &request.request_id,
-                        EmbeddingResult::Hello {
-                            compatibility_sha256: self
-                                .compatibility
-                                .digest()
-                                .map_err(io::Error::other)?,
-                            snapshot: Box::new(test_snapshot()),
-                        },
-                    ),
-                    Vec::new(),
-                ),
+                EmbeddingOperation::Hello { .. } => {
+                    if matches!(self.outcome, ScriptOutcome::HelloLoss) {
+                        self.reads = Cursor::new(Vec::new());
+                        return Ok(());
+                    }
+                    (
+                        success_response(
+                            &request.request_id,
+                            EmbeddingResult::Hello {
+                                compatibility_sha256: self
+                                    .compatibility
+                                    .digest()
+                                    .map_err(io::Error::other)?,
+                                snapshot: Box::new(test_snapshot()),
+                            },
+                        ),
+                        Vec::new(),
+                    )
+                }
                 EmbeddingOperation::EmbedQuery { .. } => match self.outcome.clone() {
                     ScriptOutcome::Loss => {
                         self.reads = Cursor::new(Vec::new());
@@ -5280,6 +5296,9 @@ mod tests {
                             ),
                             Vec::new(),
                         )
+                    }
+                    ScriptOutcome::HelloLoss => {
+                        return Err(io::Error::other("query reached hello-loss stream"));
                     }
                 },
                 EmbeddingOperation::Cancel { .. } => {
@@ -5492,6 +5511,7 @@ mod tests {
     enum BootstrapConnectOutcome {
         Connected,
         Loss,
+        HelloLoss,
         NoOwner,
         OwnerUnresponsive,
     }
@@ -5550,6 +5570,9 @@ mod tests {
                 )),
                 BootstrapConnectOutcome::Loss => EmbeddingConnectOutcome::Connected(Box::new(
                     ScriptStream::new(ScriptOutcome::Loss, self.compatibility.clone()),
+                )),
+                BootstrapConnectOutcome::HelloLoss => EmbeddingConnectOutcome::Connected(Box::new(
+                    ScriptStream::new(ScriptOutcome::HelloLoss, self.compatibility.clone()),
                 )),
                 BootstrapConnectOutcome::NoOwner => EmbeddingConnectOutcome::NoOwner,
                 BootstrapConnectOutcome::OwnerUnresponsive => {
@@ -5705,6 +5728,38 @@ mod tests {
         assert_eq!(attempts[1].outcome, "completed");
         assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
         assert_eq!(transport.connect_count.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn pure_rpc_replay_converges_after_recovery_hello_loss() {
+        let transport = BootstrapTestTransport::new(
+            [
+                BootstrapConnectOutcome::Loss,
+                BootstrapConnectOutcome::HelloLoss,
+                BootstrapConnectOutcome::OwnerUnresponsive,
+                BootstrapConnectOutcome::NoOwner,
+                BootstrapConnectOutcome::OwnerUnresponsive,
+                BootstrapConnectOutcome::Connected,
+            ],
+            BootstrapConnectOutcome::Connected,
+            Duration::from_millis(6),
+        );
+        let client = PerUserEmbeddingClient {
+            transport: transport.clone(),
+            compatibility: EmbeddingCompatibility::current(true),
+            scope_id: "test-scope".into(),
+        };
+
+        let (_, attempts) = client
+            .embed_query_with_qualification_attempts("x")
+            .expect("recovery hello loss converges before the replay RPC is sent");
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, "server_loss");
+        assert_eq!(attempts[1].outcome, "completed");
+        assert_ne!(attempts[0].request_id, attempts[1].request_id);
+        assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
+        assert_eq!(transport.connect_count.load(Ordering::Acquire), 6);
     }
 
     #[test]
