@@ -1148,6 +1148,7 @@ impl<'a> ScenarioRunner<'a> {
         if first_operation.status != "ok" || first_operation.error.is_some() {
             bail!("embedding_qualification_busy_retry_query_failed");
         }
+        let interval = self.finish_measurement(start)?;
         let retry = run_raw_protocol_exchange_with_input(
             runtime,
             self.clock.as_ref(),
@@ -1161,7 +1162,6 @@ impl<'a> ScenarioRunner<'a> {
             )),
         )?;
         require_protocol_exchange_success(&retry, "busy_retry_replay")?;
-        let interval = self.finish_measurement(start)?;
 
         let seed = seed
             .join()
@@ -2123,6 +2123,10 @@ impl<'a> ScenarioRunner<'a> {
             None,
         )?;
         let overflow_output = self.finish_worker(overflow, QUEUE_SETUP_TIMEOUT)?;
+        let overflow_operations = overflow_output.queue_operations.ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_overflow_queue_output_missing")
+        })?;
+        require_pre_release_capacity_overflow(&overflow_operations)?;
         self.control("release_class", Some("bulk"))?;
         let query_selected =
             self.wait_for_snapshot("mixed_queue_query_selected", SNAPSHOT_TIMEOUT, |snapshot| {
@@ -2153,9 +2157,7 @@ impl<'a> ScenarioRunner<'a> {
         operations.extend(second_output.queue_operations.ok_or_else(|| {
             anyhow::anyhow!("embedding_qualification_second_queue_output_missing")
         })?);
-        operations.extend(overflow_output.queue_operations.ok_or_else(|| {
-            anyhow::anyhow!("embedding_qualification_overflow_queue_output_missing")
-        })?);
+        operations.extend(overflow_operations);
         let analysis = analyze_queue_operations(&operations)?;
         for operation in &operations {
             self.event(
@@ -4141,6 +4143,44 @@ struct QueueAnalysis {
     project_orders: BTreeMap<String, Value>,
     query_preference: BTreeMap<String, Value>,
     bulk_resumption: BTreeMap<String, Value>,
+}
+
+fn require_pre_release_capacity_overflow(operations: &[WorkerQueueOperation]) -> Result<()> {
+    if operations.len() != 2 {
+        bail!("embedding_qualification_pre_release_overflow_count_invalid");
+    }
+    for class in ["query", "bulk"] {
+        let class_operations = operations
+            .iter()
+            .filter(|operation| operation.class == class)
+            .collect::<Vec<_>>();
+        if class_operations.len() != 1 {
+            bail!("embedding_qualification_pre_release_overflow_class_invalid:{class}");
+        }
+        let operation = class_operations[0];
+        let pressure = operation
+            .error
+            .as_ref()
+            .and_then(|error| error.capacity.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_pre_release_overflow_untyped:{class}")
+            })?;
+        if operation.status != "failed"
+            || operation.response_payload_bytes != 0
+            || operation
+                .error
+                .as_ref()
+                .is_none_or(|error| error.code != "embedding_capacity")
+            || pressure.reason != "queue_full"
+            || pressure.queue_class != class
+            || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
+            || pressure.depth != pressure.capacity
+            || pressure.retry_condition.trim().is_empty()
+        {
+            bail!("embedding_qualification_pre_release_overflow_invalid:{class}");
+        }
+    }
+    Ok(())
 }
 
 fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<QueueAnalysis> {
