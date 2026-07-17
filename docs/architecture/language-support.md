@@ -15,7 +15,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Parser-backed graph | Extension routes to a parser and graph rules. | Full semantic navigation. |
 | Fidelity-gated | Core symbol/import/call/member shapes pass fixture suites. | Every language feature is covered. |
 | Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
-| Structural source-proof | Dedicated extractor emits exact source anchors for structural files. | Parser-backed graph extraction or semantic code navigation. |
+| Structural source-proof | Dedicated extractor emits exact source anchors and publishes `structural_text` / `source_range_only` result metadata. | Parser-backed graph extraction, semantic code navigation, or packet semantic proof. |
 | Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
 | Packet proof gate | A packet-runtime artifact proves the current packet citation and sufficiency contract for the measured tasks. | Public product-grade language quality. |
 | Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
@@ -34,7 +34,7 @@ collector-failed source remains a publication blocker.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | exact-source structural/schema anchors |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
 
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
@@ -61,12 +61,14 @@ No current language profile claims `typed_semantic_edges` or
 ## Agent-Facing Evidence
 
 GitHub Actions workflow support is path-scoped to `.github/workflows/*.{yml,yaml}`.
-The pilot emits workflow, job, and step anchors with `exact_source` /
-`source_range_only` evidence. Docker Compose support is path-scoped to
+The pilot emits workflow, job, and step anchors with `structural_text` /
+`source_range_only` evidence and collector provenance. Docker Compose support
+is path-scoped to
 `compose*.{yml,yaml}`, `docker-compose*.{yml,yaml}`, and
 `docker/*-compose.{yml,yaml}` style manifests; it emits stack, service, image or
-build, ports, environment key, and volume anchors with the same exact-source
-boundary. OpenAPI/Swagger endpoint schemas stay on the dedicated OpenAPI
+build, ports, environment key, and volume anchors with the same structural-text
+boundary. HTML, CSS, SQL, and Cargo manifest collector anchors use that result
+tier too. OpenAPI/Swagger endpoint schemas stay on the dedicated OpenAPI
 indexing path and emit `openapi:endpoint:*` anchors as `exact_source` /
 `source_range_only` diagnostic evidence only; they do not make generic YAML an
 OpenAPI surface. Unsupported shapes stay explicit: YAML anchors and merge keys are not
@@ -79,8 +81,8 @@ route behavior, or generated-client correctness. Neither collector validates
 execution semantics.
 Cargo manifest support is basename-scoped to `Cargo.toml`. It emits `[workspace]`
 member, `[package]` name, and direct dependency-key anchors from `[dependencies]`,
-`[dev-dependencies]`, and `[build-dependencies]` with the same exact-source /
-source-range-only boundary. It does not admit generic TOML, `Cargo.lock`,
+`[dev-dependencies]`, and `[build-dependencies]` with the same `structural_text` /
+`source_range_only` boundary. It does not admit generic TOML, `Cargo.lock`,
 target-scoped dependency tables, `[workspace.dependencies]`, dependency
 subtables, feature tables, patch or replace tables, dependency resolution,
 feature activation, workspace inheritance, build-script behavior, or lockfile
@@ -88,8 +90,11 @@ proof. Packet evidence treats these anchors as diagnostic unless a future
 structural role explicitly admits them; they must not satisfy semantic proof
 roles or semantic dependency proof.
 
-Safe wording: OpenAPI endpoint anchors prove only that a schema declares the
-method/path at the cited source range. Packet-runtime is implemented and
+Safe wording: structural-text anchors prove only that their collector found the
+cited source span; their `source_range_only` status and non-sufficient result
+flag must not be upgraded into graph or semantic proof. OpenAPI endpoint anchors
+prove only that a schema declares the method/path at the cited source range.
+Packet-runtime is implemented and
 can complete measured suites, but publishable agent-facing packet quality is not
 promoted until one coherent run has all quality, sufficiency, and cold-SLA gates
 green. Run-specific scorecards belong in PRs, issues, release notes, or ignored

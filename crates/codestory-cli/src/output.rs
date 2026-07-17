@@ -2010,7 +2010,8 @@ fn citation_needs_untrusted_repo_label(citation: &AgentCitationDto) -> bool {
         || matches!(
             citation.evidence_tier,
             Some(
-                PacketEvidenceTierDto::SyntheticSourceScan
+                PacketEvidenceTierDto::StructuralText
+                    | PacketEvidenceTierDto::SyntheticSourceScan
                     | PacketEvidenceTierDto::GeneratedSummary
             )
         )
@@ -4536,6 +4537,9 @@ mod tests {
                 member_count: None,
                 summary: Some("Builds the evidence packet.".to_string()),
                 edge_digest: Vec::new(),
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
             }],
             files: vec![GroundingFileDigestDto {
                 file_path: "C:/repo/src/lib.rs".to_string(),

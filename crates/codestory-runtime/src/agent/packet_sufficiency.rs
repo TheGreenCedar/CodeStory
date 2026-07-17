@@ -1597,6 +1597,7 @@ fn packet_claim_tier_label(claim: &PacketClaimDto) -> String {
 fn packet_evidence_tier_label(tier: PacketEvidenceTierDto) -> &'static str {
     match tier {
         PacketEvidenceTierDto::ExactSource => "exact_source",
+        PacketEvidenceTierDto::StructuralText => "structural_text",
         PacketEvidenceTierDto::ResolvedGraph => "resolved_graph",
         PacketEvidenceTierDto::LexicalSource => "lexical_source",
         PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
@@ -1610,6 +1611,7 @@ fn packet_evidence_tier_label(tier: PacketEvidenceTierDto) -> &'static str {
 fn packet_evidence_provenance_label(tier: PacketEvidenceTierDto) -> &'static str {
     match tier {
         PacketEvidenceTierDto::ExactSource => "exact",
+        PacketEvidenceTierDto::StructuralText => "structural_text",
         PacketEvidenceTierDto::ResolvedGraph => "graph_neighbor",
         PacketEvidenceTierDto::LexicalSource => "lexical_source",
         PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
@@ -2767,6 +2769,18 @@ mod tests {
         RetrievalShadowDto, SearchHitOrigin,
     };
     use std::path::Path;
+
+    #[test]
+    fn structural_text_labels_stay_explicit_in_packet_diagnostics() {
+        assert_eq!(
+            packet_evidence_tier_label(PacketEvidenceTierDto::StructuralText),
+            "structural_text"
+        );
+        assert_eq!(
+            packet_evidence_provenance_label(PacketEvidenceTierDto::StructuralText),
+            "structural_text"
+        );
+    }
 
     fn claim(text: &str) -> PacketClaimDto {
         PacketClaimDto {

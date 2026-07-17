@@ -109,6 +109,7 @@ fn packet_citation_is_diagnostic_only(citation: &AgentCitationDto) -> bool {
     matches!(
         evidence_tier_for_citation(citation),
         PacketEvidenceTierDto::DenseSemantic
+            | PacketEvidenceTierDto::StructuralText
             | PacketEvidenceTierDto::GeneratedSummary
             | PacketEvidenceTierDto::SyntheticSourceScan
     ) || matches!(

@@ -21,6 +21,11 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   deterministic ledger and summary, and rejects stale, duplicate,
   identity-incomplete, aggregate-host, cross-version, target-host-mismatched,
   retained-package-mismatched or cross-release evidence.
+- Collector-backed workflow, Compose, Cargo manifest, HTML, CSS, and SQL
+  anchors now publish the explicit `structural_text` evidence tier, collector
+  provenance, and `source_range_only` resolution through grounding, search, and
+  packet results. They remain non-sufficient diagnostic evidence rather than
+  parser-backed or semantic claims.
 - Exact-head source and platform proof now require one coherent workflow ref,
   reviewed SHA, Actions SHA, concurrency identity, checkout, and cache
   namespace. PR coordinators are label-only; manual runs must select the live

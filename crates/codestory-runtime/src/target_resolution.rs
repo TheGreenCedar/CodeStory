@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{
     AppController, compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank,
 };
@@ -748,7 +749,7 @@ fn compare_resolution_candidates(
 }
 
 fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
-    SearchHit {
+    let mut hit = SearchHit {
         node_id: node.id.clone(),
         display_name: node.display_name.clone(),
         kind: node.kind,
@@ -765,7 +766,9 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         coverage_role: None,
         eligible_for_sufficiency: Some(true),
         score_breakdown: None,
-    }
+    };
+    decorate_search_hit_evidence(&mut hit);
+    hit
 }
 
 fn no_query_match_error(project_root: &Path, query: &str, file_filter: Option<&str>) -> String {
@@ -948,6 +951,39 @@ mod tests {
         assert!(!is_graph_target_candidate(&semantic));
         assert!(!is_graph_target_candidate(&repo_text));
         assert!(is_graph_target_candidate(&fuzzy));
+    }
+
+    #[test]
+    fn node_details_target_keeps_structural_text_evidence_explicit() {
+        let hit = search_hit_from_node(&NodeDetailsDto {
+            id: NodeId("cargo-package".to_string()),
+            kind: NodeKind::PACKAGE,
+            display_name: "demo".to_string(),
+            serialized_name: "demo".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: Some("crates/demo/Cargo.toml".to_string()),
+            start_line: Some(2),
+            start_col: Some(1),
+            end_line: Some(2),
+            end_col: Some(8),
+            member_access: None,
+            route_endpoint: None,
+        });
+
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_cargo_manifest_collector")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]

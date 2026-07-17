@@ -1,4 +1,7 @@
 use super::*;
+use crate::agent::packet_evidence::{
+    evidence_is_sufficiency_eligible, structural_text_producer_for_path,
+};
 use crate::trail_story::build_trail_story;
 use codestory_contracts::api::SearchHitOrigin;
 #[cfg(test)]
@@ -242,6 +245,7 @@ fn symbol_digest(
     } else {
         display_name.to_string()
     };
+    let evidence_producer = structural_text_producer_for_path(relative_file_path);
 
     GroundingSymbolDigestDto {
         id: NodeId::from(node.id),
@@ -254,6 +258,11 @@ fn symbol_digest(
         member_count,
         summary: summaries.get(&node.id).map(|record| record.summary.clone()),
         edge_digest: edge_digests.get(&node.id).cloned().unwrap_or_default(),
+        evidence_tier: evidence_producer
+            .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
+        evidence_producer: evidence_producer.map(str::to_string),
+        resolution_status: evidence_producer
+            .map(|_| codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
     }
 }
 
@@ -556,6 +565,14 @@ pub(crate) fn grounding_explanation_search_hits(
 }
 
 fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<'_>) -> SearchHit {
+    let evidence_tier = candidate
+        .symbol
+        .evidence_tier
+        .unwrap_or(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph);
+    let resolution_status = candidate
+        .symbol
+        .resolution_status
+        .unwrap_or(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved);
     SearchHit {
         node_id: candidate.symbol.id.clone(),
         display_name: candidate.name.clone(),
@@ -566,12 +583,19 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         origin: SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
-        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        evidence_producer: Some("grounding_recommendation".to_string()),
-        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        evidence_tier: Some(evidence_tier),
+        evidence_producer: candidate
+            .symbol
+            .evidence_producer
+            .clone()
+            .or_else(|| Some("grounding_recommendation".to_string())),
+        resolution_status: Some(resolution_status),
         loss_reason: None,
         coverage_role: None,
-        eligible_for_sufficiency: Some(true),
+        eligible_for_sufficiency: Some(evidence_is_sufficiency_eligible(
+            evidence_tier,
+            resolution_status,
+        )),
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.45,
             semantic: 0.0,
@@ -1297,6 +1321,9 @@ mod tests {
             member_count,
             summary: None,
             edge_digest: Vec::new(),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
         }
     }
 
@@ -1446,6 +1473,74 @@ mod tests {
         assert_eq!(snapshot.coverage.represented_files, 2);
         assert_eq!(snapshot.files.len(), 2);
         assert!(snapshot.coverage_buckets.is_empty());
+    }
+
+    #[test]
+    fn grounding_snapshot_publishes_structural_text_metadata_without_graph_claims() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let manifest = temp.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"demo\"\n").expect("write manifest");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &manifest,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::PACKAGE,
+                    serialized_name: "demo".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect("insert manifest node");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("grounding snapshot");
+        let symbol = snapshot
+            .files
+            .iter()
+            .flat_map(|file| file.symbols.iter())
+            .find(|symbol| symbol.label.starts_with("demo"))
+            .expect("manifest symbol");
+
+        assert_eq!(
+            symbol.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            symbol.evidence_producer.as_deref(),
+            Some("structural_cargo_manifest_collector")
+        );
+        assert_eq!(
+            symbol.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+
+        let hit = grounding_explanation_search_hits(&snapshot, 8)
+            .into_iter()
+            .find(|hit| hit.node_id == symbol.id)
+            .expect("grounding explanation hit");
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]
