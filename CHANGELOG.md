@@ -29,9 +29,9 @@
   lane builds from source. The hosted lane remains source/protocol evidence
   rather than a packaged or Vulkan-hardware claim.
 - Linux ARM64 release builds now resolve the pinned llama.cpp binding's
-  mutually exclusive fixed-ARM and dynamic CPU-variant CMake selectors in the
-  checked-in Cargo build environment, preserving portable runtime-selected
-  CPU modules without runner-local patches.
+  incompatible fixed-ARM and all-variant CMake selectors in the checked-in
+  Cargo build environment. Packages retain the portable runtime-loaded ARM CPU
+  backend beside Vulkan without runner-local patches.
 - Draft source CI now restores exact-lock retrieval output or narrowly scoped
   prior-lock output before rebuilding. The base retrieval lane serially seeds
   the exact five test-profile targets used by draft proof, while a versioned
