@@ -157,7 +157,7 @@ pub(crate) fn run_internal_embedding_qualification(
         .projects
         .iter()
         .map(|project| {
-            SidecarRuntimeConfig::for_project_auto_with_process_defaults(
+            crate::sidecar_runtime::for_project_auto_with_process_defaults(
                 project, &defaults, &overrides,
             )
         })

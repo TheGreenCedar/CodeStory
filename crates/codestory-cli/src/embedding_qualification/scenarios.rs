@@ -289,37 +289,38 @@ struct MeasurementInterval {
     boot_id_finished: String,
 }
 
+struct RawMetricSampleInput<'a> {
+    sample_id: &'a str,
+    repeat: u32,
+    runtime: &'a QualificationRuntime,
+    workload_id: &'a str,
+    server_identity: RawServerIdentity,
+    start_phase: &'a str,
+    end_phase: &'a str,
+    operands: BTreeMap<String, Value>,
+}
+
 impl MeasurementInterval {
-    fn sample(
-        &self,
-        sample_id: &str,
-        repeat: u32,
-        runtime: &QualificationRuntime,
-        workload_id: &str,
-        server_identity: RawServerIdentity,
-        start_phase: &str,
-        end_phase: &str,
-        operands: BTreeMap<String, Value>,
-    ) -> RawMetricSample {
+    fn sample(&self, input: RawMetricSampleInput<'_>) -> RawMetricSample {
         RawMetricSample {
-            sample_id: sample_id.into(),
-            repeat,
-            matrix_cell_id: runtime.matrix_cell_id.clone(),
-            workload_id: workload_id.into(),
-            cache_state: runtime.cache_state.clone(),
-            residency_state: runtime.residency_state.clone(),
+            sample_id: input.sample_id.into(),
+            repeat: input.repeat,
+            matrix_cell_id: input.runtime.matrix_cell_id.clone(),
+            workload_id: input.workload_id.into(),
+            cache_state: input.runtime.cache_state.clone(),
+            residency_state: input.runtime.residency_state.clone(),
             process: self.process.clone(),
-            server_identity,
+            server_identity: input.server_identity,
             clock: self.clock.clone(),
             start: RawMetricPhase {
-                phase: start_phase.into(),
+                phase: input.start_phase.into(),
                 observed_ns: self.awake_started_ns,
             },
             end: RawMetricPhase {
-                phase: end_phase.into(),
+                phase: input.end_phase.into(),
                 observed_ns: self.awake_finished_ns,
             },
-            operands,
+            operands: input.operands,
             suspend_witness: SuspendWitness {
                 awake_started_ns: self.awake_started_ns,
                 awake_finished_ns: self.awake_finished_ns,
@@ -332,6 +333,19 @@ impl MeasurementInterval {
             },
         }
     }
+}
+
+fn successful_operation_duration_ns(interval: &MeasurementInterval) -> u64 {
+    interval
+        .awake_finished_ns
+        .saturating_sub(interval.awake_started_ns)
+}
+
+fn successful_operation_operands(interval: &MeasurementInterval) -> BTreeMap<String, Value> {
+    btree([(
+        "successful_operation_duration_ns",
+        json!(successful_operation_duration_ns(interval)),
+    )])
 }
 
 #[derive(Debug, Default)]
@@ -490,6 +504,20 @@ fn push_metric(
     Ok(())
 }
 
+fn opaque_measurement_sample_id(
+    nonce_sha256: &str,
+    matrix_cell_id: &str,
+    metric: &str,
+    repeat: u32,
+) -> String {
+    sha256_bytes(
+        format!(
+            "codestory-embedding-measurement-sample-v1|{nonce_sha256}|{matrix_cell_id}|{metric}|{repeat}"
+        )
+        .as_bytes(),
+    )
+}
+
 impl<'a> ScenarioRunner<'a> {
     fn new(context: ScenarioContext<'a>) -> Result<Self> {
         if context.runtimes.len() != 2
@@ -535,6 +563,15 @@ impl<'a> ScenarioRunner<'a> {
         validate_named_evidence(self.context.scenario, &self.evidence)?;
         self.artifact.orchestration.finished_ns = self.clock.now_ns();
         Ok(self.artifact)
+    }
+
+    fn measurement_sample_id(&self, metric: &str, repeat: u32) -> String {
+        opaque_measurement_sample_id(
+            self.context.nonce_sha256,
+            &self.context.qualification_runtime.matrix_cell_id,
+            metric,
+            repeat,
+        )
     }
 
     fn begin_measurement(&self) -> Result<MeasurementSpanStart> {
@@ -602,7 +639,8 @@ impl<'a> ScenarioRunner<'a> {
             transport.spawn_exact_current_exe()?;
             let mut spawn_stream =
                 connect_until(&transport, self.clock.as_ref(), Duration::from_secs(15))?;
-            let spawn_hello = validated_hello(&mut spawn_stream, &runtime, self.clock.as_ref())?;
+            let spawn_hello =
+                validated_hello(&mut spawn_stream, &transport, &runtime, self.clock.as_ref())?;
             let spawn = self.finish_measurement(spawn_start)?;
             let _ = PerUserEmbeddingClient::for_runtime(&runtime)?.ensure_resident()?;
             let spawn_resident =
@@ -616,16 +654,16 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "spawn_convergence",
                 "milliseconds",
-                spawn.sample(
-                    &format!("spawn-convergence-{repeat}"),
+                spawn.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("spawn_convergence", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "compatible_hello_absent_owner_v1",
-                    raw_server_identity(&spawn_resident)?,
-                    "owner_absence_proven",
-                    "compatible_hello_validated",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "compatible_hello_absent_owner_v1",
+                    server_identity: raw_server_identity(&spawn_resident)?,
+                    start_phase: "owner_absence_proven",
+                    end_phase: "compatible_hello_validated",
+                    operands: BTreeMap::new(),
+                }),
             )?;
         }
 
@@ -633,22 +671,27 @@ impl<'a> ScenarioRunner<'a> {
             let connect_start = self.begin_measurement()?;
             let mut existing_stream =
                 connect_until(&transport, self.clock.as_ref(), Duration::from_secs(2))?;
-            let existing = validated_hello(&mut existing_stream, &runtime, self.clock.as_ref())?;
+            let existing = validated_hello(
+                &mut existing_stream,
+                &transport,
+                &runtime,
+                self.clock.as_ref(),
+            )?;
             let connect = self.finish_measurement(connect_start)?;
             push_metric(
                 &mut metrics,
                 "existing_owner_connect",
                 "milliseconds",
-                connect.sample(
-                    &format!("existing-owner-connect-{repeat}"),
+                connect.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("existing_owner_connect", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "compatible_hello_existing_owner_v1",
-                    raw_server_identity(&existing)?,
-                    "client_connect_started",
-                    "compatible_hello_validated",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "compatible_hello_existing_owner_v1",
+                    server_identity: raw_server_identity(&existing)?,
+                    start_phase: "client_connect_started",
+                    end_phase: "compatible_hello_validated",
+                    operands: BTreeMap::new(),
+                }),
             )?;
         }
 
@@ -666,16 +709,16 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "cold_first_vector",
                 "milliseconds",
-                cold.sample(
-                    &format!("cold-first-vector-{repeat}"),
+                cold.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("cold_first_vector", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "cold_query_256b_v1",
-                    raw_server_identity(&cold_snapshot)?,
-                    "product_request_started_with_owner_absent",
-                    "first_vector_and_engine_evidence_validated",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "cold_query_256b_v1",
+                    server_identity: raw_server_identity(&cold_snapshot)?,
+                    start_phase: "product_request_started_with_owner_absent",
+                    end_phase: "first_vector_and_engine_evidence_validated",
+                    operands: successful_operation_operands(&cold),
+                }),
             )?;
         }
 
@@ -692,16 +735,16 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "first_product_ready",
                 "milliseconds",
-                ready.sample(
-                    &format!("first-product-ready-{repeat}"),
+                ready.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("first_product_ready", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "product_query_256b_v1",
-                    raw_server_identity(&ready_snapshot)?,
-                    "product_request_started",
-                    "product_result_validated",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "product_query_256b_v1",
+                    server_identity: raw_server_identity(&ready_snapshot)?,
+                    start_phase: "product_request_started",
+                    end_phase: "product_result_validated",
+                    operands: successful_operation_operands(&ready),
+                }),
             )?;
         }
 
@@ -717,16 +760,16 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "warm_query_ipc",
                 "milliseconds",
-                query.interval.sample(
-                    &format!("warm-query-rpc-{repeat}"),
+                query.interval.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("warm_query_ipc", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "warm_query_256b_v1",
-                    query.server_identity,
-                    "client_frame_started",
-                    "query_response_identity_and_vector_validated",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "warm_query_256b_v1",
+                    server_identity: query.server_identity,
+                    start_phase: "client_frame_started",
+                    end_phase: "query_response_identity_and_vector_validated",
+                    operands: successful_operation_operands(&query.interval),
+                }),
             )?;
         }
 
@@ -737,16 +780,16 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "warm_bulk_ipc",
                 "milliseconds",
-                bulk.interval.sample(
-                    &format!("warm-bulk-rpc-{repeat}"),
+                bulk.interval.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("warm_bulk_ipc", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "warm_bulk_64x256b_v1",
-                    bulk.server_identity,
-                    "client_frame_started",
-                    "bulk_response_identity_and_vectors_validated",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "warm_bulk_64x256b_v1",
+                    server_identity: bulk.server_identity,
+                    start_phase: "client_frame_started",
+                    end_phase: "bulk_response_identity_and_vectors_validated",
+                    operands: successful_operation_operands(&bulk.interval),
+                }),
             )?;
         }
 
@@ -759,31 +802,43 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "bulk_documents_per_second",
                 "documents_per_second",
-                bulk.interval.sample(
-                    &format!("bulk-documents-throughput-{repeat}"),
+                bulk.interval.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("bulk_documents_per_second", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "bulk_throughput_256x256b_v1",
-                    bulk.server_identity.clone(),
-                    "bulk_measurement_window_started",
-                    "bulk_document_results_validated",
-                    btree([("completed_documents", json!(bulk.completed_documents))]),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "bulk_throughput_256x256b_v1",
+                    server_identity: bulk.server_identity.clone(),
+                    start_phase: "bulk_measurement_window_started",
+                    end_phase: "bulk_document_results_validated",
+                    operands: btree([
+                        ("completed_documents", json!(bulk.completed_documents)),
+                        (
+                            "successful_operation_duration_ns",
+                            json!(successful_operation_duration_ns(&bulk.interval)),
+                        ),
+                    ]),
+                }),
             )?;
             push_metric(
                 &mut metrics,
                 "bulk_tokens_per_second",
                 "tokens_per_second",
-                bulk.interval.sample(
-                    &format!("bulk-tokens-throughput-{repeat}"),
+                bulk.interval.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("bulk_tokens_per_second", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "bulk_throughput_256x256b_v1",
-                    bulk.server_identity,
-                    "bulk_measurement_window_started",
-                    "bulk_token_results_validated",
-                    btree([("completed_tokens", json!(completed_tokens))]),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "bulk_throughput_256x256b_v1",
+                    server_identity: bulk.server_identity,
+                    start_phase: "bulk_measurement_window_started",
+                    end_phase: "bulk_token_results_validated",
+                    operands: btree([
+                        ("completed_tokens", json!(completed_tokens)),
+                        (
+                            "successful_operation_duration_ns",
+                            json!(successful_operation_duration_ns(&bulk.interval)),
+                        ),
+                    ]),
+                }),
             )?;
         }
 
@@ -797,16 +852,16 @@ impl<'a> ScenarioRunner<'a> {
             &mut metrics,
             "backend_observed_accelerator_residency",
             "boolean",
-            residency_interval.sample(
-                "backend-accelerator-residency-1",
-                1,
-                self.context.qualification_runtime,
-                "resident_policy_identity_v1",
-                raw_server_identity(&residency_snapshot)?,
-                "accelerator_measurement_started",
-                "backend_residency_evidence_validated",
-                accelerator_operands(&residency),
-            ),
+            residency_interval.sample(RawMetricSampleInput {
+                sample_id: &self.measurement_sample_id("backend_observed_accelerator_residency", 1),
+                repeat: 1,
+                runtime: self.context.qualification_runtime,
+                workload_id: "resident_policy_identity_v1",
+                server_identity: raw_server_identity(&residency_snapshot)?,
+                start_phase: "accelerator_measurement_started",
+                end_phase: "backend_residency_evidence_validated",
+                operands: accelerator_operands(&residency),
+            }),
         )?;
 
         for repeat in 1..=3 {
@@ -818,16 +873,16 @@ impl<'a> ScenarioRunner<'a> {
                 &mut metrics,
                 "busy_retry_usefulness",
                 "milliseconds",
-                busy.sample(
-                    &format!("busy-retry-usefulness-{repeat}"),
+                busy.sample(RawMetricSampleInput {
+                    sample_id: &self.measurement_sample_id("busy_retry_usefulness", repeat),
                     repeat,
-                    self.context.qualification_runtime,
-                    "saturated_query_65th_retry_v1",
-                    raw_server_identity(&busy_snapshot)?,
-                    "typed_retry_emitted",
-                    "named_retry_condition_became_true",
-                    BTreeMap::new(),
-                ),
+                    runtime: self.context.qualification_runtime,
+                    workload_id: "saturated_query_65th_retry_v1",
+                    server_identity: raw_server_identity(&busy_snapshot)?,
+                    start_phase: "typed_retry_emitted",
+                    end_phase: "named_retry_condition_became_true",
+                    operands: BTreeMap::new(),
+                }),
             )?;
         }
 
@@ -856,16 +911,16 @@ impl<'a> ScenarioRunner<'a> {
             &mut metrics,
             "true_idle_exit",
             "milliseconds",
-            idle.sample(
-                "true-idle-exit-1",
-                1,
-                self.context.qualification_runtime,
-                "true_idle_60000_awake_ms_v1",
-                raw_server_identity(&idle_owner)?,
-                "last_queued_active_or_leased_work_ended",
-                "engine_and_server_absent",
-                BTreeMap::new(),
-            ),
+            idle.sample(RawMetricSampleInput {
+                sample_id: &self.measurement_sample_id("true_idle_exit", 1),
+                repeat: 1,
+                runtime: self.context.qualification_runtime,
+                workload_id: "true_idle_60000_awake_ms_v1",
+                server_identity: raw_server_identity(&idle_owner)?,
+                start_phase: "last_queued_active_or_leased_work_ended",
+                end_phase: "engine_and_server_absent",
+                operands: BTreeMap::new(),
+            }),
         )?;
 
         if metrics.len() != REQUIRED_METRICS.len().saturating_sub(2)
@@ -2072,6 +2127,7 @@ fn connect_until(
 
 fn validated_hello(
     stream: &mut crate::embedding_server_transport::NativeEmbeddingStream,
+    transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
     runtime: &SidecarRuntimeConfig,
     clock: &dyn AwakeMonotonicClock,
 ) -> Result<EmbeddingServerSnapshot> {
@@ -2086,9 +2142,7 @@ fn validated_hello(
             schema_version: PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
             request_id: request_id.clone(),
             compatibility: compatibility.clone(),
-            operation: EmbeddingOperation::Hello {
-                intent: "activate".into(),
-            },
+            operation: client_hello_operation("activate", transport),
         },
         &[],
     )?;
@@ -2115,6 +2169,20 @@ fn validated_hello(
     Ok(snapshot)
 }
 
+fn client_hello_operation(
+    intent: &str,
+    transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
+) -> EmbeddingOperation {
+    let executable = EmbeddingClientTransport::executable_identity(transport);
+    EmbeddingOperation::Hello {
+        intent: intent.into(),
+        client_pid: executable.pid,
+        client_process_start_id: executable.process_start_id,
+        client_executable_sha256: executable.executable_sha256,
+        client_executable_version: executable.executable_version,
+    }
+}
+
 fn measure_vector_operation(
     transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
     runtime: &SidecarRuntimeConfig,
@@ -2126,7 +2194,7 @@ fn measure_vector_operation(
         bail!("embedding_qualification_measurement_inputs_invalid");
     }
     let mut stream = connect_until(transport, runner.clock.as_ref(), Duration::from_secs(2))?;
-    let hello = validated_hello(&mut stream, runtime, runner.clock.as_ref())?;
+    let hello = validated_hello(&mut stream, transport, runtime, runner.clock.as_ref())?;
     let compatibility = EmbeddingCompatibility::current(runtime.embedding.allow_cpu);
     let request_id =
         qualification_request_id(&format!("measurement-{class}"), runner.clock.now_ns());
@@ -2141,12 +2209,14 @@ fn measure_vector_operation(
             scope_id,
             deadline_ms: 180_000,
             retry_after_ms: 100,
+            cancel_token: None,
             input: inputs[0].clone(),
         },
         "bulk" => EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms: 180_000,
             retry_after_ms: 100,
+            cancel_token: None,
             inputs: inputs.clone(),
         },
         _ => bail!("embedding_qualification_measurement_class_invalid"),
@@ -2355,7 +2425,7 @@ pub(super) fn run_worker(command: InternalEmbeddingQualificationCommand) -> Resu
     let process_start_id = current_process_start_identity()?;
     let started_ns = clock.now_ns();
     let defaults = crate::sidecar_runtime::process_defaults();
-    let runtime = SidecarRuntimeConfig::for_project_auto_with_process_defaults(
+    let runtime = crate::sidecar_runtime::for_project_auto_with_process_defaults(
         &request.project,
         &defaults,
         &SidecarRuntimeOverrides::default(),
@@ -2562,9 +2632,7 @@ fn run_queue_operation(
             schema_version: PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
             request_id: hello_id.clone(),
             compatibility: compatibility.clone(),
-            operation: EmbeddingOperation::Hello {
-                intent: "activate".into(),
-            },
+            operation: client_hello_operation("activate", &transport),
         },
         &[],
     )?;
@@ -2590,12 +2658,14 @@ fn run_queue_operation(
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
+            cancel_token: None,
             input: format!("qualification-queue-{ordinal}"),
         },
         "bulk" => EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
+            cancel_token: None,
             inputs: vec![format!("qualification-queue-{ordinal}")],
         },
         _ => bail!("embedding_qualification_queue_class_invalid"),
@@ -2679,10 +2749,6 @@ fn run_raw_protocol_exchange_with_input(
             .peer_process_start_id
             .as_deref()
             .is_none_or(str::is_empty)
-        || transport_identity
-            .peer_executable_sha256
-            .as_deref()
-            .is_none_or(str::is_empty)
     {
         bail!("embedding_qualification_stall_peer_unverified");
     }
@@ -2697,9 +2763,7 @@ fn run_raw_protocol_exchange_with_input(
             schema_version: PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
             request_id: hello_id.clone(),
             compatibility: compatibility.clone(),
-            operation: EmbeddingOperation::Hello {
-                intent: "activate".into(),
-            },
+            operation: client_hello_operation("activate", &transport),
         },
         &[],
     )?;
@@ -2730,12 +2794,14 @@ fn run_raw_protocol_exchange_with_input(
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
+            cancel_token: None,
             input: measured_input.unwrap_or_else(|| "qualification-long-query".into()),
         },
         "bulk" => EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
+            cancel_token: None,
             inputs: vec![measured_input.unwrap_or_else(|| "qualification-long-bulk".into())],
         },
         _ => bail!("embedding_qualification_protocol_class_invalid"),
@@ -2778,8 +2844,6 @@ fn authenticate_snapshot(
         || snapshot.process.pid != transport.peer_pid.unwrap_or_default()
         || Some(snapshot.process.process_start_id.as_str())
             != transport.peer_process_start_id.as_deref()
-        || Some(snapshot.process.executable_sha256.as_str())
-            != transport.peer_executable_sha256.as_deref()
         || snapshot.authority.endpoint_namespace_id != transport.endpoint_namespace_id
         || snapshot.authority.lifetime_authority_id != transport.lifetime_authority_id
         || snapshot.authority.listener_id != transport.listener_id
@@ -3429,6 +3493,32 @@ fn btree<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measurement_sample_ids_are_opaque_stable_and_unique_between_runs() {
+        let first = opaque_measurement_sample_id(
+            &"a".repeat(64),
+            "hosted_linux_x64_cpu",
+            "warm_query_ipc",
+            1,
+        );
+        let second_run = opaque_measurement_sample_id(
+            &"b".repeat(64),
+            "hosted_linux_x64_cpu",
+            "warm_query_ipc",
+            1,
+        );
+        let duplicate = opaque_measurement_sample_id(
+            &"a".repeat(64),
+            "hosted_linux_x64_cpu",
+            "warm_query_ipc",
+            1,
+        );
+        assert_ne!(first, second_run);
+        assert_eq!(first, duplicate);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn a_generic_operation_alias_cannot_satisfy_any_named_scenario() {

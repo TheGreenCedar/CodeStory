@@ -557,6 +557,7 @@
         ],
         "environment": "macos-metal-release",
         "permissions": {
+          "actions": "read",
           "contents": "read"
         },
         "secrets": []
@@ -572,6 +573,7 @@
         ],
         "environment": "windows-vulkan-proof",
         "permissions": {
+          "actions": "read",
           "contents": "read"
         },
         "secrets": []

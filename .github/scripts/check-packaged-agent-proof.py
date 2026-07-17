@@ -14,6 +14,7 @@ from collections import Counter
 import ctypes
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -47,6 +48,13 @@ RETRIEVAL_QUALITY_EVIDENCE_CONTRACT = "publishable-three-repeat-packet/v1"
 MEMORY_EVIDENCE_CONTRACT = "codestory-five-process-memory/v1"
 FAULT_RECOVERY_CONSISTENCY_CASES = 10
 MIN_RETRIEVAL_QUALITY_REPEATS = 3
+RELEASE_QUALITY_CORPUS_ID = "codestory-release-corpus-v1"
+RELEASE_QUALITY_MODES = {"cold-cli": "cold_cli_packet"}
+REQUIRED_HOLDOUT_TASK_FILES = {
+    "axios-request-dispatch.task.json",
+    "redis-server-event-loop.task.json",
+    "ripgrep-search-pipeline.task.json",
+}
 EXTERNAL_QUALIFICATION_METRICS = {
     "retrieval_quality",
     "total_codestory_process_memory",
@@ -59,6 +67,9 @@ MEASUREMENT_PROTOCOL = (
 )
 SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-protocol.json")
 SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-constant-set.json")
+HOLDOUT_TASK_ROOT = (
+    Path(__file__).resolve().parents[2] / "benchmarks" / "tasks" / "holdout-retrieval"
+)
 DEFAULT_QUERY = "RuntimeContext"
 DEFAULT_QUESTION = "Explain how CodeStory prepares retrieval."
 SOFTWARE_ADAPTERS = ("llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader")
@@ -384,9 +395,66 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
             )
         )
     require(
-        observed_matrix == expected_matrix and len(matrix) == len(expected_matrix),
+        observed_matrix == expected_matrix and len(matrix) == len(expected_matrix) + 2,
         "measurement host/package matrix does not match the release proof lanes",
     )
+    require(
+        {
+            cell_id
+            for cell_id, cell in matrix.items()
+            if cell["host_class"].startswith("premerge_candidate_")
+        }
+        == {
+            "candidate_installed_linux_x64_cpu",
+            "candidate_installed_macos_arm64_cpu",
+        },
+        "measurement matrix omitted the two candidate-installed premerge lanes",
+    )
+    calibration_matrix = protocol.get("calibration_matrix")
+    require(
+        isinstance(calibration_matrix, dict)
+        and set(calibration_matrix)
+        == {
+            "hosted_linux_x64_cpu",
+            "protected_macos_arm64_metal",
+        },
+        "measurement calibration matrix must contain the Linux CPU and macOS Metal pre-publish lanes",
+    )
+    for cell_id, cell in calibration_matrix.items():
+        require(
+            isinstance(cell, dict)
+            and set(cell)
+            == {
+                "asset_target",
+                "proof_tier",
+                "host_class",
+                "policy",
+                "backend",
+                "cache_state",
+                "residency_state",
+                "accelerator_claim",
+            }
+            and cell["proof_tier"] == "calibration"
+            and cell["cache_state"] == "reused"
+            and cell["residency_state"] == "resident",
+            f"measurement calibration matrix cell {cell_id} is malformed",
+        )
+        qualification_cell = matrix[cell_id]
+        require(
+            all(
+                cell[field] == qualification_cell[field]
+                for field in (
+                    "asset_target",
+                    "host_class",
+                    "policy",
+                    "backend",
+                    "cache_state",
+                    "residency_state",
+                    "accelerator_claim",
+                )
+            ),
+            f"measurement calibration matrix cell {cell_id} does not use its exact qualification path",
+        )
     workloads = protocol.get("workloads")
     require(
         isinstance(workloads, dict) and set(workloads) == required_metrics,
@@ -482,7 +550,7 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
             "query_request_duration",
             "bulk_request_duration",
             "capacity_condition_duration",
-            "successful_native_progress_gap",
+            "successful_operation_duration",
         }
         and all(
             isinstance(cell, dict)
@@ -498,7 +566,7 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
         constant_selection["clean_run_requirements"]
         == {
             "minimum_runs_per_matrix_cell": 3,
-            "matrix_coverage": "every_host_package_matrix_cell",
+            "matrix_coverage": "every_calibration_matrix_cell",
             "source_identity": "one_exact_candidate_commit_and_tree",
             "artifact_selection": "all_preregistered_clean_runs",
             "unplanned_suspend": False,
@@ -515,7 +583,7 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
     expected_formula_fragments = {
         "connect_timeout_ms": "maximum_raw_value_ms_across_all_selected_samples*1.50",
         "spawn_convergence_timeout_ms": "maximum_raw_value_ms_across_all_selected_samples*1.50",
-        "hard_native_no_progress_ms": "maximum_raw_value_ms_across_all_selected_samples*4.00",
+        "hard_native_no_progress_ms": "maximum_complete_successful_operation_duration_ms_across_all_selected_samples*4.00",
         "watchdog_cadence_ms": "hard_native_no_progress_ms/20",
     }
     for field, fragment in expected_formula_fragments.items():
@@ -563,8 +631,11 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
         and threshold_selection
         == {
             "minimum_clean_calibration_runs_per_matrix_cell": 3,
-            "matrix_coverage": "every_host_package_matrix_cell",
+            "matrix_coverage": "every_calibration_matrix_cell",
             "source_identity": "one_exact_candidate_commit_and_tree",
+            "producer_identity": (
+                "trusted_packaged_platform_pr_workflow_run_and_exact_artifact"
+            ),
             "artifact_selection": "all_preregistered_clean_runs",
             "less_than_or_equal": (
                 "ceiling(maximum_cell_aggregate_across_all_runs*1.20)"
@@ -578,6 +649,44 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
             "post_result_threshold_changes": False,
         },
         "measurement threshold-selection formula is incomplete or mutable",
+    )
+    require(
+        protocol.get("calibration_bundle_contract")
+        == {
+            "schema_version": 1,
+            "required_for_frozen_qualification": True,
+            "matrix_cells": "exactly_every_calibration_matrix_cell",
+            "independent_clean_runs_per_matrix_cell": 3,
+            "source_identity": "one_exact_candidate_commit_and_tree",
+            "producer_identity": (
+                "trusted_packaged_platform_pr_workflow_run_and_exact_artifact"
+            ),
+            "contract_identity": [
+                "protocol_sha256",
+                "measurement_protocol_sha256",
+            ],
+            "raw_artifact": (
+                "embedded_product_and_five_process_measurements_with_canonical_sha256"
+            ),
+            "clock_witnesses": "awake_monotonic_plus_suspend_inclusive_per_sample",
+            "successful_operation_operand": "successful_operation_duration_ns",
+            "freeze_digest_inputs": [
+                "selection_protocol",
+                "source",
+                "producer",
+                "contracts",
+                "run_artifact_sha256s",
+                "calibration_required_values",
+                "qualification_thresholds",
+            ],
+            "constant_set_comparison": (
+                "exact_recomputed_values_thresholds_and_freeze_record"
+            ),
+            "qualification_boundary": (
+                "installed_runtime_cells_are_post_freeze_qualification_only"
+            ),
+        },
+        "measurement calibration-bundle contract is incomplete or mutable",
     )
     clock_policy = protocol.get("clock_policy")
     suspend = clock_policy.get("suspend_detection") if isinstance(clock_policy, dict) else None
@@ -606,20 +715,114 @@ def load_json_contract(path: Path, label: str) -> tuple[dict, str]:
     return document, sha256(path)
 
 
+def load_server_measurement_contract(measurement_protocol_path: Path) -> dict:
+    measurement, measurement_sha256 = load_measurement_protocol(
+        measurement_protocol_path
+    )
+    protocol_path = measurement_protocol_path.with_name(SERVER_PROTOCOL.name)
+    constant_set_path = measurement_protocol_path.with_name(SERVER_CONSTANT_SET.name)
+    protocol, protocol_sha256 = load_json_contract(
+        protocol_path, "embedding server protocol"
+    )
+    constant_set, constant_set_sha256 = load_json_contract(
+        constant_set_path,
+        "embedding server constant set",
+    )
+    return {
+        "measurement_protocol": measurement,
+        "measurement_protocol_sha256": measurement_sha256,
+        "protocol": protocol,
+        "protocol_sha256": protocol_sha256,
+        "constant_set": constant_set,
+        "constant_set_sha256": constant_set_sha256,
+    }
+
+
+def load_holdout_task_contracts(root: Path = HOLDOUT_TASK_ROOT) -> tuple[dict[tuple[str, str], dict], str]:
+    require(root.is_dir(), f"holdout retrieval task directory is missing: {root}")
+    paths = sorted(root.glob("*.task.json"))
+    require(
+        {path.name for path in paths} == REQUIRED_HOLDOUT_TASK_FILES,
+        "checked-in holdout retrieval task set changed without updating the release contract",
+    )
+    tasks: dict[tuple[str, str], dict] = {}
+    corpus_records = []
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ProofFailure(f"holdout task manifest is not valid JSON: {path}: {exc}") from exc
+        require(isinstance(raw, dict), f"holdout task manifest must be an object: {path}")
+        require(raw.get("version") == 1, f"holdout task manifest schema is unsupported: {path}")
+        task_id = require_nonempty_string(raw.get("id"), f"holdout task {path.name}.id")
+        require(
+            path.name == f"{task_id}.task.json",
+            f"holdout task id does not match its checked-in filename: {path}",
+        )
+        require(raw.get("suite") == "holdout-retrieval", f"holdout task {task_id} left the release suite")
+        repo = raw.get("repo")
+        require(isinstance(repo, dict), f"holdout task {task_id} omitted repository identity")
+        repo_name = require_nonempty_string(repo.get("name"), f"holdout task {task_id} repo.name")
+        require(
+            isinstance(repo.get("url"), str)
+            and re.fullmatch(
+                r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?",
+                repo["url"],
+            )
+            is not None,
+            f"holdout task {task_id} repository URL is not trusted",
+        )
+        require(
+            isinstance(repo.get("ref"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", repo["ref"]) is not None,
+            f"holdout task {task_id} repository ref is not immutable",
+        )
+        key = (repo_name, task_id)
+        require(key not in tasks, f"holdout task identity is duplicated: {repo_name}/{task_id}")
+        expected_snapshot = {
+            "id": task_id,
+            "name": raw.get("name", task_id),
+            "suite": "holdout-retrieval",
+            "repo": repo_name,
+            "repo_metadata": repo,
+            "task_class": raw.get("task_class"),
+            "prompt": raw.get("prompt"),
+            "expected_files": raw.get("expected_files", []),
+            "expected_verification_files": raw.get("expected_verification_files", []),
+            "expected_symbols": raw.get("expected_symbols", []),
+            "expected_symbol_probes": raw.get("expected_symbol_probes", []),
+            "expected_claims": raw.get("expected_claims", []),
+            "forbidden_claims": raw.get("forbidden_claims", []),
+            "quality_thresholds": raw.get("quality_thresholds", {}),
+        }
+        tasks[key] = {
+            "path": path,
+            "manifest_sha256": sha256(path),
+            "snapshot": expected_snapshot,
+            "repo": repo,
+        }
+        corpus_records.append(
+            {
+                "path": path.relative_to(Path(__file__).resolve().parents[2]).as_posix(),
+                "sha256": tasks[key]["manifest_sha256"],
+            }
+        )
+    return tasks, canonical_sha256(corpus_records)
+
+
 def verify_package_server_contracts(
     manifest: dict,
     measurement_protocol_path: Path,
     *,
     require_frozen: bool,
 ) -> dict:
-    measurement, measurement_sha256 = load_measurement_protocol(measurement_protocol_path)
-    protocol_path = measurement_protocol_path.with_name(SERVER_PROTOCOL.name)
-    constant_set_path = measurement_protocol_path.with_name(SERVER_CONSTANT_SET.name)
-    protocol, protocol_sha256 = load_json_contract(protocol_path, "embedding server protocol")
-    constant_set, constant_set_sha256 = load_json_contract(
-        constant_set_path,
-        "embedding server constant set",
-    )
+    contract = load_server_measurement_contract(measurement_protocol_path)
+    measurement = contract["measurement_protocol"]
+    measurement_sha256 = contract["measurement_protocol_sha256"]
+    protocol = contract["protocol"]
+    protocol_sha256 = contract["protocol_sha256"]
+    constant_set = contract["constant_set"]
+    constant_set_sha256 = contract["constant_set_sha256"]
     server_proof = manifest.get("server_proof")
     require(isinstance(server_proof, dict), "package manifest omitted server_proof")
     expected = {
@@ -653,23 +856,60 @@ def verify_package_server_contracts(
         )
         freeze_record = constant_set.get("freeze_record")
         require(isinstance(freeze_record, dict), "frozen embedding server constants omit their freeze record")
+        require_exact_keys(
+            freeze_record,
+            {
+                "selection_source_commit",
+                "selection_source_tree",
+                "measurement_protocol_sha256",
+                "protocol_sha256",
+                "input_constant_set_sha256",
+                "calibration_bundle_sha256",
+                "calibration_freeze_digest",
+                "run_artifact_sha256s",
+                "selection_rule",
+                "selected_at",
+            },
+            "constant-set freeze_record",
+        )
         for field in (
             "selection_source_commit",
             "selection_source_tree",
-            "host_profile_id",
-            "host_fingerprint",
-            "calibration_artifact_sha256",
+            "measurement_protocol_sha256",
+            "protocol_sha256",
+            "input_constant_set_sha256",
+            "calibration_bundle_sha256",
+            "calibration_freeze_digest",
             "selection_rule",
             "selected_at",
         ):
-            require_nonempty_string(freeze_record.get(field), f"constant-set freeze_record.{field}")
+            require_nonempty_string(
+                freeze_record.get(field),
+                f"constant-set freeze_record.{field}",
+            )
         for field in ("selection_source_commit", "selection_source_tree"):
             require(
                 re.fullmatch(r"[0-9a-f]{40}", freeze_record[field]) is not None,
                 f"constant-set freeze_record.{field} must be a lowercase Git object id",
             )
-        for field in ("host_fingerprint", "calibration_artifact_sha256"):
+        for field in (
+            "measurement_protocol_sha256",
+            "protocol_sha256",
+            "input_constant_set_sha256",
+            "calibration_bundle_sha256",
+            "calibration_freeze_digest",
+        ):
             require_sha256(freeze_record[field], f"constant-set freeze_record.{field}")
+        run_digests = freeze_record["run_artifact_sha256s"]
+        required_run_count = len(measurement["calibration_matrix"]) * 3
+        require(
+            isinstance(run_digests, list)
+            and len(run_digests) == required_run_count
+            and len(set(run_digests)) == required_run_count,
+            "constant-set freeze record must bind three distinct runs for every calibration cell",
+        )
+        for index, digest in enumerate(run_digests):
+            require_sha256(digest, f"constant-set freeze_record.run_artifact_sha256s[{index}]")
         unresolved = [
             field
             for section in ("calibration_required_values", "qualification_thresholds")
@@ -677,14 +917,7 @@ def verify_package_server_contracts(
             if value is None
         ]
         require(not unresolved, "frozen embedding server constants contain unresolved values: " + ", ".join(unresolved))
-    return {
-        "measurement_protocol": measurement,
-        "measurement_protocol_sha256": measurement_sha256,
-        "protocol": protocol,
-        "protocol_sha256": protocol_sha256,
-        "constant_set": constant_set,
-        "constant_set_sha256": constant_set_sha256,
-    }
+    return contract
 
 
 def expected_archive_digest(checksum_file: Path, archive: Path) -> str:
@@ -1570,9 +1803,13 @@ def verify_retained_qualification(
     *,
     manifest: dict,
     archive_sha256: str,
-    shared_identity: dict | None,
+    shared_identity: dict,
     measurement_contract: dict,
     required_tier: str,
+    required_matrix_cell_id: str,
+    expected_policy: str,
+    expected_backend: str,
+    expected_accelerator_claim: str,
     installed_plugin: dict | None = None,
     managed_runtime: dict | None = None,
 ) -> dict:
@@ -1586,31 +1823,82 @@ def verify_retained_qualification(
         tier in {"hosted_package", "protected_hardware", "installed_runtime"},
         "retained qualification tier is invalid",
     )
-    tier_rank = {"hosted_package": 1, "protected_hardware": 2, "installed_runtime": 3}
     require(
-        tier_rank[tier] >= tier_rank[required_tier],
-        f"retained {tier} evidence cannot support required tier {required_tier}",
+        tier == required_tier,
+        f"retained {tier} evidence cannot support exact requested tier {required_tier}",
+    )
+    matrix_cell = selected_qualification_matrix_cell(
+        measurement_contract["measurement_protocol"],
+        cell_id=required_matrix_cell_id,
+        target=manifest["asset_target"],
+        proof_tier=required_tier,
+        expected_policy=expected_policy,
+        expected_backend=expected_backend,
+    )
+    require(
+        matrix_cell["accelerator_claim"] == expected_accelerator_claim,
+        "requested accelerator claim does not match the selected qualification matrix cell",
     )
     retained_plugin = evidence.get("installed_plugin")
     retained_runtime = evidence.get("managed_runtime")
     if tier == "installed_runtime":
         require(isinstance(retained_plugin, dict), "installed evidence omitted plugin provenance")
         require(isinstance(retained_runtime, dict), "installed evidence omitted managed runtime provenance")
+        installation_source = retained_plugin.get("installation_source")
         require(
-            retained_plugin.get("marketplace_repository")
-            == "TheGreenCedar/AgentPluginMarketplace"
+            installation_source in {"marketplace", "candidate_archive"}
             and retained_plugin.get("plugin_id") == "codestory"
             and retained_plugin.get("plugin_version") == manifest["release_version"],
-            "installed evidence has invalid marketplace/plugin provenance",
+            "installed evidence has invalid plugin provenance",
         )
+        if installation_source == "marketplace":
+            require(
+                retained_plugin.get("marketplace_repository")
+                == "TheGreenCedar/AgentPluginMarketplace"
+                and retained_runtime.get("build_source") == "github_release"
+                and retained_runtime.get("repo_ref")
+                == f"v{manifest['release_version']}",
+                "installed evidence has invalid marketplace/release provenance",
+            )
+            require(
+                isinstance(retained_plugin.get("marketplace_commit"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    retained_plugin["marketplace_commit"],
+                )
+                is not None,
+                "installed evidence marketplace commit is invalid",
+            )
+        else:
+            producer = retained_plugin.get("producer")
+            require(
+                retained_plugin.get("candidate_archive_sha256")
+                == archive_sha256
+                and retained_plugin.get("candidate_asset_target")
+                == manifest["asset_target"]
+                and retained_plugin.get("plugin_source_tree")
+                == manifest["source"]["tree"]
+                and retained_runtime.get("build_source")
+                == "candidate_archive"
+                and retained_runtime.get("repo_ref")
+                == manifest["source"]["commit"],
+                "installed evidence has invalid staged-candidate provenance",
+            )
+            require(
+                isinstance(producer, dict)
+                and producer.get("repository") == "TheGreenCedar/CodeStory"
+                and producer.get("workflow_path")
+                == ".github/workflows/packaged-platform-pr.yml"
+                and isinstance(producer.get("run_id"), str)
+                and re.fullmatch(r"[1-9][0-9]*", producer["run_id"]) is not None
+                and isinstance(producer.get("run_attempt"), str)
+                and re.fullmatch(r"[1-9][0-9]*", producer["run_attempt"])
+                is not None,
+                "installed evidence has unauthenticated candidate producer identity",
+            )
         require_sha256(
             retained_plugin.get("plugin_package_sha256"),
             "installed evidence plugin_package_sha256",
-        )
-        require(
-            isinstance(retained_plugin.get("marketplace_commit"), str)
-            and re.fullmatch(r"[0-9a-f]{40}", retained_plugin["marketplace_commit"]) is not None,
-            "installed evidence marketplace commit is invalid",
         )
         require(
             retained_plugin.get("plugin_source_commit") == manifest["source"]["commit"],
@@ -1659,6 +1947,14 @@ def verify_retained_qualification(
         package.get("model_sha256") == manifest["model"]["sha256"],
         "retained qualification names a different model",
     )
+    require(
+        package.get("matrix_cell_id") == required_matrix_cell_id
+        and package.get("policy") == expected_policy
+        and normalized_backend(package.get("backend"))
+        == normalized_backend(expected_backend)
+        and package.get("accelerator_claim") == expected_accelerator_claim,
+        "retained qualification package does not match the requested matrix cell, policy, backend, or accelerator claim",
+    )
     for field in (
         "protocol_sha256",
         "constant_set_sha256",
@@ -1679,6 +1975,12 @@ def verify_retained_qualification(
     )
     require_nonempty_string(host.get("backend"), "retained qualification host backend")
     require(
+        host.get("matrix_cell_id") == required_matrix_cell_id
+        and host.get("accelerator_claim") == expected_accelerator_claim
+        and host.get("host_class") == matrix_cell["host_class"],
+        "retained qualification host does not match the requested matrix cell",
+    )
+    require(
         normalized_backend(package.get("backend")) == normalized_backend(host["backend"]),
         "retained qualification package and host backend identities disagree",
     )
@@ -1687,11 +1989,21 @@ def verify_retained_qualification(
         and host.get("policy") in {"accelerated", "cpu_explicit"},
         "retained qualification package and host policy identities disagree",
     )
+    require(
+        host.get("policy") == expected_policy
+        and normalized_backend(host.get("backend"))
+        == normalized_backend(expected_backend),
+        "retained qualification host used the wrong requested policy or backend",
+    )
     for field in ("cache_state", "residency_state"):
         require_nonempty_string(host.get(field), f"retained qualification host {field}")
         require(
             package.get(field) == host[field],
             f"retained qualification package and host {field} disagree",
+        )
+        require(
+            host[field] == matrix_cell[field],
+            f"retained qualification host {field} differs from the selected matrix cell",
         )
     require(
         host.get("unplanned_suspend") is False,
@@ -1735,6 +2047,10 @@ def verify_retained_qualification(
 
     retained_shared = evidence.get("shared_identity")
     require(isinstance(retained_shared, dict), "retained qualification omitted shared server identity")
+    require(
+        isinstance(shared_identity, dict),
+        "live two-host proof omitted shared server identity",
+    )
     for field in (
         "endpoint_namespace_id",
         "lifetime_authority_id",
@@ -1747,11 +2063,10 @@ def verify_retained_qualification(
         "model_load_count",
     ):
         require(field in retained_shared, f"retained shared identity omitted {field}")
-        if shared_identity is not None:
-            require(
-                retained_shared[field] == shared_identity[field],
-                f"retained shared identity {field} does not match the live two-host proof",
-            )
+        require(
+            retained_shared[field] == shared_identity[field],
+            f"retained shared identity {field} does not match the live two-host proof",
+        )
     require(retained_shared["model_load_count"] == 1, "retained cold race did not prove one model load")
 
     timing = evidence.get("timing")
@@ -1844,6 +2159,8 @@ def verify_retained_qualification(
                     "evaluation_contract",
                     "source_commit",
                     "source_tree",
+                    "corpus_id",
+                    "holdout_manifest_set_sha256",
                     "repeats",
                     "row_count",
                     "passing_row_count",
@@ -1870,8 +2187,16 @@ def verify_retained_qualification(
             )
             require(
                 require_positive_int(raw_evidence["repeats"], "retrieval quality repeats")
-                >= MIN_RETRIEVAL_QUALITY_REPEATS,
-                "retrieval quality retained too few repeats",
+                == MIN_RETRIEVAL_QUALITY_REPEATS,
+                "retrieval quality retained the wrong repeat count",
+            )
+            require(
+                raw_evidence["corpus_id"] == RELEASE_QUALITY_CORPUS_ID,
+                "retrieval quality retained the wrong holdout corpus",
+            )
+            require_sha256(
+                raw_evidence["holdout_manifest_set_sha256"],
+                "retrieval quality holdout manifest set sha256",
             )
             row_count = require_positive_int(
                 raw_evidence["row_count"], "retrieval quality row count"
@@ -2005,7 +2330,13 @@ def suspend_clock_pair(target_os: str) -> tuple[int, int, str, str]:
     )
 
 
-def plugin_client_process(status: dict, manifest: dict, label: str) -> dict:
+def plugin_client_process(
+    status: dict,
+    manifest: dict,
+    label: str,
+    *,
+    target_os: str,
+) -> dict:
     plugin_runtime = status.get("plugin_runtime")
     require(isinstance(plugin_runtime, dict), f"{label} omitted plugin_runtime")
     process = plugin_runtime.get("client_process")
@@ -2020,19 +2351,14 @@ def plugin_client_process(status: dict, manifest: dict, label: str) -> dict:
         process["process_start_id"],
         f"{label} client_process.process_start_id",
     )
-    require(
-        process_start_identity(pid) == start_id,
-        f"{label} client process identity is no longer live",
+    return verified_live_executable(
+        pid=pid,
+        process_start_id=start_id,
+        reported_sha256=process["executable_sha256"],
+        expected_sha256=manifest["binary"]["sha256"],
+        target_os=target_os,
+        label=f"{label} client process",
     )
-    require(
-        process["executable_sha256"] == manifest["binary"]["sha256"],
-        f"{label} client process is not the exact packaged executable",
-    )
-    return {
-        "pid": pid,
-        "process_start_id": start_id,
-        "executable_sha256": process["executable_sha256"],
-    }
 
 
 def capture_five_process_memory(
@@ -2062,17 +2388,35 @@ def capture_five_process_memory(
         expected_policy=args.engine_policy,
         expected_backend=expected_backend,
     )
-    client_a = plugin_client_process(status_a, manifest, "first plugin host")
-    client_b = plugin_client_process(status_b, manifest, "second plugin host")
+    target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
+    client_a = plugin_client_process(
+        status_a,
+        manifest,
+        "first plugin host",
+        target_os=target_os,
+    )
+    client_b = plugin_client_process(
+        status_b,
+        manifest,
+        "second plugin host",
+        target_os=target_os,
+    )
     require(
         (client_a["pid"], client_a["process_start_id"])
         != (client_b["pid"], client_b["process_start_id"]),
         "plugin hosts reported the same CLI client process",
     )
     server = snapshot["process"]
-    require(
-        server.get("executable_sha256") == manifest["binary"]["sha256"],
-        "shared embedding server is not the exact packaged executable",
+    server_live = verified_live_executable(
+        pid=require_positive_int(server.get("pid"), "embedding server pid"),
+        process_start_id=require_nonempty_string(
+            server.get("process_start_id"),
+            "embedding server process_start_id",
+        ),
+        reported_sha256=server.get("executable_sha256"),
+        expected_sha256=manifest["binary"]["sha256"],
+        target_os=target_os,
+        label="embedding server process",
     )
     node_digest = sha256(node_path.resolve())
     process_set = [
@@ -2092,12 +2436,7 @@ def capture_five_process_memory(
         {"role": "plugin_cli_b", **client_b},
         {
             "role": "embedding_server",
-            "pid": require_positive_int(server.get("pid"), "embedding server pid"),
-            "process_start_id": require_nonempty_string(
-                server.get("process_start_id"),
-                "embedding server process_start_id",
-            ),
-            "executable_sha256": server["executable_sha256"],
+            **server_live,
         },
     ]
     identities = {
@@ -2107,7 +2446,6 @@ def capture_five_process_memory(
         len(identities) == 5,
         "memory evidence did not identify five distinct live CodeStory processes",
     )
-    target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
     boot_id = require_nonempty_string(
         snapshot["clock"]["boot_id"],
         "embedding server clock boot_id",
@@ -2404,6 +2742,7 @@ def retain_five_process_memory_evidence(
             "sha256": hashlib.sha256(payload_bytes).hexdigest(),
         },
         "value": max(values),
+        "payload": payload,
     }
 
 
@@ -2616,24 +2955,113 @@ class McpProcess:
 
 def process_start_identity(pid: int) -> str:
     if os.name == "nt":
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CreationDate.ToUniversalTime().ToString('o')",
-            ],
-            text=True,
-            capture_output=True,
-            timeout=20,
-        )
-        require(completed.returncode == 0, f"could not read process start identity for {pid}")
-        return require_nonempty_string(completed.stdout.strip(), "process start identity")
+        class FileTime(ctypes.Structure):
+            _fields_ = [
+                ("low_date_time", ctypes.c_uint32),
+                ("high_date_time", ctypes.c_uint32),
+            ]
+
+        kernel = ctypes.windll.kernel32
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.GetProcessTimes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+        ]
+        kernel.GetProcessTimes.restype = ctypes.c_int
+        kernel.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        kernel.GetExitCodeProcess.restype = ctypes.c_int
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.OpenProcess(0x1000, 0, pid)
+        require(bool(handle), f"could not open process {pid} for start identity")
+        try:
+            creation = FileTime()
+            exit_time = FileTime()
+            kernel_time = FileTime()
+            user_time = FileTime()
+            require(
+                bool(
+                    kernel.GetProcessTimes(
+                        handle,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_time),
+                        ctypes.byref(kernel_time),
+                        ctypes.byref(user_time),
+                    )
+                ),
+                f"could not read process start identity for {pid}",
+            )
+            exit_code = ctypes.c_uint32()
+            require(
+                bool(kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+                and exit_code.value == 259
+                and exit_time.low_date_time == 0
+                and exit_time.high_date_time == 0,
+                f"process {pid} was not running during start-identity inspection",
+            )
+        finally:
+            kernel.CloseHandle(handle)
+        filetime_ticks = (creation.high_date_time << 32) | creation.low_date_time
+        # Match codestory-retrieval's legacy DateTime-tick serialization exactly.
+        creation_ticks = (filetime_ticks // 10 * 10) + 504_911_232_000_000_000
+        return f"windows:{creation_ticks}"
     if sys.platform == "linux":
-        stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
-        require(len(stat_fields) > 21, f"/proc/{pid}/stat omitted process start identity")
-        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        return f"{boot_id}:{stat_fields[21]}"
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat.rsplit(") ", 1)
+        require(len(fields) == 2, f"/proc/{pid}/stat omitted process start identity")
+        process_fields = fields[1].split()
+        require(len(process_fields) > 19, f"/proc/{pid}/stat omitted process start identity")
+        return f"linux:{process_fields[19]}"
+    if sys.platform == "darwin":
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        info = ProcBsdInfo()
+        expected = ctypes.sizeof(info)
+        read = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), expected)
+        require(
+            read == expected and info.pbi_pid == pid,
+            f"could not read complete process start identity for {pid}",
+        )
+        return f"macos-proc:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
     completed = subprocess.run(
         ["ps", "-o", "lstart=", "-p", str(pid)],
         text=True,
@@ -2641,7 +3069,129 @@ def process_start_identity(pid: int) -> str:
         timeout=20,
     )
     require(completed.returncode == 0, f"could not read process start identity for {pid}")
-    return require_nonempty_string(completed.stdout.strip(), "process start identity")
+    return "unix:" + require_nonempty_string(
+        completed.stdout.strip(), "process start identity"
+    )
+
+
+def require_native_process_start_identity(
+    identity: object,
+    target_os: str,
+    label: str,
+) -> str:
+    value = require_nonempty_string(identity, label)
+    patterns = {
+        "linux": r"linux:[0-9]+",
+        "macos": r"macos-proc:[0-9]+:[0-9]+",
+        "windows": r"windows:[0-9]+",
+    }
+    require(target_os in patterns, f"{label} used unsupported target OS {target_os}")
+    require(
+        re.fullmatch(patterns[target_os], value) is not None,
+        f"{label} did not use the canonical {target_os} process identity format",
+    )
+    return value
+
+
+def live_process_executable_sha256(
+    pid: int,
+    expected_start_id: str,
+    target_os: str,
+) -> str:
+    expected_start_id = require_native_process_start_identity(
+        expected_start_id,
+        target_os,
+        f"process {pid} expected start identity",
+    )
+    require(
+        process_start_identity(pid) == expected_start_id,
+        f"process {pid} changed identity before executable-image inspection",
+    )
+    if target_os == "linux":
+        descriptor = os.open(f"/proc/{pid}/exe", os.O_RDONLY)
+    elif target_os == "macos":
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidpath.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        libproc.proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        length = libproc.proc_pidpath(pid, buffer, len(buffer))
+        require(length > 0, f"proc_pidpath could not inspect process {pid}")
+        executable_path = os.fsdecode(buffer.raw[:length].split(b"\0", 1)[0])
+        descriptor = os.open(executable_path, os.O_RDONLY)
+    else:
+        require(target_os == "windows", f"unsupported executable-image target {target_os}")
+        kernel = ctypes.windll.kernel32
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        kernel.QueryFullProcessImageNameW.restype = ctypes.c_int
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.OpenProcess(0x1000, 0, pid)
+        require(bool(handle), f"OpenProcess could not inspect process {pid}")
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = ctypes.c_uint32(len(buffer))
+            require(
+                bool(
+                    kernel.QueryFullProcessImageNameW(
+                        handle,
+                        0,
+                        buffer,
+                        ctypes.byref(length),
+                    )
+                ),
+                f"QueryFullProcessImageNameW could not inspect process {pid}",
+            )
+            executable_path = buffer.value[: length.value]
+        finally:
+            kernel.CloseHandle(handle)
+        descriptor = os.open(executable_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    digest = hashlib.sha256()
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    require(
+        process_start_identity(pid) == expected_start_id,
+        f"process {pid} changed identity during executable-image inspection",
+    )
+    return digest.hexdigest()
+
+
+def verified_live_executable(
+    *,
+    pid: int,
+    process_start_id: str,
+    reported_sha256: str,
+    expected_sha256: str,
+    target_os: str,
+    label: str,
+) -> dict:
+    require_sha256(reported_sha256, f"{label} reported executable sha256")
+    require_sha256(expected_sha256, f"{label} expected executable sha256")
+    live_sha256 = live_process_executable_sha256(pid, process_start_id, target_os)
+    require(
+        live_sha256 == reported_sha256 == expected_sha256,
+        f"{label} live executable image does not match its reported and packaged digest",
+    )
+    return {
+        "pid": pid,
+        "process_start_id": process_start_id,
+        "executable_sha256": live_sha256,
+    }
 
 
 def current_account_identity() -> str:
@@ -2677,6 +3227,140 @@ def directory_contract_sha256(root: Path) -> str:
         digest.update(len(payload).to_bytes(8, "little"))
         digest.update(payload)
     return digest.hexdigest()
+
+
+def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
+    require(
+        args.archive is not None
+        and args.checksum_file is not None
+        and args.expected_version is not None
+        and args.plugin_root is not None
+        and args.candidate_plugin_root_output is not None
+        and args.candidate_plugin_data_output is not None
+        and args.installed_plugin_provenance_output is not None,
+        "candidate install preparation requires archive, checksum, version, plugin source, "
+        "plugin/data outputs, and provenance output",
+    )
+    archive = args.archive.resolve()
+    checksum = args.checksum_file.resolve()
+    source_plugin = args.plugin_root.resolve()
+    plugin_output = args.candidate_plugin_root_output.resolve()
+    data_output = args.candidate_plugin_data_output.resolve()
+    provenance_output = args.installed_plugin_provenance_output.resolve()
+    producer = {
+        "repository": args.candidate_producer_repository,
+        "workflow_path": args.candidate_producer_workflow_path,
+        "run_id": args.candidate_producer_run_id,
+        "run_attempt": args.candidate_producer_run_attempt,
+        "artifact_name": args.candidate_artifact_name,
+    }
+    require(
+        producer["repository"] == "TheGreenCedar/CodeStory"
+        and producer["workflow_path"]
+        == ".github/workflows/packaged-platform-pr.yml"
+        and isinstance(producer["run_id"], str)
+        and re.fullmatch(r"[1-9][0-9]*", producer["run_id"]) is not None
+        and isinstance(producer["run_attempt"], str)
+        and re.fullmatch(r"[1-9][0-9]*", producer["run_attempt"]) is not None
+        and producer["artifact_name"] == archive.name,
+        "candidate install producer identity is missing or is not the trusted coordinator artifact",
+    )
+    require(
+        sha256(archive) == expected_archive_digest(checksum, archive),
+        "candidate install archive checksum mismatch",
+    )
+    require(
+        source_plugin.is_dir()
+        and not plugin_output.exists()
+        and not data_output.exists()
+        and not provenance_output.exists(),
+        "candidate install outputs must be absent and the source plugin must exist",
+    )
+    with tempfile.TemporaryDirectory(prefix="codestory-candidate-install-") as raw:
+        unpacked = Path(raw) / "unpacked"
+        unpack_archive(archive, unpacked)
+        cli = find_cli(unpacked)
+        manifest = load_native_manifest(unpacked, cli, args.expected_version)
+        repository_root = Path(__file__).resolve().parents[2]
+        require(
+            os.path.samefile(
+                source_plugin,
+                repository_root / "plugins" / "codestory",
+            ),
+            "candidate install plugin source is not the checked-in CodeStory plugin",
+        )
+
+        def git(*arguments: str) -> str:
+            completed = subprocess.run(
+                ["git", *arguments],
+                cwd=repository_root,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            require(
+                completed.returncode == 0,
+                f"candidate install Git identity probe failed: {completed.stderr.strip()}",
+            )
+            return completed.stdout.strip()
+
+        require(
+            git("rev-parse", "HEAD") == manifest["source"]["commit"]
+            and git("rev-parse", "HEAD^{tree}") == manifest["source"]["tree"],
+            "candidate plugin checkout does not match the packaged source commit and tree",
+        )
+        require(
+            git("status", "--porcelain", "--untracked-files=all") == "",
+            "candidate plugin checkout contains tracked or untracked source drift",
+        )
+        shutil.copytree(source_plugin, plugin_output)
+        expected_archive_name = (
+            f"codestory-cli-v{args.expected_version}-"
+            f"{manifest['asset_target']}."
+            f"{'zip' if manifest['asset_target'].startswith('windows-') else 'tar.gz'}"
+        )
+        require(
+            archive.name == expected_archive_name,
+            "candidate install archive name does not match its package target",
+        )
+        version_root = data_output / "codestory-cli" / args.expected_version
+        shutil.copytree(unpacked, version_root)
+        relative_cli = cli.relative_to(unpacked).as_posix()
+        managed_manifest = {
+            "path": relative_cli,
+            "sha256": manifest["binary"]["sha256"],
+            "version": args.expected_version,
+            "build_source": "candidate_archive",
+            "repo_ref": manifest["source"]["commit"],
+            "archive": archive.name,
+            "archive_url": f"candidate-archive:{sha256(archive)}",
+            "archive_sha256": sha256(archive),
+            "target": manifest["asset_target"],
+            "stdio_initialize_verified": True,
+            "provisioned_at": f"candidate-proof:{manifest['source']['commit']}",
+        }
+        write_json(version_root / "manifest.json", managed_manifest)
+    provenance = {
+        "schema_version": 1,
+        "installation_source": "candidate_archive",
+        "plugin_id": "codestory",
+        "plugin_version": args.expected_version,
+        "plugin_source_commit": manifest["source"]["commit"],
+        "plugin_source_tree": manifest["source"]["tree"],
+        "plugin_package_sha256": directory_contract_sha256(plugin_output),
+        "candidate_archive_sha256": sha256(archive),
+        "candidate_asset_target": manifest["asset_target"],
+        "producer": producer,
+    }
+    write_json(provenance_output, provenance)
+    return {
+        "plugin_root": str(plugin_output),
+        "plugin_data": str(data_output),
+        "provenance": str(provenance_output),
+        "source": manifest["source"],
+        "archive_sha256": sha256(archive),
+        "asset_target": manifest["asset_target"],
+    }
 
 
 def installed_plugin_provenance(
@@ -2721,16 +3405,53 @@ def installed_plugin_provenance(
         raise ProofFailure(f"installed plugin provenance is not valid JSON: {exc}") from exc
     require(isinstance(provenance, dict), "installed plugin provenance must be an object")
     require(provenance.get("schema_version") == 1, "installed plugin provenance schema is unsupported")
-    require(
-        provenance.get("marketplace_repository") == "TheGreenCedar/AgentPluginMarketplace",
-        "installed plugin provenance names the wrong marketplace",
-    )
+    installation_source = args.installed_plugin_source
+    if installation_source == "candidate":
+        require_exact_keys(
+            provenance,
+            {
+                "schema_version",
+                "installation_source",
+                "plugin_id",
+                "plugin_version",
+                "plugin_source_commit",
+                "plugin_source_tree",
+                "plugin_package_sha256",
+                "candidate_archive_sha256",
+                "candidate_asset_target",
+                "producer",
+            },
+            "candidate installed plugin provenance",
+        )
+        require(
+            provenance["installation_source"] == "candidate_archive"
+            and provenance["candidate_archive_sha256"] == sha256(args.archive)
+            and provenance["candidate_asset_target"] == manifest["asset_target"]
+            and provenance["plugin_source_tree"] == manifest["source"]["tree"]
+            and provenance["producer"]
+            == {
+                "repository": args.candidate_producer_repository,
+                "workflow_path": args.candidate_producer_workflow_path,
+                "run_id": args.candidate_producer_run_id,
+                "run_attempt": args.candidate_producer_run_attempt,
+                "artifact_name": args.candidate_artifact_name,
+            },
+            "candidate installed plugin provenance does not match the exact archive and source tree",
+        )
+    else:
+        require(
+            installation_source == "marketplace"
+            and provenance.get("marketplace_repository")
+            == "TheGreenCedar/AgentPluginMarketplace",
+            "installed plugin provenance names the wrong marketplace",
+        )
     marketplace_commit = provenance.get("marketplace_commit")
-    require(
-        isinstance(marketplace_commit, str)
-        and re.fullmatch(r"[0-9a-f]{40}", marketplace_commit) is not None,
-        "installed plugin provenance has an invalid marketplace commit",
-    )
+    if installation_source == "marketplace":
+        require(
+            isinstance(marketplace_commit, str)
+            and re.fullmatch(r"[0-9a-f]{40}", marketplace_commit) is not None,
+            "installed plugin provenance has an invalid marketplace commit",
+        )
     require(provenance.get("plugin_id") == "codestory", "installed plugin provenance names the wrong plugin")
     require(
         provenance.get("plugin_version") == manifest["release_version"],
@@ -2745,15 +3466,37 @@ def installed_plugin_provenance(
         provenance.get("plugin_package_sha256") == package_sha256,
         "installed plugin package bytes do not match their provenance",
     )
-    return {
+    retained = {
         "schema_version": 1,
-        "marketplace_repository": provenance["marketplace_repository"],
-        "marketplace_commit": marketplace_commit,
+        "installation_source": (
+            "candidate_archive"
+            if installation_source == "candidate"
+            else "marketplace"
+        ),
         "plugin_id": "codestory",
         "plugin_version": provenance["plugin_version"],
         "plugin_source_commit": provenance["plugin_source_commit"],
         "plugin_package_sha256": package_sha256,
     }
+    if installation_source == "candidate":
+        retained.update(
+            {
+                "plugin_source_tree": provenance["plugin_source_tree"],
+                "candidate_archive_sha256": provenance[
+                    "candidate_archive_sha256"
+                ],
+                "candidate_asset_target": provenance["candidate_asset_target"],
+                "producer": provenance["producer"],
+            }
+        )
+    else:
+        retained.update(
+            {
+                "marketplace_repository": provenance["marketplace_repository"],
+                "marketplace_commit": marketplace_commit,
+            }
+        )
+    return retained
 
 
 def verify_managed_runtime_status(
@@ -2875,7 +3618,7 @@ def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[
 
 
 def qualification_environment(root: Path, env: dict[str, str]) -> tuple[dict[str, str], dict]:
-    proof_root = root / "qualification"
+    proof_root = (root / "qualification").resolve()
     proof_root.mkdir(parents=True, exist_ok=True)
     proof_root.chmod(0o700)
     nonce = secrets.token_hex(32)
@@ -2950,6 +3693,25 @@ def prove_runtime(
     qualified_env.pop("CODESTORY_CLI", None)
     if args.proof_tier == "installed_runtime":
         qualified_env["CODESTORY_PLUGIN_DATA"] = str(args.installed_plugin_data.resolve())
+        if args.installed_plugin_source == "candidate":
+            candidate_archive_sha256 = sha256(args.archive)
+            qualified_env[
+                "CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256"
+            ] = candidate_archive_sha256
+            write_private_json(
+                Path(qualified_env["CODESTORY_EMBED_QUALIFICATION_DIR"])
+                / "candidate-managed-install.json",
+                {
+                    "schema_version": 1,
+                    "purpose": "codestory-candidate-managed-install",
+                    "archive_sha256": candidate_archive_sha256,
+                    "qualification_nonce_sha256": hashlib.sha256(
+                        qualified_env[
+                            "CODESTORY_EMBED_QUALIFICATION_NONCE"
+                        ].encode("ascii")
+                    ).hexdigest(),
+                },
+            )
     else:
         qualified_env["CODESTORY_CLI"] = str(cli)
     command = [node, str(launcher)]
@@ -3035,6 +3797,20 @@ def prove_runtime(
                 == managed_runtime,
                 "independent installed plugin hosts reported different managed runtime provenance",
             )
+            if args.installed_plugin_source == "candidate":
+                require(
+                    managed_runtime["build_source"] == "candidate_archive"
+                    and managed_runtime["repo_ref"]
+                    == manifest["source"]["commit"],
+                    "candidate installed proof did not launch the staged candidate archive",
+                )
+            else:
+                require(
+                    managed_runtime["build_source"] == "github_release"
+                    and managed_runtime["repo_ref"]
+                    == f"v{manifest['release_version']}",
+                    "marketplace installed proof did not launch the published release archive",
+                )
             managed_binary_path = Path(
                 require_nonempty_string(
                     status_a["plugin_runtime"].get("managed_binary_path"),
@@ -3970,6 +4746,7 @@ def verify_retrieval_quality_raw_evidence(
     path: Path,
     *,
     source: dict,
+    holdout_task_root: Path = HOLDOUT_TASK_ROOT,
 ) -> dict:
     payload, artifact_sha256 = load_external_raw_evidence(
         path, "publishable packet quality raw evidence"
@@ -3997,13 +4774,22 @@ def verify_retrieval_quality_raw_evidence(
         == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
         "publishable packet evaluation contract is unsupported",
     )
+    holdout_tasks, holdout_manifest_set_sha256 = load_holdout_task_contracts(
+        holdout_task_root
+    )
+    evidence_identity = release_evidence.get("evidence_identity")
+    require(
+        isinstance(evidence_identity, dict)
+        and evidence_identity.get("corpus_id") == RELEASE_QUALITY_CORPUS_ID,
+        "publishable packet evidence is not bound to the release holdout corpus",
+    )
     repeats = require_positive_int(
         release_evidence.get("repeats"),
         "publishable packet repeat count",
     )
     require(
-        repeats >= MIN_RETRIEVAL_QUALITY_REPEATS,
-        f"publishable packet evidence requires at least {MIN_RETRIEVAL_QUALITY_REPEATS} repeats",
+        repeats == MIN_RETRIEVAL_QUALITY_REPEATS,
+        f"publishable packet evidence requires exactly {MIN_RETRIEVAL_QUALITY_REPEATS} repeats",
     )
     require(
         release_evidence.get("publishable") is True,
@@ -4024,27 +4810,23 @@ def verify_retrieval_quality_raw_evidence(
     )
     modes = payload.get("modes")
     require(
-        isinstance(modes, list) and modes,
-        "packet quality artifact omitted runtime modes",
+        isinstance(modes, list) and modes == list(RELEASE_QUALITY_MODES),
+        "packet quality artifact must contain only the release cold-cli mode",
     )
-    mode_contracts = {
-        "cold-cli": "cold_cli_packet",
-        "warm-stdio": "warm_stdio_packet",
+    expected_modes = set(RELEASE_QUALITY_MODES.values())
+    expected_cells = {
+        (repo, task_id, mode, repeat)
+        for repo, task_id in holdout_tasks
+        for mode in expected_modes
+        for repeat in range(1, MIN_RETRIEVAL_QUALITY_REPEATS + 1)
     }
-    expected_modes = set()
-    for index, mode in enumerate(modes):
-        require(
-            mode in mode_contracts,
-            f"packet quality mode {index} is unsupported",
-        )
-        expected_modes.add(mode_contracts[mode])
 
     rows = release_evidence.get("rows")
     require(
         isinstance(rows, list) and rows,
         "packet quality artifact has no quality rows",
     )
-    repeat_coverage: dict[tuple[str, str, str], set[int]] = {}
+    observed_cells: set[tuple[str, str, str, int]] = set()
     passing_rows = 0
     for index, row in enumerate(rows):
         require(isinstance(row, dict), f"packet quality row {index} is malformed")
@@ -4168,23 +4950,50 @@ def verify_retrieval_quality_raw_evidence(
             mode in expected_modes,
             f"packet quality row {index} mode is not declared at top level",
         )
-        key = (repo, task_id, mode)
-        covered = repeat_coverage.setdefault(key, set())
+        task_contract = holdout_tasks.get((repo, task_id))
         require(
-            repeat not in covered,
+            task_contract is not None,
+            f"packet quality row {index} is not one of the checked-in holdout tasks",
+        )
+        snapshot = row.get("task_manifest_snapshot")
+        require(
+            isinstance(snapshot, dict),
+            f"packet quality row {index} omitted its task manifest snapshot",
+        )
+        snapshot_without_path = {
+            key: value for key, value in snapshot.items() if key != "manifest_path"
+        }
+        require(
+            snapshot_without_path == task_contract["snapshot"],
+            f"packet quality row {index} task snapshot differs from the checked-in manifest",
+        )
+        manifest_path = snapshot.get("manifest_path")
+        require(
+            isinstance(manifest_path, str)
+            and Path(manifest_path).name == task_contract["path"].name,
+            f"packet quality row {index} names a different task manifest",
+        )
+        expected_repo = task_contract["repo"]
+        require(
+            configured.get("url") == expected_repo["url"]
+            and configured.get("ref") == expected_repo["ref"]
+            and configured.get("languages") == expected_repo.get("languages", [])
+            and manifest_repo.get("url") == expected_repo["url"]
+            and manifest_repo.get("ref") == expected_repo["ref"]
+            and manifest_repo.get("workspace_root") == expected_repo.get("workspace_root"),
+            f"packet quality row {index} repository identity differs from its checked-in task",
+        )
+        cell = (repo, task_id, mode, repeat)
+        require(
+            cell not in observed_cells,
             f"packet quality rows duplicate repeat {repeat} for {repo}/{task_id}/{mode}",
         )
-        covered.add(repeat)
+        observed_cells.add(cell)
         passing_rows += 1
 
-    expected_repeats = set(range(1, repeats + 1))
     require(
-        all(covered == expected_repeats for covered in repeat_coverage.values()),
-        "packet quality rows do not exactly cover every declared repeat",
-    )
-    require(
-        {key[2] for key in repeat_coverage} == expected_modes,
-        "packet quality row modes do not match top-level modes",
+        observed_cells == expected_cells,
+        "packet quality rows do not exactly cover the checked-in repo/task/mode/repeat matrix",
     )
     pass_rate = passing_rows / len(rows)
     return {
@@ -4195,11 +5004,452 @@ def verify_retrieval_quality_raw_evidence(
         "evaluation_contract": RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
         "source_commit": source["commit"],
         "source_tree": source["tree"],
+        "corpus_id": RELEASE_QUALITY_CORPUS_ID,
+        "holdout_manifest_set_sha256": holdout_manifest_set_sha256,
         "repeats": repeats,
         "row_count": len(rows),
         "passing_row_count": passing_rows,
         "publishable_packet_pass_rate": pass_rate,
     }
+
+
+def derive_scenario_assertions(
+    scenario_id: str,
+    *,
+    observations_by_kind: dict[str, list[dict]],
+    process_observations: list[dict],
+    invocations: list[dict],
+    control_actions: list[str],
+    same_account: dict,
+    materialization: dict,
+) -> dict[str, bool]:
+    def transition(kind: str, expected_keys: set[str] | None = None) -> dict:
+        matches = observations_by_kind.get(kind, [])
+        require(
+            len(matches) == 1,
+            f"qualification scenario {scenario_id} omitted or duplicated transition {kind}",
+        )
+        values = matches[0]["values"]
+        require(isinstance(values, dict), f"qualification transition {kind} values are malformed")
+        if expected_keys is not None:
+            require_exact_keys(values, expected_keys, f"qualification transition {kind} values")
+        return values
+
+    def scheduler(kind: str) -> dict:
+        values = transition(
+            kind,
+            {
+                "query_capacity",
+                "query_depth",
+                "bulk_capacity",
+                "bulk_depth",
+                "active_request_count",
+                "active_request_class",
+            },
+        )
+        for field in (
+            "query_capacity",
+            "query_depth",
+            "bulk_capacity",
+            "bulk_depth",
+            "active_request_count",
+        ):
+            require_nonnegative_int(values[field], f"qualification transition {kind}.{field}")
+        require(
+            values["active_request_class"] in {None, "query", "bulk"},
+            f"qualification transition {kind} has an invalid active request class",
+        )
+        return values
+
+    snapshots = [
+        observation["snapshot"]
+        for observation in process_observations
+        if observation.get("snapshot") is not None
+    ]
+    snapshot_instances = {
+        snapshot["process"]["server_instance_id"] for snapshot in snapshots
+    }
+    snapshot_authorities = {
+        (
+            snapshot["authority"]["lifetime_authority_id"],
+            snapshot["authority"]["listener_id"],
+        )
+        for snapshot in snapshots
+    }
+    snapshot_engines = {
+        (
+            snapshot["engine"]["engine_owner_id"],
+            snapshot["engine"]["native_worker_id"],
+            snapshot["engine"]["load_generation"],
+            snapshot["engine"]["model_load_count"],
+        )
+        for snapshot in snapshots
+        if snapshot.get("engine") is not None
+    }
+
+    assertions: dict[str, bool]
+    if scenario_id == "client_death":
+        active = scheduler("dead_client_work_observed")
+        continued = transition("other_client_continued", {"project_identity_sha256"})
+        terminated = transition("client_terminated", {"termination"})
+        reclaimed = scheduler("dead_client_work_reclaimed")
+        post = transition("post_reclaim_other_client_query", {"server_instance_id"})
+        assertions = {
+            "dead_client_queue_and_leases_reclaimed": (
+                active["query_depth"] > 0
+                and active["bulk_depth"] > 0
+                and active["active_request_count"] > 0
+                and reclaimed["query_depth"] == 0
+                and reclaimed["bulk_depth"] == 0
+                and reclaimed["active_request_count"] == 0
+                and terminated["termination"] == "terminated"
+            ),
+            "other_client_continues": (
+                HEX_SHA256.fullmatch(str(continued["project_identity_sha256"])) is not None
+                and post["server_instance_id"] in snapshot_instances
+            ),
+            "no_server_replacement": len(snapshot_instances) == 1,
+        }
+    elif scenario_id == "cold_race":
+        independent = transition(
+            "two_independent_processes",
+            {
+                "first_pid",
+                "second_pid",
+                "first_project_identity_sha256",
+                "second_project_identity_sha256",
+                "first_transport_peer_verified",
+                "second_transport_peer_verified",
+            },
+        )
+        converged = transition(
+            "single_server_convergence",
+            {"server_instance_id", "lifetime_authority_id"},
+        )
+        hosts = same_account.get("plugin_hosts") if isinstance(same_account, dict) else None
+        assertions = {
+            "two_independent_plugin_hosts": (
+                require_positive_int(independent["first_pid"], "cold race first pid")
+                != require_positive_int(independent["second_pid"], "cold race second pid")
+                and independent["first_transport_peer_verified"] is True
+                and independent["second_transport_peer_verified"] is True
+            ),
+            "same_os_account": (
+                same_account.get("relation") == "same_os_account"
+                and isinstance(hosts, list)
+                and len(hosts) == 2
+            ),
+            "different_repositories": (
+                independent["first_project_identity_sha256"]
+                != independent["second_project_identity_sha256"]
+                and all(
+                    HEX_SHA256.fullmatch(str(independent[field])) is not None
+                    for field in (
+                        "first_project_identity_sha256",
+                        "second_project_identity_sha256",
+                    )
+                )
+            ),
+            "one_lifetime_authority": (
+                len(snapshot_authorities) == 1
+                and converged["lifetime_authority_id"]
+                == next(iter(snapshot_authorities))[0]
+            ),
+            "one_listener": len({identity[1] for identity in snapshot_authorities}) == 1,
+            "one_server": (
+                len(snapshot_instances) == 1
+                and converged["server_instance_id"] == next(iter(snapshot_instances))
+            ),
+            "one_engine_owner": len({identity[0] for identity in snapshot_engines}) == 1,
+            "one_native_worker": len({identity[1] for identity in snapshot_engines}) == 1,
+            "one_load_generation": len({identity[2] for identity in snapshot_engines}) == 1,
+            "one_model_load": (
+                len(snapshot_engines) == 1 and next(iter(snapshot_engines))[3] == 1
+            ),
+        }
+    elif scenario_id == "frozen_owner":
+        bounded = transition(
+            "bounded_owner_unresponsive",
+            {"started_ns", "finished_ns", "error_code"},
+        )
+        stable = transition(
+            "owner_identity_stable",
+            {"server_instance_id", "lifetime_authority_id"},
+        )
+        started = require_nonnegative_int(bounded["started_ns"], "frozen owner started_ns")
+        finished = require_nonnegative_int(bounded["finished_ns"], "frozen owner finished_ns")
+        stable_identity = (
+            len(snapshot_instances) == 1
+            and stable["server_instance_id"] == next(iter(snapshot_instances))
+            and len(snapshot_authorities) == 1
+            and stable["lifetime_authority_id"] == next(iter(snapshot_authorities))[0]
+        )
+        assertions = {
+            "owner_unresponsive_is_bounded": (
+                finished >= started
+                and bounded["error_code"] == "embedding_server_owner_unresponsive"
+            ),
+            "authority_retained": stable_identity,
+            "no_unlink": "crash_server" not in control_actions,
+            "no_pid_kill": "crash_server" not in control_actions,
+            "no_takeover": stable_identity,
+            "no_second_engine": len(snapshot_engines) == 1,
+        }
+    elif scenario_id == "incompatible_owner":
+        active = transition(
+            "active_owner_rejected",
+            {"compatibility_evidence", "error_code"},
+        )
+        idle = transition(
+            "idle_owner_draining",
+            {"compatibility_evidence", "error_code"},
+        )
+        replacement = transition(
+            "compatible_replacement",
+            {"old_server_instance_id", "new_server_instance_id"},
+        )
+        replaced = (
+            replacement["old_server_instance_id"] != replacement["new_server_instance_id"]
+            and {
+                replacement["old_server_instance_id"],
+                replacement["new_server_instance_id"],
+            }
+            <= snapshot_instances
+        )
+        assertions = {
+            "idle_owner_drains": (
+                idle["compatibility_evidence"] == "injected_contract_mismatch"
+                and idle["error_code"] == "embedding_server_draining"
+                and replaced
+            ),
+            "active_owner_returns_typed_retry": (
+                active["compatibility_evidence"] == "injected_contract_mismatch"
+                and active["error_code"] == "embedding_server_incompatible_active_owner"
+            ),
+            "one_authority": len(snapshot_authorities) <= 2 and replaced,
+            "one_engine_maximum": len(snapshot_instances) == 2 and replaced,
+        }
+    elif scenario_id == "mixed_queue":
+        saturated = scheduler("queues_saturated")
+        selected = scheduler("query_selected_before_bulk_backlog")
+        capacity = transition("typed_capacity_retry_observed", {"query_65th", "bulk_65th"})
+        class_orders = transition(
+            "per_class_fifo_observed",
+            {
+                "query_submitted_request_ids",
+                "query_completed_request_ids",
+                "bulk_submitted_request_ids",
+                "bulk_completed_request_ids",
+            },
+        )
+        project_orders = transition(
+            "global_fifo_across_projects",
+            {
+                "query_submitted_project_identities",
+                "query_completed_project_identities",
+                "bulk_submitted_project_identities",
+                "bulk_completed_project_identities",
+            },
+        )
+        preference = transition(
+            "query_preference_observed",
+            {
+                "first_query_request_id",
+                "first_query_completed_ns",
+                "first_bulk_request_id",
+                "first_bulk_completed_ns",
+            },
+        )
+        resumed = transition(
+            "bulk_resumed",
+            {
+                "last_query_request_id",
+                "last_query_completed_ns",
+                "last_bulk_request_id",
+                "last_bulk_completed_ns",
+            },
+        )
+        typed_capacity = True
+        for queue_class in ("query", "bulk"):
+            record = capacity[f"{queue_class}_65th"]
+            pressure = record.get("error", {}).get("capacity") if isinstance(record, dict) else None
+            typed_capacity = typed_capacity and (
+                isinstance(pressure, dict)
+                and pressure.get("queue_class") == queue_class
+                and pressure.get("capacity") == 64
+                and pressure.get("depth") == 64
+                and bool(pressure.get("retry_condition"))
+            )
+        fifo = all(
+            class_orders[f"{queue_class}_submitted_request_ids"]
+            == class_orders[f"{queue_class}_completed_request_ids"]
+            and isinstance(class_orders[f"{queue_class}_submitted_request_ids"], list)
+            and bool(class_orders[f"{queue_class}_submitted_request_ids"])
+            for queue_class in ("query", "bulk")
+        )
+        global_fifo = all(
+            project_orders[f"{queue_class}_submitted_project_identities"]
+            == project_orders[f"{queue_class}_completed_project_identities"]
+            and len(set(project_orders[f"{queue_class}_submitted_project_identities"])) == 2
+            for queue_class in ("query", "bulk")
+        )
+        assertions = {
+            "query_and_bulk_capacities_are_64": (
+                saturated["query_capacity"] == saturated["query_depth"] == 64
+                and saturated["bulk_capacity"] == saturated["bulk_depth"] == 64
+            ),
+            "fifo_within_each_class": fifo,
+            "query_preferred_between_bulk_batches": (
+                selected["active_request_class"] == "query"
+                and selected["bulk_depth"] > 0
+                and preference["first_query_completed_ns"]
+                < preference["first_bulk_completed_ns"]
+            ),
+            "bulk_resumes_when_query_queue_permits": (
+                resumed["last_bulk_completed_ns"] > resumed["last_query_completed_ns"]
+            ),
+            "no_project_or_scope_round_robin": global_fifo,
+            "typed_retry_names_useful_condition": typed_capacity,
+            "no_project_or_request_text_leakage": all(
+                all(
+                    HEX_SHA256.fullmatch(str(value)) is not None
+                    for value in values
+                )
+                for key, values in project_orders.items()
+                if key.endswith("_project_identities")
+            ),
+        }
+    elif scenario_id == "server_crash":
+        active = scheduler("inflight_request_observed")
+        replacement = transition(
+            "server_replaced",
+            {"old_server_instance_id", "new_server_instance_id"},
+        )
+        replay = transition(
+            "query_replayed",
+            {
+                "submitted_operation_count",
+                "completed_operation_count",
+                "observed_server_instance_ids",
+            },
+        )
+        observed_ids = replay["observed_server_instance_ids"]
+        assertions = {
+            "one_replacement_server": (
+                active["active_request_class"] == "query"
+                and replacement["old_server_instance_id"]
+                != replacement["new_server_instance_id"]
+                and observed_ids
+                == [
+                    replacement["old_server_instance_id"],
+                    replacement["new_server_instance_id"],
+                ]
+            ),
+            "pure_embedding_rpc_replayed_at_most_once": (
+                replay["submitted_operation_count"]
+                == replay["completed_operation_count"]
+                == 1
+            ),
+        }
+    elif scenario_id == "true_idle_respawn":
+        active = scheduler("anti_idle_work_observed")
+        preserved = transition(
+            "owner_preserved_across_idle_boundary",
+            {
+                "held_started_ns",
+                "held_observed_ns",
+                "contract_idle_timeout_ms",
+                "server_instance_id",
+            },
+        )
+        reclaimed = scheduler("anti_idle_work_reclaimed")
+        waited = transition(
+            "true_idle_wait",
+            {"started_ns", "finished_ns", "contract_idle_timeout_ms"},
+        )
+        absent = transition("owner_absent_after_true_idle", {"old_server_instance_id"})
+        respawned = transition("server_respawned", {"new_server_instance_id"})
+        timeout_ms = require_positive_int(
+            waited["contract_idle_timeout_ms"],
+            "true idle contract timeout",
+        )
+        absent_observed = any(
+            observation.get("phase") == "true_idle_after_wait"
+            and observation.get("snapshot") is None
+            for observation in process_observations
+        )
+        assertions = {
+            "queued_active_and_leased_work_prevent_exit": (
+                active["query_depth"] > 0
+                and active["bulk_depth"] > 0
+                and active["active_request_count"] > 0
+                and preserved["server_instance_id"] == absent["old_server_instance_id"]
+                and preserved["held_observed_ns"] - preserved["held_started_ns"]
+                >= preserved["contract_idle_timeout_ms"] * 1_000_000
+            ),
+            "idle_connections_and_diagnostics_do_not_extend_idle": absent_observed,
+            "exit_after_60000_awake_ms": (
+                timeout_ms == 60_000
+                and waited["finished_ns"] - waited["started_ns"]
+                >= timeout_ms * 1_000_000
+                and reclaimed["query_depth"] == 0
+                and reclaimed["bulk_depth"] == 0
+                and reclaimed["active_request_count"] == 0
+                and absent_observed
+            ),
+            "next_product_operation_respawns_without_consent": (
+                absent["old_server_instance_id"] != respawned["new_server_instance_id"]
+                and any(invocation.get("operation") == "query" for invocation in invocations)
+            ),
+            "verified_materialization_reused": (
+                isinstance(materialization, dict)
+                and materialization.get("reused_on_rejoin") is True
+            ),
+        }
+    else:
+        require(scenario_id == "worker_stall", f"unknown qualification scenario {scenario_id}")
+        active = scheduler("stalled_request_observed")
+        fail_stop = transition(
+            "watchdog_fail_stop_observed",
+            {"old_pid", "terminal_transport_error"},
+        )
+        replacement = transition(
+            "post_stall_replacement",
+            {"new_server_instance_id"},
+        )
+        old_pid = require_positive_int(fail_stop["old_pid"], "worker stall old pid")
+        replacement_observed = (
+            replacement["new_server_instance_id"] in snapshot_instances
+            and all(snapshot["process"]["pid"] != old_pid for snapshot in snapshots[-1:])
+        )
+        assertions = {
+            "independent_watchdog_fail_stops_server": (
+                active["active_request_class"] == "bulk"
+                and bool(fail_stop["terminal_transport_error"])
+                and replacement_observed
+            ),
+            "unrelated_process_survives": (
+                replacement_observed
+                and any(
+                    invocation.get("operation") == "query"
+                    and invocation.get("termination") == "exited"
+                    for invocation in invocations
+                )
+            ),
+            "pure_embedding_rpc_replayed_at_most_once": (
+                sum(
+                    invocation.get("operation") == "stall_protocol_bulk"
+                    for invocation in invocations
+                )
+                == 1
+            ),
+        }
+    failed = sorted(name for name, value in assertions.items() if value is not True)
+    require(
+        not failed,
+        f"qualification scenario {scenario_id} raw evidence failed assertions: {', '.join(failed)}",
+    )
+    return assertions
 
 
 def qualification_artifact(
@@ -4208,6 +5458,9 @@ def qualification_artifact(
     *,
     scenario_id: str,
     contracts: dict,
+    package: dict,
+    same_account: dict,
+    materialization: dict,
     nonce_sha256: str,
     forbidden_values: list[str],
 ) -> tuple[dict, dict]:
@@ -4421,6 +5674,17 @@ def qualification_artifact(
             and isinstance(scheduler, dict),
             f"{field} omitted server identity",
         )
+        require_exact_keys(
+            process,
+            {
+                "server_instance_id",
+                "pid",
+                "process_start_id",
+                "executable_sha256",
+                "executable_version",
+            },
+            f"{field}.process",
+        )
         for identity_field in (
             "endpoint_namespace_id",
             "lifetime_authority_id",
@@ -4433,6 +5697,11 @@ def qualification_artifact(
         )
         require_positive_int(process.get("pid"), f"{field}.process.pid")
         require_nonempty_string(process.get("process_start_id"), f"{field}.process.process_start_id")
+        require(
+            process.get("executable_sha256") == package["executable_sha256"]
+            and process.get("executable_version") == package["release_version"],
+            f"{field}.process does not match the exact packaged executable",
+        )
         require(
             scheduler.get("query_capacity") == 64 and scheduler.get("bulk_capacity") == 64,
             f"{field} queue capacities differ from the bound contract",
@@ -4602,12 +5871,20 @@ def qualification_artifact(
             observation["server_instance_id"] == snapshot["process"]["server_instance_id"]
             and observation["pid"] == snapshot["process"]["pid"]
             and observation["process_start_id"] == snapshot["process"]["process_start_id"]
+            and observation["executable_sha256"] == snapshot["process"]["executable_sha256"]
+            and observation["executable_version"] == snapshot["process"]["executable_version"]
             and observation["endpoint_namespace_id"]
             == snapshot["authority"]["endpoint_namespace_id"]
             and observation["lifetime_authority_id"]
             == snapshot["authority"]["lifetime_authority_id"]
             and observation["listener_id"] == snapshot["authority"]["listener_id"],
             f"qualification artifact {name} process observation {index} identity disagrees with its snapshot",
+        )
+        engine = snapshot.get("engine")
+        require(
+            observation["load_generation"]
+            == (engine.get("load_generation") if isinstance(engine, dict) else None),
+            f"qualification artifact {name} process observation {index} load generation disagrees with its snapshot",
         )
 
     observations = payload["observations"]
@@ -4780,9 +6057,18 @@ def qualification_artifact(
             summary[field] == expected,
             f"qualification scenario {scenario_id} summary {field} is stale",
         )
+    assertions = derive_scenario_assertions(
+        scenario_id,
+        observations_by_kind=observations_by_kind,
+        process_observations=process_observations,
+        invocations=invocations,
+        control_actions=control_actions,
+        same_account=same_account,
+        materialization=materialization,
+    )
     return (
         {"name": name, "sha256": hashlib.sha256(payload_bytes).hexdigest()},
-        payload,
+        assertions,
     )
 
 
@@ -4795,7 +6081,11 @@ def selected_qualification_matrix_cell(
     expected_policy: str,
     expected_backend: str,
 ) -> dict:
-    matrix = protocol["host_package_matrix"]
+    matrix = (
+        protocol["calibration_matrix"]
+        if proof_tier == "calibration"
+        else protocol["host_package_matrix"]
+    )
     require(cell_id in matrix, f"unknown qualification matrix cell {cell_id!r}")
     cell = matrix[cell_id]
     require(
@@ -4804,11 +6094,10 @@ def selected_qualification_matrix_cell(
         and normalized_backend(cell["backend"]) == normalized_backend(expected_backend),
         "qualification matrix cell does not match target, policy, or backend",
     )
-    if proof_tier != "calibration":
-        require(
-            cell["proof_tier"] == proof_tier,
-            "qualification matrix cell does not match the requested proof tier",
-        )
+    require(
+        cell["proof_tier"] == proof_tier,
+        "qualification matrix cell does not match the requested proof tier",
+    )
     return cell
 
 
@@ -5045,6 +6334,7 @@ def qualification_measurement_artifact(
         "values": values,
         "unplanned_suspend": False,
         "matrix_cell_id": matrix_cell_id,
+        "payload": payload,
     }
 
 
@@ -5195,12 +6485,33 @@ def qualification_measurement_sample_value(
         "busy_retry_usefulness",
         "true_idle_exit",
     }
+    successful_operation_metrics = {
+        "cold_first_vector",
+        "first_product_ready",
+        "warm_query_ipc",
+        "warm_bulk_ipc",
+        "bulk_documents_per_second",
+        "bulk_tokens_per_second",
+    }
     if metric in duration_metrics:
         require_exact_keys(
             operands,
-            set(),
+            (
+                {"successful_operation_duration_ns"}
+                if metric in successful_operation_metrics
+                else set()
+            ),
             f"qualification measurement {metric} operands",
         )
+        if metric in successful_operation_metrics:
+            operation_duration_ns = require_nonnegative_int(
+                operands["successful_operation_duration_ns"],
+                f"qualification measurement {metric} successful operation duration",
+            )
+            require(
+                operation_duration_ns == awake_delta_ns,
+                f"qualification measurement {metric} successful operation duration differs from its awake interval",
+            )
         return awake_delta_ns / 1_000_000
     if metric in {"bulk_documents_per_second", "bulk_tokens_per_second"}:
         operand = (
@@ -5210,7 +6521,7 @@ def qualification_measurement_sample_value(
         )
         require_exact_keys(
             operands,
-            {operand},
+            {operand, "successful_operation_duration_ns"},
             f"qualification measurement {metric} operands",
         )
         completed = require_positive_int(
@@ -5220,6 +6531,14 @@ def qualification_measurement_sample_value(
         require(
             awake_delta_ns > 0,
             f"qualification measurement {metric} window is empty",
+        )
+        require(
+            require_nonnegative_int(
+                operands["successful_operation_duration_ns"],
+                f"qualification measurement {metric} successful operation duration",
+            )
+            == awake_delta_ns,
+            f"qualification measurement {metric} successful operation duration differs from its awake interval",
         )
         return completed * 1_000_000_000 / awake_delta_ns
     if metric == "total_codestory_process_memory":
@@ -5292,6 +6611,21 @@ def qualification_measurement_sample_value(
             "qualification memory evidence changed the five-process set",
         )
         return total
+    if metric == "retrieval_quality":
+        require_exact_keys(
+            operands,
+            {"publishable_packet_pass", "raw_artifact_sha256"},
+            "qualification retrieval quality operands",
+        )
+        require_sha256(
+            operands["raw_artifact_sha256"],
+            "qualification retrieval quality raw artifact sha256",
+        )
+        require(
+            operands["publishable_packet_pass"] is True,
+            "qualification retrieval quality sample did not pass",
+        )
+        return 1
     require(
         metric == "backend_observed_accelerator_residency",
         f"qualification measurement verifier omitted metric {metric}",
@@ -5349,6 +6683,810 @@ def qualification_measurement_sample_value(
         "qualification accelerator-residency operands contradict the selected policy",
     )
     return 1
+
+
+def verify_calibration_source_lineage(
+    calibration_source: dict,
+    frozen_source: dict,
+    repository_root: Path,
+) -> dict:
+    require(
+        frozen_source.get("tracked_dirty") is False,
+        "frozen package source tree was dirty",
+    )
+    for label, source in (
+        ("calibration", calibration_source),
+        ("frozen package", frozen_source),
+    ):
+        require(
+            isinstance(source.get("commit"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", source["commit"]) is not None
+            and isinstance(source.get("tree"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", source["tree"]) is not None,
+            f"{label} source identity is not an exact Git commit and tree",
+        )
+    require(
+        calibration_source["commit"] != frozen_source["commit"],
+        "frozen package did not add the required constant-set freeze commit",
+    )
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=repository_root,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        require(
+            completed.returncode == 0,
+            "calibration source-lineage probe failed: "
+            + require_nonempty_string(
+                completed.stderr.strip() or completed.stdout.strip(),
+                "Git lineage failure",
+            ),
+        )
+        return completed.stdout.strip()
+
+    require(
+        git("rev-parse", "HEAD") == frozen_source["commit"]
+        and git("rev-parse", "HEAD^{tree}") == frozen_source["tree"],
+        "verification checkout does not match the frozen package source",
+    )
+    require(
+        git("rev-parse", f"{calibration_source['commit']}^{{tree}}")
+        == calibration_source["tree"],
+        "calibration commit does not resolve to the recorded calibration tree",
+    )
+    completed = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            calibration_source["commit"],
+            frozen_source["commit"],
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        timeout=30,
+    )
+    require(
+        completed.returncode == 0,
+        "calibration source is not an ancestor of the frozen package source",
+    )
+    changed_paths = [
+        path
+        for path in git(
+            "diff",
+            "--name-only",
+            calibration_source["commit"],
+            frozen_source["commit"],
+        ).splitlines()
+        if path
+    ]
+    require(
+        changed_paths
+        == ["docs/testing/per-user-embedding-server-constant-set.json"],
+        "post-calibration source drift exceeded the one allowed constant-set freeze file",
+    )
+    return {
+        "selection_commit": calibration_source["commit"],
+        "frozen_commit": frozen_source["commit"],
+        "allowed_changed_paths": changed_paths,
+    }
+
+
+def verify_calibration_bundle(
+    path: Path,
+    measurement_contract: dict,
+    *,
+    compare_frozen_constant_set: bool = True,
+    frozen_source: dict | None = None,
+    repository_root: Path | None = None,
+    enforce_source_lineage: bool = False,
+    expected_producer_run_id: str | None = None,
+    expected_producer_artifact: str | None = None,
+) -> dict:
+    require(path.is_file() and not path.is_symlink(), f"calibration bundle is missing or unsafe: {path}")
+    try:
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"calibration bundle is not valid JSON: {exc}") from exc
+    require(isinstance(bundle, dict), "calibration bundle must be an object")
+    require_exact_keys(
+        bundle,
+        {
+            "schema_version",
+            "selection_protocol",
+            "source",
+            "producer",
+            "contracts",
+            "runs",
+            "freeze_digest",
+        },
+        "calibration bundle",
+    )
+    require(bundle["schema_version"] == 1, "calibration bundle schema is unsupported")
+    constant_set = measurement_contract["constant_set"]
+    protocol = measurement_contract["measurement_protocol"]
+    require(
+        bundle["selection_protocol"] == constant_set["selection_protocol"],
+        "calibration bundle used a different selection protocol",
+    )
+    source = bundle["source"]
+    require(isinstance(source, dict), "calibration bundle source identity is malformed")
+    require_exact_keys(source, {"commit", "tree", "tracked_dirty"}, "calibration bundle source")
+    for field in ("commit", "tree"):
+        require(
+            isinstance(source[field], str)
+            and re.fullmatch(r"[0-9a-f]{40}", source[field]) is not None,
+            f"calibration bundle source.{field} is not an exact Git object id",
+        )
+    require(source["tracked_dirty"] is False, "calibration bundle source tree was dirty")
+    producer = bundle["producer"]
+    require(isinstance(producer, dict), "calibration bundle producer is malformed")
+    require_exact_keys(
+        producer,
+        {
+            "repository",
+            "workflow_path",
+            "run_id",
+            "run_attempt",
+            "artifact_name",
+            "source_head_sha",
+        },
+        "calibration bundle producer",
+    )
+    require(
+        producer["repository"] == "TheGreenCedar/CodeStory"
+        and producer["workflow_path"]
+        == ".github/workflows/packaged-platform-pr.yml"
+        and isinstance(producer["run_id"], str)
+        and re.fullmatch(r"[1-9][0-9]*", producer["run_id"]) is not None
+        and isinstance(producer["run_attempt"], str)
+        and re.fullmatch(r"[1-9][0-9]*", producer["run_attempt"]) is not None
+        and producer["artifact_name"]
+        == f"embedding-calibration-bundle-{source['commit']}"
+        and producer["source_head_sha"] == source["commit"],
+        "calibration bundle producer is not the trusted exact-head coordinator artifact",
+    )
+    if expected_producer_run_id is not None or expected_producer_artifact is not None:
+        require(
+            producer["run_id"] == expected_producer_run_id
+            and producer["artifact_name"] == expected_producer_artifact,
+            "calibration bundle producer differs from the authenticated download request",
+        )
+    contracts = bundle["contracts"]
+    expected_contracts = {
+        "protocol_sha256": measurement_contract["protocol_sha256"],
+        "measurement_protocol_sha256": measurement_contract[
+            "measurement_protocol_sha256"
+        ],
+        "input_constant_set_sha256": (
+            constant_set["freeze_record"]["input_constant_set_sha256"]
+            if constant_set.get("status") == "frozen"
+            and isinstance(constant_set.get("freeze_record"), dict)
+            else measurement_contract["constant_set_sha256"]
+        ),
+    }
+    require(
+        contracts == expected_contracts,
+        "calibration bundle contract hashes differ from the checked-in protocols",
+    )
+    runs = bundle["runs"]
+    matrix = protocol["calibration_matrix"]
+    expected_run_cells = {
+        (matrix_cell_id, run_index)
+        for matrix_cell_id in matrix
+        for run_index in range(1, 4)
+    }
+    require(
+        isinstance(runs, list) and len(runs) == len(expected_run_cells),
+        "calibration bundle must contain exactly three runs for every matrix cell",
+    )
+    observed_run_cells: set[tuple[str, int]] = set()
+    run_ids: set[str] = set()
+    artifact_digests: set[str] = set()
+    packages_by_cell: dict[str, dict] = {}
+    global_sample_ids: set[str] = set()
+    calibration_metrics = set(protocol["required_metrics"]) - {"retrieval_quality"}
+    run_metric_values: dict[str, list[float | int]] = {
+        metric: [] for metric in calibration_metrics
+    }
+    raw_duration_values_ms: dict[str, list[float]] = {
+        "existing_owner_connect_duration": [],
+        "spawn_convergence_duration": [],
+        "query_request_duration": [],
+        "bulk_request_duration": [],
+        "capacity_condition_duration": [],
+        "successful_operation_duration": [],
+    }
+    phase_boundaries = protocol["phase_boundaries"]
+    metric_contracts = protocol["metric_contracts"]
+    sampling = protocol["metric_sampling"]
+    suspend_contract = protocol["clock_policy"]["suspend_detection"]
+    maximum_suspend_ns = require_nonnegative_int(
+        suspend_contract["maximum_inclusive_minus_awake_ns"],
+        "calibration suspend-detection tolerance",
+    )
+    for run_position, run in enumerate(runs):
+        require(isinstance(run, dict), f"calibration run {run_position} is malformed")
+        require_exact_keys(
+            run,
+            {
+                "run_id_sha256",
+                "matrix_cell_id",
+                "run_index",
+                "host_fingerprint",
+                "clean",
+                "unplanned_suspend",
+                "source",
+                "contracts",
+                "package",
+                "raw_artifact",
+            },
+            f"calibration run {run_position}",
+        )
+        run_id = require_sha256(
+            run["run_id_sha256"],
+            f"calibration run {run_position}.run_id_sha256",
+        )
+        require(run_id not in run_ids, "calibration bundle duplicated an independent run id")
+        run_ids.add(run_id)
+        matrix_cell_id = require_nonempty_string(
+            run["matrix_cell_id"],
+            f"calibration run {run_position}.matrix_cell_id",
+        )
+        run_index = require_positive_int(
+            run["run_index"],
+            f"calibration run {run_position}.run_index",
+        )
+        run_cell = (matrix_cell_id, run_index)
+        require(
+            run_cell in expected_run_cells and run_cell not in observed_run_cells,
+            f"calibration run {run_position} duplicated or escaped the exact matrix",
+        )
+        observed_run_cells.add(run_cell)
+        host_fingerprint = require_sha256(
+            run["host_fingerprint"],
+            f"calibration run {run_position}.host_fingerprint",
+        )
+        require(
+            run["clean"] is True and run["unplanned_suspend"] is False,
+            f"calibration run {run_position} was not a clean awake run",
+        )
+        require(
+            run["source"] == source and run["contracts"] == contracts,
+            f"calibration run {run_position} changed source, tree, or protocol identity",
+        )
+        matrix_cell = matrix[matrix_cell_id]
+        package = run["package"]
+        require(isinstance(package, dict), f"calibration run {run_position} package is malformed")
+        require_exact_keys(
+            package,
+            {
+                "archive_sha256",
+                "executable_sha256",
+                "asset_target",
+                "release_version",
+                "model_sha256",
+                "policy",
+                "backend",
+            },
+            f"calibration run {run_position} package",
+        )
+        for field in ("archive_sha256", "executable_sha256", "model_sha256"):
+            require_sha256(package[field], f"calibration run {run_position} package.{field}")
+        require(
+            package["asset_target"] == matrix_cell["asset_target"]
+            and package["policy"] == matrix_cell["policy"]
+            and normalized_backend(package["backend"])
+            == normalized_backend(matrix_cell["backend"])
+            and isinstance(package["release_version"], str)
+            and bool(package["release_version"]),
+            f"calibration run {run_position} package does not match its matrix cell",
+        )
+        if matrix_cell_id in packages_by_cell:
+            require(
+                package == packages_by_cell[matrix_cell_id],
+                f"calibration matrix cell {matrix_cell_id} changed package between runs",
+            )
+        else:
+            packages_by_cell[matrix_cell_id] = package
+        raw_artifact = run["raw_artifact"]
+        require(isinstance(raw_artifact, dict), f"calibration run {run_position} raw artifact is malformed")
+        require_exact_keys(
+            raw_artifact,
+            {"name", "sha256", "payload"},
+            f"calibration run {run_position} raw artifact",
+        )
+        require(
+            raw_artifact["name"] == "measurements.raw.json",
+            f"calibration run {run_position} raw artifact has the wrong name",
+        )
+        artifact_digest = require_sha256(
+            raw_artifact["sha256"],
+            f"calibration run {run_position} raw artifact sha256",
+        )
+        require(
+            artifact_digest == canonical_sha256(raw_artifact["payload"]),
+            f"calibration run {run_position} raw artifact digest does not match its payload",
+        )
+        require(
+            artifact_digest not in artifact_digests,
+            "calibration bundle reused one raw artifact for multiple independent runs",
+        )
+        artifact_digests.add(artifact_digest)
+        raw = raw_artifact["payload"]
+        require(isinstance(raw, dict), f"calibration run {run_position} raw payload is malformed")
+        require_exact_keys(
+            raw,
+            {
+                "schema_version",
+                "run_id_sha256",
+                "matrix_cell_id",
+                "run_index",
+                "host_fingerprint",
+                "source",
+                "contracts",
+                "package",
+                "clean",
+                "unplanned_suspend",
+                "metrics",
+            },
+            f"calibration run {run_position} raw payload",
+        )
+        require(
+            raw["schema_version"] == 1
+            and raw["run_id_sha256"] == run_id
+            and raw["matrix_cell_id"] == matrix_cell_id
+            and raw["run_index"] == run_index
+            and raw["host_fingerprint"] == host_fingerprint
+            and raw["source"] == source
+            and raw["contracts"] == contracts
+            and raw["package"] == package
+            and raw["clean"] is True
+            and raw["unplanned_suspend"] is False,
+            f"calibration run {run_position} raw payload identity is stale",
+        )
+        metrics = raw["metrics"]
+        require(
+            isinstance(metrics, dict)
+            and set(metrics) == calibration_metrics,
+            f"calibration run {run_position} omitted a required metric",
+        )
+        target_os = TARGET_CONTRACTS[matrix_cell["asset_target"]]["target_os"]
+        allowed_awake_apis = set(protocol["clock_policy"]["platform_apis"][target_os])
+        inclusive_api = suspend_contract["platform_apis"][target_os]
+        for metric in sorted(metrics):
+            record = metrics[metric]
+            require(isinstance(record, dict), f"calibration run {run_position} metric {metric} is malformed")
+            require_exact_keys(
+                record,
+                {"unit", "samples"},
+                f"calibration run {run_position} metric {metric}",
+            )
+            require(
+                record["unit"] == metric_contracts[metric]["unit"],
+                f"calibration run {run_position} metric {metric} used the wrong unit",
+            )
+            samples = record["samples"]
+            require(
+                isinstance(samples, list)
+                and len(samples) == sampling[metric]["sample_count"],
+                f"calibration run {run_position} metric {metric} sample count changed",
+            )
+            values = []
+            server_identities = []
+            for sample_index, sample in enumerate(samples):
+                require(isinstance(sample, dict), f"calibration {metric} sample is malformed")
+                require_exact_keys(
+                    sample,
+                    {
+                        "sample_id",
+                        "repeat",
+                        "matrix_cell_id",
+                        "workload_id",
+                        "cache_state",
+                        "residency_state",
+                        "process",
+                        "server_identity",
+                        "clock",
+                        "start",
+                        "end",
+                        "operands",
+                        "suspend_witness",
+                    },
+                    f"calibration run {run_position} metric {metric} sample {sample_index}",
+                )
+                sample_id = require_opaque_identifier(
+                    sample["sample_id"],
+                    f"calibration run {run_position} metric {metric} sample id",
+                )
+                require(
+                    sample_id not in global_sample_ids,
+                    "calibration bundle duplicated a sample identity",
+                )
+                global_sample_ids.add(sample_id)
+                require(
+                    sample["repeat"] == sample_index + 1
+                    and sample["matrix_cell_id"] == matrix_cell_id
+                    and sample["workload_id"] == protocol["workloads"][metric]["workload_id"]
+                    and sample["cache_state"] == matrix_cell["cache_state"]
+                    and sample["residency_state"] == matrix_cell["residency_state"],
+                    f"calibration run {run_position} metric {metric} sample identity changed",
+                )
+                server_identity = sample["server_identity"]
+                require(
+                    isinstance(server_identity, dict),
+                    f"calibration run {run_position} metric {metric} server identity is malformed",
+                )
+                require_exact_keys(
+                    server_identity,
+                    {"server_instance_id", "process_start_id", "load_generation"},
+                    f"calibration run {run_position} metric {metric} server identity",
+                )
+                server_identities.append(
+                    (
+                        require_opaque_identifier(
+                            server_identity["server_instance_id"],
+                            f"calibration run {run_position} metric {metric} server_instance_id",
+                        ),
+                        require_nonempty_string(
+                            server_identity["process_start_id"],
+                            f"calibration run {run_position} metric {metric} process_start_id",
+                        ),
+                        require_positive_int(
+                            server_identity["load_generation"],
+                            f"calibration run {run_position} metric {metric} load_generation",
+                        ),
+                    )
+                )
+                value = qualification_measurement_sample_value(
+                    metric,
+                    sample,
+                    contracts=contracts,
+                    phase_boundaries=phase_boundaries,
+                    allowed_awake_apis=allowed_awake_apis,
+                    inclusive_api=inclusive_api,
+                    maximum_suspend_ns=maximum_suspend_ns,
+                    expected_policy=matrix_cell["policy"],
+                    expected_backend=matrix_cell["backend"],
+                )
+                values.append(value)
+                awake_delta_ms = (
+                    sample["end"]["observed_ns"] - sample["start"]["observed_ns"]
+                ) / 1_000_000
+                if metric == "existing_owner_connect":
+                    raw_duration_values_ms["existing_owner_connect_duration"].append(
+                        awake_delta_ms
+                    )
+                if metric == "spawn_convergence":
+                    raw_duration_values_ms["spawn_convergence_duration"].append(
+                        awake_delta_ms
+                    )
+                if metric in {"cold_first_vector", "first_product_ready", "warm_query_ipc"}:
+                    raw_duration_values_ms["query_request_duration"].append(awake_delta_ms)
+                if metric in {
+                    "warm_bulk_ipc",
+                    "bulk_documents_per_second",
+                    "bulk_tokens_per_second",
+                }:
+                    raw_duration_values_ms["bulk_request_duration"].append(awake_delta_ms)
+                if metric == "busy_retry_usefulness":
+                    raw_duration_values_ms["capacity_condition_duration"].append(
+                        awake_delta_ms
+                    )
+                if metric in {
+                    "cold_first_vector",
+                    "first_product_ready",
+                    "warm_query_ipc",
+                    "warm_bulk_ipc",
+                    "bulk_documents_per_second",
+                    "bulk_tokens_per_second",
+                }:
+                    raw_duration_values_ms["successful_operation_duration"].append(
+                        require_nonnegative_int(
+                            sample["operands"]["successful_operation_duration_ns"],
+                            f"calibration run {run_position} metric {metric} successful operation duration",
+                        )
+                        / 1_000_000
+                    )
+            if sampling[metric].get("independence") == "distinct_server_instance_per_sample":
+                require(
+                    len({identity[:2] for identity in server_identities}) == len(samples),
+                    f"calibration run {run_position} metric {metric} samples are not independent",
+                )
+            else:
+                require(
+                    len(set(server_identities)) == 1,
+                    f"calibration run {run_position} metric {metric} changed server identity",
+                )
+            aggregation = sampling[metric]["aggregation"]
+            run_metric_values[metric].append(
+                {
+                    "maximum": max,
+                    "minimum": min,
+                    "exact": lambda raw_values: raw_values[0],
+                    "all_rows_pass_rate": lambda raw_values: sum(raw_values)
+                    / len(raw_values),
+                }[aggregation](values)
+            )
+    require(
+        observed_run_cells == expected_run_cells,
+        "calibration bundle does not exactly cover every matrix cell three times",
+    )
+    require(
+        len({package["release_version"] for package in packages_by_cell.values()}) == 1
+        and len({package["model_sha256"] for package in packages_by_cell.values()}) == 1,
+        "calibration matrix cells did not use one release version and model",
+    )
+    require(
+        all(raw_duration_values_ms.values()),
+        "calibration bundle omitted a production-constant raw source cell",
+    )
+    connect_timeout_ms = max(
+        1, math.ceil(max(raw_duration_values_ms["existing_owner_connect_duration"]) * 1.50)
+    )
+    spawn_timeout_ms = max(
+        1, math.ceil(max(raw_duration_values_ms["spawn_convergence_duration"]) * 1.50)
+    )
+    query_deadline_ms = max(
+        1, math.ceil(max(raw_duration_values_ms["query_request_duration"]) * 1.50)
+    )
+    bulk_deadline_ms = max(
+        query_deadline_ms,
+        math.ceil(max(raw_duration_values_ms["bulk_request_duration"]) * 1.50),
+    )
+    retry_after_ms = max(
+        1, math.floor(min(raw_duration_values_ms["capacity_condition_duration"]) * 0.50)
+    )
+    initial_backoff_ms = max(
+        1,
+        math.ceil(
+            max(raw_duration_values_ms["existing_owner_connect_duration"]) * 0.50
+        ),
+    )
+    maximum_backoff_ms = max(
+        initial_backoff_ms,
+        math.ceil(max(raw_duration_values_ms["spawn_convergence_duration"]) * 0.25),
+    )
+    hard_no_progress_ms = max(
+        1,
+        math.ceil(max(raw_duration_values_ms["successful_operation_duration"]) * 4.00),
+    )
+    watchdog_cadence_ms = max(1, math.floor(hard_no_progress_ms / 20))
+    selected_constants = {
+        "connect_timeout_ms": connect_timeout_ms,
+        "spawn_convergence_timeout_ms": spawn_timeout_ms,
+        "request_deadlines_ms": {
+            "query_request_deadline_ms": query_deadline_ms,
+            "bulk_request_deadline_ms": bulk_deadline_ms,
+        },
+        "capacity_retry_policy": {
+            "retry_after_ms": retry_after_ms,
+            "retry_class": "after_capacity_change",
+            "retry_condition_source": "named_condition_from_typed_capacity_response",
+        },
+        "election_backoff_policy": {
+            "initial_backoff_ms": initial_backoff_ms,
+            "maximum_backoff_ms": maximum_backoff_ms,
+            "jitter": (
+                "sha256(process_start_id||attempt) modulo inclusive "
+                "[initial_backoff_ms,maximum_backoff_ms]"
+            ),
+        },
+        "hard_native_no_progress_ms": hard_no_progress_ms,
+        "watchdog_cadence_ms": watchdog_cadence_ms,
+    }
+    thresholds: dict[str, float | int] = {}
+    for metric, values in run_metric_values.items():
+        comparison = metric_contracts[metric]["comparison"]
+        if metric == "retrieval_quality":
+            threshold: float | int = 1.0
+        elif comparison == "less_than_or_equal":
+            threshold = math.ceil(max(values) * 1.20)
+        elif comparison == "greater_than_or_equal":
+            threshold = math.floor(min(values) * 0.80)
+        else:
+            require(
+                len(set(values)) == 1,
+                f"calibration equal metric {metric} did not have one exact observed value",
+            )
+            threshold = values[0]
+        thresholds[metric] = threshold
+    thresholds["retrieval_quality"] = 1.0
+    if compare_frozen_constant_set:
+        require(
+            constant_set["calibration_required_values"] == selected_constants,
+            "frozen compiled constants do not match the preregistered calibration formulas",
+        )
+        require(
+            constant_set["qualification_thresholds"] == thresholds,
+            "frozen qualification thresholds do not match the preregistered calibration formulas",
+        )
+    freeze_payload = {
+        "selection_protocol": bundle["selection_protocol"],
+        "source": source,
+        "producer": producer,
+        "contracts": contracts,
+        "run_artifact_sha256s": sorted(artifact_digests),
+        "calibration_required_values": selected_constants,
+        "qualification_thresholds": thresholds,
+    }
+    freeze_digest = canonical_sha256(freeze_payload)
+    source_lineage = None
+    if compare_frozen_constant_set and enforce_source_lineage:
+        require(
+            frozen_source is not None and repository_root is not None,
+            "frozen qualification requires exact calibration-to-package source lineage",
+        )
+        source_lineage = verify_calibration_source_lineage(
+            source,
+            frozen_source,
+            repository_root,
+        )
+    if compare_frozen_constant_set:
+        require(
+            bundle["freeze_digest"] == freeze_digest,
+            "calibration bundle freeze digest does not match recomputed raw evidence",
+        )
+        freeze_record = constant_set["freeze_record"]
+        require(
+            freeze_record["selection_source_commit"] == source["commit"]
+            and freeze_record["selection_source_tree"] == source["tree"]
+            and freeze_record["measurement_protocol_sha256"]
+            == contracts["measurement_protocol_sha256"]
+            and freeze_record["protocol_sha256"] == contracts["protocol_sha256"]
+            and freeze_record["input_constant_set_sha256"]
+            == contracts["input_constant_set_sha256"]
+            and freeze_record["calibration_bundle_sha256"] == sha256(path)
+            and freeze_record["calibration_freeze_digest"] == freeze_digest
+            and sorted(freeze_record["run_artifact_sha256s"])
+            == sorted(artifact_digests)
+            and freeze_record["selection_rule"]
+            == "all_preregistered_clean_runs_no_outlier_removal",
+            "constant-set freeze record does not bind the exact recomputed calibration bundle",
+        )
+    return {
+        "artifact": {"name": path.name, "sha256": sha256(path)},
+        "source": source,
+        "producer": producer,
+        "contracts": contracts,
+        "matrix_cell_count": len(matrix),
+        "run_count": len(runs),
+        "freeze_digest": freeze_digest,
+        "calibration_required_values": selected_constants,
+        "qualification_thresholds": thresholds,
+        "run_artifact_sha256s": sorted(artifact_digests),
+        "source_lineage": source_lineage,
+    }
+
+
+def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
+    require(
+        args.calibration_bundle_output is not None
+        and args.frozen_constant_set_output is not None
+        and args.freeze_selected_at is not None,
+        "calibration assembly requires bundle output, frozen constant-set output, and selected-at",
+    )
+    measurement_contract = load_server_measurement_contract(
+        args.measurement_protocol
+    )
+    constant_set = measurement_contract["constant_set"]
+    require(
+        constant_set.get("status") == "unfrozen"
+        and constant_set.get("freeze_record") is None,
+        "calibration assembly requires the exact unfrozen input constant set",
+    )
+    expected_run_count = (
+        len(measurement_contract["measurement_protocol"]["calibration_matrix"]) * 3
+    )
+    run_paths = [path.resolve() for path in args.calibration_run]
+    require(
+        len(run_paths) == expected_run_count
+        and len(set(run_paths)) == expected_run_count,
+        f"calibration assembly requires exactly {expected_run_count} distinct run artifacts",
+    )
+    runs = []
+    for position, path in enumerate(run_paths):
+        require(
+            path.is_file() and not path.is_symlink(),
+            f"calibration run artifact {position} is missing or unsafe: {path}",
+        )
+        try:
+            run = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ProofFailure(
+                f"calibration run artifact {position} is invalid JSON: {exc}"
+            ) from exc
+        require(
+            isinstance(run, dict),
+            f"calibration run artifact {position} must be an object",
+        )
+        runs.append(run)
+    first = runs[0]
+    source = first.get("source")
+    contracts = first.get("contracts")
+    require(
+        isinstance(source, dict) and isinstance(contracts, dict),
+        "first calibration run omitted source or contract identity",
+    )
+    producer = {
+        "repository": args.calibration_producer_repository,
+        "workflow_path": args.calibration_producer_workflow_path,
+        "run_id": args.calibration_producer_run_id,
+        "run_attempt": args.calibration_producer_run_attempt,
+        "artifact_name": args.calibration_producer_artifact,
+        "source_head_sha": source.get("commit"),
+    }
+    bundle = {
+        "schema_version": 1,
+        "selection_protocol": constant_set["selection_protocol"],
+        "source": source,
+        "producer": producer,
+        "contracts": contracts,
+        "runs": runs,
+        "freeze_digest": "",
+    }
+    bundle_output = args.calibration_bundle_output.resolve()
+    constant_output = args.frozen_constant_set_output.resolve()
+    require(
+        bundle_output != constant_output,
+        "calibration bundle and frozen constant-set outputs must be distinct",
+    )
+    write_json(bundle_output, bundle)
+    selection = verify_calibration_bundle(
+        bundle_output,
+        measurement_contract,
+        compare_frozen_constant_set=False,
+    )
+    bundle["freeze_digest"] = selection["freeze_digest"]
+    write_json(bundle_output, bundle)
+
+    frozen_constant_set = json.loads(json.dumps(constant_set))
+    frozen_constant_set["status"] = "frozen"
+    frozen_constant_set["calibration_required_values"] = selection[
+        "calibration_required_values"
+    ]
+    frozen_constant_set["qualification_thresholds"] = selection[
+        "qualification_thresholds"
+    ]
+    frozen_constant_set["freeze_record"] = {
+        "selection_source_commit": source["commit"],
+        "selection_source_tree": source["tree"],
+        "measurement_protocol_sha256": contracts["measurement_protocol_sha256"],
+        "protocol_sha256": contracts["protocol_sha256"],
+        "input_constant_set_sha256": contracts["input_constant_set_sha256"],
+        "calibration_bundle_sha256": sha256(bundle_output),
+        "calibration_freeze_digest": selection["freeze_digest"],
+        "run_artifact_sha256s": selection["run_artifact_sha256s"],
+        "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
+        "selected_at": require_nonempty_string(
+            args.freeze_selected_at,
+            "--freeze-selected-at",
+        ),
+    }
+    write_json(constant_output, frozen_constant_set)
+    frozen_contract = json.loads(json.dumps(measurement_contract))
+    frozen_contract["constant_set"] = frozen_constant_set
+    frozen_contract["constant_set_sha256"] = sha256(constant_output)
+    verified = verify_calibration_bundle(
+        bundle_output,
+        frozen_contract,
+        enforce_source_lineage=False,
+    )
+    return {
+        "bundle": verified["artifact"],
+        "frozen_constant_set": {
+            "name": constant_output.name,
+            "sha256": sha256(constant_output),
+        },
+        "selection_source": source,
+        "run_count": verified["run_count"],
+        "matrix_cell_count": verified["matrix_cell_count"],
+        "freeze_digest": verified["freeze_digest"],
+    }
 
 
 def produce_qualification_evidence(
@@ -5619,15 +7757,17 @@ def produce_qualification_evidence(
     forbidden_values = [nonce, *projects]
     for scenario_id in sorted(REQUIRED_SERVER_SCENARIOS):
         required_assertions = set(scenario_contracts[scenario_id]["required"])
-        artifact, _raw_artifact = qualification_artifact(
+        artifact, assertions = qualification_artifact(
             artifact_root,
             raw_scenarios[scenario_id],
             scenario_id=scenario_id,
             contracts=contracts,
+            package=package,
+            same_account=runtime["same_account"],
+            materialization=runtime["materialization"],
             nonce_sha256=nonce_sha256,
             forbidden_values=forbidden_values,
         )
-        assertions = {assertion: True for assertion in required_assertions}
         external_artifacts = []
         if scenario_id in {"server_crash", "worker_stall"}:
             for assertion, value in publication_fault_evidence["assertions"].items():
@@ -5644,6 +7784,10 @@ def produce_qualification_evidence(
                 external_artifacts.append(
                     fault_recovery_consistency_evidence["artifact"]
                 )
+        require(
+            set(assertions) == required_assertions,
+            f"qualification scenario {scenario_id} derived assertion set differs from its preregistered contract",
+        )
         require(
             all(value is True for value in assertions.values()),
             f"qualification scenario {scenario_id} has a failed assertion",
@@ -5713,6 +7857,9 @@ def produce_qualification_evidence(
         ),
         "platform": platform_label,
         "target": manifest["asset_target"],
+        "matrix_cell_id": matrix_cell_id,
+        "host_class": matrix_cell["host_class"],
+        "accelerator_claim": matrix_cell["accelerator_claim"],
         "backend": identity["embedding_backend"],
         "policy": args.engine_policy,
         "cache_state": cache_state,
@@ -5811,6 +7958,8 @@ def produce_qualification_evidence(
         "package": {
             **package,
             **contracts,
+            "matrix_cell_id": matrix_cell_id,
+            "accelerator_claim": matrix_cell["accelerator_claim"],
             "model_sha256": identity["embedding_model_sha256"],
             "backend": identity["embedding_backend"],
             "policy": identity["embedding_policy"],
@@ -5829,11 +7978,474 @@ def produce_qualification_evidence(
         retained["installed_plugin"] = runtime["installed_plugin"]
         retained["managed_runtime"] = runtime["managed_runtime"]
     write_json(args.qualification_evidence, retained)
+    if args.proof_tier == "calibration" and args.calibration_run_output is not None:
+        run_index = require_positive_int(
+            args.calibration_run_index,
+            "--calibration-run-index",
+        )
+        require(
+            run_index <= 3,
+            "--calibration-run-index must be in the preregistered range 1..3",
+        )
+        normalized_package = {
+            "archive_sha256": archive_sha256,
+            "executable_sha256": manifest["binary"]["sha256"],
+            "asset_target": manifest["asset_target"],
+            "release_version": manifest["release_version"],
+            "model_sha256": identity["embedding_model_sha256"],
+            "policy": args.engine_policy,
+            "backend": expected_backend,
+        }
+        run_contracts = {
+            "protocol_sha256": measurement_contract["protocol_sha256"],
+            "measurement_protocol_sha256": measurement_contract[
+                "measurement_protocol_sha256"
+            ],
+            "input_constant_set_sha256": measurement_contract[
+                "constant_set_sha256"
+            ],
+        }
+        raw_metrics = json.loads(
+            json.dumps(measurement["payload"]["metrics"])
+        )
+        memory_samples = []
+        for sample in memory_evidence["payload"]["samples"]:
+            normalized_sample = json.loads(json.dumps(sample))
+            normalized_sample["process"] = normalized_sample.pop("producer_process")
+            memory_samples.append(normalized_sample)
+        raw_metrics["total_codestory_process_memory"] = {
+            "unit": "bytes",
+            "samples": memory_samples,
+        }
+        run_identity_seed = {
+            "source": manifest["source"],
+            "package": normalized_package,
+            "matrix_cell_id": matrix_cell_id,
+            "run_index": run_index,
+            "host_fingerprint": host["fingerprint"],
+            "measurement_artifact_sha256": measurement["artifact"]["sha256"],
+            "memory_artifact_sha256": memory_evidence["artifact"]["sha256"],
+        }
+        run_id = canonical_sha256(run_identity_seed)
+        raw_payload = {
+            "schema_version": 1,
+            "run_id_sha256": run_id,
+            "matrix_cell_id": matrix_cell_id,
+            "run_index": run_index,
+            "host_fingerprint": host["fingerprint"],
+            "source": manifest["source"],
+            "contracts": run_contracts,
+            "package": normalized_package,
+            "clean": manifest["source"]["tracked_dirty"] is False,
+            "unplanned_suspend": measurement["unplanned_suspend"],
+            "metrics": raw_metrics,
+        }
+        run_envelope = {
+            "run_id_sha256": run_id,
+            "matrix_cell_id": matrix_cell_id,
+            "run_index": run_index,
+            "host_fingerprint": host["fingerprint"],
+            "clean": raw_payload["clean"],
+            "unplanned_suspend": raw_payload["unplanned_suspend"],
+            "source": manifest["source"],
+            "contracts": run_contracts,
+            "package": normalized_package,
+            "raw_artifact": {
+                "name": "measurements.raw.json",
+                "sha256": canonical_sha256(raw_payload),
+                "payload": raw_payload,
+            },
+        }
+        write_json(args.calibration_run_output, run_envelope)
     return retained
+
+
+def build_calibration_self_test_bundle(
+    root: Path,
+    measurement_contract: dict,
+    *,
+    source: dict,
+) -> tuple[Path, dict, dict]:
+    protocol = measurement_contract["measurement_protocol"]
+    contracts = {
+        "protocol_sha256": measurement_contract["protocol_sha256"],
+        "measurement_protocol_sha256": measurement_contract[
+            "measurement_protocol_sha256"
+        ],
+        "input_constant_set_sha256": measurement_contract["constant_set_sha256"],
+    }
+    runs = []
+    run_artifact_digests = []
+    roles = (
+        "plugin_host_a",
+        "plugin_cli_a",
+        "plugin_host_b",
+        "plugin_cli_b",
+        "embedding_server",
+    )
+    for cell_position, (matrix_cell_id, cell) in enumerate(
+        sorted(protocol["calibration_matrix"].items())
+    ):
+        target_os = TARGET_CONTRACTS[cell["asset_target"]]["target_os"]
+        awake_api = protocol["clock_policy"]["platform_apis"][target_os][0]
+        inclusive_api = protocol["clock_policy"]["suspend_detection"]["platform_apis"][
+            target_os
+        ]
+        for run_index in range(1, 4):
+            run_seed = f"{matrix_cell_id}:{run_index}"
+            run_id = hashlib.sha256(f"run:{run_seed}".encode()).hexdigest()
+            host_fingerprint = hashlib.sha256(
+                f"host:{matrix_cell_id}".encode()
+            ).hexdigest()
+            metrics = {}
+            for metric_position, metric in enumerate(
+                sorted(set(protocol["required_metrics"]) - {"retrieval_quality"})
+            ):
+                samples = []
+                policy = protocol["metric_sampling"][metric]
+                shared_server_id = "server:" + hashlib.sha256(
+                    f"{run_seed}:{metric}".encode()
+                ).hexdigest()
+                for repeat in range(1, policy["sample_count"] + 1):
+                    pid = (
+                        10_000
+                        + cell_position * 1_000
+                        + run_index * 100
+                        + metric_position * 10
+                        + repeat
+                    )
+                    independent = (
+                        policy.get("independence")
+                        == "distinct_server_instance_per_sample"
+                    )
+                    server_id = (
+                        "server:"
+                        + hashlib.sha256(
+                            f"{run_seed}:{metric}:{repeat}".encode()
+                        ).hexdigest()
+                        if independent
+                        else shared_server_id
+                    )
+                    server_process_start_id = (
+                        f"boot:{pid}"
+                        if independent
+                        else "boot:"
+                        + hashlib.sha256(
+                            f"server-start:{run_seed}:{metric}".encode()
+                        ).hexdigest()
+                    )
+                    started_ns = repeat * 2_000_000
+                    finished_ns = started_ns + 1_000_000
+                    operands: dict[str, object] = {}
+                    if metric in {
+                        "cold_first_vector",
+                        "first_product_ready",
+                        "warm_query_ipc",
+                        "warm_bulk_ipc",
+                        "bulk_documents_per_second",
+                        "bulk_tokens_per_second",
+                    }:
+                        operands["successful_operation_duration_ns"] = (
+                            finished_ns - started_ns
+                        )
+                    if metric == "bulk_documents_per_second":
+                        operands["completed_documents"] = 1
+                    elif metric == "bulk_tokens_per_second":
+                        operands["completed_tokens"] = 1
+                    elif metric == "total_codestory_process_memory":
+                        operands["processes"] = [
+                            {
+                                "role": role,
+                                "pid": pid + role_index + 1,
+                                "process_start_id": f"boot:{pid + role_index + 1}",
+                                "executable_sha256": hashlib.sha256(
+                                    f"exe:{role}".encode()
+                                ).hexdigest(),
+                                "resident_bytes": 1,
+                                "measurement_api": "self_test",
+                            }
+                            for role_index, role in enumerate(roles)
+                        ]
+                    elif metric == "backend_observed_accelerator_residency":
+                        accelerated = cell["policy"] == "accelerated"
+                        operands = {
+                            "policy": cell["policy"],
+                            "backend": cell["backend"],
+                            "accelerator_execution_verified": accelerated,
+                            "resident_accelerator_tensor_count": 1 if accelerated else 0,
+                            "resident_accelerator_tensor_bytes": 1 if accelerated else 0,
+                            "offloaded_layer_count": 1 if accelerated else 0,
+                            "model_layer_count": 1,
+                        }
+                    samples.append(
+                        {
+                            "sample_id": "sample:"
+                            + hashlib.sha256(
+                                f"{run_seed}:{metric}:{repeat}".encode()
+                            ).hexdigest(),
+                            "repeat": repeat,
+                            "matrix_cell_id": matrix_cell_id,
+                            "workload_id": protocol["workloads"][metric][
+                                "workload_id"
+                            ],
+                            "cache_state": cell["cache_state"],
+                            "residency_state": cell["residency_state"],
+                            "process": {
+                                "pid": pid,
+                                "process_start_id": f"boot:{pid}",
+                            },
+                            "server_identity": {
+                                "server_instance_id": server_id,
+                                "process_start_id": server_process_start_id,
+                                "load_generation": 1,
+                            },
+                            "clock": {
+                                "domain": "awake_monotonic",
+                                "api": awake_api,
+                                "boot_id": f"boot-{cell_position}",
+                                "resolution_ns": 1,
+                            },
+                            "start": {
+                                "phase": protocol["phase_boundaries"][metric][0],
+                                "observed_ns": started_ns,
+                            },
+                            "end": {
+                                "phase": protocol["phase_boundaries"][metric][1],
+                                "observed_ns": finished_ns,
+                            },
+                            "operands": operands,
+                            "suspend_witness": {
+                                "awake_started_ns": started_ns,
+                                "awake_finished_ns": finished_ns,
+                                "inclusive_clock_api": inclusive_api,
+                                "inclusive_started_ns": started_ns,
+                                "inclusive_finished_ns": finished_ns,
+                                "boot_id_started": f"boot-{cell_position}",
+                                "boot_id_finished": f"boot-{cell_position}",
+                            },
+                        }
+                    )
+                metrics[metric] = {
+                    "unit": protocol["metric_contracts"][metric]["unit"],
+                    "samples": samples,
+                }
+            raw_payload = {
+                "schema_version": 1,
+                "run_id_sha256": run_id,
+                "matrix_cell_id": matrix_cell_id,
+                "run_index": run_index,
+                "host_fingerprint": host_fingerprint,
+                "source": source,
+                "contracts": contracts,
+                "package": {
+                    "archive_sha256": hashlib.sha256(
+                        f"archive:{matrix_cell_id}".encode()
+                    ).hexdigest(),
+                    "executable_sha256": hashlib.sha256(
+                        f"executable:{matrix_cell_id}".encode()
+                    ).hexdigest(),
+                    "asset_target": cell["asset_target"],
+                    "release_version": "0.0.0",
+                    "model_sha256": hashlib.sha256(b"model").hexdigest(),
+                    "policy": cell["policy"],
+                    "backend": cell["backend"],
+                },
+                "clean": True,
+                "unplanned_suspend": False,
+                "metrics": metrics,
+            }
+            raw_digest = canonical_sha256(raw_payload)
+            run_artifact_digests.append(raw_digest)
+            runs.append(
+                {
+                    "run_id_sha256": run_id,
+                    "matrix_cell_id": matrix_cell_id,
+                    "run_index": run_index,
+                    "host_fingerprint": host_fingerprint,
+                    "clean": True,
+                    "unplanned_suspend": False,
+                    "source": source,
+                    "contracts": contracts,
+                    "package": raw_payload["package"],
+                    "raw_artifact": {
+                        "name": "measurements.raw.json",
+                        "sha256": raw_digest,
+                        "payload": raw_payload,
+                    },
+                }
+            )
+    selected_constants = {
+        "connect_timeout_ms": 2,
+        "spawn_convergence_timeout_ms": 2,
+        "request_deadlines_ms": {
+            "query_request_deadline_ms": 2,
+            "bulk_request_deadline_ms": 2,
+        },
+        "capacity_retry_policy": {
+            "retry_after_ms": 1,
+            "retry_class": "after_capacity_change",
+            "retry_condition_source": "named_condition_from_typed_capacity_response",
+        },
+        "election_backoff_policy": {
+            "initial_backoff_ms": 1,
+            "maximum_backoff_ms": 1,
+            "jitter": (
+                "sha256(process_start_id||attempt) modulo inclusive "
+                "[initial_backoff_ms,maximum_backoff_ms]"
+            ),
+        },
+        "hard_native_no_progress_ms": 4,
+        "watchdog_cadence_ms": 1,
+    }
+    thresholds = {
+        metric: (
+            (1.0 if metric == "retrieval_quality" else 1)
+            if metric in {"backend_observed_accelerator_residency", "retrieval_quality"}
+            else (
+                800
+                if metric
+                in {"bulk_documents_per_second", "bulk_tokens_per_second"}
+                else (6 if metric == "total_codestory_process_memory" else 2)
+            )
+        )
+        for metric in protocol["required_metrics"]
+    }
+    producer = {
+        "repository": "TheGreenCedar/CodeStory",
+        "workflow_path": ".github/workflows/packaged-platform-pr.yml",
+        "run_id": "123",
+        "run_attempt": "1",
+        "artifact_name": f"embedding-calibration-bundle-{source['commit']}",
+        "source_head_sha": source["commit"],
+    }
+    freeze_payload = {
+        "selection_protocol": measurement_contract["constant_set"][
+            "selection_protocol"
+        ],
+        "source": source,
+        "producer": producer,
+        "contracts": contracts,
+        "run_artifact_sha256s": sorted(run_artifact_digests),
+        "calibration_required_values": selected_constants,
+        "qualification_thresholds": thresholds,
+    }
+    bundle = {
+        "schema_version": 1,
+        "selection_protocol": measurement_contract["constant_set"][
+            "selection_protocol"
+        ],
+        "source": source,
+        "producer": producer,
+        "contracts": contracts,
+        "runs": runs,
+        "freeze_digest": canonical_sha256(freeze_payload),
+    }
+    path = root / "calibration-bundle.json"
+    write_json(path, bundle)
+    frozen_contract = json.loads(json.dumps(measurement_contract))
+    frozen_contract["constant_set"]["status"] = "frozen"
+    frozen_contract["constant_set"]["calibration_required_values"] = selected_constants
+    frozen_contract["constant_set"]["qualification_thresholds"] = thresholds
+    frozen_contract["constant_set"]["freeze_record"] = {
+        "selection_source_commit": source["commit"],
+        "selection_source_tree": source["tree"],
+        "measurement_protocol_sha256": contracts["measurement_protocol_sha256"],
+        "protocol_sha256": contracts["protocol_sha256"],
+        "input_constant_set_sha256": contracts["input_constant_set_sha256"],
+        "calibration_bundle_sha256": sha256(path),
+        "calibration_freeze_digest": bundle["freeze_digest"],
+        "run_artifact_sha256s": sorted(run_artifact_digests),
+        "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
+        "selected_at": "self-test",
+    }
+    return path, frozen_contract, bundle
 
 
 def self_test() -> None:
     require(parse_byte_quantity("24.1M") == 25_270_682, "memory quantity parser failed")
+    require(
+        require_native_process_start_identity(
+            "linux:1234", "linux", "Linux self-test identity"
+        )
+        == "linux:1234"
+        and require_native_process_start_identity(
+            "macos-proc:1234:5678", "macos", "macOS self-test identity"
+        )
+        == "macos-proc:1234:5678"
+        and require_native_process_start_identity(
+            "windows:504911232000000010",
+            "windows",
+            "Windows self-test identity",
+        )
+        == "windows:504911232000000010",
+        "canonical process identity format self-test failed",
+    )
+    for target_os, hostile_identity in (
+        ("linux", "boot-id:1234"),
+        ("macos", "Thu Jul 17 12:00:00 2026"),
+        ("windows", "2026-07-17T12:00:00Z"),
+    ):
+        try:
+            require_native_process_start_identity(
+                hostile_identity,
+                target_os,
+                f"hostile {target_os} identity",
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"noncanonical {target_os} process identity format was accepted"
+            )
+    self_target_os = (
+        "windows"
+        if os.name == "nt"
+        else ("macos" if sys.platform == "darwin" else "linux")
+    )
+    self_pid = os.getpid()
+    self_start_id = process_start_identity(self_pid)
+    self_live_digest = live_process_executable_sha256(
+        self_pid,
+        self_start_id,
+        self_target_os,
+    )
+    verified_live_executable(
+        pid=self_pid,
+        process_start_id=self_start_id,
+        reported_sha256=self_live_digest,
+        expected_sha256=self_live_digest,
+        target_os=self_target_os,
+        label="self-test process",
+    )
+    hostile_reported_digest = (
+        ("a" if self_live_digest[0] != "a" else "b") + self_live_digest[1:]
+    )
+    try:
+        verified_live_executable(
+            pid=self_pid,
+            process_start_id=self_start_id,
+            reported_sha256=hostile_reported_digest,
+            expected_sha256=self_live_digest,
+            target_os=self_target_os,
+            label="hostile self-test process",
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("self-reported process executable digest bypassed live image hashing")
+    stale_start_id = self_start_id[:-1] + (
+        "0" if self_start_id[-1] != "0" else "1"
+    )
+    try:
+        live_process_executable_sha256(
+            self_pid,
+            stale_start_id,
+            self_target_os,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("stale process start identity bypassed live image hashing")
 
     class ScriptedMcpProcess(McpProcess):
         def __init__(self, responses: list[dict]):
@@ -6176,6 +8788,131 @@ def self_test() -> None:
             MEASUREMENT_PROTOCOL,
             require_frozen=False,
         )
+        (
+            calibration_bundle_path,
+            frozen_measurement_contract,
+            calibration_bundle_payload,
+        ) = build_calibration_self_test_bundle(
+            root,
+            measurement_contract,
+            source=manifest["source"],
+        )
+        assembled_run_paths = []
+        for index, run in enumerate(calibration_bundle_payload["runs"]):
+            run_path = root / "assembler-runs" / f"run-{index + 1}.json"
+            write_json(run_path, run)
+            assembled_run_paths.append(run_path)
+        assembled_bundle_path = root / "assembled-calibration-bundle.json"
+        assembled_constant_path = root / "assembled-constant-set.json"
+        assembled = assemble_calibration_bundle(
+            argparse.Namespace(
+                measurement_protocol=MEASUREMENT_PROTOCOL,
+                calibration_bundle_output=assembled_bundle_path,
+                frozen_constant_set_output=assembled_constant_path,
+                freeze_selected_at="self-test",
+                calibration_run=assembled_run_paths,
+                calibration_producer_repository="TheGreenCedar/CodeStory",
+                calibration_producer_workflow_path=(
+                    ".github/workflows/packaged-platform-pr.yml"
+                ),
+                calibration_producer_run_id="123",
+                calibration_producer_run_attempt="1",
+                calibration_producer_artifact=(
+                    f"embedding-calibration-bundle-{manifest['source']['commit']}"
+                ),
+            )
+        )
+        require(
+            assembled["run_count"] == 6
+            and assembled["matrix_cell_count"] == 2
+            and assembled_bundle_path.is_file()
+            and assembled_constant_path.is_file(),
+            "calibration assembler did not produce the exact frozen artifacts",
+        )
+        calibration_result = verify_calibration_bundle(
+            calibration_bundle_path,
+            frozen_measurement_contract,
+            enforce_source_lineage=False,
+        )
+        require(
+            calibration_result["run_count"] == 6
+            and calibration_result["matrix_cell_count"] == 2,
+            "calibration bundle self-test did not verify the full matrix",
+        )
+        hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+        hostile_calibration["runs"].pop()
+        hostile_calibration_path = root / "hostile-calibration-bundle.json"
+        write_json(hostile_calibration_path, hostile_calibration)
+        try:
+            verify_calibration_bundle(
+                hostile_calibration_path,
+                frozen_measurement_contract,
+                enforce_source_lineage=False,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("incomplete calibration matrix was accepted")
+        hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+        hostile_run = hostile_calibration["runs"][0]
+        hostile_metric = hostile_run["raw_artifact"]["payload"]["metrics"][
+            "cold_first_vector"
+        ]
+        hostile_metric["samples"][0]["operands"].pop(
+            "successful_operation_duration_ns"
+        )
+        hostile_run["raw_artifact"]["sha256"] = canonical_sha256(
+            hostile_run["raw_artifact"]["payload"]
+        )
+        write_json(hostile_calibration_path, hostile_calibration)
+        try:
+            verify_calibration_bundle(
+                hostile_calibration_path,
+                frozen_measurement_contract,
+                enforce_source_lineage=False,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "calibration sample without successful operation duration was accepted"
+            )
+        hostile_calibration = json.loads(json.dumps(calibration_bundle_payload))
+        first_sample_id = hostile_calibration["runs"][0]["raw_artifact"]["payload"][
+            "metrics"
+        ]["warm_query_ipc"]["samples"][0]["sample_id"]
+        duplicate_run = hostile_calibration["runs"][1]
+        duplicate_run["raw_artifact"]["payload"]["metrics"]["warm_query_ipc"][
+            "samples"
+        ][0]["sample_id"] = first_sample_id
+        duplicate_run["raw_artifact"]["sha256"] = canonical_sha256(
+            duplicate_run["raw_artifact"]["payload"]
+        )
+        write_json(hostile_calibration_path, hostile_calibration)
+        try:
+            verify_calibration_bundle(
+                hostile_calibration_path,
+                frozen_measurement_contract,
+                enforce_source_lineage=False,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("duplicate calibration sample identity was accepted")
+        hostile_frozen_contract = json.loads(json.dumps(frozen_measurement_contract))
+        hostile_frozen_contract["constant_set"]["qualification_thresholds"][
+            "warm_query_ipc"
+        ] += 1
+        try:
+            verify_calibration_bundle(
+                calibration_bundle_path,
+                hostile_frozen_contract,
+                enforce_source_lineage=False,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("post-result calibration threshold change was accepted")
         self_digest = lambda label: hashlib.sha256(label.encode("utf-8")).hexdigest()
         external_package = {
             "archive_sha256": "b" * 64,
@@ -6279,6 +9016,73 @@ def self_test() -> None:
         else:
             raise ProofFailure("self-declared publication assertions were accepted")
         write_json(publication_path, publication_payload)
+        scenario_observations = {
+            "inflight_request_observed": [
+                {
+                    "values": {
+                        "query_capacity": 64,
+                        "query_depth": 0,
+                        "bulk_capacity": 64,
+                        "bulk_depth": 0,
+                        "active_request_count": 1,
+                        "active_request_class": "query",
+                    }
+                }
+            ],
+            "server_replaced": [
+                {
+                    "values": {
+                        "old_server_instance_id": "server-before",
+                        "new_server_instance_id": "server-after",
+                    }
+                }
+            ],
+            "query_replayed": [
+                {
+                    "values": {
+                        "submitted_operation_count": 1,
+                        "completed_operation_count": 1,
+                        "observed_server_instance_ids": [
+                            "server-before",
+                            "server-after",
+                        ],
+                    }
+                }
+            ],
+        }
+        derived_server_crash = derive_scenario_assertions(
+            "server_crash",
+            observations_by_kind=scenario_observations,
+            process_observations=[],
+            invocations=[],
+            control_actions=["hold_class", "crash_server"],
+            same_account={},
+            materialization={},
+        )
+        require(
+            derived_server_crash
+            == {
+                "one_replacement_server": True,
+                "pure_embedding_rpc_replayed_at_most_once": True,
+            },
+            "scenario assertion self-test did not derive exact raw claims",
+        )
+        hostile_scenario = json.loads(json.dumps(scenario_observations))
+        hostile_scenario["query_replayed"][0]["values"]["completed_operation_count"] = 2
+        try:
+            derive_scenario_assertions(
+                "server_crash",
+                observations_by_kind=hostile_scenario,
+                process_observations=[],
+                invocations=[],
+                control_actions=["hold_class", "crash_server"],
+                same_account={},
+                materialization={},
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("named scenario transitions with false values were accepted")
 
         consistency_payload = {
             "schema_version": 1,
@@ -6372,6 +9176,31 @@ def self_test() -> None:
                 "indexing_in_timed_run": False,
             },
         }
+        holdout_tasks, _holdout_manifest_set_sha256 = load_holdout_task_contracts()
+        quality_rows = []
+        for (repo_name, task_id), task_contract in sorted(holdout_tasks.items()):
+            for repeat in range(1, MIN_RETRIEVAL_QUALITY_REPEATS + 1):
+                row = json.loads(json.dumps(packet_row))
+                row["repo"] = repo_name
+                row["task_id"] = task_id
+                row["repeat"] = repeat
+                row["task_manifest_snapshot"] = {
+                    **task_contract["snapshot"],
+                    "manifest_path": str(task_contract["path"]),
+                }
+                row["repo_provenance"]["configured"] = {
+                    "url": task_contract["repo"]["url"],
+                    "ref": task_contract["repo"]["ref"],
+                    "languages": task_contract["repo"].get("languages", []),
+                }
+                row["repo_provenance"]["manifest"] = {
+                    "url": task_contract["repo"]["url"],
+                    "ref": task_contract["repo"]["ref"],
+                    "workspace_root": task_contract["repo"].get("workspace_root"),
+                }
+                row["repo_provenance"]["git_head"] = task_contract["repo"]["ref"]
+                row["repo_provenance"]["git_origin"] = task_contract["repo"]["url"]
+                quality_rows.append(row)
         quality_payload = {
             "modes": ["cold-cli"],
             "repeats": MIN_RETRIEVAL_QUALITY_REPEATS,
@@ -6381,7 +9210,7 @@ def self_test() -> None:
                 "evaluation_contract": RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
                 "profile": "self-test",
                 "evidence_identity": {
-                    "corpus_id": "self-test-corpus",
+                    "corpus_id": RELEASE_QUALITY_CORPUS_ID,
                     "cache_id": "self-test-cache",
                     "machine_fingerprint": "self-test-host",
                 },
@@ -6389,10 +9218,7 @@ def self_test() -> None:
                 "repeats": MIN_RETRIEVAL_QUALITY_REPEATS,
                 "quality_gate_status": "pass",
                 "publishable_blockers": [],
-                "rows": [
-                    {**json.loads(json.dumps(packet_row)), "repeat": repeat}
-                    for repeat in range(1, MIN_RETRIEVAL_QUALITY_REPEATS + 1)
-                ],
+                "rows": quality_rows,
             },
         }
         quality_path = root / "packet-runtime-summary.json"
@@ -6429,6 +9255,36 @@ def self_test() -> None:
             pass
         else:
             raise ProofFailure("incomplete retrieval quality repeats were accepted")
+        hostile_quality = json.loads(json.dumps(quality_payload))
+        hostile_quality["release_evidence"]["rows"] = [
+            row
+            for row in hostile_quality["release_evidence"]["rows"]
+            if row["task_id"] == "axios-request-dispatch"
+        ]
+        write_json(quality_path, hostile_quality)
+        try:
+            verify_retrieval_quality_raw_evidence(
+                quality_path,
+                source=manifest["source"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("one-task retrieval quality subset was accepted")
+        hostile_quality = json.loads(json.dumps(quality_payload))
+        hostile_quality["release_evidence"]["rows"][0]["task_manifest_snapshot"][
+            "prompt"
+        ] = "hostile substituted task"
+        write_json(quality_path, hostile_quality)
+        try:
+            verify_retrieval_quality_raw_evidence(
+                quality_path,
+                source=manifest["source"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("substituted retrieval quality task manifest was accepted")
         hostile_quality = json.loads(json.dumps(quality_payload))
         hostile_quality["release_evidence"]["source_tree"] = "f" * 40
         write_json(quality_path, hostile_quality)
@@ -6469,9 +9325,11 @@ def self_test() -> None:
                 "asset_target": manifest["asset_target"],
                 "release_version": manifest["release_version"],
                 "model_sha256": manifest["model"]["sha256"],
-                "backend": "Metal",
-                "policy": "accelerated",
-                "cache_state": "warm",
+                "matrix_cell_id": "installed_macos_arm64_cpu",
+                "accelerator_claim": "none",
+                "backend": "cpu",
+                "policy": "cpu_explicit",
+                "cache_state": "reused",
                 "residency_state": "resident",
                 "protocol_sha256": protocol_sha256,
                 "constant_set_sha256": constant_set_sha256,
@@ -6481,14 +9339,18 @@ def self_test() -> None:
                 "fingerprint": "f" * 64,
                 "platform": "macos",
                 "target": manifest["asset_target"],
-                "backend": "Metal",
-                "policy": "accelerated",
-                "cache_state": "warm",
+                "matrix_cell_id": "installed_macos_arm64_cpu",
+                "host_class": "post_publish_macos_arm64",
+                "accelerator_claim": "none",
+                "backend": "cpu",
+                "policy": "cpu_explicit",
+                "cache_state": "reused",
                 "residency_state": "resident",
                 "unplanned_suspend": False,
             },
             "installed_plugin": {
                 "schema_version": 1,
+                "installation_source": "marketplace",
                 "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
                 "marketplace_commit": "d" * 40,
                 "plugin_id": "codestory",
@@ -6501,7 +9363,7 @@ def self_test() -> None:
                 "plugin_version": "0.0.0",
                 "managed_binary_sha256": manifest["binary"]["sha256"],
                 "archive_sha256": "b" * 64,
-                "build_source": "release_asset",
+                "build_source": "github_release",
                 "repo_ref": "v0.0.0",
                 "provisioned_at": "self-test",
             },
@@ -6591,6 +9453,10 @@ def self_test() -> None:
             shared_identity=shared,
             measurement_contract=qualification_contract,
             required_tier="installed_runtime",
+            required_matrix_cell_id="installed_macos_arm64_cpu",
+            expected_policy="cpu_explicit",
+            expected_backend="cpu",
+            expected_accelerator_claim="none",
             installed_plugin=retained["installed_plugin"],
             managed_runtime=retained["managed_runtime"],
         )
@@ -6604,6 +9470,10 @@ def self_test() -> None:
                 shared_identity=shared,
                 measurement_contract=qualification_contract,
                 required_tier="installed_runtime",
+                required_matrix_cell_id="installed_macos_arm64_cpu",
+                expected_policy="cpu_explicit",
+                expected_backend="cpu",
+                expected_accelerator_claim="none",
                 installed_plugin=retained["installed_plugin"],
                 managed_runtime=retained["managed_runtime"],
             )
@@ -6611,6 +9481,69 @@ def self_test() -> None:
             pass
         else:
             raise ProofFailure("incomplete installed scenario evidence was accepted")
+        wrong_tier = json.loads(json.dumps(retained))
+        wrong_tier["tier"] = "protected_hardware"
+        try:
+            verify_retained_qualification(
+                wrong_tier,
+                manifest=manifest,
+                archive_sha256="b" * 64,
+                shared_identity=shared,
+                measurement_contract=qualification_contract,
+                required_tier="installed_runtime",
+                required_matrix_cell_id="installed_macos_arm64_cpu",
+                expected_policy="cpu_explicit",
+                expected_backend="cpu",
+                expected_accelerator_claim="none",
+                installed_plugin=retained["installed_plugin"],
+                managed_runtime=retained["managed_runtime"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("different-tier retained qualification was accepted")
+        stale_shared = json.loads(json.dumps(retained))
+        stale_shared["shared_identity"]["server_instance_id"] = "stale-server"
+        try:
+            verify_retained_qualification(
+                stale_shared,
+                manifest=manifest,
+                archive_sha256="b" * 64,
+                shared_identity=shared,
+                measurement_contract=qualification_contract,
+                required_tier="installed_runtime",
+                required_matrix_cell_id="installed_macos_arm64_cpu",
+                expected_policy="cpu_explicit",
+                expected_backend="cpu",
+                expected_accelerator_claim="none",
+                installed_plugin=retained["installed_plugin"],
+                managed_runtime=retained["managed_runtime"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("stale retained shared server identity was accepted")
+        wrong_cell = json.loads(json.dumps(retained))
+        wrong_cell["package"]["matrix_cell_id"] = "protected_macos_arm64_metal"
+        try:
+            verify_retained_qualification(
+                wrong_cell,
+                manifest=manifest,
+                archive_sha256="b" * 64,
+                shared_identity=shared,
+                measurement_contract=qualification_contract,
+                required_tier="installed_runtime",
+                required_matrix_cell_id="installed_macos_arm64_cpu",
+                expected_policy="cpu_explicit",
+                expected_backend="cpu",
+                expected_accelerator_claim="none",
+                installed_plugin=retained["installed_plugin"],
+                managed_runtime=retained["managed_runtime"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("wrong qualification matrix cell was accepted")
         invalid = {**valid, "embedding_adapter": "llvmpipe"}
         try:
             engine_identity(invalid, "accelerated", "Metal")
@@ -6700,10 +9633,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--qualification-evidence", type=Path)
     parser.add_argument("--produce-qualification-evidence", action="store_true")
+    parser.add_argument("--server-behavior-only", action="store_true")
     parser.add_argument("--publication-fault-evidence", type=Path)
     parser.add_argument("--retrieval-quality-evidence", type=Path)
+    parser.add_argument("--calibration-bundle", type=Path)
+    parser.add_argument("--enforce-calibration-freeze-lineage", action="store_true")
+    parser.add_argument("--calibration-run-index", type=int)
+    parser.add_argument("--calibration-run-output", type=Path)
+    parser.add_argument("--assemble-calibration-bundle", action="store_true")
+    parser.add_argument("--calibration-run", type=Path, action="append", default=[])
+    parser.add_argument("--calibration-bundle-output", type=Path)
+    parser.add_argument("--frozen-constant-set-output", type=Path)
+    parser.add_argument("--freeze-selected-at")
+    parser.add_argument("--calibration-producer-repository")
+    parser.add_argument("--calibration-producer-workflow-path")
+    parser.add_argument("--calibration-producer-run-id")
+    parser.add_argument("--calibration-producer-run-attempt")
+    parser.add_argument("--calibration-producer-artifact")
     parser.add_argument("--installed-plugin-provenance", type=Path)
     parser.add_argument("--installed-plugin-data", type=Path)
+    parser.add_argument(
+        "--installed-plugin-source",
+        choices=("marketplace", "candidate"),
+        default="marketplace",
+    )
+    parser.add_argument("--prepare-candidate-installed-proof", action="store_true")
+    parser.add_argument("--candidate-plugin-root-output", type=Path)
+    parser.add_argument("--candidate-plugin-data-output", type=Path)
+    parser.add_argument("--installed-plugin-provenance-output", type=Path)
+    parser.add_argument("--candidate-producer-repository")
+    parser.add_argument("--candidate-producer-workflow-path")
+    parser.add_argument("--candidate-producer-run-id")
+    parser.add_argument("--candidate-producer-run-attempt")
+    parser.add_argument("--candidate-artifact-name")
     parser.add_argument("--measurement-protocol", type=Path, default=MEASUREMENT_PROTOCOL)
     parser.add_argument("--expected-source-sha")
     parser.add_argument("--expected-source-tree")
@@ -6716,21 +9678,54 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
+    args.measurement_protocol = args.measurement_protocol.resolve()
+    if args.assemble_calibration_bundle:
+        result = assemble_calibration_bundle(args)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.prepare_candidate_installed_proof:
+        result = prepare_candidate_installed_proof(args)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     require(args.archive and args.checksum_file and args.expected_version, "archive, checksum, and expected version are required")
     args.archive = args.archive.resolve()
     args.checksum_file = args.checksum_file.resolve()
     args.out_dir = args.out_dir.resolve()
-    args.measurement_protocol = args.measurement_protocol.resolve()
     if args.qualification_evidence is not None:
         args.qualification_evidence = args.qualification_evidence.resolve()
     if args.publication_fault_evidence is not None:
         args.publication_fault_evidence = args.publication_fault_evidence.resolve()
     if args.retrieval_quality_evidence is not None:
         args.retrieval_quality_evidence = args.retrieval_quality_evidence.resolve()
+    if args.calibration_bundle is not None:
+        args.calibration_bundle = args.calibration_bundle.resolve()
+    if args.calibration_run_output is not None:
+        args.calibration_run_output = args.calibration_run_output.resolve()
+    require(
+        (args.calibration_run_output is None)
+        == (args.calibration_run_index is None),
+        "--calibration-run-output and --calibration-run-index must be supplied together",
+    )
+    require(
+        args.calibration_run_output is None or args.proof_tier == "calibration",
+        "calibration run output is valid only for the calibration proof tier",
+    )
     if args.installed_plugin_provenance is not None:
         args.installed_plugin_provenance = args.installed_plugin_provenance.resolve()
     if args.installed_plugin_data is not None:
         args.installed_plugin_data = args.installed_plugin_data.resolve()
+    if args.server_behavior_only:
+        require(
+            not args.version_only and args.proof_tier != "calibration",
+            "server-behavior-only proof requires a frozen non-calibration runtime tier",
+        )
+        require(
+            not args.produce_qualification_evidence
+            and args.qualification_evidence is None
+            and args.retrieval_quality_evidence is None
+            and args.publication_fault_evidence is None,
+            "server-behavior-only proof rejects qualification and retrieval-quality inputs",
+        )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     require(sha256(args.archive) == expected_archive_digest(args.checksum_file, args.archive), "archive checksum mismatch")
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-") as raw:
@@ -6749,11 +9744,35 @@ def main() -> int:
                 "package source tree does not match --expected-source-tree",
             )
         require_frozen = not args.version_only and args.proof_tier != "calibration"
+        require(
+            not args.enforce_calibration_freeze_lineage or require_frozen,
+            "calibration freeze lineage is valid only for the immediate frozen proof",
+        )
         measurement_contract = verify_package_server_contracts(
             manifest,
             args.measurement_protocol,
             require_frozen=require_frozen,
         )
+        calibration_bundle = None
+        if require_frozen:
+            require(
+                args.calibration_bundle is not None,
+                f"{args.proof_tier} proof requires --calibration-bundle for the frozen constant set",
+            )
+            require(
+                args.calibration_producer_run_id is not None
+                and args.calibration_producer_artifact is not None,
+                f"{args.proof_tier} proof requires authenticated calibration producer run and artifact identity",
+            )
+            calibration_bundle = verify_calibration_bundle(
+                args.calibration_bundle,
+                measurement_contract,
+                frozen_source=manifest["source"],
+                repository_root=Path(__file__).resolve().parents[2],
+                enforce_source_lineage=args.enforce_calibration_freeze_lineage,
+                expected_producer_run_id=args.calibration_producer_run_id,
+                expected_producer_artifact=args.calibration_producer_artifact,
+            )
         env = isolated_environment(root, args.engine_policy, args.offline)
         version = run([str(cli), "--version"], env=env, cwd=root, timeout=args.timeout_secs)
         require(args.expected_version in version["stdout"], f"CLI version does not contain {args.expected_version}")
@@ -6771,6 +9790,12 @@ def main() -> int:
                 "answer_quality_claim": False,
                 "release_readiness_claim": False,
                 "measurement_contract": measurement_contract,
+                "calibration_bundle": calibration_bundle,
+                "claim_scope": (
+                    "server_behavior_only"
+                    if args.server_behavior_only
+                    else "qualification"
+                ),
                 "highest_proof_tier": "package_structure",
             },
         }
@@ -6805,7 +9830,23 @@ def main() -> int:
             summary["package_contract"]["highest_proof_tier"] = (
                 "calibration" if args.proof_tier == "calibration" else "hosted_package"
             )
-            if args.proof_tier != "calibration":
+            if args.server_behavior_only:
+                summary["server_behavior"] = {
+                    "status": "pass",
+                    "runtime_tier_exercised": args.proof_tier,
+                    "answer_quality_claim": False,
+                    "retrieval_quality_claim": False,
+                    "release_readiness_claim": False,
+                    "installed_runtime_provenance_proven": (
+                        args.proof_tier == "installed_runtime"
+                        and isinstance(runtime.get("installed_plugin"), dict)
+                        and isinstance(runtime.get("managed_runtime"), dict)
+                    ),
+                }
+                summary["package_contract"]["highest_proof_tier"] = (
+                    "server_behavior"
+                )
+            elif args.proof_tier != "calibration":
                 require(
                     args.qualification_evidence is not None,
                     f"{args.proof_tier} proof requires --qualification-evidence from the exact live scenario run",
@@ -6815,13 +9856,35 @@ def main() -> int:
                 except json.JSONDecodeError as exc:
                     raise ProofFailure(f"qualification evidence is not valid JSON: {exc}") from exc
                 require(isinstance(retained, dict), "qualification evidence must be an object")
+                requested_matrix_cell_id = require_nonempty_string(
+                    args.qualification_matrix_cell,
+                    f"{args.proof_tier} proof requires --qualification-matrix-cell",
+                )
+                requested_backend = args.expected_backend or require_nonempty_string(
+                    runtime["identity"].get("embedding_backend"),
+                    "runtime embedding backend",
+                )
+                requested_matrix_cell = selected_qualification_matrix_cell(
+                    measurement_contract["measurement_protocol"],
+                    cell_id=requested_matrix_cell_id,
+                    target=manifest["asset_target"],
+                    proof_tier=args.proof_tier,
+                    expected_policy=args.engine_policy,
+                    expected_backend=requested_backend,
+                )
                 summary["qualification"] = verify_retained_qualification(
                     retained,
                     manifest=manifest,
                     archive_sha256=sha256(args.archive),
-                    shared_identity=None,
+                    shared_identity=runtime["shared_identity"],
                     measurement_contract=measurement_contract,
                     required_tier=args.proof_tier,
+                    required_matrix_cell_id=requested_matrix_cell_id,
+                    expected_policy=args.engine_policy,
+                    expected_backend=requested_backend,
+                    expected_accelerator_claim=requested_matrix_cell[
+                        "accelerator_claim"
+                    ],
                     installed_plugin=runtime.get("installed_plugin"),
                     managed_runtime=runtime.get("managed_runtime"),
                 )

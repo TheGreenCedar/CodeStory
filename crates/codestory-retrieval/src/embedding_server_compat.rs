@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 #[cfg(not(feature = "test-support"))]
 use std::sync::Mutex;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ProductEmbeddingIdentity {
@@ -99,9 +100,11 @@ pub fn acquire_product_embedding_server_lease(
     })
 }
 
-pub fn embed_prepared_via_server(
+pub fn embed_prepared_via_server_with_control(
     runtime: &SidecarRuntimeConfig,
     inputs: &[String],
+    maximum_timeout: Option<Duration>,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<Vec<f32>>> {
     let raw = inputs
         .iter()
@@ -112,17 +115,27 @@ pub fn embed_prepared_via_server(
                 .to_string()
         })
         .collect::<Vec<_>>();
-    PerUserEmbeddingClient::for_runtime(runtime)?.embed_documents(&raw)
+    PerUserEmbeddingClient::for_runtime(runtime)?.embed_documents_with_control(
+        &raw,
+        maximum_timeout,
+        cancelled,
+    )
 }
 
-pub fn embed_prepared_query_via_server(
+pub fn embed_prepared_query_via_server_with_control(
     runtime: &SidecarRuntimeConfig,
     input: String,
+    maximum_timeout: Option<Duration>,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<f32>> {
     let raw = input
         .strip_prefix(crate::embedding_contract::CODERANK_QUERY_PREFIX)
         .unwrap_or(&input);
-    PerUserEmbeddingClient::for_runtime(runtime)?.embed_query(raw)
+    PerUserEmbeddingClient::for_runtime(runtime)?.embed_query_with_control(
+        raw,
+        maximum_timeout,
+        cancelled,
+    )
 }
 
 fn compatibility_identity(identity: EmbeddingEngineIdentity) -> Result<ProductEmbeddingIdentity> {

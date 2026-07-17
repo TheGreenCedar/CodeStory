@@ -6306,6 +6306,7 @@ version = "0.11.20"
                     retry_after_ms: None,
                     failure: Some(format!("retained-{index}")),
                     embedding_capacity: None,
+                    embedding_retry: None,
                     capabilities: codestory_runtime::ActivationCapabilities {
                         local_navigation: codestory_runtime::ActivationCapabilityState::Unavailable,
                         broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,
@@ -6821,6 +6822,7 @@ version = "0.11.20"
                 retry_after_ms: Some(375),
                 failure: None,
                 embedding_capacity: None,
+                embedding_retry: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
@@ -6861,6 +6863,13 @@ version = "0.11.20"
                 retry_after_ms: Some(250),
                 failure: Some("publication changed".to_string()),
                 embedding_capacity: None,
+                embedding_retry: Some(codestory_contracts::api::EmbeddingRetryStateDto {
+                    code: "embedding_server_incompatible_active_owner".into(),
+                    retry_class: "after_owner_idle".into(),
+                    retry_after_ms: 250,
+                    retry_condition: "the incompatible owner exits while fully idle".into(),
+                    capacity: None,
+                }),
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
@@ -6875,6 +6884,10 @@ version = "0.11.20"
         assert_eq!(
             retry.pointer("/current_operation/attempt"),
             Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            retry.pointer("/current_operation/embedding_retry/retry_class"),
+            Some(&serde_json::json!("after_owner_idle"))
         );
         assert_eq!(retry.get("retry_after_ms"), Some(&serde_json::json!(250)));
         assert_eq!(
@@ -6900,6 +6913,7 @@ version = "0.11.20"
                 retry_after_ms: None,
                 failure: Some("managed retrieval unavailable".to_string()),
                 embedding_capacity: None,
+                embedding_retry: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,

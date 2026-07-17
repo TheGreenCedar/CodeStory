@@ -22,6 +22,28 @@ digests, package target, model/backend contract, and server proof marker. Any
 source, binary, protocol, constant, measurement, package, or host identity
 change invalidates earlier evidence.
 
+## Identity boundary
+
+The transport security boundary is OS-private same-user IPC. The listener
+authenticates the account plus the client's native PID and process-start
+identity. `Hello` must repeat that PID and process-start identity exactly; its
+executable digest and version are same-user compatibility claims, not
+adversarial attestation or package-provenance proof.
+
+Before binding the listener, the server hashes its exact executable and reports
+that digest and version in every snapshot. Clients bind the snapshot PID and
+process-start identity to the authenticated transport and validate the reported
+digest and version against the executable they captured before spawn or
+connect. Installed-runtime qualification separately hashes the actual running
+executable and binds it to the package manifest. A `Hello` claim cannot replace
+that external proof.
+
+`EmbedQuery` and `EmbedDocuments` may carry an opaque cancellation token.
+`Cancel` must name the target request and repeat that token. The server accepts
+the cancellation only when the token, authenticated client PID, and
+process-start identity all match the original request; ambiguous matches fail
+closed. Cancellation tokens never appear in snapshots or diagnostics.
+
 ## Calibration and qualification
 
 Calibration measures a draft candidate and may inform a later constant-set
@@ -38,6 +60,10 @@ from its own origin. Correlated request IDs and the server event sequence order
 cross-process events; subtracting timestamps from different process origins is
 forbidden. Wall clock records provenance only. An unplanned sleep, hibernation,
 VM pause, or power transition invalidates a performance block.
+Calibration uses complete successful native-backed operation duration as a
+conservative watchdog bound; it does not claim per-native-event progress
+timing, while the watchdog still observes admission and native-batch progress
+sequence.
 
 ## Required scenarios
 
@@ -124,6 +150,33 @@ package tiers may bind the unpacked archive through the source plugin launcher.
 executable it claims; it rejects
 `CODESTORY_CLI`, a repository-source plugin root, and a direct unpacked binary
 override.
+
+Accepted-PR proof has a separate candidate-installed lane for Linux x64 and
+Apple Silicon. It copies the exact source plugin into an isolated private
+installation root beneath the canonical runner temp directory and outside the
+source checkout, stages the exact packaged archive as the managed runtime, and
+binds both to the trusted coordinator run. That lane is opt-in and cannot stand
+in for the post-publish marketplace proof. Release closeout still runs all six
+published packages through the marketplace-managed installation path.
+
+The coordinator's `server` scope is narrower than qualification. It runs the
+Linux package, protected Apple Silicon package, and both candidate-installed
+two-host paths with the frozen calibration bundle, but intentionally does not
+consume retrieval-quality evidence. The verifier records
+`claim_scope=server_behavior_only` and rejects qualification inputs in that
+mode. It may support server lifecycle, package identity, accelerator execution,
+and candidate-managed runtime provenance claims; it cannot support retrieval
+quality, answer quality, release readiness, or any retained qualification-tier
+claim. Every other frozen package, hardware, installed-runtime, and release
+scope still requires authenticated exact-head packet-quality evidence.
+
+Frozen calibration bundles are accepted only from a successful
+`workflow_dispatch` run of `packaged-platform-pr.yml` in this repository. Every
+consumer binds the run ID, exact `embedding-calibration-bundle-<source-sha>`
+artifact name, unexpired artifact record, source commit, and bundle producer
+identity before applying the frozen thresholds. The exact
+unfrozen-to-frozen source lineage is checked once at the freeze transition; it
+is not reinterpreted as a requirement for every later package proof.
 
 Platform proof boundaries:
 

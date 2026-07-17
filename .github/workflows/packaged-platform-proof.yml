@@ -32,6 +32,31 @@ on:
         required: false
         default: ""
         type: string
+      calibration_bundle_artifact:
+        description: Frozen calibration bundle artifact name.
+        required: false
+        default: ""
+        type: string
+      calibration_bundle_run_id:
+        description: Workflow run that produced the frozen calibration bundle artifact.
+        required: false
+        default: ""
+        type: string
+      calibration_mode:
+        description: Collect the three independent hosted Linux calibration runs only.
+        required: false
+        default: false
+        type: boolean
+      enforce_calibration_freeze_lineage:
+        description: Require the exact calibration-head to freeze-head constant-only transition.
+        required: false
+        default: false
+        type: boolean
+      candidate_installed_proof:
+        description: Stage and qualify the exact PR package through the private candidate-managed launcher boundary.
+        required: false
+        default: false
+        type: boolean
     secrets:
       APPLE_DEVELOPER_ID_P12_BASE64:
         required: false
@@ -47,6 +72,7 @@ on:
         required: false
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -67,18 +93,19 @@ jobs:
     # The six APPLE_* credentials are an environment-scoped release contract;
     # repository-only secrets are not the supported signing configuration.
     environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}
-    timeout-minutes: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}
+    timeout-minutes: ${{ inputs.calibration_mode && 180 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60) }}
     strategy:
       fail-fast: false
       # GitHub applies matrix exclusions before includes, so an include-only
       # matrix must select the complete row set rather than trying to exclude
       # rows after the fact.
-      matrix: ${{ fromJSON(inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-24.04-arm","rust_target":"aarch64-unknown-linux-gnu","asset_target":"linux-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","asset_target":"windows-arm64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}') }}
+      matrix: ${{ fromJSON(inputs.calibration_mode && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'server' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-24.04-arm","rust_target":"aarch64-unknown-linux-gnu","asset_target":"linux-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","asset_target":"windows-arm64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
 
       - name: Check shared worktree setup and host adapter
         if: matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64'
@@ -461,41 +488,127 @@ jobs:
           name: ${{ inputs.quality_evidence_artifact }}
           path: target/release-quality-evidence
 
+      - name: Authenticate calibration bundle producer
+        if: matrix.asset_target == 'linux-x64' && inputs.calibration_bundle_artifact != '' && inputs.calibration_bundle_run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
+        run: |
+          set -euo pipefail
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID")"
+          producer_sha="$(jq -r '.head_sha' <<<"$run")"
+          test "$(jq -r '.head_repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.path' <<<"$run")" = ".github/workflows/packaged-platform-pr.yml"
+          test "$(jq -r '.event' <<<"$run")" = workflow_dispatch
+          test "$(jq -r '.conclusion' <<<"$run")" = success
+          test "$CALIBRATION_ARTIFACT" = "embedding-calibration-bundle-$producer_sha"
+          artifact_count="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID/artifacts?per_page=100" \
+              | jq --arg name "$CALIBRATION_ARTIFACT" \
+                '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+          )"
+          test "$artifact_count" = 1
+
+      - name: Download frozen calibration bundle
+        if: matrix.asset_target == 'linux-x64' && inputs.calibration_bundle_artifact != '' && inputs.calibration_bundle_run_id != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.calibration_bundle_artifact }}
+          path: target/calibration-bundle
+          run-id: ${{ inputs.calibration_bundle_run_id }}
+          github-token: ${{ github.token }}
+
       - name: Packaged per-user server calibration or qualification
         if: matrix.asset_target == 'linux-x64'
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
+          CALIBRATION_MODE: ${{ inputs.calibration_mode }}
+          PROOF_SCOPE: ${{ inputs.scope }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
+          common_args=(
+            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz"
+            --checksum-file target/release-dist/SHA256SUMS.txt
+            --expected-version "${{ inputs.version }}"
+            --project "${{ github.workspace }}"
+            --plugin-root plugins/codestory
+            --plugin-handoff
+            --engine-policy cpu_explicit
+            --expected-backend CPU
+            --offline
+            --qualification-matrix-cell hosted_linux_x64_cpu
+            --expected-source-sha "$source_sha"
+            --expected-source-tree "$source_tree"
+          )
+          if [ "$CALIBRATION_MODE" = true ]; then
+            test "$(jq -r .status docs/testing/per-user-embedding-server-constant-set.json)" = unfrozen
+            mkdir -p target/calibration-runs/linux
+            for run_index in 1 2 3; do
+              python .github/scripts/check-packaged-agent-proof.py \
+                "${common_args[@]}" \
+                --proof-tier calibration \
+                --produce-qualification-evidence \
+                --calibration-run-index "$run_index" \
+                --calibration-run-output "target/calibration-runs/linux/run-${run_index}.json" \
+                --qualification-evidence "target/calibration-runs/linux/qualification-${run_index}.json" \
+                --out-dir "target/calibration-runs/linux/proof-${run_index}"
+            done
+            exit 0
+          fi
           proof_tier=calibration
           if [ "$(jq -r .status docs/testing/per-user-embedding-server-constant-set.json)" = frozen ]; then
             proof_tier=hosted_package
           fi
+          calibration_args=()
+          if [ "$proof_tier" = hosted_package ]; then
+            calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print 2>/dev/null || true)"
+            test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+            calibration_args=(
+              --calibration-bundle "$calibration_bundle"
+              --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}"
+              --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}"
+            )
+            if [ "${{ inputs.enforce_calibration_freeze_lineage }}" = true ]; then
+              calibration_args+=(--enforce-calibration-freeze-lineage)
+            fi
+          fi
           quality_args=()
+          qualification_args=()
+          claim_scope_args=()
           quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
-          if [ -f "$quality_path" ]; then
-            quality_args=(--retrieval-quality-evidence "$quality_path")
+          if [ "$proof_tier" = hosted_package ]; then
+            if [ "$PROOF_SCOPE" = server ]; then
+              claim_scope_args=(--server-behavior-only)
+            else
+              test -f "$quality_path"
+              quality_args=(--retrieval-quality-evidence "$quality_path")
+              qualification_args=(
+                --produce-qualification-evidence
+                --qualification-evidence target/packaged-agent-proof/qualification.json
+              )
+            fi
           fi
           python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.tar.gz" \
-            --checksum-file target/release-dist/SHA256SUMS.txt \
-            --expected-version "${{ inputs.version }}" \
-            --project "${{ github.workspace }}" \
-            --plugin-root plugins/codestory \
-            --plugin-handoff \
-            --engine-policy cpu_explicit \
-            --expected-backend CPU \
-            --offline \
+            "${common_args[@]}" \
             --proof-tier "$proof_tier" \
-            --qualification-matrix-cell hosted_linux_x64_cpu \
-            --produce-qualification-evidence \
-            --qualification-evidence target/packaged-agent-proof/qualification.json \
-            --expected-source-sha "$source_sha" \
-            --expected-source-tree "$source_tree" \
+            "${claim_scope_args[@]}" \
+            "${qualification_args[@]}" \
+            "${calibration_args[@]}" \
             "${quality_args[@]}" \
             --out-dir target/packaged-agent-proof
+
+      - name: Upload hosted Linux calibration runs
+        if: always() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: embedding-calibration-linux-${{ inputs.version }}
+          path: target/calibration-runs/linux
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload packaged agent proof artifacts
         if: always() && matrix.asset_target == 'linux-x64'
@@ -504,6 +617,111 @@ jobs:
           name: packaged-agent-proof-${{ matrix.asset_target }}
           path: target/packaged-agent-proof
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stage isolated candidate-managed Linux install
+        if: >-
+          matrix.asset_target == 'linux-x64' &&
+          inputs.candidate_installed_proof &&
+          !inputs.calibration_mode &&
+          (inputs.scope == 'server' || inputs.quality_evidence_artifact != '') &&
+          inputs.calibration_bundle_artifact != '' &&
+          inputs.calibration_bundle_run_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          archive="target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz"
+          candidate_root="$(mktemp -d "$RUNNER_TEMP/codestory-candidate-installed-linux.XXXXXX")"
+          candidate_root="$(cd "$candidate_root" && pwd -P)"
+          case "$candidate_root/" in
+            "$GITHUB_WORKSPACE/"*)
+              echo "::error::Candidate-managed root must be outside the source checkout."
+              exit 1
+              ;;
+          esac
+          echo "CODESTORY_CANDIDATE_LINUX_ROOT=$candidate_root" >> "$GITHUB_ENV"
+          mkdir -p target/candidate-installed-linux
+          python .github/scripts/check-packaged-agent-proof.py \
+            --prepare-candidate-installed-proof \
+            --archive "$archive" \
+            --checksum-file target/release-dist/SHA256SUMS.txt \
+            --expected-version "${{ inputs.version }}" \
+            --plugin-root plugins/codestory \
+            --candidate-plugin-root-output "$candidate_root/plugin" \
+            --candidate-plugin-data-output "$candidate_root/data" \
+            --installed-plugin-provenance-output target/candidate-installed-linux/provenance.json \
+            --candidate-producer-repository "$GITHUB_REPOSITORY" \
+            --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
+            --candidate-producer-run-id "$GITHUB_RUN_ID" \
+            --candidate-producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --candidate-artifact-name "$(basename "$archive")"
+
+      - name: Prove two-host candidate-installed Linux runtime
+        if: >-
+          matrix.asset_target == 'linux-x64' &&
+          inputs.candidate_installed_proof &&
+          !inputs.calibration_mode &&
+          (inputs.scope == 'server' || inputs.quality_evidence_artifact != '') &&
+          inputs.calibration_bundle_artifact != '' &&
+          inputs.calibration_bundle_run_id != ''
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          claim_args=()
+          if [ "${{ inputs.scope }}" = server ]; then
+            claim_args=(--server-behavior-only)
+          else
+            test -f "$quality_path"
+            claim_args=(
+              --produce-qualification-evidence
+              --qualification-evidence target/candidate-installed-linux/qualification.json
+              --retrieval-quality-evidence "$quality_path"
+            )
+          fi
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "$archive" \
+            --checksum-file target/release-dist/SHA256SUMS.txt \
+            --expected-version "${{ inputs.version }}" \
+            --project "${{ github.workspace }}" \
+            --plugin-root "$CODESTORY_CANDIDATE_LINUX_ROOT/plugin" \
+            --plugin-handoff \
+            --engine-policy cpu_explicit \
+            --expected-backend CPU \
+            --offline \
+            --proof-tier installed_runtime \
+            --qualification-matrix-cell candidate_installed_linux_x64_cpu \
+            "${claim_args[@]}" \
+            --calibration-bundle "$calibration_bundle" \
+            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
+            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
+            --installed-plugin-source candidate \
+            --installed-plugin-provenance target/candidate-installed-linux/provenance.json \
+            --installed-plugin-data "$CODESTORY_CANDIDATE_LINUX_ROOT/data" \
+            --candidate-producer-repository "$GITHUB_REPOSITORY" \
+            --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
+            --candidate-producer-run-id "$GITHUB_RUN_ID" \
+            --candidate-producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --candidate-artifact-name "$(basename "$archive")" \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --timeout-secs 1800 \
+            --out-dir target/candidate-installed-linux/proof
+
+      - name: Upload candidate-installed Linux proof
+        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.scope == 'server' || inputs.quality_evidence_artifact != '')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: candidate-installed-linux-${{ inputs.version }}
+          path: target/candidate-installed-linux
+          if-no-files-found: error
           retention-days: 30
 
       - name: Package release asset on Windows

@@ -31,8 +31,13 @@
   set, and measurement-protocol identities. Server qualification is
   preregistered and fail-closed: calibration cannot satisfy package, protected
   hardware, installed-plugin, or release claims, and installed evidence must
-  prove the managed marketplace plugin/runtime rather than a direct CLI
-  override.
+  prove either the isolated exact candidate package during accepted-PR proof or
+  the managed marketplace plugin/runtime after publication rather than a direct
+  CLI override. Frozen calibration consumers authenticate the exact successful
+  coordinator run and artifact before trusting the bundle. The PR coordinator
+  can select a fail-closed server-behavior scope that proves package and
+  candidate-managed runtime behavior without making retrieval-quality,
+  qualification-tier, or release-readiness claims.
 - The manual Windows manifest-missing readiness lane now installs the
   checksum-pinned Vulkan SDK before running the real locked `ready_command`
   contract with explicit CPU runtime permission. Windows source-build proof

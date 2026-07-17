@@ -2,7 +2,8 @@
 
 use crate::config::SidecarRuntimeConfig;
 use crate::embedding_server_compat::{
-    ProductEmbeddingIdentity, embed_prepared_query_via_server, embed_prepared_via_server,
+    ProductEmbeddingIdentity, embed_prepared_query_via_server_with_control,
+    embed_prepared_via_server_with_control,
 };
 #[cfg(not(feature = "test-support"))]
 use crate::embedding_server_compat::{
@@ -16,6 +17,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 #[cfg(not(feature = "test-support"))]
 use std::time::Instant;
 
@@ -127,31 +129,63 @@ impl ProductEmbeddingClient {
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_query_with_control(text, None, &|| false)
+    }
+
+    pub fn embed_query_with_control(
+        &self,
+        text: &str,
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<f32>> {
         ensure_test_embedding_available(&self.runtime.cache_root)?;
         if text.trim().is_empty() {
             bail!("cannot embed an empty query");
         }
         let prepared = format!("{CODERANK_QUERY_PREFIX_DEFAULT}{text}");
-        embed_prepared_query_via_server(&self.runtime, prepared)
+        embed_prepared_query_via_server_with_control(
+            &self.runtime,
+            prepared,
+            maximum_timeout,
+            cancelled,
+        )
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_documents_with_control(texts, None, &|| false)
+    }
+
+    pub fn embed_documents_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Vec<f32>>> {
         if CODERANK_DOCUMENT_PREFIX_DEFAULT.is_empty() {
-            return self.embed_prepared_texts(texts);
+            return self.embed_prepared_texts_with_control(texts, maximum_timeout, cancelled);
         }
         let prepared = texts
             .iter()
             .map(|text| format!("{CODERANK_DOCUMENT_PREFIX_DEFAULT}{text}"))
             .collect::<Vec<_>>();
-        self.embed_prepared_texts(&prepared)
+        self.embed_prepared_texts_with_control(&prepared, maximum_timeout, cancelled)
     }
 
     pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_prepared_texts_with_control(texts, None, &|| false)
+    }
+
+    pub fn embed_prepared_texts_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Vec<f32>>> {
         ensure_test_embedding_available(&self.runtime.cache_root)?;
         if texts.iter().any(|text| text.trim().is_empty()) {
             bail!("cannot embed empty text");
         }
-        embed_prepared_via_server(&self.runtime, texts)
+        embed_prepared_via_server_with_control(&self.runtime, texts, maximum_timeout, cancelled)
     }
 }
 

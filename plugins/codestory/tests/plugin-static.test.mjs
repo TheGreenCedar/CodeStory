@@ -698,6 +698,89 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
   }
 });
 
+test("candidate managed CLI metadata is accepted only for the exact proof archive", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-candidate-cli-"));
+  const version = "0.0.1";
+  const archiveSha256 = "a".repeat(64);
+  const qualificationNonce = "c".repeat(64);
+  const qualificationDir = join(dataDir, "qualification");
+  const target = releaseAssetForPlatform(version).archiveName
+    .slice(`codestory-cli-v${version}-`.length)
+    .replace(/\.(?:zip|tar\.gz)$/u, "");
+  try {
+    const fixture = await writeManagedCliFixture(dataDir, version);
+    const manifest = managedReleaseManifest(
+      version,
+      fixture.cliPath.slice(fixture.versionDir.length + 1),
+      createHash("sha256").update(await readFile(fixture.cliPath)).digest("hex"),
+    );
+    manifest.build_source = "candidate_archive";
+    manifest.repo_ref = "b".repeat(40);
+    manifest.archive_sha256 = archiveSha256;
+    manifest.archive_url = `candidate-archive:${archiveSha256}`;
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(manifest),
+      "utf8",
+    );
+    const probe = () => ({
+      status: 0,
+      error: null,
+      version,
+      stdout: "",
+      stderr: "",
+    });
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(
+        fixture.versionDir,
+        version,
+        target,
+        probe,
+      ).verified,
+      false,
+    );
+    process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256 = archiveSha256;
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(
+        fixture.versionDir,
+        version,
+        target,
+        probe,
+      ).verified,
+      false,
+    );
+    await mkdir(qualificationDir, { mode: 0o700 });
+    await writeFile(
+      join(qualificationDir, "candidate-managed-install.json"),
+      JSON.stringify({
+        schema_version: 1,
+        purpose: "codestory-candidate-managed-install",
+        archive_sha256: archiveSha256,
+        qualification_nonce_sha256: createHash("sha256")
+          .update(qualificationNonce)
+          .digest("hex"),
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    process.env.CODESTORY_EMBED_QUALIFICATION_DIR = await realpath(qualificationDir);
+    process.env.CODESTORY_EMBED_QUALIFICATION_NONCE = qualificationNonce;
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(
+        fixture.versionDir,
+        version,
+        target,
+        probe,
+      ).verified,
+      true,
+    );
+  } finally {
+    delete process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256;
+    delete process.env.CODESTORY_EMBED_QUALIFICATION_DIR;
+    delete process.env.CODESTORY_EMBED_QUALIFICATION_NONCE;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("plugin path comparison uses file identity and platform missing-path rules", async () => {
   const root = await mkdtemp(join(tmpdir(), "codestory-path-identity-"));
   const executable = join(root, "codestory-cli");

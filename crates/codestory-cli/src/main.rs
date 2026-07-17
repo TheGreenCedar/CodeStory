@@ -324,6 +324,7 @@ fn command_failure_envelope(
             full_repair: Vec::new(),
             readiness: None,
             embedding_capacity: None,
+            embedding_retry: None,
         },
     ))
     .with_context(context)
@@ -408,12 +409,17 @@ fn open_agent_surface(
     let opened = runtime.ensure_open_from_summary(refresh, before.clone())?;
     ensure_index_ready(&opened, surface)?;
     codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
+        .map_err(map_embedding_preflight_error)
         .with_context(|| format!("initialize retrieval for {surface}"))?;
     Ok(OpenedAgentSurface {
         runtime,
         before,
         opened,
     })
+}
+
+fn map_embedding_preflight_error(error: anyhow::Error) -> anyhow::Error {
+    codestory_runtime::embedding_api_error(&error).map_or(error, map_api_error)
 }
 
 fn run_cache(cmd: CacheCommand) -> Result<()> {
@@ -884,6 +890,7 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
                 full_repair: output.repair_hints.clone(),
                 readiness: None,
                 embedding_capacity: None,
+                embedding_retry: None,
             },
         ))
         .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
@@ -6022,6 +6029,7 @@ fn ambiguous_command_failure(
             full_repair: output.error.next_commands.clone(),
             readiness: None,
             embedding_capacity: None,
+            embedding_retry: None,
         },
     ))
     .with_context(serde_json::json!({
@@ -10438,6 +10446,40 @@ mod tests {
         assert_eq!(
             relative_path(root, "\\\\?\\UNC\\server\\share\\file.rs"),
             "//server/share/file.rs"
+        );
+    }
+
+    #[test]
+    fn embedding_preflight_preserves_typed_capacity_for_json_failures() {
+        let error = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_capacity".into(),
+            message: "query queue is full".into(),
+            retry_class: "after_capacity_change".into(),
+            retry_after_ms: 25,
+            retry_condition: "a query slot becomes available".into(),
+            capacity: Some(codestory_retrieval::EmbeddingCapacityPressureWire {
+                reason: "queue_full".into(),
+                queue_class: "query".into(),
+                capacity: 64,
+                depth: 64,
+                retry_after_ms: 25,
+                retry_condition: "a query slot becomes available".into(),
+                owner_state: "ready".into(),
+                active_scope_id: None,
+                active_request_id: None,
+                active_request_class: None,
+            }),
+        });
+
+        let mapped = map_embedding_preflight_error(error);
+        let api = runtime::api_error_in_chain(&mapped).expect("typed CLI API error");
+        assert_eq!(api.code, "embedding_capacity");
+        assert_eq!(
+            api.details
+                .as_deref()
+                .and_then(|details| details.embedding_capacity.as_ref())
+                .map(|pressure| pressure.retry_condition.as_str()),
+            Some("a query slot becomes available")
         );
     }
 

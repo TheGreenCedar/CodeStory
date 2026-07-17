@@ -61,6 +61,28 @@
     "nonclaim": "overhead_relative_to_incumbent",
     "rationale": "the incumbent in-process runtime does not expose the same server phase hooks or ownership semantics, so a paired delta would conflate IPC with runtime, cache, model-load, and lifecycle changes"
   },
+  "calibration_matrix": {
+    "hosted_linux_x64_cpu": {
+      "asset_target": "linux-x64",
+      "proof_tier": "calibration",
+      "host_class": "github_hosted_linux_x64",
+      "policy": "cpu_explicit",
+      "backend": "cpu",
+      "cache_state": "reused",
+      "residency_state": "resident",
+      "accelerator_claim": "none"
+    },
+    "protected_macos_arm64_metal": {
+      "asset_target": "macos-arm64",
+      "proof_tier": "calibration",
+      "host_class": "protected_self_hosted_macos_arm64",
+      "policy": "accelerated",
+      "backend": "metal",
+      "cache_state": "reused",
+      "residency_state": "resident",
+      "accelerator_claim": "metal"
+    }
+  },
   "host_package_matrix": {
     "hosted_linux_x64_cpu": {
       "asset_target": "linux-x64",
@@ -106,6 +128,26 @@
       "asset_target": "linux-arm64",
       "proof_tier": "installed_runtime",
       "host_class": "post_publish_linux_arm64",
+      "policy": "cpu_explicit",
+      "backend": "cpu",
+      "cache_state": "reused",
+      "residency_state": "resident",
+      "accelerator_claim": "none"
+    },
+    "candidate_installed_linux_x64_cpu": {
+      "asset_target": "linux-x64",
+      "proof_tier": "installed_runtime",
+      "host_class": "premerge_candidate_linux_x64",
+      "policy": "cpu_explicit",
+      "backend": "cpu",
+      "cache_state": "reused",
+      "residency_state": "resident",
+      "accelerator_claim": "none"
+    },
+    "candidate_installed_macos_arm64_cpu": {
+      "asset_target": "macos-arm64",
+      "proof_tier": "installed_runtime",
+      "host_class": "premerge_candidate_macos_arm64",
       "policy": "cpu_explicit",
       "backend": "cpu",
       "cache_state": "reused",
@@ -499,7 +541,7 @@
         "metric": "busy_retry_usefulness",
         "operand": "awake_end_ns-awake_start_ns"
       },
-      "successful_native_progress_gap": {
+      "successful_operation_duration": {
         "artifact": "measurements.raw.json",
         "metrics": [
           "cold_first_vector",
@@ -509,12 +551,12 @@
           "bulk_documents_per_second",
           "bulk_tokens_per_second"
         ],
-        "operand": "maximum_successive_native_progress_gap_ns"
+        "operand": "successful_operation_duration_ns"
       }
     },
     "clean_run_requirements": {
       "minimum_runs_per_matrix_cell": 3,
-      "matrix_coverage": "every_host_package_matrix_cell",
+      "matrix_coverage": "every_calibration_matrix_cell",
       "source_identity": "one_exact_candidate_commit_and_tree",
       "artifact_selection": "all_preregistered_clean_runs",
       "unplanned_suspend": false,
@@ -566,13 +608,13 @@
       },
       "hard_native_no_progress_ms": {
         "source_cells": [
-          "successful_native_progress_gap"
+          "successful_operation_duration"
         ],
-        "formula": "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*4.00))"
+        "formula": "max(1,ceiling(maximum_complete_successful_operation_duration_ms_across_all_selected_samples*4.00))"
       },
       "watchdog_cadence_ms": {
         "source_cells": [
-          "successful_native_progress_gap"
+          "successful_operation_duration"
         ],
         "formula": "max(1,floor(hard_native_no_progress_ms/20))"
       }
@@ -581,8 +623,9 @@
   },
   "threshold_selection": {
     "minimum_clean_calibration_runs_per_matrix_cell": 3,
-    "matrix_coverage": "every_host_package_matrix_cell",
+    "matrix_coverage": "every_calibration_matrix_cell",
     "source_identity": "one_exact_candidate_commit_and_tree",
+    "producer_identity": "trusted_packaged_platform_pr_workflow_run_and_exact_artifact",
     "artifact_selection": "all_preregistered_clean_runs",
     "less_than_or_equal": "ceiling(maximum_cell_aggregate_across_all_runs*1.20)",
     "greater_than_or_equal": "floor(minimum_cell_aggregate_across_all_runs*0.80)",
@@ -590,6 +633,32 @@
     "retrieval_quality": 1.0,
     "outlier_removal": "none",
     "post_result_threshold_changes": false
+  },
+  "calibration_bundle_contract": {
+    "schema_version": 1,
+    "required_for_frozen_qualification": true,
+    "matrix_cells": "exactly_every_calibration_matrix_cell",
+    "independent_clean_runs_per_matrix_cell": 3,
+    "source_identity": "one_exact_candidate_commit_and_tree",
+    "producer_identity": "trusted_packaged_platform_pr_workflow_run_and_exact_artifact",
+    "contract_identity": [
+      "protocol_sha256",
+      "measurement_protocol_sha256"
+    ],
+    "raw_artifact": "embedded_product_and_five_process_measurements_with_canonical_sha256",
+    "clock_witnesses": "awake_monotonic_plus_suspend_inclusive_per_sample",
+    "successful_operation_operand": "successful_operation_duration_ns",
+    "freeze_digest_inputs": [
+      "selection_protocol",
+      "source",
+      "producer",
+      "contracts",
+      "run_artifact_sha256s",
+      "calibration_required_values",
+      "qualification_thresholds"
+    ],
+    "constant_set_comparison": "exact_recomputed_values_thresholds_and_freeze_record",
+    "qualification_boundary": "installed_runtime_cells_are_post_freeze_qualification_only"
   },
   "measurement_rules": {
     "calibration_and_qualification_are_distinct": true,

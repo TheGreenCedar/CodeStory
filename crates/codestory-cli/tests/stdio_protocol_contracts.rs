@@ -4655,7 +4655,7 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
 }
 
 #[test]
-fn cold_ground_uses_local_capability_while_search_stays_unavailable() {
+fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     let fixture = unindexed_fixture();
     write_live_local_refresh(&fixture);
     let mut server = spawn_stdio_server(&fixture);
@@ -4681,9 +4681,10 @@ fn cold_ground_uses_local_capability_while_search_stays_unavailable() {
         }),
     );
     let error = assert_tool_error(&search, json!("cold-search-unavailable"));
-    assert_eq!(error["code"], json!("codestory_unavailable"));
-    assert_eq!(error["state"], json!("unavailable"));
+    assert_eq!(error["code"], json!("codestory_preparing"));
+    assert_eq!(error["state"], json!("preparing"));
     assert_eq!(error["tool"], json!("search"));
+    assert_eq!(error["retry_tool"], json!("search"));
     assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
     assert_eq!(
         error["operation"]["capabilities"]["local_navigation"],
@@ -4691,7 +4692,11 @@ fn cold_ground_uses_local_capability_while_search_stays_unavailable() {
     );
     assert_eq!(
         error["operation"]["capabilities"]["broad_search"],
-        json!("unavailable")
+        json!("retryable")
+    );
+    assert_eq!(
+        error["operation"]["embedding_retry"]["retry_class"],
+        json!("after_server_change")
     );
 
     let fixture = indexed_fixture();
@@ -4710,6 +4715,7 @@ fn cold_ground_uses_local_capability_while_search_stays_unavailable() {
         }),
     );
     let error = assert_tool_error(&response, json!("migration-search-preparing"));
-    assert_eq!(error["code"], json!("codestory_unavailable"));
-    assert_eq!(error["state"], json!("unavailable"));
+    assert_eq!(error["code"], json!("codestory_preparing"));
+    assert_eq!(error["state"], json!("preparing"));
+    assert_eq!(error["retry_tool"], json!("search"));
 }

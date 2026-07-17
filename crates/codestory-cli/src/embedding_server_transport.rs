@@ -6,13 +6,12 @@
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -23,95 +22,7 @@ const EXPECTED_EXECUTABLE_SHA256_ENV: &str =
 const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 const ENDPOINT_NAMESPACE: &str = "codestory-per-user-embedding-v1";
-const PEER_EXECUTABLE_DIGEST_CACHE_CAPACITY: usize = 256;
-static PEER_EXECUTABLE_DIGEST_CACHE: OnceLock<Mutex<VecDeque<PeerExecutableDigestEntry>>> =
-    OnceLock::new();
-
 type TransportIdentity = codestory_retrieval::EmbeddingTransportIdentity;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PeerExecutableDigestKey {
-    pid: u32,
-    process_start_id: String,
-    file_identity_a: u64,
-    file_identity_b: u64,
-    file_size: u64,
-    write_stamp: i128,
-    change_stamp: i128,
-}
-
-#[derive(Debug, Clone)]
-struct PeerExecutableDigestEntry {
-    key: PeerExecutableDigestKey,
-    sha256: String,
-}
-
-fn cached_peer_executable_digest(key: &PeerExecutableDigestKey) -> Option<String> {
-    let cache = PEER_EXECUTABLE_DIGEST_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
-    let mut entries = cache.lock().ok()?;
-    let index = entries.iter().position(|entry| entry.key == *key)?;
-    let entry = entries.remove(index)?;
-    let digest = entry.sha256.clone();
-    entries.push_back(entry);
-    Some(digest)
-}
-
-fn remember_peer_executable_digest(key: PeerExecutableDigestKey, sha256: String) {
-    let cache = PEER_EXECUTABLE_DIGEST_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
-    let Ok(mut entries) = cache.lock() else {
-        return;
-    };
-    if let Some(index) = entries.iter().position(|entry| entry.key == key) {
-        entries.remove(index);
-    }
-    entries.push_back(PeerExecutableDigestEntry { key, sha256 });
-    while entries.len() > PEER_EXECUTABLE_DIGEST_CACHE_CAPACITY {
-        entries.pop_front();
-    }
-}
-
-#[cfg(unix)]
-fn peer_executable_digest_key(
-    pid: u32,
-    process_start_id: &str,
-    metadata: &std::fs::Metadata,
-) -> PeerExecutableDigestKey {
-    use std::os::unix::fs::MetadataExt;
-
-    PeerExecutableDigestKey {
-        pid,
-        process_start_id: process_start_id.into(),
-        file_identity_a: metadata.dev(),
-        file_identity_b: metadata.ino(),
-        file_size: metadata.len(),
-        write_stamp: (i128::from(metadata.mtime()) << 64)
-            | i128::from(metadata.mtime_nsec() as u64),
-        // Unlike mtime, ctime cannot be restored by an ordinary file owner
-        // after an in-place rewrite. It keeps a cached digest bound to the
-        // executable bytes for the lifetime of this process identity.
-        change_stamp: (i128::from(metadata.ctime()) << 64)
-            | i128::from(metadata.ctime_nsec() as u64),
-    }
-}
-
-#[cfg(windows)]
-fn peer_executable_digest_key(
-    pid: u32,
-    process_start_id: &str,
-    metadata: &std::fs::Metadata,
-) -> PeerExecutableDigestKey {
-    use std::os::windows::fs::MetadataExt;
-
-    PeerExecutableDigestKey {
-        pid,
-        process_start_id: process_start_id.into(),
-        file_identity_a: metadata.volume_serial_number().unwrap_or_default() as u64,
-        file_identity_b: metadata.file_index().unwrap_or_default(),
-        file_size: metadata.file_size(),
-        write_stamp: i128::from(metadata.last_write_time()),
-        change_stamp: 0,
-    }
-}
 
 #[derive(Debug)]
 pub(crate) enum NativeConnectOutcome {
@@ -636,12 +547,6 @@ fn transport_failure(
     }
 }
 
-#[cfg(windows)]
-fn sha256_file(path: &Path) -> Result<String> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    sha256_reader(&file, path)
-}
-
 fn sha256_reader(file: &File, path: &Path) -> Result<String> {
     let mut reader = file;
     let mut hasher = Sha256::new();
@@ -665,6 +570,32 @@ fn is_sha256(value: &str) -> bool {
 fn remaining_awake_budget(started_ns: u64, now_ns: u64, budget: Duration) -> Option<Duration> {
     let elapsed = Duration::from_nanos(now_ns.saturating_sub(started_ns));
     (elapsed < budget).then(|| budget.saturating_sub(elapsed))
+}
+
+#[cfg(windows)]
+fn awake_deadline_ns(started_ns: u64, budget: Duration) -> u64 {
+    started_ns.saturating_add(budget.as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_FILE_NOT_FOUND_CODE: u32 = 2;
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedWindowsAuthorityState {
+    Absent,
+    Live,
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_data_pipe_open_error(
+    error_code: u32,
+    authority: RetainedWindowsAuthorityState,
+) -> Option<NativeConnectOutcome> {
+    (error_code == WINDOWS_ERROR_FILE_NOT_FOUND_CODE).then(|| match authority {
+        RetainedWindowsAuthorityState::Absent => NativeConnectOutcome::NoOwner,
+        RetainedWindowsAuthorityState::Live => NativeConnectOutcome::OwnerUnresponsive,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,22 +641,6 @@ fn executable_file_identity(metadata: &std::fs::Metadata) -> Result<ExecutableFi
     })
 }
 
-#[cfg(windows)]
-fn native_file_identity(path: &Path) -> Result<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-
-    let metadata = path
-        .metadata()
-        .with_context(|| format!("read metadata for {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("expected a regular executable at {}", path.display());
-    }
-    Ok((
-        metadata.volume_serial_number().unwrap_or_default() as u64,
-        metadata.file_index().unwrap_or_default(),
-    ))
-}
-
 #[cfg(unix)]
 mod platform {
     use super::{
@@ -733,7 +648,6 @@ mod platform {
         TransportIdentity, sha256_fields,
     };
     use anyhow::{Context, Result, bail};
-    use sha2::{Digest, Sha256};
     use std::ffi::CString as UnixCString;
     #[cfg(target_os = "macos")]
     use std::ffi::{CStr, CString, OsStr};
@@ -806,32 +720,9 @@ mod platform {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
-                        let authenticated = (|| -> Result<Stream> {
-                            let peer = peer_identity(stream.as_raw_fd())?;
-                            if peer.uid != self.runtime.uid {
-                                bail!(
-                                    "embedding_peer_identity_mismatch: accepted uid {} but expected {}",
-                                    peer.uid,
-                                    self.runtime.uid
-                                );
-                            }
-                            let (peer_process_start_id, peer_executable_sha256) =
-                                peer_process_executable_identity(
-                                    peer.pid
-                                        .context("authenticated Unix peer PID is unavailable")?,
-                                )?;
-                            Stream::new(
-                                stream,
-                                TransportIdentity {
-                                    peer_pid: peer.pid,
-                                    peer_process_start_id: Some(peer_process_start_id),
-                                    peer_executable_sha256: Some(peer_executable_sha256),
-                                    ..self.identity.clone()
-                                },
-                            )
-                        })()
-                        .context("embedding_peer_rejected")?;
-                        return Ok(Some(authenticated));
+                        return authenticate_peer(stream, self.runtime.uid, self.identity.clone())
+                            .map(Some)
+                            .context("embedding_peer_rejected");
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         let elapsed = Duration::from_nanos(awake_now_ns().saturating_sub(started));
@@ -844,6 +735,33 @@ mod platform {
                 }
             }
         }
+    }
+
+    fn authenticate_peer(
+        stream: UnixStream,
+        expected_uid: u32,
+        identity: TransportIdentity,
+    ) -> Result<Stream> {
+        let peer = peer_identity(stream.as_raw_fd())?;
+        if peer.uid != expected_uid {
+            bail!(
+                "embedding_peer_identity_mismatch: accepted uid {} but expected {}",
+                peer.uid,
+                expected_uid
+            );
+        }
+        let peer_pid = peer
+            .pid
+            .context("authenticated Unix peer PID is unavailable")?;
+        let peer_process_start_id = canonical_peer_process_start_identity(peer_pid)?;
+        Stream::new(
+            stream,
+            TransportIdentity {
+                peer_pid: peer.pid,
+                peer_process_start_id: Some(peer_process_start_id),
+                ..identity
+            },
+        )
     }
 
     impl Drop for Listener {
@@ -878,13 +796,8 @@ mod platform {
             let peer_start_identity = peer_process_start_identity(peer_pid)?
                 .context("authenticated Unix peer exited before identity capture")?;
             let canonical_start_identity = canonical_peer_process_start_identity(peer_pid)?;
-            if identity.peer_process_start_id.as_deref() != Some(&canonical_start_identity)
-                || identity
-                    .peer_executable_sha256
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-            {
-                bail!("embedding_peer_executable_identity_changed");
+            if identity.peer_process_start_id.as_deref() != Some(&canonical_start_identity) {
+                bail!("embedding_peer_process_identity_changed");
             }
             stream
                 .set_nonblocking(true)
@@ -1014,8 +927,7 @@ mod platform {
                     let peer_pid = peer
                         .pid
                         .context("authenticated Unix peer PID is unavailable")?;
-                    let (peer_process_start_id, peer_executable_sha256) =
-                        peer_process_executable_identity(peer_pid)?;
+                    let peer_process_start_id = canonical_peer_process_start_identity(peer_pid)?;
                     if super::remaining_awake_budget(started, awake_now_ns(), budget).is_none() {
                         return classify_failed_connect(authority);
                     }
@@ -1038,7 +950,6 @@ mod platform {
                                     peer_verified: true,
                                     peer_pid: peer.pid,
                                     peer_process_start_id: Some(peer_process_start_id),
-                                    peer_executable_sha256: Some(peer_executable_sha256),
                                 },
                             )?,
                         },
@@ -1106,7 +1017,6 @@ mod platform {
             peer_verified: true,
             peer_pid: None,
             peer_process_start_id: None,
-            peer_executable_sha256: None,
         };
         Ok(BindOutcome::Bound(Listener {
             listener,
@@ -1926,46 +1836,6 @@ mod platform {
         pid: Option<u32>,
     }
 
-    fn peer_process_executable_identity(pid: u32) -> Result<(String, String)> {
-        let native_start_before = peer_process_start_identity(pid)?
-            .context("authenticated Unix peer exited before executable inspection")?;
-        let mut executable = open_peer_executable(pid)?;
-        let metadata_before = executable
-            .metadata()
-            .context("inspect authenticated peer executable")?;
-        if !metadata_before.is_file() {
-            bail!("embedding_peer_executable_untrusted: peer image is not a regular file");
-        }
-        let cache_key =
-            super::peer_executable_digest_key(pid, &native_start_before, &metadata_before);
-        let cached_digest = super::cached_peer_executable_digest(&cache_key);
-        let sha256 = if let Some(sha256) = cached_digest {
-            sha256
-        } else {
-            let mut hasher = Sha256::new();
-            std::io::copy(&mut executable, &mut hasher)
-                .context("hash authenticated peer executable")?;
-            format!("{:x}", hasher.finalize())
-        };
-        let metadata_after = executable
-            .metadata()
-            .context("reinspect authenticated peer executable")?;
-        let native_start_after = peer_process_start_identity(pid)?
-            .context("authenticated Unix peer exited during executable inspection")?;
-        if native_start_before != native_start_after
-            || cache_key
-                != super::peer_executable_digest_key(pid, &native_start_after, &metadata_after)
-        {
-            bail!("embedding_peer_executable_identity_changed");
-        }
-        let canonical_start = canonical_peer_process_start_identity(pid)?;
-        if peer_process_start_identity(pid)?.as_deref() != Some(native_start_before.as_str()) {
-            bail!("embedding_peer_executable_identity_changed");
-        }
-        super::remember_peer_executable_digest(cache_key, sha256.clone());
-        Ok((canonical_start, sha256))
-    }
-
     fn canonical_peer_process_start_identity(pid: u32) -> Result<String> {
         match codestory_retrieval::probe_process_start_identity(pid) {
             codestory_retrieval::ProcessStartProbe::Running { start_identity } => {
@@ -1978,47 +1848,6 @@ mod platform {
                 bail!("authenticated Unix peer process identity unavailable: {reason}")
             }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn open_peer_executable(pid: u32) -> Result<File> {
-        let path = PathBuf::from(format!("/proc/{pid}/exe"));
-        File::open(&path)
-            .with_context(|| format!("open authenticated peer executable {}", path.display()))
-    }
-
-    #[cfg(target_os = "macos")]
-    fn open_peer_executable(pid: u32) -> Result<File> {
-        let mut path = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        let written = unsafe {
-            libc::proc_pidpath(
-                pid as i32,
-                path.as_mut_ptr().cast(),
-                path.len().try_into().unwrap_or(u32::MAX),
-            )
-        };
-        if written <= 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("resolve authenticated peer executable path");
-        }
-        path.truncate(written as usize);
-        while path.last() == Some(&0) {
-            path.pop();
-        }
-        if path.is_empty() || path.contains(&0) {
-            bail!("embedding_peer_executable_untrusted: peer image path is invalid");
-        }
-        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&path));
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
-            .with_context(|| format!("open authenticated peer executable {}", path.display()))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn open_peer_executable(_pid: u32) -> Result<File> {
-        bail!("authenticated peer executable identity is unsupported")
     }
 
     #[cfg(target_os = "linux")]
@@ -2206,8 +2035,8 @@ mod platform {
         }
 
         fn test_identity(pid: u32) -> TransportIdentity {
-            let (peer_process_start_id, peer_executable_sha256) =
-                peer_process_executable_identity(pid).expect("inspect test peer executable");
+            let peer_process_start_id =
+                canonical_peer_process_start_identity(pid).expect("inspect test peer process");
             TransportIdentity {
                 endpoint_namespace_id: "test-endpoint".into(),
                 lifetime_authority_id: "test-authority".into(),
@@ -2215,7 +2044,6 @@ mod platform {
                 peer_verified: true,
                 peer_pid: Some(pid),
                 peer_process_start_id: Some(peer_process_start_id),
-                peer_executable_sha256: Some(peer_executable_sha256),
             }
         }
 
@@ -2364,6 +2192,57 @@ mod platform {
         }
 
         #[test]
+        fn embedding_accept_poll_remains_bounded_without_peer_image_work() {
+            let root = tempfile::tempdir().expect("create test root");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("secure test root");
+            let authority_directory = validate_private_directory(root.path(), false)
+                .expect("validate authority directory")
+                .expect("authority directory exists");
+            let runtime_path = root.path().join(SERVER_DIR_NAME);
+            private_directory(&runtime_path);
+            let runtime = validate_private_directory(&runtime_path, false)
+                .expect("validate runtime directory")
+                .expect("runtime directory exists");
+            let authority = open_authority(&authority_directory, true)
+                .expect("open authority")
+                .expect("authority exists");
+            assert!(try_lock(authority.as_raw_fd()).expect("lock authority"));
+            let socket_path = runtime.path.join(SOCKET_NAME);
+            let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("secure test socket");
+            listener
+                .set_nonblocking(true)
+                .expect("set test listener nonblocking");
+            let socket_identity = socket_identity(&socket_path).expect("socket identity");
+            let listener = Listener {
+                listener,
+                runtime,
+                authority_directory,
+                authority,
+                socket_identity,
+                identity: TransportIdentity {
+                    endpoint_namespace_id: "test-endpoint".into(),
+                    lifetime_authority_id: "test-authority".into(),
+                    listener_id: "test-listener".into(),
+                    peer_verified: true,
+                    peer_pid: None,
+                    peer_process_start_id: None,
+                },
+            };
+            let started = Instant::now();
+            assert!(
+                listener
+                    .accept(Duration::from_millis(25))
+                    .expect("bounded accept")
+                    .is_none()
+            );
+            assert!(started.elapsed() >= Duration::from_millis(15));
+            assert!(started.elapsed() < Duration::from_millis(250));
+        }
+
+        #[test]
         fn embedding_awake_clock_failure_panics_instead_of_disabling_deadlines() {
             assert_eq!(fail_closed_clock_value(Some(7), "test"), 7);
             let failure = std::panic::catch_unwind(|| fail_closed_clock_value(None, "test"));
@@ -2376,13 +2255,13 @@ mod platform {
 mod platform {
     use super::{
         ENDPOINT_NAMESPACE, NativeConnectOutcome, QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV,
-        TransportIdentity, sha256_fields,
+        RetainedWindowsAuthorityState, TransportIdentity, awake_deadline_ns,
+        classify_windows_data_pipe_open_error, sha256_fields,
     };
     use anyhow::{Context, Result, bail};
     use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::path::PathBuf;
     use std::process::Command;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2416,7 +2295,7 @@ mod platform {
     use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise;
 
@@ -2470,26 +2349,30 @@ mod platform {
                     _ => return Err(error).context("accept embedding named-pipe connection"),
                 }
             }
-            let authenticated = (|| -> Result<Stream> {
-                validate_pipe_dacl(raw(&handle), &self.current_sid)?;
-                let peer_pid = named_pipe_client_pid(raw(&handle))?;
-                validate_process_sid(peer_pid, &self.current_sid)?;
-                let (peer_process_start_id, peer_executable_sha256) =
-                    peer_process_executable_identity(peer_pid)?;
-                Stream::new(
-                    handle,
-                    true,
-                    TransportIdentity {
-                        peer_pid: Some(peer_pid),
-                        peer_process_start_id: Some(peer_process_start_id),
-                        peer_executable_sha256: Some(peer_executable_sha256),
-                        ..self.identity.clone()
-                    },
-                )
-            })()
-            .context("embedding_peer_rejected")?;
-            Ok(Some(authenticated))
+            authenticate_peer(handle, &self.current_sid, self.identity.clone())
+                .map(Some)
+                .context("embedding_peer_rejected")
         }
+    }
+
+    fn authenticate_peer(
+        handle: OwnedHandle,
+        current_sid: &SidBuffer,
+        identity: TransportIdentity,
+    ) -> Result<Stream> {
+        validate_pipe_dacl(raw(&handle), current_sid)?;
+        let peer_pid = named_pipe_client_pid(raw(&handle))?;
+        validate_process_sid(peer_pid, current_sid)?;
+        let peer_process_start_id = canonical_process_start_identity(peer_pid)?;
+        Stream::new(
+            handle,
+            true,
+            TransportIdentity {
+                peer_pid: Some(peer_pid),
+                peer_process_start_id: Some(peer_process_start_id),
+                ..identity
+            },
+        )
     }
 
     #[derive(Debug)]
@@ -2512,13 +2395,8 @@ mod platform {
                 .peer_pid
                 .context("authenticated Windows peer PID is unavailable")?;
             let peer_start_identity = canonical_process_start_identity(peer_pid)?;
-            if identity.peer_process_start_id.as_deref() != Some(&peer_start_identity)
-                || identity
-                    .peer_executable_sha256
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-            {
-                bail!("embedding_peer_executable_identity_changed");
+            if identity.peer_process_start_id.as_deref() != Some(&peer_start_identity) {
+                bail!("embedding_peer_process_identity_changed");
             }
             let peer_process = unsafe {
                 OpenProcess(
@@ -2666,10 +2544,15 @@ mod platform {
     }
 
     pub(super) fn connect(budget: Duration) -> Result<NativeConnectOutcome> {
+        let started = awake_now_ns();
+        let deadline_ns = awake_deadline_ns(started, budget);
         let current_sid = current_process_sid()?;
         let (pipe_name, endpoint_namespace_id) = pipe_name(&current_sid)?;
-        let started = awake_now_ns();
+        let authority_pipe_name = authority_pipe_name(&endpoint_namespace_id);
         loop {
+            if awake_now_ns() >= deadline_ns {
+                return Ok(NativeConnectOutcome::OwnerUnresponsive);
+            }
             let handle = unsafe {
                 CreateFileW(
                     pipe_name.as_ptr(),
@@ -2693,8 +2576,7 @@ mod platform {
                 validate_pipe_dacl(raw(&handle), &current_sid)?;
                 let server_pid = named_pipe_server_pid(raw(&handle))?;
                 validate_process_sid(server_pid, &current_sid)?;
-                let (peer_process_start_id, peer_executable_sha256) =
-                    peer_process_executable_identity(server_pid)?;
+                let peer_process_start_id = canonical_process_start_identity(server_pid)?;
                 let (lifetime_authority_id, listener_id) =
                     windows_authority_ids(&endpoint_namespace_id, server_pid)?;
                 return Ok(NativeConnectOutcome::Connected(
@@ -2709,7 +2591,6 @@ mod platform {
                                 peer_verified: true,
                                 peer_pid: Some(server_pid),
                                 peer_process_start_id: Some(peer_process_start_id),
-                                peer_executable_sha256: Some(peer_executable_sha256),
                             },
                         )?,
                     },
@@ -2717,7 +2598,13 @@ mod platform {
             }
             let error = std::io::Error::last_os_error();
             match error.raw_os_error().map(|code| code as u32) {
-                Some(ERROR_FILE_NOT_FOUND) => return Ok(NativeConnectOutcome::NoOwner),
+                Some(ERROR_FILE_NOT_FOUND) => {
+                    return Ok(classify_windows_data_pipe_open_error(
+                        ERROR_FILE_NOT_FOUND,
+                        probe_retained_authority(&authority_pipe_name)?,
+                    )
+                    .expect("ERROR_FILE_NOT_FOUND is classified"));
+                }
                 Some(ERROR_PIPE_BUSY) => {
                     let elapsed = Duration::from_nanos(awake_now_ns().saturating_sub(started));
                     let remaining = budget.saturating_sub(elapsed);
@@ -2746,7 +2633,11 @@ mod platform {
                         if wait_error.raw_os_error().map(|code| code as u32)
                             == Some(ERROR_FILE_NOT_FOUND)
                         {
-                            return Ok(NativeConnectOutcome::NoOwner);
+                            return Ok(classify_windows_data_pipe_open_error(
+                                ERROR_FILE_NOT_FOUND,
+                                probe_retained_authority(&authority_pipe_name)?,
+                            )
+                            .expect("ERROR_FILE_NOT_FOUND is classified"));
                         }
                         return Err(wait_error).context("wait for embedding named pipe");
                     }
@@ -2831,7 +2722,6 @@ mod platform {
                 peer_verified: true,
                 peer_pid: None,
                 peer_process_start_id: None,
-                peer_executable_sha256: None,
             },
         }))
     }
@@ -2962,6 +2852,27 @@ mod platform {
         ))
     }
 
+    fn probe_retained_authority(
+        authority_pipe_name: &[u16],
+    ) -> Result<RetainedWindowsAuthorityState> {
+        // Observation must never connect to the retained first instance:
+        // doing so can steal the authority during the bind-before-seal window.
+        if unsafe { WaitNamedPipeW(authority_pipe_name.as_ptr(), 0) } != 0 {
+            return Ok(RetainedWindowsAuthorityState::Live);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_PIPE_BUSY) | Some(ERROR_SEM_TIMEOUT) => {
+                Ok(RetainedWindowsAuthorityState::Live)
+            }
+            Some(ERROR_FILE_NOT_FOUND) => Ok(RetainedWindowsAuthorityState::Absent),
+            Some(ERROR_ACCESS_DENIED) => {
+                bail!("embedding_lifetime_authority_untrusted: authority pipe denied access")
+            }
+            _ => Err(error).context("probe retained embedding lifetime authority"),
+        }
+    }
+
     fn qualification_namespace_salt() -> Result<String> {
         match (
             std::env::var_os(QUALIFICATION_DIR_ENV),
@@ -3030,52 +2941,6 @@ mod platform {
         }
     }
 
-    fn peer_process_executable_identity(pid: u32) -> Result<(String, String)> {
-        let start_before = canonical_process_start_identity(pid)?;
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if process.is_null() {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("open authenticated Windows peer {pid}"));
-        }
-        let process = unsafe { OwnedHandle::from_raw_handle(process.cast()) };
-        let mut path = vec![0_u16; 32_768];
-        let mut length = path.len() as u32;
-        if unsafe { QueryFullProcessImageNameW(raw(&process), 0, path.as_mut_ptr(), &mut length) }
-            == 0
-            || length == 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("resolve authenticated Windows peer executable");
-        }
-        path.truncate(length as usize);
-        let path = PathBuf::from(
-            String::from_utf16(&path)
-                .context("decode authenticated Windows peer executable path")?,
-        );
-        let metadata_before =
-            std::fs::metadata(&path).context("inspect authenticated Windows peer executable")?;
-        if !metadata_before.is_file() {
-            bail!("embedding_peer_executable_untrusted: peer image is not a regular file");
-        }
-        let before = super::native_file_identity(&path)?;
-        let cache_key = super::peer_executable_digest_key(pid, &start_before, &metadata_before);
-        // std::fs::Metadata does not expose NTFS change time. File owners can
-        // restore last-write time after an in-place rewrite, so metadata alone
-        // cannot safely authorize a digest cache hit on Windows.
-        let sha256 = super::sha256_file(&path)?;
-        let metadata_after =
-            std::fs::metadata(&path).context("reinspect authenticated Windows peer executable")?;
-        let after = super::native_file_identity(&path)?;
-        let start_after = canonical_process_start_identity(pid)?;
-        if before != after
-            || start_before != start_after
-            || cache_key != super::peer_executable_digest_key(pid, &start_after, &metadata_after)
-        {
-            bail!("embedding_peer_executable_identity_changed");
-        }
-        Ok((start_before, sha256))
-    }
-
     fn current_process_sid() -> Result<SidBuffer> {
         let process = unsafe { GetCurrentProcess() };
         process_token_sid(process)
@@ -3129,7 +2994,7 @@ mod platform {
         SidBuffer::copy_from(sid)
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct SidBuffer(Vec<u8>);
 
     impl SidBuffer {
@@ -3363,6 +3228,23 @@ mod tests {
     }
 
     #[test]
+    fn missing_windows_data_pipe_with_live_authority_is_owner_unresponsive() {
+        let outcome = classify_windows_data_pipe_open_error(
+            WINDOWS_ERROR_FILE_NOT_FOUND_CODE,
+            RetainedWindowsAuthorityState::Live,
+        )
+        .expect("missing data pipe is classified");
+        assert!(matches!(outcome, NativeConnectOutcome::OwnerUnresponsive));
+
+        let outcome = classify_windows_data_pipe_open_error(
+            WINDOWS_ERROR_FILE_NOT_FOUND_CODE,
+            RetainedWindowsAuthorityState::Absent,
+        )
+        .expect("missing data pipe is classified");
+        assert!(matches!(outcome, NativeConnectOutcome::NoOwner));
+    }
+
+    #[test]
     fn captured_executable_identity_includes_content_metadata() {
         let executable = ExactExecutable::capture().expect("capture exact executable");
         let file = File::open(executable.path()).expect("open exact executable");
@@ -3371,29 +3253,5 @@ mod tests {
                 .expect("capture executable metadata identity");
         assert_eq!(identity, executable.file_identity);
         assert!(identity.file_size > 0);
-    }
-
-    #[test]
-    fn executable_digest_cache_rejects_change_time_drift() {
-        let key = PeerExecutableDigestKey {
-            pid: u32::MAX,
-            process_start_id: "cache-test".into(),
-            file_identity_a: 1,
-            file_identity_b: 2,
-            file_size: 3,
-            write_stamp: 4,
-            change_stamp: 5,
-        };
-        remember_peer_executable_digest(key.clone(), "digest".into());
-        assert_eq!(
-            cached_peer_executable_digest(&key).as_deref(),
-            Some("digest")
-        );
-
-        let changed = PeerExecutableDigestKey {
-            change_stamp: 6,
-            ..key
-        };
-        assert_eq!(cached_peer_executable_digest(&changed), None);
     }
 }

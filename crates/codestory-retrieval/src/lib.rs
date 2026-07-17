@@ -97,10 +97,10 @@ pub use per_user_embedding::{
     EmbeddingExecutableIdentity, EmbeddingOperation, EmbeddingProtocolError,
     EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingQualificationOperationResult,
     EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
-    EmbeddingResult, EmbeddingServerActiveRequestSnapshot, EmbeddingServerAuthoritySnapshot,
-    EmbeddingServerBindOutcome, EmbeddingServerBudgets, EmbeddingServerClockSnapshot,
-    EmbeddingServerEngineSnapshot, EmbeddingServerFailureSnapshot, EmbeddingServerListener,
-    EmbeddingServerProcessSnapshot, EmbeddingServerProtocolSnapshot,
+    EmbeddingResult, EmbeddingRetryStateWire, EmbeddingServerActiveRequestSnapshot,
+    EmbeddingServerAuthoritySnapshot, EmbeddingServerBindOutcome, EmbeddingServerBudgets,
+    EmbeddingServerClockSnapshot, EmbeddingServerEngineSnapshot, EmbeddingServerFailureSnapshot,
+    EmbeddingServerListener, EmbeddingServerProcessSnapshot, EmbeddingServerProtocolSnapshot,
     EmbeddingServerSchedulerSnapshot, EmbeddingServerSnapshot, EmbeddingServerStream,
     EmbeddingServerTransport, EmbeddingTransportFailure, EmbeddingTransportIdentity,
     PER_USER_EMBEDDING_BOOTSTRAP_VERSION, PER_USER_EMBEDDING_CONSTANT_SET_FROZEN,
@@ -111,8 +111,9 @@ pub use per_user_embedding::{
     PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
     PER_USER_EMBEDDING_SERVER_PROOF_MARKER, PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
     PerUserEmbeddingClient, PerUserEmbeddingError, PerUserEmbeddingResidencyLease,
-    PerUserEmbeddingServerConfig, embedding_capacity_pressure, install_embedding_client_transport,
-    run_per_user_embedding_qualification, run_per_user_embedding_server,
+    PerUserEmbeddingServerConfig, embedding_capacity_pressure, embedding_retry_state,
+    install_embedding_client_transport, run_per_user_embedding_qualification,
+    run_per_user_embedding_server,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{

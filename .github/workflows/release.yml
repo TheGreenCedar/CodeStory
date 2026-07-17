@@ -12,6 +12,14 @@ on:
         required: false
         type: string
         default: ""
+      calibration_bundle_artifact:
+        description: "Frozen calibration bundle artifact name"
+        required: true
+        type: string
+      calibration_bundle_run_id:
+        description: "Workflow run that produced the frozen calibration bundle artifact"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       version:
@@ -23,6 +31,14 @@ on:
         required: false
         type: string
         default: ""
+      calibration_bundle_artifact:
+        description: "Frozen calibration bundle artifact name"
+        required: true
+        type: string
+      calibration_bundle_run_id:
+        description: "Workflow run that produced the frozen calibration bundle artifact"
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -140,6 +156,8 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
       quality_evidence_artifact: release-evidence-${{ github.sha }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
     # Provision these names as environment secrets on macos-release-signing.
     # That protected environment is selected by the called macOS matrix jobs,
     # and its values take precedence over caller/repository secrets.
@@ -162,6 +180,8 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
       quality_evidence_artifact: release-evidence-${{ github.sha }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
 
   windows-vulkan-proof:
     needs:
@@ -174,6 +194,8 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
       quality_evidence_artifact: release-evidence-${{ github.sha }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
 
   publish:
     name: Publish GitHub release
@@ -278,5 +300,8 @@ jobs:
     with:
       version: ${{ needs.preflight.outputs.version }}
       quality_evidence_artifact: release-evidence-${{ github.sha }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
     permissions:
+      actions: read
       contents: read

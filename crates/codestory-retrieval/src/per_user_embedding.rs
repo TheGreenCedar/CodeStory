@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -68,8 +68,6 @@ pub struct EmbeddingTransportIdentity {
     pub peer_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_process_start_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_executable_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +462,10 @@ pub struct EmbeddingProtocolRequest {
 pub enum EmbeddingOperation {
     Hello {
         intent: String,
+        client_pid: u32,
+        client_process_start_id: String,
+        client_executable_sha256: String,
+        client_executable_version: String,
     },
     Snapshot,
     EnsureResident {
@@ -483,16 +485,21 @@ pub enum EmbeddingOperation {
         scope_id: String,
         deadline_ms: u64,
         retry_after_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_token: Option<String>,
         input: String,
     },
     EmbedDocuments {
         scope_id: String,
         deadline_ms: u64,
         retry_after_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_token: Option<String>,
         inputs: Vec<String>,
     },
     Cancel {
         target_request_id: String,
+        cancel_token: String,
     },
 }
 
@@ -577,12 +584,33 @@ pub struct PerUserEmbeddingError {
     pub capacity: Option<EmbeddingCapacityPressureWire>,
 }
 
-pub fn embedding_capacity_pressure(error: &anyhow::Error) -> Option<EmbeddingCapacityPressureWire> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRetryStateWire {
+    pub code: String,
+    pub message: String,
+    pub retry_class: String,
+    pub retry_after_ms: u64,
+    pub retry_condition: String,
+    pub capacity: Option<EmbeddingCapacityPressureWire>,
+}
+
+pub fn embedding_retry_state(error: &anyhow::Error) -> Option<EmbeddingRetryStateWire> {
     error.chain().find_map(|cause| {
         cause
             .downcast_ref::<PerUserEmbeddingError>()
-            .and_then(|error| error.capacity.clone())
+            .map(|error| EmbeddingRetryStateWire {
+                code: error.code.clone(),
+                message: error.message.clone(),
+                retry_class: error.retry_class.clone(),
+                retry_after_ms: error.retry_after_ms,
+                retry_condition: error.retry_condition.clone(),
+                capacity: error.capacity.clone(),
+            })
     })
+}
+
+pub fn embedding_capacity_pressure(error: &anyhow::Error) -> Option<EmbeddingCapacityPressureWire> {
+    embedding_retry_state(error).and_then(|retry| retry.capacity)
 }
 
 static CLIENT_TRANSPORT: OnceLock<Arc<dyn EmbeddingClientTransport>> = OnceLock::new();
@@ -600,6 +628,71 @@ pub struct PerUserEmbeddingClient {
     transport: Arc<dyn EmbeddingClientTransport>,
     compatibility: EmbeddingCompatibility,
     scope_id: String,
+}
+
+struct EmbeddingCallControl<'a> {
+    deadline: Instant,
+    cancelled: &'a (dyn Fn() -> bool + Sync),
+}
+
+impl<'a> EmbeddingCallControl<'a> {
+    fn new(timeout: Duration, cancelled: &'a (dyn Fn() -> bool + Sync)) -> Result<Self> {
+        if timeout.is_zero() {
+            bail!("embedding_server_deadline_invalid");
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("embedding_server_deadline_invalid"))?;
+        let control = Self {
+            deadline,
+            cancelled,
+        };
+        control.check()?;
+        Ok(control)
+    }
+
+    fn triggered(&self) -> bool {
+        (self.cancelled)() || Instant::now() >= self.deadline
+    }
+
+    fn check(&self) -> Result<()> {
+        if (self.cancelled)() {
+            return Err(PerUserEmbeddingError {
+                code: "embedding_cancelled".into(),
+                message: "the caller cancelled the embedding request".into(),
+                retry_class: "none".into(),
+                retry_after_ms: 0,
+                retry_condition: "the caller starts a new request".into(),
+                capacity: None,
+            }
+            .into());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(PerUserEmbeddingError {
+                code: "embedding_deadline_exceeded".into(),
+                message: "the caller deadline elapsed during the embedding request".into(),
+                retry_class: "after_delay".into(),
+                retry_after_ms: 0,
+                retry_condition: "the caller starts a new request with a fresh deadline".into(),
+                capacity: None,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn remaining(&self, maximum: Duration) -> Result<Duration> {
+        self.check()?;
+        let remaining = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(maximum);
+        if remaining.is_zero() {
+            self.check()?;
+            bail!("embedding_server_deadline_invalid");
+        }
+        Ok(remaining)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,14 +945,30 @@ impl PerUserEmbeddingClient {
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_query_with_control(text, None, &|| false)
+    }
+
+    pub fn embed_query_with_control(
+        &self,
+        text: &str,
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<f32>> {
         validate_raw_inputs(std::slice::from_ref(&text.to_string()))?;
         let budgets = self.transport.budgets();
-        let result = self.call_pure_with_replay(EmbeddingOperation::EmbedQuery {
-            scope_id: self.scope_id.clone(),
-            deadline_ms: duration_ms(budgets.query_request),
-            retry_after_ms: duration_ms(budgets.retry_after),
-            input: text.to_string(),
-        })?;
+        let timeout = maximum_timeout
+            .unwrap_or(budgets.query_request)
+            .min(budgets.query_request);
+        let result =
+            self.call_pure_with_replay_controlled(timeout, cancelled, |deadline_ms, token| {
+                EmbeddingOperation::EmbedQuery {
+                    scope_id: self.scope_id.clone(),
+                    deadline_ms,
+                    retry_after_ms: duration_ms(budgets.retry_after),
+                    cancel_token: Some(token),
+                    input: text.to_string(),
+                }
+            })?;
         let (rows, columns, identity, payload) = vectors_result(result)?;
         if rows != 1 {
             bail!("embedding_vector_row_count_mismatch: expected=1 observed={rows}");
@@ -872,17 +981,33 @@ impl PerUserEmbeddingClient {
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_documents_with_control(texts, None, &|| false)
+    }
+
+    pub fn embed_documents_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         validate_raw_inputs(texts)?;
         let budgets = self.transport.budgets();
-        let result = self.call_pure_with_replay(EmbeddingOperation::EmbedDocuments {
-            scope_id: self.scope_id.clone(),
-            deadline_ms: duration_ms(budgets.bulk_request),
-            retry_after_ms: duration_ms(budgets.retry_after),
-            inputs: texts.to_vec(),
-        })?;
+        let timeout = maximum_timeout
+            .unwrap_or(budgets.bulk_request)
+            .min(budgets.bulk_request);
+        let result =
+            self.call_pure_with_replay_controlled(timeout, cancelled, |deadline_ms, token| {
+                EmbeddingOperation::EmbedDocuments {
+                    scope_id: self.scope_id.clone(),
+                    deadline_ms,
+                    retry_after_ms: duration_ms(budgets.retry_after),
+                    cancel_token: Some(token),
+                    inputs: texts.to_vec(),
+                }
+            })?;
         let (rows, columns, identity, payload) = vectors_result(result)?;
         if rows as usize != texts.len() {
             bail!(
@@ -989,21 +1114,50 @@ impl PerUserEmbeddingClient {
         Ok(Some((*snapshot, identity.map(|identity| *identity))))
     }
 
-    fn call_pure_with_replay(
+    fn call_pure_with_replay_controlled<B>(
         &self,
-        operation: EmbeddingOperation,
-    ) -> Result<(EmbeddingResult, Vec<u8>)> {
+        timeout: Duration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        operation: B,
+    ) -> Result<(EmbeddingResult, Vec<u8>)>
+    where
+        B: Fn(u64, String) -> EmbeddingOperation,
+    {
+        let control = EmbeddingCallControl::new(timeout, cancelled)?;
         let mut replayed = false;
         loop {
+            control.check()?;
             let call = (|| {
-                let mut connection = self.connect(EmbeddingConnectIntent::Activate, true)?;
-                let request_id = Uuid::new_v4().to_string();
-                let timeout = operation_timeout(&operation, self.transport.budgets());
-                configure_exchange_timeout(&*connection.stream, timeout)?;
-                let (response, payload) = exchange(
-                    &mut *connection.stream,
-                    request(&request_id, self.compatibility.clone(), operation.clone()),
+                let mut connection = self.connect_with_control(
+                    EmbeddingConnectIntent::Activate,
+                    true,
+                    Some(&control),
                 )?;
+                control.check()?;
+                let request_id = Uuid::new_v4().to_string();
+                let cancel_token = Uuid::new_v4().to_string();
+                let remaining = control.remaining(timeout)?;
+                let operation = operation(positive_duration_ms(remaining), cancel_token.clone());
+                configure_exchange_timeout(&*connection.stream, remaining)?;
+                let completed = AtomicBool::new(false);
+                let exchange_result = thread::scope(|scope| {
+                    scope.spawn(|| {
+                        self.watch_controlled_cancellation(
+                            &control,
+                            &completed,
+                            &request_id,
+                            &cancel_token,
+                        );
+                    });
+                    let result = exchange(
+                        &mut *connection.stream,
+                        request(&request_id, self.compatibility.clone(), operation),
+                    );
+                    completed.store(true, Ordering::Release);
+                    result
+                });
+                control.check()?;
+                let (response, payload) = exchange_result?;
                 let result = response_result(response)?;
                 if let EmbeddingResult::Vectors { identity, .. } = &result {
                     validate_engine_server_identity(identity, &connection.snapshot)?;
@@ -1013,10 +1167,51 @@ impl PerUserEmbeddingClient {
             match call {
                 Ok(result) => return Ok(result),
                 Err(error) if !replayed && is_server_loss(&error) => {
+                    control.check()?;
                     replayed = true;
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    fn watch_controlled_cancellation(
+        &self,
+        control: &EmbeddingCallControl<'_>,
+        completed: &AtomicBool,
+        request_id: &str,
+        cancel_token: &str,
+    ) {
+        while !completed.load(Ordering::Acquire) && !control.triggered() {
+            thread::sleep(CONNECTION_POLL);
+        }
+        while !completed.load(Ordering::Acquire) {
+            if self.send_cancel(request_id, cancel_token).unwrap_or(false) {
+                return;
+            }
+            thread::sleep(CONNECTION_POLL);
+        }
+    }
+
+    fn send_cancel(&self, target_request_id: &str, cancel_token: &str) -> Result<bool> {
+        let mut connection = self.connect(EmbeddingConnectIntent::Activate, false)?;
+        configure_exchange_timeout(&*connection.stream, self.transport.budgets().connect)?;
+        let request_id = Uuid::new_v4().to_string();
+        let (response, _) = exchange(
+            &mut *connection.stream,
+            request(
+                &request_id,
+                self.compatibility.clone(),
+                EmbeddingOperation::Cancel {
+                    target_request_id: target_request_id.into(),
+                    cancel_token: cancel_token.into(),
+                },
+            ),
+        )?;
+        match response_result(response)? {
+            EmbeddingResult::Cancelled => Ok(true),
+            EmbeddingResult::Released => Ok(false),
+            _ => bail!("embedding_server_protocol_mismatch: expected cancellation result"),
         }
     }
 
@@ -1025,27 +1220,50 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
     ) -> Result<ValidatedEmbeddingConnection> {
+        self.connect_with_control(intent, may_spawn, None)
+    }
+
+    fn connect_with_control(
+        &self,
+        intent: EmbeddingConnectIntent,
+        may_spawn: bool,
+        control: Option<&EmbeddingCallControl<'_>>,
+    ) -> Result<ValidatedEmbeddingConnection> {
         let budgets = self.transport.budgets();
         let mut spawned_at_ns = None;
         let wait_for_spawn = |spawned_at_ns| -> Result<()> {
+            if let Some(control) = control {
+                control.check()?;
+            }
             let elapsed = elapsed_since(self.transport.clock().as_ref(), spawned_at_ns);
             let remaining = budgets.spawn.saturating_sub(elapsed);
             if remaining.is_zero() {
                 bail!("embedding_server_start_timeout");
             }
+            let remaining = control
+                .map(|control| control.remaining(remaining))
+                .transpose()?
+                .unwrap_or(remaining);
             self.transport
                 .clock()
                 .sleep(budgets.retry_after.min(remaining));
             Ok(())
         };
         loop {
+            if let Some(control) = control {
+                control.check()?;
+            }
+            let connect_budget = control
+                .map(|control| control.remaining(budgets.connect))
+                .transpose()?
+                .unwrap_or(budgets.connect);
             match self
                 .transport
-                .connect(intent, budgets.connect)
+                .connect(intent, connect_budget)
                 .map_err(anyhow::Error::new)?
             {
                 EmbeddingConnectOutcome::Connected(mut stream) => {
-                    configure_exchange_timeout(&*stream, budgets.connect)?;
+                    configure_exchange_timeout(&*stream, connect_budget)?;
                     let transport_identity = stream.transport_identity().clone();
                     let executable = self.transport.executable_identity();
                     let snapshot = hello(
@@ -1055,6 +1273,9 @@ impl PerUserEmbeddingClient {
                         &transport_identity,
                         &executable,
                     )?;
+                    if let Some(control) = control {
+                        control.check()?;
+                    }
                     return Ok(ValidatedEmbeddingConnection { stream, snapshot });
                 }
                 EmbeddingConnectOutcome::NoOwner if may_spawn && spawned_at_ns.is_none() => {
@@ -1312,6 +1533,14 @@ struct ServerRequestAdmissionPermitInner {
 struct ServerCancellation {
     context: EmbeddingRequestContext,
     admission: ServerRequestAdmissionPermit,
+    auth: Option<ServerCancellationAuth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerCancellationAuth {
+    token: String,
+    client_pid: u32,
+    client_process_start_id: String,
 }
 
 #[derive(Debug)]
@@ -1590,6 +1819,7 @@ impl PerUserEmbeddingServerState {
         phase: &str,
         context: EmbeddingRequestContext,
         admission: ServerRequestAdmissionPermit,
+        cancellation_auth: Option<ServerCancellationAuth>,
     ) -> Result<ServerRequestGuard> {
         let _admission = self
             .admission_gate
@@ -1625,6 +1855,7 @@ impl PerUserEmbeddingServerState {
             ServerCancellation {
                 context,
                 admission: admission.clone(),
+                auth: cancellation_auth,
             },
         );
         drop(cancellations);
@@ -1637,31 +1868,37 @@ impl PerUserEmbeddingServerState {
         })
     }
 
-    fn cancel(&self, connection_id: &str, request_id: &str) -> bool {
-        let exact = request_key(connection_id, request_id);
+    fn cancel(
+        &self,
+        request_id: &str,
+        cancel_token: &str,
+        client_pid: u32,
+        client_process_start_id: &str,
+    ) -> bool {
         self.cancellations.lock().ok().is_some_and(|requests| {
-            requests
-                .get(&exact)
-                .or_else(|| {
-                    let suffix = format!(":{request_id}");
-                    let mut matches = requests
-                        .iter()
-                        .filter(|(key, _)| key.ends_with(&suffix))
-                        .map(|(_, context)| context);
-                    let first = matches.next();
-                    if matches.next().is_some() {
-                        None
-                    } else {
-                        first
-                    }
+            let suffix = format!(":{request_id}");
+            let mut matches = requests
+                .iter()
+                .filter(|(key, cancellation)| {
+                    key.ends_with(&suffix)
+                        && cancellation.auth.as_ref().is_some_and(|auth| {
+                            auth.token == cancel_token
+                                && auth.client_pid == client_pid
+                                && auth.client_process_start_id == client_process_start_id
+                        })
                 })
-                .is_some_and(|cancellation| {
-                    let cancelled = cancellation.context.cancel();
-                    if cancelled {
-                        cancellation.admission.release();
-                    }
-                    cancelled
-                })
+                .map(|(_, context)| context);
+            let first = matches.next();
+            if matches.next().is_some() {
+                return false;
+            }
+            first.is_some_and(|cancellation| {
+                let cancelled = cancellation.context.cancel();
+                if cancelled {
+                    cancellation.admission.release();
+                }
+                cancelled
+            })
         })
     }
 
@@ -2716,22 +2953,18 @@ fn serve_embedding_connection_inner(
     if !stream.transport_identity().peer_verified {
         bail!("embedding_server_peer_unverified");
     }
-    let peer_executable_sha256 = stream
+    let transport_peer_pid = stream
         .transport_identity()
-        .peer_executable_sha256
-        .as_deref()
-        .filter(|digest| !digest.is_empty())
-        .ok_or_else(|| anyhow!("embedding_server_peer_executable_identity_missing"))?;
-    if stream
+        .peer_pid
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| anyhow!("embedding_server_peer_process_identity_missing"))?;
+    let transport_peer_process_start_id = stream
         .transport_identity()
         .peer_process_start_id
         .as_deref()
-        .is_none_or(str::is_empty)
-    {
-        bail!("embedding_server_peer_process_identity_missing");
-    }
-    let peer_executable_mismatch =
-        peer_executable_sha256 != state.process.executable_sha256.as_str();
+        .filter(|start_id| !start_id.is_empty())
+        .ok_or_else(|| anyhow!("embedding_server_peer_process_identity_missing"))?
+        .to_owned();
     stream
         .set_read_timeout(Some(EmbeddingClientBudgets::current().connect))
         .context("bound embedding server handshake read")?;
@@ -2745,9 +2978,26 @@ fn serve_embedding_connection_inner(
         bail!("embedding_server_protocol_hello_required");
     }
     validate_protocol_request(&hello_request)?;
-    let EmbeddingOperation::Hello { intent } = &hello_request.operation else {
+    let EmbeddingOperation::Hello {
+        intent,
+        client_pid,
+        client_process_start_id,
+        client_executable_sha256,
+        client_executable_version,
+    } = &hello_request.operation
+    else {
         bail!("embedding_server_protocol_hello_required");
     };
+    if *client_pid != transport_peer_pid
+        || client_process_start_id != &transport_peer_process_start_id
+    {
+        bail!("embedding_server_peer_identity_mismatch");
+    }
+    if !is_sha256(client_executable_sha256) || client_executable_version.trim().is_empty() {
+        bail!("embedding_server_peer_executable_identity_invalid");
+    }
+    let peer_executable_mismatch = client_executable_sha256 != &state.process.executable_sha256
+        || client_executable_version != &state.process.executable_version;
     if !matches!(intent.as_str(), "activate" | "observe") {
         write_protocol_response(
             &mut *stream,
@@ -2944,6 +3194,7 @@ fn serve_embedding_connection_inner(
                 "ensure_resident",
                 context,
                 admission,
+                None,
             )?;
             guard.update_phase("native_execution");
             let result = state
@@ -2999,6 +3250,7 @@ fn serve_embedding_connection_inner(
             scope_id,
             deadline_ms,
             retry_after_ms,
+            cancel_token,
             input,
         } => {
             if let Err(error) = validate_raw_inputs(std::slice::from_ref(&input)) {
@@ -3023,6 +3275,9 @@ fn serve_embedding_connection_inner(
                 EmbeddingRequestClass::Query,
                 deadline_ms,
                 retry_after_ms,
+                cancel_token,
+                transport_peer_pid,
+                &transport_peer_process_start_id,
                 vec![format!("{CODERANK_QUERY_PREFIX}{input}")],
             )?;
         }
@@ -3030,6 +3285,7 @@ fn serve_embedding_connection_inner(
             scope_id,
             deadline_ms,
             retry_after_ms,
+            cancel_token,
             inputs,
         } => {
             if let Err(error) = validate_raw_inputs(&inputs) {
@@ -3058,11 +3314,35 @@ fn serve_embedding_connection_inner(
                 EmbeddingRequestClass::Bulk,
                 deadline_ms,
                 retry_after_ms,
+                cancel_token,
+                transport_peer_pid,
+                &transport_peer_process_start_id,
                 inputs,
             )?;
         }
-        EmbeddingOperation::Cancel { target_request_id } => {
-            let cancelled = state.cancel(&connection_id, &target_request_id);
+        EmbeddingOperation::Cancel {
+            target_request_id,
+            cancel_token,
+        } => {
+            if !valid_cancel_token(&cancel_token) {
+                return write_protocol_response(
+                    &mut *stream,
+                    failure_response(
+                        &request.request_id,
+                        protocol_error(
+                            "embedding_server_cancel_token_invalid",
+                            "embedding cancellation requires an unguessable token",
+                        ),
+                    ),
+                    &[],
+                );
+            }
+            let cancelled = state.cancel(
+                &target_request_id,
+                &cancel_token,
+                transport_peer_pid,
+                &transport_peer_process_start_id,
+            );
             write_protocol_response(
                 &mut *stream,
                 success_response(
@@ -3103,6 +3383,9 @@ fn serve_embedding_request(
     request_class: EmbeddingRequestClass,
     deadline_ms: u64,
     retry_after_ms: u64,
+    cancel_token: Option<String>,
+    client_pid: u32,
+    client_process_start_id: &str,
     inputs: Vec<String>,
 ) -> Result<()> {
     if deadline_ms == 0 {
@@ -3120,6 +3403,27 @@ fn serve_embedding_request(
     }
     let deadline = ServerRequestDeadline::start(state.clock.as_ref(), deadline_ms);
     let context = EmbeddingRequestContext::new(request_id, &scope_id, retry_after_ms);
+    let cancellation_auth = match cancel_token {
+        Some(token) if valid_cancel_token(&token) => Some(ServerCancellationAuth {
+            token,
+            client_pid,
+            client_process_start_id: client_process_start_id.into(),
+        }),
+        Some(_) => {
+            return write_protocol_response(
+                stream,
+                failure_response(
+                    request_id,
+                    protocol_error(
+                        "embedding_server_cancel_token_invalid",
+                        "embedding cancellation requires an unguessable token",
+                    ),
+                ),
+                &[],
+            );
+        }
+        None => None,
+    };
     configure_server_operation_timeout(stream, deadline_ms)?;
     let admission = state.try_admit_request(request_class, retry_after_ms);
     if deadline.cancel_if_elapsed(state.clock.as_ref(), &context) {
@@ -3139,6 +3443,7 @@ fn serve_embedding_request(
         "queued",
         context.clone(),
         admission,
+        cancellation_auth,
     );
     if deadline.cancel_if_elapsed(state.clock.as_ref(), &context) {
         return write_deadline_exceeded(stream, request_id, retry_after_ms, request_class, None);
@@ -3343,6 +3648,7 @@ fn serve_lease_connection(
         "acquire_lease",
         context,
         admission,
+        None,
     )?;
     let engine = match state.engine() {
         Ok(engine) => engine,
@@ -3909,6 +4215,10 @@ fn request_key(connection_id: &str, request_id: &str) -> String {
     format!("{connection_id}:{request_id}")
 }
 
+fn valid_cancel_token(token: &str) -> bool {
+    Uuid::parse_str(token).is_ok()
+}
+
 fn engine_error(error: EngineError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
@@ -3946,6 +4256,10 @@ fn hello(
             compatibility.clone(),
             EmbeddingOperation::Hello {
                 intent: intent.into(),
+                client_pid: executable.pid,
+                client_process_start_id: executable.process_start_id.clone(),
+                client_executable_sha256: executable.executable_sha256.clone(),
+                client_executable_version: executable.executable_version.clone(),
             },
         ),
     )?;
@@ -4257,8 +4571,6 @@ fn validate_server_snapshot(
         || transport.peer_pid != Some(snapshot.process.pid)
         || transport.peer_process_start_id.as_deref()
             != Some(snapshot.process.process_start_id.as_str())
-        || transport.peer_executable_sha256.as_deref()
-            != Some(snapshot.process.executable_sha256.as_str())
     {
         bail!("embedding_server_peer_identity_mismatch");
     }
@@ -4295,21 +4607,12 @@ fn exchange_timeout_configuration_error(error: io::Error) -> anyhow::Error {
     .into()
 }
 
-fn operation_timeout(operation: &EmbeddingOperation, budgets: EmbeddingClientBudgets) -> Duration {
-    match operation {
-        EmbeddingOperation::EmbedQuery { .. } => budgets.query_request,
-        EmbeddingOperation::EmbedDocuments { .. }
-        | EmbeddingOperation::EnsureResident { .. }
-        | EmbeddingOperation::AcquireLease { .. } => budgets.bulk_request,
-        EmbeddingOperation::Hello { .. }
-        | EmbeddingOperation::Snapshot
-        | EmbeddingOperation::ReleaseLease { .. }
-        | EmbeddingOperation::Cancel { .. } => budgets.connect,
-    }
-}
-
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn embedding_scope_id(runtime: &SidecarRuntimeConfig) -> String {
@@ -4323,6 +4626,10 @@ fn embedding_scope_id(runtime: &SidecarRuntimeConfig) -> String {
 
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn positive_duration_ms(duration: Duration) -> u64 {
+    duration_ms(duration).max(1)
 }
 
 fn elapsed_since(clock: &dyn AwakeMonotonicClock, started_ns: u64) -> Duration {
@@ -4467,11 +4774,15 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum ScriptOutcome {
         Success,
         Loss,
         Capacity,
+        Blocking {
+            request_started: Arc<AtomicBool>,
+            cancelled: Arc<AtomicBool>,
+        },
     }
 
     struct ScriptStream {
@@ -4480,6 +4791,7 @@ mod tests {
         reads: Cursor<Vec<u8>>,
         outcome: ScriptOutcome,
         compatibility: EmbeddingCompatibility,
+        read_gate: Option<Arc<AtomicBool>>,
     }
 
     impl ScriptStream {
@@ -4490,6 +4802,7 @@ mod tests {
                 reads: Cursor::new(Vec::new()),
                 outcome,
                 compatibility,
+                read_gate: None,
             }
         }
 
@@ -4511,7 +4824,7 @@ mod tests {
                     ),
                     Vec::new(),
                 ),
-                EmbeddingOperation::EmbedQuery { .. } => match self.outcome {
+                EmbeddingOperation::EmbedQuery { .. } => match self.outcome.clone() {
                     ScriptOutcome::Loss => {
                         self.reads = Cursor::new(Vec::new());
                         return Ok(());
@@ -4546,7 +4859,38 @@ mod tests {
                             encode_vectors(&[vector]).map_err(io::Error::other)?,
                         )
                     }
+                    ScriptOutcome::Blocking {
+                        request_started,
+                        cancelled,
+                    } => {
+                        request_started.store(true, Ordering::Release);
+                        self.read_gate = Some(cancelled);
+                        (
+                            failure_response(
+                                &request.request_id,
+                                EmbeddingProtocolError {
+                                    code: "embedding_cancelled".into(),
+                                    message: "the active request was cancelled".into(),
+                                    retry_class: "none".into(),
+                                    retry_after_ms: 0,
+                                    retry_condition: "the caller starts a new request".into(),
+                                    capacity: None,
+                                },
+                            ),
+                            Vec::new(),
+                        )
+                    }
                 },
+                EmbeddingOperation::Cancel { .. } => {
+                    let ScriptOutcome::Blocking { cancelled, .. } = self.outcome.clone() else {
+                        return Err(io::Error::other("unexpected cancellation request"));
+                    };
+                    cancelled.store(true, Ordering::Release);
+                    (
+                        success_response(&request.request_id, EmbeddingResult::Cancelled),
+                        Vec::new(),
+                    )
+                }
                 EmbeddingOperation::Snapshot => (
                     success_response(
                         &request.request_id,
@@ -4573,6 +4917,13 @@ mod tests {
 
     impl Read for ScriptStream {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            while self
+                .read_gate
+                .as_ref()
+                .is_some_and(|gate| !gate.load(Ordering::Acquire))
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
             self.reads.read(buffer)
         }
     }
@@ -4666,6 +5017,67 @@ mod tests {
 
         fn budgets(&self) -> EmbeddingClientBudgets {
             EmbeddingClientBudgets::current()
+        }
+    }
+
+    struct ControlledCancelTestTransport {
+        clock: Arc<TestClock>,
+        connect_count: AtomicUsize,
+        request_started: Arc<AtomicBool>,
+        server_cancelled: Arc<AtomicBool>,
+        compatibility: EmbeddingCompatibility,
+    }
+
+    impl ControlledCancelTestTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                clock: TestClock::new(),
+                connect_count: AtomicUsize::new(0),
+                request_started: Arc::new(AtomicBool::new(false)),
+                server_cancelled: Arc::new(AtomicBool::new(false)),
+                compatibility: EmbeddingCompatibility::current(true),
+            })
+        }
+    }
+
+    impl EmbeddingClientTransport for ControlledCancelTestTransport {
+        fn connect(
+            &self,
+            _intent: EmbeddingConnectIntent,
+            _budget: Duration,
+        ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
+            self.connect_count.fetch_add(1, Ordering::AcqRel);
+            Ok(EmbeddingConnectOutcome::Connected(Box::new(
+                ScriptStream::new(
+                    ScriptOutcome::Blocking {
+                        request_started: Arc::clone(&self.request_started),
+                        cancelled: Arc::clone(&self.server_cancelled),
+                    },
+                    self.compatibility.clone(),
+                ),
+            )))
+        }
+
+        fn spawn_exact_current_exe(&self) -> std::result::Result<(), EmbeddingTransportFailure> {
+            Ok(())
+        }
+
+        fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
+            self.clock.clone()
+        }
+
+        fn executable_identity(&self) -> EmbeddingExecutableIdentity {
+            test_executable()
+        }
+
+        fn budgets(&self) -> EmbeddingClientBudgets {
+            EmbeddingClientBudgets {
+                connect: Duration::from_millis(100),
+                spawn: Duration::from_millis(100),
+                retry_after: Duration::from_millis(1),
+                query_request: Duration::from_secs(1),
+                bulk_request: Duration::from_secs(1),
+            }
         }
     }
 
@@ -4844,6 +5256,57 @@ mod tests {
     }
 
     #[test]
+    fn caller_cancellation_interrupts_active_rpc_over_authenticated_control_connection() {
+        let transport = ControlledCancelTestTransport::new();
+        let client = test_client(transport.clone());
+        let caller_cancelled = AtomicBool::new(false);
+
+        let error = thread::scope(|scope| {
+            let request = scope.spawn(|| {
+                client.embed_query_with_control("x", Some(Duration::from_secs(1)), &|| {
+                    caller_cancelled.load(Ordering::Acquire)
+                })
+            });
+            while !transport.request_started.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            caller_cancelled.store(true, Ordering::Release);
+            request
+                .join()
+                .expect("controlled request thread")
+                .expect_err("caller cancellation must win")
+        });
+
+        let retry = embedding_retry_state(&error).expect("typed cancellation");
+        assert_eq!(retry.code, "embedding_cancelled");
+        assert_eq!(retry.retry_class, "none");
+        assert!(transport.server_cancelled.load(Ordering::Acquire));
+        assert!(
+            transport.connect_count.load(Ordering::Acquire) >= 2,
+            "the watcher must use a separate authenticated control connection"
+        );
+    }
+
+    #[test]
+    fn cancellation_wins_before_connection_loss_can_replay() {
+        let transport = ClientTestTransport::new(usize::MAX, false);
+        let client = test_client(transport.clone());
+        let error = client
+            .embed_query_with_control("x", Some(Duration::from_secs(1)), &|| {
+                transport.connect_count.load(Ordering::Acquire) > 0
+            })
+            .expect_err("cancellation after connect must suppress pure replay");
+
+        assert_eq!(
+            embedding_retry_state(&error)
+                .expect("typed cancellation")
+                .code,
+            "embedding_cancelled"
+        );
+        assert_eq!(transport.connect_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn typed_capacity_does_not_spawn_or_replay() {
         let transport = ClientTestTransport::new(0, true);
         let client = test_client(transport.clone());
@@ -4947,11 +5410,79 @@ mod tests {
                 .contains("embedding_server_response_request_id_mismatch")
         );
 
+        validate_server_snapshot(
+            &test_snapshot(),
+            &test_transport_identity(),
+            &test_executable(),
+        )
+        .expect("same exact executable digest is compatible");
+
         let mut snapshot = test_snapshot();
         snapshot.protocol.protocol_sha256 = "wrong".into();
         assert!(
             validate_server_snapshot(&snapshot, &test_transport_identity(), &test_executable(),)
                 .is_err()
+        );
+
+        let mut snapshot = test_snapshot();
+        snapshot.process.executable_sha256 = "b".repeat(64);
+        let error =
+            validate_server_snapshot(&snapshot, &test_transport_identity(), &test_executable())
+                .expect_err("snapshot executable digest mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("embedding_server_executable_identity_mismatch")
+        );
+    }
+
+    #[test]
+    fn checked_in_protocol_hash_flows_into_the_build_marker() {
+        let expected = hex_sha256(include_bytes!(
+            "../../../docs/testing/per-user-embedding-server-protocol.json"
+        ));
+        assert_eq!(PER_USER_EMBEDDING_PROTOCOL_SHA256, expected);
+
+        let marker =
+            std::str::from_utf8(PER_USER_EMBEDDING_SERVER_PROOF_MARKER).expect("UTF-8 marker");
+        assert!(
+            marker.contains(&format!("protocol_sha256={expected}|")),
+            "build marker did not bind the checked-in protocol hash: {marker}"
+        );
+    }
+
+    #[test]
+    fn transport_identity_contains_no_peer_image_hash() {
+        let identity =
+            serde_json::to_value(test_transport_identity()).expect("serialize transport identity");
+        assert!(identity.get("peer_executable_sha256").is_none());
+        assert_eq!(identity["peer_pid"], 42);
+        assert_eq!(identity["peer_process_start_id"], "server-start");
+    }
+
+    #[test]
+    fn hello_process_start_claim_must_match_authenticated_transport() {
+        let mut operation = test_hello_operation("observe");
+        let EmbeddingOperation::Hello {
+            client_process_start_id,
+            ..
+        } = &mut operation
+        else {
+            unreachable!("test helper always builds hello");
+        };
+        *client_process_start_id = "stale-start".into();
+        let hello = request(
+            "stale-client",
+            EmbeddingCompatibility::current(true),
+            operation,
+        );
+        let (stream, _) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
+        let error = serve_embedding_connection(test_server_state(), Box::new(stream))
+            .expect_err("stale client identity must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("embedding_server_peer_identity_mismatch")
         );
     }
 
@@ -5111,6 +5642,7 @@ mod tests {
                     "queued",
                     context,
                     admission,
+                    None,
                 )
                 .is_err()
         );
@@ -5131,9 +5663,7 @@ mod tests {
         let hello = request(
             "hello",
             compatibility.clone(),
-            EmbeddingOperation::Hello {
-                intent: "observe".into(),
-            },
+            test_hello_operation("observe"),
         );
         let activate = request(
             "activate",
@@ -5175,13 +5705,7 @@ mod tests {
     fn incompatible_observe_reports_without_draining_or_resetting_idle() {
         let mut compatibility = EmbeddingCompatibility::current(true);
         compatibility.config_sha256 = "incompatible-observer".into();
-        let hello = request(
-            "hello",
-            compatibility,
-            EmbeddingOperation::Hello {
-                intent: "observe".into(),
-            },
-        );
+        let hello = request("hello", compatibility, test_hello_operation("observe"));
         let (stream, output) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
         let state = test_server_state();
         let idle_before = state.last_work_ended_ns.load(Ordering::Acquire);
@@ -5210,7 +5734,7 @@ mod tests {
     }
 
     #[test]
-    fn real_peer_executable_mismatch_uses_typed_upgrade_handshake() {
+    fn same_user_hello_executable_mismatch_uses_typed_upgrade_handshake() {
         let observed = test_server_state();
         let observe_error = serve_mismatched_peer_hello(&observed, "observe");
         assert_eq!(
@@ -5302,7 +5826,24 @@ mod tests {
             EMBEDDING_QUERY_QUEUE_CAPACITY + EMBEDDING_BULK_QUEUE_CAPACITY
         );
 
-        assert!(state.cancel("different-connection", "query-0"));
+        assert!(!state.cancel(
+            "query-0",
+            "00000000-0000-0000-0000-000000000000",
+            test_executable().pid,
+            &test_executable().process_start_id,
+        ));
+        assert!(!state.cancel(
+            "query-0",
+            &test_cancel_token(),
+            test_executable().pid + 1,
+            &test_executable().process_start_id,
+        ));
+        assert!(state.cancel(
+            "query-0",
+            &test_cancel_token(),
+            test_executable().pid,
+            &test_executable().process_start_id,
+        ));
         assert_eq!(
             state.request_admission.snapshot().query,
             EMBEDDING_QUERY_QUEUE_CAPACITY - 1
@@ -5361,9 +5902,7 @@ mod tests {
         let product_hello = request(
             "product-pre-request-capacity",
             EmbeddingCompatibility::current(true),
-            EmbeddingOperation::Hello {
-                intent: "activate".into(),
-            },
+            test_hello_operation("activate"),
         );
         let (stream, output) = MemoryStream::new(encode_test_frame(&product_hello, &[]), true);
         serve_embedding_connection(Arc::clone(&state), Box::new(stream))
@@ -5388,9 +5927,7 @@ mod tests {
         let hello = request(
             "product-hello",
             EmbeddingCompatibility::current(true),
-            EmbeddingOperation::Hello {
-                intent: "activate".into(),
-            },
+            test_hello_operation("activate"),
         );
         let (stream, output) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
         serve_embedding_connection_at_handler_capacity(Arc::clone(&state), Box::new(stream))
@@ -5658,7 +6195,10 @@ mod tests {
         assert!(state.stopped.load(Ordering::Acquire));
     }
 
-    fn test_client(transport: Arc<ClientTestTransport>) -> PerUserEmbeddingClient {
+    fn test_client<T>(transport: Arc<T>) -> PerUserEmbeddingClient
+    where
+        T: EmbeddingClientTransport + 'static,
+    {
         PerUserEmbeddingClient {
             transport,
             compatibility: EmbeddingCompatibility::current(true),
@@ -5746,23 +6286,38 @@ mod tests {
                 "queued",
                 EmbeddingRequestContext::new(request_id, format!("scope-{request_id}"), 11),
                 admission,
+                Some(ServerCancellationAuth {
+                    token: test_cancel_token(),
+                    client_pid: test_executable().pid,
+                    client_process_start_id: test_executable().process_start_id,
+                }),
             )
             .expect("admitted request enters bounded active state")
+    }
+
+    fn test_cancel_token() -> String {
+        "b9236f3d-c1f4-4af0-8c73-6d6574c40c5e".into()
     }
 
     fn serve_mismatched_peer_hello(
         state: &Arc<PerUserEmbeddingServerState>,
         intent: &str,
     ) -> EmbeddingProtocolError {
+        let mut operation = test_hello_operation(intent);
+        let EmbeddingOperation::Hello {
+            client_executable_sha256,
+            ..
+        } = &mut operation
+        else {
+            unreachable!("test helper always builds hello");
+        };
+        *client_executable_sha256 = "b".repeat(64);
         let hello = request(
             "upgrade-hello",
             EmbeddingCompatibility::current(true),
-            EmbeddingOperation::Hello {
-                intent: intent.into(),
-            },
+            operation,
         );
-        let (mut stream, output) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
-        stream.identity.peer_executable_sha256 = Some("new-executable-sha256".into());
+        let (stream, output) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
         serve_embedding_connection(Arc::clone(state), Box::new(stream))
             .expect("upgrade incompatibility is correlated");
         let bytes = output
@@ -5779,8 +6334,18 @@ mod tests {
         EmbeddingExecutableIdentity {
             pid: 42,
             process_start_id: "server-start".into(),
-            executable_sha256: "exe-sha".into(),
+            executable_sha256: "a".repeat(64),
             executable_version: "0.16.0".into(),
+        }
+    }
+
+    fn test_hello_operation(intent: &str) -> EmbeddingOperation {
+        EmbeddingOperation::Hello {
+            intent: intent.into(),
+            client_pid: 42,
+            client_process_start_id: "server-start".into(),
+            client_executable_sha256: "a".repeat(64),
+            client_executable_version: "0.16.0".into(),
         }
     }
 
@@ -5792,7 +6357,6 @@ mod tests {
             peer_verified: true,
             peer_pid: Some(42),
             peer_process_start_id: Some("server-start".into()),
-            peer_executable_sha256: Some("exe-sha".into()),
         }
     }
 
@@ -5813,7 +6377,7 @@ mod tests {
                 server_instance_id: "server".into(),
                 pid: 42,
                 process_start_id: "server-start".into(),
-                executable_sha256: "exe-sha".into(),
+                executable_sha256: "a".repeat(64),
                 executable_version: "0.16.0".into(),
             },
             scheduler: EmbeddingServerSchedulerSnapshot {

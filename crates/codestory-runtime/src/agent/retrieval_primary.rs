@@ -180,8 +180,8 @@ impl PinnedRetrievalRead {
 }
 
 fn map_pinned_query_error(error: AnyhowError) -> ApiError {
-    if let Some(pressure) = codestory_retrieval::embedding_capacity_pressure(&error) {
-        crate::services::embedding_capacity_api_error(pressure)
+    if let Some(error) = crate::services::embedding_api_error(&error) {
+        error
     } else if is_retrieval_publication_changed(&error) {
         ApiError::new("publication_changed", error.to_string())
     } else {
@@ -620,7 +620,7 @@ pub(crate) fn run_sidecar_query(
                 storage_path: &storage_path,
                 query,
                 budget_ms: Some(sidecar_budget_ms(latency_budget_ms)),
-                cancelled: None,
+                cancelled: crate::services::active_public_operation_cancellation(),
             },
             cache,
             &controller.runtime_config,
@@ -639,7 +639,7 @@ pub(crate) fn run_and_resolve_sidecar_query(
             pinned.session.execute_with_cache(
                 query,
                 Some(sidecar_budget_ms(latency_budget_ms)),
-                None,
+                crate::services::active_public_operation_cancellation(),
                 cache,
             )
         })
@@ -706,7 +706,7 @@ pub(crate) enum SidecarPrimarySearchOutcome {
 fn sidecar_primary_error_outcome(error: ApiError) -> SidecarPrimarySearchOutcome {
     if matches!(
         error.code.as_str(),
-        "embedding_capacity" | "cache_busy" | "publication_changed"
+        "embedding_capacity" | "embedding_retryable" | "cache_busy" | "publication_changed"
     ) {
         SidecarPrimarySearchOutcome::Retryable { error }
     } else {
@@ -894,9 +894,11 @@ fn search_sidecar_packet_batch_inner(
             })
             .collect::<Vec<_>>();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
-            pinned
-                .session
-                .execute_batch_with_cache(&batch_items, None, cache)
+            pinned.session.execute_batch_with_cache(
+                &batch_items,
+                crate::services::active_public_operation_cancellation(),
+                cache,
+            )
         })
         .map_err(map_pinned_query_error)?;
         for result in &query_results {

@@ -165,6 +165,7 @@ struct PublicationQualificationHook {
 
 #[cfg(any(not(feature = "test-support"), test))]
 impl PublicationQualificationHook {
+    #[cfg(not(feature = "test-support"))]
     fn from_environment() -> Result<Option<Self>> {
         Self::from_environment_values(
             std::env::var_os(EMBEDDING_QUALIFICATION_DIR_ENV),
@@ -967,7 +968,9 @@ fn ensure_semantic_index(
                             .map(|anchor| anchor.text.clone())
                             .collect::<Vec<_>>();
                         let vectors = client
-                            .embed_documents(&texts)
+                            .embed_documents_with_control(&texts, None, &|| {
+                                cancelled.load(Ordering::Acquire)
+                            })
                             .context("embed pinned dense anchor batch")?;
                         ensure_retrieval_index_not_cancelled(
                             cancelled,

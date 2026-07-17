@@ -21,6 +21,14 @@ on:
         required: false
         default: ""
         type: string
+      calibration_bundle_artifact:
+        required: false
+        default: ""
+        type: string
+      calibration_bundle_run_id:
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       version:
@@ -35,8 +43,15 @@ on:
       quality_evidence_artifact:
         required: false
         type: string
+      calibration_bundle_artifact:
+        required: true
+        type: string
+      calibration_bundle_run_id:
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -53,6 +68,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
 
       - name: Capture host evidence
         shell: pwsh
@@ -111,6 +127,44 @@ jobs:
           name: ${{ inputs.quality_evidence_artifact }}
           path: target/release-quality-evidence
 
+      - name: Authenticate calibration bundle producer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
+        run: |
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CALIBRATION_RUN_ID" |
+            ConvertFrom-Json
+          if (
+            $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY -or
+            $run.path -ne ".github/workflows/packaged-platform-pr.yml" -or
+            $run.event -ne "workflow_dispatch" -or
+            $run.conclusion -ne "success" -or
+            $env:CALIBRATION_ARTIFACT -ne "embedding-calibration-bundle-$($run.head_sha)"
+          ) {
+            throw "calibration bundle producer is not the trusted exact-head coordinator run"
+          }
+          $artifacts = gh api `
+            "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CALIBRATION_RUN_ID/artifacts?per_page=100" |
+            ConvertFrom-Json
+          $artifactCount = @(
+            $artifacts.artifacts | Where-Object {
+              $_.name -eq $env:CALIBRATION_ARTIFACT -and $_.expired -eq $false
+            }
+          ).Count
+          if ($artifactCount -ne 1) {
+            throw "expected exactly one unexpired calibration bundle artifact"
+          }
+
+      - name: Download frozen calibration bundle
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.calibration_bundle_artifact }}
+          path: target/calibration-bundle
+          run-id: ${{ inputs.calibration_bundle_run_id }}
+          github-token: ${{ github.token }}
+
       - name: Prove offline Vulkan and multi-repository reuse
         shell: pwsh
         env:
@@ -120,6 +174,12 @@ jobs:
           $version = $env:VERSION.TrimStart('v')
           $sourceSha = (git rev-parse HEAD).Trim()
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $calibrationBundles = @(
+            Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
+          )
+          if ($calibrationBundles.Count -ne 1) {
+            throw "expected exactly one frozen calibration-bundle.json"
+          }
           $qualityArgs = @()
           $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           if (Test-Path $qualityPath) {
@@ -139,6 +199,9 @@ jobs:
             --qualification-matrix-cell protected_windows_x64_vulkan `
             --produce-qualification-evidence `
             --qualification-evidence target/windows-vulkan-proof/qualification.json `
+            --calibration-bundle $calibrationBundles[0].FullName `
+            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
+            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
             --expected-source-sha $sourceSha `
             --expected-source-tree $sourceTree `
             @qualityArgs `

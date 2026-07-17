@@ -753,8 +753,10 @@ impl EmbeddedVectorIndex {
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        context.timeout(std::time::Duration::from_secs(2))?;
-        let vector = self.embedding.embed_query(query)?;
+        let timeout = context.timeout(std::time::Duration::from_secs(2))?;
+        let vector = self
+            .embedding
+            .embed_query_with_control(query, Some(timeout), &|| context.is_cancelled())?;
         context.check_cancelled()?;
         let context = context.clone();
         search_database(

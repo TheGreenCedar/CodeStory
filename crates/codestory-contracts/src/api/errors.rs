@@ -27,6 +27,8 @@ pub struct ApiErrorDetails {
     pub readiness: Option<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_retry: Option<EmbeddingRetryStateDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -44,6 +46,16 @@ pub struct EmbeddingCapacityPressureDto {
     pub active_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_request_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingRetryStateDto {
+    pub code: String,
+    pub retry_class: String,
+    pub retry_after_ms: u64,
+    pub retry_condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<EmbeddingCapacityPressureDto>,
 }
 
 pub const COMMAND_FAILURE_SCHEMA_VERSION: u32 = 1;
@@ -82,6 +94,7 @@ impl ApiErrorDetails {
             next_commands,
             readiness: None,
             embedding_capacity: None,
+            embedding_retry: None,
         }
     }
 
@@ -159,7 +172,35 @@ impl ApiError {
                 minimum_next: Vec::new(),
                 full_repair: Vec::new(),
                 readiness: None,
-                embedding_capacity: Some(pressure),
+                embedding_capacity: Some(pressure.clone()),
+                embedding_retry: Some(EmbeddingRetryStateDto {
+                    code: "embedding_capacity".into(),
+                    retry_class: "after_capacity_change".into(),
+                    retry_after_ms: pressure.retry_after_ms,
+                    retry_condition: pressure.retry_condition.clone(),
+                    capacity: Some(pressure),
+                }),
+            },
+        )
+    }
+
+    pub fn embedding_retry(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retry: EmbeddingRetryStateDto,
+    ) -> Self {
+        Self::with_details(
+            code,
+            message,
+            ApiErrorDetails {
+                failed_layer: Some("embedding_runtime".into()),
+                project: None,
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+                embedding_capacity: retry.capacity.clone(),
+                embedding_retry: Some(retry),
             },
         )
     }
@@ -239,9 +280,37 @@ mod tests {
             value["details"]["embedding_capacity"]["retry_condition"],
             "a query slot becomes available"
         );
+        assert_eq!(
+            value["details"]["embedding_retry"]["retry_class"],
+            "after_capacity_change"
+        );
         assert!(value["details"].get("project").is_none());
         assert!(value["details"].get("next_commands").is_none());
         assert!(value["details"].get("minimum_next").is_none());
         assert!(value["details"].get("full_repair").is_none());
+    }
+
+    #[test]
+    fn generic_embedding_retry_is_typed_without_repair_commands() {
+        let error = ApiError::embedding_retry(
+            "embedding_retryable",
+            "the active owner must become idle",
+            EmbeddingRetryStateDto {
+                code: "embedding_server_incompatible_active_owner".into(),
+                retry_class: "after_owner_idle".into(),
+                retry_after_ms: 0,
+                retry_condition: "the incompatible server exits while fully idle".into(),
+                capacity: None,
+            },
+        );
+
+        let value = serde_json::to_value(error).expect("serialize retry error");
+        assert_eq!(value["code"], "embedding_retryable");
+        assert_eq!(
+            value["details"]["embedding_retry"]["retry_condition"],
+            "the incompatible server exits while fully idle"
+        );
+        assert!(value["details"].get("embedding_capacity").is_none());
+        assert!(value["details"].get("next_commands").is_none());
     }
 }

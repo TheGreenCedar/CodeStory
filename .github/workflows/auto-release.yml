@@ -97,3 +97,5 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.detect-version.outputs.version }}
+      calibration_bundle_artifact: ${{ vars.CODESTORY_CALIBRATION_BUNDLE_ARTIFACT }}
+      calibration_bundle_run_id: ${{ vars.CODESTORY_CALIBRATION_BUNDLE_RUN_ID }}

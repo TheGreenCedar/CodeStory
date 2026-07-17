@@ -99,6 +99,18 @@ function requireStepUses(violations, file, job, name, expected) {
   );
 }
 
+function requireCalibrationProducerAuthentication(violations, file, job) {
+  requireStepRun(violations, file, job, "Authenticate calibration bundle producer", [
+    "actions/runs/",
+    ".github/workflows/packaged-platform-pr.yml",
+    "workflow_dispatch",
+    "success",
+    "embedding-calibration-bundle-",
+    "artifacts?per_page=100",
+    "expired",
+  ]);
+}
+
 function requireJob(violations, file, workflow, name) {
   const found = object(workflow.jobs)[name];
   add(violations, found !== undefined, `${file} must contain job ${name}`);
@@ -1179,6 +1191,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   for (const event of ["workflow_call", "workflow_dispatch"]) {
     const input = object(at(release, "on", event, "inputs", "source_run_id"));
     add(violations, input.required === false && input.type === "string" && input.default === "", `${releaseFile} ${event} source_run_id must be an optional empty string`);
+    for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
+      const calibrationInput = object(at(release, "on", event, "inputs", key));
+      add(
+        violations,
+        calibrationInput.required === true && calibrationInput.type === "string",
+        `${releaseFile} ${event} ${key} must be a required string`,
+      );
+    }
   }
   const policy = requireJob(violations, releaseFile, release, "workflow-policy");
   requireStepRun(violations, releaseFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
@@ -1214,6 +1234,20 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${releaseFile} packaged-proof must call the package workflow`);
   add(violations, sameMembers(needs(packaged), releaseChain.dependencies["packaged-proof"]), `${releaseFile} packaged-proof dependencies must match the release claim graph`);
   add(violations, object(packaged.with).sign_macos === true, `${releaseFile} packaged-proof must sign Mac assets`);
+  add(
+    violations,
+    object(packaged.with).candidate_installed_proof === undefined,
+    `${releaseFile} must leave pre-merge candidate-installed proof to the PR coordinator`,
+  );
+  for (const job of [packaged]) {
+    for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
+      add(
+        violations,
+        object(job.with)[key] === `\${{ inputs.${key} }}`,
+        `${releaseFile} packaged proof must pass exact ${key}`,
+      );
+    }
+  }
   const expectedSecrets = [
     "APPLE_DEVELOPER_ID_P12_BASE64",
     "APPLE_DEVELOPER_ID_P12_PASSWORD",
@@ -1228,6 +1262,12 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, metal.uses === "./.github/workflows/macos-metal-proof.yml", `${releaseFile} must call protected Metal proof`);
   add(violations, sameMembers(needs(metal), releaseChain.dependencies["macos-metal-proof"]), `${releaseFile} Metal proof dependencies must match the release claim graph`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${releaseFile} Metal proof must use the packaged CLI`);
+  add(
+    violations,
+    object(metal.with).candidate_installed_proof === undefined
+      && object(metal.with).server_behavior_only === undefined,
+    `${releaseFile} must leave pre-merge candidate/server-only proof to the PR coordinator`,
+  );
 
   const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
   add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
@@ -1249,6 +1289,19 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
   add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
+  for (const [jobName, job] of [
+    ["Metal proof", metal],
+    ["Vulkan proof", vulkan],
+    ["post-publish proof", post],
+  ]) {
+    for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
+      add(
+        violations,
+        object(job.with)[key] === `\${{ inputs.${key} }}`,
+        `${releaseFile} ${jobName} must pass exact ${key}`,
+      );
+    }
+  }
 }
 
 function expectedPackageRows(graph) {
@@ -1257,7 +1310,7 @@ function expectedPackageRows(graph) {
 
 function validatePackageMatrixExpression(violations, expression, graph) {
   const match = typeof expression === "string" && expression.match(
-    /fromJSON\(inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
+    /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'server' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
   );
   if (!match) {
     violations.push("packaged-platform-proof.yml matrix must select structural JSON by scope");
@@ -1265,6 +1318,12 @@ function validatePackageMatrixExpression(violations, expression, graph) {
   }
   const full = expectedPackageRows(graph);
   const expected = [
+    { include: full.filter(row => row.asset_target === "linux-x64") },
+    {
+      include: full.filter(
+        row => row.asset_target === "linux-x64" || row.asset_target === "macos-arm64",
+      ),
+    },
     { include: full.filter(row => row.asset_target === "windows-x64") },
     { include: full.filter(row => row.asset_target.startsWith("macos-")) },
     { include: full },
@@ -1287,6 +1346,29 @@ function validatePackagedProof(workflows, violations, graph) {
   }
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
   add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
+  add(violations, object(workflow.permissions).actions === "read", `${file} must read the prior-run calibration artifact`);
+  for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
+    const input = object(at(workflow, "on", "workflow_call", "inputs", key));
+    add(
+      violations,
+      input.required === false && input.type === "string" && input.default === "",
+      `${file} ${key} must be an optional empty string until constants are frozen`,
+    );
+  }
+  const candidateInput = object(at(
+    workflow,
+    "on",
+    "workflow_call",
+    "inputs",
+    "candidate_installed_proof",
+  ));
+  add(
+    violations,
+    candidateInput.required === false
+      && candidateInput.type === "boolean"
+      && candidateInput.default === false,
+    `${file} candidate-installed proof must be an explicit opt-in`,
+  );
   add(
     violations,
     object(workflow.env).LINUX_GLIBC_BUILD_IMAGE ===
@@ -1416,6 +1498,76 @@ function validatePackagedProof(workflows, violations, graph) {
     !executableRunText(String(linuxBaseline?.run ?? "")).includes("libvulkan"),
     `${file} Linux glibc baseline must not install a Vulkan loader`,
   );
+  requireCalibrationProducerAuthentication(violations, file, job);
+  requireStepUses(
+    violations,
+    file,
+    job,
+    "Download frozen calibration bundle",
+    "actions/download-artifact@v8.0.1",
+  );
+  const calibrationDownload = namedStep(job, "Download frozen calibration bundle");
+  add(
+    violations,
+    object(calibrationDownload?.with)["run-id"] === "${{ inputs.calibration_bundle_run_id }}"
+      && object(calibrationDownload?.with).name === "${{ inputs.calibration_bundle_artifact }}"
+      && object(calibrationDownload?.with)["github-token"] === "${{ github.token }}",
+    `${file} frozen calibration download must bind its artifact name, prior run, and token`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    job,
+    "Packaged per-user server calibration or qualification",
+    [
+      "proof_tier=hosted_package",
+      "calibration-bundle.json",
+      '--calibration-bundle "$calibration_bundle"',
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+      'if [ "$PROOF_SCOPE" = server ]',
+      "--server-behavior-only",
+      'test -f "$quality_path"',
+    ],
+  );
+  const candidateStage = namedStep(job, "Stage isolated candidate-managed Linux install");
+  add(
+    violations,
+    String(candidateStage?.if ?? "").includes("inputs.candidate_installed_proof")
+      && String(candidateStage?.if ?? "").includes("inputs.scope == 'server'"),
+    `${file} candidate-managed Linux staging must require coordinator opt-in and remain runnable in server scope`,
+  );
+  requireStepRun(violations, file, job, "Stage isolated candidate-managed Linux install", [
+    "--prepare-candidate-installed-proof",
+    "--candidate-plugin-root-output",
+    "--candidate-plugin-data-output",
+    "--installed-plugin-provenance-output",
+    "--candidate-producer-workflow-path",
+    "$RUNNER_TEMP/codestory-candidate-installed-linux.",
+    'candidate_root="$(cd "$candidate_root" && pwd -P)"',
+    '"$GITHUB_WORKSPACE/"*',
+    "CODESTORY_CANDIDATE_LINUX_ROOT=",
+  ]);
+  const candidateProof = namedStep(job, "Prove two-host candidate-installed Linux runtime");
+  add(
+    violations,
+    String(candidateProof?.if ?? "").includes("inputs.candidate_installed_proof")
+      && String(candidateProof?.if ?? "").includes("inputs.scope == 'server'"),
+    `${file} candidate-installed Linux proof must require coordinator opt-in and remain runnable in server scope`,
+  );
+  requireStepRun(violations, file, job, "Prove two-host candidate-installed Linux runtime", [
+    "--proof-tier installed_runtime",
+    "--qualification-matrix-cell candidate_installed_linux_x64_cpu",
+    "--installed-plugin-source candidate",
+    "--installed-plugin-provenance",
+    "--installed-plugin-data",
+    "--calibration-producer-run-id",
+    "--calibration-producer-artifact",
+    "--server-behavior-only",
+    "$CODESTORY_CANDIDATE_LINUX_ROOT/plugin",
+    "$CODESTORY_CANDIDATE_LINUX_ROOT/data",
+    'test -f "$quality_path"',
+  ]);
   violations.push(...managedPluginViolations(
     job,
     '--archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"',
@@ -1432,6 +1584,17 @@ function validatePostPublish(workflows, violations, graph) {
     return;
   }
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
+  add(violations, object(workflow.permissions).actions === "read", `${file} must read the prior-run calibration artifact`);
+  for (const event of ["workflow_call", "workflow_dispatch"]) {
+    for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
+      const input = object(at(workflow, "on", event, "inputs", key));
+      add(
+        violations,
+        input.required === true && input.type === "string",
+        `${file} ${event} ${key} must be a required string`,
+      );
+    }
+  }
   const job = requireJob(violations, file, workflow, "smoke");
   const expected = expectedPackageRows(graph).map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
   add(violations, JSON.stringify(at(job, "strategy", "matrix", "include")) === JSON.stringify(expected), `${file} must smoke all six native assets`);
@@ -1475,6 +1638,10 @@ function validatePostPublish(workflows, violations, graph) {
     "--installed-plugin-data",
     "--expected-source-sha",
     "--expected-source-tree",
+    '--calibration-bundle "$calibration_bundle"',
+    "--calibration-producer-run-id",
+    "--calibration-producer-artifact",
+    "--installed-plugin-source marketplace",
   ]) {
     add(
       violations,
@@ -1482,6 +1649,22 @@ function validatePostPublish(workflows, violations, graph) {
       `${file} installed runtime proof must run ${fragment}`,
     );
   }
+  requireCalibrationProducerAuthentication(violations, file, job);
+  requireStepUses(
+    violations,
+    file,
+    job,
+    "Download frozen calibration bundle",
+    "actions/download-artifact@v8.0.1",
+  );
+  const calibrationDownload = namedStep(job, "Download frozen calibration bundle");
+  add(
+    violations,
+    object(calibrationDownload?.with)["run-id"] === "${{ inputs.calibration_bundle_run_id }}"
+      && object(calibrationDownload?.with).name === "${{ inputs.calibration_bundle_artifact }}"
+      && object(calibrationDownload?.with)["github-token"] === "${{ github.token }}",
+    `${file} frozen calibration download must bind its artifact name, prior run, and token`,
+  );
   add(
     violations,
     !installedRun.includes("--offline"),
@@ -1508,8 +1691,22 @@ function validatePackagedCoordinator(workflows, violations) {
     return;
   }
   add(violations, sameMembers(at(workflow, "on", "pull_request", "types"), ["labeled", "synchronize"]), `${file} pull request types must be labeled and synchronize`);
-  add(violations, includesAll(at(workflow, "on", "workflow_dispatch", "inputs", "mode", "options"), ["platform", "release-evidence", "integration"]), `${file} dispatch modes changed`);
-  add(violations, includesAll(at(workflow, "on", "workflow_dispatch", "inputs", "scope", "options"), ["auto", "windows", "macos", "full"]), `${file} dispatch scopes changed`);
+  add(
+    violations,
+    sameMembers(
+      at(workflow, "on", "workflow_dispatch", "inputs", "mode", "options"),
+      ["platform", "calibration", "release-evidence", "integration"],
+    ),
+    `${file} dispatch modes changed`,
+  );
+  add(
+    violations,
+    sameMembers(
+      at(workflow, "on", "workflow_dispatch", "inputs", "scope", "options"),
+      ["auto", "server", "windows", "macos", "full"],
+    ),
+    `${file} dispatch scopes changed`,
+  );
   add(violations, trigger(workflow, "pull_request_target") === undefined, `${file} must not use pull_request_target`);
   add(violations, object(workflow.permissions).actions === "read", `${file} must read source-proof runs`);
   add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
@@ -1518,6 +1715,7 @@ function validatePackagedCoordinator(workflows, violations) {
     'test "$head_repo" = "$GITHUB_REPOSITORY"',
     'test "$current_head" = "$expected_head"',
     'test "$base_ref" = "dev/codestory-next"',
+    'test "$GITHUB_SHA" = "$current_head"',
   ]);
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
@@ -1525,8 +1723,78 @@ function validatePackagedCoordinator(workflows, violations) {
     '.name == "full-source-gate" and .conclusion == "success"',
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", ["node .github/scripts/route-ci-proof.mjs --stdin"]);
+  requireCalibrationProducerAuthentication(violations, file, route);
+  const calibrationLinux = requireJob(violations, file, workflow, "calibration-linux");
+  add(
+    violations,
+    calibrationLinux.uses === "./.github/workflows/packaged-platform-proof.yml"
+      && object(calibrationLinux.with).calibration_mode === true,
+    `${file} hosted Linux calibration must call packaged proof in calibration mode`,
+  );
+  const calibrationMacos = requireJob(violations, file, workflow, "calibration-macos");
+  add(
+    violations,
+    calibrationMacos.uses === "./.github/workflows/macos-metal-proof.yml"
+      && object(calibrationMacos.with).calibration_mode === true,
+    `${file} protected macOS calibration must call Metal proof in calibration mode`,
+  );
+  const calibrationAssemble = requireJob(
+    violations,
+    file,
+    workflow,
+    "calibration-assemble",
+  );
+  add(
+    violations,
+    sameMembers(needs(calibrationAssemble), [
+      "route",
+      "calibration-linux",
+      "calibration-macos",
+    ]),
+    `${file} calibration assembly must wait for both independent calibration cells`,
+  );
+  requireStepRun(
+    violations,
+    file,
+    calibrationAssemble,
+    "Assemble frozen calibration candidate",
+    [
+      "--assemble-calibration-bundle",
+      'test "${#runs[@]}" = 6',
+      "--calibration-producer-workflow-path",
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+    ],
+  );
+  requireStepUses(
+    violations,
+    file,
+    calibrationAssemble,
+    "Upload calibration bundle and frozen constant candidate",
+    "actions/upload-artifact@v7.0.1",
+  );
+  add(
+    violations,
+    object(namedStep(
+      calibrationAssemble,
+      "Upload calibration bundle and frozen constant candidate",
+    )?.with).name
+      === "embedding-calibration-bundle-${{ needs.route.outputs.head_sha }}",
+    `${file} calibration artifact name must bind the exact source head`,
+  );
   const packaged = requireJob(violations, file, workflow, "packaged-proof");
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${file} must call packaged proof`);
+  add(
+    violations,
+    object(packaged.with).enforce_calibration_freeze_lineage
+      === "${{ needs.route.outputs.freeze_transition == 'true' }}",
+    `${file} must enforce calibration lineage only on the detected freeze transition`,
+  );
+  add(
+    violations,
+    object(packaged.with).candidate_installed_proof === true,
+    `${file} must opt the accepted PR package into candidate-installed proof`,
+  );
   violations.push(...packagedPrSigningViolations(workflow));
   const metal = requireJob(violations, file, workflow, "macos-metal-proof");
   add(
@@ -1535,6 +1803,17 @@ function validatePackagedCoordinator(workflows, violations) {
     `${file} Metal proof must wait for package and exact-head release evidence`,
   );
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${file} Metal proof must use the packaged CLI`);
+  add(
+    violations,
+    object(metal.with).candidate_installed_proof === true,
+    `${file} must opt the accepted PR Metal package into candidate-installed proof`,
+  );
+  add(
+    violations,
+    object(metal.with).server_behavior_only
+      === "${{ needs.route.outputs.scope == 'server' }}",
+    `${file} must select the non-quality server claim only for server scope`,
+  );
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
   add(
     violations,
@@ -1608,14 +1887,89 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${metalFile} must exist`);
   } else {
     add(violations, trigger(metal, "workflow_call") !== undefined && trigger(metal, "workflow_dispatch") !== undefined, `${metalFile} must support reusable and manual proof`);
+    const candidateInput = object(at(
+      metal,
+      "on",
+      "workflow_call",
+      "inputs",
+      "candidate_installed_proof",
+    ));
+    add(
+      violations,
+      candidateInput.required === false
+        && candidateInput.type === "boolean"
+        && candidateInput.default === false,
+      `${metalFile} candidate-installed proof must be an explicit opt-in`,
+    );
+    const serverBehaviorInput = object(at(
+      metal,
+      "on",
+      "workflow_call",
+      "inputs",
+      "server_behavior_only",
+    ));
+    add(
+      violations,
+      serverBehaviorInput.required === false
+        && serverBehaviorInput.type === "boolean"
+        && serverBehaviorInput.default === false,
+      `${metalFile} server-behavior-only claim scope must be an explicit opt-in`,
+    );
     const job = requireJob(violations, metalFile, metal, "packaged-metal");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "macOS", "ARM64", "codestory-metal"]), `${metalFile} must use the protected Apple Silicon runner`);
     add(violations, job.environment === "macos-metal-release", `${metalFile} must use the protected Metal environment`);
     requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
+    requireCalibrationProducerAuthentication(violations, metalFile, job);
     const engine = namedStep(job, "Prove cold and warm Metal, offline packaging, and multi-repository reuse");
-    requireStepRun(violations, metalFile, job, "Prove cold and warm Metal, offline packaging, and multi-repository reuse", ["--engine-policy accelerated", "--expected-backend Metal", "--offline"]);
+    requireStepRun(violations, metalFile, job, "Prove cold and warm Metal, offline packaging, and multi-repository reuse", [
+      "--engine-policy accelerated",
+      "--expected-backend Metal",
+      "--offline",
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+      "--server-behavior-only",
+      'test -f "$quality_path"',
+    ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} engine proof must reject CPU fallback`);
+    const candidateStage = namedStep(job, "Stage isolated candidate-managed macOS install");
+    add(
+      violations,
+      String(candidateStage?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateStage?.if ?? "").includes("inputs.server_behavior_only"),
+      `${metalFile} candidate-managed staging must require coordinator opt-in and remain runnable in server scope`,
+    );
+    requireStepRun(violations, metalFile, job, "Stage isolated candidate-managed macOS install", [
+      "--prepare-candidate-installed-proof",
+      "--candidate-plugin-root-output",
+      "--candidate-plugin-data-output",
+      "--installed-plugin-provenance-output",
+      "--candidate-producer-workflow-path",
+      "$RUNNER_TEMP/codestory-candidate-installed-macos.",
+      'candidate_root="$(cd "$candidate_root" && pwd -P)"',
+      '"$GITHUB_WORKSPACE/"*',
+      "CODESTORY_CANDIDATE_MACOS_ROOT=",
+    ]);
+    const candidateProof = namedStep(job, "Prove two-host candidate-installed macOS runtime");
+    add(
+      violations,
+      String(candidateProof?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateProof?.if ?? "").includes("inputs.server_behavior_only"),
+      `${metalFile} candidate-installed proof must require coordinator opt-in and remain runnable in server scope`,
+    );
+    requireStepRun(violations, metalFile, job, "Prove two-host candidate-installed macOS runtime", [
+      "--proof-tier installed_runtime",
+      "--qualification-matrix-cell candidate_installed_macos_arm64_cpu",
+      "--installed-plugin-source candidate",
+      "--installed-plugin-provenance",
+      "--installed-plugin-data",
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+      "--server-behavior-only",
+      "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin",
+      "$CODESTORY_CANDIDATE_MACOS_ROOT/data",
+      'test -f "$quality_path"',
+    ]);
   }
 
   const vulkanFile = "windows-vulkan-proof.yml";
@@ -1652,8 +2006,15 @@ function validateRemainingWorkflows(workflows, violations) {
       "cargo build --release --locked -p codestory-cli",
       "package-codestory-release.py",
     ]);
+    requireCalibrationProducerAuthentication(violations, vulkanFile, job);
     const engine = namedStep(job, "Prove offline Vulkan and multi-repository reuse");
-    requireStepRun(violations, vulkanFile, job, "Prove offline Vulkan and multi-repository reuse", ["--engine-policy accelerated", "--expected-backend Vulkan", "--offline"]);
+    requireStepRun(violations, vulkanFile, job, "Prove offline Vulkan and multi-repository reuse", [
+      "--engine-policy accelerated",
+      "--expected-backend Vulkan",
+      "--offline",
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+    ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
   }
 
