@@ -2404,7 +2404,7 @@ fn affected_tool_matches_existing_alias_by_native_file_identity() {
 }
 
 #[test]
-fn affected_tool_matches_rename_by_previous_path_identity() {
+fn affected_tool_uses_previous_rename_identity_as_bounded_graph_seed() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -2430,9 +2430,31 @@ fn affected_tool_matches_rename_by_previous_path_identity() {
     );
 
     let result = assert_tool_success(&response, json!("affected-rename-previous"));
-    assert_eq!(result["matched_file_count"], json!(1));
-    assert_eq!(result["matched_files"][0]["path"], json!("src/runtime.rs"));
-    assert_eq!(result["matched_files"][0]["change_kind"], json!("renamed"));
+    assert_eq!(result["matched_file_count"], json!(0));
+    assert_eq!(result["matched_files"], json!([]));
+    assert_eq!(
+        result["unmatched_paths"][0]["classification"],
+        json!("rename_unresolved")
+    );
+    assert_eq!(
+        result["unmatched_paths"][0]["change_kind"],
+        json!("renamed")
+    );
+    assert!(
+        result["unmatched_paths"][0]["evidence"]
+            .as_array()
+            .is_some_and(|evidence| evidence.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|text| text.contains("previous indexed identity"))
+            })),
+        "previous identity should stay bounded evidence rather than current-path coverage: {result}"
+    );
+    assert!(
+        result["impacted_symbols"]
+            .as_array()
+            .is_some_and(|symbols| !symbols.is_empty()),
+        "previous rename identity should still seed bounded graph impact: {result}"
+    );
 }
 
 #[test]

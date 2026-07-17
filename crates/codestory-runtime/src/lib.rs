@@ -62,7 +62,8 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 use std::ops::Deref;
@@ -102,7 +103,7 @@ pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
-use path_identity::OperationPathIdentityResolver;
+use path_identity::{OperationPathIdentityResolver, PathIdentityUnavailable};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
@@ -366,11 +367,188 @@ fn route_handler_certainty_rank(
 }
 
 #[derive(Debug, Clone)]
+struct RouteHandlerCandidate {
+    edge: GraphEdge,
+    target: GraphNode,
+}
+
+fn compare_optional_confidence_desc(left: Option<f32>, right: Option<f32>) -> Ordering {
+    let left = left.filter(|value| value.is_finite());
+    let right = right.filter(|value| value.is_finite());
+    match (left, right) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_route_handler_candidates(
+    left: &RouteHandlerCandidate,
+    right: &RouteHandlerCandidate,
+) -> Ordering {
+    // Persisted graph edges have unique IDs, so the edge ID tie-breaker makes
+    // this a total order for every valid route-handler candidate set.
+    compare_optional_confidence_desc(left.edge.confidence, right.edge.confidence)
+        .then_with(|| {
+            route_handler_certainty_rank(right.edge.certainty)
+                .cmp(&route_handler_certainty_rank(left.edge.certainty))
+        })
+        .then(left.target.canonical_id.cmp(&right.target.canonical_id))
+        .then(left.target.qualified_name.cmp(&right.target.qualified_name))
+        .then(
+            left.target
+                .serialized_name
+                .cmp(&right.target.serialized_name),
+        )
+        .then((left.target.kind as i32).cmp(&(right.target.kind as i32)))
+        .then(left.target.file_node_id.cmp(&right.target.file_node_id))
+        .then(left.target.start_line.cmp(&right.target.start_line))
+        .then(left.target.start_col.cmp(&right.target.start_col))
+        .then(left.target.end_line.cmp(&right.target.end_line))
+        .then(left.target.end_col.cmp(&right.target.end_col))
+        .then(left.target.id.cmp(&right.target.id))
+        .then(left.edge.id.cmp(&right.edge.id))
+        .then(left.edge.source.cmp(&right.edge.source))
+        .then(left.edge.target.cmp(&right.edge.target))
+        .then(left.edge.resolved_source.cmp(&right.edge.resolved_source))
+        .then(left.edge.resolved_target.cmp(&right.edge.resolved_target))
+        .then(left.edge.line.cmp(&right.edge.line))
+        .then(
+            left.edge
+                .callsite_identity
+                .cmp(&right.edge.callsite_identity),
+        )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffectedConfidenceFloor {
+    strength: u8,
+    label: String,
+}
+
+impl AffectedConfidenceFloor {
+    fn from_label(label: impl Into<String>) -> Self {
+        let mut label = label.into();
+        let strength = match label.as_str() {
+            "direct" => 7,
+            "certain" | "schema" => 6,
+            "probable" | "file_convention" | "decorator" | "annotation" | "attribute" => 5,
+            "graph" => 4,
+            "heuristic" => 3,
+            "uncertain" => 2,
+            "bounded" => 1,
+            _ => 1,
+        };
+        if !matches!(
+            label.as_str(),
+            "direct"
+                | "certain"
+                | "schema"
+                | "probable"
+                | "graph"
+                | "heuristic"
+                | "file_convention"
+                | "decorator"
+                | "annotation"
+                | "attribute"
+                | "uncertain"
+                | "bounded"
+        ) {
+            label = "bounded".to_string();
+        }
+        Self { strength, label }
+    }
+
+    fn bounded() -> Self {
+        Self::from_label("bounded")
+    }
+
+    fn weakest(&self, other: &Self) -> Self {
+        match self.strength.cmp(&other.strength) {
+            Ordering::Less => self.clone(),
+            Ordering::Greater => other.clone(),
+            Ordering::Equal if self.label <= other.label => self.clone(),
+            Ordering::Equal => other.clone(),
+        }
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AffectedPathTieStep {
+    edge_id: i64,
+    source_node_id: GraphNodeId,
+    target_node_id: GraphNodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AffectedGraphEvidence {
     distance: u32,
     reason: String,
-    confidence: String,
+    confidence_floor: AffectedConfidenceFloor,
     previous_identity_proxy: bool,
+    path_tie_key: Vec<AffectedPathTieStep>,
+}
+
+impl AffectedGraphEvidence {
+    fn seed(
+        node_id: GraphNodeId,
+        reason: impl Into<String>,
+        confidence_floor: AffectedConfidenceFloor,
+        previous_identity_proxy: bool,
+    ) -> Self {
+        Self {
+            distance: 0,
+            reason: reason.into(),
+            confidence_floor: if previous_identity_proxy {
+                AffectedConfidenceFloor::bounded()
+            } else {
+                confidence_floor
+            },
+            previous_identity_proxy,
+            path_tie_key: vec![AffectedPathTieStep {
+                edge_id: i64::MIN,
+                source_node_id: node_id,
+                target_node_id: node_id,
+            }],
+        }
+    }
+}
+
+fn compare_affected_evidence(
+    left: &AffectedGraphEvidence,
+    right: &AffectedGraphEvidence,
+) -> Ordering {
+    left.distance
+        .cmp(&right.distance)
+        .then(
+            left.previous_identity_proxy
+                .cmp(&right.previous_identity_proxy),
+        )
+        .then_with(|| {
+            right
+                .confidence_floor
+                .strength
+                .cmp(&left.confidence_floor.strength)
+        })
+        .then(
+            left.confidence_floor
+                .label
+                .cmp(&right.confidence_floor.label),
+        )
+        .then(left.path_tie_key.cmp(&right.path_tie_key))
+        .then(left.reason.cmp(&right.reason))
+}
+
+fn affected_evidence_is_better(
+    candidate: &AffectedGraphEvidence,
+    current: &AffectedGraphEvidence,
+) -> bool {
+    compare_affected_evidence(candidate, current) == Ordering::Less
 }
 
 fn normalized_affected_input(
@@ -469,49 +647,155 @@ fn affected_change_path(root: &Path, raw: &str) -> PathBuf {
     }
 }
 
+type AffectedNativePathIdentityResolver = fn(&Path) -> io::Result<WorkspacePathIdentity>;
+
+/// Native path observations and freshness membership for one affected call.
+///
+/// Keeping the resolver and identity-keyed refresh sets together prevents the
+/// affected path from falling back to pairwise path comparisons or observing
+/// one spelling twice after a concurrent replacement.
+struct AffectedOperationIdentityIndex<R = AffectedNativePathIdentityResolver> {
+    resolver: OperationPathIdentityResolver<R>,
+    admitted_identities: HashSet<WorkspacePathIdentity>,
+    stale_identities: HashSet<WorkspacePathIdentity>,
+    freshness_identity_gaps: BTreeMap<PathBuf, String>,
+}
+
+impl AffectedOperationIdentityIndex<AffectedNativePathIdentityResolver> {
+    fn native() -> Self {
+        Self {
+            resolver: OperationPathIdentityResolver::native(),
+            admitted_identities: HashSet::new(),
+            stale_identities: HashSet::new(),
+            freshness_identity_gaps: BTreeMap::new(),
+        }
+    }
+}
+
+impl<R> AffectedOperationIdentityIndex<R>
+where
+    R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
+{
+    #[cfg(test)]
+    fn with_resolver(resolver: R) -> Self {
+        Self {
+            resolver: OperationPathIdentityResolver::with_resolver(resolver),
+            admitted_identities: HashSet::new(),
+            stale_identities: HashSet::new(),
+            freshness_identity_gaps: BTreeMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, path: &Path) -> Result<WorkspacePathIdentity, PathIdentityUnavailable> {
+        self.resolver.resolve(path)
+    }
+
+    fn record_admitted(&mut self, path: &Path) {
+        match self.resolve(path) {
+            Ok(identity) => {
+                self.admitted_identities.insert(identity);
+            }
+            Err(error) => self.record_freshness_gap(error),
+        }
+    }
+
+    fn record_stale(&mut self, path: &Path) {
+        match self.resolve(path) {
+            Ok(identity) => {
+                self.stale_identities.insert(identity);
+            }
+            Err(error) => self.record_freshness_gap(error),
+        }
+    }
+
+    fn record_freshness_gap(&mut self, error: PathIdentityUnavailable) {
+        self.freshness_identity_gaps
+            .entry(error.path.clone())
+            .or_insert_with(|| error.to_string());
+    }
+
+    fn freshness_identity_gap_count(&self) -> usize {
+        self.freshness_identity_gaps.len()
+    }
+
+    fn freshness_identity_gap_sample(&self) -> Option<String> {
+        self.freshness_identity_gaps.values().next().cloned()
+    }
+}
+
 struct AffectedIdentityMatches {
     matched_file_ids: HashSet<GraphNodeId>,
-    matched_record_indexes: HashSet<usize>,
+    matched_record_flags: Vec<bool>,
     matched_record_index_by_file_id: HashMap<GraphNodeId, usize>,
-    graph_seeded_record_indexes: HashSet<usize>,
+    graph_seeded_record_flags: Vec<bool>,
     previous_record_index_by_file_id: HashMap<GraphNodeId, usize>,
-    unavailable_changed_identity_count: usize,
-    unavailable_changed_identity_sample: Option<String>,
+    current_identity_by_record: Vec<Option<WorkspacePathIdentity>>,
+    previous_identity_by_record: Vec<Option<WorkspacePathIdentity>>,
+    current_identity_error_by_record: Vec<Option<String>>,
+    previous_identity_error_by_record: Vec<Option<String>>,
+    indexed_identity_by_file_id: HashMap<GraphNodeId, WorkspacePathIdentity>,
     unavailable_indexed_identity_count: usize,
     unavailable_indexed_identity_sample: Option<String>,
-    #[cfg(test)]
-    record_bucket_visits: usize,
-    #[cfg(test)]
-    record_index_visits: usize,
+    work: AffectedIdentityMatchWork,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AffectedIdentityMatchWork {
+    record_visits: usize,
+    indexed_file_visits: usize,
+    current_identity_bucket_visits: usize,
+    previous_identity_bucket_visits: usize,
+    bucket_record_visits: usize,
+    indexed_bucket_file_visits: usize,
+}
+
+#[derive(Debug, Default)]
+struct AffectedOrderedIdentityBuckets {
+    positions: HashMap<WorkspacePathIdentity, usize>,
+    buckets: Vec<(WorkspacePathIdentity, Vec<usize>)>,
+}
+
+impl AffectedOrderedIdentityBuckets {
+    fn push(&mut self, identity: WorkspacePathIdentity, record_index: usize) {
+        if let Some(position) = self.positions.get(&identity).copied() {
+            self.buckets[position].1.push(record_index);
+            return;
+        }
+        let position = self.buckets.len();
+        self.positions.insert(identity.clone(), position);
+        self.buckets.push((identity, vec![record_index]));
+    }
 }
 
 fn match_affected_file_identities<'a, I, R>(
     root: &Path,
     change_records: &[AffectedChangeRecordDto],
     indexed_files: I,
-    path_identities: &mut OperationPathIdentityResolver<R>,
+    path_identities: &mut AffectedOperationIdentityIndex<R>,
 ) -> AffectedIdentityMatches
 where
     I: IntoIterator<Item = (GraphNodeId, &'a Path)>,
     R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
 {
-    let mut current_record_indexes_by_identity =
-        HashMap::<WorkspacePathIdentity, Vec<usize>>::new();
-    let mut previous_record_indexes_by_identity =
-        HashMap::<WorkspacePathIdentity, Vec<usize>>::new();
-    let mut unavailable_changed_identity_count = 0_usize;
-    let mut unavailable_changed_identity_sample = None;
+    let mut work = AffectedIdentityMatchWork::default();
+    let mut current_buckets = AffectedOrderedIdentityBuckets::default();
+    let mut previous_buckets = AffectedOrderedIdentityBuckets::default();
+    let mut current_identity_by_record = Vec::with_capacity(change_records.len());
+    let mut previous_identity_by_record = Vec::with_capacity(change_records.len());
+    let mut current_identity_error_by_record = Vec::with_capacity(change_records.len());
+    let mut previous_identity_error_by_record = Vec::with_capacity(change_records.len());
     for (record_index, record) in change_records.iter().enumerate() {
-        let mut identity_unavailable = false;
+        work.record_visits = work.record_visits.saturating_add(1);
         let current_path = affected_change_path(root, &record.path);
         match path_identities.resolve(&current_path) {
-            Ok(identity) => current_record_indexes_by_identity
-                .entry(identity)
-                .or_default()
-                .push(record_index),
+            Ok(identity) => {
+                current_buckets.push(identity.clone(), record_index);
+                current_identity_by_record.push(Some(identity));
+                current_identity_error_by_record.push(None);
+            }
             Err(error) => {
-                identity_unavailable = true;
-                unavailable_changed_identity_sample.get_or_insert_with(|| error.to_string());
+                current_identity_by_record.push(None);
+                current_identity_error_by_record.push(Some(error.to_string()));
             }
         }
 
@@ -522,28 +806,34 @@ where
         {
             let previous_path = affected_change_path(root, previous_path);
             match path_identities.resolve(&previous_path) {
-                Ok(identity) => previous_record_indexes_by_identity
-                    .entry(identity)
-                    .or_default()
-                    .push(record_index),
+                Ok(identity) => {
+                    previous_buckets.push(identity.clone(), record_index);
+                    previous_identity_by_record.push(Some(identity));
+                    previous_identity_error_by_record.push(None);
+                }
                 Err(error) => {
-                    identity_unavailable = true;
-                    unavailable_changed_identity_sample.get_or_insert_with(|| error.to_string());
+                    previous_identity_by_record.push(None);
+                    previous_identity_error_by_record.push(Some(error.to_string()));
                 }
             }
+        } else {
+            previous_identity_by_record.push(None);
+            previous_identity_error_by_record.push(None);
         }
-        unavailable_changed_identity_count += usize::from(identity_unavailable);
     }
 
     let mut matched_file_ids = HashSet::new();
-    let mut matched_record_indexes = HashSet::new();
-    let mut matched_record_index_by_file_id = HashMap::new();
-    let mut graph_seeded_record_indexes = HashSet::new();
-    let mut previous_record_index_by_file_id = HashMap::new();
+    let mut matched_record_flags = vec![false; change_records.len()];
+    let mut matched_record_index_by_file_id = HashMap::<GraphNodeId, usize>::new();
+    let mut graph_seeded_record_flags = vec![false; change_records.len()];
+    let mut previous_record_index_by_file_id = HashMap::<GraphNodeId, usize>::new();
     let mut unavailable_indexed_identity_count = 0_usize;
-    let mut unavailable_indexed_identity_sample = None;
-    let mut indexed_identities = Vec::new();
+    let mut unavailable_indexed_identity_sample = None::<(String, String)>;
+    let mut indexed_identity_by_file_id = HashMap::new();
+    let mut indexed_file_ids_by_identity =
+        HashMap::<WorkspacePathIdentity, Vec<GraphNodeId>>::new();
     for (file_id, path) in indexed_files {
+        work.indexed_file_visits = work.indexed_file_visits.saturating_add(1);
         let indexed_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -553,82 +843,100 @@ where
             Ok(identity) => identity,
             Err(error) => {
                 unavailable_indexed_identity_count += 1;
-                unavailable_indexed_identity_sample.get_or_insert_with(|| error.to_string());
+                let candidate = (
+                    indexed_path.to_string_lossy().into_owned(),
+                    error.to_string(),
+                );
+                if unavailable_indexed_identity_sample
+                    .as_ref()
+                    .is_none_or(|current| candidate < *current)
+                {
+                    unavailable_indexed_identity_sample = Some(candidate);
+                }
                 continue;
             }
         };
-        if let Some(record_indexes) = current_record_indexes_by_identity.get(&identity) {
-            matched_file_ids.insert(file_id);
-            matched_record_indexes.extend(record_indexes.iter().copied());
-            graph_seeded_record_indexes.extend(record_indexes.iter().copied());
-            if let Some(record_index) = record_indexes.first() {
-                matched_record_index_by_file_id.insert(file_id, *record_index);
+        indexed_identity_by_file_id.insert(file_id, identity.clone());
+        indexed_file_ids_by_identity
+            .entry(identity)
+            .or_default()
+            .push(file_id);
+    }
+
+    for (identity, record_indexes) in current_buckets.buckets {
+        work.current_identity_bucket_visits = work.current_identity_bucket_visits.saturating_add(1);
+        let Some(file_ids) = indexed_file_ids_by_identity.get(&identity) else {
+            continue;
+        };
+        let mut first_record_index = None::<usize>;
+        for record_index in record_indexes {
+            work.bucket_record_visits = work.bucket_record_visits.saturating_add(1);
+            matched_record_flags[record_index] = true;
+            graph_seeded_record_flags[record_index] = true;
+            first_record_index =
+                Some(first_record_index.map_or(record_index, |current| current.min(record_index)));
+        }
+        let Some(first_record_index) = first_record_index else {
+            continue;
+        };
+        for file_id in file_ids {
+            work.indexed_bucket_file_visits = work.indexed_bucket_file_visits.saturating_add(1);
+            matched_file_ids.insert(*file_id);
+            matched_record_index_by_file_id
+                .entry(*file_id)
+                .and_modify(|current| *current = (*current).min(first_record_index))
+                .or_insert(first_record_index);
+        }
+    }
+
+    for (identity, record_indexes) in previous_buckets.buckets {
+        work.previous_identity_bucket_visits =
+            work.previous_identity_bucket_visits.saturating_add(1);
+        let Some(file_ids) = indexed_file_ids_by_identity.get(&identity) else {
+            continue;
+        };
+        let mut first_eligible_record_index = None::<usize>;
+        for record_index in record_indexes {
+            work.bucket_record_visits = work.bucket_record_visits.saturating_add(1);
+            if matched_record_flags[record_index] {
+                continue;
             }
+            graph_seeded_record_flags[record_index] = true;
+            first_eligible_record_index = Some(
+                first_eligible_record_index
+                    .map_or(record_index, |current| current.min(record_index)),
+            );
         }
-        indexed_identities.push((file_id, identity));
-    }
-
-    #[cfg(test)]
-    let mut record_bucket_visits = 0_usize;
-    #[cfg(test)]
-    let mut record_index_visits = 0_usize;
-    let mut visited_current_identities = HashSet::new();
-    for (_, identity) in &indexed_identities {
-        let Some(record_indexes) = current_record_indexes_by_identity.get(identity) else {
+        let Some(first_eligible_record_index) = first_eligible_record_index else {
             continue;
         };
-        if !visited_current_identities.insert(identity.clone()) {
-            continue;
-        }
-        #[cfg(test)]
-        {
-            record_bucket_visits += 1;
-            record_index_visits += record_indexes.len();
-        }
-    }
-
-    let mut visited_previous_identities = HashSet::new();
-    for (file_id, identity) in indexed_identities {
-        let Some(record_indexes) = previous_record_indexes_by_identity.get(&identity) else {
-            continue;
-        };
-        let eligible_record_indexes = record_indexes
-            .iter()
-            .copied()
-            .filter(|index| !matched_record_indexes.contains(index))
-            .collect::<Vec<_>>();
-        if eligible_record_indexes.is_empty() {
-            continue;
-        }
-        graph_seeded_record_indexes.extend(eligible_record_indexes.iter().copied());
-        if !matched_file_ids.contains(&file_id) {
+        for file_id in file_ids {
+            work.indexed_bucket_file_visits = work.indexed_bucket_file_visits.saturating_add(1);
+            if matched_file_ids.contains(file_id) {
+                continue;
+            }
             previous_record_index_by_file_id
-                .entry(file_id)
-                .or_insert(eligible_record_indexes[0]);
-        }
-        if visited_previous_identities.insert(identity) {
-            #[cfg(test)]
-            {
-                record_bucket_visits += 1;
-                record_index_visits += record_indexes.len();
-            }
+                .entry(*file_id)
+                .and_modify(|current| *current = (*current).min(first_eligible_record_index))
+                .or_insert(first_eligible_record_index);
         }
     }
 
     AffectedIdentityMatches {
         matched_file_ids,
-        matched_record_indexes,
+        matched_record_flags,
         matched_record_index_by_file_id,
-        graph_seeded_record_indexes,
+        graph_seeded_record_flags,
         previous_record_index_by_file_id,
-        unavailable_changed_identity_count,
-        unavailable_changed_identity_sample,
+        current_identity_by_record,
+        previous_identity_by_record,
+        current_identity_error_by_record,
+        previous_identity_error_by_record,
+        indexed_identity_by_file_id,
         unavailable_indexed_identity_count,
-        unavailable_indexed_identity_sample,
-        #[cfg(test)]
-        record_bucket_visits,
-        #[cfg(test)]
-        record_index_visits,
+        unavailable_indexed_identity_sample: unavailable_indexed_identity_sample
+            .map(|(_, error)| error),
+        work,
     }
 }
 
@@ -642,8 +950,10 @@ struct AffectedResolvedInput {
 struct IndexFreshnessObservation {
     freshness: IndexFreshnessDto,
     inventory_complete: bool,
-    admitted_paths: Vec<PathBuf>,
-    stale_paths: Vec<PathBuf>,
+    admitted_identities: HashSet<WorkspacePathIdentity>,
+    stale_identities: HashSet<WorkspacePathIdentity>,
+    identity_gap_count: usize,
+    identity_gap_sample: Option<String>,
 }
 
 impl IndexFreshnessObservation {
@@ -651,21 +961,262 @@ impl IndexFreshnessObservation {
         Self {
             freshness,
             inventory_complete: false,
-            admitted_paths: Vec::new(),
-            stale_paths: Vec::new(),
+            admitted_identities: HashSet::new(),
+            stale_identities: HashSet::new(),
+            identity_gap_count: 0,
+            identity_gap_sample: None,
         }
     }
 
-    fn path_is_admitted(&self, path: &Path) -> bool {
-        self.admitted_paths
-            .iter()
-            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
+    fn identity_is_admitted(&self, identity: &WorkspacePathIdentity) -> bool {
+        self.admitted_identities.contains(identity)
     }
 
-    fn path_is_stale(&self, path: &Path) -> bool {
-        self.stale_paths
+    fn identity_is_stale(&self, identity: &WorkspacePathIdentity) -> bool {
+        self.stale_identities.contains(identity)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AffectedEvidenceGapCategory {
+    count: usize,
+    sample: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AffectedRelevantEvidenceGaps {
+    current: AffectedEvidenceGapCategory,
+    previous: AffectedEvidenceGapCategory,
+    indexed: AffectedEvidenceGapCategory,
+    freshness: AffectedEvidenceGapCategory,
+}
+
+struct AffectedRelevantEvidenceGapInput<'a> {
+    resolved_inputs: &'a [AffectedResolvedInput],
+    matched_record_flags: &'a [bool],
+    current_identity_errors: &'a [Option<String>],
+    previous_identity_errors: &'a [Option<String>],
+    unavailable_indexed_identity_count: usize,
+    unavailable_indexed_identity_sample: Option<&'a str>,
+    freshness_evidence_affects_requested_claim: bool,
+    freshness_identity_gap_count: usize,
+    freshness_identity_gap_sample: Option<&'a str>,
+}
+
+fn affected_relevant_evidence_gaps(
+    input: AffectedRelevantEvidenceGapInput<'_>,
+) -> AffectedRelevantEvidenceGaps {
+    let current_errors = input
+        .current_identity_errors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, error)| {
+            let error = error.as_deref()?;
+            let resolved = input.resolved_inputs.get(index)?;
+            (input
+                .matched_record_flags
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+                || indexable_source_path(&resolved.current))
+            .then_some(error)
+        })
+        .collect::<Vec<_>>();
+    let previous_errors = input
+        .previous_identity_errors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, error)| {
+            let error = error.as_deref()?;
+            let resolved = input.resolved_inputs.get(index)?;
+            (!input
+                .matched_record_flags
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+                && resolved
+                    .previous
+                    .as_deref()
+                    .is_some_and(indexable_source_path))
+            .then_some(error)
+        })
+        .collect::<Vec<_>>();
+    let indexed_identity_is_relevant =
+        input
+            .resolved_inputs
             .iter()
-            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
+            .enumerate()
+            .any(|(index, resolved)| {
+                input
+                    .matched_record_flags
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+                    || indexable_source_path(&resolved.current)
+                    || resolved
+                        .previous
+                        .as_deref()
+                        .is_some_and(indexable_source_path)
+            });
+
+    AffectedRelevantEvidenceGaps {
+        current: AffectedEvidenceGapCategory {
+            count: current_errors.len(),
+            sample: current_errors.first().map(|error| (*error).to_string()),
+        },
+        previous: AffectedEvidenceGapCategory {
+            count: previous_errors.len(),
+            sample: previous_errors.first().map(|error| (*error).to_string()),
+        },
+        indexed: AffectedEvidenceGapCategory {
+            count: if indexed_identity_is_relevant {
+                input.unavailable_indexed_identity_count
+            } else {
+                0
+            },
+            sample: if indexed_identity_is_relevant {
+                input
+                    .unavailable_indexed_identity_sample
+                    .map(str::to_string)
+            } else {
+                None
+            },
+        },
+        freshness: AffectedEvidenceGapCategory {
+            count: if input.freshness_evidence_affects_requested_claim {
+                input.freshness_identity_gap_count
+            } else {
+                0
+            },
+            sample: if input.freshness_evidence_affects_requested_claim {
+                input.freshness_identity_gap_sample.map(str::to_string)
+            } else {
+                None
+            },
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffectedEvidenceGapComposition {
+    gap_free: bool,
+    unavailable_evidence_count: usize,
+    blind_spots: Vec<String>,
+}
+
+impl AffectedEvidenceGapComposition {
+    fn confidence(&self) -> &'static str {
+        if self.gap_free { "complete" } else { "bounded" }
+    }
+}
+
+fn compose_affected_evidence_gaps(
+    base_unavailable_evidence_count: usize,
+    gaps: &AffectedRelevantEvidenceGaps,
+) -> AffectedEvidenceGapComposition {
+    let unavailable_evidence_count = [
+        base_unavailable_evidence_count,
+        gaps.current.count,
+        gaps.previous.count,
+        gaps.indexed.count,
+        gaps.freshness.count,
+    ]
+    .into_iter()
+    .fold(0_usize, usize::saturating_add);
+    let gap_free = gaps.current.count == 0
+        && gaps.previous.count == 0
+        && gaps.indexed.count == 0
+        && gaps.freshness.count == 0;
+    let mut blind_spots = Vec::new();
+    if gaps.current.count > 0 {
+        let detail = gaps
+            .current
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native current-path identity was unavailable for {} relevant changed records; completeness was downgraded ({detail})",
+            gaps.current.count
+        ));
+    }
+    if gaps.previous.count > 0 {
+        let detail = gaps
+            .previous
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native previous-path identity was unavailable for {} unmatched rename/copy records; completeness was downgraded ({detail})",
+            gaps.previous.count
+        ));
+    }
+    if gaps.indexed.count > 0 {
+        let detail = gaps
+            .indexed
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native path identity was unavailable for {} relevant indexed files; completeness was downgraded ({detail})",
+            gaps.indexed.count
+        ));
+    }
+    if gaps.freshness.count > 0 {
+        let detail = gaps
+            .freshness
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native path identity was unavailable for {} refresh-plan paths needed by the requested claim ({detail})",
+            gaps.freshness.count
+        ));
+    }
+
+    AffectedEvidenceGapComposition {
+        gap_free,
+        unavailable_evidence_count,
+        blind_spots,
+    }
+}
+
+struct AffectedCompletenessInput {
+    uncovered_input_count: usize,
+    direct_impact_count: usize,
+    propagated_impact_count: usize,
+    candidate_test_count: usize,
+    freshness_evidence_affects_requested_claim: bool,
+    gap_composition: AffectedEvidenceGapComposition,
+    truncation_reasons: Vec<String>,
+}
+
+fn compose_affected_completeness(
+    input: AffectedCompletenessInput,
+) -> AffectedAnalysisCompletenessDto {
+    let truncated = !input.truncation_reasons.is_empty();
+    let complete = input.uncovered_input_count == 0
+        && !truncated
+        && input.gap_composition.gap_free
+        && !input.freshness_evidence_affects_requested_claim;
+    AffectedAnalysisCompletenessDto {
+        complete,
+        confidence: if complete {
+            "complete"
+        } else if !input.gap_composition.gap_free {
+            input.gap_composition.confidence()
+        } else {
+            "bounded"
+        }
+        .to_string(),
+        direct_impact_count: clamp_usize_to_u32(input.direct_impact_count),
+        propagated_impact_count: clamp_usize_to_u32(input.propagated_impact_count),
+        candidate_test_count: clamp_usize_to_u32(input.candidate_test_count),
+        uncovered_input_count: clamp_usize_to_u32(input.uncovered_input_count),
+        unavailable_evidence_count: clamp_usize_to_u32(
+            input.gap_composition.unavailable_evidence_count,
+        ),
+        truncated,
+        truncation_reasons: input.truncation_reasons,
     }
 }
 
@@ -697,25 +1248,31 @@ fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
 }
 
 fn classify_unmatched_affected_input(
-    root: &Path,
     record: &AffectedChangeRecordDto,
     resolved: &AffectedResolvedInput,
     freshness: &IndexFreshnessObservation,
+    current_identity: Option<&WorkspacePathIdentity>,
+    current_identity_error: Option<&str>,
+    previous_identity_error: Option<&str>,
 ) -> (AffectedInputClassificationDto, String, Vec<String>) {
     classify_unmatched_affected_input_with_metadata(
-        root,
         record,
         resolved,
         freshness,
+        current_identity,
+        current_identity_error,
+        previous_identity_error,
         affected_path_metadata(&resolved.current),
     )
 }
 
 fn classify_unmatched_affected_input_with_metadata(
-    _root: &Path,
     record: &AffectedChangeRecordDto,
     resolved: &AffectedResolvedInput,
     freshness: &IndexFreshnessObservation,
+    current_identity: Option<&WorkspacePathIdentity>,
+    current_identity_error: Option<&str>,
+    previous_identity_error: Option<&str>,
     metadata: AffectedPathMetadataObservation,
 ) -> (AffectedInputClassificationDto, String, Vec<String>) {
     let mut evidence = Vec::new();
@@ -766,7 +1323,27 @@ fn classify_unmatched_affected_input_with_metadata(
                 evidence,
             );
         }
-        if freshness.path_is_stale(path) {
+        if let Some(error) = current_identity_error {
+            evidence.push(format!(
+                "native current-path identity was unavailable: {error}"
+            ));
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "path exists and is indexable, but native identity evidence was unavailable"
+                    .to_string(),
+                evidence,
+            );
+        }
+        let Some(current_identity) = current_identity else {
+            evidence.push("native current-path identity was not observed".to_string());
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "path exists and is indexable, but native identity evidence was unavailable"
+                    .to_string(),
+                evidence,
+            );
+        };
+        if freshness.identity_is_stale(current_identity) {
             evidence
                 .push("complete freshness evidence identifies this path as changed or new".into());
             return (
@@ -776,7 +1353,7 @@ fn classify_unmatched_affected_input_with_metadata(
                 evidence,
             );
         }
-        if freshness.inventory_complete && !freshness.path_is_admitted(path) {
+        if freshness.inventory_complete && !freshness.identity_is_admitted(current_identity) {
             evidence.push(
                 "complete workspace inventory excludes this path from the admitted index set"
                     .into(),
@@ -784,6 +1361,18 @@ fn classify_unmatched_affected_input_with_metadata(
             return (
                 AffectedInputClassificationDto::ValidUncovered,
                 "regular file exists inside the project but is excluded from current graph/index coverage"
+                    .to_string(),
+                evidence,
+            );
+        }
+        if !freshness.inventory_complete {
+            evidence.push(
+                "bounded freshness or refresh-plan identity evidence was unavailable for this indexable path"
+                    .into(),
+            );
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "path exists and is indexable, but bounded freshness evidence cannot explain its graph absence"
                     .to_string(),
                 evidence,
             );
@@ -800,6 +1389,18 @@ fn classify_unmatched_affected_input_with_metadata(
         );
     }
 
+    if let Some(error) = current_identity_error {
+        evidence.push(format!(
+            "native current-path identity was unavailable: {error}"
+        ));
+        return (
+            AffectedInputClassificationDto::UnavailableEvidence,
+            "missing-path identity was unavailable, so indexed membership could not be established"
+                .to_string(),
+            evidence,
+        );
+    }
+
     match record.kind {
         AffectedChangeKindDto::Deleted => (
             AffectedInputClassificationDto::ExpectedDeleted,
@@ -807,6 +1408,17 @@ fn classify_unmatched_affected_input_with_metadata(
             evidence,
         ),
         AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied => {
+            if let Some(error) = previous_identity_error {
+                evidence.push(format!(
+                    "native previous-path identity was unavailable: {error}"
+                ));
+                return (
+                    AffectedInputClassificationDto::UnavailableEvidence,
+                    "previous rename/copy identity was unavailable, so bounded proxy coverage could not be established"
+                        .to_string(),
+                    evidence,
+                );
+            }
             if let Some(previous) = resolved.previous.as_deref() {
                 match affected_path_metadata(previous) {
                     AffectedPathMetadataObservation::RegularFile => {
@@ -851,10 +1463,8 @@ fn classify_unmatched_affected_input_with_metadata(
 fn classify_matched_affected_input(
     file: &AffectedMatchedFileDto,
     stale: bool,
+    freshness_available: bool,
 ) -> Option<(AffectedInputClassificationDto, String, Vec<String>)> {
-    if file.indexed && file.complete && file.error_count == 0 && !stale {
-        return None;
-    }
     if file.error_count > 0 {
         return Some((
             AffectedInputClassificationDto::Malformed,
@@ -868,6 +1478,20 @@ fn classify_matched_affected_input(
             "matched path has exact complete-inventory evidence of stale publication".to_string(),
             vec!["complete freshness evidence identifies this path as stale".to_string()],
         ));
+    }
+    if !freshness_available {
+        return Some((
+            AffectedInputClassificationDto::UnavailableEvidence,
+            "matched file identity is known, but bounded freshness evidence was unavailable"
+                .to_string(),
+            vec![
+                "bounded freshness or refresh-plan identity evidence was unavailable for this matched path"
+                    .to_string(),
+            ],
+        ));
+    }
+    if file.indexed && file.complete {
+        return None;
     }
     Some((
         AffectedInputClassificationDto::UnavailableEvidence,
@@ -897,12 +1521,22 @@ fn affected_files_follow_up_invocation(project: &str, path: &str) -> AffectedFol
 fn affected_follow_ups(
     project: &str,
     uncovered_inputs: &[AffectedUncoveredInputDto],
+    freshness_diagnostic: Option<&str>,
 ) -> Vec<AffectedFollowUpDto> {
-    let mut follow_ups = Vec::new();
-    for input in uncovered_inputs {
-        match input.classification {
-            AffectedInputClassificationDto::ValidUncovered => {
-                follow_ups.push(AffectedFollowUpDto {
+    let mut inputs = uncovered_inputs.iter().collect::<Vec<_>>();
+    inputs.sort_by(|left, right| {
+        affected_classification_rank(&left.classification)
+            .cmp(&affected_classification_rank(&right.classification))
+            .then(left.path.cmp(&right.path))
+            .then(left.reason.cmp(&right.reason))
+    });
+    let mut follow_ups = BTreeMap::<(u8, String, String), AffectedFollowUpDto>::new();
+    for input in inputs {
+        let (priority, dedupe_path, follow_up) = match input.classification {
+            AffectedInputClassificationDto::ValidUncovered => (
+                5,
+                input.path.clone(),
+                AffectedFollowUpDto {
                     action: "inspect_graph_boundary".to_string(),
                     reason: format!(
                         "{} is a valid project file outside current graph coverage; source inspection is the relevant next step",
@@ -910,15 +1544,16 @@ fn affected_follow_ups(
                     ),
                     confidence: "direct".to_string(),
                     invocation: None,
-                });
-            }
-            AffectedInputClassificationDto::StaleIndex => {
-                follow_ups.push(AffectedFollowUpDto {
+                },
+            ),
+            AffectedInputClassificationDto::StaleIndex => (
+                0,
+                String::new(),
+                AffectedFollowUpDto {
                     action: "refresh_stale_index".to_string(),
-                    reason: format!(
-                        "complete freshness evidence shows the publication is stale for {}",
-                        input.path
-                    ),
+                    reason:
+                        "complete requested-path freshness evidence shows the publication is stale"
+                            .to_string(),
                     confidence: "direct".to_string(),
                     invocation: Some(AffectedFollowUpInvocationDto {
                         program: "codestory-cli".to_string(),
@@ -930,12 +1565,14 @@ fn affected_follow_ups(
                             "incremental".to_string(),
                         ],
                     }),
-                });
-            }
+                },
+            ),
             AffectedInputClassificationDto::Missing
             | AffectedInputClassificationDto::RenameUnresolved
-            | AffectedInputClassificationDto::ExpectedDeleted => {
-                follow_ups.push(AffectedFollowUpDto {
+            | AffectedInputClassificationDto::ExpectedDeleted => (
+                1,
+                input.path.clone(),
+                AffectedFollowUpDto {
                     action: "locate_input_path".to_string(),
                     reason: format!(
                         "confirm the exact project-relative spelling and file state for {}",
@@ -943,37 +1580,43 @@ fn affected_follow_ups(
                     ),
                     confidence: "direct".to_string(),
                     invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
-                });
-            }
+                },
+            ),
             AffectedInputClassificationDto::Malformed => {
                 let recorded_error = input
                     .evidence
                     .iter()
                     .any(|evidence| evidence.starts_with("indexed file error_count="));
-                follow_ups.push(AffectedFollowUpDto {
-                    action: if recorded_error {
-                        "inspect_recorded_index_error"
-                    } else {
-                        "inspect_malformed_input"
-                    }
-                    .to_string(),
-                    reason: if recorded_error {
-                        format!(
-                            "inspect the exact recorded parse/index error for {} before retrying impact analysis",
-                            input.path
-                        )
-                    } else {
-                        format!(
-                            "confirm {} is a regular project file before retrying impact analysis",
-                            input.path
-                        )
+                (
+                    2,
+                    input.path.clone(),
+                    AffectedFollowUpDto {
+                        action: if recorded_error {
+                            "inspect_recorded_index_error"
+                        } else {
+                            "inspect_malformed_input"
+                        }
+                        .to_string(),
+                        reason: if recorded_error {
+                            format!(
+                                "inspect the exact recorded parse/index error for {} before retrying impact analysis",
+                                input.path
+                            )
+                        } else {
+                            format!(
+                                "confirm {} is a regular project file before retrying impact analysis",
+                                input.path
+                            )
+                        },
+                        confidence: "direct".to_string(),
+                        invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
                     },
-                    confidence: "direct".to_string(),
-                    invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
-                });
+                )
             }
-            AffectedInputClassificationDto::UnavailableEvidence => {
-                follow_ups.push(AffectedFollowUpDto {
+            AffectedInputClassificationDto::UnavailableEvidence => (
+                3,
+                input.path.clone(),
+                AffectedFollowUpDto {
                     action: "inspect_input_evidence".to_string(),
                     reason: format!(
                         "inspect the focused inventory row for {}; current evidence cannot classify its graph absence more strongly",
@@ -981,11 +1624,44 @@ fn affected_follow_ups(
                     ),
                     confidence: "bounded".to_string(),
                     invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
-                });
-            }
-        }
+                },
+            ),
+        };
+        follow_ups
+            .entry((priority, follow_up.action.clone(), dedupe_path))
+            .or_insert(follow_up);
     }
-    follow_ups
+    if let Some(reason) = freshness_diagnostic {
+        let follow_up = AffectedFollowUpDto {
+            action: "establish_freshness_evidence".to_string(),
+            reason: reason.to_string(),
+            confidence: "bounded".to_string(),
+            invocation: Some(AffectedFollowUpInvocationDto {
+                program: "codestory-cli".to_string(),
+                args: vec![
+                    "doctor".to_string(),
+                    "--project".to_string(),
+                    project.to_string(),
+                    "--format".to_string(),
+                    "markdown".to_string(),
+                ],
+            }),
+        };
+        follow_ups.insert((4, follow_up.action.clone(), String::new()), follow_up);
+    }
+    follow_ups.into_values().collect()
+}
+
+fn affected_classification_rank(classification: &AffectedInputClassificationDto) -> u8 {
+    match classification {
+        AffectedInputClassificationDto::StaleIndex => 0,
+        AffectedInputClassificationDto::Missing
+        | AffectedInputClassificationDto::ExpectedDeleted
+        | AffectedInputClassificationDto::RenameUnresolved => 1,
+        AffectedInputClassificationDto::Malformed => 2,
+        AffectedInputClassificationDto::UnavailableEvidence => 3,
+        AffectedInputClassificationDto::ValidUncovered => 4,
+    }
 }
 
 fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'static str {
@@ -1006,44 +1682,154 @@ fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'sta
     }
 }
 
-fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> String {
-    edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
-        .unwrap_or_else(|| "graph".to_string())
+fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> AffectedConfidenceFloor {
+    AffectedConfidenceFloor::from_label(
+        edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
+            .unwrap_or_else(|| "graph".to_string()),
+    )
 }
 
 fn affected_dependent_evidence(
     distance: u32,
-    edge: Option<&codestory_contracts::graph::Edge>,
+    edge: &codestory_contracts::graph::Edge,
     target_label: String,
-    previous_identity_proxy: bool,
+    parent: &AffectedGraphEvidence,
 ) -> AffectedGraphEvidence {
-    let (mut reason, mut confidence) = edge
-        .map(|edge| {
-            (
-                format!(
-                    "dependent reaches changed code via {} edge to {}",
-                    affected_edge_kind_label(edge.kind),
-                    target_label
-                ),
-                affected_edge_confidence(edge),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                format!("dependent reaches changed code through graph walk to {target_label}"),
-                "graph".to_string(),
-            )
-        });
-    if previous_identity_proxy {
+    let mut reason = format!(
+        "dependent reaches changed code via {} edge to {}",
+        affected_edge_kind_label(edge.kind),
+        target_label
+    );
+    let mut confidence_floor = parent
+        .confidence_floor
+        .weakest(&affected_edge_confidence(edge));
+    if parent.previous_identity_proxy {
         reason = format!("bounded previous-identity proxy; {reason}");
-        confidence = "bounded".to_string();
+        confidence_floor = AffectedConfidenceFloor::bounded();
     }
+    let mut path_tie_key = parent.path_tie_key.clone();
+    path_tie_key.push(AffectedPathTieStep {
+        edge_id: edge.id.0,
+        source_node_id: edge.effective_source(),
+        target_node_id: edge.effective_target(),
+    });
     AffectedGraphEvidence {
         distance,
         reason,
-        confidence,
-        previous_identity_proxy,
+        confidence_floor,
+        previous_identity_proxy: parent.previous_identity_proxy,
+        path_tie_key,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffectedReverseWalk {
+    distances: BTreeMap<GraphNodeId, u32>,
+    evidence: BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    visited_edge_count: usize,
+}
+
+fn compare_affected_reverse_edges(
+    left: &codestory_contracts::graph::Edge,
+    right: &codestory_contracts::graph::Edge,
+) -> Ordering {
+    left.effective_source()
+        .cmp(&right.effective_source())
+        .then(left.id.cmp(&right.id))
+        .then(left.effective_target().cmp(&right.effective_target()))
+        .then((left.kind as i32).cmp(&(right.kind as i32)))
+        .then(left.line.cmp(&right.line))
+        .then(left.source.cmp(&right.source))
+        .then(left.target.cmp(&right.target))
+        .then(left.resolved_source.cmp(&right.resolved_source))
+        .then(left.resolved_target.cmp(&right.resolved_target))
+        .then(left.callsite_identity.cmp(&right.callsite_identity))
+}
+
+fn affected_reverse_walk(
+    depth: u32,
+    edges: &[codestory_contracts::graph::Edge],
+    seed_evidence: BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    labels: &HashMap<GraphNodeId, String>,
+) -> AffectedReverseWalk {
+    let mut reverse_dependents = BTreeMap::<GraphNodeId, Vec<usize>>::new();
+    for (edge_index, edge) in edges.iter().enumerate() {
+        reverse_dependents
+            .entry(edge.effective_target())
+            .or_default()
+            .push(edge_index);
+    }
+    for edge_indexes in reverse_dependents.values_mut() {
+        edge_indexes
+            .sort_by(|left, right| compare_affected_reverse_edges(&edges[*left], &edges[*right]));
+    }
+
+    let mut distances = BTreeMap::<GraphNodeId, u32>::new();
+    let mut evidence = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
+    for (seed, seed_evidence) in seed_evidence {
+        distances.insert(seed, 0);
+        evidence.insert(seed, seed_evidence);
+    }
+    let mut frontier = distances.keys().copied().collect::<Vec<_>>();
+    let mut visited_edge_count = 0_usize;
+    for distance in 0..depth {
+        let next_distance = distance + 1;
+        let mut next_candidates = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
+        for node_id in frontier {
+            let Some(parent_evidence) = evidence.get(&node_id) else {
+                continue;
+            };
+            for edge_index in reverse_dependents.get(&node_id).into_iter().flatten() {
+                visited_edge_count = visited_edge_count.saturating_add(1);
+                let edge = &edges[*edge_index];
+                let dependent = edge.effective_source();
+                if distances.contains_key(&dependent) {
+                    continue;
+                }
+                let target_label = labels
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_else(|| node_id.0.to_string());
+                let candidate =
+                    affected_dependent_evidence(next_distance, edge, target_label, parent_evidence);
+                next_candidates
+                    .entry(dependent)
+                    .and_modify(|current| {
+                        if affected_evidence_is_better(&candidate, current) {
+                            current.clone_from(&candidate);
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+        frontier = Vec::with_capacity(next_candidates.len());
+        for (node_id, candidate) in next_candidates {
+            distances.insert(node_id, next_distance);
+            evidence.insert(node_id, candidate);
+            frontier.push(node_id);
+        }
+        if frontier.is_empty() {
+            break;
+        }
+    }
+
+    AffectedReverseWalk {
+        distances,
+        evidence,
+        visited_edge_count,
+    }
+}
+
+fn affected_route_confidence(
+    graph_evidence: &AffectedGraphEvidence,
+    route_confidence: Option<&str>,
+) -> String {
+    let route_floor = AffectedConfidenceFloor::from_label(route_confidence.unwrap_or("graph"));
+    graph_evidence
+        .confidence_floor
+        .weakest(&route_floor)
+        .label()
+        .to_string()
 }
 
 struct FrameworkRouteCoverageEntry {
@@ -4298,6 +5084,24 @@ fn index_freshness_observation_from_storage(
     workspace: &WorkspaceManifest,
     storage: &Storage,
 ) -> IndexFreshnessObservation {
+    let mut identities = AffectedOperationIdentityIndex::native();
+    index_freshness_observation_from_storage_with_identities(
+        root,
+        workspace,
+        storage,
+        &mut identities,
+    )
+}
+
+fn index_freshness_observation_from_storage_with_identities<R>(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    storage: &Storage,
+    identities: &mut AffectedOperationIdentityIndex<R>,
+) -> IndexFreshnessObservation
+where
+    R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
+{
     let started_at = Instant::now();
     match storage.has_incomplete_incremental_run() {
         Ok(true) => {
@@ -4453,35 +5257,25 @@ fn index_freshness_observation_from_storage(
         .saturating_sub(removed_file_count)
         .saturating_add(new_file_count);
 
-    let mut admitted_paths: Vec<PathBuf> = Vec::with_capacity(
-        plan.existing_file_ids
-            .len()
-            .saturating_add(plan.files_to_index.len()),
-    );
     for path in plan
         .existing_file_ids
         .keys()
         .chain(plan.files_to_index.iter())
     {
-        if !admitted_paths
-            .iter()
-            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
-        {
-            admitted_paths.push(path.to_path_buf());
-        }
+        identities.record_admitted(path);
     }
-    let mut stale_paths = plan.files_to_index.clone();
+    for path in &plan.files_to_index {
+        identities.record_stale(path);
+    }
     for removed_id in &plan.files_to_remove {
         let Some(path) = removed_paths.get(removed_id) else {
             continue;
         };
-        if !stale_paths
-            .iter()
-            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
-        {
-            stale_paths.push(path.clone());
-        }
+        identities.record_stale(path);
     }
+
+    let identity_gap_count = identities.freshness_identity_gap_count();
+    let identity_gap_sample = identities.freshness_identity_gap_sample();
 
     IndexFreshnessObservation {
         freshness: IndexFreshnessDto {
@@ -4495,9 +5289,11 @@ fn index_freshness_observation_from_storage(
             reason: None,
             samples,
         },
-        inventory_complete: true,
-        admitted_paths,
-        stale_paths,
+        inventory_complete: identity_gap_count == 0,
+        admitted_identities: identities.admitted_identities.clone(),
+        stale_identities: identities.stale_identities.clone(),
+        identity_gap_count,
+        identity_gap_sample,
     }
 }
 
@@ -11033,10 +11829,14 @@ impl AppController {
 
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
-        let freshness_observation =
-            index_freshness_observation_from_storage(&root, &workspace, &storage);
+        let mut path_identities = AffectedOperationIdentityIndex::native();
+        let freshness_observation = index_freshness_observation_from_storage_with_identities(
+            &root,
+            &workspace,
+            &storage,
+            &mut path_identities,
+        );
         let freshness = &freshness_observation.freshness;
-        let mut path_identities = OperationPathIdentityResolver::native();
         let identity_matches = match_affected_file_identities(
             &root,
             &change_records,
@@ -11050,25 +11850,37 @@ impl AppController {
         );
         let AffectedIdentityMatches {
             matched_file_ids: current_matched_file_ids,
-            matched_record_indexes: current_matched_record_indexes,
+            matched_record_flags: current_matched_record_flags,
             matched_record_index_by_file_id,
-            graph_seeded_record_indexes,
+            graph_seeded_record_flags,
             previous_record_index_by_file_id,
-            unavailable_changed_identity_count,
-            unavailable_changed_identity_sample,
+            current_identity_by_record,
+            previous_identity_by_record: _previous_identity_by_record,
+            current_identity_error_by_record,
+            previous_identity_error_by_record,
+            indexed_identity_by_file_id,
             unavailable_indexed_identity_count,
             unavailable_indexed_identity_sample,
-            ..
+            work: identity_match_work,
         } = identity_matches;
+        tracing::debug!(
+            record_visits = identity_match_work.record_visits,
+            indexed_file_visits = identity_match_work.indexed_file_visits,
+            current_identity_bucket_visits = identity_match_work.current_identity_bucket_visits,
+            previous_identity_bucket_visits = identity_match_work.previous_identity_bucket_visits,
+            bucket_record_visits = identity_match_work.bucket_record_visits,
+            indexed_bucket_file_visits = identity_match_work.indexed_bucket_file_visits,
+            "affected identity matching work"
+        );
         let previous_identity_seed_evidence = previous_record_index_by_file_id
             .into_iter()
             .map(|(file_id, record_index)| {
                 let record = &change_records[record_index];
                 (
                     file_id,
-                    AffectedGraphEvidence {
-                        distance: 0,
-                        reason: format!(
+                    AffectedGraphEvidence::seed(
+                        file_id,
+                        format!(
                             "previous indexed identity {} proxy-seeded graph evidence for current {} path {}",
                             record.previous_path.as_deref().unwrap_or_default(),
                             match &record.kind {
@@ -11078,17 +11890,17 @@ impl AppController {
                             },
                             record.path,
                         ),
-                        confidence: "bounded".to_string(),
-                        previous_identity_proxy: true,
-                    },
+                        AffectedConfidenceFloor::bounded(),
+                        true,
+                    ),
                 )
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         let graph_seed_file_ids = current_matched_file_ids
             .iter()
             .copied()
             .chain(previous_identity_seed_evidence.keys().copied())
-            .collect::<HashSet<_>>();
+            .collect::<BTreeSet<_>>();
         let mut matched_files = files
             .iter()
             .filter(|file| {
@@ -11099,31 +11911,47 @@ impl AppController {
                 let record = matched_record_index_by_file_id
                     .get(&file_id)
                     .map(|record_index| &change_records[*record_index]);
-                AffectedMatchedFileDto {
-                    path: runtime_relative_path(&root, &file.path),
-                    role: indexed_file_role(&file.path),
-                    indexed: file.indexed,
-                    complete: file.complete,
-                    change_kind: record.map(|record| record.kind.clone()),
-                    change_status: record.map(|record| record.status.clone()),
-                    previous_path: record.and_then(|record| record.previous_path.clone()),
-                    error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
-                }
+                (
+                    file_id,
+                    AffectedMatchedFileDto {
+                        path: runtime_relative_path(&root, &file.path),
+                        role: indexed_file_role(&file.path),
+                        indexed: file.indexed,
+                        complete: file.complete,
+                        change_kind: record.map(|record| record.kind.clone()),
+                        change_status: record.map(|record| record.status.clone()),
+                        previous_path: record.and_then(|record| record.previous_path.clone()),
+                        error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+                    },
+                )
             })
             .collect::<Vec<_>>();
-        matched_files.sort_by(|left, right| left.path.cmp(&right.path));
+        matched_files
+            .sort_by(|left, right| left.1.path.cmp(&right.1.path).then(left.0.cmp(&right.0)));
+        let mut unmatched_freshness_unavailable = false;
         let unmatched_paths = change_records
             .iter()
             .enumerate()
-            .filter(|(index, _)| !current_matched_record_indexes.contains(index))
+            .filter(|(index, _)| !current_matched_record_flags[*index])
             .map(|(index, record)| {
                 let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
-                    &root,
                     record,
                     &resolved_inputs[index],
                     &freshness_observation,
+                    current_identity_by_record[index].as_ref(),
+                    current_identity_error_by_record[index].as_deref(),
+                    previous_identity_error_by_record[index].as_deref(),
                 );
-                if graph_seeded_record_indexes.contains(&index) {
+                unmatched_freshness_unavailable |= matches!(
+                    affected_path_metadata(&resolved_inputs[index].current),
+                    AffectedPathMetadataObservation::RegularFile
+                ) && indexable_source_path(&resolved_inputs[index].current)
+                    && current_identity_error_by_record[index].is_none()
+                    && current_identity_by_record[index]
+                        .as_ref()
+                        .is_some_and(|identity| !freshness_observation.identity_is_stale(identity))
+                    && !freshness_observation.inventory_complete;
+                if graph_seeded_record_flags[index] {
                     evidence.push(format!(
                         "previous indexed identity {} supplied bounded proxy graph evidence",
                         record.previous_path.as_deref().unwrap_or_default()
@@ -11153,12 +11981,19 @@ impl AppController {
                 evidence: input.evidence.clone(),
             })
             .collect::<Vec<_>>();
-        for file in &matched_files {
-            let absolute_path = root.join(&file.path);
-            let stale = freshness_observation.path_is_stale(&absolute_path);
-            let Some((classification, reason, evidence)) =
-                classify_matched_affected_input(file, stale)
-            else {
+        let mut matched_freshness_unavailable = false;
+        for (file_id, file) in &matched_files {
+            let stale = indexed_identity_by_file_id
+                .get(file_id)
+                .is_some_and(|identity| freshness_observation.identity_is_stale(identity));
+            matched_freshness_unavailable |=
+                !stale && file.error_count == 0 && !freshness_observation.inventory_complete;
+            let Some((classification, reason, evidence)) = classify_matched_affected_input(
+                file,
+                stale,
+                freshness_observation.inventory_complete
+                    && freshness.status != IndexFreshnessStatusDto::NotChecked,
+            ) else {
                 continue;
             };
             uncovered_inputs.push(AffectedUncoveredInputDto {
@@ -11168,6 +12003,10 @@ impl AppController {
                 evidence,
             });
         }
+        let matched_files = matched_files
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect::<Vec<_>>();
 
         let mut labels = self.cached_labels(nodes.iter().map(|node| node.id));
         for node in &nodes {
@@ -11196,94 +12035,66 @@ impl AppController {
                 node_ids_by_file.entry(file_id).or_default().push(node.id);
             }
         }
+        for node_ids in node_ids_by_file.values_mut() {
+            node_ids.sort_unstable();
+        }
 
-        let mut seed_evidence = HashMap::<GraphNodeId, AffectedGraphEvidence>::new();
+        let mut seed_evidence = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
         for file_id in &graph_seed_file_ids {
             let file_evidence = previous_identity_seed_evidence.get(file_id).cloned();
-            seed_evidence.insert(
-                *file_id,
-                file_evidence
-                    .clone()
-                    .unwrap_or_else(|| AffectedGraphEvidence {
-                        distance: 0,
-                        reason: "changed file matched current input path".to_string(),
-                        confidence: "direct".to_string(),
-                        previous_identity_proxy: false,
-                    }),
-            );
+            let file_candidate = file_evidence.clone().unwrap_or_else(|| {
+                AffectedGraphEvidence::seed(
+                    *file_id,
+                    "changed file matched current input path",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    false,
+                )
+            });
+            seed_evidence
+                .entry(*file_id)
+                .and_modify(|current| {
+                    if affected_evidence_is_better(&file_candidate, current) {
+                        current.clone_from(&file_candidate);
+                    }
+                })
+                .or_insert(file_candidate);
             if let Some(file_nodes) = node_ids_by_file.get(file_id) {
                 for node_id in file_nodes {
-                    seed_evidence.insert(
-                        *node_id,
-                        file_evidence
-                            .clone()
-                            .unwrap_or_else(|| AffectedGraphEvidence {
-                                distance: 0,
-                                reason: "symbol declared in file matched by current input path"
-                                    .to_string(),
-                                confidence: "direct".to_string(),
-                                previous_identity_proxy: false,
-                            }),
-                    );
+                    let node_candidate = file_evidence
+                        .as_ref()
+                        .map(|evidence| {
+                            AffectedGraphEvidence::seed(
+                                *node_id,
+                                evidence.reason.clone(),
+                                evidence.confidence_floor.clone(),
+                                evidence.previous_identity_proxy,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            AffectedGraphEvidence::seed(
+                                *node_id,
+                                "symbol declared in file matched by current input path",
+                                AffectedConfidenceFloor::from_label("direct"),
+                                false,
+                            )
+                        });
+                    seed_evidence
+                        .entry(*node_id)
+                        .and_modify(|current| {
+                            if affected_evidence_is_better(&node_candidate, current) {
+                                current.clone_from(&node_candidate);
+                            }
+                        })
+                        .or_insert(node_candidate);
                 }
             }
         }
 
-        let mut reverse_dependents = HashMap::<GraphNodeId, Vec<(GraphNodeId, usize)>>::new();
-        for (edge_index, edge) in edges.iter().enumerate() {
-            let source = edge.effective_source();
-            let target = edge.effective_target();
-            reverse_dependents
-                .entry(target)
-                .or_default()
-                .push((source, edge_index));
-        }
-
-        let mut distances = HashMap::<GraphNodeId, u32>::new();
-        let mut evidence = HashMap::<GraphNodeId, AffectedGraphEvidence>::new();
-        let mut queue = VecDeque::<(GraphNodeId, u32)>::new();
-        let mut visited_edge_count = 0usize;
-        for (seed, seed_evidence) in seed_evidence {
-            distances.insert(seed, 0);
-            evidence.insert(seed, seed_evidence);
-            queue.push_back((seed, 0));
-        }
-        while let Some((node_id, distance)) = queue.pop_front() {
-            if distance >= depth {
-                continue;
-            }
-            for (dependent, edge_id) in reverse_dependents.get(&node_id).into_iter().flatten() {
-                visited_edge_count = visited_edge_count.saturating_add(1);
-                let next_distance = distance + 1;
-                let previous_identity_proxy = evidence
-                    .get(&node_id)
-                    .is_some_and(|evidence| evidence.previous_identity_proxy);
-                let edge = edges.get(*edge_id);
-                let target_label = labels
-                    .get(&node_id)
-                    .cloned()
-                    .unwrap_or_else(|| node_id.0.to_string());
-                let dependent_evidence = affected_dependent_evidence(
-                    next_distance,
-                    edge,
-                    target_label,
-                    previous_identity_proxy,
-                );
-                let improves_evidence = distances.get(dependent).is_none_or(|current| {
-                    next_distance < *current
-                        || (next_distance == *current
-                            && evidence
-                                .get(dependent)
-                                .is_some_and(|current| current.previous_identity_proxy)
-                            && !dependent_evidence.previous_identity_proxy)
-                });
-                if improves_evidence {
-                    distances.insert(*dependent, next_distance);
-                    evidence.insert(*dependent, dependent_evidence);
-                    queue.push_back((*dependent, next_distance));
-                }
-            }
-        }
+        let AffectedReverseWalk {
+            distances,
+            evidence,
+            visited_edge_count,
+        } = affected_reverse_walk(depth, &edges, seed_evidence, &labels);
 
         let mut impacted_symbols = distances
             .iter()
@@ -11305,16 +12116,17 @@ impl AppController {
                 }) {
                     return None;
                 }
-                let graph_evidence =
-                    evidence
-                        .get(node_id)
-                        .cloned()
-                        .unwrap_or_else(|| AffectedGraphEvidence {
-                            distance: *distance,
-                            reason: "reached by dependent graph walk".to_string(),
-                            confidence: "graph".to_string(),
-                            previous_identity_proxy: false,
-                        });
+                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
+                    let mut fallback = AffectedGraphEvidence::seed(
+                        *node_id,
+                        "reached by dependent graph walk",
+                        AffectedConfidenceFloor::from_label("graph"),
+                        false,
+                    );
+                    fallback.distance = *distance;
+                    fallback
+                });
+                let confidence = graph_evidence.confidence_floor.label().to_string();
                 Some(AffectedSymbolDto {
                     node_id: NodeId::from(*node_id),
                     display_name: labels
@@ -11327,7 +12139,7 @@ impl AppController {
                     distance: *distance,
                     graph_depth: graph_evidence.distance,
                     reason: graph_evidence.reason,
-                    confidence: graph_evidence.confidence,
+                    confidence,
                 })
             })
             .collect::<Vec<_>>();
@@ -11344,6 +12156,7 @@ impl AppController {
                 .cmp(&right.distance)
                 .then(left.file_path.cmp(&right.file_path))
                 .then(left.display_name.cmp(&right.display_name))
+                .then(left.node_id.0.cmp(&right.node_id.0))
         });
         let impacted_symbol_total = impacted_symbols.len();
         let impacted_symbols_truncated = impacted_symbol_total > 200;
@@ -11376,27 +12189,18 @@ impl AppController {
                     file_path.as_deref(),
                     &display_name,
                 )?;
-                let graph_evidence =
-                    evidence
-                        .get(node_id)
-                        .cloned()
-                        .unwrap_or_else(|| AffectedGraphEvidence {
-                            distance: *distance,
-                            reason: "route endpoint reached by dependent graph walk".to_string(),
-                            confidence: route
-                                .confidence
-                                .clone()
-                                .unwrap_or_else(|| "graph".to_string()),
-                            previous_identity_proxy: false,
-                        });
-                let confidence = if graph_evidence.previous_identity_proxy {
-                    "bounded".to_string()
-                } else {
-                    route
-                        .confidence
-                        .clone()
-                        .unwrap_or_else(|| graph_evidence.confidence.clone())
-                };
+                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
+                    let mut fallback = AffectedGraphEvidence::seed(
+                        *node_id,
+                        "route endpoint reached by dependent graph walk",
+                        AffectedConfidenceFloor::from_label("graph"),
+                        false,
+                    );
+                    fallback.distance = *distance;
+                    fallback
+                });
+                let confidence =
+                    affected_route_confidence(&graph_evidence, route.confidence.as_deref());
                 Some(AffectedRouteDto {
                     node_id: NodeId::from(*node_id),
                     display_name,
@@ -11415,6 +12219,7 @@ impl AppController {
                 .cmp(&right.distance)
                 .then(left.file_path.cmp(&right.file_path))
                 .then(left.display_name.cmp(&right.display_name))
+                .then(left.node_id.0.cmp(&right.node_id.0))
         });
         let impacted_route_total = impacted_routes.len();
         let impacted_routes_truncated = impacted_route_total > 100;
@@ -11454,6 +12259,28 @@ impl AppController {
 
         let mut notes = Vec::new();
         let mut blind_spots = Vec::new();
+        let freshness_evidence_affects_requested_claim =
+            unmatched_freshness_unavailable || matched_freshness_unavailable;
+        let relevant_evidence_gaps =
+            affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+                resolved_inputs: &resolved_inputs,
+                matched_record_flags: &current_matched_record_flags,
+                current_identity_errors: &current_identity_error_by_record,
+                previous_identity_errors: &previous_identity_error_by_record,
+                unavailable_indexed_identity_count,
+                unavailable_indexed_identity_sample: unavailable_indexed_identity_sample.as_deref(),
+                freshness_evidence_affects_requested_claim,
+                freshness_identity_gap_count: freshness_observation.identity_gap_count,
+                freshness_identity_gap_sample: freshness_observation.identity_gap_sample.as_deref(),
+            });
+        let unavailable_input_count = uncovered_inputs
+            .iter()
+            .filter(|input| {
+                input.classification == AffectedInputClassificationDto::UnavailableEvidence
+            })
+            .count();
+        let gap_composition =
+            compose_affected_evidence_gaps(unavailable_input_count, &relevant_evidence_gaps);
         if current_matched_file_ids.is_empty() {
             let note = "no current input paths matched indexed file identity; inspect the typed uncovered-input evidence"
                 .to_string();
@@ -11467,38 +12294,29 @@ impl AppController {
                 current_matched_file_ids.len()
             ));
         }
+        let graph_seeded_input_count = graph_seeded_record_flags
+            .iter()
+            .filter(|seeded| **seeded)
+            .count();
         let graph_unseeded_input_count = change_records
             .len()
-            .saturating_sub(graph_seeded_record_indexes.len());
+            .saturating_sub(graph_seeded_input_count);
         if graph_unseeded_input_count > 0 {
             blind_spots.push(format!(
                 "{graph_unseeded_input_count} inputs had no indexed current or previous identity and were excluded from graph traversal"
             ));
         }
-        let previous_only_seed_count = graph_seeded_record_indexes
-            .difference(&current_matched_record_indexes)
+        let previous_only_seed_count = graph_seeded_record_flags
+            .iter()
+            .zip(&current_matched_record_flags)
+            .filter(|(seeded, matched)| **seeded && !**matched)
             .count();
         if previous_only_seed_count > 0 {
             notes.push(format!(
                 "{previous_only_seed_count} current input paths were classified separately while their previous indexed identities seeded graph traversal"
             ));
         }
-        if unavailable_changed_identity_count > 0 {
-            let detail = unavailable_changed_identity_sample
-                .as_deref()
-                .unwrap_or("no identity error sample available");
-            blind_spots.push(format!(
-                "native path identity was unavailable for {unavailable_changed_identity_count} changed records; completeness was downgraded ({detail})"
-            ));
-        }
-        if unavailable_indexed_identity_count > 0 {
-            let detail = unavailable_indexed_identity_sample
-                .as_deref()
-                .unwrap_or("no identity error sample available");
-            blind_spots.push(format!(
-                "native path identity was unavailable for {unavailable_indexed_identity_count} indexed files; completeness was downgraded ({detail})"
-            ));
-        }
+        blind_spots.extend(gap_composition.blind_spots.iter().cloned());
         if matched_files
             .iter()
             .any(|file| !file.complete || file.error_count > 0)
@@ -11533,7 +12351,6 @@ impl AppController {
         }
 
         let project = root.to_string_lossy().to_string();
-        let mut follow_ups = affected_follow_ups(&project, &uncovered_inputs);
         if freshness.status == IndexFreshnessStatusDto::Stale
             && !uncovered_inputs
                 .iter()
@@ -11544,47 +12361,37 @@ impl AppController {
                     .to_string(),
             );
         }
-        if freshness.status == IndexFreshnessStatusDto::NotChecked {
+        let freshness_diagnostic = freshness_evidence_affects_requested_claim.then(|| {
+            freshness
+                .reason
+                .as_deref()
+                .map(|reason| {
+                    format!(
+                        "inspect observational freshness because requested-path evidence was unavailable: {reason}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "inspect observational freshness because requested-path refresh-plan identity evidence was unavailable"
+                        .to_string()
+                })
+        });
+        if freshness_diagnostic.is_some() {
             blind_spots.push(
-                "bounded index freshness evidence was unavailable; no complete no-impact claim is possible"
+                "bounded index freshness evidence was unavailable for a requested indexable path; no complete no-impact claim is possible"
                     .to_string(),
             );
-            follow_ups.push(AffectedFollowUpDto {
-                action: "establish_freshness_evidence".to_string(),
-                reason: "inspect the observational index status because bounded freshness could not be established"
-                    .to_string(),
-                confidence: "bounded".to_string(),
-                invocation: Some(AffectedFollowUpInvocationDto {
-                    program: "codestory-cli".to_string(),
-                    args: vec![
-                        "doctor".to_string(),
-                        "--project".to_string(),
-                        project.clone(),
-                        "--format".to_string(),
-                        "markdown".to_string(),
-                    ],
-                }),
-            });
         }
-        let freshness_complete = freshness.status == IndexFreshnessStatusDto::Fresh;
-        let unavailable_evidence_count = uncovered_inputs
-            .iter()
-            .filter(|input| {
-                input.classification == AffectedInputClassificationDto::UnavailableEvidence
-            })
-            .count();
-        let complete = uncovered_inputs.is_empty() && !truncated && freshness_complete;
-        let completeness = AffectedAnalysisCompletenessDto {
-            complete,
-            confidence: if complete { "complete" } else { "bounded" }.to_string(),
-            direct_impact_count: clamp_usize_to_u32(direct_impact_count),
-            propagated_impact_count: clamp_usize_to_u32(propagated_impact_count),
-            candidate_test_count: clamp_usize_to_u32(impacted_tests.len()),
-            uncovered_input_count: clamp_usize_to_u32(uncovered_inputs.len()),
-            unavailable_evidence_count: clamp_usize_to_u32(unavailable_evidence_count),
-            truncated,
+        let follow_ups =
+            affected_follow_ups(&project, &uncovered_inputs, freshness_diagnostic.as_deref());
+        let completeness = compose_affected_completeness(AffectedCompletenessInput {
+            uncovered_input_count: uncovered_inputs.len(),
+            direct_impact_count,
+            propagated_impact_count,
+            candidate_test_count: impacted_tests.len(),
+            freshness_evidence_affects_requested_claim,
+            gap_composition,
             truncation_reasons,
-        };
+        });
         let bounds = AffectedAnalysisBoundsDto {
             requested_depth: depth,
             maximum_depth: 8,
@@ -12420,36 +13227,27 @@ impl AppController {
                 edge.kind == codestory_contracts::graph::EdgeKind::CALL
                     && edge.effective_source() == route_node.id
             })
+            .filter_map(|edge| {
+                let target = storage.get_node(edge.effective_target()).ok().flatten()?;
+                let terminal = target
+                    .qualified_name
+                    .as_deref()
+                    .unwrap_or(&target.serialized_name)
+                    .rsplit([':', '.', '#'])
+                    .next()
+                    .unwrap_or(&target.serialized_name)
+                    .to_ascii_lowercase();
+                if matches!(
+                    terminal.as_str(),
+                    "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "route"
+                ) {
+                    return None;
+                }
+                Some(RouteHandlerCandidate { edge, target })
+            })
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .confidence
-                .partial_cmp(&left.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    route_handler_certainty_rank(right.certainty)
-                        .cmp(&route_handler_certainty_rank(left.certainty))
-                })
-        });
-        let (edge, target) = candidates.into_iter().find_map(|edge| {
-            let target_id = edge.effective_target();
-            let target = storage.get_node(target_id).ok().flatten()?;
-            let terminal = target
-                .qualified_name
-                .as_deref()
-                .unwrap_or(&target.serialized_name)
-                .rsplit([':', '.', '#'])
-                .next()
-                .unwrap_or(&target.serialized_name)
-                .to_ascii_lowercase();
-            if matches!(
-                terminal.as_str(),
-                "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "route"
-            ) {
-                return None;
-            }
-            Some((edge, target))
-        })?;
+        candidates.sort_by(compare_route_handler_candidates);
+        let RouteHandlerCandidate { edge, target } = candidates.into_iter().next()?;
         let display_name = self
             .state
             .lock()
@@ -14014,6 +14812,25 @@ mod tests {
     use std::sync::MutexGuard as StdMutexGuard;
     use tempfile::tempdir;
 
+    fn all_permutations<T: Clone>(values: &[T]) -> Vec<Vec<T>> {
+        fn visit<T: Clone>(values: &mut [T], index: usize, output: &mut Vec<Vec<T>>) {
+            if index == values.len() {
+                output.push(values.to_vec());
+                return;
+            }
+            for candidate in index..values.len() {
+                values.swap(index, candidate);
+                visit(values, index + 1, output);
+                values.swap(index, candidate);
+            }
+        }
+
+        let mut values = values.to_vec();
+        let mut output = Vec::new();
+        visit(&mut values, 0, &mut output);
+        output
+    }
+
     #[test]
     fn affected_identity_matching_visits_one_bucket_for_all_same_identity_aliases() {
         let root = tempdir().expect("project");
@@ -14024,9 +14841,9 @@ mod tests {
         let change_records = (0..200)
             .map(|index| AffectedChangeRecordDto {
                 path: format!("changed-alias-{index}.rs"),
-                kind: AffectedChangeKindDto::Modified,
-                status: "M".to_string(),
-                previous_path: None,
+                kind: AffectedChangeKindDto::Renamed,
+                status: "R".to_string(),
+                previous_path: Some(format!("previous-alias-{index}.rs")),
             })
             .collect::<Vec<_>>();
         let indexed_files = (0..25_000)
@@ -14038,13 +14855,18 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let resolver_calls = std::cell::Cell::new(0_usize);
-        let mut path_identities = OperationPathIdentityResolver::with_resolver(|_: &Path| {
+        let mut path_identities = AffectedOperationIdentityIndex::with_resolver(|_: &Path| {
             resolver_calls.set(resolver_calls.get() + 1);
             Ok(shared_identity.clone())
         });
+        for (_, path) in &indexed_files {
+            path_identities.record_admitted(path);
+            path_identities.record_stale(path);
+        }
 
         // The injected identity models 25,000 indexed hardlink spellings and
-        // 200 changed aliases of the same native file without using wall time.
+        // 200 current and previous aliases of the same native file. Refresh
+        // membership and affected matching share each indexed observation.
         let matches = match_affected_file_identities(
             root.path(),
             &change_records,
@@ -14054,9 +14876,16 @@ mod tests {
             &mut path_identities,
         );
 
-        assert_eq!(resolver_calls.get(), 25_200);
+        assert_eq!(resolver_calls.get(), 25_400);
         assert_eq!(matches.matched_file_ids.len(), 25_000);
-        assert_eq!(matches.matched_record_indexes.len(), 200);
+        assert_eq!(
+            matches
+                .matched_record_flags
+                .iter()
+                .filter(|matched| **matched)
+                .count(),
+            200
+        );
         assert_eq!(matches.matched_record_index_by_file_id.len(), 25_000);
         assert!(
             matches
@@ -14064,10 +14893,284 @@ mod tests {
                 .values()
                 .all(|record_index| *record_index == 0)
         );
-        assert_eq!(matches.record_bucket_visits, 1);
-        assert_eq!(matches.record_index_visits, 200);
-        assert_eq!(matches.unavailable_changed_identity_count, 0);
+        assert_eq!(matches.work.record_visits, 200);
+        assert_eq!(matches.work.indexed_file_visits, 25_000);
+        assert_eq!(matches.work.current_identity_bucket_visits, 1);
+        assert_eq!(matches.work.previous_identity_bucket_visits, 1);
+        assert!(matches.work.bucket_record_visits <= change_records.len() * 2);
+        assert!(matches.work.indexed_bucket_file_visits <= indexed_files.len() * 2);
+        assert!(
+            matches
+                .current_identity_error_by_record
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            matches
+                .previous_identity_error_by_record
+                .iter()
+                .all(Option::is_none)
+        );
         assert_eq!(matches.unavailable_indexed_identity_count, 0);
+    }
+
+    #[test]
+    fn affected_identity_matching_uses_native_hardlink_identity() {
+        let root = tempdir().expect("project");
+        let indexed = root.path().join("indexed.rs");
+        let alias = root.path().join("alias.rs");
+        fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+        fs::hard_link(&indexed, &alias).expect("create hardlink alias");
+        let records = vec![affected_test_record(
+            AffectedChangeKindDto::Modified,
+            "alias.rs",
+        )];
+        let mut identities = AffectedOperationIdentityIndex::native();
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut identities,
+        );
+
+        assert_eq!(matches.matched_file_ids, HashSet::from([CoreNodeId(1)]));
+        assert_eq!(matches.matched_record_flags, vec![true]);
+        assert_eq!(matches.work.indexed_file_visits, 1);
+    }
+
+    #[test]
+    fn affected_identity_matching_processes_first_seen_previous_bucket_once() {
+        let root = tempdir().expect("project");
+        let shared_seed = root.path().join("shared.rs");
+        fs::write(&shared_seed, "pub fn shared() {}\n").expect("write shared seed");
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&shared_seed).expect("shared identity");
+        let distinct_identities = (0..3)
+            .map(|index| {
+                let path = root.path().join(format!("distinct-{index}.rs"));
+                fs::write(&path, format!("pub fn distinct_{index}() {{}}\n"))
+                    .expect("write distinct seed");
+                codestory_workspace::workspace_path_identity(&path).expect("distinct identity")
+            })
+            .collect::<Vec<_>>();
+        let records = (0..3)
+            .map(|index| {
+                affected_test_move_record(
+                    AffectedChangeKindDto::Renamed,
+                    &format!("current-{index}.rs"),
+                    &format!("previous-{index}.rs"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let indexed = [
+            (CoreNodeId(30), PathBuf::from("indexed-30.rs")),
+            (CoreNodeId(10), PathBuf::from("indexed-10.rs")),
+            (CoreNodeId(20), PathBuf::from("indexed-20.rs")),
+        ];
+        let mut identities = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if let Some(index) = name
+                    .strip_prefix("current-")
+                    .and_then(|value| value.strip_suffix(".rs"))
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    return Ok(distinct_identities[index].clone());
+                }
+                Ok(shared_identity.clone())
+            }
+        });
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &records,
+            indexed
+                .iter()
+                .map(|(file_id, path)| (*file_id, path.as_path())),
+            &mut identities,
+        );
+
+        assert!(matches.matched_file_ids.is_empty());
+        assert_eq!(matches.graph_seeded_record_flags, vec![true, true, true]);
+        assert_eq!(
+            matches
+                .previous_record_index_by_file_id
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                (CoreNodeId(10), 0),
+                (CoreNodeId(20), 0),
+                (CoreNodeId(30), 0),
+            ])
+        );
+        assert_eq!(matches.work.record_visits, 3);
+        assert_eq!(matches.work.indexed_file_visits, 3);
+        assert_eq!(matches.work.current_identity_bucket_visits, 3);
+        assert_eq!(matches.work.previous_identity_bucket_visits, 1);
+        assert_eq!(matches.work.bucket_record_visits, 3);
+        assert_eq!(matches.work.indexed_bucket_file_visits, 3);
+    }
+
+    #[test]
+    fn affected_identity_matching_is_invariant_to_indexed_input_order() {
+        let root = tempdir().expect("project");
+        let first_seed = root.path().join("first-seed.rs");
+        let second_seed = root.path().join("second-seed.rs");
+        fs::write(&first_seed, "pub fn first() {}\n").expect("write first seed");
+        fs::write(&second_seed, "pub fn second() {}\n").expect("write second seed");
+        let first_identity =
+            codestory_workspace::workspace_path_identity(&first_seed).expect("first identity");
+        let second_identity =
+            codestory_workspace::workspace_path_identity(&second_seed).expect("second identity");
+        let records = vec![
+            affected_test_record(AffectedChangeKindDto::Modified, "current-first.rs"),
+            affected_test_record(AffectedChangeKindDto::Modified, "current-second.rs"),
+        ];
+        let forward = vec![
+            (CoreNodeId(30), PathBuf::from("indexed-first-z.rs")),
+            (CoreNodeId(10), PathBuf::from("indexed-first-a.rs")),
+            (CoreNodeId(20), PathBuf::from("indexed-second.rs")),
+            (CoreNodeId(40), PathBuf::from("missing-z.rs")),
+            (CoreNodeId(50), PathBuf::from("missing-a.rs")),
+        ];
+        let run = |indexed: &[(CoreNodeId, PathBuf)]| {
+            let first_identity = first_identity.clone();
+            let second_identity = second_identity.clone();
+            let mut identities =
+                AffectedOperationIdentityIndex::with_resolver(move |path: &Path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    if name == "current-first.rs" || name.starts_with("indexed-first-") {
+                        return Ok(first_identity.clone());
+                    }
+                    if matches!(name, "current-second.rs" | "indexed-second.rs") {
+                        return Ok(second_identity.clone());
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{name} unavailable"),
+                    ))
+                });
+            let matches = match_affected_file_identities(
+                root.path(),
+                &records,
+                indexed
+                    .iter()
+                    .map(|(file_id, path)| (*file_id, path.as_path())),
+                &mut identities,
+            );
+            (
+                matches.matched_file_ids,
+                matches.matched_record_flags,
+                matches.matched_record_index_by_file_id,
+                matches.graph_seeded_record_flags,
+                matches.unavailable_indexed_identity_count,
+                matches.unavailable_indexed_identity_sample,
+                matches.work,
+            )
+        };
+
+        let mut reverse = forward.clone();
+        reverse.reverse();
+        let mut rotated = forward.clone();
+        rotated.rotate_left(2);
+        let expected = run(&forward);
+        assert_eq!(run(&reverse), expected);
+        assert_eq!(run(&rotated), expected);
+        assert_eq!(expected.4, 2);
+        assert!(
+            expected
+                .5
+                .as_deref()
+                .is_some_and(|sample| sample.contains("missing-a.rs unavailable"))
+        );
+    }
+
+    #[test]
+    fn affected_identity_matching_counts_actual_two_phase_worst_case_work() {
+        let root = tempdir().expect("project");
+        let shared_seed = root.path().join("shared-seed.rs");
+        let previous_seed = root.path().join("previous-seed.rs");
+        let current_seed = root.path().join("current-seed.rs");
+        for path in [&shared_seed, &previous_seed, &current_seed] {
+            fs::write(path, "pub fn seed() {}\n").expect("write identity seed");
+        }
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&shared_seed).expect("shared identity");
+        let previous_identity = codestory_workspace::workspace_path_identity(&previous_seed)
+            .expect("previous identity");
+        let current_identity =
+            codestory_workspace::workspace_path_identity(&current_seed).expect("current identity");
+        let records = vec![
+            affected_test_move_record(
+                AffectedChangeKindDto::Renamed,
+                "current-matched.rs",
+                "previous-unmatched.rs",
+            ),
+            affected_test_move_record(
+                AffectedChangeKindDto::Renamed,
+                "current-unmatched.rs",
+                "previous-matched.rs",
+            ),
+        ];
+        let indexed = (0..1_000)
+            .map(|index| {
+                (
+                    CoreNodeId(index + 1),
+                    PathBuf::from(format!("indexed-{index}.rs")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let resolver_calls = std::cell::Cell::new(0_usize);
+        let resolver_calls_for_run = &resolver_calls;
+        let mut identities = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                resolver_calls_for_run.set(resolver_calls_for_run.get() + 1);
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if name == "current-matched.rs"
+                    || name == "previous-matched.rs"
+                    || name.starts_with("indexed-")
+                {
+                    Ok(shared_identity.clone())
+                } else if name == "previous-unmatched.rs" {
+                    Ok(previous_identity.clone())
+                } else {
+                    Ok(current_identity.clone())
+                }
+            }
+        });
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &records,
+            indexed
+                .iter()
+                .map(|(file_id, path)| (*file_id, path.as_path())),
+            &mut identities,
+        );
+
+        assert_eq!(resolver_calls.get(), indexed.len() + records.len() * 2);
+        assert_eq!(matches.matched_file_ids.len(), indexed.len());
+        assert_eq!(matches.matched_record_flags, vec![true, false]);
+        assert_eq!(matches.graph_seeded_record_flags, vec![true, true]);
+        assert!(matches.previous_record_index_by_file_id.is_empty());
+        assert_eq!(matches.work.record_visits, records.len());
+        assert_eq!(matches.work.indexed_file_visits, indexed.len());
+        assert_eq!(matches.work.bucket_record_visits, records.len());
+        assert_eq!(matches.work.indexed_bucket_file_visits, indexed.len() * 2);
+        assert!(matches.work.bucket_record_visits <= records.len() * 2);
+        assert!(matches.work.indexed_bucket_file_visits <= indexed.len() * 2);
     }
 
     #[test]
@@ -14081,7 +15184,7 @@ mod tests {
         }];
         let indexed_path = PathBuf::from("identity-unavailable.rs");
         let resolver_calls = std::cell::Cell::new(0_usize);
-        let mut path_identities = OperationPathIdentityResolver::with_resolver(|_: &Path| {
+        let mut path_identities = AffectedOperationIdentityIndex::with_resolver(|_: &Path| {
             resolver_calls.set(resolver_calls.get() + 1);
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -14098,12 +15201,18 @@ mod tests {
 
         assert_eq!(resolver_calls.get(), 1);
         assert!(matches.matched_file_ids.is_empty());
-        assert!(matches.matched_record_indexes.is_empty());
-        assert_eq!(matches.unavailable_changed_identity_count, 1);
+        assert_eq!(matches.matched_record_flags, vec![false]);
+        assert_eq!(
+            matches
+                .current_identity_error_by_record
+                .iter()
+                .filter(|error| error.is_some())
+                .count(),
+            1
+        );
         assert_eq!(matches.unavailable_indexed_identity_count, 1);
         assert!(
-            matches
-                .unavailable_changed_identity_sample
+            matches.current_identity_error_by_record[0]
                 .as_deref()
                 .is_some_and(|sample| sample.contains("injected identity failure"))
         );
@@ -14113,6 +15222,273 @@ mod tests {
                 .as_deref()
                 .is_some_and(|sample| sample.contains("injected identity failure"))
         );
+    }
+
+    #[test]
+    fn affected_identity_matching_accounts_current_previous_and_indexed_failures_independently() {
+        let root = tempdir().expect("project");
+        let shared_seed = root.path().join("shared-seed.rs");
+        let distinct_seed = root.path().join("distinct-seed.rs");
+        fs::write(&shared_seed, "pub fn shared() {}\n").expect("write shared seed");
+        fs::write(&distinct_seed, "pub fn distinct() {}\n").expect("write distinct seed");
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&shared_seed).expect("shared identity");
+        let distinct_identity = codestory_workspace::workspace_path_identity(&distinct_seed)
+            .expect("distinct identity");
+        let records = vec![affected_test_move_record(
+            AffectedChangeKindDto::Renamed,
+            "current.rs",
+            "previous.rs",
+        )];
+        let indexed = PathBuf::from("indexed.rs");
+
+        let mut current_failure = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("current.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "current identity failure",
+                    ))
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let current = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut current_failure,
+        );
+        assert!(
+            current.current_identity_error_by_record[0]
+                .as_deref()
+                .is_some_and(|error| error.contains("current identity failure"))
+        );
+        assert_eq!(current.matched_record_flags, vec![false]);
+        assert_eq!(current.graph_seeded_record_flags, vec![true]);
+
+        let mut previous_failure = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            let distinct_identity = distinct_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("previous.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "previous identity failure",
+                    ))
+                } else if path.ends_with("current.rs") {
+                    Ok(distinct_identity.clone())
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let previous = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut previous_failure,
+        );
+        assert!(
+            previous.previous_identity_error_by_record[0]
+                .as_deref()
+                .is_some_and(|error| error.contains("previous identity failure"))
+        );
+        assert_eq!(previous.matched_record_flags, vec![false]);
+        assert_eq!(previous.graph_seeded_record_flags, vec![false]);
+
+        let mut indexed_failure = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("indexed.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "indexed identity failure",
+                    ))
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let indexed_result = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut indexed_failure,
+        );
+        assert_eq!(indexed_result.unavailable_indexed_identity_count, 1);
+        assert!(
+            indexed_result
+                .unavailable_indexed_identity_sample
+                .as_deref()
+                .is_some_and(|error| error.contains("indexed identity failure"))
+        );
+        assert_eq!(indexed_result.matched_record_flags, vec![false]);
+
+        let mut excludable_previous = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("previous.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "excludable previous identity failure",
+                    ))
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let excludable = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut excludable_previous,
+        );
+        assert_eq!(excludable.matched_record_flags, vec![true]);
+        assert!(excludable.previous_identity_error_by_record[0].is_some());
+    }
+
+    #[test]
+    fn affected_gap_composition_has_zero_one_hot_and_all_four_controls() {
+        let completeness_for = |gap_composition| {
+            compose_affected_completeness(AffectedCompletenessInput {
+                uncovered_input_count: 0,
+                direct_impact_count: 1,
+                propagated_impact_count: 2,
+                candidate_test_count: 3,
+                freshness_evidence_affects_requested_claim: false,
+                gap_composition,
+                truncation_reasons: Vec::new(),
+            })
+        };
+        let zero = compose_affected_evidence_gaps(0, &AffectedRelevantEvidenceGaps::default());
+        assert!(zero.gap_free);
+        assert_eq!(zero.confidence(), "complete");
+        assert_eq!(zero.unavailable_evidence_count, 0);
+        assert!(zero.blind_spots.is_empty());
+        let zero_completeness = completeness_for(zero);
+        assert!(zero_completeness.complete);
+        assert_eq!(zero_completeness.confidence, "complete");
+        assert_eq!(zero_completeness.unavailable_evidence_count, 0);
+
+        for category in ["current", "previous", "indexed", "freshness"] {
+            let mut gaps = AffectedRelevantEvidenceGaps::default();
+            let gap = match category {
+                "current" => &mut gaps.current,
+                "previous" => &mut gaps.previous,
+                "indexed" => &mut gaps.indexed,
+                "freshness" => &mut gaps.freshness,
+                _ => unreachable!(),
+            };
+            gap.count = 1;
+            gap.sample = Some(format!("{category} sample"));
+            let composition = compose_affected_evidence_gaps(0, &gaps);
+            assert!(!composition.gap_free, "{category}");
+            assert_eq!(composition.confidence(), "bounded", "{category}");
+            assert_eq!(composition.unavailable_evidence_count, 1, "{category}");
+            assert_eq!(composition.blind_spots.len(), 1, "{category}");
+            assert!(composition.blind_spots[0].contains(category), "{category}");
+            let completeness = completeness_for(composition);
+            assert!(!completeness.complete, "{category}");
+            assert_eq!(completeness.confidence, "bounded", "{category}");
+            assert_eq!(completeness.unavailable_evidence_count, 1, "{category}");
+        }
+
+        let all_four = AffectedRelevantEvidenceGaps {
+            current: AffectedEvidenceGapCategory {
+                count: 1,
+                sample: Some("current sample".to_string()),
+            },
+            previous: AffectedEvidenceGapCategory {
+                count: 2,
+                sample: Some("previous sample".to_string()),
+            },
+            indexed: AffectedEvidenceGapCategory {
+                count: 3,
+                sample: Some("indexed sample".to_string()),
+            },
+            freshness: AffectedEvidenceGapCategory {
+                count: 4,
+                sample: Some("freshness sample".to_string()),
+            },
+        };
+        let composition = compose_affected_evidence_gaps(0, &all_four);
+        assert!(!composition.gap_free);
+        assert_eq!(composition.confidence(), "bounded");
+        assert_eq!(composition.unavailable_evidence_count, 10);
+        assert_eq!(composition.blind_spots.len(), 4);
+        for (blind_spot, category) in composition.blind_spots.iter().zip([
+            "current-path",
+            "previous-path",
+            "indexed files",
+            "refresh-plan",
+        ]) {
+            assert!(blind_spot.contains(category), "{blind_spot}");
+        }
+        let completeness = completeness_for(composition);
+        assert!(!completeness.complete);
+        assert_eq!(completeness.confidence, "bounded");
+        assert_eq!(completeness.unavailable_evidence_count, 10);
+    }
+
+    #[test]
+    fn affected_gap_relevance_is_pure_and_excludes_previous_after_current_match() {
+        let resolved = vec![AffectedResolvedInput {
+            current: PathBuf::from("current.rs"),
+            previous: Some(PathBuf::from("previous.rs")),
+        }];
+        let current_errors = vec![Some("current gap".to_string())];
+        let previous_errors = vec![Some("previous gap".to_string())];
+        let unmatched = [false];
+        let all_relevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            resolved_inputs: &resolved,
+            matched_record_flags: &unmatched,
+            current_identity_errors: &current_errors,
+            previous_identity_errors: &previous_errors,
+            unavailable_indexed_identity_count: 2,
+            unavailable_indexed_identity_sample: Some("indexed gap"),
+            freshness_evidence_affects_requested_claim: true,
+            freshness_identity_gap_count: 3,
+            freshness_identity_gap_sample: Some("freshness gap"),
+        });
+        assert_eq!(all_relevant.current.count, 1);
+        assert_eq!(all_relevant.previous.count, 1);
+        assert_eq!(all_relevant.indexed.count, 2);
+        assert_eq!(all_relevant.freshness.count, 3);
+
+        let matched = [true];
+        let current_wins = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            resolved_inputs: &resolved,
+            matched_record_flags: &matched,
+            current_identity_errors: &current_errors,
+            previous_identity_errors: &previous_errors,
+            unavailable_indexed_identity_count: 0,
+            unavailable_indexed_identity_sample: None,
+            freshness_evidence_affects_requested_claim: false,
+            freshness_identity_gap_count: 0,
+            freshness_identity_gap_sample: None,
+        });
+        assert_eq!(current_wins.current.count, 1);
+        assert_eq!(current_wins.previous.count, 0);
+
+        let svg = vec![AffectedResolvedInput {
+            current: PathBuf::from("desk.svg"),
+            previous: None,
+        }];
+        let irrelevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            resolved_inputs: &svg,
+            matched_record_flags: &[false],
+            current_identity_errors: &current_errors,
+            previous_identity_errors: &[None],
+            unavailable_indexed_identity_count: 4,
+            unavailable_indexed_identity_sample: Some("irrelevant indexed gap"),
+            freshness_evidence_affects_requested_claim: false,
+            freshness_identity_gap_count: 5,
+            freshness_identity_gap_sample: Some("irrelevant freshness gap"),
+        });
+        assert_eq!(irrelevant, AffectedRelevantEvidenceGaps::default());
     }
 
     struct EnvGuard {
@@ -14176,6 +15552,13 @@ mod tests {
             .iter()
             .map(|sample| root.join(&sample.path))
             .collect::<Vec<_>>();
+        let stale_identities = stale_paths
+            .iter()
+            .map(|path| {
+                codestory_workspace::workspace_path_identity(path)
+                    .expect("test freshness path identity")
+            })
+            .collect::<HashSet<_>>();
         IndexFreshnessObservation {
             freshness: IndexFreshnessDto {
                 status,
@@ -14189,9 +15572,27 @@ mod tests {
                 samples,
             },
             inventory_complete: status != IndexFreshnessStatusDto::NotChecked,
-            admitted_paths: stale_paths.clone(),
-            stale_paths,
+            admitted_identities: stale_identities.clone(),
+            stale_identities,
+            identity_gap_count: 0,
+            identity_gap_sample: None,
         }
+    }
+
+    fn classify_unmatched_affected_input_for_test(
+        record: &AffectedChangeRecordDto,
+        resolved: &AffectedResolvedInput,
+        freshness: &IndexFreshnessObservation,
+    ) -> (AffectedInputClassificationDto, String, Vec<String>) {
+        let current_identity = codestory_workspace::workspace_path_identity(&resolved.current).ok();
+        classify_unmatched_affected_input(
+            record,
+            resolved,
+            freshness,
+            current_identity.as_ref(),
+            None,
+            None,
+        )
     }
 
     fn affected_test_record(kind: AffectedChangeKindDto, path: &str) -> AffectedChangeRecordDto {
@@ -14238,8 +15639,7 @@ mod tests {
             current: svg.clone(),
             previous: None,
         };
-        let (classification, _, _) = classify_unmatched_affected_input(
-            project.path(),
+        let (classification, _, _) = classify_unmatched_affected_input_for_test(
             &affected_test_record(AffectedChangeKindDto::Modified, "desk.svg"),
             &resolved_svg,
             &fresh,
@@ -14263,8 +15663,7 @@ mod tests {
             current: source,
             previous: None,
         };
-        let (classification, _, evidence) = classify_unmatched_affected_input(
-            project.path(),
+        let (classification, _, evidence) = classify_unmatched_affected_input_for_test(
             &affected_test_record(AffectedChangeKindDto::Added, "new.rs"),
             &resolved_source,
             &stale,
@@ -14280,10 +15679,22 @@ mod tests {
     #[test]
     fn affected_unmatched_classification_distinguishes_missing_delete_and_rename() {
         let project = tempdir().expect("project");
-        let missing = project.path().join("missing.rs");
+        fs::create_dir(project.path().join("src")).expect("create source directory");
+        let missing = resolve_project_file_path_from_root(
+            project.path(),
+            "src/deleted/parents/missing.rs",
+            true,
+        )
+        .expect("resolve nested missing current path");
+        let previous = resolve_project_file_path_from_root(
+            project.path(),
+            "src/old/deleted/parents/previous.rs",
+            true,
+        )
+        .expect("resolve nested missing previous path");
         let resolved = AffectedResolvedInput {
             current: missing,
-            previous: None,
+            previous: Some(previous),
         };
         let freshness =
             affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
@@ -14301,9 +15712,8 @@ mod tests {
                 AffectedInputClassificationDto::RenameUnresolved,
             ),
         ] {
-            let (classification, _, _) = classify_unmatched_affected_input(
-                project.path(),
-                &affected_test_record(kind, "missing.rs"),
+            let (classification, _, _) = classify_unmatched_affected_input_for_test(
+                &affected_test_record(kind, "src/deleted/parents/missing.rs"),
                 &resolved,
                 &freshness,
             );
@@ -14323,8 +15733,7 @@ mod tests {
         let freshness =
             affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
 
-        let (classification, reason, _) = classify_unmatched_affected_input(
-            project.path(),
+        let (classification, reason, _) = classify_unmatched_affected_input_for_test(
             &affected_test_record(AffectedChangeKindDto::Modified, "assets"),
             &resolved,
             &freshness,
@@ -14345,10 +15754,12 @@ mod tests {
             affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
 
         let (classification, reason, evidence) = classify_unmatched_affected_input_with_metadata(
-            project.path(),
             &affected_test_record(AffectedChangeKindDto::Modified, "unreadable.rs"),
             &resolved,
             &freshness,
+            None,
+            None,
+            None,
             AffectedPathMetadataObservation::Unavailable {
                 kind: io::ErrorKind::PermissionDenied,
                 message: "injected metadata denial".to_string(),
@@ -14380,8 +15791,7 @@ mod tests {
         let freshness =
             affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
 
-        let (classification, reason, _) = classify_unmatched_affected_input(
-            project.path(),
+        let (classification, reason, _) = classify_unmatched_affected_input_for_test(
             &affected_test_record(AffectedChangeKindDto::Modified, "broken.rs"),
             &resolved,
             &freshness,
@@ -14405,13 +15815,13 @@ mod tests {
         };
 
         let (classification, _, evidence) =
-            classify_matched_affected_input(&file, true).expect("incomplete evidence");
+            classify_matched_affected_input(&file, true, true).expect("incomplete evidence");
         assert_eq!(classification, AffectedInputClassificationDto::Malformed);
         assert!(evidence.iter().any(|item| item.contains("error_count=1")));
 
         file.error_count = 0;
         let (classification, _, _) =
-            classify_matched_affected_input(&file, true).expect("stale evidence");
+            classify_matched_affected_input(&file, true, true).expect("stale evidence");
         assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
     }
 
@@ -14426,6 +15836,12 @@ mod tests {
             previous: None,
         };
         let record = affected_test_record(AffectedChangeKindDto::Modified, "target/excluded.rs");
+        let admitted_identity =
+            codestory_workspace::workspace_path_identity(&project.path().join("src/lib.rs"))
+                .expect("admitted identity");
+        let unrelated_stale_identity =
+            codestory_workspace::workspace_path_identity(&project.path().join("src/unrelated.rs"))
+                .expect("unrelated stale identity");
 
         let complete_excluded = IndexFreshnessObservation {
             freshness: affected_test_freshness(
@@ -14435,15 +15851,13 @@ mod tests {
             )
             .freshness,
             inventory_complete: true,
-            admitted_paths: vec![project.path().join("src/lib.rs")],
-            stale_paths: vec![project.path().join("src/unrelated.rs")],
+            admitted_identities: HashSet::from([admitted_identity]),
+            stale_identities: HashSet::from([unrelated_stale_identity]),
+            identity_gap_count: 0,
+            identity_gap_sample: None,
         };
-        let (classification, _, evidence) = classify_unmatched_affected_input(
-            project.path(),
-            &record,
-            &resolved,
-            &complete_excluded,
-        );
+        let (classification, _, evidence) =
+            classify_unmatched_affected_input_for_test(&record, &resolved, &complete_excluded);
         assert_eq!(
             classification,
             AffectedInputClassificationDto::ValidUncovered
@@ -14454,13 +15868,15 @@ mod tests {
                 .any(|item| item.contains("inventory excludes"))
         );
 
+        let excluded_identity =
+            codestory_workspace::workspace_path_identity(&excluded).expect("excluded identity");
         let exact_stale = IndexFreshnessObservation {
-            admitted_paths: vec![excluded.clone()],
-            stale_paths: vec![excluded.clone()],
+            admitted_identities: HashSet::from([excluded_identity.clone()]),
+            stale_identities: HashSet::from([excluded_identity]),
             ..complete_excluded.clone()
         };
         let (classification, _, _) =
-            classify_unmatched_affected_input(project.path(), &record, &resolved, &exact_stale);
+            classify_unmatched_affected_input_for_test(&record, &resolved, &exact_stale);
         assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
 
         let incomplete = IndexFreshnessObservation::incomplete(not_checked_index_freshness(
@@ -14469,7 +15885,7 @@ mod tests {
             Instant::now(),
         ));
         let (classification, _, _) =
-            classify_unmatched_affected_input(project.path(), &record, &resolved, &incomplete);
+            classify_unmatched_affected_input_for_test(&record, &resolved, &incomplete);
         assert_eq!(
             classification,
             AffectedInputClassificationDto::UnavailableEvidence
@@ -14484,7 +15900,7 @@ mod tests {
             reason: "excluded by complete inventory".to_string(),
             evidence: Vec::new(),
         };
-        let follow_ups = affected_follow_ups("/project", &[unrelated_stale]);
+        let follow_ups = affected_follow_ups("/project", &[unrelated_stale], None);
         assert!(
             follow_ups
                 .iter()
@@ -14497,13 +15913,153 @@ mod tests {
             reason: "exact stale path".to_string(),
             evidence: Vec::new(),
         };
-        let follow_ups = affected_follow_ups("/project", &[requested_stale]);
+        let follow_ups = affected_follow_ups("/project", &[requested_stale], None);
         assert_eq!(
             follow_ups
                 .iter()
                 .filter(|follow_up| follow_up.action == "refresh_stale_index")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn affected_follow_ups_are_deduplicated_and_empty_for_complete_input() {
+        let duplicate = AffectedUncoveredInputDto {
+            path: "desk.svg".to_string(),
+            classification: AffectedInputClassificationDto::ValidUncovered,
+            reason: "outside graph coverage".to_string(),
+            evidence: Vec::new(),
+        };
+
+        let follow_ups = affected_follow_ups("/project", &[duplicate.clone(), duplicate], None);
+
+        assert_eq!(follow_ups.len(), 1);
+        assert_eq!(follow_ups[0].action, "inspect_graph_boundary");
+        assert!(follow_ups[0].invocation.is_none());
+        assert!(affected_follow_ups("/project", &[], None).is_empty());
+    }
+
+    #[test]
+    fn affected_not_checked_svg_has_no_doctor_or_index_follow_up() {
+        let project = tempdir().expect("project");
+        fs::write(project.path().join("desk.svg"), "<svg/>\n").expect("write SVG");
+        Storage::open(project.path().join("codestory.db")).expect("create empty storage");
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["desk.svg".to_string()]),
+                depth: Some(1),
+                filter: None,
+            })
+            .expect("analyze SVG without freshness inventory");
+
+        assert_eq!(
+            result.uncovered_inputs[0].classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert_eq!(result.follow_ups.len(), 1);
+        assert_eq!(result.follow_ups[0].action, "inspect_graph_boundary");
+        assert!(result.follow_ups[0].invocation.is_none());
+    }
+
+    #[test]
+    fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
+        let project = tempdir().expect("project");
+        let source_dir = project.path().join("src");
+        fs::create_dir(&source_dir).expect("create source directory");
+        let requested = source_dir.join("requested.rs");
+        let unrelated = source_dir.join("unrelated.rs");
+        fs::write(&requested, "pub fn requested() {}\n").expect("write requested source");
+        fs::write(&unrelated, "pub fn unrelated() {}\n").expect("write unrelated source");
+        let requested_mtime = fs::metadata(&requested)
+            .expect("requested metadata")
+            .modified()
+            .expect("requested mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("requested mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        {
+            let mut storage = Storage::open(project.path().join("codestory.db"))
+                .expect("open stale fixture storage");
+            for file in [
+                FileInfo {
+                    id: 1,
+                    path: requested.clone(),
+                    language: "rust".to_string(),
+                    modification_time: requested_mtime,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                },
+                FileInfo {
+                    id: 2,
+                    path: unrelated.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                },
+            ] {
+                storage.insert_file(&file).expect("insert fixture file");
+            }
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: requested.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(10),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "requested".to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FILE,
+                        serialized_name: unrelated.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert fixture nodes");
+        }
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["src/requested.rs".to_string()]),
+                depth: Some(1),
+                filter: None,
+            })
+            .expect("analyze fresh requested path");
+
+        assert!(result.completeness.complete, "{result:?}");
+        assert!(result.follow_ups.is_empty(), "{result:?}");
+        assert!(
+            result
+                .blind_spots
+                .iter()
+                .any(|spot| spot.contains("unrelated stale index state"))
         );
     }
 
@@ -14712,6 +16268,310 @@ mod tests {
                 .iter()
                 .all(|symbol| symbol.display_name != "previous_seed")
         );
+    }
+
+    #[test]
+    fn affected_reverse_walk_is_total_across_every_edge_and_seed_permutation() {
+        let edges = vec![
+            Edge {
+                id: EdgeId(100),
+                source: CoreNodeId(30),
+                target: CoreNodeId(10),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(101),
+                source: CoreNodeId(30),
+                target: CoreNodeId(11),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(102),
+                source: CoreNodeId(30),
+                target: CoreNodeId(20),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(201),
+                source: CoreNodeId(40),
+                target: CoreNodeId(30),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Uncertain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(301),
+                source: CoreNodeId(50),
+                target: CoreNodeId(20),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+        ];
+        let seeds = vec![
+            (
+                CoreNodeId(10),
+                AffectedGraphEvidence::seed(
+                    CoreNodeId(10),
+                    "first direct seed",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    false,
+                ),
+            ),
+            (
+                CoreNodeId(11),
+                AffectedGraphEvidence::seed(
+                    CoreNodeId(11),
+                    "second direct seed",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    false,
+                ),
+            ),
+            (
+                CoreNodeId(20),
+                AffectedGraphEvidence::seed(
+                    CoreNodeId(20),
+                    "previous identity proxy seed",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    true,
+                ),
+            ),
+        ];
+        let labels = HashMap::from([
+            (CoreNodeId(10), "first_seed".to_string()),
+            (CoreNodeId(11), "second_seed".to_string()),
+            (CoreNodeId(20), "proxy_seed".to_string()),
+            (CoreNodeId(30), "convergence".to_string()),
+        ]);
+        let edge_permutations = all_permutations(&edges);
+        let seed_permutations = all_permutations(&seeds);
+        assert_eq!(edge_permutations.len(), 120);
+        assert_eq!(seed_permutations.len(), 6);
+
+        let mut expected = None;
+        for edge_order in edge_permutations {
+            for seed_order in &seed_permutations {
+                let seed_evidence = seed_order.iter().cloned().collect::<BTreeMap<_, _>>();
+                let walk = affected_reverse_walk(2, &edge_order, seed_evidence, &labels);
+                if let Some(expected) = expected.as_ref() {
+                    assert_eq!(&walk, expected);
+                } else {
+                    expected = Some(walk);
+                }
+            }
+        }
+
+        let walk = expected.expect("deterministic reverse walk");
+        assert_eq!(walk.visited_edge_count, 5);
+        let convergence = &walk.evidence[&CoreNodeId(30)];
+        assert_eq!(convergence.confidence_floor.label(), "certain");
+        assert!(!convergence.previous_identity_proxy);
+        assert_eq!(
+            convergence.path_tie_key,
+            vec![
+                AffectedPathTieStep {
+                    edge_id: i64::MIN,
+                    source_node_id: CoreNodeId(10),
+                    target_node_id: CoreNodeId(10),
+                },
+                AffectedPathTieStep {
+                    edge_id: 100,
+                    source_node_id: CoreNodeId(30),
+                    target_node_id: CoreNodeId(10),
+                },
+            ]
+        );
+        assert_eq!(
+            walk.evidence[&CoreNodeId(40)].confidence_floor.label(),
+            "uncertain",
+            "the weakest edge floor must survive the complete path"
+        );
+        assert_eq!(
+            walk.evidence[&CoreNodeId(50)].confidence_floor.label(),
+            "bounded",
+            "a previous-identity proxy must remain bounded across traversal"
+        );
+    }
+
+    #[test]
+    fn affected_route_confidence_is_the_weaker_graph_or_metadata_floor() {
+        let probable = AffectedConfidenceFloor::from_label("probable");
+        for structured_label in ["file_convention", "decorator", "annotation", "attribute"] {
+            assert_eq!(
+                AffectedConfidenceFloor::from_label(structured_label).strength,
+                probable.strength,
+                "{structured_label} must retain the probable structured-evidence tier"
+            );
+        }
+        assert!(probable.strength > AffectedConfidenceFloor::from_label("graph").strength);
+        assert!(
+            AffectedConfidenceFloor::from_label("graph").strength
+                > AffectedConfidenceFloor::from_label("heuristic").strength
+        );
+
+        let graph = AffectedGraphEvidence::seed(
+            CoreNodeId(1),
+            "graph route evidence",
+            AffectedConfidenceFloor::from_label("certain"),
+            false,
+        );
+        let nested_metadata_label = "heuristic".to_string();
+        assert_eq!(
+            affected_route_confidence(&graph, Some(&nested_metadata_label)),
+            "heuristic"
+        );
+        assert_eq!(nested_metadata_label, "heuristic");
+
+        let proxy = AffectedGraphEvidence::seed(
+            CoreNodeId(2),
+            "proxy route evidence",
+            AffectedConfidenceFloor::from_label("schema"),
+            true,
+        );
+        assert_eq!(affected_route_confidence(&proxy, Some("schema")), "bounded");
+        assert_eq!(affected_route_confidence(&graph, None), "graph");
+    }
+
+    #[test]
+    fn route_handler_comparator_is_total_across_every_candidate_permutation() {
+        let candidate = |edge_id: i64,
+                         confidence: Option<f32>,
+                         certainty: ResolutionCertainty,
+                         semantic: &str,
+                         start_line: u32,
+                         target_id: i64| RouteHandlerCandidate {
+            edge: Edge {
+                id: EdgeId(edge_id),
+                source: CoreNodeId(900),
+                target: CoreNodeId(target_id),
+                kind: EdgeKind::CALL,
+                confidence,
+                certainty: Some(certainty),
+                ..Default::default()
+            },
+            target: Node {
+                id: CoreNodeId(target_id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: semantic.to_string(),
+                qualified_name: Some(semantic.to_string()),
+                canonical_id: Some(semantic.to_string()),
+                file_node_id: Some(CoreNodeId(800)),
+                start_line: Some(start_line),
+                start_col: Some(1),
+                end_line: Some(start_line),
+                end_col: Some(2),
+            },
+        };
+        let candidates = vec![
+            candidate(1, Some(0.9), ResolutionCertainty::Uncertain, "zeta", 9, 9),
+            candidate(2, Some(0.8), ResolutionCertainty::Certain, "alpha", 1, 1),
+            candidate(3, Some(0.8), ResolutionCertainty::Certain, "alpha", 1, 1),
+            candidate(4, Some(0.8), ResolutionCertainty::Certain, "alpha", 1, 2),
+            candidate(5, Some(0.8), ResolutionCertainty::Certain, "alpha", 2, 3),
+            candidate(
+                6,
+                Some(0.8),
+                ResolutionCertainty::Probable,
+                "aardvark",
+                1,
+                4,
+            ),
+            candidate(7, Some(0.8), ResolutionCertainty::Certain, "beta", 1, 5),
+        ];
+        let permutations = all_permutations(&candidates);
+        assert_eq!(permutations.len(), 5_040);
+        for mut permutation in permutations {
+            permutation.sort_by(compare_route_handler_candidates);
+            assert_eq!(
+                permutation
+                    .iter()
+                    .map(|candidate| candidate.edge.id.0)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5, 7, 6]
+            );
+        }
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                compare_optional_confidence_desc(Some(non_finite), None),
+                Ordering::Equal,
+                "non-finite confidence must rank as absent"
+            );
+        }
+        assert_eq!(
+            compare_optional_confidence_desc(Some(0.0), None),
+            Ordering::Less,
+            "every finite confidence must rank ahead of absent quality"
+        );
+
+        let hostile = vec![
+            candidate(11, Some(0.9), ResolutionCertainty::Certain, "same", 1, 100),
+            candidate(12, Some(0.4), ResolutionCertainty::Certain, "same", 1, 100),
+            candidate(13, None, ResolutionCertainty::Certain, "same", 1, 100),
+            candidate(
+                14,
+                Some(f32::NAN),
+                ResolutionCertainty::Certain,
+                "same",
+                1,
+                100,
+            ),
+            candidate(
+                15,
+                Some(f32::INFINITY),
+                ResolutionCertainty::Certain,
+                "same",
+                1,
+                100,
+            ),
+            candidate(
+                16,
+                Some(f32::NEG_INFINITY),
+                ResolutionCertainty::Certain,
+                "same",
+                1,
+                100,
+            ),
+        ];
+        let permutations = all_permutations(&hostile);
+        assert_eq!(permutations.len(), 720);
+        for mut permutation in permutations {
+            permutation.sort_by(compare_route_handler_candidates);
+            assert_eq!(
+                permutation
+                    .iter()
+                    .map(|candidate| candidate.edge.id.0)
+                    .collect::<Vec<_>>(),
+                vec![11, 12, 13, 14, 15, 16]
+            );
+        }
+        for left in &hostile {
+            assert_eq!(
+                compare_route_handler_candidates(left, left),
+                Ordering::Equal
+            );
+            for right in &hostile {
+                assert_eq!(
+                    compare_route_handler_candidates(left, right),
+                    compare_route_handler_candidates(right, left).reverse()
+                );
+                for third in &hostile {
+                    let left_to_right = compare_route_handler_candidates(left, right);
+                    let right_to_third = compare_route_handler_candidates(right, third);
+                    if left_to_right != Ordering::Greater && right_to_third != Ordering::Greater {
+                        assert_ne!(
+                            compare_route_handler_candidates(left, third),
+                            Ordering::Greater
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -6350,6 +6350,7 @@ version = "0.11.20"
     fn affected_preflight_rejects_invalid_previous_kind_and_outside_paths_before_activation() {
         let cache = tempfile::tempdir().expect("cache");
         let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
         std::fs::create_dir_all(project.path().join("src")).expect("create source dir");
         std::fs::write(project.path().join("src/lib.rs"), "pub fn inside() {}\n")
             .expect("write source");
@@ -6364,7 +6365,7 @@ version = "0.11.20"
             ),
         };
 
-        let cases = [
+        let mut cases = vec![
             json!({
                 "project": project.path(),
                 "change_records": [{
@@ -6385,7 +6386,43 @@ version = "0.11.20"
                     "previous_path": "../outside.rs"
                 }]
             }),
+            json!({
+                "project": project.path(),
+                "paths": [outside.path().join("absolute-outside.rs")]
+            }),
         ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), project.path().join("escape"))
+                .expect("create escaping symlink ancestor");
+            std::os::unix::fs::symlink("absent-target", project.path().join("dangling"))
+                .expect("create dangling symlink ancestor");
+            std::os::unix::fs::symlink("loop-b", project.path().join("loop-a"))
+                .expect("create first loop link");
+            std::os::unix::fs::symlink("loop-a", project.path().join("loop-b"))
+                .expect("create second loop link");
+            cases.push(json!({
+                "project": project.path(),
+                "change_records": [{
+                    "path": "src/new/parent/current.rs",
+                    "kind": "renamed",
+                    "previous_path": "escape/deleted/parent/old.rs"
+                }]
+            }));
+            for previous_path in [
+                "dangling/deleted/parent/old.rs",
+                "loop-a/deleted/parent/old.rs",
+            ] {
+                cases.push(json!({
+                    "project": project.path(),
+                    "change_records": [{
+                        "path": "src/new/parent/current.rs",
+                        "kind": "renamed",
+                        "previous_path": previous_path
+                    }]
+                }));
+            }
+        }
         for (index, arguments) in cases.into_iter().enumerate() {
             let response = handle_stdio_message(
                 &mut session,

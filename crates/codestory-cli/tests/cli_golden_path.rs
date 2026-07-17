@@ -1907,8 +1907,8 @@ pub fn changed_after_index() -> bool {
     );
 
     let query = run_cli(
-        workspace,
-        cache_dir,
+        workspace.path(),
+        cache_dir.path(),
         &[
             "query",
             "trail(symbol: 'AppController')",
