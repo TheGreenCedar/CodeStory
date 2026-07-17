@@ -5645,37 +5645,39 @@ def derive_scenario_assertions(
         class_orders = transition(
             "per_class_fifo_observed",
             {
-                "query_submitted_request_ids",
-                "query_completed_request_ids",
-                "bulk_submitted_request_ids",
-                "bulk_completed_request_ids",
+                "query_expected_queue_insertion_request_ids",
+                "query_native_completed_request_ids",
+                "query_native_completion_sequences",
+                "bulk_expected_queue_insertion_request_ids",
+                "bulk_native_completed_request_ids",
+                "bulk_native_completion_sequences",
             },
         )
         project_orders = transition(
             "global_fifo_across_projects",
             {
-                "query_submitted_project_identities",
-                "query_completed_project_identities",
-                "bulk_submitted_project_identities",
-                "bulk_completed_project_identities",
+                "query_expected_queue_insertion_project_identities",
+                "query_native_completed_project_identities",
+                "bulk_expected_queue_insertion_project_identities",
+                "bulk_native_completed_project_identities",
             },
         )
         preference = transition(
             "query_preference_observed",
             {
                 "first_query_request_id",
-                "first_query_completed_ns",
+                "first_query_native_completion_sequence",
                 "first_bulk_request_id",
-                "first_bulk_completed_ns",
+                "first_bulk_native_completion_sequence",
             },
         )
         resumed = transition(
             "bulk_resumed",
             {
                 "last_query_request_id",
-                "last_query_completed_ns",
+                "last_query_native_completion_sequence",
                 "last_bulk_request_id",
-                "last_bulk_completed_ns",
+                "last_bulk_native_completion_sequence",
             },
         )
         typed_capacity = True
@@ -5690,16 +5692,33 @@ def derive_scenario_assertions(
                 and bool(pressure.get("retry_condition"))
             )
         fifo = all(
-            class_orders[f"{queue_class}_submitted_request_ids"]
-            == class_orders[f"{queue_class}_completed_request_ids"]
-            and isinstance(class_orders[f"{queue_class}_submitted_request_ids"], list)
-            and bool(class_orders[f"{queue_class}_submitted_request_ids"])
+            class_orders[f"{queue_class}_expected_queue_insertion_request_ids"]
+            == class_orders[f"{queue_class}_native_completed_request_ids"]
+            and isinstance(
+                class_orders[f"{queue_class}_expected_queue_insertion_request_ids"], list
+            )
+            and bool(class_orders[f"{queue_class}_expected_queue_insertion_request_ids"])
+            and isinstance(class_orders[f"{queue_class}_native_completion_sequences"], list)
+            and bool(class_orders[f"{queue_class}_native_completion_sequences"])
+            and all(
+                isinstance(sequence, int)
+                and not isinstance(sequence, bool)
+                and sequence > 0
+                for sequence in class_orders[f"{queue_class}_native_completion_sequences"]
+            )
+            and class_orders[f"{queue_class}_native_completion_sequences"]
+            == sorted(class_orders[f"{queue_class}_native_completion_sequences"])
+            and len(set(class_orders[f"{queue_class}_native_completion_sequences"]))
+            == len(class_orders[f"{queue_class}_native_completion_sequences"])
             for queue_class in ("query", "bulk")
         )
         global_fifo = all(
-            project_orders[f"{queue_class}_submitted_project_identities"]
-            == project_orders[f"{queue_class}_completed_project_identities"]
-            and len(set(project_orders[f"{queue_class}_submitted_project_identities"])) == 2
+            project_orders[f"{queue_class}_expected_queue_insertion_project_identities"]
+            == project_orders[f"{queue_class}_native_completed_project_identities"]
+            and len(
+                set(project_orders[f"{queue_class}_expected_queue_insertion_project_identities"])
+            )
+            == 2
             for queue_class in ("query", "bulk")
         )
         assertions = {
@@ -5711,11 +5730,12 @@ def derive_scenario_assertions(
             "query_preferred_between_bulk_batches": (
                 selected["active_request_class"] == "query"
                 and selected["bulk_depth"] > 0
-                and preference["first_query_completed_ns"]
-                < preference["first_bulk_completed_ns"]
+                and preference["first_query_native_completion_sequence"]
+                < preference["first_bulk_native_completion_sequence"]
             ),
             "bulk_resumes_when_query_queue_permits": (
-                resumed["last_bulk_completed_ns"] > resumed["last_query_completed_ns"]
+                resumed["last_bulk_native_completion_sequence"]
+                > resumed["last_query_native_completion_sequence"]
             ),
             "no_project_or_scope_round_robin": global_fifo,
             "typed_retry_names_useful_condition": typed_capacity,
@@ -6047,7 +6067,7 @@ def qualification_artifact(
         },
         f"qualification artifact {name}",
     )
-    require(payload["schema_version"] == 2, f"qualification artifact {name} schema is unsupported")
+    require(payload["schema_version"] == 3, f"qualification artifact {name} schema is unsupported")
     require(payload["scenario"] == scenario_id, f"qualification artifact {name} names the wrong scenario")
     require(payload["contracts"] == contracts, f"qualification artifact {name} used different contracts")
 

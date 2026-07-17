@@ -289,7 +289,7 @@ impl EmbeddingAdmissionTracker {
         context: &EmbeddingRequestContext,
         succeeded: bool,
         cancelled: bool,
-    ) {
+    ) -> u64 {
         if let Ok(mut state) = self.state.lock() {
             if let Some(index) = state
                 .active
@@ -307,7 +307,9 @@ impl EmbeddingAdmissionTracker {
             }
             state.event_sequence = state.event_sequence.saturating_add(1);
             state.progress_sequence = state.progress_sequence.saturating_add(1);
+            return state.completed_request_count;
         }
+        0
     }
 
     pub(crate) fn cancelled(&self) {
@@ -435,5 +437,20 @@ mod tests {
                 .map(|request| request.scope_id.as_str()),
             Some("scope-opaque")
         );
+    }
+
+    #[test]
+    fn successful_finishes_receive_monotonic_native_completion_sequences() {
+        let tracker = EmbeddingAdmissionTracker::default();
+        let first = EmbeddingRequestContext::new("first", "scope", 25);
+        let failed = EmbeddingRequestContext::new("failed", "scope", 25);
+        let second = EmbeddingRequestContext::new("second", "scope", 25);
+        assert!(tracker.begin(&first, EmbeddingRequestClass::Query));
+        assert!(tracker.begin(&failed, EmbeddingRequestClass::Bulk));
+        assert!(tracker.begin(&second, EmbeddingRequestClass::Query));
+
+        assert_eq!(tracker.finish(&first, true, false), 1);
+        assert_eq!(tracker.finish(&failed, false, false), 1);
+        assert_eq!(tracker.finish(&second, true, false), 2);
     }
 }

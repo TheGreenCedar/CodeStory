@@ -687,10 +687,16 @@ pub struct EmbeddingResidencyLease {
 
 pub struct EmbeddingRequestHandle {
     context: EmbeddingRequestContext,
-    result: Receiver<Result<Vec<Vec<f32>>, EngineError>>,
+    result: Receiver<Result<EmbeddingRequestCompletion, EngineError>>,
 }
 
 pub type EmbeddingRequestResult = Result<Vec<Vec<f32>>, EngineError>;
+
+#[derive(Debug)]
+pub struct EmbeddingRequestCompletion {
+    pub vectors: Vec<Vec<f32>>,
+    pub completion_sequence: u64,
+}
 
 impl std::fmt::Debug for EmbeddingRequestHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -712,12 +718,24 @@ impl EmbeddingRequestHandle {
     }
 
     pub fn recv(self) -> Result<Vec<Vec<f32>>, EngineError> {
+        self.recv_with_completion()
+            .map(|completion| completion.vectors)
+    }
+
+    pub fn recv_with_completion(self) -> Result<EmbeddingRequestCompletion, EngineError> {
         self.result
             .recv()
             .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?
     }
 
     pub fn try_recv(&self) -> Result<Option<EmbeddingRequestResult>, EngineError> {
+        self.try_recv_with_completion()
+            .map(|result| result.map(|result| result.map(|completion| completion.vectors)))
+    }
+
+    pub fn try_recv_with_completion(
+        &self,
+    ) -> Result<Option<Result<EmbeddingRequestCompletion, EngineError>>, EngineError> {
         match self.result.try_recv() {
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -790,7 +808,7 @@ impl EngineShared {
 struct EmbeddingRequest {
     context: EmbeddingRequestContext,
     inputs: Vec<String>,
-    response: Sender<Result<Vec<Vec<f32>>, EngineError>>,
+    response: Sender<Result<EmbeddingRequestCompletion, EngineError>>,
 }
 
 struct CancellableRequestQueue {
@@ -1051,7 +1069,10 @@ impl EmbeddingEngine {
     ) -> Result<EmbeddingRequestHandle, EngineError> {
         if inputs.is_empty() {
             let (response, result) = bounded(1);
-            let _ = response.send(Ok(Vec::new()));
+            let _ = response.send(Ok(EmbeddingRequestCompletion {
+                vectors: Vec::new(),
+                completion_sequence: 0,
+            }));
             return Ok(EmbeddingRequestHandle { context, result });
         }
         let (response, result) = bounded(1);
@@ -1649,8 +1670,13 @@ fn handle_request(
     } else {
         result
     };
-    admission.finish(&request.context, result.is_ok(), cancelled);
-    let _ = request.response.send(result);
+    let completion_sequence = admission.finish(&request.context, result.is_ok(), cancelled);
+    let _ = request
+        .response
+        .send(result.map(|vectors| EmbeddingRequestCompletion {
+            vectors,
+            completion_sequence,
+        }));
 }
 
 #[allow(clippy::too_many_arguments)]

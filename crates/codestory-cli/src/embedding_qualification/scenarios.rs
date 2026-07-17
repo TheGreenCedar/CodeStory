@@ -30,7 +30,8 @@ const CLIENT_DEATH_LEASE_HOLD_MS: u64 = 600_000;
 const DEAD_CLIENT_QUERY_COUNT: usize = 16;
 const DEAD_CLIENT_BULK_COUNT: usize = 16;
 const QUALIFICATION_QUEUE_CAPACITY: u64 = 64;
-const MIXED_QUEUE_COUNT: u32 = 65;
+const MIXED_QUEUE_PROJECT_COUNT: u32 = (QUALIFICATION_QUEUE_CAPACITY / 2) as u32;
+const MIXED_QUEUE_COUNT: u32 = QUALIFICATION_QUEUE_CAPACITY as u32 + 1;
 const IDLE_EXIT_GRACE: Duration = Duration::from_millis(2_500);
 
 pub(super) struct ScenarioContext<'a> {
@@ -429,8 +430,12 @@ struct WorkerQueueOperation {
     project_identity_sha256: String,
     class: String,
     ordinal: u32,
+    #[serde(default)]
+    submission_batch: u32,
     submitted_ns: u64,
     completed_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_completion_sequence: Option<u64>,
     status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<codestory_retrieval::EmbeddingProtocolError>,
@@ -575,7 +580,7 @@ impl<'a> ScenarioRunner<'a> {
             executable: crate::embedding_server_transport::ExactExecutable::capture()?,
             clock,
             artifact: ScenarioArtifact {
-                schema_version: 2,
+                schema_version: 3,
                 scenario: context.scenario.into(),
                 contracts: context.contracts.clone(),
                 orchestration: ScenarioOrchestration {
@@ -2075,8 +2080,8 @@ impl<'a> ScenarioRunner<'a> {
             0,
             "queue_load",
             EmbeddingQualificationParameters {
-                query_count: 32,
-                bulk_count: 32,
+                query_count: MIXED_QUEUE_PROJECT_COUNT,
+                bulk_count: MIXED_QUEUE_PROJECT_COUNT,
                 documents_per_bulk: 1,
                 input_bytes: 64,
                 hold_ms: 0,
@@ -2087,8 +2092,8 @@ impl<'a> ScenarioRunner<'a> {
             1,
             "queue_load",
             EmbeddingQualificationParameters {
-                query_count: 32,
-                bulk_count: 32,
+                query_count: MIXED_QUEUE_PROJECT_COUNT,
+                bulk_count: MIXED_QUEUE_PROJECT_COUNT,
                 documents_per_bulk: 1,
                 input_bytes: 64,
                 hold_ms: 0,
@@ -2099,7 +2104,10 @@ impl<'a> ScenarioRunner<'a> {
         self.wait_for_snapshot(
             "mixed_queue_first_project_enqueued",
             QUEUE_SETUP_TIMEOUT,
-            |snapshot| snapshot.scheduler.query_depth >= 32 && snapshot.scheduler.bulk_depth >= 32,
+            |snapshot| {
+                snapshot.scheduler.query_depth >= u64::from(MIXED_QUEUE_PROJECT_COUNT)
+                    && snapshot.scheduler.bulk_depth >= u64::from(MIXED_QUEUE_PROJECT_COUNT)
+            },
         )?;
         write_atomic_json(&second_gate, &json!({"schema_version": 1}))?;
         let saturated =
@@ -2123,7 +2131,7 @@ impl<'a> ScenarioRunner<'a> {
             None,
         )?;
         let overflow_output = self.finish_worker(overflow, QUEUE_SETUP_TIMEOUT)?;
-        let overflow_operations = overflow_output.queue_operations.ok_or_else(|| {
+        let mut overflow_operations = overflow_output.queue_operations.ok_or_else(|| {
             anyhow::anyhow!("embedding_qualification_overflow_queue_output_missing")
         })?;
         require_pre_release_capacity_overflow(&overflow_operations)?;
@@ -2154,10 +2162,21 @@ impl<'a> ScenarioRunner<'a> {
         let mut operations = first_output
             .queue_operations
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_first_queue_output_missing"))?;
-        operations.extend(second_output.queue_operations.ok_or_else(|| {
+        for operation in &mut operations {
+            operation.submission_batch = 0;
+        }
+        let mut second_operations = second_output.queue_operations.ok_or_else(|| {
             anyhow::anyhow!("embedding_qualification_second_queue_output_missing")
-        })?);
+        })?;
+        for operation in &mut second_operations {
+            operation.submission_batch = 1;
+        }
+        for operation in &mut overflow_operations {
+            operation.submission_batch = 2;
+        }
+        operations.extend(second_operations);
         operations.extend(overflow_operations);
+        attach_native_completion_sequences(self.context.output_directory, &mut operations)?;
         let analysis = analyze_queue_operations(&operations)?;
         for operation in &operations {
             self.event(
@@ -2171,8 +2190,13 @@ impl<'a> ScenarioRunner<'a> {
                     ),
                     ("class", json!(operation.class)),
                     ("ordinal", json!(operation.ordinal)),
+                    ("submission_batch", json!(operation.submission_batch)),
                     ("submitted_ns", json!(operation.submitted_ns)),
                     ("completed_ns", json!(operation.completed_ns)),
+                    (
+                        "native_completion_sequence",
+                        json!(operation.native_completion_sequence),
+                    ),
                     ("status", json!(operation.status)),
                     ("error", json!(operation.error)),
                 ]),
@@ -2936,6 +2960,67 @@ fn completed_token_count(directory: &Path, request_id: &str) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_completed_tokens_missing"))
 }
 
+fn attach_native_completion_sequences(
+    directory: &Path,
+    operations: &mut [WorkerQueueOperation],
+) -> Result<()> {
+    let expected_request_ids = operations
+        .iter()
+        .filter(|operation| operation.status == "ok")
+        .map(|operation| operation.correlation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut sequences_by_request = BTreeMap::new();
+    for event in existing_control_events(directory)? {
+        if event.action != "completed_tokens" || event.status != "completed" {
+            continue;
+        }
+        let Some(details) = event.details else {
+            continue;
+        };
+        let Some(request_id) = details.get("request_id") else {
+            continue;
+        };
+        if !expected_request_ids.contains(request_id) {
+            continue;
+        }
+        let sequence = details
+            .get("native_completion_sequence")
+            .ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_native_completion_sequence_missing")
+            })?
+            .parse::<u64>()
+            .map_err(|_| {
+                anyhow::anyhow!("embedding_qualification_native_completion_sequence_invalid")
+            })?;
+        if sequence == 0 {
+            bail!("embedding_qualification_native_completion_sequence_invalid");
+        }
+        if sequences_by_request
+            .insert(request_id.clone(), sequence)
+            .is_some()
+        {
+            bail!("embedding_qualification_native_completion_sequence_duplicate_request");
+        }
+    }
+    let mut observed_sequences = BTreeSet::new();
+    for operation in operations {
+        if operation.status == "ok" {
+            let sequence = sequences_by_request
+                .remove(&operation.correlation_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("embedding_qualification_native_completion_sequence_missing")
+                })?;
+            if !observed_sequences.insert(sequence) {
+                bail!("embedding_qualification_native_completion_sequence_duplicate");
+            }
+            operation.native_completion_sequence = Some(sequence);
+        } else if operation.native_completion_sequence.is_some() {
+            bail!("embedding_qualification_native_completion_sequence_unexpected");
+        }
+    }
+    Ok(())
+}
+
 fn accelerator_operands(identity: &EmbeddingEngineIdentity) -> BTreeMap<String, Value> {
     btree([
         ("policy", json!(identity.policy)),
@@ -3371,8 +3456,10 @@ fn run_queue_operation(
         project_identity_sha256: project_identity_sha256.into(),
         class: class.into(),
         ordinal,
+        submission_batch: 0,
         submitted_ns,
         completed_ns: clock.now_ns(),
+        native_completion_sequence: None,
         status: status.into(),
         error: response.error,
         response_payload_bytes: payload.len() as u64,
@@ -4190,11 +4277,26 @@ fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<Queue
     if operations.iter().any(|operation| {
         !same_server_authority(&first.hello_snapshot, &operation.hello_snapshot)
             || (operation.status == "ok"
-                && (operation.error.is_some() || operation.response_payload_bytes == 0))
+                && (operation.error.is_some()
+                    || operation.response_payload_bytes == 0
+                    || operation.native_completion_sequence.is_none()))
             || (operation.status == "failed"
-                && (operation.error.is_none() || operation.response_payload_bytes != 0))
+                && (operation.error.is_none()
+                    || operation.response_payload_bytes != 0
+                    || operation.native_completion_sequence.is_some()))
+            || !matches!(operation.status.as_str(), "ok" | "failed")
     }) {
         bail!("embedding_qualification_queue_operation_identity_invalid");
+    }
+    let mut observed_native_completion_sequences = BTreeSet::new();
+    for operation in operations
+        .iter()
+        .filter(|operation| operation.status == "ok")
+    {
+        let sequence = operation.native_completion_sequence.unwrap_or_default();
+        if sequence == 0 || !observed_native_completion_sequences.insert(sequence) {
+            bail!("embedding_qualification_native_completion_sequence_invalid");
+        }
     }
     let mut capacity = BTreeMap::new();
     let mut class_orders = BTreeMap::new();
@@ -4227,6 +4329,7 @@ fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<Queue
             || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
             || pressure.depth != pressure.capacity
             || pressure.retry_condition.trim().is_empty()
+            || failures[0].submission_batch != 2
         {
             bail!("embedding_qualification_queue_capacity_contract_invalid:{class}");
         }
@@ -4239,53 +4342,107 @@ fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<Queue
                 "completed_ns": failures[0].completed_ns,
             }),
         );
-        let mut submitted = class_operations
+        let mut expected_queue_insertion = class_operations
             .iter()
             .copied()
             .filter(|operation| operation.status == "ok")
             .collect::<Vec<_>>();
-        submitted.sort_by_key(|operation| (operation.submitted_ns, &operation.correlation_id));
-        let mut completed = submitted.clone();
-        completed.sort_by_key(|operation| (operation.completed_ns, &operation.correlation_id));
-        let submitted_ids = submitted
+        expected_queue_insertion.sort_by_key(|operation| {
+            (
+                operation.submission_batch,
+                operation.ordinal,
+                &operation.correlation_id,
+            )
+        });
+        let mut expected_batch_projects = Vec::new();
+        for submission_batch in 0..2 {
+            let batch_operations = expected_queue_insertion
+                .iter()
+                .copied()
+                .filter(|operation| operation.submission_batch == submission_batch)
+                .collect::<Vec<_>>();
+            if batch_operations.len() != MIXED_QUEUE_PROJECT_COUNT as usize
+                || batch_operations
+                    .iter()
+                    .map(|operation| operation.ordinal)
+                    .collect::<Vec<_>>()
+                    != (0..MIXED_QUEUE_PROJECT_COUNT).collect::<Vec<_>>()
+            {
+                bail!("embedding_qualification_queue_insertion_order_invalid:{class}");
+            }
+            let projects = batch_operations
+                .iter()
+                .map(|operation| operation.project_identity_sha256.as_str())
+                .collect::<BTreeSet<_>>();
+            if projects.len() != 1 {
+                bail!("embedding_qualification_queue_project_batch_invalid:{class}");
+            }
+            let project = projects.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("embedding_qualification_queue_project_batch_invalid:{class}")
+            })?;
+            expected_batch_projects.push(project);
+        }
+        if expected_batch_projects[0] == expected_batch_projects[1] {
+            bail!("embedding_qualification_queue_project_batches_not_independent:{class}");
+        }
+        let mut completed = expected_queue_insertion.clone();
+        completed.sort_by_key(|operation| {
+            (
+                operation.native_completion_sequence.unwrap_or_default(),
+                &operation.correlation_id,
+            )
+        });
+        let expected_queue_insertion_ids = expected_queue_insertion
             .iter()
             .map(|operation| operation.correlation_id.clone())
             .collect::<Vec<_>>();
-        let completed_ids = completed
+        let native_completed_ids = completed
             .iter()
             .map(|operation| operation.correlation_id.clone())
             .collect::<Vec<_>>();
-        if submitted_ids != completed_ids {
+        if expected_queue_insertion_ids != native_completed_ids {
             bail!("embedding_qualification_queue_fifo_violation:{class}");
         }
-        let submitted_projects = submitted
+        let expected_queue_insertion_projects = expected_queue_insertion
             .iter()
             .map(|operation| operation.project_identity_sha256.clone())
             .collect::<Vec<_>>();
-        let completed_projects = completed
+        let native_completed_projects = completed
             .iter()
             .map(|operation| operation.project_identity_sha256.clone())
             .collect::<Vec<_>>();
-        if submitted_projects != completed_projects
-            || submitted_projects.iter().collect::<BTreeSet<_>>().len() != 2
+        if expected_queue_insertion_projects != native_completed_projects
+            || expected_queue_insertion_projects
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 2
         {
             bail!("embedding_qualification_queue_scope_order_invalid:{class}");
         }
+        let native_completion_sequences = completed
+            .iter()
+            .map(|operation| operation.native_completion_sequence.unwrap_or_default())
+            .collect::<Vec<_>>();
         class_orders.insert(
-            format!("{class}_submitted_request_ids"),
-            json!(submitted_ids),
+            format!("{class}_expected_queue_insertion_request_ids"),
+            json!(expected_queue_insertion_ids),
         );
         class_orders.insert(
-            format!("{class}_completed_request_ids"),
-            json!(completed_ids),
+            format!("{class}_native_completed_request_ids"),
+            json!(native_completed_ids),
+        );
+        class_orders.insert(
+            format!("{class}_native_completion_sequences"),
+            json!(native_completion_sequences),
         );
         project_orders.insert(
-            format!("{class}_submitted_project_identities"),
-            json!(submitted_projects),
+            format!("{class}_expected_queue_insertion_project_identities"),
+            json!(expected_queue_insertion_projects),
         );
         project_orders.insert(
-            format!("{class}_completed_project_identities"),
-            json!(completed_projects),
+            format!("{class}_native_completed_project_identities"),
+            json!(native_completed_projects),
         );
         completed_by_class.insert(class, completed);
     }
@@ -4297,12 +4454,20 @@ fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<Queue
     let first_bulk = bulks
         .first()
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_bulk_completion_missing"))?;
-    if first_query.completed_ns >= first_bulk.completed_ns {
+    let first_query_native_completion_sequence =
+        first_query.native_completion_sequence.unwrap_or_default();
+    let first_bulk_native_completion_sequence =
+        first_bulk.native_completion_sequence.unwrap_or_default();
+    if first_query_native_completion_sequence >= first_bulk_native_completion_sequence {
         bail!("embedding_qualification_query_preference_missing");
     }
     let last_query = queries.last().expect("non-empty query completions");
     let last_bulk = bulks.last().expect("non-empty bulk completions");
-    if last_bulk.completed_ns <= last_query.completed_ns {
+    let last_query_native_completion_sequence =
+        last_query.native_completion_sequence.unwrap_or_default();
+    let last_bulk_native_completion_sequence =
+        last_bulk.native_completion_sequence.unwrap_or_default();
+    if last_bulk_native_completion_sequence <= last_query_native_completion_sequence {
         bail!("embedding_qualification_bulk_resumption_missing");
     }
     Ok(QueueAnalysis {
@@ -4311,15 +4476,27 @@ fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<Queue
         project_orders,
         query_preference: btree([
             ("first_query_request_id", json!(first_query.correlation_id)),
-            ("first_query_completed_ns", json!(first_query.completed_ns)),
+            (
+                "first_query_native_completion_sequence",
+                json!(first_query_native_completion_sequence),
+            ),
             ("first_bulk_request_id", json!(first_bulk.correlation_id)),
-            ("first_bulk_completed_ns", json!(first_bulk.completed_ns)),
+            (
+                "first_bulk_native_completion_sequence",
+                json!(first_bulk_native_completion_sequence),
+            ),
         ]),
         bulk_resumption: btree([
             ("last_query_request_id", json!(last_query.correlation_id)),
-            ("last_query_completed_ns", json!(last_query.completed_ns)),
+            (
+                "last_query_native_completion_sequence",
+                json!(last_query_native_completion_sequence),
+            ),
             ("last_bulk_request_id", json!(last_bulk.correlation_id)),
-            ("last_bulk_completed_ns", json!(last_bulk.completed_ns)),
+            (
+                "last_bulk_native_completion_sequence",
+                json!(last_bulk_native_completion_sequence),
+            ),
         ]),
     })
 }
@@ -4503,7 +4680,7 @@ mod tests {
     #[test]
     fn scenario_artifact_schema_has_raw_fields_without_verdicts() {
         let value = serde_json::to_value(ScenarioArtifact {
-            schema_version: 2,
+            schema_version: 3,
             scenario: "cold_race".into(),
             contracts: QualificationContracts {
                 protocol_sha256: "a".repeat(64),

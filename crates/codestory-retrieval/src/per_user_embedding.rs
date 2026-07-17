@@ -3871,9 +3871,10 @@ fn serve_embedding_request(
             let _ = handle.cancel();
             return Ok(());
         }
-        match handle.try_recv() {
-            Ok(Some(Ok(vectors))) => {
-                let vectors = normalize_and_validate_vectors(vectors)?;
+        match handle.try_recv_with_completion() {
+            Ok(Some(Ok(completion))) => {
+                let native_completion_sequence = completion.completion_sequence;
+                let vectors = normalize_and_validate_vectors(completion.vectors)?;
                 let payload = encode_vectors(&vectors)?;
                 let snapshot = engine.snapshot().map_err(engine_error)?;
                 let identity = engine_identity(&state.process.server_instance_id, &snapshot)?;
@@ -3891,6 +3892,7 @@ fn serve_embedding_request(
                     state,
                     request_id,
                     context.completed_tokens(),
+                    native_completion_sequence,
                 )?;
                 guard.update_phase("response");
                 return write_protocol_response(
@@ -3946,12 +3948,16 @@ fn record_qualification_completed_tokens(
     state: &PerUserEmbeddingServerState,
     request_id: &str,
     completed_tokens: u64,
+    native_completion_sequence: u64,
 ) -> Result<()> {
     let Some(control) = state.qualification.as_ref() else {
         return Ok(());
     };
     if completed_tokens == 0 {
         bail!("embedding_qualification_completed_token_count_missing");
+    }
+    if native_completion_sequence == 0 {
+        bail!("embedding_qualification_native_completion_sequence_missing");
     }
     let clock = state.clock.snapshot();
     write_server_qualification_event(
@@ -3974,6 +3980,10 @@ fn record_qualification_completed_tokens(
                 [
                     ("request_id".into(), request_id.into()),
                     ("completed_tokens".into(), completed_tokens.to_string()),
+                    (
+                        "native_completion_sequence".into(),
+                        native_completion_sequence.to_string(),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
