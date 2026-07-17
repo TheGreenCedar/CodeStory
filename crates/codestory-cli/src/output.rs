@@ -1994,6 +1994,13 @@ pub(crate) fn render_agent_citation(
     if citation_needs_untrusted_repo_label(citation) {
         let _ = write!(out, " {UNTRUSTED_REPO_EVIDENCE_TRUST}");
     }
+    append_evidence_metadata(
+        &mut out,
+        citation.evidence_tier,
+        citation.evidence_producer.as_deref(),
+        citation.resolution_status,
+        citation.eligible_for_sufficiency,
+    );
     if include_breakdown && let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
         let _ = write!(
             out,
@@ -3306,6 +3313,13 @@ fn render_search_hit(project_root: &Path, hit: &SearchHit) -> String {
     }
     let _ = write!(out, " score={:.2}", hit.score);
     let _ = write!(out, " origin={}", hit.origin.as_str());
+    append_evidence_metadata(
+        &mut out,
+        hit.evidence_tier,
+        hit.evidence_producer.as_deref(),
+        hit.resolution_status,
+        hit.eligible_for_sufficiency,
+    );
     if let Some(node_ref) = node_ref(
         project_root,
         hit.file_path.as_deref(),
@@ -3333,6 +3347,13 @@ pub(crate) fn render_search_hit_output(hit: &SearchHitOutput) -> String {
     let _ = write!(out, " score={:.2}", hit.score);
     let _ = write!(out, " origin={}", hit.origin.as_str());
     let _ = write!(out, " match={}", format_match_quality(hit.match_quality));
+    append_evidence_metadata(
+        &mut out,
+        hit.evidence_tier,
+        hit.evidence_producer.as_deref(),
+        hit.resolution_status,
+        hit.eligible_for_sufficiency,
+    );
     if hit.origin == SearchHitOrigin::TextMatch {
         let _ = write!(out, " {UNTRUSTED_REPO_EVIDENCE_TRUST}");
     }
@@ -3349,6 +3370,58 @@ pub(crate) fn render_search_hit_output(hit: &SearchHitOutput) -> String {
         let _ = write!(out, " (see above)");
     }
     out
+}
+
+fn append_evidence_metadata(
+    out: &mut String,
+    evidence_tier: Option<PacketEvidenceTierDto>,
+    evidence_producer: Option<&str>,
+    resolution_status: Option<PacketEvidenceResolutionDto>,
+    eligible_for_sufficiency: Option<bool>,
+) {
+    if let Some(evidence_tier) = evidence_tier {
+        let _ = write!(
+            out,
+            " evidence_tier={}",
+            format_evidence_tier(evidence_tier)
+        );
+    }
+    if let Some(evidence_producer) = evidence_producer {
+        let _ = write!(out, " evidence_producer={evidence_producer}");
+    }
+    if let Some(resolution_status) = resolution_status {
+        let _ = write!(
+            out,
+            " resolution_status={}",
+            format_evidence_resolution(resolution_status)
+        );
+    }
+    if let Some(eligible_for_sufficiency) = eligible_for_sufficiency {
+        let _ = write!(out, " eligible_for_sufficiency={eligible_for_sufficiency}");
+    }
+}
+
+fn format_evidence_tier(tier: PacketEvidenceTierDto) -> &'static str {
+    match tier {
+        PacketEvidenceTierDto::ExactSource => "exact_source",
+        PacketEvidenceTierDto::StructuralText => "structural_text",
+        PacketEvidenceTierDto::ResolvedGraph => "resolved_graph",
+        PacketEvidenceTierDto::LexicalSource => "lexical_source",
+        PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
+        PacketEvidenceTierDto::ComponentReport => "component_report",
+        PacketEvidenceTierDto::DenseSemantic => "dense_semantic",
+        PacketEvidenceTierDto::SyntheticSourceScan => "synthetic_source_scan",
+        PacketEvidenceTierDto::GeneratedSummary => "generated_summary",
+    }
+}
+
+fn format_evidence_resolution(resolution: PacketEvidenceResolutionDto) -> &'static str {
+    match resolution {
+        PacketEvidenceResolutionDto::Resolved => "resolved",
+        PacketEvidenceResolutionDto::SourceRangeOnly => "source_range_only",
+        PacketEvidenceResolutionDto::Unresolved => "unresolved",
+        PacketEvidenceResolutionDto::DiagnosticOnly => "diagnostic_only",
+    }
 }
 
 fn format_match_quality(quality: codestory_contracts::api::SearchMatchQualityDto) -> &'static str {
@@ -4197,6 +4270,10 @@ mod tests {
             origin: SearchHitOrigin::IndexedSymbol,
             match_quality: codestory_contracts::api::SearchMatchQualityDto::NormalizedExact,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            eligible_for_sufficiency: None,
             score_breakdown: Some(RetrievalScoreBreakdownDto {
                 lexical: 0.7,
                 semantic: 0.1,
@@ -4241,6 +4318,67 @@ mod tests {
         hit.resolution_hints = Vec::new();
         hit.why = vec!["repo-text diagnostic match".to_string()];
         hit
+    }
+
+    #[test]
+    fn search_hit_markdown_keeps_structural_evidence_metadata() {
+        let mut hit = sample_search_hit();
+        hit.file_path = Some("Cargo.toml".to_string());
+        hit.evidence_tier = Some(PacketEvidenceTierDto::StructuralText);
+        hit.evidence_producer = Some("structural_cargo_manifest_collector".to_string());
+        hit.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        hit.eligible_for_sufficiency = Some(false);
+
+        let markdown = render_search_hit_output(&hit);
+
+        for expected in [
+            "evidence_tier=structural_text",
+            "evidence_producer=structural_cargo_manifest_collector",
+            "resolution_status=source_range_only",
+            "eligible_for_sufficiency=false",
+        ] {
+            assert!(
+                markdown.contains(expected),
+                "missing {expected}: {markdown}"
+            );
+        }
+    }
+
+    #[test]
+    fn citation_markdown_keeps_structural_evidence_metadata() {
+        let citation = AgentCitationDto {
+            node_id: NodeId("workflow-job".to_string()),
+            display_name: "test".to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some("C:/repo/.github/workflows/ci.yml".to_string()),
+            line: Some(12),
+            score: 0.8,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(false),
+        };
+
+        let markdown = render_agent_citation(Path::new("C:/repo"), &citation, false);
+
+        for expected in [
+            "evidence_tier=structural_text",
+            "evidence_producer=structural_github_actions_workflow_collector",
+            "resolution_status=source_range_only",
+            "eligible_for_sufficiency=false",
+        ] {
+            assert!(
+                markdown.contains(expected),
+                "missing {expected}: {markdown}"
+            );
+        }
     }
 
     #[test]

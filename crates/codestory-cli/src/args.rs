@@ -10,11 +10,12 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
-    ReadinessStatusDto, ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
-    RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    NodeId, NodeKind, PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
+    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
+    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
+    TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
@@ -1559,6 +1560,14 @@ pub(crate) struct SearchHitOutput {
     pub(crate) origin: SearchHitOrigin,
     pub(crate) match_quality: SearchMatchQualityDto,
     pub(crate) resolvable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolution_status: Option<PacketEvidenceResolutionDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) eligible_for_sufficiency: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) score_breakdown: Option<RetrievalScoreBreakdownDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

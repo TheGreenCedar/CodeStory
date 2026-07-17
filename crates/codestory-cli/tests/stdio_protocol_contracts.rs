@@ -2080,6 +2080,61 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "SearchHit outputSchema should still advertise optional match_quality: {search_hit_schema}"
     );
 
+    let citation_schema = tool_output_schema(&tools, "context")
+        .pointer("/properties/citations/items")
+        .unwrap_or_else(|| panic!("context outputSchema should describe agent citations: {tools}"));
+    for (surface, schema) in [
+        ("search hit", search_hit_schema),
+        ("agent citation", citation_schema),
+    ] {
+        for field in [
+            "evidence_tier",
+            "evidence_producer",
+            "resolution_status",
+            "eligible_for_sufficiency",
+        ] {
+            assert!(
+                !required_fields(schema).contains(field),
+                "{surface} evidence field {field} must remain optional: {schema}"
+            );
+        }
+        assert_schema_enum_values(
+            schema,
+            "/properties/evidence_tier/enum",
+            &[
+                "exact_source",
+                "structural_text",
+                "resolved_graph",
+                "lexical_source",
+                "symbol_doc",
+                "component_report",
+                "dense_semantic",
+                "synthetic_source_scan",
+                "generated_summary",
+            ],
+        );
+        assert_schema_enum_values(
+            schema,
+            "/properties/resolution_status/enum",
+            &[
+                "resolved",
+                "source_range_only",
+                "unresolved",
+                "diagnostic_only",
+            ],
+        );
+        assert_eq!(
+            schema_property(schema, "evidence_producer")["type"],
+            "string",
+            "{surface} outputSchema should expose the evidence producer: {schema}"
+        );
+        assert_eq!(
+            schema_property(schema, "eligible_for_sufficiency")["type"],
+            "boolean",
+            "{surface} outputSchema should expose the sufficiency flag: {schema}"
+        );
+    }
+
     let related_hit_schema = tool_output_schema(&tools, "symbol")
         .pointer("/properties/related_hits/items")
         .unwrap_or_else(|| {

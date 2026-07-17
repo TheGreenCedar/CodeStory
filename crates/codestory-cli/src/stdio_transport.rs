@@ -5738,6 +5738,69 @@ version = "0.11.20"
     }
 
     #[test]
+    fn stdio_search_preserves_structural_workflow_evidence_metadata() {
+        let workflow_hit = codestory_contracts::api::SearchHit {
+            node_id: NodeId("workflow-job".to_string()),
+            display_name: "test".to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some(".github/workflows/ci.yml".to_string()),
+            line: Some(12),
+            score: 0.8,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(false),
+            score_breakdown: None,
+        };
+        let result = codestory_contracts::api::SearchResultsDto {
+            query: "test".to_string(),
+            retrieval_publication: None,
+            retrieval: codestory_contracts::api::RetrievalStateDto {
+                mode: codestory_contracts::api::RetrievalModeDto::Hybrid,
+                hybrid_configured: true,
+                semantic_ready: true,
+                semantic_mode: codestory_contracts::api::SemanticModeDto::Enabled,
+                semantic_doc_count: 1,
+                embedding_model: None,
+                current_embedding: None,
+                stored_embedding: None,
+                fallback_reason: None,
+                fallback_message: None,
+            },
+            retrieval_shadow: None,
+            freshness: None,
+            limit_per_source: 5,
+            repo_text_mode: SearchRepoTextMode::Off,
+            repo_text_enabled: false,
+            query_assessment: None,
+            search_plan: None,
+            repo_text_stats: None,
+            suggestions: Vec::new(),
+            indexed_symbol_hits: vec![workflow_hit.clone()],
+            repo_text_hits: Vec::new(),
+            hits: vec![workflow_hit],
+        };
+
+        let response = stdio_tool_call_success("search", enrich_stdio_search_result(result));
+        let hit = &response["structuredContent"]["hits"][0];
+
+        assert_eq!(hit["evidence_tier"], "structural_text");
+        assert_eq!(
+            hit["evidence_producer"],
+            "structural_github_actions_workflow_collector"
+        );
+        assert_eq!(hit["resolution_status"], "source_range_only");
+        assert_eq!(hit["eligible_for_sufficiency"], false);
+    }
+
+    #[test]
     fn stdio_installed_host_results_stay_compact() {
         let projection: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/stdio_installed_host_search_retrieval.json"

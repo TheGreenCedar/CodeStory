@@ -600,6 +600,23 @@ impl SchemaObject {
 }
 
 const TEXT_HIT_ORIGINS: &[&str] = &["indexed_symbol", "text_match"];
+const PACKET_EVIDENCE_TIERS: &[&str] = &[
+    "exact_source",
+    "structural_text",
+    "resolved_graph",
+    "lexical_source",
+    "symbol_doc",
+    "component_report",
+    "dense_semantic",
+    "synthetic_source_scan",
+    "generated_summary",
+];
+const PACKET_EVIDENCE_RESOLUTIONS: &[&str] = &[
+    "resolved",
+    "source_range_only",
+    "unresolved",
+    "diagnostic_only",
+];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
 const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "unknown"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
@@ -692,6 +709,24 @@ static SEARCH_HIT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::boolean(
             "resolvable",
             "Whether the hit can be used as a symbol target.",
+        ),
+        SchemaProperty::string(
+            "evidence_tier",
+            "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+        )
+        .with_enum(PACKET_EVIDENCE_TIERS),
+        SchemaProperty::string(
+            "evidence_producer",
+            "Collector or retrieval producer that emitted the evidence.",
+        ),
+        SchemaProperty::string(
+            "resolution_status",
+            "Resolution state. source_range_only has a source span but no typed graph resolution.",
+        )
+        .with_enum(PACKET_EVIDENCE_RESOLUTIONS),
+        SchemaProperty::boolean(
+            "eligible_for_sufficiency",
+            "Whether this hit may satisfy answer-sufficiency requirements.",
         ),
         SchemaProperty::object("score_breakdown", "Optional retrieval score breakdown."),
         SchemaProperty::array(
@@ -1187,6 +1222,24 @@ static AGENT_CITATION_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::boolean(
             "resolvable",
             "Whether the citation can be resolved as a symbol.",
+        ),
+        SchemaProperty::string(
+            "evidence_tier",
+            "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+        )
+        .with_enum(PACKET_EVIDENCE_TIERS),
+        SchemaProperty::string(
+            "evidence_producer",
+            "Collector or retrieval producer that emitted the evidence.",
+        ),
+        SchemaProperty::string(
+            "resolution_status",
+            "Resolution state. source_range_only has a source span but no typed graph resolution.",
+        )
+        .with_enum(PACKET_EVIDENCE_RESOLUTIONS),
+        SchemaProperty::boolean(
+            "eligible_for_sufficiency",
+            "Whether this citation may satisfy answer-sufficiency requirements.",
         ),
         SchemaProperty::string("subgraph_id", "Related subgraph id.").nullable(),
         SchemaProperty::string_array("evidence_edge_ids", "Evidence edge ids."),
