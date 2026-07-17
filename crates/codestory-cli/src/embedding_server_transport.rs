@@ -556,9 +556,14 @@ impl codestory_retrieval::EmbeddingServerTransport for NativeEmbeddingServerTran
     }
 
     fn fail_stop(&self, reason_code: &str) {
-        eprintln!("CodeStory embedding server fail-stop: {reason_code}");
-        std::process::abort();
+        fail_stop_process(reason_code);
     }
+}
+
+fn fail_stop_process(_reason_code: &str) -> ! {
+    // A spawned server can outlive the process that owns its stderr reader.
+    // Fail-stop must not perform fallible I/O before terminating the process.
+    std::process::abort()
 }
 
 impl codestory_retrieval::EmbeddingServerListener for NativeEmbeddingListener {
@@ -3447,6 +3452,30 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn fail_stop_does_not_depend_on_a_live_stderr_reader() {
+        use std::os::unix::process::ExitStatusExt;
+
+        const CHILD_ENV: &str = "CODESTORY_TEST_FAIL_STOP_WITH_CLOSED_STDERR";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            unsafe {
+                libc::close(libc::STDERR_FILENO);
+            }
+            fail_stop_process("embedding_engine_stalled");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("embedding_server_transport::tests::fail_stop_does_not_depend_on_a_live_stderr_reader")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("run fail-stop child");
+
+        assert_eq!(status.signal(), Some(libc::SIGABRT));
+    }
 
     #[test]
     fn sha256_validation_is_exact() {
