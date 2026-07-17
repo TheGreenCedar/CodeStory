@@ -29,6 +29,7 @@ const ANTI_IDLE_PROTOCOL_DEADLINE_MS: u64 = 90_000;
 const CLIENT_DEATH_LEASE_HOLD_MS: u64 = 600_000;
 const DEAD_CLIENT_QUERY_COUNT: usize = 16;
 const DEAD_CLIENT_BULK_COUNT: usize = 16;
+const QUALIFICATION_QUEUE_CAPACITY: u64 = 64;
 const MIXED_QUEUE_COUNT: u32 = 65;
 const IDLE_EXIT_GRACE: Duration = Duration::from_millis(2_500);
 
@@ -1055,12 +1056,13 @@ impl<'a> ScenarioRunner<'a> {
                     .is_some_and(|active| active.class == "bulk")
             },
         )?;
-        let query_capacity = usize::try_from(seed_active.scheduler.query_capacity)
-            .context("convert qualification query capacity")?;
+        if seed_active.scheduler.query_capacity != QUALIFICATION_QUEUE_CAPACITY {
+            bail!("embedding_qualification_busy_retry_query_capacity_invalid");
+        }
         let project_identity = project_identity_sha256(runtime);
 
         let mut queued = Vec::new();
-        for ordinal in 0..query_capacity {
+        for ordinal in 0..QUALIFICATION_QUEUE_CAPACITY {
             let runtime = runtime.clone();
             let clock = Arc::clone(&self.clock);
             let transport = transport.clone();
@@ -1099,10 +1101,13 @@ impl<'a> ScenarioRunner<'a> {
                 |snapshot| snapshot.scheduler.query_depth >= expected_depth,
             )?;
         }
-        let saturated = self.wait_for_snapshot(
+        self.wait_for_snapshot(
             "measurement_busy_saturated",
             QUEUE_SETUP_TIMEOUT,
-            |snapshot| snapshot.scheduler.query_depth == snapshot.scheduler.query_capacity,
+            |snapshot| {
+                snapshot.scheduler.query_capacity == QUALIFICATION_QUEUE_CAPACITY
+                    && snapshot.scheduler.query_depth == QUALIFICATION_QUEUE_CAPACITY
+            },
         )?;
         let overflow = run_raw_protocol_exchange_with_input(
             runtime,
@@ -1127,20 +1132,35 @@ impl<'a> ScenarioRunner<'a> {
         if overflow.terminal_transport_error.is_some()
             || pressure.reason != "queue_full"
             || pressure.queue_class != "query"
-            || pressure.capacity != saturated.scheduler.query_capacity
+            || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
             || pressure.depth != pressure.capacity
             || pressure.retry_condition.trim().is_empty()
         {
             bail!("embedding_qualification_busy_retry_pressure_invalid");
         }
         let start = self.begin_measurement()?;
-        self.control("release_class", Some("query"))?;
         self.control("release_class", Some("bulk"))?;
-        self.wait_for_snapshot(
-            "measurement_busy_retry_condition_true",
-            SNAPSHOT_TIMEOUT,
-            |snapshot| snapshot.scheduler.query_depth < pressure.capacity,
+        self.control("release_class", Some("query"))?;
+        let first = queued.remove(0);
+        let first_operation = first
+            .join()
+            .map_err(|_| anyhow::anyhow!("embedding_qualification_busy_query_panicked"))??;
+        if first_operation.status != "ok" || first_operation.error.is_some() {
+            bail!("embedding_qualification_busy_retry_query_failed");
+        }
+        let retry = run_raw_protocol_exchange_with_input(
+            runtime,
+            self.clock.as_ref(),
+            "query",
+            ANTI_IDLE_PROTOCOL_DEADLINE_MS,
+            Some(workload_input(
+                "saturated_query_65th_retry_v1",
+                repeat,
+                65,
+                256,
+            )),
         )?;
+        require_protocol_exchange_success(&retry, "busy_retry_replay")?;
         let interval = self.finish_measurement(start)?;
 
         let seed = seed
@@ -2027,7 +2047,12 @@ impl<'a> ScenarioRunner<'a> {
     }
 
     fn mixed_queue(&mut self) -> Result<()> {
-        self.ensure_owner("mixed_queue_owner")?;
+        let owner = self.ensure_owner("mixed_queue_owner")?;
+        if owner.scheduler.query_capacity != QUALIFICATION_QUEUE_CAPACITY
+            || owner.scheduler.bulk_capacity != QUALIFICATION_QUEUE_CAPACITY
+        {
+            bail!("embedding_qualification_mixed_queue_capacity_invalid");
+        }
         self.control("hold_class", Some("bulk"))?;
         self.control("hold_class", Some("query"))?;
         let seed = self.spawn_worker("long_protocol_bulk", query_parameters(1), None)?;
@@ -2062,8 +2087,8 @@ impl<'a> ScenarioRunner<'a> {
             1,
             "queue_load",
             EmbeddingQualificationParameters {
-                query_count: 33,
-                bulk_count: 33,
+                query_count: 32,
+                bulk_count: 32,
                 documents_per_bulk: 1,
                 input_bytes: 64,
                 hold_ms: 0,
@@ -2079,10 +2104,25 @@ impl<'a> ScenarioRunner<'a> {
         write_atomic_json(&second_gate, &json!({"schema_version": 1}))?;
         let saturated =
             self.wait_for_snapshot("mixed_queue_saturated", QUEUE_SETUP_TIMEOUT, |snapshot| {
-                snapshot.scheduler.query_depth == snapshot.scheduler.query_capacity
-                    && snapshot.scheduler.bulk_depth == snapshot.scheduler.bulk_capacity
+                snapshot.scheduler.query_capacity == QUALIFICATION_QUEUE_CAPACITY
+                    && snapshot.scheduler.bulk_capacity == QUALIFICATION_QUEUE_CAPACITY
+                    && snapshot.scheduler.query_depth == QUALIFICATION_QUEUE_CAPACITY
+                    && snapshot.scheduler.bulk_depth == QUALIFICATION_QUEUE_CAPACITY
             })?;
         self.transition("queues_saturated", scheduler_values(&saturated));
+        let overflow = self.spawn_worker_for(
+            1,
+            "queue_load",
+            EmbeddingQualificationParameters {
+                query_count: 1,
+                bulk_count: 1,
+                documents_per_bulk: 1,
+                input_bytes: 64,
+                hold_ms: 0,
+            },
+            None,
+        )?;
+        let overflow_output = self.finish_worker(overflow, QUEUE_SETUP_TIMEOUT)?;
         self.control("release_class", Some("bulk"))?;
         let query_selected =
             self.wait_for_snapshot("mixed_queue_query_selected", SNAPSHOT_TIMEOUT, |snapshot| {
@@ -2112,6 +2152,9 @@ impl<'a> ScenarioRunner<'a> {
             .ok_or_else(|| anyhow::anyhow!("embedding_qualification_first_queue_output_missing"))?;
         operations.extend(second_output.queue_operations.ok_or_else(|| {
             anyhow::anyhow!("embedding_qualification_second_queue_output_missing")
+        })?);
+        operations.extend(overflow_output.queue_operations.ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_overflow_queue_output_missing")
         })?);
         let analysis = analyze_queue_operations(&operations)?;
         for operation in &operations {
@@ -3105,16 +3148,15 @@ fn run_queue_load(
     let baseline = observer
         .observe()?
         .ok_or_else(|| anyhow::anyhow!("embedding_qualification_queue_owner_absent"))?;
+    if baseline.scheduler.query_capacity != QUALIFICATION_QUEUE_CAPACITY
+        || baseline.scheduler.bulk_capacity != QUALIFICATION_QUEUE_CAPACITY
+    {
+        bail!("embedding_qualification_queue_capacity_invalid");
+    }
     let mut expected_query_depth = baseline.scheduler.query_depth;
     let mut expected_bulk_depth = baseline.scheduler.bulk_depth;
-    let query_success_limit = baseline
-        .scheduler
-        .query_capacity
-        .saturating_sub(expected_query_depth);
-    let bulk_success_limit = baseline
-        .scheduler
-        .bulk_capacity
-        .saturating_sub(expected_bulk_depth);
+    let query_success_limit = QUALIFICATION_QUEUE_CAPACITY.saturating_sub(expected_query_depth);
+    let bulk_success_limit = QUALIFICATION_QUEUE_CAPACITY.saturating_sub(expected_bulk_depth);
     let mut query_attempts = 0_u64;
     let mut bulk_attempts = 0_u64;
     let mut workers = Vec::new();
@@ -4142,7 +4184,7 @@ fn analyze_queue_operations(operations: &[WorkerQueueOperation]) -> Result<Queue
                 anyhow::anyhow!("embedding_qualification_queue_capacity_untyped:{class}")
             })?;
         if pressure.queue_class != class
-            || pressure.capacity != 64
+            || pressure.capacity != QUALIFICATION_QUEUE_CAPACITY
             || pressure.depth != pressure.capacity
             || pressure.retry_condition.trim().is_empty()
         {
