@@ -177,6 +177,17 @@ observed no candidate measurements. Record the exact successful measurement
 commit in the approved profile; changes made afterward cannot define or move
 the reference values used to evaluate them.
 
+Protected run `29616984735` at
+`42b88537840a2fcb77cad523a5a0d4627f42961f` built the repaired native package
+and produced CodeStory self-corpus stats, then correctly rejected the Serde
+drill because its repository-wide synthetic manifest scheduled the intentional
+compiler-failure fixture `tests/ui/parse_expr.rs`. Packet production and
+candidate evaluation did not run, so those partial stats cannot define the v2
+baseline. The runner now binds a checked-in project manifest into its machine
+contract and attestation so the drill corpus includes valid Rust source while
+excluding `tests/ui/**`; production parser and publication completeness remain
+unchanged.
+
 Before observing the v2 measurements, its operational budgets are fixed as
 follows:
 

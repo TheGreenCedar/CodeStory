@@ -22,6 +22,7 @@ The approved host shape for the 0.16 in-process retrieval baseline is:
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
 | Drill manifest | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
+| Drill project manifest | `scripts/release-evidence/serde-json-codestory-project.json` |
 
 The profile ID is a stable comparison key, not evidence about the current
 machine. Provisioning records the observed host, generated Colima VM shape,
@@ -60,7 +61,9 @@ Provisioning is idempotent. It:
 - disables automatic runner updates so baseline changes are deliberate;
 - verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and
   linked embedding engine without provisioning either one;
-- prepares a source-backed `serde_json` drill at an exact commit;
+- prepares a source-backed `serde_json` drill at an exact commit and installs
+  the checksum-bound project manifest that excludes its intentionally malformed
+  compiler UI fixtures from the valid-source corpus;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
 - keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
   under the proof-owned volume.

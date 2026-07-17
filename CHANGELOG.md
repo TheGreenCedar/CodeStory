@@ -32,6 +32,9 @@
   incompatible fixed-ARM and all-variant CMake selectors in the checked-in
   Cargo build environment. Packages retain the portable runtime-loaded ARM CPU
   backend beside Vulkan without runner-local patches.
+- Linux ARM64 release evidence now checksum-binds an explicit Serde project
+  manifest, keeping intentional compiler-failure UI fixtures outside the valid
+  source corpus without weakening fail-closed production indexing.
 - Draft source CI now restores exact-lock retrieval output or narrowly scoped
   prior-lock output before rebuilding. The base retrieval lane serially seeds
   the exact five test-profile targets used by draft proof, while a versioned
