@@ -8,6 +8,7 @@ publish = false
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
 codestory-runtime = { workspace = true, features = ["benchmark-support"] }
+codestory-retrieval = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 criterion = { workspace = true }
@@ -16,6 +17,13 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+clap = { workspace = true }
+hex = "0.4"
+libc = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+sqlite-vec = "=0.1.9"
+usearch = { version = "2.26.0", default-features = false }
 
 [[bench]]
 name = "indexing"

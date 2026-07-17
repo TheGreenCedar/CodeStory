@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "issue": 1202,
+  "purpose": "evidence-only comparison; this harness cannot select or adopt a production backend",
+  "approved_profile": {
+    "os": "macOS arm64",
+    "machine": "local Apple Silicon evidence host",
+    "corpus": "torvalds/linux at 37e2f878a7a660a216cc7a60459995fefd150f25"
+  },
+  "candidates": {
+    "sqlite-vec": "0.1.9, vec0 float[768], cosine",
+    "usearch": "2.26.0, HNSW F32, cosine, default features disabled"
+  },
+  "shared_workload": {
+    "vector_counts": [1000, 10000, 25000, 100000],
+    "dimensions": 768,
+    "query_count": 30,
+    "top_k": 20,
+    "warmups": 5,
+    "paired_counterbalanced_blocks_per_workload": 6,
+    "clean_evidence_roots": 2,
+    "selection": "seeded nested real anchors; all catalog targets are force-included before the seeded fill",
+    "input_contract": "one complete immutable CodeStory vectors.sqlite3 publication, its manifest identity, an independently reviewable vector-free source-truth query catalog, and frozen query vectors generated before candidate timing"
+  },
+  "required_measurements": [
+    "build_ms",
+    "load_ms",
+    "cold_query_ms",
+    "warm_query_p50_ms",
+    "warm_query_p95_ms",
+    "rss_bytes_after_warm_queries",
+    "disk_bytes",
+    "incremental_reuse_ms",
+    "ann_recall_at_20_against_embedded_scan",
+    "source_truth_hit_at_20",
+    "concurrent_readers",
+    "rollback_and_corrupt_generation_rejection"
+  ],
+  "decision_rules": {
+    "allowed_dispositions": ["recommend sqlite-vec", "recommend USearch", "retain embedded scan", "inconclusive"],
+    "minimum_ann_recall_at_20": 0.99,
+    "minimum_source_truth_hit_at_20": 1.0,
+    "selection_requires": [
+      "both clean evidence roots pass every declared workload and paired block",
+      "the source-truth catalog receives independent review",
+      "the immutable-generation, publication, rollback, corruption, cancellation, and concurrent-reader rows all pass",
+      "offline, license, native-dependency, archive-size, and later adoption integration evidence are complete",
+      "the candidate has a reversible fallback to the embedded scan"
+    ]
+  },
+  "non_goals": [
+    "shipping either candidate",
+    "changing production retrieval routing",
+    "using synthetic vectors as decision evidence",
+    "using a cache, hook, or workflow change to manufacture proof"
+  ]
+}
