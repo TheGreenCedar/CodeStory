@@ -1299,6 +1299,7 @@ impl PerUserEmbeddingClient {
         let control = EmbeddingCallControl::new(timeout, cancelled)?;
         let clock = self.transport.clock();
         let mut replayed = false;
+        let mut recover_after_inflight_loss = false;
         let mut attempts = Vec::with_capacity(2);
         loop {
             control.check()?;
@@ -1306,6 +1307,7 @@ impl PerUserEmbeddingClient {
                 EmbeddingConnectIntent::Activate,
                 true,
                 Some(&control),
+                recover_after_inflight_loss,
             ) {
                 Ok(connection) => connection,
                 Err(error) if !replayed && is_server_loss(&error) => {
@@ -1369,6 +1371,7 @@ impl PerUserEmbeddingClient {
                 Err(error) if !replayed && is_server_loss(&error) => {
                     control.check()?;
                     replayed = true;
+                    recover_after_inflight_loss = true;
                 }
                 Err(error) => return Err(error),
             }
@@ -1421,7 +1424,7 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
     ) -> Result<ValidatedEmbeddingConnection> {
-        self.connect_with_control(intent, may_spawn, None)
+        self.connect_with_control(intent, may_spawn, None, false)
     }
 
     fn connect_with_control(
@@ -1429,15 +1432,17 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
         control: Option<&EmbeddingCallControl<'_>>,
+        recover_after_server_loss: bool,
     ) -> Result<ValidatedEmbeddingConnection> {
         let budgets = self.transport.budgets();
         let mut spawned_at_ns = None;
+        let mut owner_recovery_started_at_ns = None;
         let mut spawn_attempt = None;
-        let wait_for_spawn = |spawned_at_ns| -> Result<()> {
+        let wait_for_convergence = |started_at_ns| -> Result<()> {
             if let Some(control) = control {
                 control.check()?;
             }
-            let elapsed = elapsed_since(self.transport.clock().as_ref(), spawned_at_ns);
+            let elapsed = elapsed_since(self.transport.clock().as_ref(), started_at_ns);
             let remaining = budgets.spawn.saturating_sub(elapsed);
             if remaining.is_zero() {
                 bail!("embedding_server_start_timeout");
@@ -1494,11 +1499,17 @@ impl PerUserEmbeddingClient {
                 EmbeddingConnectOutcome::NoOwner => {
                     let spawned_at_ns =
                         spawned_at_ns.expect("an activating retry follows an exact-exe spawn");
-                    wait_for_spawn(spawned_at_ns)?;
+                    wait_for_convergence(spawned_at_ns)?;
                 }
                 EmbeddingConnectOutcome::OwnerUnresponsive(error) => {
                     if let Some(spawned_at_ns) = spawned_at_ns {
-                        wait_for_spawn(spawned_at_ns)?;
+                        wait_for_convergence(spawned_at_ns)?;
+                        continue;
+                    }
+                    if recover_after_server_loss {
+                        let recovery_started_at_ns = owner_recovery_started_at_ns
+                            .get_or_insert_with(|| self.transport.clock().now_ns());
+                        wait_for_convergence(*recovery_started_at_ns)?;
                         continue;
                     }
                     return Err(PerUserEmbeddingError {
@@ -5480,6 +5491,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum BootstrapConnectOutcome {
         Connected,
+        Loss,
         NoOwner,
         OwnerUnresponsive,
     }
@@ -5510,8 +5522,8 @@ mod tests {
                     connect: Duration::from_millis(1),
                     spawn,
                     retry_after: Duration::from_millis(1),
-                    query_request: Duration::from_millis(10),
-                    bulk_request: Duration::from_millis(10),
+                    query_request: Duration::from_secs(1),
+                    bulk_request: Duration::from_secs(1),
                 },
                 compatibility: EmbeddingCompatibility::current(true),
             })
@@ -5535,6 +5547,9 @@ mod tests {
             Ok(match outcome {
                 BootstrapConnectOutcome::Connected => EmbeddingConnectOutcome::Connected(Box::new(
                     ScriptStream::new(ScriptOutcome::Success, self.compatibility.clone()),
+                )),
+                BootstrapConnectOutcome::Loss => EmbeddingConnectOutcome::Connected(Box::new(
+                    ScriptStream::new(ScriptOutcome::Loss, self.compatibility.clone()),
                 )),
                 BootstrapConnectOutcome::NoOwner => EmbeddingConnectOutcome::NoOwner,
                 BootstrapConnectOutcome::OwnerUnresponsive => {
@@ -5659,6 +5674,61 @@ mod tests {
             .embed_query("x")
             .expect_err("second loss is terminal");
         assert!(is_server_loss(&error));
+        assert_eq!(transport.connect_count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn pure_rpc_replay_waits_for_a_fail_stopped_owner_to_release_authority() {
+        let transport = BootstrapTestTransport::new(
+            [
+                BootstrapConnectOutcome::Loss,
+                BootstrapConnectOutcome::OwnerUnresponsive,
+                BootstrapConnectOutcome::NoOwner,
+                BootstrapConnectOutcome::OwnerUnresponsive,
+                BootstrapConnectOutcome::Connected,
+            ],
+            BootstrapConnectOutcome::Connected,
+            Duration::from_millis(5),
+        );
+        let client = PerUserEmbeddingClient {
+            transport: transport.clone(),
+            compatibility: EmbeddingCompatibility::current(true),
+            scope_id: "test-scope".into(),
+        };
+
+        let (_, attempts) = client
+            .embed_query_with_qualification_attempts("x")
+            .expect("one replay converges after the fail-stopped owner releases authority");
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, "server_loss");
+        assert_eq!(attempts[1].outcome, "completed");
+        assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
+        assert_eq!(transport.connect_count.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn pure_rpc_does_not_wait_for_a_preexisting_frozen_owner() {
+        let transport = BootstrapTestTransport::new(
+            [BootstrapConnectOutcome::OwnerUnresponsive],
+            BootstrapConnectOutcome::OwnerUnresponsive,
+            Duration::from_millis(5),
+        );
+        let client = PerUserEmbeddingClient {
+            transport: transport.clone(),
+            compatibility: EmbeddingCompatibility::current(true),
+            scope_id: "test-scope".into(),
+        };
+
+        let error = client
+            .embed_query("x")
+            .expect_err("a pre-existing frozen owner remains a typed failure");
+        let typed = error
+            .downcast_ref::<PerUserEmbeddingError>()
+            .expect("typed frozen-owner state");
+
+        assert_eq!(typed.code, "embedding_server_owner_unresponsive");
+        assert_eq!(transport.spawn_count.load(Ordering::Acquire), 0);
         assert_eq!(transport.connect_count.load(Ordering::Acquire), 2);
     }
 
