@@ -23,6 +23,7 @@ mod scenarios;
 
 const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
+const DIAGNOSTIC_SCENARIO_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIAGNOSTIC_SCENARIO";
 const ARCHIVE_SHA256_ENV: &str = "CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256";
 const MANIFEST_PATH_ENV: &str = "CODESTORY_PLUGIN_CLI_MANIFEST_PATH";
 const NATIVE_MANIFEST_FILE: &str = "codestory-native-manifest.json";
@@ -164,6 +165,22 @@ pub(crate) fn run_internal_embedding_qualification(
         })
         .collect::<Vec<_>>();
 
+    if diagnostic_worker_stall_enabled()? {
+        let artifact = scenarios::run_scenario(scenarios::ScenarioContext {
+            scenario: "worker_stall",
+            runtimes: &runtimes,
+            projects: &request.projects,
+            primary_index: 0,
+            contracts: &request.contracts,
+            qualification_runtime: &request.runtime,
+            output_directory: &validation.output_directory,
+            nonce_sha256: &validation.nonce_sha256,
+        })
+        .context("run diagnostic embedding qualification scenario worker_stall")?;
+        return write_atomic_json(&validation.output_path, &artifact)
+            .context("write diagnostic worker_stall artifact");
+    }
+
     let measurements_artifact_name = "measurements.raw.json";
     let measurements_artifact = scenarios::run_measurements(scenarios::ScenarioContext {
         scenario: "measurements",
@@ -215,6 +232,14 @@ pub(crate) fn run_internal_embedding_qualification(
         scenarios,
     };
     write_atomic_json(&validation.output_path, &output).context("write raw qualification output")
+}
+
+fn diagnostic_worker_stall_enabled() -> Result<bool> {
+    match std::env::var_os(DIAGNOSTIC_SCENARIO_ENV) {
+        None => Ok(false),
+        Some(value) if value == "worker_stall" => Ok(true),
+        Some(_) => bail!("embedding_qualification_diagnostic_scenario_invalid"),
+    }
 }
 
 pub(crate) fn run_internal_embedding_qualification_worker(

@@ -2552,6 +2552,16 @@ impl<'a> ScenarioRunner<'a> {
             })?;
         self.transition("stalled_request_observed", scheduler_values(&active));
         let output = self.finish_worker(worker, stall_worker_timeout())?;
+        if diagnostic_worker_stall_enabled()? {
+            write_atomic_json(
+                &self
+                    .context
+                    .output_directory
+                    .join("worker_stall.replay-worker-output.json"),
+                &output,
+            )
+            .context("retain diagnostic worker_stall replay output")?;
+        }
         require_worker_success(&output, "worker_stall_replay")?;
         let operation = output
             .result
