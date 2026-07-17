@@ -738,19 +738,32 @@ pub struct PerUserEmbeddingClient {
 }
 
 struct EmbeddingCallControl<'a> {
-    timeout: Duration,
-    deadline: OnceLock<Instant>,
+    operation_timeout: Duration,
+    outer_deadline: Option<Instant>,
+    operation_deadline: OnceLock<Instant>,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
 impl<'a> EmbeddingCallControl<'a> {
-    fn new(timeout: Duration, cancelled: &'a (dyn Fn() -> bool + Sync)) -> Result<Self> {
-        if timeout.is_zero() {
+    fn new(
+        operation_timeout: Duration,
+        outer_timeout: Option<Duration>,
+        cancelled: &'a (dyn Fn() -> bool + Sync),
+    ) -> Result<Self> {
+        if operation_timeout.is_zero() || outer_timeout.is_some_and(|timeout| timeout.is_zero()) {
             bail!("embedding_server_deadline_invalid");
         }
+        let outer_deadline = outer_timeout
+            .map(|timeout| {
+                Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| anyhow!("embedding_server_deadline_invalid"))
+            })
+            .transpose()?;
         let control = Self {
-            timeout,
-            deadline: OnceLock::new(),
+            operation_timeout,
+            outer_deadline,
+            operation_deadline: OnceLock::new(),
             cancelled,
         };
         control.check()?;
@@ -758,21 +771,29 @@ impl<'a> EmbeddingCallControl<'a> {
     }
 
     fn arm(&self) -> Result<()> {
-        if self.deadline.get().is_none() {
+        if self.operation_deadline.get().is_none() {
             let deadline = Instant::now()
-                .checked_add(self.timeout)
+                .checked_add(self.operation_timeout)
                 .ok_or_else(|| anyhow!("embedding_server_deadline_invalid"))?;
-            let _ = self.deadline.set(deadline);
+            let _ = self.operation_deadline.set(deadline);
         }
         self.check()
+    }
+
+    fn active_deadline(&self) -> Option<Instant> {
+        match (self.outer_deadline, self.operation_deadline.get().copied()) {
+            (Some(outer), Some(operation)) => Some(outer.min(operation)),
+            (Some(outer), None) => Some(outer),
+            (None, Some(operation)) => Some(operation),
+            (None, None) => None,
+        }
     }
 
     fn triggered(&self) -> bool {
         (self.cancelled)()
             || self
-                .deadline
-                .get()
-                .is_some_and(|deadline| Instant::now() >= *deadline)
+                .active_deadline()
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     fn check(&self) -> Result<()> {
@@ -788,9 +809,8 @@ impl<'a> EmbeddingCallControl<'a> {
             .into());
         }
         if self
-            .deadline
-            .get()
-            .is_some_and(|deadline| Instant::now() >= *deadline)
+            .active_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
         {
             return Err(PerUserEmbeddingError {
                 code: "embedding_deadline_exceeded".into(),
@@ -807,7 +827,7 @@ impl<'a> EmbeddingCallControl<'a> {
 
     fn remaining(&self, maximum: Duration) -> Result<Duration> {
         self.check()?;
-        let remaining = self.deadline.get().map_or(maximum, |deadline| {
+        let remaining = self.active_deadline().map_or(maximum, |deadline| {
             deadline
                 .saturating_duration_since(Instant::now())
                 .min(maximum)
@@ -1124,11 +1144,9 @@ impl PerUserEmbeddingClient {
     ) -> Result<(Vec<f32>, Vec<EmbeddingQualificationAttemptResult>)> {
         validate_raw_inputs(std::slice::from_ref(&text.to_string()))?;
         let budgets = self.transport.budgets();
-        let timeout = maximum_timeout
-            .unwrap_or(budgets.query_request)
-            .min(budgets.query_request);
         let (result, attempts) = self.call_pure_with_replay_controlled_and_attempts(
-            timeout,
+            budgets.query_request,
+            maximum_timeout,
             cancelled,
             |deadline_ms, token| EmbeddingOperation::EmbedQuery {
                 scope_id: self.scope_id.clone(),
@@ -1182,11 +1200,9 @@ impl PerUserEmbeddingClient {
         }
         validate_raw_inputs(texts)?;
         let budgets = self.transport.budgets();
-        let timeout = maximum_timeout
-            .unwrap_or(budgets.bulk_request)
-            .min(budgets.bulk_request);
         let (result, attempts) = self.call_pure_with_replay_controlled_and_attempts(
-            timeout,
+            budgets.bulk_request,
+            maximum_timeout,
             cancelled,
             |deadline_ms, token| EmbeddingOperation::EmbedDocuments {
                 scope_id: self.scope_id.clone(),
@@ -1307,14 +1323,15 @@ impl PerUserEmbeddingClient {
 
     fn call_pure_with_replay_controlled_and_attempts<B>(
         &self,
-        timeout: Duration,
+        operation_timeout: Duration,
+        outer_timeout: Option<Duration>,
         cancelled: &(dyn Fn() -> bool + Sync),
         operation: B,
     ) -> Result<EmbeddingQualificationAttemptExchange>
     where
         B: Fn(u64, String) -> EmbeddingOperation,
     {
-        let control = EmbeddingCallControl::new(timeout, cancelled)?;
+        let control = EmbeddingCallControl::new(operation_timeout, outer_timeout, cancelled)?;
         let clock = self.transport.clock();
         let mut replayed = false;
         let mut recover_after_inflight_loss = false;
@@ -1338,7 +1355,7 @@ impl PerUserEmbeddingClient {
             control.arm()?;
             let request_id = Uuid::new_v4().to_string();
             let cancel_token = Uuid::new_v4().to_string();
-            let remaining = control.remaining(timeout)?;
+            let remaining = control.remaining(operation_timeout)?;
             let request_operation =
                 operation(positive_duration_ms(remaining), cancel_token.clone());
             configure_exchange_timeout(&*connection.stream, remaining)?;
@@ -5444,6 +5461,67 @@ mod tests {
         }
     }
 
+    struct StallingHelloStream {
+        identity: EmbeddingTransportIdentity,
+        read_timeout: Mutex<Option<Duration>>,
+        observed_read_timeout: Arc<Mutex<Option<Duration>>>,
+    }
+
+    impl Read for StallingHelloStream {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            let timeout = self
+                .read_timeout
+                .lock()
+                .expect("stalling Hello read timeout")
+                .expect("Hello exchange must configure a read timeout");
+            thread::sleep(timeout.saturating_add(Duration::from_millis(5)));
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "scripted initial Hello stall",
+            ))
+        }
+    }
+
+    impl Write for StallingHelloStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl EmbeddingServerStream for StallingHelloStream {
+        fn transport_identity(&self) -> &EmbeddingTransportIdentity {
+            &self.identity
+        }
+
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            *self
+                .read_timeout
+                .lock()
+                .expect("stalling Hello read timeout") = timeout;
+            *self
+                .observed_read_timeout
+                .lock()
+                .expect("observed Hello read timeout") = timeout;
+            Ok(())
+        }
+
+        fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn peer_is_alive(&self) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn shutdown(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct ClientTestTransport {
         clock: Arc<TestClock>,
         connect_count: AtomicUsize,
@@ -5594,6 +5672,70 @@ mod tests {
         connect_count: AtomicUsize,
         spawn_count: AtomicUsize,
         compatibility: EmbeddingCompatibility,
+    }
+
+    struct ExplicitDeadlineTransport {
+        clock: Arc<TestClock>,
+        connect_count: AtomicUsize,
+        observed_connect_budget: Mutex<Option<Duration>>,
+        observed_read_timeout: Arc<Mutex<Option<Duration>>>,
+    }
+
+    impl ExplicitDeadlineTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                clock: TestClock::new(),
+                connect_count: AtomicUsize::new(0),
+                observed_connect_budget: Mutex::new(None),
+                observed_read_timeout: Arc::new(Mutex::new(None)),
+            })
+        }
+    }
+
+    impl EmbeddingClientTransport for ExplicitDeadlineTransport {
+        fn connect(
+            &self,
+            _intent: EmbeddingConnectIntent,
+            budget: Duration,
+            _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
+        ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
+            self.connect_count.fetch_add(1, Ordering::AcqRel);
+            *self
+                .observed_connect_budget
+                .lock()
+                .expect("observed connect budget") = Some(budget);
+            Ok(EmbeddingConnectOutcome::Connected(Box::new(
+                StallingHelloStream {
+                    identity: test_transport_identity(),
+                    read_timeout: Mutex::new(None),
+                    observed_read_timeout: Arc::clone(&self.observed_read_timeout),
+                },
+            )))
+        }
+
+        fn spawn_exact_current_exe(
+            &self,
+        ) -> std::result::Result<EmbeddingSpawnAttempt, EmbeddingTransportFailure> {
+            panic!("an explicit deadline must expire before spawning")
+        }
+
+        fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
+            self.clock.clone()
+        }
+
+        fn executable_identity(&self) -> EmbeddingExecutableIdentity {
+            test_executable()
+        }
+
+        fn budgets(&self) -> EmbeddingClientBudgets {
+            EmbeddingClientBudgets {
+                connect: Duration::from_millis(500),
+                spawn: Duration::from_millis(500),
+                retry_after: Duration::from_millis(10),
+                query_request: Duration::from_millis(500),
+                bulk_request: Duration::from_millis(500),
+            }
+        }
     }
 
     impl DeadlineBudgetTransport {
@@ -5932,6 +6074,37 @@ mod tests {
         assert_eq!(attempts[0].outcome, "server_loss");
         assert_eq!(attempts[1].outcome, "completed");
         assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn explicit_caller_deadline_bounds_initial_hello() {
+        let transport = ExplicitDeadlineTransport::new();
+        let client = test_client(transport.clone());
+        let started = Instant::now();
+        let error = client
+            .embed_query_with_control("x", Some(Duration::from_millis(50)), &|| false)
+            .expect_err("the explicit caller deadline must bound initial Hello");
+        let elapsed = started.elapsed();
+        let retry = embedding_retry_state(&error).expect("typed caller deadline");
+        let connect_budget = transport
+            .observed_connect_budget
+            .lock()
+            .expect("observed connect budget")
+            .expect("connect budget");
+        let read_timeout = transport
+            .observed_read_timeout
+            .lock()
+            .expect("observed Hello read timeout")
+            .expect("Hello read timeout");
+
+        assert_eq!(retry.code, "embedding_deadline_exceeded");
+        assert!(connect_budget <= Duration::from_millis(50));
+        assert!(read_timeout <= Duration::from_millis(50));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "explicit deadline took {elapsed:?}, approaching the 500 ms connect budget"
+        );
+        assert_eq!(transport.connect_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
