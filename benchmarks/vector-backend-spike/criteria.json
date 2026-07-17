@@ -20,7 +20,8 @@
     "paired_counterbalanced_blocks_per_workload": 6,
     "clean_evidence_roots": 2,
     "selection": "seeded nested real anchors; all catalog targets are force-included before the seeded fill",
-    "input_contract": "one complete immutable CodeStory vectors.sqlite3 publication, its manifest identity, an independently reviewable vector-free source-truth query catalog, and frozen query vectors generated before candidate timing"
+    "input_contract": "one complete immutable CodeStory retrieval publication admitted through a pinned product query session; its vectors.sqlite3, vector-generation-manifest.json, core publication identity, live query-embedder identity, independently reviewable vector-free source-truth query catalog, and frozen query vectors generated before candidate timing",
+    "execution_contract": "the orchestrator snapshots source, generation manifest, and fixture into one immutable evidence bundle; every child verifies that bundle, the exact binary digest, and macOS-arm64 host evidence before and after work"
   },
   "required_measurements": [
     "build_ms",
@@ -28,7 +29,10 @@
     "cold_query_ms",
     "warm_query_p50_ms",
     "warm_query_p95_ms",
+    "rss_baseline_after_input_verification_bytes",
+    "rss_bytes_after_load",
     "rss_bytes_after_warm_queries",
+    "rss_bytes_after_warm_queries_delta",
     "disk_bytes",
     "incremental_reuse_ms",
     "ann_recall_at_20_against_embedded_scan",

@@ -3,14 +3,20 @@
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
-use codestory_retrieval::{InProcessEmbeddingClient, SidecarRuntimeConfig};
+use codestory_retrieval::{
+    CODERANK_QUERY_PREFIX_DEFAULT, InProcessEmbeddingClient, PinnedQuerySession,
+    RetrievalPublicationIdentity, SidecarRuntimeConfig, embedding_runtime_id_for_runtime,
+    process_embedding_identity, semantic_vector_dim,
+};
+use codestory_store::RetrievalIndexManifest;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -32,7 +38,9 @@ enum Command {
     /// Bind a vector-free source-truth catalog to one immutable production publication.
     Prepare {
         #[arg(long)]
-        source: PathBuf,
+        project_root: PathBuf,
+        #[arg(long)]
+        storage: PathBuf,
         #[arg(long)]
         catalog: PathBuf,
         #[arg(long)]
@@ -41,18 +49,18 @@ enum Command {
     /// Run the production embedded cosine scan over the exact frozen subset.
     Oracle {
         #[arg(long)]
-        source: PathBuf,
+        inputs: PathBuf,
         #[arg(long)]
-        fixture: PathBuf,
+        expected_input_sha256: String,
         #[arg(long)]
         count: usize,
     },
     /// Build, load, query, increment, and fault-probe one candidate in one fresh process.
     Candidate {
         #[arg(long)]
-        source: PathBuf,
+        inputs: PathBuf,
         #[arg(long)]
-        fixture: PathBuf,
+        expected_input_sha256: String,
         #[arg(long)]
         oracle: PathBuf,
         #[arg(long)]
@@ -61,6 +69,21 @@ enum Command {
         backend: Backend,
         #[arg(long)]
         workdir: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        warmups: usize,
+    },
+    /// Measure current resident memory in a fresh candidate-reader process.
+    ResidentRss {
+        #[arg(long)]
+        inputs: PathBuf,
+        #[arg(long)]
+        expected_input_sha256: String,
+        #[arg(long, value_enum)]
+        backend: Backend,
+        #[arg(long)]
+        workdir: PathBuf,
+        #[arg(long)]
+        generation: String,
         #[arg(long, default_value_t = 5)]
         warmups: usize,
     },
@@ -96,7 +119,7 @@ impl Backend {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SourceAttestation {
     database_sha256: String,
     schema_version: i64,
@@ -108,6 +131,73 @@ struct SourceAttestation {
     producer_identity: String,
     evidence_contract_identity: String,
     vector_digest: String,
+    generation_manifest_sha256: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ProductPublicationBinding {
+    retrieval_manifest: RetrievalIndexManifest,
+    publication: RetrievalPublicationIdentity,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct QueryEmbedderIdentity {
+    runtime_id: String,
+    embedding_dim: usize,
+    query_prefix: String,
+    model_digest: String,
+    ggml_build_identity: String,
+    backend: String,
+    policy: String,
+    execution_device_names: Vec<String>,
+    execution_backend_names: Vec<String>,
+    accelerator_execution_verified: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenArtifact {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenInputManifest {
+    schema_version: u32,
+    source: FrozenArtifact,
+    source_generation_manifest: FrozenArtifact,
+    fixture: FrozenArtifact,
+    binary_sha256: String,
+    host_evidence: FrozenArtifact,
+}
+
+#[derive(Deserialize)]
+struct HostEvidence {
+    schema_version: u32,
+    os: String,
+    arch: String,
+    binary: HostBinaryEvidence,
+}
+
+#[derive(Deserialize)]
+struct HostBinaryEvidence {
+    sha256: String,
+}
+
+struct FrozenInputPaths {
+    input_path: PathBuf,
+    source: PathBuf,
+    source_generation_manifest: PathBuf,
+    fixture: PathBuf,
+    host_evidence: PathBuf,
+    input_manifest_sha256: String,
+}
+
+struct VerifiedInputs {
+    paths: FrozenInputPaths,
+    fixture: Fixture,
+    fixture_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +230,8 @@ struct FrozenQuery {
 struct Fixture {
     schema_version: u32,
     source: SourceAttestation,
+    publication: ProductPublicationBinding,
+    query_embedder: QueryEmbedderIdentity,
     source_database_path: String,
     corpus_commit: String,
     catalog_sha256: String,
@@ -152,8 +244,11 @@ struct Fixture {
 #[derive(Clone, Deserialize, Serialize)]
 struct Oracle {
     schema_version: u32,
+    input_manifest_sha256: String,
     source_database_sha256: String,
+    source_generation_manifest_sha256: String,
     fixture_sha256: String,
+    query_embedder: QueryEmbedderIdentity,
     count: usize,
     cold_query_ms: f64,
     warm_query_p50_ms: f64,
@@ -169,14 +264,22 @@ struct CandidateResult {
     backend: &'static str,
     backend_version: &'static str,
     count: usize,
+    input_manifest_sha256: String,
     source_database_sha256: String,
+    source_generation_manifest_sha256: String,
     fixture_sha256: String,
+    query_embedder: QueryEmbedderIdentity,
     build_ms: f64,
     load_ms: f64,
     cold_query_ms: f64,
     warm_query_p50_ms: f64,
     warm_query_p95_ms: f64,
+    rss_baseline_after_input_verification_bytes: u64,
+    rss_bytes_after_load: u64,
     rss_bytes_after_warm_queries: u64,
+    rss_bytes_after_warm_queries_delta: i64,
+    rss_measurement_scope: &'static str,
+    rss_measurement_warmups: usize,
     disk_bytes: u64,
     incremental_reuse_ms: f64,
     ann_recall_at_20: f64,
@@ -192,13 +295,33 @@ struct CandidateResult {
     pinned_reader_after_referenced_tamper: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+struct ResidentRss {
+    schema_version: u32,
+    input_manifest_sha256: String,
+    backend: String,
+    generation: String,
+    source_database_sha256: String,
+    source_generation_manifest_sha256: String,
+    fixture_sha256: String,
+    query_embedder: QueryEmbedderIdentity,
+    warmups: usize,
+    rss_baseline_after_input_verification_bytes: u64,
+    rss_bytes_after_load: u64,
+    rss_bytes_after_warm_queries: u64,
+    rss_bytes_after_warm_queries_delta: i64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct GenerationManifest {
     schema_version: u32,
     backend: String,
     backend_version: String,
+    input_manifest_sha256: String,
     source_database_sha256: String,
+    source_generation_manifest_sha256: String,
     fixture_sha256: String,
+    query_embedder: QueryEmbedderIdentity,
     count: usize,
     index_sha256: String,
 }
@@ -212,31 +335,37 @@ struct Pointer {
 
 #[derive(Clone, Copy)]
 struct FixtureBinding<'a> {
+    input_manifest_sha256: &'a str,
     source_database_sha256: &'a str,
+    source_generation_manifest_sha256: &'a str,
     fixture_sha256: &'a str,
+    query_embedder: &'a QueryEmbedderIdentity,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Prepare {
-            source,
+            project_root,
+            storage,
             catalog,
             output,
-        } => prepare(&source, &catalog, &output),
+        } => prepare(&project_root, &storage, &catalog, &output),
         Command::Oracle {
-            source,
-            fixture,
+            inputs,
+            expected_input_sha256,
             count,
         } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&run_oracle(&source, &fixture, count)?)?
+                serde_json::to_string_pretty(
+                    &run_oracle(&inputs, &expected_input_sha256, count,)?
+                )?
             );
             Ok(())
         }
         Command::Candidate {
-            source,
-            fixture,
+            inputs,
+            expected_input_sha256,
             oracle,
             count,
             backend,
@@ -246,7 +375,34 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&run_candidate(
-                    &source, &fixture, &oracle, count, backend, &workdir, warmups
+                    &inputs,
+                    &expected_input_sha256,
+                    &oracle,
+                    count,
+                    backend,
+                    &workdir,
+                    warmups,
+                )?)?
+            );
+            Ok(())
+        }
+        Command::ResidentRss {
+            inputs,
+            expected_input_sha256,
+            backend,
+            workdir,
+            generation,
+            warmups,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&run_resident_rss(
+                    &inputs,
+                    &expected_input_sha256,
+                    backend,
+                    &workdir,
+                    &generation,
+                    warmups,
                 )?)?
             );
             Ok(())
@@ -254,7 +410,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn prepare(source: &Path, catalog_path: &Path, output: &Path) -> Result<()> {
+fn prepare(
+    project_root: &Path,
+    storage_path: &Path,
+    catalog_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    require_approved_execution_target()?;
     ensure!(
         output.parent().is_some(),
         "fixture output needs a parent directory"
@@ -264,11 +426,22 @@ fn prepare(source: &Path, catalog_path: &Path, output: &Path) -> Result<()> {
         "fixture output already exists: {}",
         output.display()
     );
-    let source = source
+    let project_root = project_root
         .canonicalize()
-        .context("canonicalize source database")?;
-    reject_sidecars(&source)?;
+        .context("canonicalize production project root")?;
+    let storage_path = storage_path
+        .canonicalize()
+        .context("canonicalize production storage")?;
+    let runtime = SidecarRuntimeConfig::for_project_auto(&project_root);
+    let session = PinnedQuerySession::begin(&project_root, &storage_path, &runtime)
+        .context("admit the production retrieval publication before freezing vector evidence")?;
+    let publication = ProductPublicationBinding {
+        retrieval_manifest: session.manifest().clone(),
+        publication: session.publication_identity().clone(),
+    };
+    let source = source_for_pinned_publication(&runtime, &publication)?;
     let attestation = attest_source(&source)?;
+    verify_source_matches_pinned_publication(&source, &attestation, &publication)?;
     ensure!(
         attestation.point_count > 100_000 + INCREMENTAL_COUNT,
         "production publication needs more than 100100 dense anchors"
@@ -305,7 +478,6 @@ fn prepare(source: &Path, catalog_path: &Path, output: &Path) -> Result<()> {
         "not enough real anchors for nested fixture"
     );
     let incremental_node_ids = selected.split_off(100_000);
-    let runtime = SidecarRuntimeConfig::local();
     let embedder = InProcessEmbeddingClient::new(&runtime);
     let queries = identities
         .into_iter()
@@ -315,9 +487,41 @@ fn prepare(source: &Path, catalog_path: &Path, output: &Path) -> Result<()> {
             Ok(query)
         })
         .collect::<Result<Vec<_>>>()?;
+    let query_embedder = current_query_embedder_identity(&runtime)?;
+    ensure!(
+        query_embedder.runtime_id == attestation.embedding_backend
+            && query_embedder.embedding_dim == attestation.embedding_dim,
+        "production vectors are not bound to the current query embedder identity"
+    );
+    let ending_attestation = attest_source(&source)?;
+    ensure!(
+        ending_attestation == attestation,
+        "production vector publication changed while freezing the fixture"
+    );
+    let final_session = PinnedQuerySession::begin(&project_root, &storage_path, &runtime)
+        .context("re-admit the production retrieval publication before writing the fixture")?;
+    ensure!(
+        final_session.manifest() == session.manifest()
+            && final_session.publication_identity() == session.publication_identity(),
+        "production retrieval publication changed while freezing the fixture"
+    );
+    let final_source = source_for_pinned_publication(&runtime, &publication)?;
+    ensure!(
+        final_source == source,
+        "production vector source changed while freezing the fixture"
+    );
+    ensure!(
+        attest_source(&final_source)? == attestation,
+        "production vector publication changed while freezing the fixture"
+    );
+    final_session
+        .revalidate()
+        .context("production retrieval publication changed while freezing the fixture")?;
     let fixture = Fixture {
-        schema_version: 1,
+        schema_version: 2,
         source: attestation,
+        publication,
+        query_embedder,
         source_database_path: source.display().to_string(),
         corpus_commit: catalog.corpus_commit,
         catalog_sha256: sha256_bytes(&catalog_bytes),
@@ -329,23 +533,36 @@ fn prepare(source: &Path, catalog_path: &Path, output: &Path) -> Result<()> {
     atomic_write_json(output, &fixture)
 }
 
-fn run_oracle(source: &Path, fixture_path: &Path, count: usize) -> Result<Oracle> {
-    let (source, fixture, fixture_sha) = verified_fixture(source, fixture_path)?;
-    let selected = selected_ordinals(&fixture, count)?;
+fn run_oracle(inputs: &Path, expected_input_sha256: &str, count: usize) -> Result<Oracle> {
+    let verified = verified_inputs(inputs, expected_input_sha256)?;
+    let selected = selected_ordinals(&verified.fixture, count)?;
     let started = Instant::now();
-    let top_k_ordinals = exact_scan(&source, &selected, &fixture.queries)?;
+    let top_k_ordinals = exact_scan(&verified.paths.source, &selected, &verified.fixture.queries)?;
     let cold_query_ms = elapsed_ms(started);
     let mut warm = Vec::new();
-    for query in &fixture.queries {
+    for query in &verified.fixture.queries {
         let started = Instant::now();
-        let _ = exact_scan(&source, &selected, std::slice::from_ref(query))?;
+        let _ = exact_scan(
+            &verified.paths.source,
+            &selected,
+            std::slice::from_ref(query),
+        )?;
         warm.push(elapsed_ms(started));
     }
-    let source_truth_hit_at_20 = source_truth_hit(&fixture.queries, &top_k_ordinals, &selected);
+    let source_truth_hit_at_20 =
+        source_truth_hit(&verified.fixture.queries, &top_k_ordinals, &selected);
+    verify_frozen_input_paths(&verified.paths)?;
     Ok(Oracle {
-        schema_version: 1,
-        source_database_sha256: fixture.source.database_sha256.clone(),
-        fixture_sha256: fixture_sha,
+        schema_version: 2,
+        input_manifest_sha256: verified.paths.input_manifest_sha256.clone(),
+        source_database_sha256: verified.fixture.source.database_sha256.clone(),
+        source_generation_manifest_sha256: verified
+            .fixture
+            .source
+            .generation_manifest_sha256
+            .clone(),
+        fixture_sha256: verified.fixture_sha256,
+        query_embedder: verified.fixture.query_embedder.clone(),
         count,
         cold_query_ms,
         warm_query_p50_ms: percentile(&mut warm.clone(), 0.50),
@@ -356,8 +573,8 @@ fn run_oracle(source: &Path, fixture_path: &Path, count: usize) -> Result<Oracle
 }
 
 fn run_candidate(
-    source: &Path,
-    fixture_path: &Path,
+    inputs: &Path,
+    expected_input_sha256: &str,
     oracle_path: &Path,
     count: usize,
     backend: Backend,
@@ -369,24 +586,32 @@ fn run_candidate(
         "candidate workdir must be new: {}",
         workdir.display()
     );
-    let (source, fixture, fixture_sha) = verified_fixture(source, fixture_path)?;
-    let source_database_sha256 = fixture.source.database_sha256.clone();
-    let binding = FixtureBinding {
-        source_database_sha256: &source_database_sha256,
-        fixture_sha256: &fixture_sha,
-    };
-    let oracle: Oracle = serde_json::from_slice(&fs::read(oracle_path)?)?;
+    let verified = verified_inputs(inputs, expected_input_sha256)?;
+    let binding = fixture_binding(&verified);
+    let oracle: Oracle =
+        serde_json::from_slice(&fs::read(oracle_path)?).context("read exact-scan oracle")?;
     ensure!(
-        oracle.count == count
-            && oracle.fixture_sha256 == fixture_sha
-            && oracle.source_database_sha256 == fixture.source.database_sha256,
-        "oracle does not bind this candidate input"
+        oracle.schema_version == 2
+            && oracle.count == count
+            && oracle.input_manifest_sha256 == verified.paths.input_manifest_sha256
+            && oracle.fixture_sha256 == verified.fixture_sha256
+            && oracle.source_database_sha256 == verified.fixture.source.database_sha256
+            && oracle.source_generation_manifest_sha256
+                == verified.fixture.source.generation_manifest_sha256
+            && oracle.query_embedder == verified.fixture.query_embedder,
+        "oracle does not bind this frozen candidate input"
     );
-    let selected = selected_ordinals(&fixture, count)?;
+    let selected = selected_ordinals(&verified.fixture, count)?;
     fs::create_dir_all(workdir.join("generations"))?;
     let generation_one = workdir.join("generations").join("generation-1");
     let started = Instant::now();
-    build_generation(backend, &source, &selected, &generation_one, binding)?;
+    build_generation(
+        backend,
+        &verified.paths.source,
+        &selected,
+        &generation_one,
+        binding,
+    )?;
     publish_pointer(workdir, "generation-1", None)?;
     let build_ms = elapsed_ms(started);
     let old_hash = directory_hash(&generation_one)?;
@@ -395,30 +620,39 @@ fn run_candidate(
     let pinned_old = open_generation(backend, workdir, "generation-1", binding)?;
     let load_ms = elapsed_ms(started);
     let cold_started = Instant::now();
-    let cold = pinned_old.search(&fixture.queries[0].vector)?;
+    let cold = pinned_old.search(&verified.fixture.queries[0].vector)?;
     let cold_query_ms = elapsed_ms(cold_started);
-    for query in &fixture.queries {
+    for query in &verified.fixture.queries {
         for _ in 0..warmups {
             let _ = pinned_old.search(&query.vector)?;
         }
     }
     let mut warm = Vec::new();
     let mut candidate_hits = Vec::new();
-    for query in &fixture.queries {
+    for query in &verified.fixture.queries {
         let started = Instant::now();
         let hits = pinned_old.search(&query.vector)?;
         warm.push(elapsed_ms(started));
         candidate_hits.push(hits);
     }
-    let rss_bytes_after_warm_queries = current_rss_bytes();
+    let resident_rss = measure_resident_rss(
+        inputs,
+        expected_input_sha256,
+        backend,
+        workdir,
+        "generation-1",
+        warmups,
+        &verified,
+    )?;
     let ann_recall_at_20 = recall(&candidate_hits, &oracle.top_k_ordinals);
-    let source_truth_hit_at_20 = source_truth_hit(&fixture.queries, &candidate_hits, &selected);
+    let source_truth_hit_at_20 =
+        source_truth_hit(&verified.fixture.queries, &candidate_hits, &selected);
     let concurrent_reader_consistency = concurrent_reader_consistency(
         backend,
         workdir,
         "generation-1",
         binding,
-        &fixture.queries[0].vector,
+        &verified.fixture.queries[0].vector,
         &cold,
     )?;
     let generation_two = workdir.join("generations").join("generation-2");
@@ -428,14 +662,14 @@ fn run_candidate(
         &generation_one,
         &generation_two,
         count,
-        &source,
-        &fixture.incremental_node_ids,
+        &verified.paths.source,
+        &verified.fixture.incremental_node_ids,
         binding,
     )?;
     publish_pointer(workdir, "generation-2", Some("generation-1"))?;
     let incremental_reuse_ms = elapsed_ms(started);
     let pinned_old_reader_after_publication =
-        pinned_old.search(&fixture.queries[0].vector)? == cold;
+        pinned_old.search(&verified.fixture.queries[0].vector)? == cold;
     let current = open_current_generation(backend, workdir, binding)?;
     let new_current_reader_observed_incremental = current.count() == count + INCREMENTAL_COUNT;
     let old_generation_unchanged = directory_hash(&generation_one)? == old_hash;
@@ -453,21 +687,35 @@ fn run_candidate(
     let referenced_generation_tamper_rejected =
         open_current_generation(backend, workdir, binding).is_err();
     let pinned_reader_after_referenced_tamper =
-        pinned_old.search(&fixture.queries[0].vector)? == cold;
+        pinned_old.search(&verified.fixture.queries[0].vector)? == cold;
+    verify_frozen_input_paths(&verified.paths)?;
     Ok(CandidateResult {
-        schema_version: 1,
+        schema_version: 2,
         generated_at_unix_seconds: now_unix_seconds(),
         backend: backend.label(),
         backend_version: backend.version(),
         count,
-        source_database_sha256,
-        fixture_sha256: fixture_sha,
+        input_manifest_sha256: verified.paths.input_manifest_sha256.clone(),
+        source_database_sha256: verified.fixture.source.database_sha256.clone(),
+        source_generation_manifest_sha256: verified
+            .fixture
+            .source
+            .generation_manifest_sha256
+            .clone(),
+        fixture_sha256: verified.fixture_sha256,
+        query_embedder: verified.fixture.query_embedder.clone(),
         build_ms,
         load_ms,
         cold_query_ms,
         warm_query_p50_ms: percentile(&mut warm.clone(), 0.50),
         warm_query_p95_ms: percentile(&mut warm, 0.95),
-        rss_bytes_after_warm_queries,
+        rss_baseline_after_input_verification_bytes: resident_rss
+            .rss_baseline_after_input_verification_bytes,
+        rss_bytes_after_load: resident_rss.rss_bytes_after_load,
+        rss_bytes_after_warm_queries: resident_rss.rss_bytes_after_warm_queries,
+        rss_bytes_after_warm_queries_delta: resident_rss.rss_bytes_after_warm_queries_delta,
+        rss_measurement_scope: "fresh_candidate_reader_current_resident_after_warm_queries",
+        rss_measurement_warmups: warmups,
         disk_bytes,
         incremental_reuse_ms,
         ann_recall_at_20,
@@ -484,12 +732,157 @@ fn run_candidate(
     })
 }
 
-fn verified_fixture(source: &Path, fixture_path: &Path) -> Result<(PathBuf, Fixture, String)> {
-    let source = source.canonicalize()?;
-    reject_sidecars(&source)?;
-    let fixture_bytes = fs::read(fixture_path)?;
-    let fixture: Fixture = serde_json::from_slice(&fixture_bytes)?;
-    ensure!(fixture.schema_version == 1, "unsupported fixture schema");
+fn run_resident_rss(
+    inputs: &Path,
+    expected_input_sha256: &str,
+    backend: Backend,
+    workdir: &Path,
+    generation: &str,
+    warmups: usize,
+) -> Result<ResidentRss> {
+    let paths = load_frozen_input_paths(inputs, expected_input_sha256)?;
+    let (fixture, fixture_sha256) = frozen_fixture(&paths)?;
+    verify_fixture_contract(&fixture)?;
+    verify_source_matches_pinned_publication(&paths.source, &fixture.source, &fixture.publication)?;
+    let binding = FixtureBinding {
+        input_manifest_sha256: &paths.input_manifest_sha256,
+        source_database_sha256: &fixture.source.database_sha256,
+        source_generation_manifest_sha256: &fixture.source.generation_manifest_sha256,
+        fixture_sha256: &fixture_sha256,
+        query_embedder: &fixture.query_embedder,
+    };
+    let rss_baseline_after_input_verification_bytes = current_resident_bytes()?;
+    let reader = open_generation(backend, workdir, generation, binding)?;
+    let rss_bytes_after_load = current_resident_bytes()?;
+    for query in &fixture.queries {
+        for _ in 0..warmups {
+            let _ = reader.search(&query.vector)?;
+        }
+    }
+    let rss_bytes_after_warm_queries = current_resident_bytes()?;
+    verify_frozen_input_paths(&paths)?;
+    Ok(ResidentRss {
+        schema_version: 1,
+        input_manifest_sha256: paths.input_manifest_sha256,
+        backend: backend.label().into(),
+        generation: generation.into(),
+        source_database_sha256: fixture.source.database_sha256,
+        source_generation_manifest_sha256: fixture.source.generation_manifest_sha256,
+        fixture_sha256,
+        query_embedder: fixture.query_embedder,
+        warmups,
+        rss_baseline_after_input_verification_bytes,
+        rss_bytes_after_load,
+        rss_bytes_after_warm_queries,
+        rss_bytes_after_warm_queries_delta: signed_delta(
+            rss_bytes_after_warm_queries,
+            rss_baseline_after_input_verification_bytes,
+        ),
+    })
+}
+
+fn measure_resident_rss(
+    inputs: &Path,
+    expected_input_sha256: &str,
+    backend: Backend,
+    workdir: &Path,
+    generation: &str,
+    warmups: usize,
+    verified: &VerifiedInputs,
+) -> Result<ResidentRss> {
+    let executable = std::env::current_exe().context("locate vector spike executable")?;
+    let output = ProcessCommand::new(&executable)
+        .arg("resident-rss")
+        .arg("--inputs")
+        .arg(inputs)
+        .arg("--expected-input-sha256")
+        .arg(expected_input_sha256)
+        .arg("--backend")
+        .arg(backend.label())
+        .arg("--workdir")
+        .arg(workdir)
+        .arg("--generation")
+        .arg(generation)
+        .arg("--warmups")
+        .arg(warmups.to_string())
+        .output()
+        .context("launch fresh resident-memory reader")?;
+    ensure!(
+        output.status.success(),
+        "fresh resident-memory reader failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let measured: ResidentRss = serde_json::from_slice(&output.stdout)
+        .context("parse fresh resident-memory reader result")?;
+    ensure!(
+        measured.schema_version == 1
+            && measured.backend == backend.label()
+            && measured.generation == generation
+            && measured.input_manifest_sha256 == verified.paths.input_manifest_sha256
+            && measured.source_database_sha256 == verified.fixture.source.database_sha256
+            && measured.source_generation_manifest_sha256
+                == verified.fixture.source.generation_manifest_sha256
+            && measured.fixture_sha256 == verified.fixture_sha256
+            && measured.query_embedder == verified.fixture.query_embedder
+            && measured.warmups == warmups,
+        "fresh resident-memory reader did not bind the candidate evidence"
+    );
+    Ok(measured)
+}
+
+fn verified_inputs(inputs: &Path, expected_input_sha256: &str) -> Result<VerifiedInputs> {
+    let paths = load_frozen_input_paths(inputs, expected_input_sha256)?;
+    let (fixture, fixture_sha256) = frozen_fixture(&paths)?;
+    verify_fixture_contract(&fixture)?;
+    let expected_generation_manifest = paths
+        .source
+        .parent()
+        .context("frozen source has no parent directory")?
+        .join("vector-generation-manifest.json")
+        .canonicalize()
+        .context("canonicalize frozen source generation manifest")?;
+    ensure!(
+        paths.source_generation_manifest == expected_generation_manifest,
+        "frozen source generation manifest is not the source publication sibling"
+    );
+    let attestation = attest_source(&paths.source)?;
+    ensure!(
+        attestation == fixture.source,
+        "frozen source publication no longer matches fixture attestation"
+    );
+    ensure!(
+        attestation.generation_manifest_sha256 == sha256_file(&paths.source_generation_manifest)?,
+        "frozen source generation manifest no longer matches fixture attestation"
+    );
+    verify_source_matches_pinned_publication(&paths.source, &attestation, &fixture.publication)?;
+    verify_frozen_input_paths(&paths)?;
+    Ok(VerifiedInputs {
+        paths,
+        fixture,
+        fixture_sha256,
+    })
+}
+
+fn fixture_binding(verified: &VerifiedInputs) -> FixtureBinding<'_> {
+    FixtureBinding {
+        input_manifest_sha256: &verified.paths.input_manifest_sha256,
+        source_database_sha256: &verified.fixture.source.database_sha256,
+        source_generation_manifest_sha256: &verified.fixture.source.generation_manifest_sha256,
+        fixture_sha256: &verified.fixture_sha256,
+        query_embedder: &verified.fixture.query_embedder,
+    }
+}
+
+fn frozen_fixture(paths: &FrozenInputPaths) -> Result<(Fixture, String)> {
+    let bytes = fs::read(&paths.fixture)
+        .with_context(|| format!("read frozen fixture {}", paths.fixture.display()))?;
+    let sha256 = sha256_bytes(&bytes);
+    let fixture: Fixture = serde_json::from_slice(&bytes).context("parse frozen fixture")?;
+    Ok((fixture, sha256))
+}
+
+fn verify_fixture_contract(fixture: &Fixture) -> Result<()> {
+    ensure!(fixture.schema_version == 2, "unsupported fixture schema");
     ensure!(
         fixture.source.embedding_dim == DIMENSIONS && fixture.queries.len() == 30,
         "fixture does not meet the declared profile"
@@ -499,17 +892,278 @@ fn verified_fixture(source: &Path, fixture_path: &Path) -> Result<(PathBuf, Fixt
             && fixture.incremental_node_ids.len() == INCREMENTAL_COUNT,
         "fixture does not contain the declared nested real-anchor input"
     );
-    let attestation = attest_source(&source)?;
     ensure!(
-        attestation.database_sha256 == fixture.source.database_sha256
-            && attestation.vector_digest == fixture.source.vector_digest
-            && attestation.generation == fixture.source.generation,
-        "source publication no longer matches fixture attestation"
+        fixture.query_embedder.runtime_id == fixture.source.embedding_backend
+            && fixture.query_embedder.embedding_dim == fixture.source.embedding_dim
+            && fixture.query_embedder.query_prefix == CODERANK_QUERY_PREFIX_DEFAULT
+            && !fixture.query_embedder.model_digest.is_empty()
+            && !fixture.query_embedder.ggml_build_identity.is_empty()
+            && !fixture.query_embedder.backend.is_empty()
+            && !fixture.query_embedder.policy.is_empty(),
+        "fixture query embedder identity is incomplete or incompatible with the source publication"
     );
     for query in &fixture.queries {
         validate_vector(&query.id, &query.vector)?;
     }
-    Ok((source, fixture, sha256_bytes(&fixture_bytes)))
+    Ok(())
+}
+
+fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result<FrozenInputPaths> {
+    require_approved_execution_target()?;
+    reject_symlinked_path(inputs, "frozen input manifest")?;
+    require_regular_file(inputs, "frozen input manifest")?;
+    let input_path = inputs
+        .canonicalize()
+        .with_context(|| format!("canonicalize frozen input manifest {}", inputs.display()))?;
+    let input_bytes = fs::read(&input_path)
+        .with_context(|| format!("read frozen input manifest {}", input_path.display()))?;
+    let input_manifest_sha256 = sha256_bytes(&input_bytes);
+    ensure!(
+        input_manifest_sha256 == expected_input_sha256,
+        "frozen input manifest digest mismatch: expected {expected_input_sha256}, observed {input_manifest_sha256}"
+    );
+    let input: FrozenInputManifest =
+        serde_json::from_slice(&input_bytes).context("parse frozen input manifest")?;
+    ensure!(
+        input.schema_version == 1,
+        "unsupported frozen input manifest schema"
+    );
+    let source = resolve_frozen_artifact(&input_path, &input.source, "source database")?;
+    reject_sidecars(&source)?;
+    let source_generation_manifest = resolve_frozen_artifact(
+        &input_path,
+        &input.source_generation_manifest,
+        "source generation manifest",
+    )?;
+    let fixture = resolve_frozen_artifact(&input_path, &input.fixture, "fixture")?;
+    let host_evidence =
+        resolve_frozen_artifact(&input_path, &input.host_evidence, "host evidence")?;
+    let executable = std::env::current_exe().context("locate vector spike executable")?;
+    reject_symlinked_path(&executable, "vector spike executable")?;
+    require_regular_file(&executable, "vector spike executable")?;
+    let executable = executable
+        .canonicalize()
+        .context("canonicalize vector spike executable")?;
+    ensure!(
+        sha256_file(&executable)? == input.binary_sha256,
+        "vector spike executable digest does not match frozen input manifest"
+    );
+    let host: HostEvidence = serde_json::from_slice(
+        &fs::read(&host_evidence)
+            .with_context(|| format!("read host evidence {}", host_evidence.display()))?,
+    )
+    .context("parse host evidence")?;
+    ensure!(
+        host.schema_version == 1
+            && host.os == "darwin"
+            && host.arch == "arm64"
+            && host.binary.sha256 == input.binary_sha256,
+        "host evidence does not attest the approved macOS arm64 executable"
+    );
+    Ok(FrozenInputPaths {
+        input_path,
+        source,
+        source_generation_manifest,
+        fixture,
+        host_evidence,
+        input_manifest_sha256,
+    })
+}
+
+fn resolve_frozen_artifact(
+    input_path: &Path,
+    artifact: &FrozenArtifact,
+    label: &str,
+) -> Result<PathBuf> {
+    validate_relative_evidence_path(&artifact.path, label)?;
+    let root = input_path
+        .parent()
+        .context("frozen input manifest has no parent directory")?
+        .canonicalize()
+        .context("canonicalize frozen input root")?;
+    let unresolved = root.join(&artifact.path);
+    let artifact_label = format!("frozen {label}");
+    reject_symlinked_path(&unresolved, &artifact_label)?;
+    require_regular_file(&unresolved, &artifact_label)?;
+    let path = unresolved
+        .canonicalize()
+        .with_context(|| format!("canonicalize frozen {label} {}", artifact.path))?;
+    ensure!(
+        path.starts_with(&root),
+        "frozen {label} escapes the evidence root"
+    );
+    let observed = sha256_file(&path)?;
+    ensure!(
+        observed == artifact.sha256,
+        "frozen {label} digest mismatch: expected {}, observed {observed}",
+        artifact.sha256
+    );
+    Ok(path)
+}
+
+fn validate_relative_evidence_path(path: &str, label: &str) -> Result<()> {
+    let candidate = Path::new(path);
+    ensure!(
+        candidate
+            .components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "frozen {label} path must be a plain relative path"
+    );
+    Ok(())
+}
+
+fn reject_symlinked_path(path: &Path, label: &str) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for frozen evidence")?
+            .join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new("/")),
+            Component::Normal(segment) => {
+                current.push(segment);
+                let metadata = fs::symlink_metadata(&current).with_context(|| {
+                    format!("inspect {label} path component {}", current.display())
+                })?;
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "{label} traverses a symbolic link: {}",
+                    current.display()
+                );
+            }
+            Component::CurDir | Component::ParentDir => {
+                anyhow::bail!("{label} path must not contain dot path components")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "{label} must be an ordinary regular file: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn verify_frozen_input_paths(paths: &FrozenInputPaths) -> Result<()> {
+    let reloaded = load_frozen_input_paths(&paths.input_path, &paths.input_manifest_sha256)?;
+    ensure!(
+        reloaded.source == paths.source
+            && reloaded.source_generation_manifest == paths.source_generation_manifest
+            && reloaded.fixture == paths.fixture
+            && reloaded.host_evidence == paths.host_evidence,
+        "frozen input manifest resolved to different evidence paths"
+    );
+    Ok(())
+}
+
+fn source_for_pinned_publication(
+    runtime: &SidecarRuntimeConfig,
+    publication: &ProductPublicationBinding,
+) -> Result<PathBuf> {
+    let collection = publication.retrieval_manifest.semantic_generation.trim();
+    ensure!(
+        !collection.is_empty(),
+        "pinned retrieval publication has no semantic collection"
+    );
+    let source = runtime
+        .layout
+        .semantic_data_dir
+        .join("collections")
+        .join(collection)
+        .join("vectors.sqlite3")
+        .canonicalize()
+        .context("canonicalize pinned production vectors.sqlite3")?;
+    reject_sidecars(&source)?;
+    Ok(source)
+}
+
+fn verify_source_matches_pinned_publication(
+    source: &Path,
+    attestation: &SourceAttestation,
+    publication: &ProductPublicationBinding,
+) -> Result<()> {
+    let manifest = &publication.retrieval_manifest;
+    let identity = &publication.publication;
+    ensure!(
+        !manifest.project_id.is_empty()
+            && !manifest.semantic_generation.is_empty()
+            && !identity.core_generation_id.is_empty()
+            && !identity.core_run_id.is_empty(),
+        "fixture publication binding is incomplete"
+    );
+    let expected_count = manifest
+        .dense_projection_count
+        .or(manifest.projection_count)
+        .context("pinned retrieval publication has no dense anchor count")?;
+    ensure!(
+        expected_count >= 0 && expected_count as usize == attestation.point_count,
+        "pinned retrieval publication anchor count does not match vectors.sqlite3"
+    );
+    ensure!(
+        manifest.sidecar_generation.as_deref() == Some(attestation.generation.as_str())
+            && manifest.sidecar_input_hash.as_deref() == Some(attestation.input_hash.as_str())
+            && manifest.embedding_backend.as_deref()
+                == Some(attestation.embedding_backend.as_str())
+            && manifest.embedding_dim == Some(attestation.embedding_dim as i32),
+        "pinned retrieval manifest does not match vectors.sqlite3 attestation"
+    );
+    ensure!(
+        identity.sidecar_generation == attestation.generation
+            && identity.sidecar_input_hash == attestation.input_hash
+            && identity.semantic_generation == manifest.semantic_generation,
+        "pinned retrieval publication identity does not match vectors.sqlite3"
+    );
+    let collection = source
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    ensure!(
+        collection == Some(manifest.semantic_generation.as_str()),
+        "vectors.sqlite3 is not located in the pinned semantic generation"
+    );
+    Ok(())
+}
+
+fn current_query_embedder_identity(
+    runtime: &SidecarRuntimeConfig,
+) -> Result<QueryEmbedderIdentity> {
+    let identity = process_embedding_identity(&runtime.cache_root, runtime.embedding.allow_cpu)
+        .context("observe live query embedder identity")?;
+    ensure!(
+        identity.worker_alive && identity.load_error.is_none(),
+        "query embedder is not live while freezing the fixture"
+    );
+    Ok(QueryEmbedderIdentity {
+        runtime_id: embedding_runtime_id_for_runtime(runtime),
+        embedding_dim: semantic_vector_dim(),
+        query_prefix: CODERANK_QUERY_PREFIX_DEFAULT.into(),
+        model_digest: identity.model_digest.into(),
+        ggml_build_identity: identity.ggml_build_identity.into(),
+        backend: identity.backend,
+        policy: identity.policy.into(),
+        execution_device_names: identity.execution_device_names,
+        execution_backend_names: identity.execution_backend_names,
+        accelerator_execution_verified: identity.accelerator_execution_verified,
+    })
+}
+
+fn require_approved_execution_target() -> Result<()> {
+    ensure!(
+        cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"),
+        "vector backend spike is approved only on a native macOS arm64 executable"
+    );
+    Ok(())
 }
 
 fn resolve_catalog(source: &Path, catalog: &Catalog) -> Result<Vec<FrozenQuery>> {
@@ -820,8 +1474,11 @@ fn write_manifest(
             schema_version: 1,
             backend: backend.label().into(),
             backend_version: backend.version().into(),
+            input_manifest_sha256: binding.input_manifest_sha256.into(),
             source_database_sha256: binding.source_database_sha256.into(),
+            source_generation_manifest_sha256: binding.source_generation_manifest_sha256.into(),
             fixture_sha256: binding.fixture_sha256.into(),
+            query_embedder: binding.query_embedder.clone(),
             count,
             index_sha256: sha256_file(&index)?,
         },
@@ -835,8 +1492,12 @@ fn validate_generation(dir: &Path, backend: Backend, binding: FixtureBinding<'_>
     ensure!(
         manifest.schema_version == 1
             && manifest.backend == backend.label()
+            && manifest.input_manifest_sha256 == binding.input_manifest_sha256
             && manifest.source_database_sha256 == binding.source_database_sha256
-            && manifest.fixture_sha256 == binding.fixture_sha256,
+            && manifest.source_generation_manifest_sha256
+                == binding.source_generation_manifest_sha256
+            && manifest.fixture_sha256 == binding.fixture_sha256
+            && manifest.query_embedder == *binding.query_embedder,
         "generation manifest identity mismatch"
     );
     ensure!(
@@ -870,8 +1531,12 @@ fn concurrent_reader_consistency(
         let root = root.to_path_buf();
         let query = query.to_vec();
         let expected = expected.to_vec();
+        let input_manifest_sha256 = binding.input_manifest_sha256.to_owned();
         let source_database_sha256 = binding.source_database_sha256.to_owned();
+        let source_generation_manifest_sha256 =
+            binding.source_generation_manifest_sha256.to_owned();
         let fixture_sha256 = binding.fixture_sha256.to_owned();
+        let query_embedder = binding.query_embedder.clone();
         let generation = generation.to_owned();
         workers.push(std::thread::spawn(move || {
             open_generation(
@@ -879,8 +1544,11 @@ fn concurrent_reader_consistency(
                 &root,
                 &generation,
                 FixtureBinding {
+                    input_manifest_sha256: &input_manifest_sha256,
                     source_database_sha256: &source_database_sha256,
+                    source_generation_manifest_sha256: &source_generation_manifest_sha256,
                     fixture_sha256: &fixture_sha256,
+                    query_embedder: &query_embedder,
                 },
             )
             .and_then(|handle| Ok(handle.search(&query)? == expected))
@@ -892,24 +1560,46 @@ fn concurrent_reader_consistency(
 }
 
 fn attest_source(source: &Path) -> Result<SourceAttestation> {
-    let conn = open_read_only(source)?;
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("canonicalize vectors source {}", source.display()))?;
+    reject_sidecars(&source)?;
+    let generation_manifest = source
+        .parent()
+        .context("vectors source has no parent directory")?
+        .join("vector-generation-manifest.json");
+    ensure!(
+        generation_manifest.is_file(),
+        "published vectors source is missing vector-generation-manifest.json"
+    );
+    let conn = open_read_only(&source)?;
     let quick: String = conn.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
     ensure!(
         quick == "ok",
         "production vectors.sqlite3 quick_check failed: {quick}"
+    );
+    let metadata_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))?;
+    ensure!(
+        metadata_count == 1,
+        "production vectors.sqlite3 must contain exactly one metadata row; found {metadata_count}"
     );
     let metadata = conn.query_row("SELECT schema_version, generation, input_hash, embedding_backend, embedding_dim, point_count, producer_identity, evidence_contract_identity, vector_digest FROM metadata", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?)))?;
     ensure!(
         metadata.0 > 0 && metadata.4 == DIMENSIONS as i64 && metadata.5 >= 0,
         "unexpected production vector metadata"
     );
-    let digest = canonical_digest(&conn, DIMENSIONS)?;
+    let (digest, row_count) = canonical_digest(&conn, DIMENSIONS)?;
     ensure!(
         digest == metadata.8,
         "production vector canonical digest mismatch"
     );
+    ensure!(
+        row_count == metadata.5 as usize,
+        "production vector row count does not match metadata point_count"
+    );
     Ok(SourceAttestation {
-        database_sha256: sha256_file(source)?,
+        database_sha256: sha256_file(&source)?,
         schema_version: metadata.0,
         generation: metadata.1,
         input_hash: metadata.2,
@@ -919,10 +1609,11 @@ fn attest_source(source: &Path) -> Result<SourceAttestation> {
         producer_identity: metadata.6,
         evidence_contract_identity: metadata.7,
         vector_digest: digest,
+        generation_manifest_sha256: sha256_file(&generation_manifest)?,
     })
 }
 
-fn canonical_digest(conn: &Connection, dimensions: usize) -> Result<String> {
+fn canonical_digest(conn: &Connection, dimensions: usize) -> Result<(String, usize)> {
     let mut statement =
         conn.prepare("SELECT node_id, document_hash, vector FROM vectors ORDER BY node_id")?;
     let mut rows = statement.query([])?;
@@ -940,7 +1631,7 @@ fn canonical_digest(conn: &Connection, dimensions: usize) -> Result<String> {
         count += 1;
     }
     ensure!(count > 0, "production vector database has no rows");
-    Ok(hex::encode(digest.finalize()))
+    Ok((hex::encode(digest.finalize()), count))
 }
 
 fn reject_sidecars(path: &Path) -> Result<()> {
@@ -1131,21 +1822,36 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
-fn current_rss_bytes() -> u64 {
+#[cfg(target_os = "macos")]
+fn current_resident_bytes() -> Result<u64> {
     unsafe {
-        let mut usage: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
-            #[cfg(target_os = "macos")]
-            {
-                return usage.ru_maxrss.max(0) as u64;
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                return (usage.ru_maxrss.max(0) as u64) * 1024;
-            }
-        }
+        let mut info: mach2::task_info::mach_task_basic_info = std::mem::zeroed();
+        let mut count = mach2::task_info::MACH_TASK_BASIC_INFO_COUNT;
+        let status = mach2::task::task_info(
+            mach2::traps::mach_task_self(),
+            mach2::task_info::MACH_TASK_BASIC_INFO,
+            (&mut info as *mut mach2::task_info::mach_task_basic_info).cast(),
+            &mut count,
+        );
+        ensure!(
+            status == mach2::kern_return::KERN_SUCCESS,
+            "read current resident memory with task_info failed: {status}"
+        );
+        Ok(std::ptr::addr_of!(info.resident_size).read_unaligned() as u64)
     }
-    0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_resident_bytes() -> Result<u64> {
+    anyhow::bail!("current resident-memory measurement is approved only on macOS")
+}
+
+fn signed_delta(after: u64, before: u64) -> i64 {
+    if after >= before {
+        i64::try_from(after - before).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(before - after).unwrap_or(i64::MAX)
+    }
 }
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
@@ -1181,9 +1887,24 @@ mod tests {
             .map(|ordinal| (format!("node-{ordinal:04}"), ordinal))
             .collect::<HashMap<_, _>>();
         let source_sha = sha256_file(&source)?;
+        let query_embedder = QueryEmbedderIdentity {
+            runtime_id: "runtime-test".into(),
+            embedding_dim: DIMENSIONS,
+            query_prefix: CODERANK_QUERY_PREFIX_DEFAULT.into(),
+            model_digest: "model-test".into(),
+            ggml_build_identity: "ggml-test".into(),
+            backend: "backend-test".into(),
+            policy: "accelerated".into(),
+            execution_device_names: vec!["device-test".into()],
+            execution_backend_names: vec!["backend-test".into()],
+            accelerator_execution_verified: true,
+        };
         let binding = FixtureBinding {
+            input_manifest_sha256: "input-test",
             source_database_sha256: &source_sha,
+            source_generation_manifest_sha256: "source-generation-manifest-test",
             fixture_sha256: "fixture-test",
+            query_embedder: &query_embedder,
         };
         let query = {
             let mut vector = vec![0.0; DIMENSIONS];
@@ -1205,6 +1926,100 @@ mod tests {
             tamper_file(&generation.join(backend.index_name()))?;
             assert!(open_current_generation(backend, &root, binding).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_attestation_rejects_multiple_metadata_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("vectors.sqlite3");
+        fs::write(temp.path().join("vector-generation-manifest.json"), b"{}")?;
+        let conn = Connection::open(&source)?;
+        conn.execute_batch(
+            "CREATE TABLE metadata (
+                schema_version INTEGER,
+                generation TEXT,
+                input_hash TEXT,
+                embedding_backend TEXT,
+                embedding_dim INTEGER,
+                point_count INTEGER,
+                producer_identity TEXT,
+                evidence_contract_identity TEXT,
+                vector_digest TEXT
+            );
+            CREATE TABLE vectors (node_id TEXT, document_hash TEXT, vector BLOB);",
+        )?;
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO metadata VALUES (1, 'generation', 'input', 'runtime', 768, 0, 'producer', 'contract', 'digest')",
+                [],
+            )?;
+        }
+        drop(conn);
+        let error = attest_source(&source).expect_err("multiple metadata rows must fail");
+        assert!(error.to_string().contains("exactly one metadata row"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn frozen_input_manifest_rejects_mutated_artifact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let temp_root = temp.path().canonicalize()?;
+        let source = temp_root.join("source.sqlite3");
+        let source_manifest = temp_root.join("vector-generation-manifest.json");
+        let fixture = temp_root.join("fixture.json");
+        let host_evidence = temp_root.join("host-evidence.json");
+        fs::write(&source, b"source")?;
+        fs::write(&source_manifest, b"manifest")?;
+        fs::write(&fixture, b"fixture")?;
+        let binary = std::env::current_exe()?.canonicalize()?;
+        let binary_sha256 = sha256_file(&binary)?;
+        atomic_write_json(
+            &host_evidence,
+            &serde_json::json!({
+                "schema_version": 1,
+                "os": "darwin",
+                "arch": "arm64",
+                "binary": { "sha256": binary_sha256 },
+            }),
+        )?;
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "source": { "path": "source.sqlite3", "sha256": sha256_file(&source)? },
+            "source_generation_manifest": {
+                "path": "vector-generation-manifest.json",
+                "sha256": sha256_file(&source_manifest)?,
+            },
+            "fixture": { "path": "fixture.json", "sha256": sha256_file(&fixture)? },
+            "binary_sha256": binary_sha256,
+            "host_evidence": {
+                "path": "host-evidence.json",
+                "sha256": sha256_file(&host_evidence)?,
+            },
+        });
+        let input_path = temp_root.join("input.json");
+        atomic_write_json(&input_path, &input)?;
+        let input_sha256 = sha256_file(&input_path)?;
+        assert_eq!(
+            load_frozen_input_paths(&input_path, &input_sha256)?.source,
+            source.canonicalize()?
+        );
+        fs::write(&source, b"changed")?;
+        assert!(load_frozen_input_paths(&input_path, &input_sha256).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frozen_paths_reject_symbolic_links() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let temp_root = temp.path().canonicalize()?;
+        let target = temp_root.join("target");
+        let link = temp_root.join("link");
+        fs::write(&target, b"target")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+        assert!(reject_symlinked_path(&link, "fixture").is_err());
         Ok(())
     }
 }
