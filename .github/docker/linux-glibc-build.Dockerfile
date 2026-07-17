@@ -26,10 +26,24 @@ ARG DEBIAN_FRONTEND=noninteractive
 # Keep its linker/runtime and run the pinned shader compiler under its own loader.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-      libclang-dev=1:11.0-51+nmu5 \
+      clang-13=1:13.0.1-6~deb11u1 \
+      libclang-13-dev=1:13.0.1-6~deb11u1 \
       libvulkan-dev=1.2.162.0-1 \
       pkg-config=0.29.2-1 \
     && rm -rf /var/lib/apt/lists/*
+
+ENV CC=clang-13 \
+    CXX=clang++-13 \
+    LIBCLANG_PATH=/usr/lib/llvm-13/lib
+
+# llama.cpp compiles dispatch variants newer than Bullseye's GCC 10. Keep the
+# Bullseye ABI floor while proving the pinned compiler accepts every required
+# x86 feature flag before the release build starts.
+RUN printf 'int main() { return 0; }\n' \
+      | "${CXX}" -x c++ -std=c++17 \
+          -mavxvnni -mavx512bf16 -mamx-tile -mamx-int8 \
+          -c -o /tmp/codestory-compiler-probe.o - \
+    && rm /tmp/codestory-compiler-probe.o
 
 ARG CMAKE_VERSION=3.28.3
 ARG CMAKE_SHA256=804d231460ab3c8b556a42d2660af4ac7a0e21c98a7f8ee3318a74b4a9a187a6

@@ -26,7 +26,10 @@
   and the next product call starts it again without consent or repair. The
   persisted embedding-runtime identity changes with this ownership boundary, so
   existing semantic generations rebuild once instead of being mislabeled as
-  in-process output.
+  in-process output. Qualification keeps its authority in the exact private
+  control directory while using an identity-derived bounded Unix socket path,
+  and a failed server bootstrap now reports the retained child cause instead of
+  collapsing into a generic start timeout.
 - Release packages now bind source/tree, executable, server protocol, constant
   set, and measurement-protocol identities. Server qualification is
   preregistered and fail-closed: calibration cannot satisfy package, protected
@@ -37,7 +40,9 @@
   coordinator run and artifact before trusting the bundle. The PR coordinator
   can select a fail-closed server-behavior scope that proves package and
   candidate-managed runtime behavior without making retrieval-quality,
-  qualification-tier, or release-readiness claims.
+  qualification-tier, or release-readiness claims. Linux glibc-2.31 packages
+  use a pinned Bullseye Clang toolchain whose x86 dispatch flags are proved in
+  the image and whose Docker inputs are part of the native build cache identity.
 - The manual Windows manifest-missing readiness lane now installs the
   checksum-pinned Vulkan SDK before running the real locked `ready_command`
   contract with explicit CPU runtime permission. Windows source-build proof

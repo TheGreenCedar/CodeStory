@@ -141,7 +141,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v2-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v3-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}
 
       - name: Prove native workspace path identity
         if: runner.os == 'Windows'
@@ -463,7 +463,7 @@ jobs:
               "glibc 2.31"
 
       - name: Upload Linux glibc baseline proof
-        if: always() && matrix.asset_target == 'linux-x64'
+        if: success() && matrix.asset_target == 'linux-x64'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: linux-glibc-2.31-baseline-proof
@@ -602,7 +602,7 @@ jobs:
             --out-dir target/packaged-agent-proof
 
       - name: Upload hosted Linux calibration runs
-        if: always() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode
+        if: success() && matrix.asset_target == 'linux-x64' && inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: embedding-calibration-linux-${{ inputs.version }}

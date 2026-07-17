@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ const EXPECTED_EXECUTABLE_SHA256_ENV: &str =
 const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 const ENDPOINT_NAMESPACE: &str = "codestory-per-user-embedding-v1";
+const CHILD_STDERR_TAIL_BYTES: usize = 8 * 1024;
 type TransportIdentity = codestory_retrieval::EmbeddingTransportIdentity;
 
 #[derive(Debug)]
@@ -108,6 +109,7 @@ pub(crate) struct NativeEmbeddingClientTransport {
     executable: ExactExecutable,
     executable_identity: codestory_retrieval::EmbeddingExecutableIdentity,
     clock: Arc<NativeAwakeClock>,
+    next_spawn_generation: Arc<AtomicU64>,
 }
 
 impl NativeEmbeddingClientTransport {
@@ -118,14 +120,37 @@ impl NativeEmbeddingClientTransport {
             executable,
             executable_identity,
             clock: Arc::new(NativeAwakeClock::capture()?),
+            next_spawn_generation: Arc::new(AtomicU64::new(1)),
         })
     }
 
     pub(crate) fn connect(&self, budget: Duration) -> Result<NativeConnectOutcome> {
-        platform::connect(budget)
+        self.connect_for_attempt(budget, None)
     }
 
-    pub(crate) fn spawn_exact_current_exe(&self) -> Result<()> {
+    pub(crate) fn connect_for_attempt(
+        &self,
+        budget: Duration,
+        spawn_attempt: Option<&codestory_retrieval::EmbeddingSpawnAttempt>,
+    ) -> Result<NativeConnectOutcome> {
+        let outcome = platform::connect(budget)?;
+        if matches!(&outcome, NativeConnectOutcome::Connected(_)) {
+            if let Some(spawn_attempt) = spawn_attempt {
+                spawn_attempt.record_success();
+            }
+            return Ok(outcome);
+        }
+        if let Some(failure) =
+            spawn_attempt.and_then(codestory_retrieval::EmbeddingSpawnAttempt::failure)
+        {
+            bail!("{failure}");
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn spawn_exact_current_exe(
+        &self,
+    ) -> Result<codestory_retrieval::EmbeddingSpawnAttempt> {
         // Keep the verified candidate open until spawn so replacement cannot
         // silently turn metadata validation into validation of one file and
         // execution of another on platforms that deny replacement of open
@@ -159,13 +184,20 @@ impl NativeEmbeddingClientTransport {
             );
         }
 
+        let generation = self
+            .next_spawn_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("embedding_server_spawn_generation_exhausted"))?;
+        let spawn_attempt = codestory_retrieval::EmbeddingSpawnAttempt::new(generation);
         let mut command = Command::new(self.executable.path());
         command
             .arg(INTERNAL_SERVER_COMMAND)
             .env(EXPECTED_EXECUTABLE_SHA256_ENV, self.executable.sha256())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         platform::detach_command(&mut command);
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -173,13 +205,55 @@ impl NativeEmbeddingClientTransport {
                 self.executable.path().display()
             )
         })?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .context("capture embedding server startup diagnostics")?;
+        let reaper_attempt = spawn_attempt.clone();
         std::thread::Builder::new()
             .name("codestory-embedding-server-reaper".into())
             .spawn(move || {
-                let _ = child.wait();
+                let mut tail = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match child_stderr.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            tail.extend_from_slice(&buffer[..read]);
+                            if tail.len() > CHILD_STDERR_TAIL_BYTES {
+                                tail.drain(..tail.len() - CHILD_STDERR_TAIL_BYTES);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                if let Ok(status) = child.wait() {
+                    if status.success() {
+                        reaper_attempt.record_success();
+                    } else {
+                        let diagnostics = String::from_utf8_lossy(&tail)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let diagnostics = if diagnostics.is_empty() {
+                            "no child diagnostics".to_string()
+                        } else {
+                            diagnostics
+                        };
+                        reaper_attempt.record_failure(
+                            codestory_retrieval::EmbeddingTransportFailure {
+                                code: "embedding_server_start_failed".into(),
+                                message: format!(
+                                    "internal server exited with {status}; {diagnostics}"
+                                ),
+                            },
+                        );
+                    }
+                }
             })
             .context("start embedding server child reaper")?;
-        Ok(())
+        Ok(spawn_attempt)
     }
 }
 
@@ -399,11 +473,12 @@ impl codestory_retrieval::EmbeddingClientTransport for NativeEmbeddingClientTran
         &self,
         _intent: codestory_retrieval::EmbeddingConnectIntent,
         budget: Duration,
+        spawn_attempt: Option<&codestory_retrieval::EmbeddingSpawnAttempt>,
     ) -> std::result::Result<
         codestory_retrieval::EmbeddingConnectOutcome,
         codestory_retrieval::EmbeddingTransportFailure,
     > {
-        self.connect(budget)
+        self.connect_for_attempt(budget, spawn_attempt)
             .map(|outcome| match outcome {
                 NativeConnectOutcome::Connected(stream) => {
                     codestory_retrieval::EmbeddingConnectOutcome::Connected(Box::new(stream))
@@ -427,7 +502,10 @@ impl codestory_retrieval::EmbeddingClientTransport for NativeEmbeddingClientTran
 
     fn spawn_exact_current_exe(
         &self,
-    ) -> std::result::Result<(), codestory_retrieval::EmbeddingTransportFailure> {
+    ) -> std::result::Result<
+        codestory_retrieval::EmbeddingSpawnAttempt,
+        codestory_retrieval::EmbeddingTransportFailure,
+    > {
         self.spawn_exact_current_exe()
             .map_err(|error| transport_failure("embedding_server_spawn_failed", error))
     }
@@ -665,6 +743,7 @@ mod platform {
     use std::time::Duration;
 
     const SERVER_DIR_NAME: &str = "codestory-embedding-v1";
+    const QUALIFICATION_SERVER_DIR_NAME: &str = "cs-eq1";
     const SOCKET_NAME: &str = "server.sock";
     const LOCK_NAME: &str = "codestory-embedding-v1.authority.lock";
     const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -696,6 +775,9 @@ mod platform {
         socket_base: PathBuf,
         authority_directory: PathBuf,
         namespace_salt: String,
+        server_dir_name: String,
+        socket_name: String,
+        expected_authority_identity: Option<(u64, u64, u32)>,
         authority_is_private: bool,
         authority_has_fixed_parent: bool,
     }
@@ -706,6 +788,7 @@ mod platform {
         runtime: RuntimeDirectory,
         authority_directory: RuntimeDirectory,
         authority: File,
+        socket_name: String,
         socket_identity: (u64, u64),
         identity: TransportIdentity,
     }
@@ -771,9 +854,12 @@ mod platform {
             // then lose its fresh socket to this old listener's destructor.
             if runtime_directory_matches(&self.authority_directory)
                 && runtime_directory_matches(&self.runtime)
-                && socket_identity_at(&self.runtime).ok().flatten() == Some(self.socket_identity)
+                && socket_identity_at(&self.runtime, &self.socket_name)
+                    .ok()
+                    .flatten()
+                    == Some(self.socket_identity)
             {
-                let _ = unlink_socket_at(&self.runtime);
+                let _ = unlink_socket_at(&self.runtime, &self.socket_name);
             }
             let _ = unlock(self.authority.as_raw_fd());
         }
@@ -906,7 +992,7 @@ mod platform {
         let Some(runtime) = runtime else {
             return classify_failed_connect(authority);
         };
-        let socket_path = runtime.path.join(SOCKET_NAME);
+        let socket_path = runtime.path.join(&paths.socket_name);
         match validate_socket_path(&socket_path, runtime.uid) {
             Ok(Some(listener_id)) => match bounded_connect(
                 &socket_path,
@@ -996,8 +1082,8 @@ mod platform {
         let runtime = runtime_directory(&paths, &authority_directory, true)?
             .context("embedding runtime socket directory was not created")?;
 
-        let socket_path = runtime.path.join(SOCKET_NAME);
-        remove_stale_socket(&runtime, &socket_path)?;
+        let socket_path = runtime.path.join(&paths.socket_name);
+        remove_stale_socket(&runtime, &socket_path, &paths.socket_name)?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind embedding socket {}", socket_path.display()))?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
@@ -1023,6 +1109,7 @@ mod platform {
             runtime,
             authority_directory,
             authority,
+            socket_name: paths.socket_name,
             socket_identity,
             identity,
         }))
@@ -1199,22 +1286,11 @@ mod platform {
     }
 
     fn bounded_connect(path: &Path, budget: Duration) -> std::io::Result<UnixStream> {
+        validate_unix_socket_path(path)?;
         let path_bytes = path.as_os_str().as_bytes();
-        if path_bytes.contains(&0) {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "embedding socket path contains NUL",
-            ));
-        }
         let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
         let path_offset =
             std::ptr::addr_of!(address.sun_path) as usize - std::ptr::addr_of!(address) as usize;
-        if path_bytes.len() + 1 > address.sun_path.len() {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "embedding socket path is too long",
-            ));
-        }
         address.sun_family = libc::AF_UNIX as libc::sa_family_t;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1314,6 +1390,30 @@ mod platform {
         Ok(unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) })
     }
 
+    fn validate_unix_socket_path(path: &Path) -> std::io::Result<()> {
+        let path_bytes = path.as_os_str().as_bytes();
+        if path_bytes.contains(&0) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "embedding_endpoint_path_invalid: socket path contains NUL",
+            ));
+        }
+        let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len();
+        if path_bytes.len() + 1 > capacity {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "embedding_endpoint_path_too_long: socket path uses {} bytes but the platform limit is {}",
+                    path_bytes.len(),
+                    capacity.saturating_sub(1),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn timeout_ns(timeout: Option<Duration>) -> u64 {
         timeout
             .map(|timeout| timeout.as_nanos().min(u128::from(NO_TIMEOUT - 1)) as u64)
@@ -1367,7 +1467,9 @@ mod platform {
                 paths.socket_base.display()
             );
         };
-        let server_dir = socket_base.path.join(SERVER_DIR_NAME);
+        let server_dir = socket_base.path.join(&paths.server_dir_name);
+        let socket_path = server_dir.join(&paths.socket_name);
+        validate_unix_socket_path(&socket_path).map_err(anyhow::Error::new)?;
         if create {
             match DirBuilder::new().mode(PRIVATE_DIR_MODE).create(&server_dir) {
                 Ok(()) => {}
@@ -1410,28 +1512,11 @@ mod platform {
             std::env::var_os(QUALIFICATION_NONCE_ENV),
         ) {
             (None, None) => platform_runtime_paths(),
-            (Some(dir), Some(nonce)) => {
-                let nonce = nonce.to_string_lossy();
-                if nonce.is_empty()
-                    || nonce.len() > 64
-                    || !nonce
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-                {
-                    bail!("embedding_qualification_nonce_invalid");
-                }
-                let dir = PathBuf::from(dir);
-                if !dir.is_absolute() {
-                    bail!("embedding_qualification_directory_not_absolute");
-                }
-                Ok(RuntimePaths {
-                    socket_base: dir.clone(),
-                    authority_directory: dir,
-                    namespace_salt: format!("qualification:{nonce}"),
-                    authority_is_private: true,
-                    authority_has_fixed_parent: false,
-                })
-            }
+            (Some(dir), Some(nonce)) => qualification_runtime_paths(
+                PathBuf::from(dir),
+                &nonce.to_string_lossy(),
+                platform_runtime_paths()?.socket_base,
+            ),
             _ => bail!(
                 "embedding_qualification_gate_incomplete: both {QUALIFICATION_DIR_ENV} and {QUALIFICATION_NONCE_ENV} are required"
             ),
@@ -1453,6 +1538,9 @@ mod platform {
             socket_base: path.clone(),
             authority_directory: path,
             namespace_salt: "linux-xdg-runtime".into(),
+            server_dir_name: SERVER_DIR_NAME.into(),
+            socket_name: SOCKET_NAME.into(),
+            expected_authority_identity: None,
             authority_is_private: true,
             authority_has_fixed_parent: true,
         })
@@ -1493,6 +1581,9 @@ mod platform {
             socket_base: path,
             authority_directory,
             namespace_salt: "macos-darwin-user-temp".into(),
+            server_dir_name: SERVER_DIR_NAME.into(),
+            socket_name: SOCKET_NAME.into(),
+            expected_authority_identity: None,
             authority_is_private: false,
             authority_has_fixed_parent: true,
         })
@@ -1501,6 +1592,44 @@ mod platform {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn platform_runtime_paths() -> Result<RuntimePaths> {
         bail!("per-user embedding server is unsupported on this Unix platform")
+    }
+
+    fn qualification_runtime_paths(
+        authority_directory: PathBuf,
+        nonce: &str,
+        socket_base: PathBuf,
+    ) -> Result<RuntimePaths> {
+        if nonce.is_empty()
+            || nonce.len() > 64
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("embedding_qualification_nonce_invalid");
+        }
+        if !authority_directory.is_absolute() {
+            bail!("embedding_qualification_directory_not_absolute");
+        }
+        let authority = validate_private_directory(&authority_directory, false)?
+            .context("embedding qualification directory does not exist")?;
+        let expected_authority_identity = (authority.dev, authority.ino, authority.uid);
+        let namespace = sha256_fields(&[
+            b"codestory-embedding-qualification-endpoint-v1",
+            nonce.as_bytes(),
+            authority.dev.to_string().as_bytes(),
+            authority.ino.to_string().as_bytes(),
+            authority.uid.to_string().as_bytes(),
+        ]);
+        Ok(RuntimePaths {
+            socket_base,
+            authority_directory,
+            namespace_salt: format!("qualification:{namespace}"),
+            server_dir_name: QUALIFICATION_SERVER_DIR_NAME.into(),
+            socket_name: format!("q-{}.sock", &namespace[..32]),
+            expected_authority_identity: Some(expected_authority_identity),
+            authority_is_private: true,
+            authority_has_fixed_parent: false,
+        })
     }
 
     fn authority_directory(paths: &RuntimePaths) -> Result<RuntimeDirectory> {
@@ -1518,6 +1647,13 @@ mod platform {
                 paths.authority_directory.display()
             )
         })?;
+        if let Some(expected) = paths.expected_authority_identity
+            && expected != (directory.dev, directory.ino, directory.uid)
+        {
+            bail!(
+                "embedding_runtime_authority_replaced: qualification authority directory changed"
+            );
+        }
         if paths.authority_has_fixed_parent {
             validate_fixed_parent(&directory)?;
         }
@@ -1769,12 +1905,16 @@ mod platform {
         ])))
     }
 
-    fn remove_stale_socket(runtime: &RuntimeDirectory, path: &Path) -> Result<()> {
+    fn remove_stale_socket(
+        runtime: &RuntimeDirectory,
+        path: &Path,
+        socket_name: &str,
+    ) -> Result<()> {
         ensure_runtime_directory_matches(runtime)?;
         let Some(path_identity) = validate_socket_path(path, runtime.uid)? else {
             return Ok(());
         };
-        let held_identity = socket_identity_at(runtime)?
+        let held_identity = socket_identity_at(runtime, socket_name)?
             .context("embedding stale socket disappeared before removal")?;
         let held_listener_id = sha256_fields(&[
             b"unix-listener-v1",
@@ -1785,16 +1925,19 @@ mod platform {
         if held_listener_id != path_identity {
             bail!("embedding_endpoint_replaced: stale socket identity changed before removal");
         }
-        unlink_socket_at(runtime)
+        unlink_socket_at(runtime, socket_name)
             .with_context(|| format!("remove stale embedding socket {}", path.display()))?;
-        if socket_identity_at(runtime)?.is_some() {
+        if socket_identity_at(runtime, socket_name)?.is_some() {
             bail!("embedding_endpoint_replaced: stale socket removal did not clear the held entry");
         }
         ensure_runtime_directory_matches(runtime)
     }
 
-    fn socket_identity_at(runtime: &RuntimeDirectory) -> Result<Option<(u64, u64)>> {
-        let name = UnixCString::new(SOCKET_NAME).expect("static socket name");
+    fn socket_identity_at(
+        runtime: &RuntimeDirectory,
+        socket_name: &str,
+    ) -> Result<Option<(u64, u64)>> {
+        let name = UnixCString::new(socket_name).context("embedding endpoint name contains NUL")?;
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe {
             libc::fstatat(
@@ -1820,8 +1963,8 @@ mod platform {
         Ok(Some((stat.st_dev as u64, stat.st_ino as u64)))
     }
 
-    fn unlink_socket_at(runtime: &RuntimeDirectory) -> Result<()> {
-        let name = UnixCString::new(SOCKET_NAME).expect("static socket name");
+    fn unlink_socket_at(runtime: &RuntimeDirectory, socket_name: &str) -> Result<()> {
+        let name = UnixCString::new(socket_name).context("embedding endpoint name contains NUL")?;
         if unsafe { libc::unlinkat(runtime.handle.as_raw_fd(), name.as_ptr(), 0) } == 0 {
             Ok(())
         } else {
@@ -2034,6 +2177,106 @@ mod platform {
                 .expect("secure private test directory");
         }
 
+        #[test]
+        fn qualification_endpoint_stays_short_and_shared_for_long_unicode_control_path() {
+            let control_parent = tempfile::tempdir().expect("create qualification parent");
+            fs::set_permissions(
+                control_parent.path(),
+                fs::Permissions::from_mode(PRIVATE_DIR_MODE),
+            )
+            .expect("secure qualification parent");
+            let control = control_parent.path().join("qualification-ü-".repeat(12));
+            private_directory(&control);
+
+            let short_socket_base = tempfile::Builder::new()
+                .prefix("csq")
+                .tempdir_in("/tmp")
+                .expect("create short socket base");
+            fs::set_permissions(
+                short_socket_base.path(),
+                fs::Permissions::from_mode(PRIVATE_DIR_MODE),
+            )
+            .expect("secure short socket base");
+
+            let legacy_path = control.join(SERVER_DIR_NAME).join(SOCKET_NAME);
+            let legacy_error = validate_unix_socket_path(&legacy_path)
+                .expect_err("the legacy qualification endpoint must exceed sun_path");
+            assert!(
+                legacy_error
+                    .to_string()
+                    .contains("embedding_endpoint_path_too_long")
+            );
+
+            let paths = qualification_runtime_paths(
+                control.clone(),
+                "long-unicode-path-regression",
+                short_socket_base.path().to_path_buf(),
+            )
+            .expect("derive bounded qualification paths");
+            let second_paths = qualification_runtime_paths(
+                control,
+                "long-unicode-path-regression",
+                short_socket_base.path().to_path_buf(),
+            )
+            .expect("derive the same bounded qualification paths");
+            assert_eq!(paths.server_dir_name, second_paths.server_dir_name);
+            assert_eq!(paths.socket_name, second_paths.socket_name);
+            assert_eq!(paths.namespace_salt, second_paths.namespace_salt);
+
+            let authority_directory =
+                authority_directory(&paths).expect("open qualification authority");
+            let authority = open_authority(&authority_directory, true)
+                .expect("create qualification authority")
+                .expect("qualification authority exists");
+            let contender = open_authority(&authority_directory, false)
+                .expect("open contender authority")
+                .expect("contender authority exists");
+            assert!(try_lock(authority.as_raw_fd()).expect("win qualification election"));
+            assert!(
+                !try_lock(contender.as_raw_fd()).expect("contend qualification election"),
+                "one qualification namespace must have one owner"
+            );
+
+            let runtime = runtime_directory(&paths, &authority_directory, true)
+                .expect("create short runtime")
+                .expect("short runtime exists");
+            let socket_path = runtime.path.join(&paths.socket_name);
+            validate_unix_socket_path(&socket_path).expect("derived endpoint fits sun_path");
+            let listener = UnixListener::bind(&socket_path).expect("bind derived endpoint");
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("secure derived endpoint");
+            let first_client = bounded_connect(&socket_path, Duration::from_secs(1))
+                .expect("connect first qualification client");
+            let second_client = bounded_connect(&socket_path, Duration::from_secs(1))
+                .expect("connect second qualification client");
+            drop((first_client, second_client));
+
+            let socket_identity = socket_identity(&socket_path).expect("capture socket identity");
+            let listener = Listener {
+                listener,
+                runtime,
+                authority_directory,
+                authority,
+                socket_name: paths.socket_name,
+                socket_identity,
+                identity: TransportIdentity {
+                    endpoint_namespace_id: "qualification-endpoint".into(),
+                    lifetime_authority_id: "qualification-authority".into(),
+                    listener_id: "qualification-listener".into(),
+                    peer_verified: true,
+                    peer_pid: None,
+                    peer_process_start_id: None,
+                },
+            };
+            drop(listener);
+            assert!(!socket_path.exists(), "owner drop must unlink its endpoint");
+            assert!(
+                try_lock(contender.as_raw_fd()).expect("successor takes authority"),
+                "the successor must acquire authority after owner drop"
+            );
+            unlock(contender.as_raw_fd()).expect("release successor authority");
+        }
+
         fn test_identity(pid: u32) -> TransportIdentity {
             let peer_process_start_id =
                 canonical_peer_process_start_identity(pid).expect("inspect test peer process");
@@ -2101,7 +2344,8 @@ mod platform {
 
             unlock(first.as_raw_fd()).expect("release first authority");
             assert!(try_lock(second.as_raw_fd()).expect("second authority becomes winner"));
-            remove_stale_socket(&runtime, &socket_path).expect("winner removes stale socket");
+            remove_stale_socket(&runtime, &socket_path, SOCKET_NAME)
+                .expect("winner removes stale socket");
             assert!(!socket_path.exists());
             unlock(second.as_raw_fd()).expect("release second authority");
             drop(stale_listener);
@@ -2125,7 +2369,7 @@ mod platform {
             File::create(&endpoint).expect("create wrong-type endpoint");
             fs::set_permissions(&endpoint, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
                 .expect("secure wrong-type endpoint");
-            let error = remove_stale_socket(&runtime, &endpoint)
+            let error = remove_stale_socket(&runtime, &endpoint, SOCKET_NAME)
                 .expect_err("wrong-type endpoint must fail closed");
             assert!(error.to_string().contains("embedding_endpoint_untrusted"));
             assert!(endpoint.is_file(), "wrong-type entry must be preserved");
@@ -2221,6 +2465,7 @@ mod platform {
                 runtime,
                 authority_directory,
                 authority,
+                socket_name: SOCKET_NAME.into(),
                 socket_identity,
                 identity: TransportIdentity {
                     endpoint_namespace_id: "test-endpoint".into(),
@@ -3225,6 +3470,59 @@ mod tests {
         );
         assert_eq!(remaining_awake_budget(100, 20_000_100, budget), None);
         assert_eq!(remaining_awake_budget(100, 30_000_100, budget), None);
+    }
+
+    #[test]
+    fn embedding_server_spawn_failures_are_attempt_scoped_and_repeatable() {
+        let delayed_attempt = codestory_retrieval::EmbeddingSpawnAttempt::new(1);
+        let delayed_reaper = delayed_attempt.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal delayed reaper");
+            release_rx.recv().expect("release delayed reaper");
+            delayed_reaper.record_failure(codestory_retrieval::EmbeddingTransportFailure {
+                code: "embedding_server_start_failed".into(),
+                message: "delayed prior failure".into(),
+            });
+        });
+        ready_rx.recv().expect("wait for delayed attempt");
+
+        let viable_retry = codestory_retrieval::EmbeddingSpawnAttempt::new(2);
+        viable_retry.record_success();
+        release_tx.send(()).expect("release delayed failure");
+        reaper.join().expect("join delayed reaper");
+        assert!(
+            viable_retry.failure().is_none(),
+            "an earlier reaper cannot poison a viable retry generation"
+        );
+        assert_eq!(
+            delayed_attempt
+                .failure()
+                .expect("the delayed reaper only completes its own attempt")
+                .message,
+            "delayed prior failure"
+        );
+
+        let current_attempt = codestory_retrieval::EmbeddingSpawnAttempt::new(3);
+        current_attempt.record_failure(codestory_retrieval::EmbeddingTransportFailure {
+            code: "embedding_server_start_failed".into(),
+            message: "current bind failed".into(),
+        });
+        assert_eq!(
+            current_attempt
+                .failure()
+                .expect("first waiter observes the current failure")
+                .message,
+            "current bind failed"
+        );
+        assert_eq!(
+            current_attempt
+                .failure()
+                .expect("second waiter observes the same current failure")
+                .message,
+            "current bind failed"
+        );
     }
 
     #[test]

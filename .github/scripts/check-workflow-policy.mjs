@@ -1427,9 +1427,27 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   add(
     violations,
-    object(packageRestore?.with).key === "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v2-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock') }}",
+    object(packageRestore?.with).key === "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v3-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}",
     `${file} native build cache must bind generator, CMake, Ninja, target, features, and lock identity`,
   );
+  const linuxBuildDockerfile = fs.readFileSync(
+    path.join(repositoryRoot, ".github", "docker", "linux-glibc-build.Dockerfile"),
+    "utf8",
+  );
+  for (const fragment of [
+    "clang-13=1:13.0.1-6~deb11u1",
+    "libclang-13-dev=1:13.0.1-6~deb11u1",
+    "CC=clang-13",
+    "CXX=clang++-13",
+    "LIBCLANG_PATH=/usr/lib/llvm-13/lib",
+    "-mavxvnni -mavx512bf16 -mamx-tile -mamx-int8",
+  ]) {
+    add(
+      violations,
+      linuxBuildDockerfile.includes(fragment),
+      `${file} Bullseye native build must preserve compiler contract ${fragment}`,
+    );
+  }
   const packageBuild = namedStep(job, "Build codestory-cli");
   add(
     violations,

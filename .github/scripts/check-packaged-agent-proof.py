@@ -3577,8 +3577,11 @@ def run_parallel(tasks: dict[str, callable]) -> dict[str, object]:
     for thread in threads:
         thread.join()
     if failures:
-        name, failure = failures[0]
-        raise ProofFailure(f"parallel qualification task {name} failed: {failure}") from failure
+        failures.sort(key=lambda item: item[0])
+        details = "; ".join(f"{name}: {failure}" for name, failure in failures)
+        raise ProofFailure(
+            f"parallel qualification tasks failed: {details}"
+        ) from failures[0][1]
     return results
 
 
@@ -8366,6 +8369,25 @@ def build_calibration_self_test_bundle(
 
 def self_test() -> None:
     require(parse_byte_quantity("24.1M") == 25_270_682, "memory quantity parser failed")
+    def fail_parallel(message: str) -> None:
+        raise ProofFailure(message)
+
+    try:
+        run_parallel(
+            {
+                "z-task": lambda: fail_parallel("z failed"),
+                "a-task": lambda: fail_parallel("a failed"),
+            }
+        )
+    except ProofFailure as error:
+        require(
+            str(error)
+            == "parallel qualification tasks failed: a-task: a failed; z-task: z failed",
+            "parallel qualification failure aggregation is unstable",
+        )
+    else:
+        raise ProofFailure("parallel qualification failures were ignored")
+
     require(
         require_native_process_start_identity(
             "linux:1234", "linux", "Linux self-test identity"

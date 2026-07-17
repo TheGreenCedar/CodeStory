@@ -83,6 +83,62 @@ pub struct EmbeddingTransportFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct EmbeddingSpawnAttempt {
+    generation: u64,
+    state: Arc<Mutex<EmbeddingSpawnAttemptState>>,
+}
+
+#[derive(Debug)]
+enum EmbeddingSpawnAttemptState {
+    Pending,
+    Succeeded,
+    Failed(EmbeddingTransportFailure),
+}
+
+impl EmbeddingSpawnAttempt {
+    pub fn new(generation: u64) -> Self {
+        debug_assert_ne!(generation, 0);
+        Self {
+            generation,
+            state: Arc::new(Mutex::new(EmbeddingSpawnAttemptState::Pending)),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn record_failure(&self, failure: EmbeddingTransportFailure) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, EmbeddingSpawnAttemptState::Pending) {
+            *state = EmbeddingSpawnAttemptState::Failed(failure);
+        }
+    }
+
+    pub fn record_success(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            EmbeddingSpawnAttemptState::Succeeded;
+    }
+
+    pub fn failure(&self) -> Option<EmbeddingTransportFailure> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            EmbeddingSpawnAttemptState::Failed(failure) => Some(failure.clone()),
+            EmbeddingSpawnAttemptState::Pending | EmbeddingSpawnAttemptState::Succeeded => None,
+        }
+    }
+}
+
 pub trait EmbeddingServerStream: Read + Write + Send {
     fn transport_identity(&self) -> &EmbeddingTransportIdentity;
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
@@ -126,8 +182,11 @@ pub trait EmbeddingClientTransport: Send + Sync {
         &self,
         intent: EmbeddingConnectIntent,
         budget: Duration,
+        spawn_attempt: Option<&EmbeddingSpawnAttempt>,
     ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure>;
-    fn spawn_exact_current_exe(&self) -> std::result::Result<(), EmbeddingTransportFailure>;
+    fn spawn_exact_current_exe(
+        &self,
+    ) -> std::result::Result<EmbeddingSpawnAttempt, EmbeddingTransportFailure>;
     fn clock(&self) -> Arc<dyn AwakeMonotonicClock>;
     fn executable_identity(&self) -> EmbeddingExecutableIdentity;
     fn budgets(&self) -> EmbeddingClientBudgets;
@@ -1231,6 +1290,7 @@ impl PerUserEmbeddingClient {
     ) -> Result<ValidatedEmbeddingConnection> {
         let budgets = self.transport.budgets();
         let mut spawned_at_ns = None;
+        let mut spawn_attempt = None;
         let wait_for_spawn = |spawned_at_ns| -> Result<()> {
             if let Some(control) = control {
                 control.check()?;
@@ -1259,7 +1319,7 @@ impl PerUserEmbeddingClient {
                 .unwrap_or(budgets.connect);
             match self
                 .transport
-                .connect(intent, connect_budget)
+                .connect(intent, connect_budget, spawn_attempt.as_ref())
                 .map_err(anyhow::Error::new)?
             {
                 EmbeddingConnectOutcome::Connected(mut stream) => {
@@ -1279,9 +1339,11 @@ impl PerUserEmbeddingClient {
                     return Ok(ValidatedEmbeddingConnection { stream, snapshot });
                 }
                 EmbeddingConnectOutcome::NoOwner if may_spawn && spawned_at_ns.is_none() => {
-                    self.transport
-                        .spawn_exact_current_exe()
-                        .map_err(anyhow::Error::new)?;
+                    spawn_attempt = Some(
+                        self.transport
+                            .spawn_exact_current_exe()
+                            .map_err(anyhow::Error::new)?,
+                    );
                     spawned_at_ns = Some(self.transport.clock().now_ns());
                 }
                 EmbeddingConnectOutcome::NoOwner if !may_spawn => {
@@ -5019,6 +5081,7 @@ mod tests {
             &self,
             _intent: EmbeddingConnectIntent,
             _budget: Duration,
+            _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
         ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
             let attempt = self.connect_count.fetch_add(1, Ordering::AcqRel) + 1;
             let outcome = if self.capacity {
@@ -5033,9 +5096,11 @@ mod tests {
             )))
         }
 
-        fn spawn_exact_current_exe(&self) -> std::result::Result<(), EmbeddingTransportFailure> {
-            self.spawn_count.fetch_add(1, Ordering::AcqRel);
-            Ok(())
+        fn spawn_exact_current_exe(
+            &self,
+        ) -> std::result::Result<EmbeddingSpawnAttempt, EmbeddingTransportFailure> {
+            let generation = self.spawn_count.fetch_add(1, Ordering::AcqRel) as u64 + 1;
+            Ok(EmbeddingSpawnAttempt::new(generation))
         }
 
         fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
@@ -5076,6 +5141,7 @@ mod tests {
             &self,
             _intent: EmbeddingConnectIntent,
             _budget: Duration,
+            _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
         ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
             self.connect_count.fetch_add(1, Ordering::AcqRel);
             Ok(EmbeddingConnectOutcome::Connected(Box::new(
@@ -5089,8 +5155,10 @@ mod tests {
             )))
         }
 
-        fn spawn_exact_current_exe(&self) -> std::result::Result<(), EmbeddingTransportFailure> {
-            Ok(())
+        fn spawn_exact_current_exe(
+            &self,
+        ) -> std::result::Result<EmbeddingSpawnAttempt, EmbeddingTransportFailure> {
+            Ok(EmbeddingSpawnAttempt::new(1))
         }
 
         fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
@@ -5158,6 +5226,7 @@ mod tests {
             &self,
             _intent: EmbeddingConnectIntent,
             _budget: Duration,
+            _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
         ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
             self.connect_count.fetch_add(1, Ordering::AcqRel);
             let outcome = self
@@ -5180,9 +5249,11 @@ mod tests {
             })
         }
 
-        fn spawn_exact_current_exe(&self) -> std::result::Result<(), EmbeddingTransportFailure> {
-            self.spawn_count.fetch_add(1, Ordering::AcqRel);
-            Ok(())
+        fn spawn_exact_current_exe(
+            &self,
+        ) -> std::result::Result<EmbeddingSpawnAttempt, EmbeddingTransportFailure> {
+            let generation = self.spawn_count.fetch_add(1, Ordering::AcqRel) as u64 + 1;
+            Ok(EmbeddingSpawnAttempt::new(generation))
         }
 
         fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {

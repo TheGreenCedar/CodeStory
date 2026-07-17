@@ -636,9 +636,13 @@ impl<'a> ScenarioRunner<'a> {
         for repeat in 1..=3 {
             self.reset_owner(&format!("measure_spawn_no_owner_{repeat}"))?;
             let spawn_start = self.begin_measurement()?;
-            transport.spawn_exact_current_exe()?;
-            let mut spawn_stream =
-                connect_until(&transport, self.clock.as_ref(), Duration::from_secs(15))?;
+            let spawn_attempt = transport.spawn_exact_current_exe()?;
+            let mut spawn_stream = connect_until(
+                &transport,
+                self.clock.as_ref(),
+                Duration::from_secs(15),
+                Some(&spawn_attempt),
+            )?;
             let spawn_hello =
                 validated_hello(&mut spawn_stream, &transport, &runtime, self.clock.as_ref())?;
             let spawn = self.finish_measurement(spawn_start)?;
@@ -669,8 +673,12 @@ impl<'a> ScenarioRunner<'a> {
 
         for repeat in 1..=3 {
             let connect_start = self.begin_measurement()?;
-            let mut existing_stream =
-                connect_until(&transport, self.clock.as_ref(), Duration::from_secs(2))?;
+            let mut existing_stream = connect_until(
+                &transport,
+                self.clock.as_ref(),
+                Duration::from_secs(2),
+                None,
+            )?;
             let existing = validated_hello(
                 &mut existing_stream,
                 &transport,
@@ -2122,10 +2130,14 @@ fn connect_until(
     transport: &crate::embedding_server_transport::NativeEmbeddingClientTransport,
     clock: &dyn AwakeMonotonicClock,
     budget: Duration,
+    spawn_attempt: Option<&codestory_retrieval::EmbeddingSpawnAttempt>,
 ) -> Result<crate::embedding_server_transport::NativeEmbeddingStream> {
     let started = clock.now_ns();
     loop {
-        match transport.connect(budget.saturating_sub(elapsed(clock, started)))? {
+        match transport.connect_for_attempt(
+            budget.saturating_sub(elapsed(clock, started)),
+            spawn_attempt,
+        )? {
             crate::embedding_server_transport::NativeConnectOutcome::Connected(stream) => {
                 return Ok(stream);
             }
@@ -2207,7 +2219,12 @@ fn measure_vector_operation(
     if inputs.is_empty() || inputs.iter().any(|input| input.trim().is_empty()) {
         bail!("embedding_qualification_measurement_inputs_invalid");
     }
-    let mut stream = connect_until(transport, runner.clock.as_ref(), Duration::from_secs(2))?;
+    let mut stream = connect_until(
+        transport,
+        runner.clock.as_ref(),
+        Duration::from_secs(2),
+        None,
+    )?;
     let hello = validated_hello(&mut stream, transport, runtime, runner.clock.as_ref())?;
     let compatibility = EmbeddingCompatibility::current(runtime.embedding.allow_cpu);
     let request_id =
