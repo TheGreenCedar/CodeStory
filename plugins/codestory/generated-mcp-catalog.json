@@ -337,6 +337,29 @@
                   "description": "Display name.",
                   "type": "string"
                 },
+                "eligible_for_sufficiency": {
+                  "description": "Whether this hit may satisfy answer-sufficiency requirements.",
+                  "type": "boolean"
+                },
+                "evidence_producer": {
+                  "description": "Collector or retrieval producer that emitted the evidence.",
+                  "type": "string"
+                },
+                "evidence_tier": {
+                  "description": "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+                  "enum": [
+                    "exact_source",
+                    "structural_text",
+                    "resolved_graph",
+                    "lexical_source",
+                    "symbol_doc",
+                    "component_report",
+                    "dense_semantic",
+                    "synthetic_source_scan",
+                    "generated_summary"
+                  ],
+                  "type": "string"
+                },
                 "file_path": {
                   "description": "Project-relative file path.",
                   "type": [
@@ -392,6 +415,16 @@
                   "enum": [
                     "indexed_symbol",
                     "text_match"
+                  ],
+                  "type": "string"
+                },
+                "resolution_status": {
+                  "description": "Resolution state. source_range_only has a source span but no typed graph resolution.",
+                  "enum": [
+                    "resolved",
+                    "source_range_only",
+                    "unresolved",
+                    "diagnostic_only"
                   ],
                   "type": "string"
                 },
@@ -1541,6 +1574,29 @@
                   "description": "Display name.",
                   "type": "string"
                 },
+                "eligible_for_sufficiency": {
+                  "description": "Whether this hit may satisfy answer-sufficiency requirements.",
+                  "type": "boolean"
+                },
+                "evidence_producer": {
+                  "description": "Collector or retrieval producer that emitted the evidence.",
+                  "type": "string"
+                },
+                "evidence_tier": {
+                  "description": "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+                  "enum": [
+                    "exact_source",
+                    "structural_text",
+                    "resolved_graph",
+                    "lexical_source",
+                    "symbol_doc",
+                    "component_report",
+                    "dense_semantic",
+                    "synthetic_source_scan",
+                    "generated_summary"
+                  ],
+                  "type": "string"
+                },
                 "file_path": {
                   "description": "Project-relative file path.",
                   "type": [
@@ -1596,6 +1652,16 @@
                   "enum": [
                     "indexed_symbol",
                     "text_match"
+                  ],
+                  "type": "string"
+                },
+                "resolution_status": {
+                  "description": "Resolution state. source_range_only has a source span but no typed graph resolution.",
+                  "enum": [
+                    "resolved",
+                    "source_range_only",
+                    "unresolved",
+                    "diagnostic_only"
                   ],
                   "type": "string"
                 },
@@ -3279,12 +3345,35 @@
                   "description": "Display name.",
                   "type": "string"
                 },
+                "eligible_for_sufficiency": {
+                  "description": "Whether this citation may satisfy answer-sufficiency requirements.",
+                  "type": "boolean"
+                },
                 "evidence_edge_ids": {
                   "description": "Evidence edge ids.",
                   "items": {
                     "type": "string"
                   },
                   "type": "array"
+                },
+                "evidence_producer": {
+                  "description": "Collector or retrieval producer that emitted the evidence.",
+                  "type": "string"
+                },
+                "evidence_tier": {
+                  "description": "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+                  "enum": [
+                    "exact_source",
+                    "structural_text",
+                    "resolved_graph",
+                    "lexical_source",
+                    "symbol_doc",
+                    "component_report",
+                    "dense_semantic",
+                    "synthetic_source_scan",
+                    "generated_summary"
+                  ],
+                  "type": "string"
                 },
                 "file_path": {
                   "description": "Project-relative file path.",
@@ -3314,6 +3403,16 @@
                   "enum": [
                     "indexed_symbol",
                     "text_match"
+                  ],
+                  "type": "string"
+                },
+                "resolution_status": {
+                  "description": "Resolution state. source_range_only has a source span but no typed graph resolution.",
+                  "enum": [
+                    "resolved",
+                    "source_range_only",
+                    "unresolved",
+                    "diagnostic_only"
                   ],
                   "type": "string"
                 },

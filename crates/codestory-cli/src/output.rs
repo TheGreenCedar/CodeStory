@@ -1450,14 +1450,15 @@ fn append_ground_evidence_packet(
                 .as_deref()
                 .map(|value| format!(" ref=`{value}`"))
                 .unwrap_or_default();
-            let _ = writeln!(
-                markdown,
-                "- [{}] {} [{}]{}",
+            let mut citation = format!(
+                "[{}] {} [{}]{}",
                 symbol.id.0,
                 symbol.label,
                 format_kind(symbol.kind),
                 node_ref
             );
+            append_ground_symbol_evidence_metadata(&mut citation, symbol);
+            let _ = writeln!(markdown, "- {citation}");
         }
     }
 
@@ -3717,7 +3718,21 @@ fn render_ground_symbol(symbol: &codestory_contracts::api::GroundingSymbolDigest
     if !symbol.edge_digest.is_empty() {
         let _ = write!(out, " edges={}", symbol.edge_digest.join("; "));
     }
+    append_ground_symbol_evidence_metadata(&mut out, symbol);
     out
+}
+
+fn append_ground_symbol_evidence_metadata(
+    out: &mut String,
+    symbol: &codestory_contracts::api::GroundingSymbolDigestDto,
+) {
+    append_evidence_metadata(
+        out,
+        symbol.evidence_tier,
+        symbol.evidence_producer.as_deref(),
+        symbol.resolution_status,
+        None,
+    );
 }
 
 #[cfg(test)]
@@ -4675,9 +4690,9 @@ mod tests {
                 member_count: None,
                 summary: Some("Builds the evidence packet.".to_string()),
                 edge_digest: Vec::new(),
-                evidence_tier: None,
-                evidence_producer: None,
-                resolution_status: None,
+                evidence_tier: Some(PacketEvidenceTierDto::StructuralText),
+                evidence_producer: Some("structural_cargo_manifest_collector".to_string()),
+                resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
             }],
             files: vec![GroundingFileDigestDto {
                 file_path: "C:/repo/src/lib.rs".to_string(),
@@ -4695,9 +4710,30 @@ mod tests {
         };
 
         let markdown = render_ground_markdown(Path::new("C:/repo"), &snapshot, true);
+        let default_markdown = render_ground_markdown(Path::new("C:/repo"), &snapshot, false);
 
         assert_evidence_packet_shape(&markdown, &["short_finding:", "summary:"]);
         assert_order(&markdown, "short_finding:", "confidence:");
+        for rendered in [&default_markdown, &markdown] {
+            assert!(
+                rendered.contains("evidence_tier=structural_text"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("evidence_producer=structural_cargo_manifest_collector"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("resolution_status=source_range_only"),
+                "{rendered}"
+            );
+        }
+        assert!(
+            markdown.contains(
+                "citations:\n- [node-build-packet] build_packet [function] ref=`src/lib.rs:7:build_packet` evidence_tier=structural_text evidence_producer=structural_cargo_manifest_collector resolution_status=source_range_only"
+            ),
+            "{markdown}"
+        );
         assert!(
             !markdown.contains("why:"),
             "ground --why should use the redesigned packet instead of the legacy why block:\n{markdown}"

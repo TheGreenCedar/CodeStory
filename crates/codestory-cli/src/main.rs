@@ -3024,7 +3024,12 @@ fn drill_packet_verification_target(
 }
 
 fn drill_packet_citation_is_typed_resolvable(citation: &AgentCitationDto) -> bool {
-    citation.resolvable && citation.kind != NodeKind::UNKNOWN
+    citation.resolvable
+        && citation.kind != NodeKind::UNKNOWN
+        && citation.evidence_tier
+            != Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        && citation.resolution_status
+            != Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
 }
 
 fn drill_packet_verification_targets(
@@ -10271,6 +10276,48 @@ mod tests {
             &[citation],
         );
         assert!(anchors[0].chosen_anchor.is_none());
+    }
+
+    #[test]
+    fn drill_packet_keeps_structural_source_ranges_navigable_but_not_typed() {
+        let project_root = Path::new("C:/repo");
+        let mut structural =
+            sample_task_brief_citation("Cargo package", NodeKind::PACKAGE, "Cargo.toml", 2);
+        structural.evidence_tier =
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText);
+        structural.evidence_producer = Some("structural_cargo_manifest_collector".to_string());
+        structural.resolution_status =
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly);
+
+        let navigable =
+            drill_search_hit_from_packet_citation(project_root, "Cargo package", &structural);
+        assert!(navigable.resolvable);
+        assert!(!drill_packet_citation_is_typed_resolvable(&structural));
+
+        let anchors = drill_packet_anchors(
+            project_root,
+            &["Cargo package".to_string()],
+            std::slice::from_ref(&structural),
+        );
+        assert_eq!(anchors[0].typed_hit_count, 0);
+        assert!(anchors[0].chosen_anchor.is_none());
+        assert!(anchors[0].verification_targets.is_empty());
+        assert!(drill_packet_verification_targets(project_root, &[structural.clone()]).is_empty());
+
+        let mut packet = sample_task_brief_packet();
+        packet.sufficiency.covered_claims[0].citations = vec![
+            structural,
+            sample_task_brief_citation("SearchService", NodeKind::STRUCT, "src/search.rs", 24),
+        ];
+        assert!(drill_packet_bridges(project_root, &packet).is_empty());
+
+        let mut source_range_only =
+            sample_task_brief_citation("source range", NodeKind::FUNCTION, "src/lib.rs", 8);
+        source_range_only.resolution_status =
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly);
+        assert!(!drill_packet_citation_is_typed_resolvable(
+            &source_range_only
+        ));
     }
 
     #[test]
