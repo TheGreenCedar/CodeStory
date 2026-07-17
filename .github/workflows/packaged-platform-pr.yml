@@ -233,16 +233,20 @@ jobs:
         env:
           BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
         run: |
-          frozen="$(jq -er '.status == "frozen"' \
-            docs/testing/per-user-embedding-server-constant-set.json)"
-          base_frozen=true
-          if [ -n "$BASE_SHA" ]; then
-            base_frozen="$(git show \
-              "$BASE_SHA:docs/testing/per-user-embedding-server-constant-set.json" \
-              | jq -er '.status == "frozen"')"
+          constant_set_path=docs/testing/per-user-embedding-server-constant-set.json
+          frozen="$(jq -r '.status == "frozen"' "$constant_set_path")"
+          test "$frozen" = true || test "$frozen" = false
+          base_frozen=false
+          if [ -n "$BASE_SHA" ] \
+            && git cat-file -e "$BASE_SHA:$constant_set_path" 2>/dev/null; then
+            base_frozen="$(git show "$BASE_SHA:$constant_set_path" \
+              | jq -r '.status == "frozen"')"
           fi
+          test "$base_frozen" = true || test "$base_frozen" = false
           freeze_transition=false
-          if [ "$base_frozen" = false ] && [ "$frozen" = true ]; then
+          if [ -n "$BASE_SHA" ] \
+            && [ "$base_frozen" = false ] \
+            && [ "$frozen" = true ]; then
             freeze_transition=true
           fi
           echo "frozen=$frozen" >> "$GITHUB_OUTPUT"

@@ -1723,6 +1723,14 @@ function validatePackagedCoordinator(workflows, violations) {
     '.name == "full-source-gate" and .conclusion == "success"',
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", ["node .github/scripts/route-ci-proof.mjs --stdin"]);
+  requireStepRun(violations, file, route, "Read qualification constant-set state", [
+    "base_frozen=false",
+    "jq -r '.status == \"frozen\"'",
+    'git cat-file -e "$BASE_SHA:$constant_set_path"',
+    'test "$frozen" = true || test "$frozen" = false',
+    'test "$base_frozen" = true || test "$base_frozen" = false',
+    'freeze_transition=false\nif [ -n "$BASE_SHA" ] \\\n  && [ "$base_frozen" = false ] \\\n  && [ "$frozen" = true ]; then',
+  ]);
   requireCalibrationProducerAuthentication(violations, file, route);
   const calibrationLinux = requireJob(violations, file, workflow, "calibration-linux");
   add(
