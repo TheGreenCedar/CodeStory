@@ -3035,8 +3035,8 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     embedding_materialized_reused: output?.embedding_materialized_reused ?? null,
     embedding_accelerator_execution_verified: output?.embedding_accelerator_execution_verified ?? null,
     local_only: true,
-    locality_kind: "in_process",
-    locality_evidence: "retrieval embeddings execute inside codestory-cli",
+    locality_kind: "same_user_local_ipc",
+    locality_evidence: "retrieval embeddings execute in the authenticated per-user CodeStory server",
     lexical_capabilities: output?.lexical?.capabilities ?? null,
     semantic_capabilities: output?.semantic?.capabilities ?? null,
     scip_capabilities: output?.scip?.capabilities ?? null,
@@ -3253,8 +3253,8 @@ function semanticRuntimeLocality(output) {
   }
   return {
     local_only: true,
-    locality_kind: "in_process",
-    locality_evidence: `semantic backend ${backend} executes inside codestory-cli`,
+    locality_kind: "same_user_local_ipc",
+    locality_evidence: `semantic backend ${backend} executes in the authenticated per-user CodeStory server`,
   };
 }
 
@@ -5128,6 +5128,8 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
       ? {
           release_evidence: {
             commit: process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT,
+            source_tree: process.env.CODESTORY_RELEASE_EVIDENCE_TREE,
+            evaluation_contract: "publishable-three-repeat-packet/v1",
             profile: process.env.CODESTORY_RELEASE_EVIDENCE_PROFILE,
             evidence_identity: {
               corpus_id: process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID,
@@ -6291,7 +6293,7 @@ function runSelfTest() {
     null,
     1,
   );
-  assert.equal(engineStatus.locality_kind, "in_process");
+  assert.equal(engineStatus.locality_kind, "same_user_local_ipc");
   assert.equal(engineStatus.embedding_backend, "Metal");
   assert.equal(engineStatus.embedding_policy, "accelerated");
   assert.equal(engineStatus.embedding_engine_instance_id, "engine-1");

@@ -26,10 +26,11 @@ every host guide.
 - Start with the reader's task or the system relationship they need to
   understand.
 - State what success looks like and what the evidence does not prove.
-- Use current product language: one executable, in-process embeddings,
-  automatic preparation, project-scoped requests.
-- Do not revive removed embedding-server, endpoint, port, PID, repair-worker,
-  Docker-runtime, or consent flows in current guidance.
+- Use current product language: one executable package, one automatically
+  managed per-user embedding server, automatic preparation, and
+  project-scoped requests.
+- Do not revive retired external helper, user-selected endpoint, port, PID,
+  repair-worker, Docker-runtime, or consent flows in current guidance.
 - Distinguish plugin CLI package download from runtime behavior: the plugin may
   install a signed CLI, while the installed CLI contains its model and backend.
 - Keep repository examples portable. CodeStory-internal paths belong only in

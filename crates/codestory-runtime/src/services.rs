@@ -2,13 +2,14 @@ use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, BookmarkCategoryDto,
     BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
-    EmbeddingVectorPublicationIdentityDto, GroundingBudgetDto, GroundingSnapshotDto,
-    IndexDryRunDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexedFilesDto,
-    IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
+    EmbeddingCapacityPressureDto, EmbeddingVectorPublicationIdentityDto, GroundingBudgetDto,
+    GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest,
+    OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto,
 };
 
 use crate::AppController;
@@ -93,6 +94,8 @@ pub struct ActivationSnapshot {
     pub stage: ActivationStage,
     pub attempt: u32,
     pub retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
     pub failure: Option<String>,
     pub capabilities: ActivationCapabilities,
 }
@@ -342,6 +345,7 @@ impl ActivationService {
             {
                 snapshot.attempt += 1;
                 snapshot.failure = None;
+                snapshot.embedding_capacity = None;
                 snapshot.retry_after_ms = Some(250);
                 snapshot.state = ActivationState::Preparing;
                 snapshot.stage = ActivationStage::Discovery;
@@ -357,6 +361,7 @@ impl ActivationService {
                     stage: ActivationStage::Discovery,
                     attempt: 1,
                     retry_after_ms: Some(250),
+                    embedding_capacity: None,
                     failure: None,
                     capabilities: ActivationCapabilities {
                         local_navigation: ActivationCapabilityState::Unavailable,
@@ -588,16 +593,17 @@ fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
         ActivationState::Retryable => "activation_retryable",
         _ => "project_unavailable",
     };
-    ApiError::new(
+    activation_api_error(
         code,
         snapshot.failure.clone().unwrap_or_else(|| {
             "project activation did not provide the requested capability".into()
         }),
+        snapshot.embedding_capacity.clone(),
     )
 }
 
 fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
-    ApiError::new(
+    activation_api_error(
         "activation_preparing",
         format!(
             "project activation {} is still {:?} at {:?}; retry after {}ms",
@@ -606,14 +612,22 @@ fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
             snapshot.stage,
             snapshot.retry_after_ms.unwrap_or(250)
         ),
+        snapshot.embedding_capacity.clone(),
     )
 }
 
 fn map_activation_error(error: anyhow::Error) -> ApiError {
+    if let Some(pressure) = codestory_retrieval::embedding_capacity_pressure(&error) {
+        return classify_activation_api_error(embedding_capacity_api_error(pressure));
+    }
     classify_activation_api_error(ApiError::new("project_unavailable", error.to_string()))
 }
 
-fn classify_activation_api_error(error: ApiError) -> ApiError {
+fn classify_activation_api_error(mut error: ApiError) -> ApiError {
+    if error.code == "embedding_capacity" {
+        error.code = "activation_retryable".into();
+        return error;
+    }
     if matches!(
         error.code.as_str(),
         "cancelled" | "activation_preparing" | "activation_retryable"
@@ -638,6 +652,43 @@ fn classify_activation_api_error(error: ApiError) -> ApiError {
     } else {
         ApiError::new("project_unavailable", error.message)
     }
+}
+
+fn activation_api_error(
+    code: &str,
+    message: String,
+    pressure: Option<EmbeddingCapacityPressureDto>,
+) -> ApiError {
+    let Some(pressure) = pressure else {
+        return ApiError::new(code, message);
+    };
+    let mut error = ApiError::embedding_capacity(message, pressure);
+    error.code = code.into();
+    error
+}
+
+pub(crate) fn embedding_capacity_api_error(
+    pressure: codestory_retrieval::EmbeddingCapacityPressureWire,
+) -> ApiError {
+    let message = format!(
+        "embedding {} capacity is unavailable while the owner is {}; retry when {}",
+        pressure.queue_class, pressure.owner_state, pressure.retry_condition
+    );
+    ApiError::embedding_capacity(
+        message,
+        EmbeddingCapacityPressureDto {
+            reason: pressure.reason,
+            queue_class: pressure.queue_class,
+            capacity: pressure.capacity,
+            depth: pressure.depth,
+            retry_after_ms: pressure.retry_after_ms,
+            retry_condition: pressure.retry_condition,
+            owner_state: pressure.owner_state,
+            active_scope_id: pressure.active_scope_id,
+            active_request_id: pressure.active_request_id,
+            active_request_class: pressure.active_request_class,
+        },
+    )
 }
 
 #[derive(Clone)]
@@ -929,9 +980,10 @@ impl ActivationOperation {
         if let Some(error) = error {
             let capability = match error.code.as_str() {
                 "cancelled" => ActivationCapabilityState::Cancelled,
-                "activation_retryable" | "cache_busy" | "publication_changed" => {
-                    ActivationCapabilityState::Retryable
-                }
+                "activation_retryable"
+                | "embedding_capacity"
+                | "cache_busy"
+                | "publication_changed" => ActivationCapabilityState::Retryable,
                 _ => ActivationCapabilityState::Unavailable,
             };
             if snapshot.capabilities.local_navigation != ActivationCapabilityState::Ready {
@@ -946,13 +998,23 @@ impl ActivationOperation {
                 ActivationCapabilityState::Cancelled => ActivationState::Cancelled,
                 ActivationCapabilityState::Ready => ActivationState::Ready,
             };
+            snapshot.embedding_capacity = error
+                .details
+                .as_deref()
+                .and_then(|details| details.embedding_capacity.clone());
             snapshot.retry_after_ms =
-                (capability == ActivationCapabilityState::Retryable).then_some(250);
+                (capability == ActivationCapabilityState::Retryable).then(|| {
+                    snapshot
+                        .embedding_capacity
+                        .as_ref()
+                        .map_or(250, |pressure| pressure.retry_after_ms)
+                });
             snapshot.failure = Some(error.message.clone());
         } else {
             snapshot.state = ActivationState::Ready;
             snapshot.stage = ActivationStage::Ready;
             snapshot.retry_after_ms = None;
+            snapshot.embedding_capacity = None;
             snapshot.failure = None;
         }
         let snapshot = snapshot.clone();
@@ -1694,6 +1756,38 @@ mod activation_tests {
     }
 
     #[test]
+    fn embedding_capacity_stays_typed_and_never_suggests_repair() {
+        let error =
+            embedding_capacity_api_error(codestory_retrieval::EmbeddingCapacityPressureWire {
+                reason: "queue_full".into(),
+                queue_class: "query".into(),
+                capacity: 64,
+                depth: 64,
+                retry_after_ms: 25,
+                retry_condition: "a query slot becomes available".into(),
+                owner_state: "ready".into(),
+                active_scope_id: Some("opaque-scope".into()),
+                active_request_id: Some("opaque-request".into()),
+                active_request_class: Some("bulk".into()),
+            });
+        let classified = classify_activation_api_error(error);
+        let details = classified.details.as_deref().expect("capacity details");
+
+        assert_eq!(classified.code, "activation_retryable");
+        assert!(details.project.is_none());
+        assert!(details.next_commands.is_empty());
+        assert!(details.minimum_next.is_empty());
+        assert!(details.full_repair.is_empty());
+        assert_eq!(
+            details
+                .embedding_capacity
+                .as_ref()
+                .map(|pressure| pressure.retry_condition.as_str()),
+            Some("a query slot becomes available")
+        );
+    }
+
+    #[test]
     fn failed_broad_activation_never_becomes_ready_but_can_preserve_local_capability() {
         let snapshot = ActivationSnapshot {
             operation_id: "activation-1".into(),
@@ -1701,6 +1795,7 @@ mod activation_tests {
             stage: ActivationStage::Validation,
             attempt: 1,
             retry_after_ms: None,
+            embedding_capacity: None,
             failure: Some("embedding backend unavailable".into()),
             capabilities: ActivationCapabilities {
                 local_navigation: ActivationCapabilityState::Ready,

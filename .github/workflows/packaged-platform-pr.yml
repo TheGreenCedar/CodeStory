@@ -49,6 +49,7 @@ jobs:
       proof_key: ${{ steps.resolve.outputs.proof_key }}
       scope: ${{ steps.scope.outputs.scope }}
       version: ${{ steps.version.outputs.version }}
+      constants_frozen: ${{ steps.constants.outputs.frozen }}
     steps:
       - name: Resolve trusted exact head
         id: resolve
@@ -171,6 +172,14 @@ jobs:
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "Selected $scope platform proof."
 
+      - name: Read qualification constant-set state
+        id: constants
+        shell: bash
+        run: |
+          frozen="$(jq -er '.status == "frozen"' \
+            docs/testing/per-user-embedding-server-constant-set.json)"
+          echo "frozen=$frozen" >> "$GITHUB_OUTPUT"
+
       - name: Verify package version surfaces
         if: steps.resolve.outputs.mode != 'release-evidence'
         id: version
@@ -226,7 +235,9 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
 
   release-evidence:
-    if: needs.route.outputs.mode == 'release-evidence'
+    if: >-
+      needs.route.outputs.mode == 'release-evidence' ||
+      needs.route.outputs.constants_frozen == 'true'
     needs: route
     uses: ./.github/workflows/release-candidate-evidence.yml
     with:
@@ -250,10 +261,13 @@ jobs:
       needs.route.result == 'success' &&
       needs.route.outputs.scope != 'none' &&
       (needs.macos-source.result == 'success' || needs.macos-source.result == 'skipped') &&
-      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped'))
+      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped')) &&
+      (needs.release-evidence.result == 'success' ||
+       (needs.route.outputs.constants_frozen != 'true' && needs.release-evidence.result == 'skipped'))
     needs:
       - route
       - macos-source
+      - release-evidence
       - source-proof
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
@@ -262,6 +276,7 @@ jobs:
       scope: ${{ needs.route.outputs.scope }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       sign_macos: false
+      quality_evidence_artifact: ${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
 
   macos-metal-proof:
     if: >-
@@ -272,12 +287,14 @@ jobs:
     needs:
       - route
       - packaged-proof
+      - release-evidence
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
+      quality_evidence_artifact: ${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
 
   windows-vulkan-proof:
     if: >-
@@ -288,12 +305,14 @@ jobs:
     needs:
       - route
       - packaged-proof
+      - release-evidence
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
+      quality_evidence_artifact: ${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
 
   closeout:
     if: always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence'
@@ -302,6 +321,7 @@ jobs:
       - macos-source
       - source-proof
       - repo-scale-stats
+      - release-evidence
       - packaged-proof
       - macos-metal-proof
       - windows-vulkan-proof
@@ -318,6 +338,8 @@ jobs:
           MACOS_SOURCE_RESULT: ${{ needs.macos-source.result }}
           SOURCE_RESULT: ${{ needs.source-proof.result }}
           STATS_RESULT: ${{ needs.repo-scale-stats.result }}
+          EVIDENCE_RESULT: ${{ needs.release-evidence.result }}
+          CONSTANTS_FROZEN: ${{ needs.route.outputs.constants_frozen }}
           PACKAGE_RESULT: ${{ needs.packaged-proof.result }}
           METAL_RESULT: ${{ needs.macos-metal-proof.result }}
           VULKAN_RESULT: ${{ needs.windows-vulkan-proof.result }}
@@ -331,6 +353,11 @@ jobs:
           }
           require_result "$ROUTE_RESULT" success routing
           require_result "$STATS_RESULT" success repo-scale-stats
+          if [ "$CONSTANTS_FROZEN" = true ]; then
+            require_result "$EVIDENCE_RESULT" success release-evidence
+          else
+            require_result "$EVIDENCE_RESULT" skipped release-evidence
+          fi
           if [ "$MODE" = integration ]; then
             require_result "$SOURCE_RESULT" success source-proof
           else

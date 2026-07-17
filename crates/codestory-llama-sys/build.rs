@@ -11,6 +11,12 @@ use std::path::PathBuf;
 
 const MODEL_CONTRACT_FILE: &str = "model-contract.json";
 const NATIVE_RUNTIME_FILE_LIST: &str = "codestory-native-runtime-files-v1.txt";
+const EMBEDDING_SERVER_PROTOCOL_FILE: &str =
+    "../../docs/testing/per-user-embedding-server-protocol.json";
+const EMBEDDING_SERVER_CONSTANT_SET_FILE: &str =
+    "../../docs/testing/per-user-embedding-server-constant-set.json";
+const EMBEDDING_SERVER_MEASUREMENT_PROTOCOL_FILE: &str =
+    "../../docs/testing/per-user-embedding-server-measurement-protocol.json";
 
 struct ModelContract {
     file_name: String,
@@ -34,13 +40,35 @@ struct ModelContract {
     license_source_url: String,
 }
 
+struct EmbeddingServerConstants {
+    frozen: bool,
+    connect_timeout_ms: u64,
+    spawn_convergence_timeout_ms: u64,
+    retry_after_ms: u64,
+    query_request_deadline_ms: u64,
+    bulk_request_deadline_ms: u64,
+    hard_native_no_progress_ms: u64,
+    watchdog_cadence_ms: u64,
+    election_initial_backoff_ms: Option<u64>,
+    election_maximum_backoff_ms: Option<u64>,
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=CODESTORY_EMBED_MODEL_SOURCE");
     println!("cargo:rerun-if-changed={MODEL_CONTRACT_FILE}");
     println!("cargo:rerun-if-changed=model_staging.rs");
     println!("cargo:rerun-if-changed=native_staging.rs");
+    println!("cargo:rerun-if-changed={EMBEDDING_SERVER_PROTOCOL_FILE}");
+    println!("cargo:rerun-if-changed={EMBEDDING_SERVER_CONSTANT_SET_FILE}");
+    println!("cargo:rerun-if-changed={EMBEDDING_SERVER_MEASUREMENT_PROTOCOL_FILE}");
 
     let contract = load_model_contract();
+    let embedding_server_protocol_sha256 = file_sha256(EMBEDDING_SERVER_PROTOCOL_FILE);
+    let embedding_server_constant_set_sha256 = file_sha256(EMBEDDING_SERVER_CONSTANT_SET_FILE);
+    let embedding_server_constants =
+        load_embedding_server_constants(EMBEDDING_SERVER_CONSTANT_SET_FILE);
+    let embedding_server_measurement_protocol_sha256 =
+        file_sha256(EMBEDDING_SERVER_MEASUREMENT_PROTOCOL_FILE);
     let target = env::var("TARGET").expect("Cargo sets TARGET");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo sets CARGO_CFG_TARGET_OS");
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo sets CARGO_CFG_TARGET_ARCH");
@@ -116,6 +144,46 @@ fn main() {
         ),
     )
     .expect("write embedding model contract");
+    let embedding_server_proof_marker = format!(
+        "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=1|protocol_sha256={embedding_server_protocol_sha256}|constant_set_sha256={embedding_server_constant_set_sha256}|measurement_protocol_sha256={embedding_server_measurement_protocol_sha256}|clock_policy=awake_monotonic|query_capacity=64|bulk_capacity=64|idle_timeout_ms=60000|end"
+    );
+    fs::write(
+        out_dir.join("embedding_server_contract.rs"),
+        format!(
+            "pub const PER_USER_EMBEDDING_PROTOCOL_SHA256: &str = {embedding_server_protocol_sha256:?};\n\
+             pub const PER_USER_EMBEDDING_CONSTANT_SET_SHA256: &str = {embedding_server_constant_set_sha256:?};\n\
+             pub const PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256: &str = {embedding_server_measurement_protocol_sha256:?};\n\
+             pub const PER_USER_EMBEDDING_CONSTANT_SET_FROZEN: bool = {constant_set_frozen};\n\
+             pub const PER_USER_EMBEDDING_CONNECT_TIMEOUT_MS: u64 = {connect_timeout_ms};\n\
+             pub const PER_USER_EMBEDDING_SPAWN_CONVERGENCE_TIMEOUT_MS: u64 = {spawn_convergence_timeout_ms};\n\
+             pub const PER_USER_EMBEDDING_RETRY_AFTER_MS: u64 = {retry_after_ms};\n\
+             pub const PER_USER_EMBEDDING_QUERY_REQUEST_DEADLINE_MS: u64 = {query_request_deadline_ms};\n\
+             pub const PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS: u64 = {bulk_request_deadline_ms};\n\
+             pub const PER_USER_EMBEDDING_HARD_NATIVE_NO_PROGRESS_MS: u64 = {hard_native_no_progress_ms};\n\
+             pub const PER_USER_EMBEDDING_WATCHDOG_CADENCE_MS: u64 = {watchdog_cadence_ms};\n\
+             pub const PER_USER_EMBEDDING_ELECTION_INITIAL_BACKOFF_MS: Option<u64> = {election_initial_backoff_ms:?};\n\
+             pub const PER_USER_EMBEDDING_ELECTION_MAXIMUM_BACKOFF_MS: Option<u64> = {election_maximum_backoff_ms:?};\n\
+             #[used]\n\
+             pub static EMBEDDING_SERVER_PROOF_MARKER: &[u8] = {embedding_server_proof_marker:?}.as_bytes();\n",
+            constant_set_frozen = embedding_server_constants.frozen,
+            connect_timeout_ms = embedding_server_constants.connect_timeout_ms,
+            spawn_convergence_timeout_ms =
+                embedding_server_constants.spawn_convergence_timeout_ms,
+            retry_after_ms = embedding_server_constants.retry_after_ms,
+            query_request_deadline_ms =
+                embedding_server_constants.query_request_deadline_ms,
+            bulk_request_deadline_ms =
+                embedding_server_constants.bulk_request_deadline_ms,
+            hard_native_no_progress_ms =
+                embedding_server_constants.hard_native_no_progress_ms,
+            watchdog_cadence_ms = embedding_server_constants.watchdog_cadence_ms,
+            election_initial_backoff_ms =
+                embedding_server_constants.election_initial_backoff_ms,
+            election_maximum_backoff_ms =
+                embedding_server_constants.election_maximum_backoff_ms,
+        ),
+    )
+    .expect("write embedding server proof contract");
 
     let generated = out_dir.join("embedded_model.rs");
     match model_source {
@@ -161,6 +229,137 @@ fn main() {
             );
         }
     }
+}
+
+fn load_embedding_server_constants(path: &str) -> EmbeddingServerConstants {
+    let bytes =
+        fs::read(path).unwrap_or_else(|error| panic!("failed to read contract {path}: {error}"));
+    let value: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse contract {path}: {error}"));
+    assert_eq!(
+        value.get("schema_version").and_then(Value::as_u64),
+        Some(1),
+        "embedding server constant-set schema is unsupported"
+    );
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .expect("embedding server constant set omits status");
+    assert!(
+        matches!(status, "unfrozen" | "frozen"),
+        "embedding server constant-set status is invalid"
+    );
+    let frozen = status == "frozen";
+    let selected = if frozen {
+        value
+            .get("calibration_required_values")
+            .and_then(Value::as_object)
+            .expect("frozen embedding server constant set omits calibrated values")
+    } else {
+        value
+            .get("draft_values")
+            .and_then(Value::as_object)
+            .expect("unfrozen embedding server constant set omits draft values")
+    };
+    let positive = |object: &serde_json::Map<String, Value>, field: &str| {
+        let selected = object
+            .get(field)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                panic!("embedding server constant {field} is not a positive integer")
+            });
+        assert!(
+            selected > 0,
+            "embedding server constant {field} must be positive"
+        );
+        selected
+    };
+    let (
+        connect_timeout_ms,
+        spawn_convergence_timeout_ms,
+        retry_after_ms,
+        query_request_deadline_ms,
+        bulk_request_deadline_ms,
+        hard_native_no_progress_ms,
+        watchdog_cadence_ms,
+        election_initial_backoff_ms,
+        election_maximum_backoff_ms,
+    ) = if frozen {
+        let capacity = selected
+            .get("capacity_retry_policy")
+            .and_then(Value::as_object)
+            .expect("frozen capacity_retry_policy is malformed");
+        assert_eq!(
+            capacity.get("retry_class").and_then(Value::as_str),
+            Some("after_capacity_change"),
+            "frozen capacity retry class changed"
+        );
+        let deadlines = selected
+            .get("request_deadlines_ms")
+            .and_then(Value::as_object)
+            .expect("frozen request_deadlines_ms is malformed");
+        let election = selected
+            .get("election_backoff_policy")
+            .and_then(Value::as_object)
+            .expect("frozen election_backoff_policy is malformed");
+        (
+            positive(selected, "connect_timeout_ms"),
+            positive(selected, "spawn_convergence_timeout_ms"),
+            positive(capacity, "retry_after_ms"),
+            positive(deadlines, "query_request_deadline_ms"),
+            positive(deadlines, "bulk_request_deadline_ms"),
+            positive(selected, "hard_native_no_progress_ms"),
+            positive(selected, "watchdog_cadence_ms"),
+            Some(positive(election, "initial_backoff_ms")),
+            Some(positive(election, "maximum_backoff_ms")),
+        )
+    } else {
+        (
+            positive(selected, "connect_timeout_ms"),
+            positive(selected, "spawn_convergence_timeout_ms"),
+            positive(selected, "retry_after_ms"),
+            positive(selected, "query_request_deadline_ms"),
+            positive(selected, "bulk_request_deadline_ms"),
+            positive(selected, "hard_native_no_progress_ms"),
+            positive(selected, "watchdog_cadence_ms"),
+            None,
+            None,
+        )
+    };
+    assert!(
+        query_request_deadline_ms <= bulk_request_deadline_ms,
+        "query request deadline must not exceed the bulk deadline"
+    );
+    assert!(
+        watchdog_cadence_ms < hard_native_no_progress_ms,
+        "watchdog cadence must be shorter than the hard no-progress bound"
+    );
+    if let (Some(initial), Some(maximum)) =
+        (election_initial_backoff_ms, election_maximum_backoff_ms)
+    {
+        assert!(
+            initial <= maximum,
+            "election initial backoff must not exceed its maximum"
+        );
+    }
+    EmbeddingServerConstants {
+        frozen,
+        connect_timeout_ms,
+        spawn_convergence_timeout_ms,
+        retry_after_ms,
+        query_request_deadline_ms,
+        bulk_request_deadline_ms,
+        hard_native_no_progress_ms,
+        watchdog_cadence_ms,
+        election_initial_backoff_ms,
+        election_maximum_backoff_ms,
+    }
+}
+
+fn file_sha256(path: &str) -> String {
+    let bytes =
+        fs::read(path).unwrap_or_else(|error| panic!("failed to read contract {path}: {error}"));
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {

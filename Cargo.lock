@@ -511,6 +511,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm 0.28.1",
  "fs4",
+ "libc",
  "notify",
  "ratatui",
  "serde",
@@ -520,6 +521,7 @@ dependencies = [
  "tokio",
  "toml",
  "ureq",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -604,6 +606,7 @@ dependencies = [
  "codestory-workspace",
  "directories",
  "fs4",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

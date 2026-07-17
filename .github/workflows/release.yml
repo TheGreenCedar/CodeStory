@@ -139,6 +139,7 @@ jobs:
       scope: full
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
+      quality_evidence_artifact: release-evidence-${{ github.sha }}
     # Provision these names as environment secrets on macos-release-signing.
     # That protected environment is selected by the called macOS matrix jobs,
     # and its values take precedence over caller/repository secrets.
@@ -160,6 +161,7 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
+      quality_evidence_artifact: release-evidence-${{ github.sha }}
 
   windows-vulkan-proof:
     needs:
@@ -171,6 +173,7 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
+      quality_evidence_artifact: release-evidence-${{ github.sha }}
 
   publish:
     name: Publish GitHub release
@@ -218,7 +221,7 @@ jobs:
           This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
 
           - Windows x64 managed install and local ground are acceptance-smoked; accelerated retrieval requires the protected Vulkan hardware proof.
-          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged in-process Metal cold/warm reuse, packet, and search proof.
+          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged per-user-server Metal qualification with frozen evidence.
           - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
           - Windows arm64 ships a CLI asset but has no protected accelerated embedding cell.
           - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
@@ -274,5 +277,6 @@ jobs:
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
+      quality_evidence_artifact: release-evidence-${{ github.sha }}
     permissions:
       contents: read

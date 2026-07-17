@@ -51,6 +51,8 @@ mod config;
 mod display;
 mod drill_targeting;
 mod embedding_config;
+mod embedding_qualification;
+mod embedding_server_transport;
 mod explore;
 mod file_state;
 mod http_transport;
@@ -164,7 +166,6 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let _embedding_shutdown = ProcessEmbeddingShutdown;
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let json = json_output_requested(&raw_args);
     let cli = match Cli::try_parse_from(&raw_args) {
@@ -225,15 +226,11 @@ async fn main() -> ExitCode {
     }
 }
 
-struct ProcessEmbeddingShutdown;
-
-impl Drop for ProcessEmbeddingShutdown {
-    fn drop(&mut self) {
-        codestory_retrieval::shutdown_process_embedding_engine();
-    }
-}
-
 async fn run_cli(cli: Cli) -> Result<()> {
+    if !matches!(&cli.command, Command::InternalEmbeddingServer) {
+        embedding_server_transport::install_client_transport()
+            .context("install native embedding server transport")?;
+    }
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
@@ -270,6 +267,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::InternalOwnedDelete(cmd) => run_internal_owned_delete(cmd),
+        Command::InternalEmbeddingServer => {
+            embedding_server_transport::run_internal_embedding_server()
+        }
+        Command::InternalEmbeddingQualification(cmd) => {
+            embedding_qualification::run_internal_embedding_qualification(cmd)
+        }
+        Command::InternalEmbeddingQualificationWorker(cmd) => {
+            embedding_qualification::run_internal_embedding_qualification_worker(cmd)
+        }
     }
 }
 
@@ -317,6 +323,7 @@ fn command_failure_envelope(
             minimum_next: Vec::new(),
             full_repair: Vec::new(),
             readiness: None,
+            embedding_capacity: None,
         },
     ))
     .with_context(context)
@@ -876,6 +883,7 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
                 minimum_next: output.repair_hints.iter().take(1).cloned().collect(),
                 full_repair: output.repair_hints.clone(),
                 readiness: None,
+                embedding_capacity: None,
             },
         ))
         .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
@@ -6013,6 +6021,7 @@ fn ambiguous_command_failure(
             minimum_next: output.error.next_commands.iter().take(1).cloned().collect(),
             full_repair: output.error.next_commands.clone(),
             readiness: None,
+            embedding_capacity: None,
         },
     ))
     .with_context(serde_json::json!({
@@ -8460,7 +8469,7 @@ mod tests {
         retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
         retrieval.current_embedding = Some(codestory_contracts::api::EmbeddingProfileContractDto {
             profile: "coderank-embed".to_string(),
-            backend: "inprocess".to_string(),
+            backend: "per_user_server".to_string(),
             model_id: "nomic-ai/CodeRankEmbed".to_string(),
             cache_key: "current".to_string(),
             dimension: Some(768),
@@ -8470,7 +8479,7 @@ mod tests {
             Some(codestory_contracts::api::StoredSemanticDocsContractDto {
                 doc_count: 1,
                 embedding_profile: Some("unexpected-profile".to_string()),
-                embedding_backend: Some("inprocess".to_string()),
+                embedding_backend: Some("per_user_server".to_string()),
                 cache_key: Some("old".to_string()),
                 dimension: Some(768),
                 doc_version: Some(5),

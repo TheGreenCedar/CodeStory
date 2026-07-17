@@ -417,7 +417,15 @@ function statsContractFrom(repoRoot) {
   return contract;
 }
 
-function validateRawProvenance(stats, packet, commit, profileName, identity, statsContract) {
+function validateRawProvenance(
+  stats,
+  packet,
+  commit,
+  sourceTree,
+  profileName,
+  identity,
+  statsContract,
+) {
   if (fullSha(stats.commit, "stats.commit") !== commit) fail("raw stats commit does not match candidate");
   if (JSON.stringify(stats.evidence_identity) !== JSON.stringify(identity)) fail("raw stats identity does not match profile");
   if (stats.proof_tier !== "full_retrieval"
@@ -443,6 +451,10 @@ function validateRawProvenance(stats, packet, commit, profileName, identity, sta
   }
   const packetProvenance = object(packet.release_evidence, "packet.release_evidence");
   if (fullSha(packetProvenance.commit, "packet commit") !== commit) fail("raw packet commit does not match candidate");
+  if (packetProvenance.source_tree !== sourceTree) fail("raw packet source tree does not match candidate");
+  if (packetProvenance.evaluation_contract !== "publishable-three-repeat-packet/v1") {
+    fail("raw packet evaluation contract is unsupported");
+  }
   if (packetProvenance.profile !== profileName) fail("raw packet profile does not match candidate");
   if (JSON.stringify(packetProvenance.evidence_identity) !== JSON.stringify(identity)) fail("raw packet identity does not match profile");
   if (packetProvenance.publishable !== true || packetProvenance.repeats < 3 || packetProvenance.quality_gate_status !== "pass") fail("raw packet artifact is not publishable three-repeat quality-gated evidence");
@@ -496,7 +508,15 @@ export function produceCandidate({ baselineDocument, baselineDir, profileName, s
     if (identity[key] !== profile.identity[key]) fail(`candidate ${key} does not match approved profile`);
   }
   const statsContract = statsContractFrom(repoRoot);
-  validateRawProvenance(stats, packet, commit, profileName, identity, statsContract);
+  validateRawProvenance(
+    stats,
+    packet,
+    commit,
+    sourceTreeIdentity(commit, mode, repoRoot),
+    profileName,
+    identity,
+    statsContract,
+  );
   const baseDir = path.dirname(path.resolve(outPath));
   const measured = metricsFrom(stats, packet, profile);
   const baselineSha256 = sha256(Buffer.from(JSON.stringify(profile)));
@@ -561,7 +581,15 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
   const stats = readJson(statsPath, "stats artifact");
   const packet = readJson(packetPath, "packet artifact");
   const statsContract = statsContractFrom(repoRoot);
-  validateRawProvenance(stats, packet, commit, candidate.profile, profile.identity, statsContract);
+  validateRawProvenance(
+    stats,
+    packet,
+    commit,
+    sourceTreeIdentity(commit, mode, repoRoot),
+    candidate.profile,
+    profile.identity,
+    statsContract,
+  );
   const measured = metricsFrom(stats, packet, profile);
   if (approvalDocument && approvalDocument.schema_version !== 3) fail("approval schema_version must be 3");
   const approvals = object(approvalDocument?.metrics ?? {}, "approval.metrics");

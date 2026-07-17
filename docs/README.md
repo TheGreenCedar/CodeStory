@@ -43,8 +43,9 @@ evidence.
 | How CodeStory works internally | [Architecture overview](architecture/overview.md) |
 | How the installed plugin reaches native CodeStory | [Host integration](architecture/host-integration.md) |
 | How a request activates and reads a project | [Runtime execution path](architecture/runtime-execution-path.md) |
-| In-process retrieval operations | [Retrieval engine](ops/retrieval-engine.md) |
+| Per-user retrieval operations | [Retrieval engine](ops/retrieval-engine.md) |
 | Retrieval design and promotion | [Retrieval design](architecture/retrieval-design.md), [Retrieval architecture guide](testing/retrieval-architecture.md) |
+| Per-user server qualification | [Qualification contract](testing/per-user-embedding-server-qualification.md) |
 | Language support claims | [Language support](architecture/language-support.md) |
 | Timing and benchmark records | [E2E stats log](testing/codestory-e2e-stats-log.md), [language-expansion holdout stats](testing/language-expansion-holdout-stats.md) |
 | Research comparisons | [Research handbook](research.md) |

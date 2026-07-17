@@ -60,9 +60,11 @@ behavior changed. Intermediate commits do not append telemetry.
 
 ## Retrieval engine
 
-The supported product path is one executable with a process-wide in-process
-CodeRankEmbed Q8 engine. It performs no model or backend download and starts no
-helper process. `retrieval_mode=full` still gates agent packet/search.
+The supported product path is one packaged executable whose hidden mode owns
+one automatically spawned per-user CodeRankEmbed Q8 server. It performs no
+model or backend download and opens no TCP port. Compatible clients use a
+private same-user UDS or named pipe and have no in-process fallback.
+`retrieval_mode=full` still gates agent packet/search.
 
 Focused proof covers:
 
@@ -77,8 +79,14 @@ Focused proof covers:
 - live embedding smoke plus post-encode backend observations for execution
   device/backend, layer placement, resident tensor count/bytes, execution nodes,
   and an advancing successful-encode counter;
-- one engine/model load shared across repositories;
-- owner-thread idle unload, observational sleeping status, and automatic wake;
+- one endpoint authority, listener, server, engine owner, native worker, load
+  generation, and model load shared across independent client processes;
+- 64-entry query and bulk queues, FIFO within each class, query preference
+  between bulk batches, bulk resumption, cancellation, useful retry state, and
+  no project/scope round-robin or bounded-starvation claim;
+- client death, server crash, worker stall, incompatible-owner handoff,
+  whole-server freeze without takeover, 60-second true-idle exit, and automatic
+  respawn;
 - publication leases that retain one load generation through commit;
 - generation-coherent query reads and producer migration;
 - cleanup confined to proved owned generations.
@@ -126,25 +134,30 @@ executable, and verifies every packaged core/CPU/Vulkan module and native
 dependency against the engine marker, embedded model contract, compiled
 backends, llama source, and producer version. The resulting
 `codestory-native-manifest.json` records compiled capability without claiming
-runtime accelerator execution. Packaged proof binds that manifest to the exact
-binary digest, live model/build/backend identity, process restart, version/help,
-full retrieval, plugin packet/search, multi-repository engine reuse,
-an encode counter that advances across real retrieval requests,
-restart/materialization reuse, and absence of helper-process lifecycle state.
+runtime accelerator execution. Manifest schema 3 also binds the exact source
+commit and tree, executable digest, server protocol, accepted constant set, and
+measurement protocol. `--version-only` proves package structure, version, and
+help; it does not prove a running server.
+
+Runtime proof uses the ordinary plugin launcher with two independently started
+host processes and different repositories. `--proof-tier calibration` may
+collect draft measurements, but cannot satisfy a package, hardware, installed,
+or release claim. A higher tier requires a frozen constant set and a retained
+qualification record. `--produce-qualification-evidence` runs the private,
+nonce-gated scenario orchestrator and writes the path passed to
+`--qualification-evidence`; without the producer flag, the harness verifies an
+existing record. Missing, stale, partial, self-selected, or wrong-tier evidence
+fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
 ship runtime-loaded native modules beside the executable. Hosted Linux proof
 does not install a Vulkan loader before help, stdio initialization, or explicit
 CPU execution, and it makes no Linux acceleration claim.
 
-Protected hardware proof also passes `--idle-residency-proof`. It records an
-uninitialized process-memory baseline, verifies the owner becomes `sleeping`
-after the idle window, requires memory to return near that baseline, then wakes
-the same owner and requires a second verified load from the unchanged
-materialized model. macOS uses physical footprint; Windows uses working set.
-
 Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
-to make the claim explicit. The harness self-test is:
+to make the claim explicit. Protected and installed tiers additionally name
+their exact proof tier and retained qualification file. The harness self-test
+uses synthetic fixtures only:
 
 ```sh
 python .github/scripts/check-packaged-agent-proof.py --self-test
@@ -154,22 +167,31 @@ python .github/scripts/check-packaged-agent-proof.py --self-test
 
 | Workflow | Required claim |
 | --- | --- |
-| `.github/workflows/macos-metal-proof.yml` | Packaged Apple Silicon binary, CPU disallowed, Metal, physical adapter, live smoke, full layer offload |
-| `.github/workflows/windows-vulkan-proof.yml` | Packaged Windows binary, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload |
+| `.github/workflows/macos-metal-proof.yml` | Exact Apple Silicon package, CPU disallowed, Metal, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
+| `.github/workflows/windows-vulkan-proof.yml` | Exact Windows x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
 | Linux protected Vulkan workflow | Required before any Linux GPU claim; hosted CPU proof is insufficient |
 
 Signing and notarization are main-release concerns, not PR gates. A PR package
-may be unsigned while still proving in-process behavior.
+may be unsigned while still proving the named package/runtime tier.
 
 ### Performance and quality
 
-Before removing an incumbent embedding implementation, compare incumbent and
-candidate in the same release build on the same machine. Keep the selector
-private and delete it with the incumbent before merge.
+Before replacing a model or native embedding implementation, compare incumbent
+and candidate in the same release build on the same machine. Keep that
+measurement selector private and delete it before merge. A server-ownership
+cutover does not relabel pre-fault and post-fault searches as two
+implementations: it consumes the existing exact-head
+`publishable-three-repeat-packet/v1` artifact and derives the pass rate from
+every row and repeat. Freeze every production timing value and qualification
+threshold before running the unchanged qualification candidate; a result
+cannot define its own pass threshold.
 
-Measure cold initialization, warm query latency, bulk documents/sec, process
-RSS, GPU memory, vector parity, retrieval quality, multi-repository reuse, and
-restart reuse separately. Quality cannot regress. A repeatable throughput,
+Measure existing-owner connect, listener spawn, first residency, first product
+ready, warm query/bulk IPC, bulk documents and tokens per second, useful retry
+latency, true-idle exit, total CodeStory process memory, accelerator residency,
+retrieval quality, multi-process reuse, and restart reuse separately. Use
+awake-time monotonic clocks within each process; never subtract timestamps from
+different process origins. Quality cannot regress. A repeatable throughput,
 warm-latency, or memory regression blocks the cutover; 5% is measurement noise,
 not an accepted sustained loss.
 

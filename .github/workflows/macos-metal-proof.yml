@@ -21,6 +21,11 @@ on:
         required: false
         default: false
         type: boolean
+      quality_evidence_artifact:
+        description: Exact-head release-evidence artifact containing packet/packet-runtime-summary.json.
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       version:
@@ -33,6 +38,10 @@ on:
         type: string
       proof_key:
         description: Stable proof identity for cancellation.
+        required: false
+        type: string
+      quality_evidence_artifact:
+        description: Existing exact-head release-evidence artifact name.
         required: false
         type: string
 
@@ -108,6 +117,13 @@ jobs:
           name: codestory-cli-macos-arm64
           path: target/release-dist
 
+      - name: Download exact-head publishable packet quality evidence
+        if: inputs.quality_evidence_artifact != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.quality_evidence_artifact }}
+          path: target/release-quality-evidence
+
       - name: Prove cold and warm Metal, offline packaging, and multi-repository reuse
         shell: bash
         env:
@@ -116,8 +132,15 @@ jobs:
         run: |
           set -euo pipefail
           version="${VERSION#v}"
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
           export TMPDIR="${RUNNER_TEMP}/codestory metal proof ü"
           mkdir -p "$TMPDIR"
+          quality_args=()
+          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
+          if [ -f "$quality_path" ]; then
+            quality_args=(--retrieval-quality-evidence "$quality_path")
+          fi
           python3 .github/scripts/check-packaged-agent-proof.py \
             --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
             --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
@@ -128,7 +151,13 @@ jobs:
             --engine-policy accelerated \
             --expected-backend Metal \
             --offline \
-            --idle-residency-proof \
+            --proof-tier protected_hardware \
+            --qualification-matrix-cell protected_macos_arm64_metal \
+            --produce-qualification-evidence \
+            --qualification-evidence target/macos-metal-proof/qualification.json \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            "${quality_args[@]}" \
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent
 

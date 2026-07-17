@@ -6,7 +6,8 @@ stable between candidates. Ordinary pull requests must not target this runner.
 
 ## Machine contract
 
-The approved host shape for the 0.16 in-process retrieval baseline is:
+The approved host shape for the 0.16 per-user embedding-server retrieval
+baseline is:
 
 | Field | Value |
 | --- | --- |

@@ -14,7 +14,7 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | `<codestory-cli> doctor --project <target-workspace>` | Reports project root, cache path, indexed stats, retrieval state, in-process engine health, environment hints, and next commands. |
+| Normal path | `<codestory-cli> doctor --project <target-workspace>` | Reports project root, cache path, indexed stats, retrieval state, per-user server health, environment hints, and next commands. |
 | Failure path | In MCP, retry the intended tool after its reported delay. If automatic preparation stops converging, continue with local navigation or ordinary source inspection and record the visibility gap. In a maintainer transcript, inspect `doctor` and run the specific index command it recommends; use an explicit full rebuild only when diagnostics identify stale or corrupt artifacts. If symbol docs, dense anchors, policy version, vector counts, or semantic health report partial/stale/failed state, do not trust broad evidence until the next complete publication is ready. | Separates user-facing capability state from maintainer diagnostics. |
 | Integration edge | Use `doctor` only after a direct tool call fails to converge or when collecting an explicit diagnostic transcript. | Keeps observational diagnostics out of the normal grounding loop. |
 

@@ -110,6 +110,8 @@ jobs:
           CODESTORY_EMBED_ALLOW_CPU: "1"
         run: |
           set -euo pipefail
+          CODESTORY_RELEASE_EVIDENCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          export CODESTORY_RELEASE_EVIDENCE_TREE
           node scripts/codestory-agent-ab-benchmark.mjs \
             --packet-runtime \
             --packet-runtime-mode cold-cli \

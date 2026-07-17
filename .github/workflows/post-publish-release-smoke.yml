@@ -7,11 +7,20 @@ on:
         description: Release version to smoke, with or without a leading v.
         required: true
         type: string
+      quality_evidence_artifact:
+        description: Exact-head release-evidence artifact containing packet/packet-runtime-summary.json.
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       version:
         description: Release version to smoke, with or without a leading v.
         required: true
+        type: string
+      quality_evidence_artifact:
+        description: Existing exact-head release-evidence artifact name.
+        required: false
         type: string
 
 permissions:
@@ -67,6 +76,13 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.release.outputs.tag }}
+
+      - name: Download exact-head publishable packet quality evidence
+        if: inputs.quality_evidence_artifact != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.quality_evidence_artifact }}
+          path: target/release-quality-evidence
 
       - name: Download published asset and checksum
         id: asset
@@ -159,53 +175,140 @@ jobs:
           rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
           rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
 
-      - name: Prove managed plugin handoff
+      - name: Resolve the marketplace-installed plugin
+        id: installed
+        shell: bash
         env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: >-
-          python .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --plugin-root plugins/codestory
-          --plugin-handoff
-          --engine-policy cpu_explicit
-          --expected-backend CPU
-          --offline
-          --out-dir target/post-publish-managed-proof
+          MARKETPLACE_REPOSITORY: TheGreenCedar/AgentPluginMarketplace
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/codestory-installed-proof"
+          marketplace_root="$install_root/marketplace"
+          plugin_root="$install_root/plugin"
+          plugin_data="$install_root/plugin-data"
+          provenance="$install_root/provenance.json"
+          rm -rf "$install_root"
+          mkdir -p "$plugin_root" "$plugin_data"
+          git clone --depth 1 \
+            "https://github.com/${MARKETPLACE_REPOSITORY}.git" \
+            "$marketplace_root"
+          marketplace_commit="$(git -C "$marketplace_root" rev-parse HEAD)"
+          plugin_source_commit="$(
+            git ls-remote https://github.com/TheGreenCedar/CodeStory.git \
+              refs/heads/main | awk '{print $1}'
+          )"
+          release_commit="$(git rev-parse HEAD)"
+          if [ "$plugin_source_commit" != "$release_commit" ]; then
+            echo "::error::Marketplace source main is not the exact published release commit"
+            exit 1
+          fi
+          git archive --format=tar HEAD:plugins/codestory |
+            tar -xf - -C "$plugin_root"
+          python - \
+            "$marketplace_root/.agents/plugins/marketplace.json" \
+            "$plugin_root" \
+            "$provenance" \
+            "$marketplace_commit" \
+            "$plugin_source_commit" \
+            "${{ steps.release.outputs.version }}" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
 
-      - name: Prove published Intel macOS explicit CPU policy
-        if: matrix.asset_target == 'macos-x64'
-        env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: >-
-          python3 .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --engine-policy cpu_explicit
-          --expected-backend CPU
-          --offline
-          --out-dir target/post-publish-intel-policy-proof
+          (
+              catalog_path,
+              plugin_root_raw,
+              provenance_path,
+              marketplace_commit,
+              plugin_source_commit,
+              version,
+          ) = sys.argv[1:]
+          catalog = json.loads(pathlib.Path(catalog_path).read_text(encoding="utf-8"))
+          matches = [
+              plugin
+              for plugin in catalog.get("plugins", [])
+              if plugin.get("name") == "codestory"
+          ]
+          if len(matches) != 1:
+              raise SystemExit("marketplace must contain exactly one codestory plugin")
+          source = matches[0].get("source", {})
+          if source != {
+              "source": "git-subdir",
+              "url": "https://github.com/TheGreenCedar/CodeStory.git",
+              "path": "plugins/codestory",
+          }:
+              raise SystemExit("marketplace codestory source is not the release repository plugin")
+          plugin_root = pathlib.Path(plugin_root_raw)
+          digest = hashlib.sha256()
+          files = sorted(path for path in plugin_root.rglob("*") if path.is_file())
+          if not files:
+              raise SystemExit("installed plugin package is empty")
+          for path in files:
+              if path.is_symlink():
+                  raise SystemExit(f"installed plugin package contains a symlink: {path}")
+              relative = path.relative_to(plugin_root).as_posix().encode("utf-8")
+              payload = path.read_bytes()
+              digest.update(len(relative).to_bytes(8, "little"))
+              digest.update(relative)
+              digest.update(len(payload).to_bytes(8, "little"))
+              digest.update(payload)
+          document = {
+              "schema_version": 1,
+              "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
+              "marketplace_commit": marketplace_commit,
+              "plugin_id": "codestory",
+              "plugin_version": version,
+              "plugin_source_commit": plugin_source_commit,
+              "plugin_package_sha256": digest.hexdigest(),
+          }
+          pathlib.Path(provenance_path).write_text(
+              json.dumps(document, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          {
+            echo "plugin_root=$plugin_root"
+            echo "plugin_data=$plugin_data"
+            echo "provenance=$provenance"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Prove published Linux in-process agent runtime
-        if: matrix.asset_target == 'linux-x64'
+      - name: Qualify the marketplace-managed installed runtime
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: >-
-          python .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --plugin-root plugins/codestory
-          --plugin-handoff
-          --engine-policy cpu_explicit
-          --expected-backend CPU
-          --offline
-          --out-dir target/post-publish-agent-proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          matrix_cell="installed_${{ matrix.asset_target }}_cpu"
+          matrix_cell="${matrix_cell//-/_}"
+          quality_args=()
+          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
+          if [ -f "$quality_path" ]; then
+            quality_args=(--retrieval-quality-evidence "$quality_path")
+          fi
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "${{ steps.asset.outputs.archive }}" \
+            --checksum-file "${{ steps.asset.outputs.checksum }}" \
+            --expected-version "${{ steps.release.outputs.version }}" \
+            --project "${{ github.workspace }}" \
+            --plugin-root "${{ steps.installed.outputs.plugin_root }}" \
+            --plugin-handoff \
+            --engine-policy cpu_explicit \
+            --expected-backend CPU \
+            --proof-tier installed_runtime \
+            --qualification-matrix-cell "$matrix_cell" \
+            --produce-qualification-evidence \
+            --qualification-evidence target/post-publish-installed-proof/qualification.json \
+            --installed-plugin-provenance "${{ steps.installed.outputs.provenance }}" \
+            --installed-plugin-data "${{ steps.installed.outputs.plugin_data }}" \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            "${quality_args[@]}" \
+            --timeout-secs 3600 \
+            --out-dir target/post-publish-installed-proof
 
       - name: Upload post-publish proof artifacts
         if: always()
@@ -214,9 +317,7 @@ jobs:
           name: post-publish-proof-${{ matrix.asset_target }}-${{ steps.release.outputs.version }}
           path: |
             target/post-publish-version-proof/${{ matrix.asset_target }}
-            target/post-publish-managed-proof
-            target/post-publish-agent-proof
-            target/post-publish-intel-policy-proof
+            target/post-publish-installed-proof
             target/post-publish-macos-signing/${{ matrix.asset_target }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30

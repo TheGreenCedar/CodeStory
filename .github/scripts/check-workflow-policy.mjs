@@ -1435,10 +1435,58 @@ function validatePostPublish(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "smoke");
   const expected = expectedPackageRows(graph).map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
   add(violations, JSON.stringify(at(job, "strategy", "matrix", "include")) === JSON.stringify(expected), `${file} must smoke all six native assets`);
-  violations.push(...managedPluginViolations(
-    job,
+  const resolveInstalled = namedStep(job, "Resolve the marketplace-installed plugin");
+  requireStepRun(violations, file, job, "Resolve the marketplace-installed plugin", [
+    "TheGreenCedar/AgentPluginMarketplace",
+    "refs/heads/main",
+    "Marketplace source main is not the exact published release commit",
+    "plugin_source_commit",
+    "plugin_package_sha256",
+  ]);
+  add(
+    violations,
+    resolveInstalled?.if === undefined
+      && resolveInstalled?.["continue-on-error"] === undefined,
+    `${file} installed plugin resolution must be unconditional and fail closed`,
+  );
+  const installed = namedStep(job, "Qualify the marketplace-managed installed runtime");
+  add(violations, installed !== undefined, `${file} installed runtime proof step is missing`);
+  add(
+    violations,
+    installed?.if === undefined
+      && installed?.["continue-on-error"] === undefined,
+    `${file} installed runtime proof must be unconditional and fail closed`,
+  );
+  add(
+    violations,
+    object(installed?.env).CODESTORY_EMBED_ALLOW_CPU === "1",
+    `${file} installed runtime proof must explicitly allow CPU evidence`,
+  );
+  const installedRun = executableRunText(String(installed?.run ?? ""));
+  for (const fragment of [
+    "python .github/scripts/check-packaged-agent-proof.py",
     '--archive "${{ steps.asset.outputs.archive }}"',
-  ).map(message => `${file} ${message}`));
+    "--plugin-handoff",
+    "--engine-policy cpu_explicit",
+    "--expected-backend CPU",
+    "--proof-tier installed_runtime",
+    "--produce-qualification-evidence",
+    "--installed-plugin-provenance",
+    "--installed-plugin-data",
+    "--expected-source-sha",
+    "--expected-source-tree",
+  ]) {
+    add(
+      violations,
+      installedRun.includes(fragment),
+      `${file} installed runtime proof must run ${fragment}`,
+    );
+  }
+  add(
+    violations,
+    !installedRun.includes("--offline"),
+    `${file} installed runtime proof must allow the managed launcher to provision the release asset`,
+  );
   const macProof = namedStep(job, "Prove published macOS signature, notarization, and quarantined execution");
   requireStepRun(violations, file, job, "Prove published macOS signature, notarization, and quarantined execution", [
     "archive-quarantine.txt",
@@ -1449,7 +1497,6 @@ function validatePostPublish(workflows, violations, graph) {
   ]);
   violations.push(...macosCliDistributionViolations(macProof, macProof, '"$bin"').map(message => `${file} ${message}`));
   requireStepRun(violations, file, job, "Run Windows installer ownership self-test", ["scripts/install-codestory.ps1 -SelfTest"]);
-  requireStepRun(violations, file, job, "Prove published Intel macOS explicit CPU policy", ["--engine-policy cpu_explicit", "--expected-backend CPU", "--offline"]);
   add(violations, !scalarStrings(workflow).some(value => value.includes("sha256sum")), `${file} must use the portable Python checksum gate`);
 }
 
@@ -1482,10 +1529,18 @@ function validatePackagedCoordinator(workflows, violations) {
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${file} must call packaged proof`);
   violations.push(...packagedPrSigningViolations(workflow));
   const metal = requireJob(violations, file, workflow, "macos-metal-proof");
-  add(violations, sameMembers(needs(metal), ["route", "packaged-proof"]), `${file} Metal proof must wait for package proof`);
+  add(
+    violations,
+    sameMembers(needs(metal), ["route", "release-evidence", "packaged-proof"]),
+    `${file} Metal proof must wait for package and exact-head release evidence`,
+  );
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${file} Metal proof must use the packaged CLI`);
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
-  add(violations, sameMembers(needs(vulkan), ["route", "packaged-proof"]), `${file} Vulkan proof must wait for package proof`);
+  add(
+    violations,
+    sameMembers(needs(vulkan), ["route", "release-evidence", "packaged-proof"]),
+    `${file} Vulkan proof must wait for package and exact-head release evidence`,
+  );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   const closeout = requireJob(violations, file, workflow, "closeout");
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", ["dev/codestory-next moved from proved head"]);

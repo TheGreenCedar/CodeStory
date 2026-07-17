@@ -118,6 +118,12 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-embedding-server", hide = true)]
+    InternalEmbeddingServer,
+    #[command(name = "internal-embedding-qualification", hide = true)]
+    InternalEmbeddingQualification(InternalEmbeddingQualificationCommand),
+    #[command(name = "internal-embedding-qualification-worker", hide = true)]
+    InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
 }
 
 #[derive(Args, Debug)]
@@ -126,6 +132,14 @@ pub(crate) struct InternalOwnedDeleteCommand {
     pub(crate) root: PathBuf,
     #[arg(long, value_name = "RELATIVE_PATH")]
     pub(crate) relative: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalEmbeddingQualificationCommand {
+    #[arg(long, value_name = "PRIVATE_JSON")]
+    pub(crate) request: PathBuf,
+    #[arg(long, value_name = "PRIVATE_JSON")]
+    pub(crate) output: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2413,6 +2427,55 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
+    }
+
+    #[test]
+    fn embedding_server_entrypoint_is_parsable_but_hidden() {
+        let parsed = Cli::try_parse_from(["codestory-cli", "internal-embedding-server"])
+            .expect("hidden embedding server entrypoint should parse");
+        assert!(matches!(parsed.command, Command::InternalEmbeddingServer));
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help.contains("internal-embedding-server"),
+            "internal server entrypoint leaked into public help: {help}"
+        );
+
+        let qualification = Cli::try_parse_from([
+            "codestory-cli",
+            "internal-embedding-qualification",
+            "--request",
+            "/private/request.json",
+            "--output",
+            "/private/output.json",
+        ])
+        .expect("hidden embedding qualification entrypoint should parse");
+        assert!(matches!(
+            qualification.command,
+            Command::InternalEmbeddingQualification(_)
+        ));
+        assert!(
+            !help.contains("internal-embedding-qualification"),
+            "internal qualification entrypoint leaked into public help: {help}"
+        );
+
+        let worker = Cli::try_parse_from([
+            "codestory-cli",
+            "internal-embedding-qualification-worker",
+            "--request",
+            "/private/worker-request.json",
+            "--output",
+            "/private/worker-output.json",
+        ])
+        .expect("hidden embedding qualification worker should parse");
+        assert!(matches!(
+            worker.command,
+            Command::InternalEmbeddingQualificationWorker(_)
+        ));
+        assert!(
+            !help.contains("internal-embedding-qualification-worker"),
+            "internal qualification worker leaked into public help: {help}"
+        );
     }
 
     #[test]

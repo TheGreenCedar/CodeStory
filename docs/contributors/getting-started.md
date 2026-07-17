@@ -89,7 +89,7 @@ flowchart LR
 | `codestory-workspace` | Project discovery, inventories, refresh planning, repository identity |
 | `codestory-indexer` | Parsing, extraction, intermediate projections, semantic resolution |
 | `codestory-store` | SQLite source of truth, snapshots, projections, core publication |
-| `codestory-retrieval` | Lexical/vector/SCIP generations, manifests, query execution, in-process engine policy |
+| `codestory-retrieval` | Lexical/vector/SCIP generations, manifests, query execution, and the per-user embedding protocol/server |
 | `codestory-llama-sys` | The small Rust-to-llama.cpp/ggml boundary and embedded-model build contract |
 | `codestory-runtime` | Product orchestration for indexing, grounding, search, packets, and agent flows |
 | `codestory-cli` | Arguments, transports, rendering, process configuration, managed runtime boundary |
@@ -156,8 +156,9 @@ Use this loop only for packet/search, retrieval, ranking, or embedding work:
 ```
 
 Require `retrieval_mode: "full"` before treating packet/search output as
-product evidence. The in-process CodeRankEmbed engine initializes automatically. It has no
-endpoint, helper executable, port, or repair worker.
+product evidence. The CodeRankEmbed server starts automatically from the exact
+CLI over a private same-user UDS or named pipe. It has no TCP endpoint, separate
+helper executable, port, PID file, or repair worker.
 
 Useful diagnostic policies:
 

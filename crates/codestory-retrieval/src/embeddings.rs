@@ -1,16 +1,16 @@
-//! Fixed CodeRankEmbed vectors backed by the process-wide, linked llama.cpp engine.
+//! Fixed CodeRankEmbed vectors backed by the per-user embedding server.
 
 use crate::config::SidecarRuntimeConfig;
-use crate::in_process_embedding::{
-    ProcessEmbeddingIdentity, embed_prepared_in_process, embed_prepared_query_in_process,
+use crate::embedding_server_compat::{
+    ProductEmbeddingIdentity, embed_prepared_query_via_server, embed_prepared_via_server,
 };
 #[cfg(not(feature = "test-support"))]
-use crate::in_process_embedding::{
-    ProcessEmbeddingResidencyLease, acquire_process_embedding_residency,
-    process_embedding_identity, process_embedding_identity_if_initialized,
+use crate::embedding_server_compat::{
+    ProductEmbeddingServerLease, acquire_product_embedding_server_lease,
+    product_embedding_identity, product_embedding_identity_if_initialized,
 };
 use anyhow::{Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(test)]
 use std::sync::{
     Arc,
@@ -64,35 +64,43 @@ pub struct EmbeddingDeviceReadiness {
 pub struct EmbeddingEngineSnapshot {
     pub probe: EmbeddingRuntimeProbe,
     pub device: EmbeddingDeviceReadiness,
-    pub identity: Option<ProcessEmbeddingIdentity>,
+    pub identity: Option<ProductEmbeddingIdentity>,
 }
 
 #[derive(Debug)]
 pub struct ProductEmbeddingResidencyLease {
     #[cfg(not(feature = "test-support"))]
-    _inner: Option<ProcessEmbeddingResidencyLease>,
-    identity: Option<ProcessEmbeddingIdentity>,
+    inner: Option<ProductEmbeddingServerLease>,
+    identity: Option<ProductEmbeddingIdentity>,
     #[cfg(test)]
     drop_probe: Option<Arc<AtomicBool>>,
 }
 
 impl ProductEmbeddingResidencyLease {
-    pub(crate) fn identity(&self) -> Option<&ProcessEmbeddingIdentity> {
+    pub(crate) fn identity(&self) -> Option<&ProductEmbeddingIdentity> {
         self.identity.as_ref()
     }
 
     #[cfg(test)]
-    pub(crate) fn test_lease(identity: ProcessEmbeddingIdentity) -> (Self, Arc<AtomicBool>) {
+    pub(crate) fn test_lease(identity: ProductEmbeddingIdentity) -> (Self, Arc<AtomicBool>) {
         let active = Arc::new(AtomicBool::new(true));
         (
             Self {
                 #[cfg(not(feature = "test-support"))]
-                _inner: None,
+                inner: None,
                 identity: Some(identity),
                 drop_probe: Some(active.clone()),
             },
             active,
         )
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn revalidate(&self) -> Result<ProductEmbeddingIdentity> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("embedding publication lease is missing"))?
+            .revalidate()
     }
 }
 
@@ -105,28 +113,26 @@ impl Drop for ProductEmbeddingResidencyLease {
     }
 }
 
-/// Cheap cloneable handle into the one engine owned by this process.
+/// Compatibility handle into the per-user embedding server.
 #[derive(Debug, Clone)]
-pub struct InProcessEmbeddingClient {
-    cache_root: PathBuf,
-    allow_cpu: bool,
+pub struct ProductEmbeddingClient {
+    runtime: SidecarRuntimeConfig,
 }
 
-impl InProcessEmbeddingClient {
+impl ProductEmbeddingClient {
     pub fn new(runtime: &SidecarRuntimeConfig) -> Self {
         Self {
-            cache_root: runtime.cache_root.clone(),
-            allow_cpu: runtime.embedding.allow_cpu,
+            runtime: runtime.clone(),
         }
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        ensure_test_embedding_available(&self.cache_root)?;
+        ensure_test_embedding_available(&self.runtime.cache_root)?;
         if text.trim().is_empty() {
             bail!("cannot embed an empty query");
         }
         let prepared = format!("{CODERANK_QUERY_PREFIX_DEFAULT}{text}");
-        embed_prepared_query_in_process(&self.cache_root, self.allow_cpu, prepared)
+        embed_prepared_query_via_server(&self.runtime, prepared)
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -141,11 +147,11 @@ impl InProcessEmbeddingClient {
     }
 
     pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        ensure_test_embedding_available(&self.cache_root)?;
+        ensure_test_embedding_available(&self.runtime.cache_root)?;
         if texts.iter().any(|text| text.trim().is_empty()) {
             bail!("cannot embed empty text");
         }
-        embed_prepared_in_process(&self.cache_root, self.allow_cpu, texts)
+        embed_prepared_via_server(&self.runtime, texts)
     }
 }
 
@@ -166,7 +172,7 @@ pub fn semantic_vector_dim() -> usize {
 }
 
 pub fn embedding_backend_label() -> &'static str {
-    "inprocess"
+    "per_user_server"
 }
 
 pub fn embedding_backend_label_for_runtime(_runtime: &SidecarRuntimeConfig) -> &'static str {
@@ -174,14 +180,14 @@ pub fn embedding_backend_label_for_runtime(_runtime: &SidecarRuntimeConfig) -> &
 }
 
 pub fn embed_query_for_runtime(runtime: &SidecarRuntimeConfig, text: &str) -> Result<Vec<f32>> {
-    InProcessEmbeddingClient::new(runtime).embed_query(text)
+    ProductEmbeddingClient::new(runtime).embed_query(text)
 }
 
 pub fn embed_documents_for_runtime(
     runtime: &SidecarRuntimeConfig,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>> {
-    InProcessEmbeddingClient::new(runtime).embed_documents(texts)
+    ProductEmbeddingClient::new(runtime).embed_documents(texts)
 }
 
 #[cfg(test)]
@@ -203,8 +209,7 @@ pub fn ensure_product_embedding_backend_for_runtime(runtime: &SidecarRuntimeConf
     }
     #[cfg(not(feature = "test-support"))]
     {
-        let identity =
-            process_embedding_identity(&runtime.cache_root, runtime.embedding.allow_cpu)?;
+        let identity = product_embedding_identity(runtime)?;
         validate_identity(&identity, runtime.embedding.allow_cpu)
     }
 }
@@ -223,12 +228,11 @@ pub fn acquire_product_embedding_residency_for_runtime(
     }
     #[cfg(not(feature = "test-support"))]
     {
-        let lease =
-            acquire_process_embedding_residency(&runtime.cache_root, runtime.embedding.allow_cpu)?;
+        let lease = acquire_product_embedding_server_lease(runtime)?;
         let identity = lease.identity().clone();
         validate_identity(&identity, runtime.embedding.allow_cpu)?;
         Ok(ProductEmbeddingResidencyLease {
-            _inner: Some(lease),
+            inner: Some(lease),
             identity: Some(identity),
             #[cfg(test)]
             drop_probe: None,
@@ -285,10 +289,7 @@ pub fn embedding_engine_snapshot_for_runtime(
     #[cfg(not(feature = "test-support"))]
     {
         let started = Instant::now();
-        let observed = process_embedding_identity_if_initialized(
-            &runtime.cache_root,
-            runtime.embedding.allow_cpu,
-        );
+        let observed = product_embedding_identity_if_initialized(runtime);
         let elapsed_ms = Some(elapsed_ms(started));
         match observed {
             Ok(Some(identity)) => observed_engine_snapshot(runtime, elapsed_ms, identity),
@@ -307,7 +308,7 @@ pub fn embedding_engine_snapshot_for_runtime(
 fn observed_engine_snapshot(
     runtime: &SidecarRuntimeConfig,
     elapsed_ms: Option<u64>,
-    identity: ProcessEmbeddingIdentity,
+    identity: ProductEmbeddingIdentity,
 ) -> EmbeddingEngineSnapshot {
     if let Err(error) = validate_identity(&identity, runtime.embedding.allow_cpu) {
         return unavailable_engine_snapshot(runtime, elapsed_ms, error.to_string(), Some(identity));
@@ -327,7 +328,7 @@ fn unavailable_engine_snapshot(
     runtime: &SidecarRuntimeConfig,
     elapsed_ms: Option<u64>,
     detail: String,
-    identity: Option<ProcessEmbeddingIdentity>,
+    identity: Option<ProductEmbeddingIdentity>,
 ) -> EmbeddingEngineSnapshot {
     EmbeddingEngineSnapshot {
         probe: EmbeddingRuntimeProbe {
@@ -366,8 +367,7 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
     }
     #[cfg(not(feature = "test-support"))]
     {
-        let identity =
-            process_embedding_identity(&runtime.cache_root, runtime.embedding.allow_cpu)?;
+        let identity = product_embedding_identity(runtime)?;
         validate_identity(&identity, runtime.embedding.allow_cpu)?;
         if runtime.embedding.allow_cpu {
             return Ok(None);
@@ -381,7 +381,7 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
 }
 
 #[cfg(any(not(feature = "test-support"), test))]
-fn validate_identity(identity: &ProcessEmbeddingIdentity, allow_cpu: bool) -> Result<()> {
+fn validate_identity(identity: &ProductEmbeddingIdentity, allow_cpu: bool) -> Result<()> {
     if !identity.worker_alive {
         bail!("embedding engine worker is not running");
     }
@@ -449,7 +449,7 @@ fn validate_identity(identity: &ProcessEmbeddingIdentity, allow_cpu: bool) -> Re
 
 #[cfg(any(not(feature = "test-support"), test))]
 fn readiness_from_identity(
-    identity: &ProcessEmbeddingIdentity,
+    identity: &ProductEmbeddingIdentity,
     allow_cpu: bool,
 ) -> EmbeddingDeviceReadiness {
     let validation = validate_identity(identity, allow_cpu);
@@ -463,7 +463,7 @@ fn readiness_from_identity(
         } else {
             "unverified"
         },
-        observation_source: "inprocess_engine",
+        observation_source: "per_user_server",
         detected_provider: Some(identity.backend.clone()),
         detected_gpu: (!allow_cpu).then(|| identity.adapter_name.clone()),
         accelerator_requested: !allow_cpu,
@@ -479,7 +479,7 @@ fn unavailable_readiness(allow_cpu: bool, reason: &str) -> EmbeddingDeviceReadin
     EmbeddingDeviceReadiness {
         requested_policy: requested_policy(allow_cpu),
         observed_state: "unavailable",
-        observation_source: "inprocess_engine",
+        observation_source: "per_user_server",
         detected_provider: None,
         detected_gpu: None,
         accelerator_requested: !allow_cpu,
@@ -527,9 +527,10 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn identity(policy: &'static str) -> ProcessEmbeddingIdentity {
-        ProcessEmbeddingIdentity {
+    fn identity(policy: &'static str) -> ProductEmbeddingIdentity {
+        ProductEmbeddingIdentity {
             instance_id: "test".into(),
             load_generation: 1,
             model_load_count: 1,

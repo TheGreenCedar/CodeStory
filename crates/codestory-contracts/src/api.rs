@@ -64,6 +64,7 @@ pub use dto::{
 };
 pub use errors::{
     ApiError, ApiErrorDetails, COMMAND_FAILURE_SCHEMA_VERSION, CommandFailureEnvelope,
+    EmbeddingCapacityPressureDto,
 };
 pub use events::{AppEventPayload, IndexingPhaseTimings};
 pub use ids::{EdgeId, NodeId};

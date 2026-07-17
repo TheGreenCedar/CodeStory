@@ -31,8 +31,8 @@ There is no `index --semantic off` flag. Graph-native `symbol_search_doc` rows
 are part of the default index contract. Under `graph_first_v1`, dense vectors
 are only written for selected anchors such as entrypoints, public APIs,
 documented nontrivial symbols, central graph nodes, component reports, and
-unstructured docs. Product packet/search readiness uses the embedded in-process
-CodeRankEmbed engine.
+unstructured docs. Product packet/search readiness uses the embedded
+CodeRankEmbed engine through its private per-user server.
 
 High-signal environment toggles:
 

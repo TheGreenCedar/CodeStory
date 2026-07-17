@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "bootstrap": {
+    "magic": "CSEB",
+    "version": 1
+  },
+  "framing": {
+    "binary_element_type": "f32_le",
+    "binary_layout": "row_major",
+    "metadata_length": "u32_be",
+    "payload_length": "u32_be"
+  },
+  "limits": {
+    "maximum_document_count": 2048,
+    "maximum_input_bytes": 1048576,
+    "maximum_metadata_bytes": 16777216,
+    "maximum_payload_bytes": 16777216,
+    "response_payload_count": 1
+  },
+  "lifecycle_states": [
+    "absent",
+    "draining",
+    "exited",
+    "listening",
+    "resident",
+    "sleeping",
+    "unreachable",
+    "waking"
+  ],
+  "operations": [
+    "AcquireLease",
+    "Cancel",
+    "EmbedDocuments",
+    "EmbedQuery",
+    "EnsureResident",
+    "Hello",
+    "ReleaseLease",
+    "Snapshot"
+  ],
+  "response_statuses": [
+    "busy",
+    "cancelled",
+    "deadline_exceeded",
+    "draining",
+    "engine_stalled",
+    "engine_unavailable",
+    "incompatible",
+    "internal_error",
+    "ok",
+    "protocol_error"
+  ],
+  "retry_classes": [
+    "after_capacity_change",
+    "after_delay",
+    "after_owner_idle",
+    "after_server_change",
+    "none",
+    "same_rpc_once",
+    "terminal"
+  ],
+  "privacy": {
+    "project_path_allowed": false,
+    "project_root_allowed": false,
+    "repository_path_allowed": false,
+    "request_text_allowed_in_diagnostics": false
+  },
+  "publication": {
+    "pure_embedding_rpc_replay_limit": 1,
+    "lease_operations_replayed": false,
+    "lease_scope": [
+      "authenticated_connection",
+      "server_instance",
+      "load_generation"
+    ],
+    "lease_revalidation": {
+      "operation": "Snapshot",
+      "returns_optional_engine_identity": true,
+      "returns_optional_lease_identity": true
+    },
+    "manifest_last_revalidation": [
+      "connection",
+      "peer_and_executable",
+      "protocol",
+      "server_instance",
+      "lease",
+      "producer_model_backend_policy_execution",
+      "load_generation",
+      "source",
+      "core",
+      "retrieval",
+      "candidate_publication"
+    ]
+  }
+}

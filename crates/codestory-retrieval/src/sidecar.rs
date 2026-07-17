@@ -29,7 +29,7 @@ pub fn sidecar_status(
     )
 }
 
-/// Validate generation identity and in-process embedding readiness.
+/// Validate generation identity and managed per-user embedding readiness.
 pub fn strict_sidecar_status(
     project_root: &Path,
     storage_path: Option<&Path>,
@@ -236,7 +236,7 @@ pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
     producer_compatibility_identity: &str,
 ) -> Result<()> {
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)
-        .context("initialize in-process embedding engine")?;
+        .context("connect managed per-user embedding server")?;
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
     let Some(manifest) = storage
         .get_retrieval_index_manifest(&project_id)

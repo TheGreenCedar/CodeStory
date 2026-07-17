@@ -1,4 +1,4 @@
-//! Retrieval generations, in-process embeddings, health probes, and index manifests.
+//! Retrieval generations, managed per-user embeddings, health probes, and index manifests.
 //!
 //! A result with
 //! `retrieval_mode=full` means the manifest, lexical index, graph artifacts, and dense-anchor
@@ -15,17 +15,18 @@ mod capabilities;
 mod config;
 mod embedded_vector;
 mod embedding_contract;
+mod embedding_server_compat;
 mod embeddings;
 mod executor;
 mod generation;
 mod health;
-mod in_process_embedding;
 mod index;
 mod inventory;
 mod lexical_client;
 mod lexical_index;
 mod mode;
 pub mod outbound_http;
+mod per_user_embedding;
 mod planner;
 mod process_identity;
 mod query;
@@ -57,8 +58,8 @@ pub use config::{
 pub use embeddings::TEST_EMBEDDING_UNAVAILABLE_MARKER;
 pub use embeddings::{
     CODERANK_EMBED_Q8_GGUF, CODERANK_QUERY_PREFIX_DEFAULT, EmbeddingAcceleratorSmoke,
-    EmbeddingDeviceReadiness, EmbeddingRuntimeProbe, InProcessEmbeddingClient,
-    PRODUCT_EMBEDDING_RUNTIME_ID, RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime,
+    EmbeddingDeviceReadiness, EmbeddingRuntimeProbe, PRODUCT_EMBEDDING_RUNTIME_ID,
+    ProductEmbeddingClient, RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime,
     embed_query_for_runtime, embedding_backend_label, embedding_backend_label_for_runtime,
     embedding_runtime_id, embedding_runtime_id_for_runtime,
     ensure_embedding_accelerator_smoke_for_runtime, ensure_product_embedding_backend,
@@ -75,10 +76,6 @@ pub use health::{
     RetrievalManifestLaneProvenance, RetrievalStatusReport, probe_infrastructure_health,
     probe_sidecar_health,
 };
-pub use in_process_embedding::{
-    ProcessEmbeddingIdentity, process_embedding_identity,
-    process_embedding_identity_if_initialized, shutdown_process_embedding_engine,
-};
 pub use index::{
     FinalizeIndexOutcome, finalize_index, finalize_index_for_runtime,
     finalize_index_for_runtime_with_cancel, finalize_index_for_runtime_with_progress,
@@ -93,6 +90,30 @@ pub use lexical_client::LexicalClient;
 pub use lexical_index::LEXICAL_INDEX_VERSION;
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
+pub use per_user_embedding::{
+    AwakeMonotonicClock, EmbeddingCapacityPressureWire, EmbeddingClientBudgets,
+    EmbeddingClientTransport, EmbeddingCompatibility, EmbeddingConnectIntent,
+    EmbeddingConnectOutcome, EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity,
+    EmbeddingExecutableIdentity, EmbeddingOperation, EmbeddingProtocolError,
+    EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingQualificationOperationResult,
+    EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
+    EmbeddingResult, EmbeddingServerActiveRequestSnapshot, EmbeddingServerAuthoritySnapshot,
+    EmbeddingServerBindOutcome, EmbeddingServerBudgets, EmbeddingServerClockSnapshot,
+    EmbeddingServerEngineSnapshot, EmbeddingServerFailureSnapshot, EmbeddingServerListener,
+    EmbeddingServerProcessSnapshot, EmbeddingServerProtocolSnapshot,
+    EmbeddingServerSchedulerSnapshot, EmbeddingServerSnapshot, EmbeddingServerStream,
+    EmbeddingServerTransport, EmbeddingTransportFailure, EmbeddingTransportIdentity,
+    PER_USER_EMBEDDING_BOOTSTRAP_VERSION, PER_USER_EMBEDDING_CONSTANT_SET_FROZEN,
+    PER_USER_EMBEDDING_CONSTANT_SET_SHA256, PER_USER_EMBEDDING_MAX_DOCUMENT_COUNT,
+    PER_USER_EMBEDDING_MAX_INPUT_BYTES, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
+    PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES, PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256,
+    PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_SHA256,
+    PER_USER_EMBEDDING_PROTOCOL_V1, PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS,
+    PER_USER_EMBEDDING_SERVER_PROOF_MARKER, PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
+    PerUserEmbeddingClient, PerUserEmbeddingError, PerUserEmbeddingResidencyLease,
+    PerUserEmbeddingServerConfig, embedding_capacity_pressure, install_embedding_client_transport,
+    run_per_user_embedding_qualification, run_per_user_embedding_server,
+};
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, probe_process_start_identity, process_owner_state,

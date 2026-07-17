@@ -117,9 +117,9 @@ export function cacheProvenanceBlockers(result) {
   if (!provenance.semantic_generation) {
     reasons.push("missing CodeStory semantic generation");
   }
-  if (!String(provenance.manifest_embedding_backend ?? "").startsWith("inprocess:coderank-embed:q8_0:sha256-")) {
+  if (!String(provenance.manifest_embedding_backend ?? "").startsWith("per-user-server:coderank-embed:q8_0:sha256-")) {
     reasons.push(
-      `CodeStory embedding runtime=${provenance.manifest_embedding_backend ?? "unknown"}; expected the pinned in-process CodeRankEmbed runtime`,
+      `CodeStory embedding runtime=${provenance.manifest_embedding_backend ?? "unknown"}; expected the pinned per-user CodeRankEmbed server runtime`,
     );
   }
   if (!provenance.embedding_engine_instance_id) {

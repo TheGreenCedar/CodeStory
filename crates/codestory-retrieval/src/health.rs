@@ -437,9 +437,10 @@ pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> Infrastruc
         embedding_model_load_count: identity.as_ref().map(|identity| identity.model_load_count),
         embedding_smoke_ms: identity.as_ref().map(|identity| identity.smoke_ms),
         embedding_initialization_ms: identity.as_ref().map(|identity| identity.initialization_ms),
-        embedding_materialized_path: identity
-            .as_ref()
-            .map(|identity| identity.materialized_path.display().to_string()),
+        embedding_materialized_path: identity.as_ref().and_then(|identity| {
+            (!identity.materialized_path.as_os_str().is_empty())
+                .then(|| identity.materialized_path.display().to_string())
+        }),
         embedding_materialized_reused: identity
             .as_ref()
             .map(|identity| identity.materialized_reused),
@@ -656,7 +657,7 @@ pub fn probe_sidecar_health_for_runtime(
                 ComponentStatus::Unavailable
             },
             latency_ms: Some(embedded.latency_ms),
-            detail: format!("{}; in-process embedding engine", embedded.detail),
+            detail: format!("{}; managed per-user embedding server", embedded.detail),
             degraded_reason,
             capabilities: if embedded.ready
                 && product_embedding_backend
@@ -974,7 +975,7 @@ mod tests {
         let semantic = zero_dense_semantic_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "cpu_explicit",
             observed_state: "cpu_explicit",
-            observation_source: "inprocess_engine",
+            observation_source: "per_user_server",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,
@@ -1027,7 +1028,7 @@ mod tests {
             stored_doc_vector_mixed_backends: None,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
-            embedding_device_observation_source: "inprocess_engine".into(),
+            embedding_device_observation_source: "per_user_server".into(),
             embedding_detected_provider: None,
             embedding_detected_gpu: None,
             embedding_accelerator_requested: false,

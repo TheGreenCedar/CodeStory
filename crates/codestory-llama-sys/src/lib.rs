@@ -1,6 +1,15 @@
 //! CodeStory-owned boundary around the packaged llama.cpp runtime.
 
-use crossbeam_channel::{Receiver, Sender, after, bounded, select_biased, unbounded};
+mod admission;
+
+pub use admission::{
+    EMBEDDING_BULK_QUEUE_CAPACITY, EMBEDDING_QUERY_QUEUE_CAPACITY, EmbeddingActiveRequestSnapshot,
+    EmbeddingAdmissionSnapshot, EmbeddingCapacityPressure, EmbeddingCapacityReason,
+    EmbeddingOwnerState, EmbeddingRequestClass, EmbeddingRequestContext,
+};
+
+use admission::EmbeddingAdmissionTracker;
+use crossbeam_channel::{Receiver, Sender, TryRecvError, after, bounded, select_biased, unbounded};
 use fs4::fs_std::FileExt;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType};
@@ -16,13 +25,13 @@ use llama_cpp_2::{
 };
 use llama_cpp_sys_2 as llama_sys;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,12 +39,47 @@ use thiserror::Error;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_model.rs"));
 include!(concat!(env!("OUT_DIR"), "/model_contract.rs"));
+include!(concat!(env!("OUT_DIR"), "/embedding_server_contract.rs"));
 
-const REQUEST_QUEUE_CAPACITY: usize = 64;
 const ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static QUALIFICATION_NATIVE_STALL: AtomicBool = AtomicBool::new(false);
+static QUALIFICATION_QUERY_HOLD: AtomicBool = AtomicBool::new(false);
+static QUALIFICATION_BULK_HOLD: AtomicBool = AtomicBool::new(false);
 const EXECUTION_OBSERVATION_SOURCE: &str = "ggml_eval_callback";
+
+#[doc(hidden)]
+pub fn set_embedding_qualification_native_stall(stalled: bool) {
+    if embedding_qualification_gate_open() {
+        QUALIFICATION_NATIVE_STALL.store(stalled, Ordering::Release);
+    }
+}
+
+#[doc(hidden)]
+pub fn set_embedding_qualification_class_hold(request_class: EmbeddingRequestClass, held: bool) {
+    if !embedding_qualification_gate_open() {
+        return;
+    }
+    match request_class {
+        EmbeddingRequestClass::Query => QUALIFICATION_QUERY_HOLD.store(held, Ordering::Release),
+        EmbeddingRequestClass::Bulk => QUALIFICATION_BULK_HOLD.store(held, Ordering::Release),
+    }
+}
+
+fn embedding_qualification_gate_open() -> bool {
+    std::env::var_os("CODESTORY_EMBED_QUALIFICATION_DIR").is_some_and(|value| !value.is_empty())
+        && std::env::var_os("CODESTORY_EMBED_QUALIFICATION_NONCE")
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn embedding_qualification_request_held(request_class: EmbeddingRequestClass) -> bool {
+    QUALIFICATION_NATIVE_STALL.load(Ordering::Acquire)
+        || match request_class {
+            EmbeddingRequestClass::Query => QUALIFICATION_QUERY_HOLD.load(Ordering::Acquire),
+            EmbeddingRequestClass::Bulk => QUALIFICATION_BULK_HOLD.load(Ordering::Acquire),
+        }
+}
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn load_packaged_backend_modules() -> Result<(), EngineError> {
@@ -89,6 +133,16 @@ pub enum EngineError {
     WorkerUnavailable(String),
     #[error("llama.cpp returned {actual} dimensions; expected {expected}")]
     Dimension { expected: usize, actual: usize },
+    #[error(
+        "embedding {class} queue is full (depth={depth} capacity={capacity}); retry when {retry_condition}",
+        class = pressure.request_class.as_str(),
+        depth = pressure.depth,
+        capacity = pressure.capacity,
+        retry_condition = pressure.retry_condition
+    )]
+    AdmissionFull { pressure: EmbeddingCapacityPressure },
+    #[error("embedding request was cancelled before its result committed")]
+    Cancelled,
 }
 
 impl EngineError {
@@ -108,6 +162,15 @@ impl EngineError {
             Self::InputTooLong { .. } => "native_embedding_input_too_long",
             Self::WorkerUnavailable(_) => "native_engine_worker_unavailable",
             Self::Dimension { .. } => "native_embedding_dimension_mismatch",
+            Self::AdmissionFull { .. } => "embedding_admission_full",
+            Self::Cancelled => "embedding_request_cancelled",
+        }
+    }
+
+    pub fn capacity_pressure(&self) -> Option<&EmbeddingCapacityPressure> {
+        match self {
+            Self::AdmissionFull { pressure } => Some(pressure),
+            _ => None,
         }
     }
 }
@@ -622,6 +685,49 @@ pub struct EmbeddingResidencyLease {
     snapshot: EngineLifecycleSnapshot,
 }
 
+pub struct EmbeddingRequestHandle {
+    context: EmbeddingRequestContext,
+    result: Receiver<Result<Vec<Vec<f32>>, EngineError>>,
+}
+
+pub type EmbeddingRequestResult = Result<Vec<Vec<f32>>, EngineError>;
+
+impl std::fmt::Debug for EmbeddingRequestHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddingRequestHandle")
+            .field("request_id", &self.context.request_id())
+            .field("scope_id", &self.context.scope_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddingRequestHandle {
+    pub fn context(&self) -> &EmbeddingRequestContext {
+        &self.context
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.context.cancel()
+    }
+
+    pub fn recv(self) -> Result<Vec<Vec<f32>>, EngineError> {
+        self.result
+            .recv()
+            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?
+    }
+
+    pub fn try_recv(&self) -> Result<Option<EmbeddingRequestResult>, EngineError> {
+        match self.result.try_recv() {
+            Ok(result) => Ok(Some(result)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(EngineError::WorkerUnavailable(
+                "embedding response channel disconnected".into(),
+            )),
+        }
+    }
+}
+
 impl std::fmt::Debug for EmbeddingResidencyLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -639,6 +745,7 @@ impl EmbeddingResidencyLease {
 
 impl Drop for EmbeddingResidencyLease {
     fn drop(&mut self) {
+        self.shared.admission.lease_released();
         let _ = self.shared.control_sender.send(Control::ReleaseLease);
     }
 }
@@ -653,9 +760,10 @@ impl std::fmt::Debug for EmbeddingEngine {
 }
 
 struct EngineShared {
-    query_sender: Sender<EmbeddingRequest>,
-    bulk_sender: Sender<EmbeddingRequest>,
+    query_queue: Arc<CancellableRequestQueue>,
+    bulk_queue: Arc<CancellableRequestQueue>,
     control_sender: Sender<Control>,
+    admission: Arc<EmbeddingAdmissionTracker>,
     lifecycle: Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -680,8 +788,80 @@ impl EngineShared {
 }
 
 struct EmbeddingRequest {
+    context: EmbeddingRequestContext,
     inputs: Vec<String>,
     response: Sender<Result<Vec<Vec<f32>>, EngineError>>,
+}
+
+struct CancellableRequestQueue {
+    capacity: usize,
+    requests: Mutex<VecDeque<EmbeddingRequest>>,
+    signal_sender: Sender<()>,
+    signal_receiver: Receiver<()>,
+}
+
+impl CancellableRequestQueue {
+    fn new(capacity: usize) -> Arc<Self> {
+        let (signal_sender, signal_receiver) = bounded(1);
+        Arc::new(Self {
+            capacity,
+            requests: Mutex::new(VecDeque::with_capacity(capacity)),
+            signal_sender,
+            signal_receiver,
+        })
+    }
+
+    fn try_push(&self, request: EmbeddingRequest) -> Result<(), EmbeddingRequest> {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_cancelled(&mut requests);
+        if requests.len() >= self.capacity {
+            return Err(request);
+        }
+        requests.push_back(request);
+        let _ = self.signal_sender.try_send(());
+        Ok(())
+    }
+
+    fn try_pop(&self) -> Option<EmbeddingRequest> {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_cancelled(&mut requests);
+        let request = requests.pop_front();
+        if !requests.is_empty() {
+            let _ = self.signal_sender.try_send(());
+        }
+        request
+    }
+
+    fn len(&self) -> usize {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_cancelled(&mut requests);
+        requests.len()
+    }
+
+    fn signal(&self) -> &Receiver<()> {
+        &self.signal_receiver
+    }
+
+    fn prune_cancelled(requests: &mut VecDeque<EmbeddingRequest>) {
+        let mut retained = VecDeque::with_capacity(requests.capacity());
+        while let Some(request) = requests.pop_front() {
+            if request.context.is_cancelled() {
+                let _ = request.response.send(Err(EngineError::Cancelled));
+            } else {
+                retained.push_back(request);
+            }
+        }
+        *requests = retained;
+    }
 }
 
 enum Control {
@@ -707,12 +887,16 @@ impl EmbeddingEngine {
         config: EmbeddingEngineConfig,
     ) -> Result<Self, EngineError> {
         validate_engine_config(&config)?;
-        let (query_sender, query_receiver) = bounded(REQUEST_QUEUE_CAPACITY);
-        let (bulk_sender, bulk_receiver) = bounded(REQUEST_QUEUE_CAPACITY);
+        let query_queue = CancellableRequestQueue::new(EMBEDDING_QUERY_QUEUE_CAPACITY);
+        let bulk_queue = CancellableRequestQueue::new(EMBEDDING_BULK_QUEUE_CAPACITY);
         let (control_sender, control_receiver) = unbounded();
         let (startup_sender, startup_receiver) = bounded(1);
         let lifecycle = Arc::new(Mutex::new(None));
+        let admission = Arc::new(EmbeddingAdmissionTracker::default());
         let worker_lifecycle = lifecycle.clone();
+        let worker_admission = Arc::clone(&admission);
+        let worker_query_queue = Arc::clone(&query_queue);
+        let worker_bulk_queue = Arc::clone(&bulk_queue);
         let cache_root = cache_root.to_path_buf();
         let worker = thread::Builder::new()
             .name("codestory-embedding-engine".into())
@@ -721,10 +905,11 @@ impl EmbeddingEngine {
                     &cache_root,
                     &config,
                     &startup_sender,
-                    &query_receiver,
-                    &bulk_receiver,
+                    &worker_query_queue,
+                    &worker_bulk_queue,
                     &control_receiver,
                     &worker_lifecycle,
+                    &worker_admission,
                 ) {
                     let _ = startup_sender.try_send(Err(error));
                 }
@@ -743,9 +928,10 @@ impl EmbeddingEngine {
         }
         Ok(Self {
             shared: Arc::new(EngineShared {
-                query_sender,
-                bulk_sender,
+                query_queue,
+                bulk_queue,
                 control_sender,
+                admission,
                 lifecycle,
                 worker: Mutex::new(Some(worker)),
             }),
@@ -792,6 +978,7 @@ impl EmbeddingEngine {
         let snapshot = result
             .recv()
             .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))??;
+        self.shared.admission.lease_acquired();
         Ok(EmbeddingResidencyLease {
             shared: self.shared.clone(),
             snapshot,
@@ -799,7 +986,8 @@ impl EmbeddingEngine {
     }
 
     pub fn embed_query_prepared(&self, input: String) -> Result<Vec<f32>, EngineError> {
-        let mut vectors = self.request(vec![input], RequestPriority::Query)?;
+        let context = EmbeddingRequestContext::new("local-query", "local-process", 0);
+        let mut vectors = self.submit_query_prepared(context, input)?.recv()?;
         vectors
             .pop()
             .ok_or_else(|| EngineError::Llama("embedding worker returned no query vector".into()))
@@ -809,44 +997,105 @@ impl EmbeddingEngine {
         &self,
         inputs: &[String],
     ) -> Result<Vec<Vec<f32>>, EngineError> {
-        self.request(inputs.to_vec(), RequestPriority::Bulk)
+        let context = EmbeddingRequestContext::new("local-bulk", "local-process", 0);
+        self.submit_documents_prepared(context, inputs.to_vec())?
+            .recv()
     }
 
     pub fn embed_prepared(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, EngineError> {
         self.embed_documents_prepared(inputs)
     }
 
-    fn request(
+    pub fn submit_query_prepared(
         &self,
+        context: EmbeddingRequestContext,
+        input: String,
+    ) -> Result<EmbeddingRequestHandle, EngineError> {
+        self.submit(context, vec![input], RequestPriority::Query)
+    }
+
+    pub fn submit_documents_prepared(
+        &self,
+        context: EmbeddingRequestContext,
+        inputs: Vec<String>,
+    ) -> Result<EmbeddingRequestHandle, EngineError> {
+        self.submit(context, inputs, RequestPriority::Bulk)
+    }
+
+    pub fn admission_snapshot(&self) -> EmbeddingAdmissionSnapshot {
+        self.shared
+            .admission
+            .snapshot(self.shared.query_queue.len(), self.shared.bulk_queue.len())
+    }
+
+    pub fn begin_draining_if_idle(&self) -> bool {
+        let snapshot = self.admission_snapshot();
+        if snapshot.query_depth != 0
+            || snapshot.bulk_depth != 0
+            || snapshot.active_request_count != 0
+            || snapshot.lease_count != 0
+        {
+            return false;
+        }
+        self.shared
+            .admission
+            .set_owner_state(EmbeddingOwnerState::Draining);
+        true
+    }
+
+    fn submit(
+        &self,
+        context: EmbeddingRequestContext,
         inputs: Vec<String>,
         priority: RequestPriority,
-    ) -> Result<Vec<Vec<f32>>, EngineError> {
+    ) -> Result<EmbeddingRequestHandle, EngineError> {
         if inputs.is_empty() {
-            return Ok(Vec::new());
+            let (response, result) = bounded(1);
+            let _ = response.send(Ok(Vec::new()));
+            return Ok(EmbeddingRequestHandle { context, result });
         }
         let (response, result) = bounded(1);
-        let request = EmbeddingRequest { inputs, response };
-        let sender = match priority {
-            RequestPriority::Query => &self.shared.query_sender,
-            RequestPriority::Bulk => &self.shared.bulk_sender,
+        let request = EmbeddingRequest {
+            context: context.clone(),
+            inputs,
+            response,
         };
-        sender
-            .send(request)
-            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?;
-        result
-            .recv()
-            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?
+        let queue = match priority {
+            RequestPriority::Query => &self.shared.query_queue,
+            RequestPriority::Bulk => &self.shared.bulk_queue,
+        };
+        match queue.try_push(request) {
+            Ok(()) => Ok(EmbeddingRequestHandle { context, result }),
+            Err(_) => {
+                let request_class = match priority {
+                    RequestPriority::Query => EmbeddingRequestClass::Query,
+                    RequestPriority::Bulk => EmbeddingRequestClass::Bulk,
+                };
+                Err(EngineError::AdmissionFull {
+                    pressure: self.shared.admission.pressure(
+                        EmbeddingCapacityReason::QueueFull,
+                        request_class,
+                        self.shared.query_queue.len(),
+                        self.shared.bulk_queue.len(),
+                        context.retry_after_ms(),
+                        "a queued request completes, is cancelled, or the server instance changes",
+                    ),
+                })
+            }
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_engine_owner(
     cache_root: &Path,
     config: &EmbeddingEngineConfig,
     startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
-    query_receiver: &Receiver<EmbeddingRequest>,
-    bulk_receiver: &Receiver<EmbeddingRequest>,
+    query_queue: &Arc<CancellableRequestQueue>,
+    bulk_queue: &Arc<CancellableRequestQueue>,
     control_receiver: &Receiver<Control>,
     lifecycle: &Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
+    admission: &Arc<EmbeddingAdmissionTracker>,
 ) -> Result<(), EngineError> {
     let mut wake = WakeReason::Startup;
     let mut load_generation = 0;
@@ -858,21 +1107,24 @@ fn run_engine_owner(
             wake,
             load_generation + 1,
             startup,
-            query_receiver,
-            bulk_receiver,
+            query_queue,
+            bulk_queue,
             control_receiver,
             lifecycle,
+            admission,
         );
         trim_unloaded_engine_working_set();
         match result {
             ResidentRunResult::Sleeping(mut snapshot) => {
                 load_generation = snapshot.load_generation;
                 snapshot.residency = EngineResidency::Sleeping;
+                admission.set_owner_state(EmbeddingOwnerState::Sleeping);
                 publish_lifecycle(lifecycle, snapshot.clone())?;
                 last_snapshot = Some(snapshot);
             }
             ResidentRunResult::Shutdown(mut snapshot) => {
                 snapshot.worker_alive = false;
+                admission.set_owner_state(EmbeddingOwnerState::Draining);
                 publish_lifecycle(lifecycle, snapshot)?;
                 return Ok(());
             }
@@ -880,6 +1132,7 @@ fn run_engine_owner(
                 if let Some(snapshot) = last_snapshot.as_mut() {
                     snapshot.residency = EngineResidency::Sleeping;
                     snapshot.load_error = Some(error.to_string());
+                    admission.set_owner_state(EmbeddingOwnerState::Sleeping);
                     publish_lifecycle(lifecycle, snapshot.clone())?;
                 }
                 if fail_wake(wake, startup, error) {
@@ -888,7 +1141,8 @@ fn run_engine_owner(
             }
         }
 
-        let Some(next_wake) = wait_for_wake(query_receiver, bulk_receiver, control_receiver) else {
+        let Some(next_wake) = wait_for_wake(query_queue, bulk_queue, control_receiver, admission)
+        else {
             if let Some(mut snapshot) = last_snapshot {
                 snapshot.worker_alive = false;
                 publish_lifecycle(lifecycle, snapshot)?;
@@ -977,14 +1231,16 @@ fn run_resident_generation(
     wake: WakeReason,
     load_generation: u64,
     startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
-    query_receiver: &Receiver<EmbeddingRequest>,
-    bulk_receiver: &Receiver<EmbeddingRequest>,
+    query_queue: &Arc<CancellableRequestQueue>,
+    bulk_queue: &Arc<CancellableRequestQueue>,
     control_receiver: &Receiver<Control>,
     lifecycle: &Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
+    admission: &Arc<EmbeddingAdmissionTracker>,
 ) -> ResidentRunResult {
     let mut pending_wake = Some(wake);
     let result = (|| -> Result<ResidentRunResult, EngineError> {
         let started = Instant::now();
+        admission.set_owner_state(EmbeddingOwnerState::Waking);
         let materialized = materialize_embedded_model(cache_root)?;
         send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
         load_packaged_backend_modules()?;
@@ -1031,15 +1287,20 @@ fn run_resident_generation(
             .find(|candidate| candidate.index == device.index)
             .map_or(device.memory_free, |candidate| candidate.memory_free);
         let smoke_started = Instant::now();
+        let smoke_context = EmbeddingRequestContext::new("engine-startup-smoke", "engine-owner", 0);
+        let _ = smoke_context.activate();
         let smoke = embed_inputs(
             &model,
             &mut context,
             &telemetry,
             std::slice::from_ref(&config.embedding.smoke_input),
             RequestPriority::Query,
-            query_receiver,
+            query_queue,
             &config.embedding,
+            admission,
+            &smoke_context,
         )?;
+        let _ = smoke_context.commit();
         if smoke
             .first()
             .is_none_or(|vector| vector.len() != config.embedding.dimension)
@@ -1124,12 +1385,13 @@ fn run_resident_generation(
             worker_alive: true,
             load_error: None,
         };
+        admission.set_owner_state(EmbeddingOwnerState::Ready);
         publish_lifecycle(lifecycle, snapshot.clone())?;
 
         let channels = ResidentChannels {
             startup,
-            query: query_receiver,
-            bulk: bulk_receiver,
+            query: query_queue,
+            bulk: bulk_queue,
             control: control_receiver,
         };
         let mut live_snapshot = snapshot.clone();
@@ -1147,8 +1409,9 @@ fn run_resident_generation(
                     &model,
                     &mut context,
                     &telemetry,
-                    query_receiver,
+                    query_queue,
                     &config.embedding,
+                    admission,
                 );
                 if let Ok(observation) = telemetry.observation() {
                     apply_live_observation(&mut live_snapshot.identity, observation);
@@ -1171,8 +1434,8 @@ fn run_resident_generation(
 
 struct ResidentChannels<'a> {
     startup: &'a Sender<Result<EngineLifecycleSnapshot, EngineError>>,
-    query: &'a Receiver<EmbeddingRequest>,
-    bulk: &'a Receiver<EmbeddingRequest>,
+    query: &'a CancellableRequestQueue,
+    bulk: &'a CancellableRequestQueue,
     control: &'a Receiver<Control>,
 }
 
@@ -1221,15 +1484,21 @@ fn serve_resident_generation(
                 }
                 Ok(Control::ReleaseLease) => tracker.release_lease(Instant::now()),
             },
-            recv(channels.query) -> request => match request {
-                Ok(request) => {
+            recv(channels.query.signal()) -> signal => match signal {
+                Ok(()) => {
+                    let Some(request) = channels.query.try_pop() else {
+                        continue;
+                    };
                     handle(request, RequestPriority::Query);
                     tracker.complete_activity(Instant::now());
                 }
                 Err(_) => return ResidentRunResult::Shutdown(snapshot.clone()),
             },
-            recv(channels.bulk) -> request => match request {
-                Ok(request) => {
+            recv(channels.bulk.signal()) -> signal => match signal {
+                Ok(()) => {
+                    let Some(request) = channels.bulk.try_pop() else {
+                        continue;
+                    };
                     handle(request, RequestPriority::Bulk);
                     tracker.complete_activity(Instant::now());
                 }
@@ -1276,9 +1545,10 @@ fn fail_wake(
 }
 
 fn wait_for_wake(
-    query_receiver: &Receiver<EmbeddingRequest>,
-    bulk_receiver: &Receiver<EmbeddingRequest>,
+    query_queue: &CancellableRequestQueue,
+    bulk_queue: &CancellableRequestQueue,
     control_receiver: &Receiver<Control>,
+    admission: &EmbeddingAdmissionTracker,
 ) -> Option<WakeReason> {
     loop {
         select_biased! {
@@ -1292,11 +1562,33 @@ fn wait_for_wake(
                 }
                 Ok(Control::ReleaseLease) => {}
             },
-            recv(query_receiver) -> request => {
-                return request.ok().map(WakeReason::Query);
+            recv(query_queue.signal()) -> signal => {
+                if signal.is_ok() {
+                    let Some(request) = query_queue.try_pop() else {
+                        continue;
+                    };
+                    if request.context.is_cancelled() {
+                        admission.cancelled();
+                        let _ = request.response.send(Err(EngineError::Cancelled));
+                        continue;
+                    }
+                    return Some(WakeReason::Query(request));
+                }
+                return None;
             },
-            recv(bulk_receiver) -> request => {
-                return request.ok().map(WakeReason::Bulk);
+            recv(bulk_queue.signal()) -> signal => {
+                if signal.is_ok() {
+                    let Some(request) = bulk_queue.try_pop() else {
+                        continue;
+                    };
+                    if request.context.is_cancelled() {
+                        admission.cancelled();
+                        let _ = request.response.send(Err(EngineError::Cancelled));
+                        continue;
+                    }
+                    return Some(WakeReason::Bulk(request));
+                }
+                return None;
             },
         }
     }
@@ -1313,35 +1605,65 @@ fn publish_lifecycle(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     request: EmbeddingRequest,
     priority: RequestPriority,
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
     telemetry: &EvalTelemetry,
-    query_receiver: &Receiver<EmbeddingRequest>,
+    query_queue: &CancellableRequestQueue,
     config: &NativeEmbeddingRequest,
+    admission: &EmbeddingAdmissionTracker,
 ) {
+    let request_class = match priority {
+        RequestPriority::Query => EmbeddingRequestClass::Query,
+        RequestPriority::Bulk => EmbeddingRequestClass::Bulk,
+    };
+    if !admission.begin(&request.context, request_class) {
+        let _ = request.response.send(Err(EngineError::Cancelled));
+        return;
+    }
+    while embedding_qualification_request_held(request_class) {
+        if request.context.is_cancelled() {
+            admission.finish(&request.context, false, true);
+            let _ = request.response.send(Err(EngineError::Cancelled));
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
     let result = embed_inputs(
         model,
         context,
         telemetry,
         &request.inputs,
         priority,
-        query_receiver,
+        query_queue,
         config,
+        admission,
+        &request.context,
     );
+    let cancelled = request.context.is_cancelled();
+    let result = if cancelled || !request.context.commit() {
+        Err(EngineError::Cancelled)
+    } else {
+        result
+    };
+    admission.finish(&request.context, result.is_ok(), cancelled);
     let _ = request.response.send(result);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn embed_inputs(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
     telemetry: &EvalTelemetry,
     inputs: &[String],
     priority: RequestPriority,
-    query_receiver: &Receiver<EmbeddingRequest>,
+    query_queue: &CancellableRequestQueue,
     config: &NativeEmbeddingRequest,
+    admission: &EmbeddingAdmissionTracker,
+    request_context: &EmbeddingRequestContext,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     if inputs.is_empty() {
         return Ok(Vec::new());
@@ -1353,19 +1675,24 @@ fn embed_inputs(
         .iter()
         .map(|input| tokenize(model, input, config.max_input_tokens))
         .collect::<Result<Vec<_>, _>>()?;
+    let completed_tokens = tokenized.iter().map(Vec::len).sum::<usize>();
     let mut output = Vec::with_capacity(inputs.len());
     let mut offset = 0;
     while offset < tokenized.len() {
+        if request_context.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
         if priority == RequestPriority::Bulk {
-            while let Ok(query) = query_receiver.try_recv() {
+            while let Some(query) = query_queue.try_pop() {
                 handle_request(
                     query,
                     RequestPriority::Query,
                     model,
                     context,
                     telemetry,
-                    query_receiver,
+                    query_queue,
                     config,
+                    admission,
                 );
             }
         }
@@ -1382,8 +1709,10 @@ fn embed_inputs(
             &mut output,
             config.dimension,
         )?;
+        admission.progress();
         offset = end;
     }
+    request_context.record_completed_tokens(completed_tokens);
     Ok(output)
 }
 
@@ -1767,6 +2096,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_queue_entries_release_capacity_without_reordering_live_work() {
+        let queue = CancellableRequestQueue::new(2);
+        let request = |id: &str| {
+            let context = EmbeddingRequestContext::new(id, "scope", 0);
+            let (response, result) = bounded(1);
+            (
+                context.clone(),
+                EmbeddingRequest {
+                    context,
+                    inputs: vec![id.into()],
+                    response,
+                },
+                result,
+            )
+        };
+        let (first_context, first, first_result) = request("first");
+        let (_, second, _) = request("second");
+        let (_, third, _) = request("third");
+        assert!(queue.try_push(first).is_ok(), "first queue slot");
+        assert!(queue.try_push(second).is_ok(), "second queue slot");
+        assert_eq!(queue.len(), 2);
+
+        assert!(first_context.cancel());
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            first_result.try_recv(),
+            Ok(Err(EngineError::Cancelled))
+        ));
+        assert!(
+            queue.try_push(third).is_ok(),
+            "cancelled slot is immediately reusable"
+        );
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue
+                .try_pop()
+                .expect("second remains first")
+                .context
+                .request_id(),
+            "second"
+        );
+        assert_eq!(
+            queue
+                .try_pop()
+                .expect("third remains second")
+                .context
+                .request_id(),
+            "third"
+        );
+    }
+
+    #[test]
     fn compiled_model_descriptor_and_native_build_contract_are_inspectable() {
         let compatibility = COMPILED_MODEL_COMPATIBILITY;
         assert_eq!(compatibility.model_id(), MODEL_FILE_NAME);
@@ -2113,8 +2494,8 @@ mod tests {
     #[test]
     fn owner_loop_honors_injected_timeout_and_all_live_leases() {
         let (startup_sender, _startup_receiver) = bounded(1);
-        let (_query_sender, query_receiver) = bounded(1);
-        let (_bulk_sender, bulk_receiver) = bounded(1);
+        let query_queue = CancellableRequestQueue::new(1);
+        let bulk_queue = CancellableRequestQueue::new(1);
         let (control_sender, control_receiver) = unbounded();
         let (first_lease_sender, first_lease_receiver) = bounded(1);
         let (done_sender, done_receiver) = bounded(1);
@@ -2123,8 +2504,8 @@ mod tests {
         let worker = thread::spawn(move || {
             let channels = ResidentChannels {
                 startup: &startup_sender,
-                query: &query_receiver,
-                bulk: &bulk_receiver,
+                query: &query_queue,
+                bulk: &bulk_queue,
                 control: &control_receiver,
             };
             let result = serve_resident_generation(

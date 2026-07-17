@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Verify that a packaged CodeStory executable owns retrieval end to end.
+"""Verify a packaged CodeStory executable and its per-user embedding server.
 
-The proof is deliberately process-shaped: one packaged executable, an embedded
-model, an in-process engine, and no network or helper process preparation.
+The runtime proof is deliberately multi-process. Two independent plugin hosts
+must converge on one same-account local authority, one server, one native
+worker, and one model load. Synthetic self-tests validate this verifier only;
+they never stand in for package, installed-runtime, or hardware evidence.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import ctypes
 import hashlib
 import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import stat
 import struct
@@ -34,6 +39,26 @@ from native_binary_contract import (
 
 STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
+SERVER_PROOF_SCHEMA_VERSION = 1
+QUALIFICATION_SCHEMA_VERSION = 1
+PUBLICATION_FAULT_EVIDENCE_CONTRACT = "codestory-publication-lease-fault/v1"
+FAULT_RECOVERY_CONSISTENCY_CONTRACT = "codestory-fault-recovery-search-consistency/v1"
+RETRIEVAL_QUALITY_EVIDENCE_CONTRACT = "publishable-three-repeat-packet/v1"
+MEMORY_EVIDENCE_CONTRACT = "codestory-five-process-memory/v1"
+FAULT_RECOVERY_CONSISTENCY_CASES = 10
+MIN_RETRIEVAL_QUALITY_REPEATS = 3
+EXTERNAL_QUALIFICATION_METRICS = {
+    "retrieval_quality",
+    "total_codestory_process_memory",
+}
+MEASUREMENT_PROTOCOL = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "testing"
+    / "per-user-embedding-server-measurement-protocol.json"
+)
+SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-protocol.json")
+SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-constant-set.json")
 DEFAULT_QUERY = "RuntimeContext"
 DEFAULT_QUESTION = "Explain how CodeStory prepares retrieval."
 SOFTWARE_ADAPTERS = ("llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader")
@@ -44,11 +69,54 @@ LEGACY_TOKENS = (
     "native-embedding",
     "retrieval-sidecars",
     "sidecars",
+    "owner.pid",
+    "server.pid",
 )
 LEGACY_HELP_TOKENS = ("llama-server", "sidecar", "repair", "consent", "download")
 NATIVE_MANIFEST_FILE = "codestory-native-manifest.json"
 NATIVE_ENGINE_MARKER_PREFIX = "codestory-native-engine-v1|"
 NATIVE_ENGINE_MARKER_SUFFIX = "|end"
+SERVER_PROOF_MARKER_PREFIX = "codestory-embedding-server-proof-v1|"
+SERVER_PROOF_MARKER_SUFFIX = "|end"
+HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SERVER_LIFECYCLES = {
+    "absent",
+    "listening",
+    "waking",
+    "resident",
+    "sleeping",
+    "draining",
+    "unreachable",
+    "exited",
+}
+RETRY_CLASSES = {
+    "none",
+    "after_delay",
+    "after_capacity_change",
+    "after_server_change",
+    "after_owner_idle",
+    "same_rpc_once",
+    "terminal",
+}
+REQUIRED_SERVER_SCENARIOS = {
+    "cold_race",
+    "mixed_queue",
+    "client_death",
+    "server_crash",
+    "worker_stall",
+    "true_idle_respawn",
+    "incompatible_owner",
+    "frozen_owner",
+}
+LOWER_TIER_NONCLAIMS = {
+    "answer_quality",
+    "release_readiness",
+    "cross_user_sharing",
+    "cross_session_sharing",
+    "bounded_bulk_starvation",
+    "whole_server_takeover",
+    "linux_gpu_execution",
+}
 TARGET_CONTRACTS = {
     "linux-x64": {
         "binary_name": "codestory-cli",
@@ -147,6 +215,478 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_sha256(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def require_sha256(value: object, field: str) -> str:
+    require(
+        isinstance(value, str)
+        and HEX_SHA256.fullmatch(value) is not None
+        and value != "0" * 64,
+        f"{field} must be a lowercase SHA-256 digest",
+    )
+    return value
+
+
+def require_nonempty_string(value: object, field: str) -> str:
+    require(isinstance(value, str) and bool(value.strip()), f"{field} must be a non-empty string")
+    return value
+
+
+def require_nonnegative_int(value: object, field: str) -> int:
+    require(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+        f"{field} must be a non-negative integer",
+    )
+    return value
+
+
+def require_positive_int(value: object, field: str) -> int:
+    value = require_nonnegative_int(value, field)
+    require(value > 0, f"{field} must be positive")
+    return value
+
+
+def require_exact_keys(value: dict, expected: set[str], field: str) -> None:
+    actual = set(value)
+    require(
+        actual == expected,
+        f"{field} fields differ from the contract; missing={sorted(expected - actual)}, "
+        f"unknown={sorted(actual - expected)}",
+    )
+
+
+def load_measurement_protocol(path: Path) -> tuple[dict, str]:
+    require(path.is_file(), f"measurement protocol is missing: {path}")
+    try:
+        protocol = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"measurement protocol is not valid JSON: {exc}") from exc
+    require(isinstance(protocol, dict), "measurement protocol must be an object")
+    require(
+        protocol.get("schema_version") == QUALIFICATION_SCHEMA_VERSION,
+        "measurement protocol schema is unsupported",
+    )
+    require(
+        set(protocol.get("required_scenarios", [])) == REQUIRED_SERVER_SCENARIOS,
+        "measurement protocol does not name the complete server scenario set",
+    )
+    scenario_contracts = protocol.get("scenario_contracts")
+    require(
+        isinstance(scenario_contracts, dict)
+        and set(scenario_contracts) == REQUIRED_SERVER_SCENARIOS,
+        "measurement protocol scenario contracts do not match its required scenarios",
+    )
+    for scenario, contract in scenario_contracts.items():
+        require(
+            isinstance(contract, dict)
+            and set(contract) == {"required"}
+            and isinstance(contract["required"], list)
+            and bool(contract["required"])
+            and len(set(contract["required"])) == len(contract["required"])
+            and all(isinstance(assertion, str) and assertion for assertion in contract["required"]),
+            f"measurement scenario {scenario} assertion contract is malformed",
+        )
+    require(
+        set(protocol.get("required_lower_tier_nonclaims", [])) == LOWER_TIER_NONCLAIMS,
+        "measurement protocol does not name the complete lower-tier nonclaim set",
+    )
+    required_metrics = set(protocol.get("required_metrics", []))
+    phase_boundaries = protocol.get("phase_boundaries")
+    require(
+        isinstance(phase_boundaries, dict)
+        and set(phase_boundaries) == required_metrics,
+        "measurement protocol phase boundaries do not match its required metrics",
+    )
+    for metric, boundaries in phase_boundaries.items():
+        require(
+            isinstance(boundaries, list)
+            and len(boundaries) == 2
+            and all(isinstance(event, str) and event for event in boundaries),
+            f"measurement metric {metric} must have exact start and end events",
+        )
+    metric_contracts = protocol.get("metric_contracts")
+    require(
+        isinstance(metric_contracts, dict)
+        and set(metric_contracts) == required_metrics,
+        "measurement protocol metric contracts do not match its required metrics",
+    )
+    for metric, contract in metric_contracts.items():
+        require(isinstance(contract, dict), f"measurement metric {metric} contract is malformed")
+        require(
+            contract.get("comparison")
+            in {"equal", "greater_than_or_equal", "less_than_or_equal"},
+            f"measurement metric {metric} has an unsupported comparison",
+        )
+        require_nonempty_string(contract.get("unit"), f"measurement metric {metric} unit")
+    comparison_basis = protocol.get("comparison_basis")
+    require(
+        isinstance(comparison_basis, dict)
+        and comparison_basis
+        == {
+            "type": "absolute_candidate_sla",
+            "paired_incumbent_required": False,
+            "warm_ipc_claim": "candidate_end_to_end_ipc_latency",
+            "nonclaim": "overhead_relative_to_incumbent",
+            "rationale": (
+                "the incumbent in-process runtime does not expose the same server phase hooks "
+                "or ownership semantics, so a paired delta would conflate IPC with runtime, "
+                "cache, model-load, and lifecycle changes"
+            ),
+        },
+        "measurement protocol must preregister absolute candidate SLAs and the incumbent-overhead nonclaim",
+    )
+    matrix = protocol.get("host_package_matrix")
+    require(isinstance(matrix, dict), "measurement protocol omitted its host/package matrix")
+    expected_matrix = {
+        ("linux-x64", "hosted_package", "cpu_explicit", "cpu", "none"),
+        ("macos-arm64", "protected_hardware", "accelerated", "metal", "metal"),
+        ("windows-x64", "protected_hardware", "accelerated", "vulkan", "vulkan"),
+        ("linux-x64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+        ("linux-arm64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+        ("macos-x64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+        ("macos-arm64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+        ("windows-x64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+        ("windows-arm64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+    }
+    observed_matrix: set[tuple[str, str, str, str, str]] = set()
+    for cell_id, cell in matrix.items():
+        require_nonempty_string(cell_id, "measurement host/package matrix cell id")
+        require(isinstance(cell, dict), f"measurement matrix cell {cell_id} is malformed")
+        require_exact_keys(
+            cell,
+            {
+                "asset_target",
+                "proof_tier",
+                "host_class",
+                "policy",
+                "backend",
+                "cache_state",
+                "residency_state",
+                "accelerator_claim",
+            },
+            f"measurement matrix cell {cell_id}",
+        )
+        require_nonempty_string(cell["host_class"], f"measurement matrix cell {cell_id}.host_class")
+        require(
+            cell["cache_state"] == "reused" and cell["residency_state"] == "resident",
+            f"measurement matrix cell {cell_id} changed cache or residency state",
+        )
+        observed_matrix.add(
+            (
+                cell["asset_target"],
+                cell["proof_tier"],
+                cell["policy"],
+                cell["backend"],
+                cell["accelerator_claim"],
+            )
+        )
+    require(
+        observed_matrix == expected_matrix and len(matrix) == len(expected_matrix),
+        "measurement host/package matrix does not match the release proof lanes",
+    )
+    workloads = protocol.get("workloads")
+    require(
+        isinstance(workloads, dict) and set(workloads) == required_metrics,
+        "measurement workloads do not match required metrics",
+    )
+    for metric, workload in workloads.items():
+        require(isinstance(workload, dict), f"measurement workload {metric} is malformed")
+        require_nonempty_string(workload.get("workload_id"), f"measurement workload {metric}.workload_id")
+        require_nonempty_string(workload.get("owner_state"), f"measurement workload {metric}.owner_state")
+        require_nonempty_string(workload.get("operation"), f"measurement workload {metric}.operation")
+        require_nonempty_string(
+            workload.get("input_generator"),
+            f"measurement workload {metric}.input_generator",
+        )
+    sampling = protocol.get("metric_sampling")
+    require(
+        isinstance(sampling, dict) and set(sampling) == required_metrics,
+        "measurement sample policy does not match required metrics",
+    )
+    for metric, policy in sampling.items():
+        require(isinstance(policy, dict), f"measurement sample policy {metric} is malformed")
+        count = require_positive_int(
+            policy.get("sample_count"),
+            f"measurement sample policy {metric}.sample_count",
+        )
+        aggregation = require_nonempty_string(
+            policy.get("aggregation"),
+            f"measurement sample policy {metric}.aggregation",
+        )
+        if metric == "retrieval_quality":
+            require(
+                count == MIN_RETRIEVAL_QUALITY_REPEATS
+                and aggregation == "all_rows_pass_rate"
+                and policy.get("external_contract") == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+                "retrieval quality sample policy changed",
+            )
+        elif metric in {
+            "true_idle_exit",
+            "backend_observed_accelerator_residency",
+        }:
+            require(
+                count == 1 and bool(policy.get("single_sample_reason")),
+                f"single-sample metric {metric} lacks its preregistered reason",
+            )
+        else:
+            require(count == 3, f"measurement metric {metric} must use three repeats")
+        expected_aggregation = {
+            "less_than_or_equal": "maximum",
+            "greater_than_or_equal": "minimum",
+            "equal": "exact",
+        }[metric_contracts[metric]["comparison"]]
+        if metric != "retrieval_quality":
+            require(
+                aggregation == expected_aggregation,
+                f"measurement metric {metric} aggregation is not conservative",
+            )
+    constant_selection = protocol.get("constant_selection")
+    require(
+        isinstance(constant_selection, dict),
+        "measurement protocol omitted production-constant selection",
+    )
+    require_exact_keys(
+        constant_selection,
+        {
+            "selection_order",
+            "raw_source_cells",
+            "clean_run_requirements",
+            "formulas",
+            "post_result_formula_changes",
+        },
+        "measurement production-constant selection",
+    )
+    expected_constant_order = [
+        "connect_timeout_ms",
+        "spawn_convergence_timeout_ms",
+        "request_deadlines_ms",
+        "capacity_retry_policy",
+        "election_backoff_policy",
+        "hard_native_no_progress_ms",
+        "watchdog_cadence_ms",
+    ]
+    require(
+        constant_selection["selection_order"] == expected_constant_order,
+        "production constants changed selection order",
+    )
+    source_cells = constant_selection["raw_source_cells"]
+    require(
+        isinstance(source_cells, dict)
+        and set(source_cells)
+        == {
+            "existing_owner_connect_duration",
+            "spawn_convergence_duration",
+            "query_request_duration",
+            "bulk_request_duration",
+            "capacity_condition_duration",
+            "successful_native_progress_gap",
+        }
+        and all(
+            isinstance(cell, dict)
+            and cell.get("artifact") == "measurements.raw.json"
+            and isinstance(cell.get("operand"), str)
+            and bool(cell["operand"])
+            and (isinstance(cell.get("metric"), str) or isinstance(cell.get("metrics"), list))
+            for cell in source_cells.values()
+        ),
+        "production constants do not name their exact raw source cells",
+    )
+    require(
+        constant_selection["clean_run_requirements"]
+        == {
+            "minimum_runs_per_matrix_cell": 3,
+            "matrix_coverage": "every_host_package_matrix_cell",
+            "source_identity": "one_exact_candidate_commit_and_tree",
+            "artifact_selection": "all_preregistered_clean_runs",
+            "unplanned_suspend": False,
+            "outlier_removal": "none",
+        },
+        "production-constant calibration run selection changed",
+    )
+    formulas = constant_selection["formulas"]
+    require(
+        isinstance(formulas, dict)
+        and set(formulas) == set(expected_constant_order),
+        "production-constant formulas are incomplete",
+    )
+    expected_formula_fragments = {
+        "connect_timeout_ms": "maximum_raw_value_ms_across_all_selected_samples*1.50",
+        "spawn_convergence_timeout_ms": "maximum_raw_value_ms_across_all_selected_samples*1.50",
+        "hard_native_no_progress_ms": "maximum_raw_value_ms_across_all_selected_samples*4.00",
+        "watchdog_cadence_ms": "hard_native_no_progress_ms/20",
+    }
+    for field, fragment in expected_formula_fragments.items():
+        require(
+            isinstance(formulas[field], dict)
+            and fragment in formulas[field].get("formula", ""),
+            f"production-constant formula {field} changed",
+        )
+    require(
+        formulas["request_deadlines_ms"].get("query_request_deadline_ms", {}).get(
+            "formula"
+        )
+        == "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
+        and formulas["request_deadlines_ms"].get("bulk_request_deadline_ms", {}).get(
+            "formula"
+        )
+        == "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))",
+        "request-deadline selection formulas changed",
+    )
+    require(
+        formulas["capacity_retry_policy"].get("retry_after_ms_formula")
+        == "max(1,floor(minimum_raw_value_ms_across_all_selected_samples*0.50))"
+        and formulas["capacity_retry_policy"].get("retry_class")
+        == "after_capacity_change"
+        and formulas["capacity_retry_policy"].get("retry_condition_source")
+        == "named_condition_from_typed_capacity_response",
+        "capacity retry selection formula or typed policy changed",
+    )
+    require(
+        formulas["election_backoff_policy"].get("initial_backoff_ms_formula")
+        == "max(1,ceiling(maximum_existing_owner_connect_duration_ms_across_all_selected_samples*0.50))"
+        and formulas["election_backoff_policy"].get("maximum_backoff_ms_formula")
+        == "max(initial_backoff_ms,ceiling(maximum_spawn_convergence_duration_ms_across_all_selected_samples*0.25))"
+        and formulas["election_backoff_policy"].get("jitter")
+        == "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
+        "election backoff selection formula changed",
+    )
+    require(
+        constant_selection["post_result_formula_changes"] is False,
+        "production constants allow post-result formula changes",
+    )
+    threshold_selection = protocol.get("threshold_selection")
+    require(
+        isinstance(threshold_selection, dict)
+        and threshold_selection
+        == {
+            "minimum_clean_calibration_runs_per_matrix_cell": 3,
+            "matrix_coverage": "every_host_package_matrix_cell",
+            "source_identity": "one_exact_candidate_commit_and_tree",
+            "artifact_selection": "all_preregistered_clean_runs",
+            "less_than_or_equal": (
+                "ceiling(maximum_cell_aggregate_across_all_runs*1.20)"
+            ),
+            "greater_than_or_equal": (
+                "floor(minimum_cell_aggregate_across_all_runs*0.80)"
+            ),
+            "equal": "exact_observed_contract_value",
+            "retrieval_quality": 1.0,
+            "outlier_removal": "none",
+            "post_result_threshold_changes": False,
+        },
+        "measurement threshold-selection formula is incomplete or mutable",
+    )
+    clock_policy = protocol.get("clock_policy")
+    suspend = clock_policy.get("suspend_detection") if isinstance(clock_policy, dict) else None
+    require(
+        isinstance(suspend, dict)
+        and suspend.get("maximum_inclusive_minus_awake_ns") == 50_000_000
+        and suspend.get("platform_apis")
+        == {
+            "linux": "CLOCK_BOOTTIME",
+            "macos": "mach_continuous_time",
+            "windows": "QueryInterruptTimePrecise",
+        },
+        "measurement suspend-detection contract is incomplete",
+    )
+    return protocol, sha256(path)
+
+
+def load_json_contract(path: Path, label: str) -> tuple[dict, str]:
+    require(path.is_file(), f"{label} is missing: {path}")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"{label} is not valid JSON: {exc}") from exc
+    require(isinstance(document, dict), f"{label} must be an object")
+    require(document.get("schema_version") == 1, f"{label} schema is unsupported")
+    return document, sha256(path)
+
+
+def verify_package_server_contracts(
+    manifest: dict,
+    measurement_protocol_path: Path,
+    *,
+    require_frozen: bool,
+) -> dict:
+    measurement, measurement_sha256 = load_measurement_protocol(measurement_protocol_path)
+    protocol_path = measurement_protocol_path.with_name(SERVER_PROTOCOL.name)
+    constant_set_path = measurement_protocol_path.with_name(SERVER_CONSTANT_SET.name)
+    protocol, protocol_sha256 = load_json_contract(protocol_path, "embedding server protocol")
+    constant_set, constant_set_sha256 = load_json_contract(
+        constant_set_path,
+        "embedding server constant set",
+    )
+    server_proof = manifest.get("server_proof")
+    require(isinstance(server_proof, dict), "package manifest omitted server_proof")
+    expected = {
+        "measurement_protocol_sha256": measurement_sha256,
+        "protocol_sha256": protocol_sha256,
+        "constant_set_sha256": constant_set_sha256,
+    }
+    for field, digest in expected.items():
+        require(
+            server_proof.get(field) == digest,
+            f"package manifest {field} does not match the checked-in contract",
+        )
+    require(
+        server_proof.get("constant_set_status") == constant_set.get("status"),
+        "package manifest constant-set status does not match the checked-in contract",
+    )
+    require(
+        set(protocol.get("lifecycle_states", [])) == SERVER_LIFECYCLES,
+        "embedding server lifecycle states do not match the verifier",
+    )
+    required_metrics = set(measurement["required_metrics"])
+    thresholds = constant_set.get("qualification_thresholds")
+    require(
+        isinstance(thresholds, dict) and set(thresholds) == required_metrics,
+        "embedding server qualification thresholds do not match the measurement metrics",
+    )
+    if require_frozen:
+        require(
+            constant_set.get("status") == "frozen",
+            "embedding server constants are not frozen; calibration cannot be treated as qualification",
+        )
+        freeze_record = constant_set.get("freeze_record")
+        require(isinstance(freeze_record, dict), "frozen embedding server constants omit their freeze record")
+        for field in (
+            "selection_source_commit",
+            "selection_source_tree",
+            "host_profile_id",
+            "host_fingerprint",
+            "calibration_artifact_sha256",
+            "selection_rule",
+            "selected_at",
+        ):
+            require_nonempty_string(freeze_record.get(field), f"constant-set freeze_record.{field}")
+        for field in ("selection_source_commit", "selection_source_tree"):
+            require(
+                re.fullmatch(r"[0-9a-f]{40}", freeze_record[field]) is not None,
+                f"constant-set freeze_record.{field} must be a lowercase Git object id",
+            )
+        for field in ("host_fingerprint", "calibration_artifact_sha256"):
+            require_sha256(freeze_record[field], f"constant-set freeze_record.{field}")
+        unresolved = [
+            field
+            for section in ("calibration_required_values", "qualification_thresholds")
+            for field, value in constant_set.get(section, {}).items()
+            if value is None
+        ]
+        require(not unresolved, "frozen embedding server constants contain unresolved values: " + ", ".join(unresolved))
+    return {
+        "measurement_protocol": measurement,
+        "measurement_protocol_sha256": measurement_sha256,
+        "protocol": protocol,
+        "protocol_sha256": protocol_sha256,
+        "constant_set": constant_set,
+        "constant_set_sha256": constant_set_sha256,
+    }
+
+
 def expected_archive_digest(checksum_file: Path, archive: Path) -> str:
     lines = checksum_file.read_text(encoding="utf-8").splitlines()
     records: dict[str, str] = {}
@@ -194,9 +734,9 @@ def find_cli(root: Path) -> Path:
     return cli
 
 
-def native_engine_markers(path: Path) -> list[str]:
-    prefix = NATIVE_ENGINE_MARKER_PREFIX.encode("ascii")
-    suffix = NATIVE_ENGINE_MARKER_SUFFIX.encode("ascii")
+def binary_markers(path: Path, marker_prefix: str, marker_suffix: str) -> list[str]:
+    prefix = marker_prefix.encode("ascii")
+    suffix = marker_suffix.encode("ascii")
     markers: set[bytes] = set()
     overlap = b""
     with path.open("rb") as handle:
@@ -219,8 +759,16 @@ def native_engine_markers(path: Path) -> list[str]:
         try:
             decoded.append(marker.decode("ascii"))
         except UnicodeDecodeError as exc:
-            raise ProofFailure("packaged native engine marker is not ASCII") from exc
+            raise ProofFailure(f"packaged marker {marker_prefix!r} is not ASCII") from exc
     return decoded
+
+
+def native_engine_markers(path: Path) -> list[str]:
+    return binary_markers(path, NATIVE_ENGINE_MARKER_PREFIX, NATIVE_ENGINE_MARKER_SUFFIX)
+
+
+def server_proof_markers(path: Path) -> list[str]:
+    return binary_markers(path, SERVER_PROOF_MARKER_PREFIX, SERVER_PROOF_MARKER_SUFFIX)
 
 
 def ordered_contract_digest(domain: str, values: list[str]) -> str:
@@ -312,6 +860,64 @@ def parse_native_build_identity(identity: str) -> dict[str, str]:
     return fields
 
 
+def parse_server_proof_identity(identity: str) -> dict[str, object]:
+    parts = identity.split("|")
+    require(
+        parts[0] == SERVER_PROOF_MARKER_PREFIX.removesuffix("|"),
+        "embedding server proof schema is unsupported",
+    )
+    require(parts[-1] == "end", "embedding server proof identity terminator is missing")
+    raw: dict[str, str] = {}
+    for part in parts[1:-1]:
+        require("=" in part, f"malformed embedding server proof field: {part!r}")
+        key, value = part.split("=", 1)
+        require(bool(key) and bool(value), f"empty embedding server proof field: {part!r}")
+        require(key not in raw, f"duplicate embedding server proof field: {key}")
+        raw[key] = value
+    required = {
+        "bootstrap",
+        "protocol_schema",
+        "protocol_sha256",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
+        "clock_policy",
+        "query_capacity",
+        "bulk_capacity",
+        "idle_timeout_ms",
+    }
+    missing = sorted(required - raw.keys())
+    require(not missing, "embedding server proof identity is missing fields: " + ", ".join(missing))
+    require(set(raw) == required, "embedding server proof identity contains unknown fields")
+    for field in ("protocol_sha256", "constant_set_sha256", "measurement_protocol_sha256"):
+        require_sha256(raw[field], f"embedding server proof {field}")
+    require(raw["clock_policy"] == "awake_monotonic", "embedding server proof clock policy is unsupported")
+    numeric: dict[str, int] = {}
+    for field in ("bootstrap", "protocol_schema", "query_capacity", "bulk_capacity", "idle_timeout_ms"):
+        try:
+            numeric[field] = int(raw[field])
+        except ValueError as exc:
+            raise ProofFailure(f"embedding server proof {field} is not an integer") from exc
+        require(numeric[field] > 0, f"embedding server proof {field} must be positive")
+    require(numeric["bootstrap"] == 1, "embedding server bootstrap version is unsupported")
+    require(numeric["protocol_schema"] == 1, "embedding server protocol schema is unsupported")
+    require(numeric["query_capacity"] == 64, "embedding server query capacity is not the accepted value")
+    require(numeric["bulk_capacity"] == 64, "embedding server bulk capacity is not the accepted value")
+    require(numeric["idle_timeout_ms"] == 60_000, "embedding server idle timeout is not the accepted value")
+    return {
+        "schema_version": SERVER_PROOF_SCHEMA_VERSION,
+        "bootstrap_version": numeric["bootstrap"],
+        "protocol_schema_version": numeric["protocol_schema"],
+        "protocol_sha256": raw["protocol_sha256"],
+        "constant_set_sha256": raw["constant_set_sha256"],
+        "measurement_protocol_sha256": raw["measurement_protocol_sha256"],
+        "clock_policy": raw["clock_policy"],
+        "query_capacity": numeric["query_capacity"],
+        "bulk_capacity": numeric["bulk_capacity"],
+        "idle_timeout_ms": numeric["idle_timeout_ms"],
+        "lower_tier_nonclaims": sorted(LOWER_TIER_NONCLAIMS),
+    }
+
+
 def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     matches = [path for path in root.rglob(NATIVE_MANIFEST_FILE) if path.is_file()]
     require(
@@ -323,7 +929,7 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     except json.JSONDecodeError as exc:
         raise ProofFailure(f"native engine manifest is not valid JSON: {exc}") from exc
     require(isinstance(manifest, dict), "native engine manifest is not an object")
-    require(manifest.get("schema_version") == 2, "native engine manifest schema is unsupported")
+    require(manifest.get("schema_version") == 3, "native engine manifest schema is unsupported")
     require(
         manifest.get("release_version") == expected_version,
         "native engine manifest version does not match expected release",
@@ -333,18 +939,31 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     require(target_contract is not None, f"native manifest has unsupported asset target: {asset_target}")
 
     binary = manifest.get("binary")
+    source = manifest.get("source")
     engine = manifest.get("engine")
     model = manifest.get("model")
     embedding = manifest.get("embedding")
     tokenizer = manifest.get("tokenizer_config")
     accelerator = manifest.get("accelerator")
+    server_proof = manifest.get("server_proof")
     runtime_artifacts = manifest.get("runtime_artifacts")
     require(isinstance(binary, dict), "native engine manifest has no binary descriptor")
+    require(isinstance(source, dict), "native engine manifest has no source descriptor")
+    for field in ("commit", "tree"):
+        value = source.get(field)
+        require(
+            isinstance(value, str)
+            and len(value) == 40
+            and all(char in "0123456789abcdef" for char in value),
+            f"native engine manifest source {field} is invalid",
+        )
+    require(source.get("tracked_dirty") is False, "native engine manifest was built from tracked changes")
     require(isinstance(engine, dict), "native engine manifest has no engine descriptor")
     require(isinstance(model, dict), "native engine manifest has no model descriptor")
     require(isinstance(embedding, dict), "native engine manifest has no embedding descriptor")
     require(isinstance(tokenizer, dict), "native engine manifest has no tokenizer descriptor")
     require(isinstance(accelerator, dict), "native engine manifest has no accelerator descriptor")
+    require(isinstance(server_proof, dict), "native engine manifest has no server proof descriptor")
     require(isinstance(runtime_artifacts, list), "native engine manifest has no runtime artifact set")
     require(
         cli.name == target_contract["binary_name"],
@@ -422,6 +1041,25 @@ def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
     require(
         binary_markers == [build_identity],
         "packaged executable native engine marker does not match manifest",
+    )
+    server_markers = server_proof_markers(cli)
+    require(
+        len(server_markers) == 1,
+        "packaged executable must contain exactly one embedding server proof marker",
+    )
+    marker_server_proof = parse_server_proof_identity(server_markers[0])
+    require(
+        set(server_proof) == {*marker_server_proof, "constant_set_status"},
+        "native manifest server proof fields do not match the binary marker schema",
+    )
+    for field, value in marker_server_proof.items():
+        require(
+            server_proof.get(field) == value,
+            f"packaged executable embedding server proof field {field} does not match manifest",
+        )
+    require(
+        server_proof.get("constant_set_status") in {"unfrozen", "frozen"},
+        "native manifest server proof constant-set status is invalid",
     )
     require(engine.get("linkage") == target_contract["linkage"], "packaged native engine linkage is wrong")
     require(build_fields["linkage"] == engine["linkage"], "native build linkage contradicts manifest")
@@ -536,14 +1174,18 @@ def verify_runtime_against_manifest(
     runtime: dict,
     expected_policy: str | None,
 ) -> dict:
-    identities = [runtime.get("identity"), runtime.get("restart_identity")]
+    identities = [
+        runtime.get("identity"),
+        runtime.get("second_host_identity"),
+        runtime.get("rejoin_identity"),
+    ]
     require(all(isinstance(identity, dict) for identity in identities), "runtime proof omitted engine identity")
     engine = manifest["engine"]
     model = manifest["model"]
     accelerator = manifest["accelerator"]
     compiled_backends = engine["compiled_backends"]
     observed_backend = ""
-    for label, identity in zip(("first process", "restart"), identities):
+    for label, identity in zip(("first plugin host", "second plugin host", "rejoined plugin host"), identities):
         require(
             identity.get("embedding_ggml_build_identity") == engine["build_identity"],
             f"{label} loaded a different native engine build than the package manifest",
@@ -742,6 +1384,546 @@ def engine_identity(
     return fields
 
 
+def server_snapshot(status: dict, manifest: dict, *, require_resident: bool) -> dict:
+    snapshot = find_value(status, "embedding_server")
+    require(isinstance(snapshot, dict), "diagnostics omitted the embedding_server snapshot")
+    require(
+        snapshot.get("schema_version") == SERVER_PROOF_SCHEMA_VERSION,
+        "embedding_server snapshot schema is unsupported",
+    )
+    event_sequence = require_nonnegative_int(
+        snapshot.get("event_sequence"),
+        "embedding_server.event_sequence",
+    )
+    lifecycle = snapshot.get("lifecycle")
+    require(lifecycle in SERVER_LIFECYCLES, "embedding_server lifecycle is invalid")
+
+    clock = snapshot.get("clock")
+    require(isinstance(clock, dict), "embedding_server snapshot omitted clock identity")
+    require(clock.get("domain") == "awake_monotonic", "embedding_server clock is not awake-monotonic")
+    require_nonempty_string(clock.get("api"), "embedding_server.clock.api")
+    require_nonempty_string(clock.get("boot_id"), "embedding_server.clock.boot_id")
+    require_positive_int(clock.get("resolution_ns"), "embedding_server.clock.resolution_ns")
+
+    protocol = snapshot.get("protocol")
+    require(isinstance(protocol, dict), "embedding_server snapshot omitted protocol identity")
+    require(protocol.get("bootstrap_version") == 1, "embedding_server bootstrap version is unsupported")
+    require(protocol.get("schema_version") == 1, "embedding_server protocol version is unsupported")
+    for field in ("protocol_sha256", "constant_set_sha256", "measurement_protocol_sha256"):
+        require_sha256(protocol.get(field), f"embedding_server.protocol.{field}")
+
+    server_proof = manifest.get("server_proof")
+    require(isinstance(server_proof, dict), "package manifest omitted server_proof")
+    for field in (
+        "bootstrap_version",
+        "protocol_schema_version",
+        "protocol_sha256",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
+    ):
+        runtime_field = "schema_version" if field == "protocol_schema_version" else field
+        require(
+            protocol.get(runtime_field) == server_proof.get(field),
+            f"runtime embedding server {runtime_field} does not match the package manifest",
+        )
+
+    authority = snapshot.get("authority")
+    require(isinstance(authority, dict), "embedding_server snapshot omitted authority identity")
+    for field in ("endpoint_namespace_id", "lifetime_authority_id", "listener_id"):
+        require_nonempty_string(authority.get(field), f"embedding_server.authority.{field}")
+    require(authority.get("peer_verified") is True, "embedding_server peer identity is not verified")
+
+    process = snapshot.get("process")
+    require(isinstance(process, dict), "embedding_server snapshot omitted process identity")
+    for field in ("server_instance_id", "process_start_id", "executable_version"):
+        require_nonempty_string(process.get(field), f"embedding_server.process.{field}")
+    require_positive_int(process.get("pid"), "embedding_server.process.pid")
+    require_sha256(process.get("executable_sha256"), "embedding_server.process.executable_sha256")
+    require(
+        process["executable_sha256"] == manifest["binary"]["sha256"],
+        "embedding server process executable does not match the package manifest",
+    )
+    require(
+        process["executable_version"] == manifest["release_version"],
+        "embedding server process version does not match the package manifest",
+    )
+
+    scheduler = snapshot.get("scheduler")
+    require(isinstance(scheduler, dict), "embedding_server snapshot omitted scheduler state")
+    require(
+        scheduler.get("query_capacity") == server_proof.get("query_capacity") == 64,
+        "embedding_server query capacity is not the manifest-bound accepted value",
+    )
+    require(
+        scheduler.get("bulk_capacity") == server_proof.get("bulk_capacity") == 64,
+        "embedding_server bulk capacity is not the manifest-bound accepted value",
+    )
+    for field in (
+        "query_depth",
+        "bulk_depth",
+        "connection_count",
+        "active_request_count",
+        "lease_count",
+    ):
+        require_nonnegative_int(scheduler.get(field), f"embedding_server.scheduler.{field}")
+    require(scheduler["query_depth"] <= 64, "embedding_server query depth exceeds capacity")
+    require(scheduler["bulk_depth"] <= 64, "embedding_server bulk depth exceeds capacity")
+    active_request = scheduler.get("active_request")
+    if active_request is not None:
+        require(isinstance(active_request, dict), "embedding_server active request is malformed")
+        for field in ("request_id", "scope_id", "class", "phase"):
+            require_nonempty_string(
+                active_request.get(field),
+                f"embedding_server.scheduler.active_request.{field}",
+            )
+        require(active_request["class"] in {"query", "bulk"}, "active request class is invalid")
+        require_nonnegative_int(
+            active_request.get("elapsed_ms"),
+            "embedding_server.scheduler.active_request.elapsed_ms",
+        )
+
+    engine = snapshot.get("engine")
+    if require_resident:
+        require(isinstance(engine, dict), "resident embedding_server snapshot omitted engine identity")
+    if engine is not None:
+        require(isinstance(engine, dict), "embedding_server engine identity is malformed")
+        for field in ("engine_owner_id", "native_worker_id"):
+            require_nonempty_string(engine.get(field), f"embedding_server.engine.{field}")
+        require_positive_int(engine.get("load_generation"), "embedding_server.engine.load_generation")
+        require_positive_int(engine.get("model_load_count"), "embedding_server.engine.model_load_count")
+        require_nonnegative_int(
+            engine.get("successful_encode_count"),
+            "embedding_server.engine.successful_encode_count",
+        )
+
+    failure = snapshot.get("failure")
+    if failure is not None:
+        require(isinstance(failure, dict), "embedding_server failure state is malformed")
+        require_nonempty_string(failure.get("code"), "embedding_server.failure.code")
+        require(
+            failure.get("retry_class") in RETRY_CLASSES,
+            "embedding_server failure retry class is invalid",
+        )
+        require_nonnegative_int(
+            failure.get("retry_after_ms"),
+            "embedding_server.failure.retry_after_ms",
+        )
+        require_nonempty_string(
+            failure.get("retry_condition"),
+            "embedding_server.failure.retry_condition",
+        )
+
+    private_tokens = (
+        str(snapshot).lower()
+        if not isinstance(snapshot, (str, bytes))
+        else str(snapshot).lower()
+    )
+    for forbidden in ("project_path", "project_root", "repository_path", "request_text"):
+        require(forbidden not in private_tokens, f"embedding_server diagnostics leaked {forbidden}")
+    return {
+        "schema_version": snapshot["schema_version"],
+        "event_sequence": event_sequence,
+        "lifecycle": lifecycle,
+        "clock": clock,
+        "protocol": protocol,
+        "authority": authority,
+        "process": process,
+        "scheduler": scheduler,
+        "engine": engine,
+        "failure": failure,
+    }
+
+
+def shared_server_identity(first: dict, second: dict) -> dict:
+    for group, fields in (
+        ("authority", ("endpoint_namespace_id", "lifetime_authority_id", "listener_id")),
+        ("process", ("server_instance_id", "pid", "process_start_id", "executable_sha256")),
+        ("engine", ("engine_owner_id", "native_worker_id", "load_generation", "model_load_count")),
+    ):
+        left = first.get(group)
+        right = second.get(group)
+        require(isinstance(left, dict) and isinstance(right, dict), f"shared proof omitted {group}")
+        for field in fields:
+            require(
+                left.get(field) == right.get(field),
+                f"independent plugin hosts observed different {group}.{field}",
+            )
+    require(
+        first["engine"]["model_load_count"] == 1,
+        "cold two-host race produced more than one model load",
+    )
+    return {
+        "endpoint_namespace_id": first["authority"]["endpoint_namespace_id"],
+        "lifetime_authority_id": first["authority"]["lifetime_authority_id"],
+        "listener_id": first["authority"]["listener_id"],
+        "server_instance_id": first["process"]["server_instance_id"],
+        "server_process_start_id": first["process"]["process_start_id"],
+        "engine_owner_id": first["engine"]["engine_owner_id"],
+        "native_worker_id": first["engine"]["native_worker_id"],
+        "load_generation": first["engine"]["load_generation"],
+        "model_load_count": first["engine"]["model_load_count"],
+    }
+
+
+def verify_retained_qualification(
+    evidence: dict,
+    *,
+    manifest: dict,
+    archive_sha256: str,
+    shared_identity: dict | None,
+    measurement_contract: dict,
+    required_tier: str,
+    installed_plugin: dict | None = None,
+    managed_runtime: dict | None = None,
+) -> dict:
+    require(
+        evidence.get("schema_version") == QUALIFICATION_SCHEMA_VERSION,
+        "retained qualification schema is unsupported",
+    )
+    require(evidence.get("status") == "pass", "retained qualification is not a passing result")
+    tier = evidence.get("tier")
+    require(
+        tier in {"hosted_package", "protected_hardware", "installed_runtime"},
+        "retained qualification tier is invalid",
+    )
+    tier_rank = {"hosted_package": 1, "protected_hardware": 2, "installed_runtime": 3}
+    require(
+        tier_rank[tier] >= tier_rank[required_tier],
+        f"retained {tier} evidence cannot support required tier {required_tier}",
+    )
+    retained_plugin = evidence.get("installed_plugin")
+    retained_runtime = evidence.get("managed_runtime")
+    if tier == "installed_runtime":
+        require(isinstance(retained_plugin, dict), "installed evidence omitted plugin provenance")
+        require(isinstance(retained_runtime, dict), "installed evidence omitted managed runtime provenance")
+        require(
+            retained_plugin.get("marketplace_repository")
+            == "TheGreenCedar/AgentPluginMarketplace"
+            and retained_plugin.get("plugin_id") == "codestory"
+            and retained_plugin.get("plugin_version") == manifest["release_version"],
+            "installed evidence has invalid marketplace/plugin provenance",
+        )
+        require_sha256(
+            retained_plugin.get("plugin_package_sha256"),
+            "installed evidence plugin_package_sha256",
+        )
+        require(
+            isinstance(retained_plugin.get("marketplace_commit"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", retained_plugin["marketplace_commit"]) is not None,
+            "installed evidence marketplace commit is invalid",
+        )
+        require(
+            retained_plugin.get("plugin_source_commit") == manifest["source"]["commit"],
+            "installed evidence does not bind the marketplace plugin to the packaged source commit",
+        )
+        require(
+            retained_runtime.get("cli_source") == "managed"
+            and retained_runtime.get("plugin_version") == manifest["release_version"]
+            and retained_runtime.get("managed_binary_sha256") == manifest["binary"]["sha256"]
+            and retained_runtime.get("archive_sha256") == archive_sha256,
+            "installed evidence does not bind the exact managed runtime",
+        )
+        if installed_plugin is not None:
+            require(retained_plugin == installed_plugin, "retained installed plugin provenance is stale")
+        if managed_runtime is not None:
+            require(retained_runtime == managed_runtime, "retained managed runtime provenance is stale")
+    else:
+        require(
+            retained_plugin is None and retained_runtime is None,
+            "lower-tier evidence must not claim installed plugin provenance",
+        )
+
+    source = evidence.get("source")
+    require(isinstance(source, dict), "retained qualification omitted source identity")
+    require(source == manifest["source"], "retained qualification source identity does not match package")
+
+    package = evidence.get("package")
+    require(isinstance(package, dict), "retained qualification omitted package identity")
+    require(
+        package.get("archive_sha256") == archive_sha256,
+        "retained qualification names a different archive",
+    )
+    require(
+        package.get("executable_sha256") == manifest["binary"]["sha256"],
+        "retained qualification names a different executable",
+    )
+    require(
+        package.get("asset_target") == manifest["asset_target"],
+        "retained qualification names a different package target",
+    )
+    require(
+        package.get("release_version") == manifest["release_version"],
+        "retained qualification names a different release version",
+    )
+    require(
+        package.get("model_sha256") == manifest["model"]["sha256"],
+        "retained qualification names a different model",
+    )
+    for field in (
+        "protocol_sha256",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
+    ):
+        require(
+            package.get(field) == manifest["server_proof"][field],
+            f"retained qualification {field} does not match package",
+        )
+
+    host = evidence.get("host")
+    require(isinstance(host, dict), "retained qualification omitted host identity")
+    require_sha256(host.get("fingerprint"), "retained qualification host fingerprint")
+    require_nonempty_string(host.get("platform"), "retained qualification host platform")
+    require(
+        host.get("target") == manifest["asset_target"],
+        "retained qualification host names a different package target",
+    )
+    require_nonempty_string(host.get("backend"), "retained qualification host backend")
+    require(
+        normalized_backend(package.get("backend")) == normalized_backend(host["backend"]),
+        "retained qualification package and host backend identities disagree",
+    )
+    require(
+        package.get("policy") == host.get("policy")
+        and host.get("policy") in {"accelerated", "cpu_explicit"},
+        "retained qualification package and host policy identities disagree",
+    )
+    for field in ("cache_state", "residency_state"):
+        require_nonempty_string(host.get(field), f"retained qualification host {field}")
+        require(
+            package.get(field) == host[field],
+            f"retained qualification package and host {field} disagree",
+        )
+    require(
+        host.get("unplanned_suspend") is False,
+        "retained qualification host recorded an unplanned suspend",
+    )
+
+    same_account = evidence.get("same_account")
+    require(isinstance(same_account, dict), "retained qualification omitted same-account evidence")
+    require_nonempty_string(same_account.get("account_id"), "same_account.account_id")
+    require(
+        same_account.get("relation") == "same_os_account",
+        "retained qualification does not prove same-OS-account scope",
+    )
+    hosts = same_account.get("plugin_hosts")
+    require(isinstance(hosts, list) and len(hosts) == 2, "qualification requires exactly two plugin hosts")
+    host_ids: set[tuple[object, object]] = set()
+    repository_ids: set[str] = set()
+    for index, host in enumerate(hosts):
+        require(isinstance(host, dict), f"plugin host {index} is malformed")
+        require_positive_int(host.get("pid"), f"plugin_hosts[{index}].pid")
+        start_id = require_nonempty_string(
+            host.get("process_start_id"),
+            f"plugin_hosts[{index}].process_start_id",
+        )
+        repository_id = require_nonempty_string(
+            host.get("repository_id"),
+            f"plugin_hosts[{index}].repository_id",
+        )
+        require(
+            not Path(repository_id).is_absolute(),
+            "retained plugin-host evidence must use an opaque repository identity, not a path",
+        )
+        host_ids.add((host["pid"], start_id))
+        repository_ids.add(repository_id)
+    require(len(host_ids) == 2, "plugin hosts are not independently started processes")
+    require(len(repository_ids) == 2, "plugin hosts did not use different repositories")
+    require(
+        same_account.get("cross_login_or_terminal_sessions_proven") is False,
+        "base same-account evidence must not infer cross-session sharing",
+    )
+
+    retained_shared = evidence.get("shared_identity")
+    require(isinstance(retained_shared, dict), "retained qualification omitted shared server identity")
+    for field in (
+        "endpoint_namespace_id",
+        "lifetime_authority_id",
+        "listener_id",
+        "server_instance_id",
+        "server_process_start_id",
+        "engine_owner_id",
+        "native_worker_id",
+        "load_generation",
+        "model_load_count",
+    ):
+        require(field in retained_shared, f"retained shared identity omitted {field}")
+        if shared_identity is not None:
+            require(
+                retained_shared[field] == shared_identity[field],
+                f"retained shared identity {field} does not match the live two-host proof",
+            )
+    require(retained_shared["model_load_count"] == 1, "retained cold race did not prove one model load")
+
+    timing = evidence.get("timing")
+    require(isinstance(timing, dict), "retained qualification omitted timing identity")
+    require(timing.get("clock_domain") == "awake_monotonic", "qualification used the wrong clock domain")
+    require(timing.get("cross_process_timestamp_subtraction") is False, "qualification subtracted cross-process timestamps")
+    require(timing.get("unplanned_suspend") is False, "qualification performance block included suspend")
+    require(timing.get("constants_frozen_before_run") is True, "qualification selected constants from its own results")
+    require(
+        timing.get("constant_set_sha256") == manifest["server_proof"]["constant_set_sha256"],
+        "qualification timing used a different constant set",
+    )
+
+    scenarios = evidence.get("scenarios")
+    require(isinstance(scenarios, dict), "retained qualification omitted scenario evidence")
+    scenario_contracts = measurement_contract["measurement_protocol"]["scenario_contracts"]
+    require(set(scenarios) == REQUIRED_SERVER_SCENARIOS, "retained qualification scenario set is incomplete")
+    for scenario_id in sorted(REQUIRED_SERVER_SCENARIOS):
+        scenario = scenarios.get(scenario_id)
+        require(isinstance(scenario, dict), f"scenario {scenario_id} is malformed")
+        require(scenario.get("status") == "pass", f"scenario {scenario_id} did not pass")
+        assertions = scenario.get("assertions")
+        require(isinstance(assertions, dict), f"scenario {scenario_id} omitted assertions")
+        required_assertions = set(scenario_contracts[scenario_id]["required"])
+        require(
+            set(assertions) == required_assertions,
+            f"scenario {scenario_id} assertions do not match the preregistered contract",
+        )
+        failed = sorted(name for name, passed in assertions.items() if passed is not True)
+        require(not failed, f"scenario {scenario_id} has failed assertions: " + ", ".join(failed))
+        artifacts = scenario.get("artifacts")
+        require(isinstance(artifacts, list) and artifacts, f"scenario {scenario_id} has no retained artifacts")
+        artifact_names: set[str] = set()
+        for artifact in artifacts:
+            require(isinstance(artifact, dict), f"scenario {scenario_id} artifact is malformed")
+            name = require_nonempty_string(artifact.get("name"), f"scenario {scenario_id} artifact name")
+            require(
+                Path(name).name == name and Path(name).suffix == ".json",
+                f"scenario {scenario_id} artifact name is not a safe JSON basename",
+            )
+            require_sha256(artifact.get("sha256"), f"scenario {scenario_id} artifact sha256")
+            artifact_names.add(name)
+        if scenario_id in {"server_crash", "worker_stall"}:
+            require(
+                "publication-fault-external.raw.json" in artifact_names,
+                f"{scenario_id} scenario omitted separately hashed publication-fence evidence",
+            )
+
+    nonclaims = evidence.get("lower_tier_nonclaims")
+    require(isinstance(nonclaims, dict), "retained qualification omitted lower-tier nonclaims")
+    require(set(nonclaims) == LOWER_TIER_NONCLAIMS, "retained qualification nonclaim set is incomplete")
+    for claim, record in nonclaims.items():
+        require(isinstance(record, dict), f"nonclaim {claim} is malformed")
+        require(record.get("claimed") is False, f"lower-tier evidence incorrectly claims {claim}")
+        require_nonempty_string(record.get("reason"), f"nonclaim {claim} reason")
+
+    metrics = evidence.get("metrics")
+    require(isinstance(metrics, dict), "retained qualification omitted metric results")
+    required_metrics = set(measurement_contract["measurement_protocol"]["required_metrics"])
+    require(set(metrics) == required_metrics, "retained qualification metric set is incomplete")
+    thresholds = measurement_contract["constant_set"]["qualification_thresholds"]
+    metric_contracts = measurement_contract["measurement_protocol"]["metric_contracts"]
+    for metric, result in metrics.items():
+        require(isinstance(result, dict), f"metric {metric} is malformed")
+        require(result.get("status") == "pass", f"metric {metric} did not pass its frozen threshold")
+        require(
+            result.get("unit") == metric_contracts[metric]["unit"],
+            f"metric {metric} used the wrong unit",
+        )
+        require(
+            isinstance(result.get("value"), (int, float))
+            and not isinstance(result.get("value"), bool),
+            f"metric {metric} value is not numeric",
+        )
+        require(
+            result.get("threshold") == thresholds[metric]
+            and isinstance(result.get("threshold"), (int, float))
+            and not isinstance(result.get("threshold"), bool),
+            f"metric {metric} threshold does not match the frozen constant set",
+        )
+        comparison = metric_contracts[metric]["comparison"]
+        require(result.get("comparison") == comparison, f"metric {metric} used the wrong comparison")
+        if metric == "retrieval_quality":
+            raw_evidence = result.get("raw_evidence")
+            require(isinstance(raw_evidence, dict), "retrieval quality metric omitted raw evidence")
+            require_exact_keys(
+                raw_evidence,
+                {
+                    "artifact",
+                    "evaluation_contract",
+                    "source_commit",
+                    "source_tree",
+                    "repeats",
+                    "row_count",
+                    "passing_row_count",
+                    "publishable_packet_pass_rate",
+                },
+                "retrieval quality retained raw evidence",
+            )
+            artifact = raw_evidence["artifact"]
+            require(isinstance(artifact, dict), "retrieval quality raw artifact is malformed")
+            require_exact_keys(artifact, {"name", "sha256"}, "retrieval quality raw artifact")
+            require(
+                artifact["name"] == "packet-runtime-summary.json",
+                "retrieval quality raw artifact name is invalid",
+            )
+            require_sha256(artifact["sha256"], "retrieval quality raw artifact sha256")
+            require(
+                raw_evidence["evaluation_contract"] == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+                "retrieval quality retained evaluation contract changed",
+            )
+            require(
+                raw_evidence["source_commit"] == evidence["source"]["commit"]
+                and raw_evidence["source_tree"] == evidence["source"]["tree"],
+                "retrieval quality retained source identity is stale",
+            )
+            require(
+                require_positive_int(raw_evidence["repeats"], "retrieval quality repeats")
+                >= MIN_RETRIEVAL_QUALITY_REPEATS,
+                "retrieval quality retained too few repeats",
+            )
+            row_count = require_positive_int(
+                raw_evidence["row_count"], "retrieval quality row count"
+            )
+            require(
+                require_positive_int(
+                    raw_evidence["passing_row_count"],
+                    "retrieval quality passing row count",
+                )
+                == row_count,
+                "retrieval quality retained a failing row",
+            )
+            require(
+                isinstance(raw_evidence["publishable_packet_pass_rate"], (int, float))
+                and not isinstance(raw_evidence["publishable_packet_pass_rate"], bool),
+                "retrieval quality pass rate is not numeric",
+            )
+            require(
+                raw_evidence["publishable_packet_pass_rate"] == result["value"],
+                "retrieval quality metric does not match its raw evidence",
+            )
+        else:
+            raw_evidence = result.get("raw_evidence")
+            require(
+                isinstance(raw_evidence, dict),
+                f"metric {metric} omitted its raw measurement artifact",
+            )
+            require_exact_keys(
+                raw_evidence,
+                {"name", "sha256"},
+                f"metric {metric} raw measurement artifact",
+            )
+            expected_artifact_name = (
+                "total-codestory-process-memory.raw.json"
+                if metric == "total_codestory_process_memory"
+                else "measurements.raw.json"
+            )
+            require(
+                raw_evidence["name"] == expected_artifact_name,
+                f"metric {metric} used the wrong raw measurement artifact",
+            )
+            require_sha256(raw_evidence["sha256"], f"metric {metric} raw artifact sha256")
+        passed = {
+            "equal": result["value"] == result["threshold"],
+            "greater_than_or_equal": result["value"] >= result["threshold"],
+            "less_than_or_equal": result["value"] <= result["threshold"],
+        }[comparison]
+        require(passed, f"metric {metric} value failed its frozen comparison")
+
+    return evidence
+
+
 def parse_byte_quantity(value: str) -> int:
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMG])?", value.strip())
     require(match is not None, f"invalid memory quantity: {value!r}")
@@ -782,10 +1964,447 @@ def process_resident_memory(pid: int) -> tuple[int, str]:
         raise ProofFailure(f"invalid RSS for process {pid}: {completed.stdout!r}") from exc
 
 
-def engine_process_id(identity: dict) -> int:
-    parts = str(identity.get("embedding_engine_instance_id") or "").split(":")
-    require(len(parts) >= 3 and parts[0] == "inprocess" and parts[1].isdigit(), "invalid process engine identity")
-    return int(parts[1])
+def suspend_clock_pair(target_os: str) -> tuple[int, int, str, str]:
+    awake_ns = time.monotonic_ns()
+    if target_os == "linux":
+        require(
+            hasattr(time, "CLOCK_BOOTTIME"),
+            "Linux qualification host lacks CLOCK_BOOTTIME",
+        )
+        inclusive_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        return awake_ns, inclusive_ns, "CLOCK_MONOTONIC", "CLOCK_BOOTTIME"
+    if target_os == "macos":
+        class MachTimebaseInfo(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+        system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        system.mach_continuous_time.restype = ctypes.c_uint64
+        system.mach_timebase_info.argtypes = [ctypes.POINTER(MachTimebaseInfo)]
+        info = MachTimebaseInfo()
+        require(
+            system.mach_timebase_info(ctypes.byref(info)) == 0 and info.denom > 0,
+            "macOS qualification host could not read mach timebase",
+        )
+        inclusive_ticks = system.mach_continuous_time()
+        inclusive_ns = inclusive_ticks * info.numer // info.denom
+        return awake_ns, inclusive_ns, "mach_absolute_time", "mach_continuous_time"
+    require(target_os == "windows", f"unsupported qualification clock target {target_os}")
+    kernel = ctypes.windll.kernel32
+    unbiased = ctypes.c_ulonglong()
+    inclusive = ctypes.c_ulonglong()
+    require(
+        bool(kernel.QueryUnbiasedInterruptTimePrecise(ctypes.byref(unbiased))),
+        "Windows qualification host could not read unbiased interrupt time",
+    )
+    kernel.QueryInterruptTimePrecise(ctypes.byref(inclusive))
+    return (
+        int(unbiased.value) * 100,
+        int(inclusive.value) * 100,
+        "QueryUnbiasedInterruptTimePrecise",
+        "QueryInterruptTimePrecise",
+    )
+
+
+def plugin_client_process(status: dict, manifest: dict, label: str) -> dict:
+    plugin_runtime = status.get("plugin_runtime")
+    require(isinstance(plugin_runtime, dict), f"{label} omitted plugin_runtime")
+    process = plugin_runtime.get("client_process")
+    require(isinstance(process, dict), f"{label} omitted client_process")
+    require_exact_keys(
+        process,
+        {"pid", "process_start_id", "executable_sha256"},
+        f"{label} client_process",
+    )
+    pid = require_positive_int(process["pid"], f"{label} client_process.pid")
+    start_id = require_nonempty_string(
+        process["process_start_id"],
+        f"{label} client_process.process_start_id",
+    )
+    require(
+        process_start_identity(pid) == start_id,
+        f"{label} client process identity is no longer live",
+    )
+    require(
+        process["executable_sha256"] == manifest["binary"]["sha256"],
+        f"{label} client process is not the exact packaged executable",
+    )
+    return {
+        "pid": pid,
+        "process_start_id": start_id,
+        "executable_sha256": process["executable_sha256"],
+    }
+
+
+def capture_five_process_memory(
+    *,
+    args: argparse.Namespace,
+    node_path: Path,
+    host_a: McpProcess,
+    host_a_start: str,
+    host_b: McpProcess,
+    host_b_start: str,
+    status_a: dict,
+    status_b: dict,
+    snapshot: dict,
+    manifest: dict,
+    expected_backend: str,
+) -> dict:
+    protocol, _ = load_measurement_protocol(args.measurement_protocol)
+    matrix_cell_id = require_nonempty_string(
+        args.qualification_matrix_cell,
+        "memory qualification requires --qualification-matrix-cell",
+    )
+    matrix_cell = selected_qualification_matrix_cell(
+        protocol,
+        cell_id=matrix_cell_id,
+        target=manifest["asset_target"],
+        proof_tier=args.proof_tier,
+        expected_policy=args.engine_policy,
+        expected_backend=expected_backend,
+    )
+    client_a = plugin_client_process(status_a, manifest, "first plugin host")
+    client_b = plugin_client_process(status_b, manifest, "second plugin host")
+    require(
+        (client_a["pid"], client_a["process_start_id"])
+        != (client_b["pid"], client_b["process_start_id"]),
+        "plugin hosts reported the same CLI client process",
+    )
+    server = snapshot["process"]
+    require(
+        server.get("executable_sha256") == manifest["binary"]["sha256"],
+        "shared embedding server is not the exact packaged executable",
+    )
+    node_digest = sha256(node_path.resolve())
+    process_set = [
+        {
+            "role": "plugin_host_a",
+            "pid": host_a.process.pid,
+            "process_start_id": host_a_start,
+            "executable_sha256": node_digest,
+        },
+        {"role": "plugin_cli_a", **client_a},
+        {
+            "role": "plugin_host_b",
+            "pid": host_b.process.pid,
+            "process_start_id": host_b_start,
+            "executable_sha256": node_digest,
+        },
+        {"role": "plugin_cli_b", **client_b},
+        {
+            "role": "embedding_server",
+            "pid": require_positive_int(server.get("pid"), "embedding server pid"),
+            "process_start_id": require_nonempty_string(
+                server.get("process_start_id"),
+                "embedding server process_start_id",
+            ),
+            "executable_sha256": server["executable_sha256"],
+        },
+    ]
+    identities = {
+        (process["pid"], process["process_start_id"]) for process in process_set
+    }
+    require(
+        len(identities) == 5,
+        "memory evidence did not identify five distinct live CodeStory processes",
+    )
+    target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
+    boot_id = require_nonempty_string(
+        snapshot["clock"]["boot_id"],
+        "embedding server clock boot_id",
+    )
+    samples = []
+    for repeat in range(1, 4):
+        awake_started, inclusive_started, awake_api, inclusive_api = (
+            suspend_clock_pair(target_os)
+        )
+        processes = []
+        for process in process_set:
+            require(
+                process_start_identity(process["pid"])
+                == process["process_start_id"],
+                f"memory process {process['role']} changed identity before sampling",
+            )
+            resident_bytes, measurement_api = process_resident_memory(process["pid"])
+            processes.append(
+                {
+                    **process,
+                    "resident_bytes": resident_bytes,
+                    "measurement_api": measurement_api,
+                }
+            )
+        awake_finished, inclusive_finished, finished_awake_api, finished_inclusive_api = (
+            suspend_clock_pair(target_os)
+        )
+        require(
+            finished_awake_api == awake_api
+            and finished_inclusive_api == inclusive_api,
+            "memory sampling clock API changed within one sample",
+        )
+        for process in process_set:
+            require(
+                process_start_identity(process["pid"])
+                == process["process_start_id"],
+                f"memory process {process['role']} changed identity during sampling",
+            )
+        samples.append(
+            {
+                "sample_id": canonical_sha256(
+                    {
+                        "matrix_cell_id": matrix_cell_id,
+                        "repeat": repeat,
+                        "identities": sorted(identities),
+                    }
+                ),
+                "repeat": repeat,
+                "matrix_cell_id": matrix_cell_id,
+                "workload_id": protocol["workloads"][
+                    "total_codestory_process_memory"
+                ]["workload_id"],
+                "cache_state": matrix_cell["cache_state"],
+                "residency_state": matrix_cell["residency_state"],
+                "producer_process": {
+                    "pid": os.getpid(),
+                    "process_start_id": process_start_identity(os.getpid()),
+                },
+                "server_identity": {
+                    "server_instance_id": snapshot["process"]["server_instance_id"],
+                    "process_start_id": snapshot["process"]["process_start_id"],
+                    "load_generation": snapshot["engine"]["load_generation"],
+                },
+                "clock": {
+                    "domain": "awake_monotonic",
+                    "api": awake_api,
+                    "boot_id": boot_id,
+                    "resolution_ns": max(1, round(time.get_clock_info("monotonic").resolution * 1e9)),
+                },
+                "start": {
+                    "phase": "steady_state_process_set_identified",
+                    "observed_ns": awake_started,
+                },
+                "end": {
+                    "phase": "steady_state_memory_samples_collected",
+                    "observed_ns": awake_finished,
+                },
+                "operands": {"processes": processes},
+                "suspend_witness": {
+                    "awake_started_ns": awake_started,
+                    "awake_finished_ns": awake_finished,
+                    "inclusive_clock_api": inclusive_api,
+                    "inclusive_started_ns": inclusive_started,
+                    "inclusive_finished_ns": inclusive_finished,
+                    "boot_id_started": boot_id,
+                    "boot_id_finished": boot_id,
+                },
+            }
+        )
+        if repeat < 3:
+            time.sleep(0.25)
+    return {
+        "evidence_contract": MEMORY_EVIDENCE_CONTRACT,
+        "metric": "total_codestory_process_memory",
+        "unit": "bytes",
+        "samples": samples,
+    }
+
+
+def retain_five_process_memory_evidence(
+    artifact_root: Path,
+    raw: object,
+    *,
+    source: dict,
+    package: dict,
+    contracts: dict,
+    protocol: dict,
+    target: str,
+    proof_tier: str,
+    matrix_cell_id: str,
+    expected_policy: str,
+    expected_backend: str,
+    forbidden_values: list[str],
+) -> dict:
+    require(isinstance(raw, dict), "live runtime omitted five-process memory observations")
+    require_exact_keys(
+        raw,
+        {"evidence_contract", "metric", "unit", "samples"},
+        "five-process memory observations",
+    )
+    payload = {
+        "schema_version": 1,
+        "source": source,
+        "package": package,
+        "contracts": contracts,
+        **raw,
+    }
+    name = "total-codestory-process-memory.raw.json"
+    path = artifact_root / name
+    write_private_json(path, payload)
+    payload_bytes = path.read_bytes()
+    for forbidden in forbidden_values:
+        require(
+            forbidden.encode("utf-8") not in payload_bytes,
+            "five-process memory artifact leaked private request material",
+        )
+    require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "source",
+            "package",
+            "contracts",
+            "evidence_contract",
+            "metric",
+            "unit",
+            "samples",
+        },
+        "five-process memory artifact",
+    )
+    require(
+        payload["schema_version"] == 1
+        and payload["source"] == source
+        and payload["package"] == package
+        and payload["contracts"] == contracts
+        and payload["evidence_contract"] == MEMORY_EVIDENCE_CONTRACT
+        and payload["metric"] == "total_codestory_process_memory"
+        and payload["unit"] == "bytes",
+        "five-process memory artifact changed its bound contract",
+    )
+    matrix_cell = selected_qualification_matrix_cell(
+        protocol,
+        cell_id=matrix_cell_id,
+        target=target,
+        proof_tier=proof_tier,
+        expected_policy=expected_policy,
+        expected_backend=expected_backend,
+    )
+    samples = payload["samples"]
+    require(
+        isinstance(samples, list) and len(samples) == 3,
+        "five-process memory evidence requires three samples",
+    )
+    target_os = TARGET_CONTRACTS[target]["target_os"]
+    clock_policy = protocol["clock_policy"]
+    allowed_awake_apis = set(clock_policy["platform_apis"][target_os])
+    suspend_contract = clock_policy["suspend_detection"]
+    expected_measurement_api = {
+        "linux": "rss",
+        "macos": "macos_physical_footprint",
+        "windows": "windows_working_set",
+    }[target_os]
+    values = []
+    sample_ids: set[str] = set()
+    server_identities: set[tuple[str, str, int]] = set()
+    for index, sample in enumerate(samples):
+        require(isinstance(sample, dict), f"five-process memory sample {index} is malformed")
+        require_exact_keys(
+            sample,
+            {
+                "sample_id",
+                "repeat",
+                "matrix_cell_id",
+                "workload_id",
+                "cache_state",
+                "residency_state",
+                "producer_process",
+                "server_identity",
+                "clock",
+                "start",
+                "end",
+                "operands",
+                "suspend_witness",
+            },
+            f"five-process memory sample {index}",
+        )
+        sample_id = require_opaque_identifier(
+            sample["sample_id"],
+            f"five-process memory sample {index}.sample_id",
+        )
+        require(sample_id not in sample_ids, "five-process memory sample id was reused")
+        sample_ids.add(sample_id)
+        require(
+            sample["repeat"] == index + 1
+            and sample["matrix_cell_id"] == matrix_cell_id
+            and sample["workload_id"]
+            == protocol["workloads"]["total_codestory_process_memory"]["workload_id"]
+            and sample["cache_state"] == matrix_cell["cache_state"]
+            and sample["residency_state"] == matrix_cell["residency_state"],
+            "five-process memory sample changed its preregistered cell or workload",
+        )
+        processes = sample.get("operands", {}).get("processes", [])
+        require(
+            all(
+                isinstance(process, dict)
+                and process.get("measurement_api") == expected_measurement_api
+                for process in processes
+            ),
+            "five-process memory sample used the wrong platform memory API",
+        )
+        package_processes = {
+            "plugin_cli_a",
+            "plugin_cli_b",
+            "embedding_server",
+        }
+        require(
+            all(
+                process.get("executable_sha256") == package["executable_sha256"]
+                for process in processes
+                if process.get("role") in package_processes
+            ),
+            "five-process memory sample used a different packaged executable",
+        )
+        server = sample["server_identity"]
+        require(
+            isinstance(server, dict),
+            f"five-process memory sample {index} server identity is malformed",
+        )
+        require_exact_keys(
+            server,
+            {"server_instance_id", "process_start_id", "load_generation"},
+            f"five-process memory sample {index} server identity",
+        )
+        server_identities.add(
+            (
+                require_opaque_identifier(
+                    server["server_instance_id"],
+                    f"five-process memory sample {index}.server_instance_id",
+                ),
+                require_nonempty_string(
+                    server["process_start_id"],
+                    f"five-process memory sample {index}.server_process_start_id",
+                ),
+                require_positive_int(
+                    server["load_generation"],
+                    f"five-process memory sample {index}.load_generation",
+                ),
+            )
+        )
+        adapted = {**sample, "process": sample["producer_process"]}
+        adapted.pop("producer_process")
+        values.append(
+            qualification_measurement_sample_value(
+                "total_codestory_process_memory",
+                adapted,
+                contracts=contracts,
+                phase_boundaries=protocol["phase_boundaries"],
+                allowed_awake_apis=allowed_awake_apis,
+                inclusive_api=suspend_contract["platform_apis"][target_os],
+                maximum_suspend_ns=suspend_contract[
+                    "maximum_inclusive_minus_awake_ns"
+                ],
+                expected_policy=expected_policy,
+                expected_backend=expected_backend,
+            )
+        )
+    require(
+        len(server_identities) == 1,
+        "five-process memory block changed shared server identity",
+    )
+    return {
+        "artifact": {
+            "name": name,
+            "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        },
+        "value": max(values),
+    }
 
 
 def assert_public_status(status: dict) -> None:
@@ -805,6 +2424,14 @@ def assert_public_status(status: dict) -> None:
         "embedding_materialized_path",
         "embedding_detected_provider",
         "embedding_detected_gpu",
+        "embedding_server",
+        "server_instance_id",
+        "lifetime_authority_id",
+        "listener_id",
+        "engine_owner_id",
+        "native_worker_id",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
     )
     leaked = [key for key in maintainer_only if find_value(status, key) is not None]
     require(not leaked, "public status leaked maintainer-only retrieval fields: " + ", ".join(leaked))
@@ -981,6 +2608,236 @@ class McpProcess:
                 self.process.kill()
                 self.process.wait(timeout=5)
 
+    def kill(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait(timeout=10)
+
+
+def process_start_identity(pid: int) -> str:
+    if os.name == "nt":
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CreationDate.ToUniversalTime().ToString('o')",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        require(completed.returncode == 0, f"could not read process start identity for {pid}")
+        return require_nonempty_string(completed.stdout.strip(), "process start identity")
+    if sys.platform == "linux":
+        stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        require(len(stat_fields) > 21, f"/proc/{pid}/stat omitted process start identity")
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        return f"{boot_id}:{stat_fields[21]}"
+    completed = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    require(completed.returncode == 0, f"could not read process start identity for {pid}")
+    return require_nonempty_string(completed.stdout.strip(), "process start identity")
+
+
+def current_account_identity() -> str:
+    if os.name != "nt":
+        return f"uid:{os.geteuid()}"
+    completed = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    require(completed.returncode == 0, "could not read current Windows account SID")
+    match = re.search(r'"(S-[0-9-]+)"\s*$', completed.stdout.strip())
+    require(match is not None, "Windows account command omitted SID")
+    return f"sid:{match.group(1)}"
+
+
+def opaque_repository_id(project: Path) -> str:
+    return "repo:" + hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()
+
+
+def directory_contract_sha256(root: Path) -> str:
+    require(root.is_dir(), f"plugin package root does not exist: {root}")
+    digest = hashlib.sha256()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    require(files, "plugin package root is empty")
+    for path in files:
+        require(not path.is_symlink(), f"installed plugin package contains a symlink: {path}")
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        payload = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "little"))
+        digest.update(relative)
+        digest.update(len(payload).to_bytes(8, "little"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def installed_plugin_provenance(
+    args: argparse.Namespace,
+    plugin_root: Path,
+    manifest: dict,
+) -> dict:
+    require(
+        args.proof_tier == "installed_runtime",
+        "installed plugin provenance is valid only at installed_runtime tier",
+    )
+    require(
+        args.installed_plugin_provenance is not None,
+        "installed_runtime proof requires --installed-plugin-provenance",
+    )
+    require(
+        args.installed_plugin_data is not None and args.installed_plugin_data.is_dir(),
+        "installed_runtime proof requires an existing --installed-plugin-data directory",
+    )
+    source_plugin_root = Path(__file__).resolve().parents[2] / "plugins" / "codestory"
+    require(
+        not os.path.samefile(plugin_root, source_plugin_root),
+        "installed_runtime proof rejects the repository-source plugin root",
+    )
+    completed = subprocess.run(
+        ["git", "-C", str(plugin_root), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    if completed.returncode == 0:
+        checkout = Path(completed.stdout.strip())
+        require(
+            not ((checkout / "Cargo.toml").is_file() and (checkout / "crates/codestory-cli").is_dir()),
+            "installed_runtime proof rejects a plugin launched from a CodeStory source checkout",
+        )
+    try:
+        provenance = json.loads(
+            args.installed_plugin_provenance.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"installed plugin provenance is not valid JSON: {exc}") from exc
+    require(isinstance(provenance, dict), "installed plugin provenance must be an object")
+    require(provenance.get("schema_version") == 1, "installed plugin provenance schema is unsupported")
+    require(
+        provenance.get("marketplace_repository") == "TheGreenCedar/AgentPluginMarketplace",
+        "installed plugin provenance names the wrong marketplace",
+    )
+    marketplace_commit = provenance.get("marketplace_commit")
+    require(
+        isinstance(marketplace_commit, str)
+        and re.fullmatch(r"[0-9a-f]{40}", marketplace_commit) is not None,
+        "installed plugin provenance has an invalid marketplace commit",
+    )
+    require(provenance.get("plugin_id") == "codestory", "installed plugin provenance names the wrong plugin")
+    require(
+        provenance.get("plugin_version") == manifest["release_version"],
+        "installed plugin version does not match the package",
+    )
+    require(
+        provenance.get("plugin_source_commit") == manifest["source"]["commit"],
+        "installed plugin source commit does not match the packaged source commit",
+    )
+    package_sha256 = directory_contract_sha256(plugin_root)
+    require(
+        provenance.get("plugin_package_sha256") == package_sha256,
+        "installed plugin package bytes do not match their provenance",
+    )
+    return {
+        "schema_version": 1,
+        "marketplace_repository": provenance["marketplace_repository"],
+        "marketplace_commit": marketplace_commit,
+        "plugin_id": "codestory",
+        "plugin_version": provenance["plugin_version"],
+        "plugin_source_commit": provenance["plugin_source_commit"],
+        "plugin_package_sha256": package_sha256,
+    }
+
+
+def verify_managed_runtime_status(
+    status: dict,
+    *,
+    plugin_root: Path,
+    manifest: dict,
+    archive_sha256: str,
+) -> dict:
+    plugin = status.get("plugin_runtime")
+    require(isinstance(plugin, dict), "installed status omitted plugin_runtime provenance")
+    require(plugin.get("cli_source") == "managed", "installed proof did not use the managed runtime")
+    require(plugin.get("local_dev_override") is False, "installed proof used a local CLI override")
+    require(
+        plugin.get("plugin_version") == manifest["release_version"],
+        "installed plugin version does not match the package",
+    )
+    reported_root = plugin.get("plugin_root")
+    require(isinstance(reported_root, str), "installed status omitted plugin_root")
+    require(
+        os.path.samefile(Path(reported_root), plugin_root),
+        "installed status names a different plugin root",
+    )
+    require(
+        plugin.get("managed_binary_sha256") == manifest["binary"]["sha256"],
+        "installed managed executable does not match the package",
+    )
+    require(
+        plugin.get("archive_sha256") == archive_sha256,
+        "installed managed runtime names a different release archive",
+    )
+    require(
+        plugin.get("cli_version") == manifest["release_version"],
+        "installed managed executable version does not match the package",
+    )
+    managed_binary_path = plugin.get("managed_binary_path")
+    require(
+        isinstance(managed_binary_path, str) and Path(managed_binary_path).is_file(),
+        "installed status omitted the managed executable path",
+    )
+    require(
+        sha256(Path(managed_binary_path)) == manifest["binary"]["sha256"],
+        "installed managed executable path does not contain the packaged binary",
+    )
+    for field in ("build_source", "repo_ref", "provisioned_at"):
+        require_nonempty_string(plugin.get(field), f"installed plugin_runtime.{field}")
+    return {
+        "cli_source": "managed",
+        "plugin_version": plugin["plugin_version"],
+        "managed_binary_sha256": plugin["managed_binary_sha256"],
+        "archive_sha256": plugin["archive_sha256"],
+        "build_source": plugin["build_source"],
+        "repo_ref": plugin["repo_ref"],
+        "provisioned_at": plugin["provisioned_at"],
+    }
+
+
+def run_parallel(tasks: dict[str, callable]) -> dict[str, object]:
+    results: dict[str, object] = {}
+    failures: list[tuple[str, BaseException]] = []
+    lock = threading.Lock()
+
+    def invoke(name: str, task) -> None:
+        try:
+            value = task()
+            with lock:
+                results[name] = value
+        except BaseException as exc:  # noqa: BLE001 - preserve worker failure for the proof.
+            with lock:
+                failures.append((name, exc))
+
+    threads = [
+        threading.Thread(target=invoke, args=(name, task), daemon=True)
+        for name, task in tasks.items()
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if failures:
+        name, failure = failures[0]
+        raise ProofFailure(f"parallel qualification task {name} failed: {failure}") from failure
+    return results
+
 
 def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[str, str]:
     env = dict(os.environ)
@@ -988,8 +2845,10 @@ def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[
     cache = root / "cache"
     data = root / "plugin-data"
     temp = root / "tmp"
-    for path in (home, cache, data, temp):
+    runtime = root / "runtime"
+    for path in (home, cache, data, temp, runtime):
         path.mkdir(parents=True, exist_ok=True)
+    runtime.chmod(0o700)
     env.update({
         "HOME": str(home),
         "USERPROFILE": str(home),
@@ -998,6 +2857,7 @@ def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[
         "TMPDIR": str(temp),
         "TEMP": str(temp),
         "TMP": str(temp),
+        "XDG_RUNTIME_DIR": str(runtime),
         "CODESTORY_EMBED_ALLOW_CPU": "1" if policy == "cpu_explicit" else "0",
     })
     if offline:
@@ -1012,6 +2872,21 @@ def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[
         if key.startswith("CODESTORY_EMBED_") and key != "CODESTORY_EMBED_ALLOW_CPU":
             del env[key]
     return env
+
+
+def qualification_environment(root: Path, env: dict[str, str]) -> tuple[dict[str, str], dict]:
+    proof_root = root / "qualification"
+    proof_root.mkdir(parents=True, exist_ok=True)
+    proof_root.chmod(0o700)
+    nonce = secrets.token_hex(32)
+    qualified = dict(env)
+    qualified["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(proof_root)
+    qualified["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
+    return qualified, {
+        "schema_version": QUALIFICATION_SCHEMA_VERSION,
+        "directory": str(proof_root),
+        "nonce_sha256": hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+    }
 
 
 def assert_no_legacy_state(cache_root: Path) -> None:
@@ -1031,327 +2906,2930 @@ def create_second_repository(root: Path) -> Path:
     return repo
 
 
-def native_cli_pid(mcp: McpProcess, plugin_handoff: bool) -> int:
-    if not plugin_handoff:
-        return mcp.process.pid
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if os.name == "nt":
-            command = [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"Get-CimInstance Win32_Process -Filter \"ParentProcessId = {mcp.process.pid}\" | Select-Object -ExpandProperty ProcessId",
-            ]
-            completed = subprocess.run(command, text=True, capture_output=True, timeout=10)
-            candidates = [line.strip() for line in completed.stdout.splitlines()]
-        else:
-            completed = subprocess.run(
-                ["ps", "-axo", "pid=,ppid="],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-            candidates = []
-            for line in completed.stdout.splitlines():
-                fields = line.split()
-                if len(fields) == 2 and fields[1] == str(mcp.process.pid):
-                    candidates.append(fields[0])
-        numeric = [int(value) for value in candidates if value.isdigit()]
-        if len(numeric) == 1:
-            return numeric[0]
-        time.sleep(0.1)
-    raise ProofFailure("plugin launcher did not expose exactly one native CLI child")
-
-
-def create_residency_projects(root: Path) -> list[tuple[Path, str]]:
-    projects = []
-    for name, symbol in (("idle fixture alpha", "AlphaResidency"), ("idle fixture ü", "BetaResidency")):
-        project = root / name
-        source = project / "src"
-        source.mkdir(parents=True, exist_ok=True)
-        (project / "Cargo.toml").write_text(
-            f'[package]\nname = "{name.replace(" ", "-").replace("ü", "u")}"\nversion = "0.1.0"\nedition = "2024"\n',
-            encoding="utf-8",
-        )
-        (source / "lib.rs").write_text(
-            f"pub struct {symbol};\nimpl {symbol} {{ pub fn ready(&self) -> bool {{ true }} }}\n",
-            encoding="utf-8",
-        )
-        projects.append((project, symbol))
-    return projects
-
-
-def prove_idle_residency(
+def prove_runtime(
     args: argparse.Namespace,
-    command: list[str],
+    cli: Path,
     env: dict[str, str],
+    root: Path,
     out_dir: Path,
+    manifest: dict,
 ) -> dict:
-    projects = create_residency_projects(out_dir / "idle-fixtures")
-    project, query = projects[0]
-    additional_projects = projects[1:]
-    mcp = McpProcess(command, env=env, cwd=project, timeout=args.timeout_secs)
-    try:
-        mcp.initialize()
-        mcp.status(project, "idle-baseline-status")
-        for index, (additional_project, _) in enumerate(additional_projects, start=1):
-            mcp.status(additional_project, f"idle-baseline-additional-{index}")
-        cli_pid = native_cli_pid(mcp, args.plugin_handoff)
-        baseline_memory, memory_metric = process_resident_memory(cli_pid)
-
-        mcp.tool_until_ready(
-            "search",
-            {"project": str(project), "query": query, "why": True},
-            "idle-load-search",
-        )
-        first_identity = engine_identity(
-            mcp.engine_diagnostics(project, "idle-load-diagnostics"),
-            args.engine_policy,
-            args.expected_backend,
-        )
-        require(engine_process_id(first_identity) == cli_pid, "diagnostics identified a different CLI process")
-        require(first_identity["embedding_materialized_reused"] is True, "measured process did not reuse the materialized model")
-        for index, (additional_project, query) in enumerate(additional_projects, start=1):
-            mcp.tool_until_ready(
-                "search",
-                {"project": str(additional_project), "query": query, "why": True},
-                f"idle-load-additional-{index}",
-            )
-            additional_identity = engine_identity(
-                mcp.engine_diagnostics(additional_project, f"idle-load-additional-diagnostics-{index}"),
-                args.engine_policy,
-                args.expected_backend,
-            )
-            require(additional_identity["embedding_engine_instance_id"] == first_identity["embedding_engine_instance_id"], "measured repositories did not share one owner")
-        loaded_memory, loaded_metric = process_resident_memory(cli_pid)
-        require(loaded_metric == memory_metric, "process memory metric changed during the proof")
-
-        time.sleep(30)
-        warm_identity = engine_identity(
-            mcp.engine_diagnostics(project, "idle-still-warm-diagnostics"),
-            args.engine_policy,
-            args.expected_backend,
-        )
-        require(warm_identity["embedding_engine_instance_id"] == first_identity["embedding_engine_instance_id"], "recently active engine changed owner")
-        time.sleep(35)
-        sleeping_identity = engine_identity(
-            mcp.engine_diagnostics(project, "idle-sleeping-diagnostics"),
-            args.engine_policy,
-            args.expected_backend,
-            expected_residency="sleeping",
-        )
-        sleeping_memory, sleeping_metric = process_resident_memory(cli_pid)
-        require(sleeping_metric == memory_metric, "process memory metric changed during the proof")
-        loaded_increment = max(0, loaded_memory - baseline_memory)
-        idle_allowance = max(50 * 1024 * 1024, loaded_increment // 4)
+    require(args.plugin_handoff, "runtime proof requires the ordinary packaged plugin handoff")
+    require(args.plugin_root is not None, "--plugin-handoff requires --plugin-root")
+    require(args.project is not None, "--project is required for runtime proof")
+    project_a = args.project.resolve()
+    require(project_a.is_dir(), f"first proof repository does not exist: {project_a}")
+    require(
+        len(args.additional_project) == len(args.additional_query),
+        "each --additional-project requires one --additional-query",
+    )
+    if args.additional_project:
         require(
-            sleeping_memory <= baseline_memory + idle_allowance,
-            "idle process memory did not return near its pre-engine baseline: "
-            f"metric={memory_metric} baseline={baseline_memory} loaded={loaded_memory} "
-            f"sleeping={sleeping_memory} allowance={idle_allowance}",
+            len(args.additional_project) == 1,
+            "two-host proof accepts exactly one --additional-project",
         )
-        assert_public_status(mcp.status(project, "idle-sleeping-status"))
+        project_b = args.additional_project[0].resolve()
+        query_b = args.additional_query[0]
+    else:
+        project_b = create_second_repository(root)
+        query_b = "shared_engine_probe"
+    require(project_b.is_dir(), f"second proof repository does not exist: {project_b}")
+    require(project_a != project_b, "two-host proof requires different repositories")
 
-        materialized = Path(str(first_identity["embedding_materialized_path"]))
-        backup = materialized.with_name(materialized.name + ".proof-backup")
-        materialized.rename(backup)
-        materialized.mkdir()
-        try:
-            failed_wake = mcp.tool(
-                "search",
-                {"project": str(project), "query": query, "why": True},
-                "idle-failed-wake",
+    plugin_root = args.plugin_root.resolve()
+    provenance = (
+        installed_plugin_provenance(args, plugin_root, manifest)
+        if args.proof_tier == "installed_runtime"
+        else None
+    )
+    launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
+    require(launcher.is_file(), f"plugin launcher is missing: {launcher}")
+    node = shutil.which("node")
+    require(node is not None, "packaged plugin proof requires Node.js for the host launcher")
+    qualified_env, qualification_control = qualification_environment(root, env)
+    qualified_env.pop("CODESTORY_CLI", None)
+    if args.proof_tier == "installed_runtime":
+        qualified_env["CODESTORY_PLUGIN_DATA"] = str(args.installed_plugin_data.resolve())
+    else:
+        qualified_env["CODESTORY_CLI"] = str(cli)
+    command = [node, str(launcher)]
+
+    embedded_models = Path(qualified_env["CODESTORY_CACHE_ROOT"]) / "embedded-models"
+    require(not embedded_models.exists(), "isolated proof cache was not empty before first use")
+    host_a = McpProcess(command, env=qualified_env, cwd=project_a, timeout=args.timeout_secs)
+    host_b = McpProcess(command, env=qualified_env, cwd=project_b, timeout=args.timeout_secs)
+    host_a_start = process_start_identity(host_a.process.pid)
+    host_b_start = process_start_identity(host_b.process.pid)
+    require(
+        (host_a.process.pid, host_a_start) != (host_b.process.pid, host_b_start),
+        "plugin hosts are not independent processes",
+    )
+    try:
+        run_parallel({"initialize-a": host_a.initialize, "initialize-b": host_b.initialize})
+        cold_started = time.perf_counter()
+        cold_results = run_parallel(
+            {
+                "search-a": lambda: host_a.search_until_ready(
+                    {"project": str(project_a), "query": args.query, "why": True},
+                    "cold-search-a",
+                ),
+                "search-b": lambda: host_b.search_until_ready(
+                    {"project": str(project_b), "query": query_b, "why": True},
+                    "cold-search-b",
+                ),
+            }
+        )
+        cold_race_wall_ms = round((time.perf_counter() - cold_started) * 1000, 3)
+        diagnostics_a = host_a.engine_diagnostics(project_a, "diagnostics-a")
+        diagnostics_b = host_b.engine_diagnostics(project_b, "diagnostics-b")
+        identity_a = engine_identity(
+            diagnostics_a,
+            args.engine_policy,
+            args.expected_backend,
+        )
+        identity_b = engine_identity(
+            diagnostics_b,
+            args.engine_policy,
+            args.expected_backend,
+        )
+        snapshot_a = server_snapshot(diagnostics_a, manifest, require_resident=True)
+        snapshot_b = server_snapshot(diagnostics_b, manifest, require_resident=True)
+        shared_identity = shared_server_identity(snapshot_a, snapshot_b)
+        require(
+            identity_a["embedding_engine_instance_id"]
+            == identity_b["embedding_engine_instance_id"],
+            "independent plugin hosts observed different engine instances",
+        )
+        require(
+            identity_a["embedding_engine_load_generation"]
+            == identity_b["embedding_engine_load_generation"]
+            == shared_identity["load_generation"],
+            "engine load generation disagrees with server proof",
+        )
+        require(
+            identity_a["embedding_model_load_count"]
+            == identity_b["embedding_model_load_count"]
+            == shared_identity["model_load_count"]
+            == 1,
+            "two-host cold race did not prove one model load",
+        )
+        status_a = host_a.status(project_a, "status-a")
+        status_b = host_b.status(project_b, "status-b")
+        assert_public_status(status_a)
+        assert_public_status(status_b)
+        managed_runtime = None
+        if args.proof_tier == "installed_runtime":
+            managed_runtime = verify_managed_runtime_status(
+                status_a,
+                plugin_root=plugin_root,
+                manifest=manifest,
+                archive_sha256=sha256(args.archive),
             )
-            require(failed_wake.get("result", {}).get("isError") is True, "blocked model path did not fail the activating wake")
-            failed_identity = engine_identity(
-                mcp.engine_diagnostics(project, "idle-failed-wake-diagnostics"),
+            require(
+                verify_managed_runtime_status(
+                    status_b,
+                    plugin_root=plugin_root,
+                    manifest=manifest,
+                    archive_sha256=sha256(args.archive),
+                )
+                == managed_runtime,
+                "independent installed plugin hosts reported different managed runtime provenance",
+            )
+            managed_binary_path = Path(
+                require_nonempty_string(
+                    status_a["plugin_runtime"].get("managed_binary_path"),
+                    "installed plugin_runtime.managed_binary_path",
+                )
+            ).resolve()
+            require(
+                managed_binary_path.is_relative_to(args.installed_plugin_data.resolve()),
+                "installed managed executable is outside the installed plugin data root",
+            )
+            require(
+                managed_binary_path != cli.resolve(),
+                "installed proof used the unpacked package executable as its managed runtime",
+            )
+
+        before_encode = snapshot_a["engine"]["successful_encode_count"]
+        run_parallel(
+            {
+                "packet-a": lambda: host_a.tool_until_ready(
+                    "packet",
+                    {
+                        "project": str(project_a),
+                        "question": args.question,
+                        "budget": "compact",
+                    },
+                    "packet-a",
+                ),
+                "search-b-live": lambda: host_b.search_until_ready(
+                    {"project": str(project_b), "query": query_b, "why": True},
+                    "search-b-live",
+                ),
+            }
+        )
+        after_diagnostics = host_b.engine_diagnostics(project_b, "diagnostics-after-live")
+        after_snapshot = server_snapshot(after_diagnostics, manifest, require_resident=True)
+        require(
+            after_snapshot["engine"]["successful_encode_count"] > before_encode,
+            "successful encode counter did not advance across two-host retrieval",
+        )
+        require(
+            after_snapshot["process"]["server_instance_id"]
+            == shared_identity["server_instance_id"],
+            "live retrieval replaced the shared server",
+        )
+        memory_observations = (
+            capture_five_process_memory(
+                args=args,
+                node_path=Path(node),
+                host_a=host_a,
+                host_a_start=host_a_start,
+                host_b=host_b,
+                host_b_start=host_b_start,
+                status_a=status_a,
+                status_b=status_b,
+                snapshot=after_snapshot,
+                manifest=manifest,
+                expected_backend=identity_a["embedding_backend"],
+            )
+            if args.produce_qualification_evidence
+            else None
+        )
+
+        host_a.kill()
+        host_b.search_until_ready(
+            {"project": str(project_b), "query": query_b, "why": True},
+            "survivor-search",
+        )
+        survivor = server_snapshot(
+            host_b.engine_diagnostics(project_b, "survivor-diagnostics"),
+            manifest,
+            require_resident=True,
+        )
+        require(
+            survivor["process"]["server_instance_id"] == shared_identity["server_instance_id"],
+            "one client exit disrupted the surviving client or replaced the server",
+        )
+
+        host_c = McpProcess(command, env=qualified_env, cwd=project_a, timeout=args.timeout_secs)
+        host_c_start = process_start_identity(host_c.process.pid)
+        try:
+            require(
+                (host_c.process.pid, host_c_start)
+                not in {
+                    (host_a.process.pid, host_a_start),
+                    (host_b.process.pid, host_b_start),
+                },
+                "replacement plugin host was not independently started",
+            )
+            host_c.initialize()
+            host_c.search_until_ready(
+                {"project": str(project_a), "query": args.query, "why": True},
+                "rejoin-search",
+            )
+            rejoin_diagnostics = host_c.engine_diagnostics(project_a, "rejoin-diagnostics")
+            rejoin_identity = engine_identity(
+                rejoin_diagnostics,
                 args.engine_policy,
                 args.expected_backend,
-                expected_residency="sleeping",
-                expected_load_error=True,
+            )
+            rejoin_snapshot = server_snapshot(
+                rejoin_diagnostics,
+                manifest,
+                require_resident=True,
+            )
+            require(
+                rejoin_snapshot["process"]["server_instance_id"]
+                == shared_identity["server_instance_id"],
+                "new plugin host did not join the existing server",
             )
         finally:
-            materialized.rmdir()
-            backup.rename(materialized)
+            write_json(out_dir / "plugin-host-c-mcp.json", host_c.transcript)
+            host_c.close()
 
-        mcp.tool_until_ready(
-            "search",
-            {"project": str(project), "query": query, "why": True},
-            "idle-wake-search",
+        cold_models = list(embedded_models.rglob("*.gguf"))
+        require(len(cold_models) == 1, "two-host first use did not materialize exactly one model")
+        materialized = cold_models[0]
+        require(
+            sha256(materialized) == identity_a["embedding_model_sha256"],
+            "materialized model digest does not match runtime identity",
         )
-        wake_identity = engine_identity(
-            mcp.engine_diagnostics(project, "idle-wake-diagnostics"),
-            args.engine_policy,
-            args.expected_backend,
-            expected_load_count=2,
-            expected_load_generation=2,
-        )
-        require(wake_identity["embedding_engine_instance_id"] == first_identity["embedding_engine_instance_id"], "idle wake replaced the engine owner")
-        require(wake_identity["embedding_materialized_path"] == first_identity["embedding_materialized_path"], "idle wake selected a different model path")
-        require(wake_identity["embedding_materialized_reused"] is True, "idle wake rewrote the content-addressed model")
         result = {
-            "memory_metric": memory_metric,
-            "baseline_memory_bytes": baseline_memory,
-            "loaded_memory_bytes": loaded_memory,
-            "sleeping_memory_bytes": sleeping_memory,
-            "idle_allowance_bytes": idle_allowance,
-            "warm_identity": warm_identity,
-            "sleeping_identity": sleeping_identity,
-            "failed_identity": failed_identity,
-            "wake_identity": wake_identity,
-            "wake_memory_bytes": process_resident_memory(cli_pid)[0],
+            "proof_tier": args.proof_tier,
+            "qualification_control": qualification_control,
+            "same_account": {
+                "account_id": current_account_identity(),
+                "relation": "same_os_account",
+                "cross_login_or_terminal_sessions_proven": False,
+                "plugin_hosts": [
+                    {
+                        "pid": host_a.process.pid,
+                        "process_start_id": host_a_start,
+                        "repository_id": opaque_repository_id(project_a),
+                    },
+                    {
+                        "pid": host_b.process.pid,
+                        "process_start_id": host_b_start,
+                        "repository_id": opaque_repository_id(project_b),
+                    },
+                ],
+            },
+            "cold_race_wall_ms": cold_race_wall_ms,
+            "cold_search_attempts": {
+                "host_a": cold_results["search-a"][1],
+                "host_b": cold_results["search-b"][1],
+            },
+            "shared_identity": shared_identity,
+            "snapshot_a": snapshot_a,
+            "snapshot_b": snapshot_b,
+            "survivor_snapshot": survivor,
+            "rejoin_snapshot": rejoin_snapshot,
+            "identity": identity_a,
+            "second_host_identity": identity_b,
+            "rejoin_identity": rejoin_identity,
+            "materialization": {
+                "sha256": sha256(materialized),
+                "reused_on_rejoin": rejoin_identity["embedding_materialized_reused"],
+            },
+            "installed_plugin": provenance,
+            "managed_runtime": managed_runtime,
+            "_qualification_cli_path": (
+                str(managed_binary_path)
+                if args.proof_tier == "installed_runtime"
+                else str(cli.resolve())
+            ),
+            "_qualification_projects": [str(project_a), str(project_b)],
+            "_memory_observations": memory_observations,
+            "nonclaims": {
+                claim: {
+                    "claimed": False,
+                    "reason": "hosted two-process package evidence does not establish this claim",
+                }
+                for claim in sorted(LOWER_TIER_NONCLAIMS)
+            },
         }
-        transcript = mcp.transcript
     finally:
-        mcp.close()
-    write_json(out_dir / "idle-residency-mcp.json", transcript)
-    write_json(out_dir / "idle-residency.json", result)
+        write_json(out_dir / "plugin-host-a-mcp.json", host_a.transcript)
+        write_json(out_dir / "plugin-host-b-mcp.json", host_b.transcript)
+        host_a.close()
+        host_b.close()
+    assert_no_legacy_state(Path(qualified_env["CODESTORY_CACHE_ROOT"]))
+    write_json(out_dir / "two-host-server-proof.json", result)
     return result
 
 
-def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root: Path, out_dir: Path) -> dict:
-    project = args.project.resolve()
-    if args.additional_project:
-        require(
-            len(args.additional_project) == len(args.additional_query),
-            "each --additional-project requires one --additional-query",
-        )
-        additional_projects = [
-            (path.resolve(), query)
-            for path, query in zip(args.additional_project, args.additional_query)
-        ]
-    else:
-        additional_projects = [(create_second_repository(root), "shared_engine_probe")]
-    embedded_models = Path(env["CODESTORY_CACHE_ROOT"]) / "embedded-models"
-    require(not embedded_models.exists(), "isolated proof cache was not empty before first use")
-
-    command = [str(cli), "serve", "--stdio", "--multi-project", "--refresh", "none"]
-    if args.plugin_handoff:
-        require(args.plugin_root is not None, "--plugin-handoff requires --plugin-root")
-        launcher = args.plugin_root.resolve() / "scripts" / "codestory-mcp.cjs"
-        require(launcher.is_file(), f"plugin launcher is missing: {launcher}")
-        env["CODESTORY_CLI"] = str(cli)
-        command = [shutil.which("node") or "node", str(launcher)]
-    mcp = McpProcess(command, env=env, cwd=project, timeout=args.timeout_secs)
-    try:
-        mcp.initialize()
-        cold_started = time.perf_counter()
-        _, cold_attempts = mcp.tool_until_ready(
-            "ground", {"project": str(project), "budget": "strict"}, "cold-ground"
-        )
-        cold_ground_wall_ms = round((time.perf_counter() - cold_started) * 1000, 3)
-        cold_models = list(embedded_models.rglob("*.gguf"))
-        require(len(cold_models) == 1, "first use did not materialize exactly one embedded model")
-        cold_materialization = {
-            "path": str(cold_models[0]),
-            "sha256": sha256(cold_models[0]),
-            "first_command_wall_ms": cold_ground_wall_ms,
-            "ground_attempts": cold_attempts,
-        }
-        mcp.tool_until_ready(
-            "search", {"project": str(project), "query": args.query, "why": True}, "search-one"
-        )
-        public_status = mcp.status(project, "status-one")
-        assert_public_status(public_status)
-        first = mcp.engine_diagnostics(project, "diagnostics-one")
-        first_identity = engine_identity(first, args.engine_policy, args.expected_backend)
-        for index, (additional_project, query) in enumerate(additional_projects, start=1):
-            mcp.tool_until_ready(
-                "search",
-                {"project": str(additional_project), "query": query, "why": True},
-                f"search-additional-{index}",
-            )
-            additional_status = mcp.engine_diagnostics(
-                additional_project, f"diagnostics-additional-{index}"
-            )
-            additional_identity = engine_identity(
-                additional_status, args.engine_policy, args.expected_backend
-            )
-            require(
-                first_identity["embedding_engine_instance_id"]
-                == additional_identity["embedding_engine_instance_id"],
-                "repositories did not share one process engine",
-            )
-            require(
-                additional_identity["embedding_model_load_count"] == 1,
-                "an additional repository reloaded the model",
-            )
-        mcp.tool_until_ready(
-            "packet", {"project": str(project), "question": args.question, "budget": "compact"}, "packet"
-        )
-        final_status = mcp.engine_diagnostics(project, "diagnostics-final")
-        final_identity = engine_identity(
-            final_status, args.engine_policy, args.expected_backend
-        )
-        require(
-            isinstance(first_identity["embedding_encode_count"], int)
-            and isinstance(final_identity["embedding_encode_count"], int)
-            and final_identity["embedding_encode_count"]
-            > first_identity["embedding_encode_count"],
-            "successful encode counter did not advance across live retrieval requests",
-        )
-        require(
-            final_identity["embedding_engine_instance_id"]
-            == first_identity["embedding_engine_instance_id"],
-            "live retrieval requests replaced the process engine",
-        )
-        transcript = mcp.transcript
-    finally:
-        mcp.close()
-    write_json(out_dir / "multi-repository-mcp.json", transcript)
-    identity = final_identity
-
-    materialized = Path(str(identity["embedding_materialized_path"] or ""))
-    require(materialized.is_file(), f"materialized model is missing: {materialized}")
-    require(sha256(materialized) == identity["embedding_model_sha256"], "materialized model digest does not match the embedded model")
-    require(cold_materialization["sha256"] == identity["embedding_model_sha256"], "first-use model digest does not match engine identity")
-    before_mtime = materialized.stat().st_mtime_ns
-
-    idle_residency = None
-    if args.idle_residency_proof:
-        idle_residency = prove_idle_residency(
-            args,
-            command,
-            env,
-            out_dir,
-        )
-
-    restart = McpProcess([str(cli), "serve", "--stdio", "--multi-project", "--refresh", "none"], env=env, cwd=project, timeout=args.timeout_secs)
-    restart_search_attempts = 0
-    try:
-        restart.initialize()
-        _, restart_search_attempts = restart.search_until_ready(
-            {"project": str(project), "query": args.query, "why": True},
-            "restart-search",
-        )
-        restart_status = restart.engine_diagnostics(project, "restart-diagnostics")
-        restart_identity = engine_identity(restart_status, args.engine_policy, args.expected_backend)
-    finally:
-        try:
-            restart.close()
-        finally:
-            restart_search_attempts = restart.tool_attempt_counts.get(
-                "restart-search", restart_search_attempts
-            )
-            write_json(
-                out_dir / "restart-mcp.json",
-                {
-                    "restart_search_attempts": restart_search_attempts,
-                    "transcript": restart.transcript,
-                },
-            )
-    require(Path(str(restart_identity["embedding_materialized_path"])).resolve() == materialized.resolve(), "restart used a different materialized model")
-    require(restart_identity["embedding_materialized_reused"] is True, "restart did not report content-addressed model reuse")
-    require(materialized.stat().st_mtime_ns == before_mtime, "restart rewrote the materialized model")
-    assert_no_legacy_state(Path(env["CODESTORY_CACHE_ROOT"]))
+def metric_passes(value: int | float, threshold: int | float, comparison: str) -> bool:
     return {
-        "cold_materialization": cold_materialization,
-        "identity": identity,
-        "idle_residency": idle_residency,
-        "restart_identity": restart_identity,
-        "restart_search_attempts": restart_search_attempts,
+        "equal": value == threshold,
+        "greater_than_or_equal": value >= threshold,
+        "less_than_or_equal": value <= threshold,
+    }[comparison]
+
+
+def write_private_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.is_file() or path.is_symlink():
+        return []
+    events = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def wait_for_jsonl_event(
+    path: Path,
+    predicate,
+    *,
+    timeout: int,
+    process: subprocess.Popen | None = None,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for event in read_jsonl(path):
+            if predicate(event):
+                return event
+        if process is not None and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise ProofFailure(
+                "qualification product process exited before its raw event: "
+                f"exit={process.returncode} stdout_sha256="
+                f"{hashlib.sha256(stdout.encode('utf-8')).hexdigest()} stderr_sha256="
+                f"{hashlib.sha256(stderr.encode('utf-8')).hexdigest()}"
+            )
+        time.sleep(0.01)
+    raise ProofFailure(f"timed out waiting for qualification event file {path.name}")
+
+
+def send_server_qualification_control(
+    directory: Path,
+    nonce: str,
+    *,
+    sequence: int,
+    action: str,
+    timeout: int,
+) -> dict:
+    nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+    command_path = directory / f"{nonce}.command.json"
+    require(not command_path.exists(), "stale embedding qualification command is present")
+    write_private_json(
+        command_path,
+        {
+            "schema_version": 1,
+            "sequence": sequence,
+            "nonce_sha256": nonce_sha256,
+            "action": action,
+            "parameters": {"class": None},
+        },
+    )
+    event_path = directory / f"{nonce}.events.jsonl"
+    event = wait_for_jsonl_event(
+        event_path,
+        lambda candidate: candidate.get("sequence") == sequence
+        and candidate.get("action") == action,
+        timeout=timeout,
+    )
+    require(
+        event.get("status") in {"completed", "accepted"},
+        f"embedding qualification control {action} failed",
+    )
+    return event
+
+
+def server_observation_from_control_event(event: dict, phase: str) -> dict:
+    snapshot = event.get("snapshot")
+    require(isinstance(snapshot, dict), f"{phase} control event omitted its server snapshot")
+    process = snapshot.get("process")
+    engine = snapshot.get("engine")
+    require(isinstance(process, dict), f"{phase} server snapshot omitted process identity")
+    require(isinstance(engine, dict), f"{phase} server snapshot omitted resident engine identity")
+    process_start = require_nonempty_string(
+        process.get("process_start_id"), f"{phase} process start"
+    )
+    return {
+        "phase": phase,
+        "server_instance_id": require_opaque_identifier(
+            process.get("server_instance_id"), f"{phase} server instance"
+        ),
+        "process_start_id": hashlib.sha256(process_start.encode("utf-8")).hexdigest(),
+        "load_generation": require_positive_int(
+            engine.get("load_generation"), f"{phase} load generation"
+        ),
     }
+
+
+def publication_identity_from_status(status: dict) -> str:
+    require(status.get("retrieval_mode") == "full", "qualification status is not full")
+    generation = require_nonempty_string(
+        status.get("manifest_generation"), "qualification manifest generation"
+    )
+    input_hash = require_sha256(
+        status.get("manifest_input_hash"), "qualification manifest input hash"
+    )
+    return canonical_sha256(
+        {
+            "manifest_generation": generation,
+            "manifest_input_hash": input_hash,
+            "profile": status.get("profile"),
+            "run_id": status.get("run_id"),
+        }
+    )
+
+
+def run_quality_search(
+    cli: Path,
+    env: dict[str, str],
+    project: Path,
+    run_id: str,
+    query: str,
+    expected: str,
+    *,
+    timeout: int,
+) -> tuple[int | None, str]:
+    result, payload = json_command(
+        [
+            str(cli),
+            "search",
+            "--project",
+            str(project),
+            "--query",
+            query,
+            "--limit",
+            "10",
+            "--repo-text",
+            "off",
+            "--refresh",
+            "none",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
+            "--format",
+            "json",
+        ],
+        env=env,
+        cwd=project,
+        timeout=timeout,
+    )
+    hits = payload.get("indexed_symbol_hits")
+    require(isinstance(hits, list), "qualification search omitted indexed symbol hits")
+    position = next(
+        (
+            index
+            for index, hit in enumerate(hits)
+            if isinstance(hit, dict)
+            and isinstance(hit.get("display_name"), str)
+            and expected in hit["display_name"]
+        ),
+        None,
+    )
+    rank = None if position is None or position >= 10 else position + 1
+    output_sha256 = hashlib.sha256(result["stdout"].encode("utf-8")).hexdigest()
+    return rank, output_sha256
+
+
+def produce_product_publication_fault_evidence(
+    cli: Path,
+    env: dict[str, str],
+    private_root: Path,
+    artifact_root: Path,
+    nonce: str,
+    *,
+    source: dict,
+    package: dict,
+    contracts: dict,
+    timeout: int,
+) -> tuple[Path, Path]:
+    project = private_root / "publication-product-repository"
+    project.mkdir(mode=0o700)
+    anchors = [
+        f"qualification_anchor_{index:02d}"
+        for index in range(FAULT_RECOVERY_CONSISTENCY_CASES)
+    ]
+    source_file = project / "lib.rs"
+    baseline_source = (
+        "\n".join(
+            f'pub fn {anchor}() -> &\'static str {{ "{anchor}" }}' for anchor in anchors
+        )
+        + "\n"
+    )
+    source_file.write_text(baseline_source, encoding="utf-8")
+    lexical_file = project / "README.md"
+    baseline_lexical = "# Publication qualification baseline\n"
+    lexical_file.write_text(baseline_lexical, encoding="utf-8")
+    run_id = "publication-qualification"
+    index_command = [
+        str(cli),
+        "index",
+        "--project",
+        str(project),
+        "--refresh",
+        "full",
+        "--format",
+        "json",
+    ]
+    retrieval_index_command = [
+        str(cli),
+        "retrieval",
+        "index",
+        "--project",
+        str(project),
+        "--profile",
+        "agent",
+        "--run-id",
+        run_id,
+        "--refresh",
+        "none",
+        "--format",
+        "json",
+    ]
+    status_command = [
+        str(cli),
+        "retrieval",
+        "status",
+        "--project",
+        str(project),
+        "--profile",
+        "agent",
+        "--run-id",
+        run_id,
+        "--format",
+        "json",
+    ]
+    json_command(index_command, env=env, cwd=project, timeout=timeout)
+    json_command(retrieval_index_command, env=env, cwd=project, timeout=timeout)
+    baseline_status_result, baseline_status = json_command(
+        status_command, env=env, cwd=project, timeout=timeout
+    )
+    previous_publication = publication_identity_from_status(baseline_status)
+    baseline_ranks = []
+    for anchor in anchors:
+        rank, _ = run_quality_search(
+            cli, env, project, run_id, anchor, anchor, timeout=timeout
+        )
+        baseline_ranks.append(rank)
+
+    snapshot_before = send_server_qualification_control(
+        private_root, nonce, sequence=1, action="snapshot", timeout=timeout
+    )
+    correlation_id = secrets.token_hex(16)
+    nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+    pause_path = private_root / f"publication-pause-{nonce_sha256}.json"
+    resume_path = private_root / f"publication-resume-{correlation_id}.json"
+    hook_event_path = private_root / f"publication-events-{correlation_id}.jsonl"
+    write_private_json(
+        pause_path,
+        {
+            "schema_version": 1,
+            "nonce_sha256": nonce_sha256,
+            "correlation_id": correlation_id,
+            "action": "pause_before_manifest_commit",
+        },
+    )
+    source_file.write_text(
+        baseline_source + "// publication qualification candidate source change\n",
+        encoding="utf-8",
+    )
+    lexical_file.write_text("# Publication qualification candidate\n", encoding="utf-8")
+    candidate = subprocess.Popen(
+        retrieval_index_command,
+        cwd=project,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    candidate_stdout = ""
+    candidate_stderr = ""
+    try:
+        wait_for_jsonl_event(
+            hook_event_path,
+            lambda event: event.get("action") == "pause_before_manifest_commit"
+            and event.get("status") == "waiting_for_resume",
+            timeout=timeout,
+            process=candidate,
+        )
+        send_server_qualification_control(
+            private_root, nonce, sequence=2, action="crash_server", timeout=timeout
+        )
+        run_quality_search(
+            cli, env, project, run_id, anchors[0], anchors[0], timeout=timeout
+        )
+        snapshot_after = send_server_qualification_control(
+            private_root, nonce, sequence=3, action="snapshot", timeout=timeout
+        )
+        write_private_json(
+            resume_path,
+            {
+                "schema_version": 1,
+                "nonce_sha256": nonce_sha256,
+                "correlation_id": correlation_id,
+                "action": "resume_manifest_commit",
+            },
+        )
+        candidate_stdout, candidate_stderr = candidate.communicate(timeout=timeout)
+    except BaseException:
+        if candidate.poll() is None:
+            candidate.kill()
+            candidate_stdout, candidate_stderr = candidate.communicate()
+        raise
+    finally:
+        source_file.write_text(baseline_source, encoding="utf-8")
+        lexical_file.write_text(baseline_lexical, encoding="utf-8")
+    require(
+        candidate.returncode is not None and candidate.returncode != 0,
+        "publication candidate did not fail after losing its server lease",
+    )
+    hook_events = read_jsonl(hook_event_path)
+    require(len(hook_events) == 4, "publication hook did not emit its exact four events")
+    final_status_result, final_status = json_command(
+        status_command, env=env, cwd=project, timeout=timeout
+    )
+    final_publication = publication_identity_from_status(final_status)
+    post_ranks = []
+    post_search_sha256 = None
+    for anchor in anchors:
+        rank, output_sha256 = run_quality_search(
+            cli, env, project, run_id, anchor, anchor, timeout=timeout
+        )
+        post_ranks.append(rank)
+        if post_search_sha256 is None:
+            post_search_sha256 = output_sha256
+    require(post_search_sha256 is not None, "qualification search emitted no output digest")
+
+    publication_payload = {
+        "schema_version": 1,
+        "evidence_contract": PUBLICATION_FAULT_EVIDENCE_CONTRACT,
+        "source": source,
+        "package": package,
+        "contracts": contracts,
+        "correlation_id": correlation_id,
+        "previous_publication_identity_sha256": previous_publication,
+        "server_observations": [
+            server_observation_from_control_event(snapshot_before, "before_crash"),
+            server_observation_from_control_event(snapshot_after, "after_replacement"),
+        ],
+        "candidate_observation": {
+            "command": "retrieval_index",
+            "exit_code": candidate.returncode,
+            "stdout_sha256": hashlib.sha256(candidate_stdout.encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(candidate_stderr.encode("utf-8")).hexdigest(),
+        },
+        "publication_hook_events": hook_events,
+        "ordinary_product_observations": [
+            {
+                "sequence": 0,
+                "command": "retrieval_status",
+                "exit_code": 0,
+                "retrieval_mode": final_status["retrieval_mode"],
+                "publication_identity_sha256": final_publication,
+                "output_sha256": hashlib.sha256(
+                    final_status_result["stdout"].encode("utf-8")
+                ).hexdigest(),
+            },
+            {
+                "sequence": 1,
+                "command": "search",
+                "exit_code": 0,
+                "retrieval_mode": final_status["retrieval_mode"],
+                "publication_identity_sha256": final_publication,
+                "output_sha256": post_search_sha256,
+            },
+        ],
+    }
+    publication_path = artifact_root / "publication-fault-external.raw.json"
+    write_private_json(publication_path, publication_payload)
+    consistency_payload = {
+        "schema_version": 1,
+        "evidence_contract": FAULT_RECOVERY_CONSISTENCY_CONTRACT,
+        "source": source,
+        "package": package,
+        "contracts": contracts,
+        "run_id_sha256": hashlib.sha256(correlation_id.encode("ascii")).hexdigest(),
+        "observations": [
+            {
+                "case_id_sha256": hashlib.sha256(anchor.encode("utf-8")).hexdigest(),
+                "before_server_fault_rank": baseline_ranks[index],
+                "after_server_replacement_rank": post_ranks[index],
+            }
+            for index, anchor in enumerate(anchors)
+        ],
+    }
+    consistency_path = artifact_root / "fault-recovery-consistency.raw.json"
+    write_private_json(consistency_path, consistency_payload)
+    for path in (pause_path, resume_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return publication_path, consistency_path
+
+
+def load_external_raw_evidence(path: Path, label: str) -> tuple[dict, str]:
+    require(path.is_file() and not path.is_symlink(), f"{label} is missing or unsafe: {path}")
+    metadata = path.stat()
+    require(stat.S_ISREG(metadata.st_mode), f"{label} is not a regular file")
+    require(metadata.st_size <= 8 * 1024 * 1024, f"{label} exceeds the 8 MiB evidence limit")
+    payload_bytes = path.read_bytes()
+    try:
+        payload = json.loads(payload_bytes)
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"{label} is not valid JSON: {exc}") from exc
+    require(isinstance(payload, dict), f"{label} must be an object")
+    return payload, hashlib.sha256(payload_bytes).hexdigest()
+
+
+def require_opaque_identifier(value: object, field: str, *, length: int = 128) -> str:
+    require(
+        isinstance(value, str)
+        and 1 <= len(value) <= length
+        and re.fullmatch(r"[A-Za-z0-9._:-]+", value) is not None,
+        f"{field} must be an opaque identifier without path or request text",
+    )
+    return value
+
+
+def verify_publication_fault_raw_evidence(
+    path: Path,
+    *,
+    source: dict,
+    package: dict,
+    contracts: dict,
+) -> dict:
+    payload, artifact_sha256 = load_external_raw_evidence(
+        path, "publication fault raw evidence"
+    )
+    require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "evidence_contract",
+            "source",
+            "package",
+            "contracts",
+            "correlation_id",
+            "previous_publication_identity_sha256",
+            "server_observations",
+            "candidate_observation",
+            "publication_hook_events",
+            "ordinary_product_observations",
+        },
+        "publication fault raw evidence",
+    )
+    require(payload["schema_version"] == 1, "publication fault evidence schema is unsupported")
+    require(
+        payload["evidence_contract"] == PUBLICATION_FAULT_EVIDENCE_CONTRACT,
+        "publication fault evidence contract is unsupported",
+    )
+    require(payload["source"] == source, "publication fault evidence source identity is stale")
+    require(payload["package"] == package, "publication fault evidence package identity is stale")
+    require(payload["contracts"] == contracts, "publication fault evidence contracts are stale")
+    correlation_id = payload["correlation_id"]
+    require(
+        isinstance(correlation_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", correlation_id) is not None,
+        "publication fault correlation id is invalid",
+    )
+    previous_publication = require_sha256(
+        payload["previous_publication_identity_sha256"],
+        "publication fault previous publication identity",
+    )
+
+    server_observations = payload["server_observations"]
+    require(
+        isinstance(server_observations, list) and len(server_observations) == 2,
+        "publication fault evidence requires before-crash and after-replacement server observations",
+    )
+    expected_server_phases = ("before_crash", "after_replacement")
+    for index, (observation, phase) in enumerate(
+        zip(server_observations, expected_server_phases)
+    ):
+        require(isinstance(observation, dict), f"server observation {index} is malformed")
+        require_exact_keys(
+            observation,
+            {"phase", "server_instance_id", "process_start_id", "load_generation"},
+            f"server observation {index}",
+        )
+        require(observation["phase"] == phase, f"server observation {index} has the wrong phase")
+        require_opaque_identifier(
+            observation["server_instance_id"],
+            f"server observation {index}.server_instance_id",
+        )
+        require_opaque_identifier(
+            observation["process_start_id"],
+            f"server observation {index}.process_start_id",
+        )
+        require_positive_int(
+            observation["load_generation"],
+            f"server observation {index}.load_generation",
+        )
+    require(
+        (
+            server_observations[0]["server_instance_id"],
+            server_observations[0]["process_start_id"],
+        )
+        != (
+            server_observations[1]["server_instance_id"],
+            server_observations[1]["process_start_id"],
+        ),
+        "publication fault evidence did not observe a replacement server",
+    )
+
+    candidate = payload["candidate_observation"]
+    require(isinstance(candidate, dict), "publication candidate observation is malformed")
+    require_exact_keys(
+        candidate,
+        {"command", "exit_code", "stdout_sha256", "stderr_sha256"},
+        "publication candidate observation",
+    )
+    require(candidate["command"] == "retrieval_index", "publication candidate used the wrong command")
+    require(
+        isinstance(candidate["exit_code"], int)
+        and not isinstance(candidate["exit_code"], bool)
+        and candidate["exit_code"] != 0,
+        "publication candidate unexpectedly committed successfully",
+    )
+    require_sha256(candidate["stdout_sha256"], "publication candidate stdout sha256")
+    require_sha256(candidate["stderr_sha256"], "publication candidate stderr sha256")
+
+    events = payload["publication_hook_events"]
+    expected_events = (
+        ("pause_before_manifest_commit", "waiting_for_resume"),
+        ("resume_manifest_commit", "observed"),
+        ("lease_revalidation", "failed"),
+        ("manifest_commit", "returned_error"),
+    )
+    require(
+        isinstance(events, list) and len(events) == len(expected_events),
+        "publication hook evidence must contain the exact four raw fence events",
+    )
+    last_elapsed = -1
+    for index, (event, expected) in enumerate(zip(events, expected_events)):
+        require(isinstance(event, dict), f"publication hook event {index} is malformed")
+        require_exact_keys(
+            event,
+            {"schema_version", "sequence", "correlation_id", "action", "status", "clock"},
+            f"publication hook event {index}",
+        )
+        require(event["schema_version"] == 1, f"publication hook event {index} schema is unsupported")
+        require(event["sequence"] == index, "publication hook event sequence is not exact")
+        require(event["correlation_id"] == correlation_id, "publication hook correlation changed")
+        require(
+            (event["action"], event["status"]) == expected,
+            f"publication hook event {index} does not match the fence contract",
+        )
+        clock = event["clock"]
+        require(isinstance(clock, dict), f"publication hook event {index} omitted its clock")
+        require_exact_keys(clock, {"domain", "api", "elapsed_ns"}, f"publication hook event {index} clock")
+        require(
+            clock["domain"] == "process_monotonic"
+            and clock["api"] == "std::time::Instant",
+            "publication hook used an unsupported clock",
+        )
+        elapsed = require_nonnegative_int(
+            clock["elapsed_ns"], f"publication hook event {index} elapsed_ns"
+        )
+        require(elapsed >= last_elapsed, "publication hook elapsed time moved backwards")
+        last_elapsed = elapsed
+
+    ordinary = payload["ordinary_product_observations"]
+    require(
+        isinstance(ordinary, list) and len(ordinary) == 2,
+        "publication fault evidence requires status and query product observations",
+    )
+    for index, (observation, command) in enumerate(
+        zip(ordinary, ("retrieval_status", "search"))
+    ):
+        require(isinstance(observation, dict), f"ordinary product observation {index} is malformed")
+        require_exact_keys(
+            observation,
+            {
+                "sequence",
+                "command",
+                "exit_code",
+                "retrieval_mode",
+                "publication_identity_sha256",
+                "output_sha256",
+            },
+            f"ordinary product observation {index}",
+        )
+        require(observation["sequence"] == index, "ordinary product observation order changed")
+        require(observation["command"] == command, "ordinary product observation used the wrong command")
+        require(observation["exit_code"] == 0, f"ordinary product {command} failed")
+        require(observation["retrieval_mode"] == "full", f"ordinary product {command} was not full")
+        require(
+            require_sha256(
+                observation["publication_identity_sha256"],
+                f"ordinary product {command} publication identity",
+            )
+            == previous_publication,
+            f"ordinary product {command} did not use the previous publication",
+        )
+        require_sha256(observation["output_sha256"], f"ordinary product {command} output sha256")
+
+    return {
+        "artifact": {
+            "name": "publication-fault-external.raw.json",
+            "sha256": artifact_sha256,
+        },
+        "assertions": {
+            "lost_publication_lease_blocks_commit": True,
+            "previous_publication_remains_usable": True,
+        },
+    }
+
+
+def verify_fault_recovery_consistency_raw_evidence(
+    path: Path,
+    *,
+    source: dict,
+    package: dict,
+    contracts: dict,
+) -> dict:
+    payload, artifact_sha256 = load_external_raw_evidence(
+        path, "fault recovery consistency raw evidence"
+    )
+    require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "evidence_contract",
+            "source",
+            "package",
+            "contracts",
+            "run_id_sha256",
+            "observations",
+        },
+        "fault recovery consistency raw evidence",
+    )
+    require(
+        payload["schema_version"] == 1,
+        "fault recovery consistency evidence schema is unsupported",
+    )
+    require(
+        payload["evidence_contract"] == FAULT_RECOVERY_CONSISTENCY_CONTRACT,
+        "fault recovery consistency evidence contract is unsupported",
+    )
+    require(
+        payload["source"] == source,
+        "fault recovery consistency source identity is stale",
+    )
+    require(
+        payload["package"] == package,
+        "fault recovery consistency package identity is stale",
+    )
+    require(
+        payload["contracts"] == contracts,
+        "fault recovery consistency contracts are stale",
+    )
+    require_sha256(payload["run_id_sha256"], "fault recovery consistency run id")
+    observations = payload["observations"]
+    require(
+        isinstance(observations, list)
+        and len(observations) == FAULT_RECOVERY_CONSISTENCY_CASES,
+        "fault recovery consistency evidence has the wrong case count",
+    )
+    case_ids: set[str] = set()
+    for index, observation in enumerate(observations):
+        require(
+            isinstance(observation, dict),
+            f"fault recovery consistency observation {index} is malformed",
+        )
+        require_exact_keys(
+            observation,
+            {
+                "case_id_sha256",
+                "before_server_fault_rank",
+                "after_server_replacement_rank",
+            },
+            f"fault recovery consistency observation {index}",
+        )
+        case_id = require_sha256(
+            observation["case_id_sha256"],
+            f"fault recovery consistency observation {index} case id",
+        )
+        require(
+            case_id not in case_ids,
+            "fault recovery consistency evidence contains duplicate cases",
+        )
+        case_ids.add(case_id)
+        for field in ("before_server_fault_rank", "after_server_replacement_rank"):
+            rank = observation[field]
+            require(
+                rank is None
+                or (
+                    isinstance(rank, int)
+                    and not isinstance(rank, bool)
+                    and 1 <= rank <= 10
+                ),
+                f"fault recovery consistency observation {index} {field} is not a rank in the fixed top 10",
+            )
+        require(
+            observation["before_server_fault_rank"]
+            == observation["after_server_replacement_rank"],
+            "fault recovery changed a search rank from the retained publication",
+        )
+    return {
+        "artifact": {
+            "name": "fault-recovery-consistency.raw.json",
+            "sha256": artifact_sha256,
+        },
+        "case_count": len(observations),
+        "ranks_stable": True,
+    }
+
+
+def verify_retrieval_quality_raw_evidence(
+    path: Path,
+    *,
+    source: dict,
+) -> dict:
+    payload, artifact_sha256 = load_external_raw_evidence(
+        path, "publishable packet quality raw evidence"
+    )
+    release_evidence = payload.get("release_evidence")
+    require(
+        isinstance(release_evidence, dict),
+        "publishable packet evidence omitted release_evidence",
+    )
+    for field in ("assertions", "accepted", "decision"):
+        require(
+            field not in payload and field not in release_evidence,
+            f"publishable packet evidence contains self-declared {field}",
+        )
+    require(
+        release_evidence.get("commit") == source["commit"],
+        "publishable packet evidence source commit is stale",
+    )
+    require(
+        release_evidence.get("source_tree") == source["tree"],
+        "publishable packet evidence source tree is stale",
+    )
+    require(
+        release_evidence.get("evaluation_contract")
+        == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+        "publishable packet evaluation contract is unsupported",
+    )
+    repeats = require_positive_int(
+        release_evidence.get("repeats"),
+        "publishable packet repeat count",
+    )
+    require(
+        repeats >= MIN_RETRIEVAL_QUALITY_REPEATS,
+        f"publishable packet evidence requires at least {MIN_RETRIEVAL_QUALITY_REPEATS} repeats",
+    )
+    require(
+        release_evidence.get("publishable") is True,
+        "packet quality artifact is not publishable",
+    )
+    require(
+        release_evidence.get("quality_gate_status") == "pass",
+        "packet quality artifact did not pass its quality gate",
+    )
+    blockers = release_evidence.get("publishable_blockers")
+    require(
+        isinstance(blockers, list) and not blockers,
+        "packet quality artifact contains publishable blockers",
+    )
+    require(
+        payload.get("repeats") == repeats,
+        "packet quality top-level repeat count changed",
+    )
+    modes = payload.get("modes")
+    require(
+        isinstance(modes, list) and modes,
+        "packet quality artifact omitted runtime modes",
+    )
+    mode_contracts = {
+        "cold-cli": "cold_cli_packet",
+        "warm-stdio": "warm_stdio_packet",
+    }
+    expected_modes = set()
+    for index, mode in enumerate(modes):
+        require(
+            mode in mode_contracts,
+            f"packet quality mode {index} is unsupported",
+        )
+        expected_modes.add(mode_contracts[mode])
+
+    rows = release_evidence.get("rows")
+    require(
+        isinstance(rows, list) and rows,
+        "packet quality artifact has no quality rows",
+    )
+    repeat_coverage: dict[tuple[str, str, str], set[int]] = {}
+    passing_rows = 0
+    for index, row in enumerate(rows):
+        require(isinstance(row, dict), f"packet quality row {index} is malformed")
+        quality = row.get("quality")
+        sufficiency = row.get("sufficiency")
+        latency = row.get("packet_latency")
+        require(
+            row.get("status") == "pass"
+            and isinstance(quality, dict)
+            and quality.get("pass") is True,
+            f"packet quality row {index} did not pass",
+        )
+        require(
+            isinstance(sufficiency, dict)
+            and sufficiency.get("status") == "sufficient"
+            and sufficiency.get("sufficient_quality_mismatch") is not True,
+            f"packet quality row {index} is not sufficient",
+        )
+        for field in (
+            "follow_up_commands_count",
+            "open_next_count",
+            "gaps_count",
+            "coverage_unresolved_blocking_count",
+        ):
+            value = sufficiency.get(field, 0)
+            require(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value == 0,
+                f"packet quality row {index} has unresolved {field}",
+            )
+        require(
+            isinstance(latency, dict)
+            and latency.get("sla_missed") is False
+            and isinstance(latency.get("retrieval_shadow"), dict)
+            and latency["retrieval_shadow"].get("retrieval_mode") == "full",
+            f"packet quality row {index} lacks full-retrieval latency proof",
+        )
+
+        provenance = row.get("repo_provenance")
+        require(
+            isinstance(provenance, dict)
+            and provenance.get("manifest_overridden_by_builtin") is False
+            and provenance.get("git_dirty") is False,
+            f"packet quality row {index} has untrusted repository provenance",
+        )
+        configured = provenance.get("configured")
+        manifest_repo = provenance.get("manifest")
+        require(
+            isinstance(configured, dict) and isinstance(manifest_repo, dict),
+            f"packet quality row {index} omitted repository identities",
+        )
+        configured_ref = configured.get("ref")
+        require(
+            isinstance(configured_ref, str)
+            and re.fullmatch(r"[0-9a-f]{40}", configured_ref) is not None
+            and manifest_repo.get("ref") == configured_ref
+            and provenance.get("git_head") == configured_ref,
+            f"packet quality row {index} is not pinned to one immutable repository commit",
+        )
+        trusted_repo_url = re.compile(
+            r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$"
+        )
+        urls = (
+            configured.get("url"),
+            manifest_repo.get("url"),
+            provenance.get("git_origin"),
+        )
+        require(
+            all(
+                isinstance(url, str) and trusted_repo_url.fullmatch(url) is not None
+                for url in urls
+            ),
+            f"packet quality row {index} has an untrusted repository URL",
+        )
+        normalized_urls = {
+            re.sub(r"\.git$", "", url, flags=re.IGNORECASE).lower()
+            for url in urls
+        }
+        require(
+            len(normalized_urls) == 1,
+            f"packet quality row {index} repository URLs disagree",
+        )
+
+        cache = row.get("codestory_cache_provenance")
+        require(
+            isinstance(cache, dict)
+            and cache.get("doctor_status") == "pass"
+            and bool(cache.get("storage_path"))
+            and bool(cache.get("cache_policy"))
+            and cache.get("cache_policy") != "unprepared-cache-blocked"
+            and cache.get("retrieval_mode") == "full"
+            and bool(cache.get("semantic_generation"))
+            and bool(cache.get("manifest_embedding_backend"))
+            and bool(cache.get("embedding_engine_instance_id"))
+            and cache.get("embedding_policy") in {"accelerated", "cpu_explicit"}
+            and cache.get("semantic_backend") is not None
+            and cache.get("local_only") is True
+            and cache.get("indexed") is True
+            and cache.get("freshness_status") == "fresh"
+            and cache.get("semantic_ready") is True
+            and cache.get("indexing_in_timed_run") is not None,
+            f"packet quality row {index} has incomplete CodeStory cache provenance",
+        )
+
+        repeat = row.get("repeat")
+        require(
+            isinstance(repeat, int)
+            and not isinstance(repeat, bool)
+            and 1 <= repeat <= repeats,
+            f"packet quality row {index} has an invalid repeat",
+        )
+        repo = require_nonempty_string(row.get("repo"), f"packet quality row {index} repo")
+        task_id = require_nonempty_string(
+            row.get("task_id"), f"packet quality row {index} task id"
+        )
+        mode = require_nonempty_string(
+            row.get("mode"), f"packet quality row {index} mode"
+        )
+        require(
+            mode in expected_modes,
+            f"packet quality row {index} mode is not declared at top level",
+        )
+        key = (repo, task_id, mode)
+        covered = repeat_coverage.setdefault(key, set())
+        require(
+            repeat not in covered,
+            f"packet quality rows duplicate repeat {repeat} for {repo}/{task_id}/{mode}",
+        )
+        covered.add(repeat)
+        passing_rows += 1
+
+    expected_repeats = set(range(1, repeats + 1))
+    require(
+        all(covered == expected_repeats for covered in repeat_coverage.values()),
+        "packet quality rows do not exactly cover every declared repeat",
+    )
+    require(
+        {key[2] for key in repeat_coverage} == expected_modes,
+        "packet quality row modes do not match top-level modes",
+    )
+    pass_rate = passing_rows / len(rows)
+    return {
+        "artifact": {
+            "name": "packet-runtime-summary.json",
+            "sha256": artifact_sha256,
+        },
+        "evaluation_contract": RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+        "source_commit": source["commit"],
+        "source_tree": source["tree"],
+        "repeats": repeats,
+        "row_count": len(rows),
+        "passing_row_count": passing_rows,
+        "publishable_packet_pass_rate": pass_rate,
+    }
+
+
+def qualification_artifact(
+    artifact_root: Path,
+    summary: object,
+    *,
+    scenario_id: str,
+    contracts: dict,
+    nonce_sha256: str,
+    forbidden_values: list[str],
+) -> tuple[dict, dict]:
+    require(
+        isinstance(summary, dict),
+        f"qualification scenario {scenario_id} summary is malformed",
+    )
+    require_exact_keys(
+        summary,
+        {
+            "artifact",
+            "process_count",
+            "control_event_count",
+            "process_observation_count",
+            "observation_count",
+            "event_count",
+        },
+        f"qualification scenario {scenario_id} summary",
+    )
+    name = require_nonempty_string(
+        summary["artifact"],
+        f"qualification scenario {scenario_id} artifact",
+    )
+    relative = Path(name)
+    require(
+        not relative.is_absolute()
+        and len(relative.parts) == 1
+        and relative.name == name
+        and relative.suffix == ".json",
+        f"qualification scenario {scenario_id} artifact must be a JSON basename",
+    )
+    path = artifact_root / relative
+    require(path.is_file() and not path.is_symlink(), f"qualification artifact is missing or unsafe: {name}")
+    require(
+        path.resolve().parent == artifact_root.resolve(),
+        f"qualification artifact escaped its private output directory: {name}",
+    )
+    payload_bytes = path.read_bytes()
+    for forbidden in forbidden_values:
+        require(
+            forbidden.encode("utf-8") not in payload_bytes,
+            f"qualification artifact {name} leaked private request material",
+        )
+    try:
+        payload = json.loads(payload_bytes)
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"qualification artifact {name} is not valid JSON: {exc}") from exc
+    require(isinstance(payload, dict), f"qualification artifact {name} must be an object")
+    require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "scenario",
+            "contracts",
+            "orchestration",
+            "control_events",
+            "process_observations",
+            "observations",
+            "events",
+        },
+        f"qualification artifact {name}",
+    )
+    require(payload["schema_version"] == 2, f"qualification artifact {name} schema is unsupported")
+    require(payload["scenario"] == scenario_id, f"qualification artifact {name} names the wrong scenario")
+    require(payload["contracts"] == contracts, f"qualification artifact {name} used different contracts")
+
+    orchestration = payload["orchestration"]
+    require(
+        isinstance(orchestration, dict),
+        f"qualification artifact {name} orchestration is malformed",
+    )
+    require_exact_keys(
+        orchestration,
+        {"started_ns", "finished_ns", "process_invocations"},
+        f"qualification artifact {name} orchestration",
+    )
+    started_ns = require_nonnegative_int(
+        orchestration["started_ns"],
+        f"qualification artifact {name} orchestration.started_ns",
+    )
+    finished_ns = require_nonnegative_int(
+        orchestration["finished_ns"],
+        f"qualification artifact {name} orchestration.finished_ns",
+    )
+    require(
+        finished_ns >= started_ns,
+        f"qualification artifact {name} orchestration moved backwards",
+    )
+    invocations = orchestration["process_invocations"]
+    require(
+        isinstance(invocations, list),
+        f"qualification artifact {name} process invocations are malformed",
+    )
+    invocation_ids: set[str] = set()
+    for index, invocation in enumerate(invocations):
+        require(
+            isinstance(invocation, dict),
+            f"qualification artifact {name} process invocation {index} is malformed",
+        )
+        require_exact_keys(
+            invocation,
+            {
+                "invocation_id",
+                "operation",
+                "project_identity_sha256",
+                "pid",
+                "process_start_id",
+                "started_ns",
+                "finished_ns",
+                "exit_code",
+                "termination",
+            },
+            f"qualification artifact {name} process invocation {index}",
+        )
+        invocation_id = require_nonempty_string(
+            invocation["invocation_id"],
+            f"qualification artifact {name} process invocation {index}.invocation_id",
+        )
+        require(
+            invocation_id not in invocation_ids,
+            f"qualification artifact {name} duplicated invocation {invocation_id}",
+        )
+        invocation_ids.add(invocation_id)
+        require_nonempty_string(
+            invocation["operation"],
+            f"qualification artifact {name} process invocation {index}.operation",
+        )
+        require_sha256(
+            invocation["project_identity_sha256"],
+            f"qualification artifact {name} process invocation {index}.project_identity_sha256",
+        )
+        require_positive_int(
+            invocation["pid"],
+            f"qualification artifact {name} process invocation {index}.pid",
+        )
+        require_nonempty_string(
+            invocation["process_start_id"],
+            f"qualification artifact {name} process invocation {index}.process_start_id",
+        )
+        invocation_started = require_nonnegative_int(
+            invocation["started_ns"],
+            f"qualification artifact {name} process invocation {index}.started_ns",
+        )
+        invocation_finished = require_nonnegative_int(
+            invocation["finished_ns"],
+            f"qualification artifact {name} process invocation {index}.finished_ns",
+        )
+        require(
+            started_ns <= invocation_started <= invocation_finished <= finished_ns,
+            f"qualification artifact {name} process invocation {index} escaped its block",
+        )
+        require(
+            invocation["exit_code"] is None
+            or (
+                isinstance(invocation["exit_code"], int)
+                and not isinstance(invocation["exit_code"], bool)
+            ),
+            f"qualification artifact {name} process invocation {index}.exit_code is invalid",
+        )
+        require(
+            invocation["termination"] in {"exited", "terminated"},
+            f"qualification artifact {name} process invocation {index}.termination is invalid",
+        )
+
+    def validate_clock(clock: object, field: str, *, observed: bool) -> None:
+        require(isinstance(clock, dict), f"{field} is malformed")
+        expected = {"domain", "api", "boot_id", "resolution_ns"}
+        if observed:
+            expected = {"domain", "api", "boot_id", "observed_ns"}
+        require_exact_keys(clock, expected, field)
+        require(clock["domain"] == "awake_monotonic", f"{field} used the wrong clock domain")
+        require_nonempty_string(clock["api"], f"{field}.api")
+        require_nonempty_string(clock["boot_id"], f"{field}.boot_id")
+        numeric = "observed_ns" if observed else "resolution_ns"
+        require_nonnegative_int(clock[numeric], f"{field}.{numeric}")
+
+    def validate_snapshot(snapshot: object, field: str) -> None:
+        require(isinstance(snapshot, dict), f"{field} is malformed")
+        required = {
+            "schema_version",
+            "event_sequence",
+            "lifecycle",
+            "clock",
+            "protocol",
+            "authority",
+            "process",
+            "scheduler",
+        }
+        require(
+            required <= set(snapshot)
+            and set(snapshot) <= required | {"engine", "failure"},
+            f"{field} fields differ from the raw snapshot contract",
+        )
+        require(snapshot["schema_version"] == 1, f"{field} schema is unsupported")
+        require_nonnegative_int(snapshot["event_sequence"], f"{field}.event_sequence")
+        require(snapshot["lifecycle"] in SERVER_LIFECYCLES, f"{field} lifecycle is invalid")
+        validate_clock(snapshot["clock"], f"{field}.clock", observed=False)
+        protocol = snapshot["protocol"]
+        require(isinstance(protocol, dict), f"{field}.protocol is malformed")
+        for contract_field, expected in contracts.items():
+            require(
+                protocol.get(contract_field) == expected,
+                f"{field}.protocol.{contract_field} is stale",
+            )
+        authority = snapshot["authority"]
+        process = snapshot["process"]
+        scheduler = snapshot["scheduler"]
+        require(
+            isinstance(authority, dict)
+            and isinstance(process, dict)
+            and isinstance(scheduler, dict),
+            f"{field} omitted server identity",
+        )
+        for identity_field in (
+            "endpoint_namespace_id",
+            "lifetime_authority_id",
+            "listener_id",
+        ):
+            require_nonempty_string(authority.get(identity_field), f"{field}.authority.{identity_field}")
+        require_nonempty_string(
+            process.get("server_instance_id"),
+            f"{field}.process.server_instance_id",
+        )
+        require_positive_int(process.get("pid"), f"{field}.process.pid")
+        require_nonempty_string(process.get("process_start_id"), f"{field}.process.process_start_id")
+        require(
+            scheduler.get("query_capacity") == 64 and scheduler.get("bulk_capacity") == 64,
+            f"{field} queue capacities differ from the bound contract",
+        )
+        engine = snapshot.get("engine")
+        if engine is not None:
+            require(isinstance(engine, dict), f"{field}.engine is malformed")
+            for identity_field in ("engine_owner_id", "native_worker_id"):
+                require_nonempty_string(engine.get(identity_field), f"{field}.engine.{identity_field}")
+            require_positive_int(engine.get("load_generation"), f"{field}.engine.load_generation")
+            require_positive_int(engine.get("model_load_count"), f"{field}.engine.model_load_count")
+
+    control_events = payload["control_events"]
+    require(
+        isinstance(control_events, list),
+        f"qualification artifact {name} control events are malformed",
+    )
+    previous_control_sequence = -1
+    control_actions: list[str] = []
+    for index, event in enumerate(control_events):
+        require(
+            isinstance(event, dict),
+            f"qualification artifact {name} control event {index} is malformed",
+        )
+        required = {
+            "schema_version",
+            "sequence",
+            "action",
+            "status",
+            "authenticated_nonce_sha256",
+            "server_event_sequence",
+            "clock",
+        }
+        require(
+            required <= set(event)
+            and set(event) <= required | {"snapshot", "details"},
+            f"qualification artifact {name} control event {index} fields are invalid",
+        )
+        require(event["schema_version"] == 1, f"qualification artifact {name} control event schema is unsupported")
+        sequence = require_nonnegative_int(
+            event["sequence"],
+            f"qualification artifact {name} control event {index}.sequence",
+        )
+        require(
+            sequence > previous_control_sequence,
+            f"qualification artifact {name} control event sequence is not increasing",
+        )
+        previous_control_sequence = sequence
+        action = require_nonempty_string(
+            event["action"],
+            f"qualification artifact {name} control event {index}.action",
+        )
+        require(
+            action
+            in {
+                "crash_server",
+                "stall_native",
+                "release_native",
+                "hold_class",
+                "release_class",
+                "force_incompatible",
+                "clear_incompatible",
+                "snapshot",
+                "freeze_owner",
+                "release_owner",
+            },
+            f"qualification artifact {name} used unknown control {action}",
+        )
+        control_actions.append(action)
+        require(
+            event["status"] in {"completed", "accepted"},
+            f"qualification artifact {name} control event {index} did not complete",
+        )
+        require(
+            event["authenticated_nonce_sha256"] == nonce_sha256,
+            f"qualification artifact {name} control event {index} was not authenticated",
+        )
+        require_nonnegative_int(
+            event["server_event_sequence"],
+            f"qualification artifact {name} control event {index}.server_event_sequence",
+        )
+        validate_clock(
+            event["clock"],
+            f"qualification artifact {name} control event {index}.clock",
+            observed=True,
+        )
+        if "snapshot" in event:
+            validate_snapshot(
+                event["snapshot"],
+                f"qualification artifact {name} control event {index}.snapshot",
+            )
+        if "details" in event:
+            require(
+                isinstance(event["details"], dict)
+                and all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in event["details"].items()
+                ),
+                f"qualification artifact {name} control event {index}.details is malformed",
+            )
+
+    process_observations = payload["process_observations"]
+    require(
+        isinstance(process_observations, list),
+        f"qualification artifact {name} process observations are malformed",
+    )
+    observation_fields = {
+        "phase",
+        "observed_ns",
+        "server_instance_id",
+        "pid",
+        "process_start_id",
+        "executable_sha256",
+        "executable_version",
+        "endpoint_namespace_id",
+        "lifetime_authority_id",
+        "listener_id",
+        "protocol_sha256",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
+        "load_generation",
+        "snapshot",
+    }
+    for index, observation in enumerate(process_observations):
+        require(
+            isinstance(observation, dict),
+            f"qualification artifact {name} process observation {index} is malformed",
+        )
+        require_exact_keys(
+            observation,
+            observation_fields,
+            f"qualification artifact {name} process observation {index}",
+        )
+        require_nonempty_string(
+            observation["phase"],
+            f"qualification artifact {name} process observation {index}.phase",
+        )
+        observed_ns = require_nonnegative_int(
+            observation["observed_ns"],
+            f"qualification artifact {name} process observation {index}.observed_ns",
+        )
+        require(
+            started_ns <= observed_ns <= finished_ns,
+            f"qualification artifact {name} process observation {index} escaped its block",
+        )
+        snapshot = observation["snapshot"]
+        if snapshot is None:
+            require(
+                all(
+                    observation[field] is None
+                    for field in observation_fields
+                    - {"phase", "observed_ns", "snapshot"}
+                ),
+                f"qualification artifact {name} absent observation retained an identity",
+            )
+            continue
+        validate_snapshot(
+            snapshot,
+            f"qualification artifact {name} process observation {index}.snapshot",
+        )
+        for field, expected in contracts.items():
+            require(
+                observation[field] == expected,
+                f"qualification artifact {name} process observation {index}.{field} is stale",
+            )
+        require(
+            observation["server_instance_id"] == snapshot["process"]["server_instance_id"]
+            and observation["pid"] == snapshot["process"]["pid"]
+            and observation["process_start_id"] == snapshot["process"]["process_start_id"]
+            and observation["endpoint_namespace_id"]
+            == snapshot["authority"]["endpoint_namespace_id"]
+            and observation["lifetime_authority_id"]
+            == snapshot["authority"]["lifetime_authority_id"]
+            and observation["listener_id"] == snapshot["authority"]["listener_id"],
+            f"qualification artifact {name} process observation {index} identity disagrees with its snapshot",
+        )
+
+    observations = payload["observations"]
+    require(
+        isinstance(observations, list),
+        f"qualification artifact {name} observations are malformed",
+    )
+    observations_by_kind: dict[str, list[dict]] = {}
+    for index, observation in enumerate(observations):
+        require(
+            isinstance(observation, dict),
+            f"qualification artifact {name} observation {index} is malformed",
+        )
+        require_exact_keys(
+            observation,
+            {"sequence", "kind", "observed_ns", "values"},
+            f"qualification artifact {name} observation {index}",
+        )
+        require(
+            observation["sequence"] == index,
+            f"qualification artifact {name} observation sequence is not contiguous",
+        )
+        kind = require_nonempty_string(
+            observation["kind"],
+            f"qualification artifact {name} observation {index}.kind",
+        )
+        observed_ns = require_nonnegative_int(
+            observation["observed_ns"],
+            f"qualification artifact {name} observation {index}.observed_ns",
+        )
+        require(
+            started_ns <= observed_ns <= finished_ns,
+            f"qualification artifact {name} observation {index} escaped its block",
+        )
+        require(
+            isinstance(observation["values"], dict),
+            f"qualification artifact {name} observation {index}.values is malformed",
+        )
+        observations_by_kind.setdefault(kind, []).append(observation)
+
+    required_transitions = {
+        "client_death": {
+            "dead_client_work_observed",
+            "other_client_continued",
+            "client_terminated",
+            "dead_client_work_reclaimed",
+            "post_reclaim_other_client_query",
+        },
+        "cold_race": {"two_independent_processes", "single_server_convergence"},
+        "frozen_owner": {"bounded_owner_unresponsive", "owner_identity_stable"},
+        "incompatible_owner": {
+            "active_owner_rejected",
+            "idle_owner_draining",
+            "compatible_replacement",
+        },
+        "mixed_queue": {
+            "queues_saturated",
+            "query_selected_before_bulk_backlog",
+            "typed_capacity_retry_observed",
+            "per_class_fifo_observed",
+            "global_fifo_across_projects",
+            "query_preference_observed",
+            "bulk_resumed",
+        },
+        "server_crash": {
+            "inflight_request_observed",
+            "server_replaced",
+            "query_replayed",
+        },
+        "true_idle_respawn": {
+            "anti_idle_work_observed",
+            "owner_preserved_across_idle_boundary",
+            "anti_idle_work_reclaimed",
+            "true_idle_wait",
+            "owner_absent_after_true_idle",
+            "server_respawned",
+        },
+        "worker_stall": {
+            "stalled_request_observed",
+            "watchdog_fail_stop_observed",
+            "post_stall_replacement",
+        },
+    }[scenario_id]
+    require(
+        all(len(observations_by_kind.get(kind, [])) == 1 for kind in required_transitions),
+        f"qualification artifact {name} omitted or duplicated required raw transitions",
+    )
+    required_controls = {
+        "client_death": Counter({"hold_class": 2, "release_class": 2}),
+        "cold_race": Counter(),
+        "frozen_owner": Counter({"freeze_owner": 1, "release_owner": 1}),
+        "incompatible_owner": Counter({"force_incompatible": 1}),
+        "mixed_queue": Counter({"hold_class": 2, "release_class": 2}),
+        "server_crash": Counter({"hold_class": 1, "crash_server": 1}),
+        "true_idle_respawn": Counter({"hold_class": 2, "release_class": 2}),
+        "worker_stall": Counter({"stall_native": 1}),
+    }[scenario_id]
+    actual_controls = Counter(control_actions)
+    require(
+        all(actual_controls[action] >= count for action, count in required_controls.items()),
+        f"qualification artifact {name} omitted required authenticated controls",
+    )
+    if scenario_id == "cold_race":
+        require(
+            any(
+                observation["phase"] == "cold_race_no_owner"
+                and observation["snapshot"] is None
+                for observation in process_observations
+            ),
+            f"qualification artifact {name} did not prove owner absence before the race",
+        )
+        independent = observations_by_kind["two_independent_processes"][0]["values"]
+        require(
+            independent.get("first_pid") != independent.get("second_pid")
+            and independent.get("first_project_identity_sha256")
+            != independent.get("second_project_identity_sha256")
+            and independent.get("first_transport_peer_verified") is True
+            and independent.get("second_transport_peer_verified") is True,
+            f"qualification artifact {name} cold-race processes were not independent",
+        )
+
+    events = payload["events"]
+    require(isinstance(events, list) and events, f"qualification artifact {name} has no correlated events")
+    for index, event in enumerate(events):
+        require(isinstance(event, dict), f"qualification artifact {name} event {index} is malformed")
+        require_exact_keys(
+            event,
+            {"sequence", "source", "action", "observed_ns", "correlation_id", "values"},
+            f"qualification artifact {name} event {index}",
+        )
+        require(
+            event["sequence"] == index,
+            f"qualification artifact {name} event sequence is not contiguous",
+        )
+        require_nonempty_string(
+            event["source"],
+            f"qualification artifact {name} event {index}.source",
+        )
+        require_nonempty_string(event["action"], f"qualification artifact {name} event {index}.action")
+        observed_ns = require_nonnegative_int(
+            event["observed_ns"],
+            f"qualification artifact {name} event {index}.observed_ns",
+        )
+        require(
+            started_ns <= observed_ns <= finished_ns,
+            f"qualification artifact {name} event {index} escaped its block",
+        )
+        require(
+            event["correlation_id"] is None
+            or (
+                isinstance(event["correlation_id"], str)
+                and bool(event["correlation_id"])
+            ),
+            f"qualification artifact {name} event {index}.correlation_id is malformed",
+        )
+        require(
+            isinstance(event["values"], dict),
+            f"qualification artifact {name} event {index}.values is malformed",
+        )
+
+    expected_counts = {
+        "process_count": len(invocations),
+        "control_event_count": len(control_events),
+        "process_observation_count": len(process_observations),
+        "observation_count": len(observations),
+        "event_count": len(events),
+    }
+    for field, expected in expected_counts.items():
+        require(
+            summary[field] == expected,
+            f"qualification scenario {scenario_id} summary {field} is stale",
+        )
+    return (
+        {"name": name, "sha256": hashlib.sha256(payload_bytes).hexdigest()},
+        payload,
+    )
+
+
+def selected_qualification_matrix_cell(
+    protocol: dict,
+    *,
+    cell_id: str,
+    target: str,
+    proof_tier: str,
+    expected_policy: str,
+    expected_backend: str,
+) -> dict:
+    matrix = protocol["host_package_matrix"]
+    require(cell_id in matrix, f"unknown qualification matrix cell {cell_id!r}")
+    cell = matrix[cell_id]
+    require(
+        cell["asset_target"] == target
+        and cell["policy"] == expected_policy
+        and normalized_backend(cell["backend"]) == normalized_backend(expected_backend),
+        "qualification matrix cell does not match target, policy, or backend",
+    )
+    if proof_tier != "calibration":
+        require(
+            cell["proof_tier"] == proof_tier,
+            "qualification matrix cell does not match the requested proof tier",
+        )
+    return cell
+
+
+def qualification_measurement_artifact(
+    artifact_root: Path,
+    summary: object,
+    *,
+    contracts: dict,
+    measurement_contract: dict,
+    target: str,
+    proof_tier: str,
+    matrix_cell_id: str,
+    expected_policy: str,
+    expected_backend: str,
+    forbidden_values: list[str],
+) -> dict:
+    require(isinstance(summary, dict), "qualification measurement summary is malformed")
+    require_exact_keys(
+        summary,
+        {"artifact", "metric_count", "sample_count"},
+        "qualification measurement summary",
+    )
+    name = require_nonempty_string(summary["artifact"], "qualification measurement artifact")
+    relative = Path(name)
+    require(
+        not relative.is_absolute()
+        and len(relative.parts) == 1
+        and relative.name == name
+        and name == "measurements.raw.json",
+        "qualification measurement artifact must be measurements.raw.json",
+    )
+    path = artifact_root / relative
+    require(
+        path.is_file() and not path.is_symlink() and path.resolve().parent == artifact_root.resolve(),
+        "qualification measurement artifact is missing or unsafe",
+    )
+    payload_bytes = path.read_bytes()
+    for forbidden in forbidden_values:
+        require(
+            forbidden.encode("utf-8") not in payload_bytes,
+            "qualification measurement artifact leaked private request material",
+        )
+    try:
+        payload = json.loads(payload_bytes)
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(
+            f"qualification measurement artifact is not valid JSON: {exc}"
+        ) from exc
+    require(isinstance(payload, dict), "qualification measurement artifact must be an object")
+    require_exact_keys(
+        payload,
+        {"schema_version", "contracts", "external_metrics", "metrics"},
+        "qualification measurement artifact",
+    )
+    require(payload["schema_version"] == 2, "qualification measurement schema is unsupported")
+    require(payload["contracts"] == contracts, "qualification measurements used stale contracts")
+    require(
+        payload["external_metrics"] == sorted(EXTERNAL_QUALIFICATION_METRICS),
+        "qualification measurements changed the externally owned metric set",
+    )
+
+    protocol = measurement_contract["measurement_protocol"]
+    metric_contracts = protocol["metric_contracts"]
+    phase_boundaries = protocol["phase_boundaries"]
+    raw_metric_names = set(protocol["required_metrics"]) - EXTERNAL_QUALIFICATION_METRICS
+    matrix_cell = selected_qualification_matrix_cell(
+        protocol,
+        cell_id=matrix_cell_id,
+        target=target,
+        proof_tier=proof_tier,
+        expected_policy=expected_policy,
+        expected_backend=expected_backend,
+    )
+    metrics = payload["metrics"]
+    require(
+        isinstance(metrics, dict) and set(metrics) == raw_metric_names,
+        "qualification measurements did not contain exactly the 12 product-path metrics",
+    )
+    require(
+        summary["metric_count"] == len(raw_metric_names),
+        "qualification measurement metric count is stale",
+    )
+    target_os = TARGET_CONTRACTS[target]["target_os"]
+    clock_policy = protocol["clock_policy"]
+    allowed_awake_apis = set(clock_policy["platform_apis"][target_os])
+    suspend_contract = clock_policy["suspend_detection"]
+    inclusive_api = suspend_contract["platform_apis"][target_os]
+    maximum_suspend_ns = require_nonnegative_int(
+        suspend_contract["maximum_inclusive_minus_awake_ns"],
+        "measurement suspend-detection tolerance",
+    )
+    duration_metrics = raw_metric_names - {
+        "bulk_documents_per_second",
+        "bulk_tokens_per_second",
+        "total_codestory_process_memory",
+        "backend_observed_accelerator_residency",
+    }
+    values: dict[str, float | int] = {}
+    sample_count = 0
+    for metric in sorted(raw_metric_names):
+        record = metrics[metric]
+        require(isinstance(record, dict), f"qualification measurement {metric} is malformed")
+        require_exact_keys(record, {"unit", "samples"}, f"qualification measurement {metric}")
+        require(
+            record["unit"] == metric_contracts[metric]["unit"],
+            f"qualification measurement {metric} used the wrong unit",
+        )
+        samples = record["samples"]
+        sample_policy = protocol["metric_sampling"][metric]
+        require(
+            isinstance(samples, list)
+            and len(samples) == sample_policy["sample_count"],
+            f"qualification measurement {metric} sample count changed",
+        )
+        sample_count += len(samples)
+        sample_values: list[float | int] = []
+        sample_ids: set[str] = set()
+        server_identities: list[tuple[str, str, int]] = []
+        for sample_index, sample in enumerate(samples):
+            require(
+                isinstance(sample, dict),
+                f"qualification measurement {metric} sample {sample_index} is malformed",
+            )
+            require_exact_keys(
+                sample,
+                {
+                    "sample_id",
+                    "repeat",
+                    "matrix_cell_id",
+                    "workload_id",
+                    "cache_state",
+                    "residency_state",
+                    "process",
+                    "server_identity",
+                    "clock",
+                    "start",
+                    "end",
+                    "operands",
+                    "suspend_witness",
+                },
+                f"qualification measurement {metric} sample {sample_index}",
+            )
+            sample_id = require_opaque_identifier(
+                sample["sample_id"],
+                f"qualification measurement {metric} sample_id",
+            )
+            require(
+                sample_id not in sample_ids,
+                f"qualification measurement {metric} duplicated a sample id",
+            )
+            sample_ids.add(sample_id)
+            require(
+                sample["repeat"] == sample_index + 1,
+                f"qualification measurement {metric} repeat sequence is not exact",
+            )
+            require(
+                sample["matrix_cell_id"] == matrix_cell_id,
+                f"qualification measurement {metric} used the wrong host/package matrix cell",
+            )
+            require(
+                sample["workload_id"] == protocol["workloads"][metric]["workload_id"],
+                f"qualification measurement {metric} used the wrong workload",
+            )
+            require(
+                sample["cache_state"] == matrix_cell["cache_state"]
+                and sample["residency_state"] == matrix_cell["residency_state"],
+                f"qualification measurement {metric} changed cache or residency state",
+            )
+            server_identity = sample["server_identity"]
+            require(
+                isinstance(server_identity, dict),
+                f"qualification measurement {metric} server identity is malformed",
+            )
+            require_exact_keys(
+                server_identity,
+                {"server_instance_id", "process_start_id", "load_generation"},
+                f"qualification measurement {metric} server identity",
+            )
+            server_identities.append(
+                (
+                    require_opaque_identifier(
+                        server_identity["server_instance_id"],
+                        f"qualification measurement {metric} server_instance_id",
+                    ),
+                    require_nonempty_string(
+                        server_identity["process_start_id"],
+                        f"qualification measurement {metric} server process_start_id",
+                    ),
+                    require_positive_int(
+                        server_identity["load_generation"],
+                        f"qualification measurement {metric} server load_generation",
+                    ),
+                )
+            )
+            sample_values.append(
+                qualification_measurement_sample_value(
+                    metric,
+                    sample,
+                    contracts=contracts,
+                    phase_boundaries=phase_boundaries,
+                    allowed_awake_apis=allowed_awake_apis,
+                    inclusive_api=inclusive_api,
+                    maximum_suspend_ns=maximum_suspend_ns,
+                    expected_policy=expected_policy,
+                    expected_backend=expected_backend,
+                )
+            )
+        if sample_policy.get("independence") == "distinct_server_instance_per_sample":
+            require(
+                len({identity[:2] for identity in server_identities}) == len(samples),
+                f"qualification measurement {metric} repeats did not use distinct server instances",
+            )
+        else:
+            require(
+                len(set(server_identities)) == 1,
+                f"qualification measurement {metric} changed server identity within its repeated block",
+            )
+        aggregation = sample_policy["aggregation"]
+        values[metric] = {
+            "maximum": max,
+            "minimum": min,
+            "exact": lambda raw: raw[0],
+        }[aggregation](sample_values)
+
+    require(
+        summary["sample_count"] == sample_count,
+        "qualification measurement sample count is stale",
+    )
+    return {
+        "artifact": {
+            "name": name,
+            "sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        },
+        "values": values,
+        "unplanned_suspend": False,
+        "matrix_cell_id": matrix_cell_id,
+    }
+
+
+def qualification_measurement_sample_value(
+    metric: str,
+    sample: dict,
+    *,
+    contracts: dict,
+    phase_boundaries: dict,
+    allowed_awake_apis: set[str],
+    inclusive_api: str,
+    maximum_suspend_ns: int,
+    expected_policy: str,
+    expected_backend: str,
+) -> float | int:
+    process = sample["process"]
+    require(
+        isinstance(process, dict),
+        f"qualification measurement {metric} process is malformed",
+    )
+    require_exact_keys(
+        process,
+        {"pid", "process_start_id"},
+        f"qualification measurement {metric} process",
+    )
+    require_positive_int(process["pid"], f"qualification measurement {metric} process.pid")
+    require_nonempty_string(
+        process["process_start_id"],
+        f"qualification measurement {metric} process.process_start_id",
+    )
+    clock = sample["clock"]
+    require(
+        isinstance(clock, dict),
+        f"qualification measurement {metric} clock is malformed",
+    )
+    require_exact_keys(
+        clock,
+        {"domain", "api", "boot_id", "resolution_ns"},
+        f"qualification measurement {metric} clock",
+    )
+    require(
+        clock["domain"] == "awake_monotonic" and clock["api"] in allowed_awake_apis,
+        f"qualification measurement {metric} used an unsupported awake clock",
+    )
+    boot_id = require_nonempty_string(
+        clock["boot_id"],
+        f"qualification measurement {metric} clock.boot_id",
+    )
+    require_nonnegative_int(
+        clock["resolution_ns"],
+        f"qualification measurement {metric} clock.resolution_ns",
+    )
+    boundaries = phase_boundaries[metric]
+    points: list[tuple[str, int]] = []
+    for index, point_name in enumerate(("start", "end")):
+        point = sample[point_name]
+        require(
+            isinstance(point, dict),
+            f"qualification measurement {metric} {point_name} is malformed",
+        )
+        require_exact_keys(
+            point,
+            {"phase", "observed_ns"},
+            f"qualification measurement {metric} {point_name}",
+        )
+        require(
+            point["phase"] == boundaries[index],
+            f"qualification measurement {metric} {point_name} phase changed",
+        )
+        points.append(
+            (
+                point["phase"],
+                require_nonnegative_int(
+                    point["observed_ns"],
+                    f"qualification measurement {metric} {point_name}.observed_ns",
+                ),
+            )
+        )
+    awake_started_ns = points[0][1]
+    awake_finished_ns = points[1][1]
+    require(
+        awake_finished_ns >= awake_started_ns,
+        f"qualification measurement {metric} awake clock moved backwards",
+    )
+    witness = sample["suspend_witness"]
+    require(
+        isinstance(witness, dict),
+        f"qualification measurement {metric} suspend witness is malformed",
+    )
+    require_exact_keys(
+        witness,
+        {
+            "awake_started_ns",
+            "awake_finished_ns",
+            "inclusive_clock_api",
+            "inclusive_started_ns",
+            "inclusive_finished_ns",
+            "boot_id_started",
+            "boot_id_finished",
+        },
+        f"qualification measurement {metric} suspend witness",
+    )
+    require(
+        witness["awake_started_ns"] == awake_started_ns
+        and witness["awake_finished_ns"] == awake_finished_ns,
+        f"qualification measurement {metric} suspend witness changed phase timestamps",
+    )
+    require(
+        witness["inclusive_clock_api"] == inclusive_api,
+        f"qualification measurement {metric} used the wrong suspend-inclusive clock",
+    )
+    inclusive_started_ns = require_nonnegative_int(
+        witness["inclusive_started_ns"],
+        f"qualification measurement {metric} suspend witness inclusive_started_ns",
+    )
+    inclusive_finished_ns = require_nonnegative_int(
+        witness["inclusive_finished_ns"],
+        f"qualification measurement {metric} suspend witness inclusive_finished_ns",
+    )
+    require(
+        inclusive_finished_ns >= inclusive_started_ns,
+        f"qualification measurement {metric} suspend-inclusive clock moved backwards",
+    )
+    require(
+        witness["boot_id_started"] == boot_id
+        and witness["boot_id_finished"] == boot_id,
+        f"qualification measurement {metric} crossed a boot boundary",
+    )
+    awake_delta_ns = awake_finished_ns - awake_started_ns
+    inclusive_delta_ns = inclusive_finished_ns - inclusive_started_ns
+    require(
+        abs(inclusive_delta_ns - awake_delta_ns) <= maximum_suspend_ns,
+        f"qualification measurement {metric} crossed an unplanned suspend or power transition",
+    )
+
+    operands = sample["operands"]
+    require(
+        isinstance(operands, dict),
+        f"qualification measurement {metric} operands are malformed",
+    )
+    duration_metrics = {
+        "existing_owner_connect",
+        "spawn_convergence",
+        "cold_first_vector",
+        "first_product_ready",
+        "warm_query_ipc",
+        "warm_bulk_ipc",
+        "busy_retry_usefulness",
+        "true_idle_exit",
+    }
+    if metric in duration_metrics:
+        require_exact_keys(
+            operands,
+            set(),
+            f"qualification measurement {metric} operands",
+        )
+        return awake_delta_ns / 1_000_000
+    if metric in {"bulk_documents_per_second", "bulk_tokens_per_second"}:
+        operand = (
+            "completed_documents"
+            if metric == "bulk_documents_per_second"
+            else "completed_tokens"
+        )
+        require_exact_keys(
+            operands,
+            {operand},
+            f"qualification measurement {metric} operands",
+        )
+        completed = require_positive_int(
+            operands[operand],
+            f"qualification measurement {metric} operands.{operand}",
+        )
+        require(
+            awake_delta_ns > 0,
+            f"qualification measurement {metric} window is empty",
+        )
+        return completed * 1_000_000_000 / awake_delta_ns
+    if metric == "total_codestory_process_memory":
+        require_exact_keys(
+            operands,
+            {"processes"},
+            "qualification five-process memory operands",
+        )
+        processes = operands["processes"]
+        require(
+            isinstance(processes, list) and len(processes) == 5,
+            "qualification memory evidence must contain exactly five processes",
+        )
+        expected_roles = {
+            "plugin_host_a",
+            "plugin_cli_a",
+            "plugin_host_b",
+            "plugin_cli_b",
+            "embedding_server",
+        }
+        identities: set[tuple[int, str]] = set()
+        roles: set[str] = set()
+        total = 0
+        for index, observed in enumerate(processes):
+            require(
+                isinstance(observed, dict),
+                f"qualification memory process {index} is malformed",
+            )
+            require_exact_keys(
+                observed,
+                {
+                    "role",
+                    "pid",
+                    "process_start_id",
+                    "executable_sha256",
+                    "resident_bytes",
+                    "measurement_api",
+                },
+                f"qualification memory process {index}",
+            )
+            roles.add(
+                require_nonempty_string(
+                    observed["role"],
+                    f"qualification memory process {index}.role",
+                )
+            )
+            pid = require_positive_int(
+                observed["pid"],
+                f"qualification memory process {index}.pid",
+            )
+            start_id = require_nonempty_string(
+                observed["process_start_id"],
+                f"qualification memory process {index}.process_start_id",
+            )
+            identities.add((pid, start_id))
+            require_sha256(
+                observed["executable_sha256"],
+                f"qualification memory process {index}.executable_sha256",
+            )
+            total += require_positive_int(
+                observed["resident_bytes"],
+                f"qualification memory process {index}.resident_bytes",
+            )
+            require_nonempty_string(
+                observed["measurement_api"],
+                f"qualification memory process {index}.measurement_api",
+            )
+        require(
+            roles == expected_roles and len(identities) == 5,
+            "qualification memory evidence changed the five-process set",
+        )
+        return total
+    require(
+        metric == "backend_observed_accelerator_residency",
+        f"qualification measurement verifier omitted metric {metric}",
+    )
+    require_exact_keys(
+        operands,
+        {
+            "policy",
+            "backend",
+            "accelerator_execution_verified",
+            "resident_accelerator_tensor_count",
+            "resident_accelerator_tensor_bytes",
+            "offloaded_layer_count",
+            "model_layer_count",
+        },
+        f"qualification measurement {metric} operands",
+    )
+    require(
+        operands["policy"] == expected_policy
+        and normalized_backend(operands["backend"])
+        == normalized_backend(expected_backend),
+        "qualification accelerator-residency sample used the wrong policy or backend",
+    )
+    tensor_count = require_nonnegative_int(
+        operands["resident_accelerator_tensor_count"],
+        "qualification accelerator resident tensor count",
+    )
+    tensor_bytes = require_nonnegative_int(
+        operands["resident_accelerator_tensor_bytes"],
+        "qualification accelerator resident tensor bytes",
+    )
+    offloaded_layers = require_nonnegative_int(
+        operands["offloaded_layer_count"],
+        "qualification accelerator offloaded layer count",
+    )
+    model_layers = require_positive_int(
+        operands["model_layer_count"],
+        "qualification accelerator model layer count",
+    )
+    policy_residency_valid = (
+        expected_policy == "accelerated"
+        and operands["accelerator_execution_verified"] is True
+        and tensor_count > 0
+        and tensor_bytes > 0
+        and offloaded_layers == model_layers
+    ) or (
+        expected_policy == "cpu_explicit"
+        and operands["accelerator_execution_verified"] is False
+        and tensor_count == 0
+        and tensor_bytes == 0
+        and offloaded_layers == 0
+    )
+    require(
+        policy_residency_valid,
+        "qualification accelerator-residency operands contradict the selected policy",
+    )
+    return 1
+
+
+def produce_qualification_evidence(
+    args: argparse.Namespace,
+    qualification_cli: Path,
+    env: dict[str, str],
+    root: Path,
+    runtime: dict,
+    manifest: dict,
+    archive_sha256: str,
+    measurement_contract: dict,
+) -> dict:
+    require(
+        args.qualification_evidence is not None,
+        "--produce-qualification-evidence requires --qualification-evidence",
+    )
+    require(
+        qualification_cli.is_file(),
+        f"qualification executable is missing: {qualification_cli}",
+    )
+    require(
+        sha256(qualification_cli) == manifest["binary"]["sha256"],
+        "qualification executable does not match the packaged executable",
+    )
+    private_root = root / "qualification-suite"
+    artifact_root = private_root / "artifacts"
+    private_root.mkdir(mode=0o700)
+    artifact_root.mkdir(mode=0o700)
+    nonce = secrets.token_hex(32)
+    nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+    projects = runtime.get("_qualification_projects")
+    require(
+        isinstance(projects, list)
+        and len(projects) == 2
+        and all(isinstance(project, str) and Path(project).is_absolute() for project in projects),
+        "runtime proof omitted its two qualification projects",
+    )
+    contracts = {
+        "protocol_sha256": measurement_contract["protocol_sha256"],
+        "constant_set_sha256": measurement_contract["constant_set_sha256"],
+        "measurement_protocol_sha256": measurement_contract["measurement_protocol_sha256"],
+    }
+    package = {
+        "archive_sha256": archive_sha256,
+        "executable_sha256": manifest["binary"]["sha256"],
+        "asset_target": manifest["asset_target"],
+        "release_version": manifest["release_version"],
+    }
+    qualification_env = dict(env)
+    qualification_env.pop("CODESTORY_CLI", None)
+    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(private_root.resolve())
+    qualification_env["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
+    fault_recovery_consistency_evidence = None
+    if args.publication_fault_evidence is None:
+        (
+            args.publication_fault_evidence,
+            consistency_path,
+        ) = produce_product_publication_fault_evidence(
+            qualification_cli,
+            qualification_env,
+            private_root,
+            artifact_root,
+            nonce,
+            source=manifest["source"],
+            package=package,
+            contracts=contracts,
+            timeout=args.timeout_secs,
+        )
+        fault_recovery_consistency_evidence = (
+            verify_fault_recovery_consistency_raw_evidence(
+                consistency_path,
+                source=manifest["source"],
+                package=package,
+                contracts=contracts,
+            )
+        )
+    publication_fault_evidence = verify_publication_fault_raw_evidence(
+        args.publication_fault_evidence,
+        source=manifest["source"],
+        package=package,
+        contracts=contracts,
+    )
+    retrieval_quality_evidence = None
+    if args.retrieval_quality_evidence is not None:
+        retrieval_quality_evidence = verify_retrieval_quality_raw_evidence(
+            args.retrieval_quality_evidence,
+            source=manifest["source"],
+        )
+    elif args.proof_tier != "calibration":
+        raise ProofFailure(
+            f"{args.proof_tier} qualification requires --retrieval-quality-evidence "
+            f"from {RETRIEVAL_QUALITY_EVIDENCE_CONTRACT}"
+        )
+    identity = runtime["identity"]
+    expected_backend = args.expected_backend or require_nonempty_string(
+        identity.get("embedding_backend"),
+        "runtime embedding backend",
+    )
+    matrix_cell_id = require_nonempty_string(
+        args.qualification_matrix_cell,
+        "--produce-qualification-evidence requires --qualification-matrix-cell",
+    )
+    matrix_cell = selected_qualification_matrix_cell(
+        measurement_contract["measurement_protocol"],
+        cell_id=matrix_cell_id,
+        target=manifest["asset_target"],
+        proof_tier=args.proof_tier,
+        expected_policy=args.engine_policy,
+        expected_backend=expected_backend,
+    )
+    request = {
+        "schema_version": 1,
+        "qualification_nonce": nonce,
+        "qualification_nonce_sha256": nonce_sha256,
+        "proof_tier": args.proof_tier,
+        "source": manifest["source"],
+        "package": package,
+        "contracts": contracts,
+        "runtime": {
+            "engine_policy": args.engine_policy,
+            "expected_backend": expected_backend,
+            "offline": args.offline,
+            "matrix_cell_id": matrix_cell_id,
+            "cache_state": matrix_cell["cache_state"],
+            "residency_state": matrix_cell["residency_state"],
+        },
+        "projects": projects,
+        "required_scenarios": sorted(REQUIRED_SERVER_SCENARIOS),
+        "required_metrics": sorted(
+            measurement_contract["measurement_protocol"]["required_metrics"]
+        ),
+        "output_directory": str(artifact_root.resolve()),
+    }
+    request_path = private_root / "request.json"
+    output_path = private_root / "output.json"
+    write_private_json(request_path, request)
+    run(
+        [
+            str(qualification_cli),
+            "internal-embedding-qualification",
+            "--request",
+            str(request_path),
+            "--output",
+            str(output_path),
+        ],
+        env=qualification_env,
+        cwd=root,
+        timeout=args.timeout_secs,
+    )
+    require(output_path.is_file() and not output_path.is_symlink(), "qualification runner omitted its output")
+    output_bytes = output_path.read_bytes()
+    for forbidden in [nonce, *projects]:
+        require(
+            forbidden.encode("utf-8") not in output_bytes,
+            "qualification runner output leaked private request material",
+        )
+    try:
+        output = json.loads(output_bytes)
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"qualification runner output is not valid JSON: {exc}") from exc
+    require(isinstance(output, dict), "qualification runner output must be an object")
+    require_exact_keys(
+        output,
+        {
+            "schema_version",
+            "tier",
+            "source",
+            "package",
+            "contracts",
+            "runtime",
+            "request_sha256",
+            "scenarios",
+            "measurements",
+        },
+        "qualification runner output",
+    )
+    require(output["schema_version"] == 2, "qualification runner schema is unsupported")
+    require(output["tier"] == args.proof_tier, "qualification runner returned the wrong proof tier")
+    expected_status = "calibration" if args.proof_tier == "calibration" else "pass"
+    require(output["source"] == manifest["source"], "qualification runner source identity is stale")
+    require(output["package"] == package, "qualification runner package identity is stale")
+    require(output["contracts"] == contracts, "qualification runner contract identity is stale")
+    require(output["runtime"] == request["runtime"], "qualification runner runtime identity is stale")
+    serialized_request = {
+        "schema_version": request["schema_version"],
+        "qualification_nonce": request["qualification_nonce"],
+        "qualification_nonce_sha256": request["qualification_nonce_sha256"],
+        "proof_tier": request["proof_tier"],
+        "source": {
+            "commit": request["source"]["commit"],
+            "tree": request["source"]["tree"],
+            "tracked_dirty": request["source"]["tracked_dirty"],
+        },
+        "package": {
+            "archive_sha256": request["package"]["archive_sha256"],
+            "executable_sha256": request["package"]["executable_sha256"],
+            "asset_target": request["package"]["asset_target"],
+            "release_version": request["package"]["release_version"],
+        },
+        "contracts": {
+            "protocol_sha256": request["contracts"]["protocol_sha256"],
+            "constant_set_sha256": request["contracts"]["constant_set_sha256"],
+            "measurement_protocol_sha256": request["contracts"][
+                "measurement_protocol_sha256"
+            ],
+        },
+        "runtime": {
+            "engine_policy": request["runtime"]["engine_policy"],
+            "expected_backend": request["runtime"]["expected_backend"],
+            "offline": request["runtime"]["offline"],
+            "matrix_cell_id": request["runtime"]["matrix_cell_id"],
+            "cache_state": request["runtime"]["cache_state"],
+            "residency_state": request["runtime"]["residency_state"],
+        },
+        "projects": request["projects"],
+        "required_scenarios": request["required_scenarios"],
+        "required_metrics": request["required_metrics"],
+        "output_directory": request["output_directory"],
+    }
+    expected_request_sha256 = hashlib.sha256(
+        json.dumps(serialized_request, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    require(
+        output["request_sha256"] == expected_request_sha256,
+        "qualification runner output is not bound to the exact private request",
+    )
+
+    constants_frozen = measurement_contract["constant_set"]["status"] == "frozen"
+    shared = runtime["shared_identity"]
+    require_exact_keys(
+        shared,
+        {
+            "endpoint_namespace_id",
+            "lifetime_authority_id",
+            "listener_id",
+            "server_instance_id",
+            "server_process_start_id",
+            "engine_owner_id",
+            "native_worker_id",
+            "load_generation",
+            "model_load_count",
+        },
+        "live two-host shared identity",
+    )
+    for field in (
+        "endpoint_namespace_id",
+        "lifetime_authority_id",
+        "listener_id",
+        "server_instance_id",
+        "server_process_start_id",
+        "engine_owner_id",
+        "native_worker_id",
+    ):
+        require_nonempty_string(shared[field], f"live shared_identity.{field}")
+    require_positive_int(shared["load_generation"], "live shared_identity.load_generation")
+    require(
+        shared["model_load_count"] == 1,
+        "qualification runner cold race did not preserve one model load",
+    )
+
+    scenario_contracts = measurement_contract["measurement_protocol"]["scenario_contracts"]
+    raw_scenarios = output["scenarios"]
+    require(
+        isinstance(raw_scenarios, dict) and set(raw_scenarios) == REQUIRED_SERVER_SCENARIOS,
+        "qualification runner returned an incomplete scenario set",
+    )
+    retained_scenarios: dict[str, dict] = {}
+    forbidden_values = [nonce, *projects]
+    for scenario_id in sorted(REQUIRED_SERVER_SCENARIOS):
+        required_assertions = set(scenario_contracts[scenario_id]["required"])
+        artifact, _raw_artifact = qualification_artifact(
+            artifact_root,
+            raw_scenarios[scenario_id],
+            scenario_id=scenario_id,
+            contracts=contracts,
+            nonce_sha256=nonce_sha256,
+            forbidden_values=forbidden_values,
+        )
+        assertions = {assertion: True for assertion in required_assertions}
+        external_artifacts = []
+        if scenario_id in {"server_crash", "worker_stall"}:
+            for assertion, value in publication_fault_evidence["assertions"].items():
+                require(
+                    assertion in required_assertions,
+                    f"publication fault evidence derived unknown assertion {assertion}",
+                )
+                assertions[assertion] = value
+            external_artifacts.append(publication_fault_evidence["artifact"])
+            if (
+                scenario_id == "server_crash"
+                and fault_recovery_consistency_evidence is not None
+            ):
+                external_artifacts.append(
+                    fault_recovery_consistency_evidence["artifact"]
+                )
+        require(
+            all(value is True for value in assertions.values()),
+            f"qualification scenario {scenario_id} has a failed assertion",
+        )
+        retained_scenarios[scenario_id] = {
+            "status": "pass",
+            "assertions": assertions,
+            "artifacts": [artifact, *external_artifacts],
+        }
+
+    measurement = qualification_measurement_artifact(
+        artifact_root,
+        output["measurements"],
+        contracts=contracts,
+        measurement_contract=measurement_contract,
+        target=manifest["asset_target"],
+        proof_tier=args.proof_tier,
+        matrix_cell_id=matrix_cell_id,
+        expected_policy=args.engine_policy,
+        expected_backend=expected_backend,
+        forbidden_values=forbidden_values,
+    )
+    memory_evidence = retain_five_process_memory_evidence(
+        artifact_root,
+        runtime.get("_memory_observations"),
+        source=manifest["source"],
+        package=package,
+        contracts=contracts,
+        protocol=measurement_contract["measurement_protocol"],
+        target=manifest["asset_target"],
+        proof_tier=args.proof_tier,
+        matrix_cell_id=matrix_cell_id,
+        expected_policy=args.engine_policy,
+        expected_backend=expected_backend,
+        forbidden_values=forbidden_values,
+    )
+    timing = {
+        "clock_domain": "awake_monotonic",
+        "cross_process_timestamp_subtraction": False,
+        "unplanned_suspend": measurement["unplanned_suspend"],
+        "constants_frozen_before_run": constants_frozen,
+        "constant_set_sha256": contracts["constant_set_sha256"],
+    }
+    cache_state = (
+        "reused"
+        if runtime["materialization"]["reused_on_rejoin"] is True
+        else "materialized"
+    )
+    residency_state = require_nonempty_string(
+        identity["embedding_engine_residency"],
+        "runtime engine residency",
+    )
+    platform_label = (
+        f"{sys.platform}:{os.uname().machine}"
+        if hasattr(os, "uname")
+        else sys.platform
+    )
+    host = {
+        "fingerprint": canonical_sha256(
+            {
+                "platform": platform_label,
+                "target": manifest["asset_target"],
+                "account_id": runtime["same_account"]["account_id"],
+                "backend": normalized_backend(expected_backend),
+                "policy": args.engine_policy,
+            }
+        ),
+        "platform": platform_label,
+        "target": manifest["asset_target"],
+        "backend": identity["embedding_backend"],
+        "policy": args.engine_policy,
+        "cache_state": cache_state,
+        "residency_state": residency_state,
+        "unplanned_suspend": measurement["unplanned_suspend"],
+    }
+    nonclaims = {
+        claim: {
+            "claimed": False,
+            "reason": (
+                "this exact-package qualification tier does not establish the broader claim"
+            ),
+        }
+        for claim in sorted(LOWER_TIER_NONCLAIMS)
+    }
+
+    required_metrics = set(measurement_contract["measurement_protocol"]["required_metrics"])
+    metric_contracts = measurement_contract["measurement_protocol"]["metric_contracts"]
+    thresholds = measurement_contract["constant_set"]["qualification_thresholds"]
+    retained_metrics: dict[str, dict] = {}
+    for metric in sorted(required_metrics):
+        unit = metric_contracts[metric]["unit"]
+        if metric == "retrieval_quality" and retrieval_quality_evidence is None:
+            require(
+                args.proof_tier == "calibration",
+                "qualification retrieval quality omitted publishable packet evidence",
+            )
+            retained_metrics[metric] = {
+                "status": "not_measured",
+                "unit": unit,
+                "value": None,
+                "reason": (
+                    "calibration omitted the separately produced exact-head publishable packet artifact"
+                ),
+            }
+            continue
+        value = (
+            retrieval_quality_evidence["publishable_packet_pass_rate"]
+            if metric == "retrieval_quality"
+            else (
+                memory_evidence["value"]
+                if metric == "total_codestory_process_memory"
+                else measurement["values"][metric]
+            )
+        )
+        require(
+            isinstance(value, (int, float)) and not isinstance(value, bool),
+            f"qualification metric {metric} is not numeric",
+        )
+        if args.proof_tier == "calibration":
+            retained_metrics[metric] = {
+                "status": "calibration",
+                "unit": unit,
+                "value": value,
+            }
+            if metric == "retrieval_quality":
+                retained_metrics[metric]["raw_evidence"] = retrieval_quality_evidence
+            elif metric == "total_codestory_process_memory":
+                retained_metrics[metric]["raw_evidence"] = memory_evidence["artifact"]
+            else:
+                retained_metrics[metric]["raw_evidence"] = measurement["artifact"]
+            continue
+        threshold = thresholds[metric]
+        require(
+            isinstance(threshold, (int, float)) and not isinstance(threshold, bool),
+            f"qualification metric {metric} has no frozen threshold",
+        )
+        comparison = metric_contracts[metric]["comparison"]
+        require(
+            metric_passes(value, threshold, comparison),
+            f"qualification metric {metric} failed its frozen threshold",
+        )
+        retained_metrics[metric] = {
+            "status": "pass",
+            "unit": unit,
+            "value": value,
+            "threshold": threshold,
+            "comparison": comparison,
+        }
+        if metric == "retrieval_quality":
+            require(
+                retrieval_quality_evidence is not None,
+                "qualification retrieval quality omitted publishable packet evidence",
+            )
+            retained_metrics[metric]["raw_evidence"] = retrieval_quality_evidence
+        elif metric == "total_codestory_process_memory":
+            retained_metrics[metric]["raw_evidence"] = memory_evidence["artifact"]
+        else:
+            retained_metrics[metric]["raw_evidence"] = measurement["artifact"]
+
+    retained = {
+        "schema_version": 1,
+        "status": expected_status,
+        "tier": args.proof_tier,
+        "source": manifest["source"],
+        "package": {
+            **package,
+            **contracts,
+            "model_sha256": identity["embedding_model_sha256"],
+            "backend": identity["embedding_backend"],
+            "policy": identity["embedding_policy"],
+            "cache_state": host["cache_state"],
+            "residency_state": host["residency_state"],
+        },
+        "host": host,
+        "same_account": runtime["same_account"],
+        "shared_identity": shared,
+        "timing": timing,
+        "scenarios": retained_scenarios,
+        "lower_tier_nonclaims": nonclaims,
+        "metrics": retained_metrics,
+    }
+    if args.proof_tier == "installed_runtime":
+        retained["installed_plugin"] = runtime["installed_plugin"]
+        retained["managed_runtime"] = runtime["managed_runtime"]
+    write_json(args.qualification_evidence, retained)
+    return retained
 
 
 def self_test() -> None:
@@ -1516,11 +5994,36 @@ def self_test() -> None:
             f"embedding_contract_sha256={contract_sha256}|model_embedded=true|"
             "producer=test@0.0.0|end"
         )
-        binary_payload = bytes(binary_header) + b"\0" + build_identity.encode("ascii") + b"\0"
+        protocol_sha256 = sha256(SERVER_PROTOCOL)
+        constant_set_sha256 = sha256(SERVER_CONSTANT_SET)
+        measurement_protocol_sha256 = sha256(MEASUREMENT_PROTOCOL)
+        server_proof_identity = (
+            "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=1|"
+            f"protocol_sha256={protocol_sha256}|"
+            f"constant_set_sha256={constant_set_sha256}|"
+            f"measurement_protocol_sha256={measurement_protocol_sha256}|"
+            "clock_policy=awake_monotonic|query_capacity=64|bulk_capacity=64|"
+            "idle_timeout_ms=60000|end"
+        )
+        binary_payload = (
+            bytes(binary_header)
+            + b"\0"
+            + build_identity.encode("ascii")
+            + b"\0"
+            + server_proof_identity.encode("ascii")
+            + b"\0"
+        )
+        server_proof = parse_server_proof_identity(server_proof_identity)
+        server_proof["constant_set_status"] = "unfrozen"
         valid_manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "release_version": "0.0.0",
             "asset_target": "macos-arm64",
+            "source": {
+                "commit": "1" * 40,
+                "tree": "2" * 40,
+                "tracked_dirty": False,
+            },
             "binary": {
                 "name": "codestory-cli",
                 "sha256": hashlib.sha256(binary_payload).hexdigest(),
@@ -1552,6 +6055,7 @@ def self_test() -> None:
                 "expected_protected_backend": "metal",
                 "non_claim_reason": None,
             },
+            "server_proof": server_proof,
         }
         with zipfile.ZipFile(payload, "w") as handle:
             handle.writestr("codestory-cli", binary_payload)
@@ -1601,9 +6105,512 @@ def self_test() -> None:
             "embedding_offloaded_layer_count": 13,
         }
         engine_identity(valid, "accelerated", "Metal")
-        runtime = {"identity": valid, "restart_identity": valid.copy()}
+        runtime = {
+            "identity": valid,
+            "second_host_identity": valid.copy(),
+            "rejoin_identity": valid.copy(),
+        }
         evidence = verify_runtime_against_manifest(manifest, runtime, "accelerated")
         require(evidence["execution"] == "proven_by_live_runtime", "runtime contract proof failed")
+        snapshot_payload = {
+            "embedding_server": {
+                "schema_version": 1,
+                "event_sequence": 17,
+                "lifecycle": "resident",
+                "clock": {
+                    "domain": "awake_monotonic",
+                    "api": "mach_absolute_time",
+                    "boot_id": "boot-1",
+                    "resolution_ns": 1,
+                },
+                "protocol": {
+                    "bootstrap_version": 1,
+                    "schema_version": 1,
+                    "protocol_sha256": protocol_sha256,
+                    "constant_set_sha256": constant_set_sha256,
+                    "measurement_protocol_sha256": measurement_protocol_sha256,
+                },
+                "authority": {
+                    "endpoint_namespace_id": "endpoint-1",
+                    "lifetime_authority_id": "authority-1",
+                    "listener_id": "listener-1",
+                    "peer_verified": True,
+                },
+                "process": {
+                    "server_instance_id": "server-1",
+                    "pid": 101,
+                    "process_start_id": "boot-1:101",
+                    "executable_sha256": manifest["binary"]["sha256"],
+                    "executable_version": "0.0.0",
+                },
+                "scheduler": {
+                    "query_capacity": 64,
+                    "query_depth": 0,
+                    "bulk_capacity": 64,
+                    "bulk_depth": 0,
+                    "connection_count": 2,
+                    "active_request_count": 0,
+                    "lease_count": 0,
+                    "active_request": None,
+                },
+                "engine": {
+                    "engine_owner_id": "engine-owner-1",
+                    "native_worker_id": "native-worker-1",
+                    "load_generation": 1,
+                    "model_load_count": 1,
+                    "successful_encode_count": 3,
+                },
+                "failure": None,
+            }
+        }
+        first_snapshot = server_snapshot(snapshot_payload, manifest, require_resident=True)
+        second_snapshot = server_snapshot(
+            json.loads(json.dumps(snapshot_payload)),
+            manifest,
+            require_resident=True,
+        )
+        shared = shared_server_identity(first_snapshot, second_snapshot)
+        require(shared["model_load_count"] == 1, "shared server identity self-test failed")
+        measurement_contract = verify_package_server_contracts(
+            manifest,
+            MEASUREMENT_PROTOCOL,
+            require_frozen=False,
+        )
+        self_digest = lambda label: hashlib.sha256(label.encode("utf-8")).hexdigest()
+        external_package = {
+            "archive_sha256": "b" * 64,
+            "executable_sha256": manifest["binary"]["sha256"],
+            "asset_target": manifest["asset_target"],
+            "release_version": manifest["release_version"],
+        }
+        external_contracts = {
+            "protocol_sha256": protocol_sha256,
+            "constant_set_sha256": constant_set_sha256,
+            "measurement_protocol_sha256": measurement_protocol_sha256,
+        }
+        correlation_id = "0123456789abcdef0123456789abcdef"
+        previous_publication = self_digest("previous-publication")
+        publication_payload = {
+            "schema_version": 1,
+            "evidence_contract": PUBLICATION_FAULT_EVIDENCE_CONTRACT,
+            "source": manifest["source"],
+            "package": external_package,
+            "contracts": external_contracts,
+            "correlation_id": correlation_id,
+            "previous_publication_identity_sha256": previous_publication,
+            "server_observations": [
+                {
+                    "phase": "before_crash",
+                    "server_instance_id": "server-before",
+                    "process_start_id": "boot-1:101",
+                    "load_generation": 1,
+                },
+                {
+                    "phase": "after_replacement",
+                    "server_instance_id": "server-after",
+                    "process_start_id": "boot-1:102",
+                    "load_generation": 1,
+                },
+            ],
+            "candidate_observation": {
+                "command": "retrieval_index",
+                "exit_code": 1,
+                "stdout_sha256": self_digest("candidate-stdout"),
+                "stderr_sha256": self_digest("candidate-stderr"),
+            },
+            "publication_hook_events": [
+                {
+                    "schema_version": 1,
+                    "sequence": index,
+                    "correlation_id": correlation_id,
+                    "action": action,
+                    "status": status,
+                    "clock": {
+                        "domain": "process_monotonic",
+                        "api": "std::time::Instant",
+                        "elapsed_ns": index,
+                    },
+                }
+                for index, (action, status) in enumerate(
+                    (
+                        ("pause_before_manifest_commit", "waiting_for_resume"),
+                        ("resume_manifest_commit", "observed"),
+                        ("lease_revalidation", "failed"),
+                        ("manifest_commit", "returned_error"),
+                    )
+                )
+            ],
+            "ordinary_product_observations": [
+                {
+                    "sequence": index,
+                    "command": command,
+                    "exit_code": 0,
+                    "retrieval_mode": "full",
+                    "publication_identity_sha256": previous_publication,
+                    "output_sha256": self_digest(f"{command}-output"),
+                }
+                for index, command in enumerate(("retrieval_status", "search"))
+            ],
+        }
+        publication_path = root / "publication-fault.raw.json"
+        write_json(publication_path, publication_payload)
+        publication_external = verify_publication_fault_raw_evidence(
+            publication_path,
+            source=manifest["source"],
+            package=external_package,
+            contracts=external_contracts,
+        )
+        require(
+            all(publication_external["assertions"].values()),
+            "publication fault self-test did not derive its assertions",
+        )
+        hostile_publication = json.loads(json.dumps(publication_payload))
+        hostile_publication["assertions"] = {"lost_publication_lease_blocks_commit": True}
+        write_json(publication_path, hostile_publication)
+        try:
+            verify_publication_fault_raw_evidence(
+                publication_path,
+                source=manifest["source"],
+                package=external_package,
+                contracts=external_contracts,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("self-declared publication assertions were accepted")
+        write_json(publication_path, publication_payload)
+
+        consistency_payload = {
+            "schema_version": 1,
+            "evidence_contract": FAULT_RECOVERY_CONSISTENCY_CONTRACT,
+            "source": manifest["source"],
+            "package": external_package,
+            "contracts": external_contracts,
+            "run_id_sha256": self_digest("consistency-run"),
+            "observations": [
+                {
+                    "case_id_sha256": self_digest(f"consistency-case-{index}"),
+                    "before_server_fault_rank": 1,
+                    "after_server_replacement_rank": 1,
+                }
+                for index in range(FAULT_RECOVERY_CONSISTENCY_CASES)
+            ],
+        }
+        consistency_path = root / "fault-recovery-consistency.raw.json"
+        write_json(consistency_path, consistency_payload)
+        consistency_external = verify_fault_recovery_consistency_raw_evidence(
+            consistency_path,
+            source=manifest["source"],
+            package=external_package,
+            contracts=external_contracts,
+        )
+        require(
+            consistency_external["ranks_stable"] is True,
+            "fault recovery consistency self-test did not derive stable ranks",
+        )
+        hostile_consistency = json.loads(json.dumps(consistency_payload))
+        hostile_consistency["observations"][0]["after_server_replacement_rank"] = 2
+        write_json(consistency_path, hostile_consistency)
+        try:
+            verify_fault_recovery_consistency_raw_evidence(
+                consistency_path,
+                source=manifest["source"],
+                package=external_package,
+                contracts=external_contracts,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("changed fault-recovery search ranks were accepted")
+
+        packet_row = {
+            "repo": "fixture",
+            "task_id": "quality-contract",
+            "mode": "cold_cli_packet",
+            "status": "pass",
+            "quality": {"pass": True},
+            "sufficiency": {
+                "status": "sufficient",
+                "sufficient_quality_mismatch": False,
+                "follow_up_commands_count": 0,
+                "open_next_count": 0,
+                "gaps_count": 0,
+                "coverage_unresolved_blocking_count": 0,
+            },
+            "packet_latency": {
+                "sla_missed": False,
+                "retrieval_shadow": {"retrieval_mode": "full"},
+            },
+            "repo_provenance": {
+                "manifest_overridden_by_builtin": False,
+                "configured": {
+                    "url": "https://github.com/example/fixture.git",
+                    "ref": "9" * 40,
+                },
+                "manifest": {
+                    "url": "https://github.com/example/fixture.git",
+                    "ref": "9" * 40,
+                },
+                "git_head": "9" * 40,
+                "git_origin": "https://github.com/example/fixture.git",
+                "git_dirty": False,
+            },
+            "codestory_cache_provenance": {
+                "doctor_status": "pass",
+                "storage_path": "fixture/codestory.db",
+                "cache_policy": "prepared-retrieval-cache-read-only",
+                "retrieval_mode": "full",
+                "semantic_generation": "fixture-generation",
+                "manifest_embedding_backend": "per-user-server:coderank-embed:q8_0",
+                "semantic_backend": "coderank-embed",
+                "embedding_engine_instance_id": "engine-fixture",
+                "embedding_policy": "accelerated",
+                "local_only": True,
+                "indexed": True,
+                "freshness_status": "fresh",
+                "semantic_ready": True,
+                "indexing_in_timed_run": False,
+            },
+        }
+        quality_payload = {
+            "modes": ["cold-cli"],
+            "repeats": MIN_RETRIEVAL_QUALITY_REPEATS,
+            "release_evidence": {
+                "commit": manifest["source"]["commit"],
+                "source_tree": manifest["source"]["tree"],
+                "evaluation_contract": RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+                "profile": "self-test",
+                "evidence_identity": {
+                    "corpus_id": "self-test-corpus",
+                    "cache_id": "self-test-cache",
+                    "machine_fingerprint": "self-test-host",
+                },
+                "publishable": True,
+                "repeats": MIN_RETRIEVAL_QUALITY_REPEATS,
+                "quality_gate_status": "pass",
+                "publishable_blockers": [],
+                "rows": [
+                    {**json.loads(json.dumps(packet_row)), "repeat": repeat}
+                    for repeat in range(1, MIN_RETRIEVAL_QUALITY_REPEATS + 1)
+                ],
+            },
+        }
+        quality_path = root / "packet-runtime-summary.json"
+        write_json(quality_path, quality_payload)
+        quality_external = verify_retrieval_quality_raw_evidence(
+            quality_path,
+            source=manifest["source"],
+        )
+        require(
+            quality_external["publishable_packet_pass_rate"] == 1,
+            "retrieval quality self-test did not derive the packet pass rate",
+        )
+        hostile_quality = json.loads(json.dumps(quality_payload))
+        hostile_quality["assertions"] = {"retrieval_quality": True}
+        write_json(quality_path, hostile_quality)
+        try:
+            verify_retrieval_quality_raw_evidence(
+                quality_path,
+                source=manifest["source"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("self-declared retrieval quality pass was accepted")
+        hostile_quality = json.loads(json.dumps(quality_payload))
+        hostile_quality["release_evidence"]["rows"].pop()
+        write_json(quality_path, hostile_quality)
+        try:
+            verify_retrieval_quality_raw_evidence(
+                quality_path,
+                source=manifest["source"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("incomplete retrieval quality repeats were accepted")
+        hostile_quality = json.loads(json.dumps(quality_payload))
+        hostile_quality["release_evidence"]["source_tree"] = "f" * 40
+        write_json(quality_path, hostile_quality)
+        try:
+            verify_retrieval_quality_raw_evidence(
+                quality_path,
+                source=manifest["source"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("stale retrieval quality source tree was accepted")
+        write_json(quality_path, quality_payload)
+        try:
+            verify_package_server_contracts(
+                manifest,
+                MEASUREMENT_PROTOCOL,
+                require_frozen=True,
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("unfrozen server constants were accepted for qualification")
+        scenario_contracts = measurement_contract["measurement_protocol"]["scenario_contracts"]
+        qualification_contract = json.loads(json.dumps(measurement_contract))
+        qualification_contract["constant_set"]["qualification_thresholds"] = {
+            metric: 1
+            for metric in measurement_contract["measurement_protocol"]["required_metrics"]
+        }
+        retained = {
+            "schema_version": 1,
+            "status": "pass",
+            "tier": "installed_runtime",
+            "source": manifest["source"],
+            "package": {
+                "archive_sha256": "b" * 64,
+                "executable_sha256": manifest["binary"]["sha256"],
+                "asset_target": manifest["asset_target"],
+                "release_version": manifest["release_version"],
+                "model_sha256": manifest["model"]["sha256"],
+                "backend": "Metal",
+                "policy": "accelerated",
+                "cache_state": "warm",
+                "residency_state": "resident",
+                "protocol_sha256": protocol_sha256,
+                "constant_set_sha256": constant_set_sha256,
+                "measurement_protocol_sha256": measurement_protocol_sha256,
+            },
+            "host": {
+                "fingerprint": "f" * 64,
+                "platform": "macos",
+                "target": manifest["asset_target"],
+                "backend": "Metal",
+                "policy": "accelerated",
+                "cache_state": "warm",
+                "residency_state": "resident",
+                "unplanned_suspend": False,
+            },
+            "installed_plugin": {
+                "schema_version": 1,
+                "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
+                "marketplace_commit": "d" * 40,
+                "plugin_id": "codestory",
+                "plugin_version": "0.0.0",
+                "plugin_source_commit": manifest["source"]["commit"],
+                "plugin_package_sha256": "e" * 64,
+            },
+            "managed_runtime": {
+                "cli_source": "managed",
+                "plugin_version": "0.0.0",
+                "managed_binary_sha256": manifest["binary"]["sha256"],
+                "archive_sha256": "b" * 64,
+                "build_source": "release_asset",
+                "repo_ref": "v0.0.0",
+                "provisioned_at": "self-test",
+            },
+            "same_account": {
+                "account_id": "uid:501",
+                "relation": "same_os_account",
+                "cross_login_or_terminal_sessions_proven": False,
+                "plugin_hosts": [
+                    {
+                        "pid": 201,
+                        "process_start_id": "boot-1:201",
+                        "repository_id": "repo:a",
+                    },
+                    {
+                        "pid": 202,
+                        "process_start_id": "boot-1:202",
+                        "repository_id": "repo:b",
+                    },
+                ],
+            },
+            "shared_identity": shared,
+            "timing": {
+                "clock_domain": "awake_monotonic",
+                "cross_process_timestamp_subtraction": False,
+                "unplanned_suspend": False,
+                "constants_frozen_before_run": True,
+                "constant_set_sha256": constant_set_sha256,
+            },
+            "scenarios": {
+                scenario_id: {
+                    "status": "pass",
+                    "assertions": {
+                        assertion: True
+                        for assertion in contract["required"]
+                    },
+                    "artifacts": [
+                        {
+                            "name": f"{scenario_id}.json",
+                            "sha256": "c" * 64,
+                        }
+                    ],
+                }
+                for scenario_id, contract in scenario_contracts.items()
+            },
+            "lower_tier_nonclaims": {
+                claim: {
+                    "claimed": False,
+                    "reason": "self-test lower-tier boundary",
+                }
+                for claim in LOWER_TIER_NONCLAIMS
+            },
+            "metrics": {
+                metric: {
+                    "status": "pass",
+                    "unit": measurement_contract["measurement_protocol"]["metric_contracts"][metric]["unit"],
+                    "value": 1,
+                    "threshold": 1,
+                    "comparison": measurement_contract["measurement_protocol"]["metric_contracts"][metric]["comparison"],
+                }
+                for metric in measurement_contract["measurement_protocol"]["required_metrics"]
+            },
+        }
+        retained["scenarios"]["server_crash"]["artifacts"].append(
+            publication_external["artifact"]
+        )
+        retained["scenarios"]["worker_stall"]["artifacts"].append(
+            publication_external["artifact"]
+        )
+        retained["scenarios"]["server_crash"]["artifacts"].append(
+            consistency_external["artifact"]
+        )
+        retained["metrics"]["retrieval_quality"]["raw_evidence"] = quality_external
+        for metric, result in retained["metrics"].items():
+            if metric != "retrieval_quality":
+                result["raw_evidence"] = {
+                    "name": (
+                        "total-codestory-process-memory.raw.json"
+                        if metric == "total_codestory_process_memory"
+                        else "measurements.raw.json"
+                    ),
+                    "sha256": "d" * 64,
+                }
+        verify_retained_qualification(
+            retained,
+            manifest=manifest,
+            archive_sha256="b" * 64,
+            shared_identity=shared,
+            measurement_contract=qualification_contract,
+            required_tier="installed_runtime",
+            installed_plugin=retained["installed_plugin"],
+            managed_runtime=retained["managed_runtime"],
+        )
+        missing_scenario = json.loads(json.dumps(retained))
+        missing_scenario["scenarios"].pop("frozen_owner")
+        try:
+            verify_retained_qualification(
+                missing_scenario,
+                manifest=manifest,
+                archive_sha256="b" * 64,
+                shared_identity=shared,
+                measurement_contract=qualification_contract,
+                required_tier="installed_runtime",
+                installed_plugin=retained["installed_plugin"],
+                managed_runtime=retained["managed_runtime"],
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("incomplete installed scenario evidence was accepted")
         invalid = {**valid, "embedding_adapter": "llvmpipe"}
         try:
             engine_identity(invalid, "accelerated", "Metal")
@@ -1664,7 +6671,7 @@ def self_test() -> None:
             pass
         else:
             raise ProofFailure("binary/manifest native marker mismatch was accepted")
-    print("packaged in-process embedding proof self-test passed")
+    print("packaged per-user embedding server proof self-test passed")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1681,11 +6688,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--additional-query", action="append", default=[])
     parser.add_argument("--timeout-secs", type=int, default=900)
     parser.add_argument("--version-only", action="store_true")
+    parser.add_argument(
+        "--proof-tier",
+        choices=("calibration", "hosted_package", "protected_hardware", "installed_runtime"),
+        default="hosted_package",
+    )
     parser.add_argument("--plugin-handoff", action="store_true")
     parser.add_argument("--engine-policy", choices=("accelerated", "cpu_explicit"))
     parser.add_argument("--expected-backend")
+    parser.add_argument("--qualification-matrix-cell")
     parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--idle-residency-proof", action="store_true")
+    parser.add_argument("--qualification-evidence", type=Path)
+    parser.add_argument("--produce-qualification-evidence", action="store_true")
+    parser.add_argument("--publication-fault-evidence", type=Path)
+    parser.add_argument("--retrieval-quality-evidence", type=Path)
+    parser.add_argument("--installed-plugin-provenance", type=Path)
+    parser.add_argument("--installed-plugin-data", type=Path)
+    parser.add_argument("--measurement-protocol", type=Path, default=MEASUREMENT_PROTOCOL)
+    parser.add_argument("--expected-source-sha")
+    parser.add_argument("--expected-source-tree")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -1699,6 +6720,17 @@ def main() -> int:
     args.archive = args.archive.resolve()
     args.checksum_file = args.checksum_file.resolve()
     args.out_dir = args.out_dir.resolve()
+    args.measurement_protocol = args.measurement_protocol.resolve()
+    if args.qualification_evidence is not None:
+        args.qualification_evidence = args.qualification_evidence.resolve()
+    if args.publication_fault_evidence is not None:
+        args.publication_fault_evidence = args.publication_fault_evidence.resolve()
+    if args.retrieval_quality_evidence is not None:
+        args.retrieval_quality_evidence = args.retrieval_quality_evidence.resolve()
+    if args.installed_plugin_provenance is not None:
+        args.installed_plugin_provenance = args.installed_plugin_provenance.resolve()
+    if args.installed_plugin_data is not None:
+        args.installed_plugin_data = args.installed_plugin_data.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     require(sha256(args.archive) == expected_archive_digest(args.checksum_file, args.archive), "archive checksum mismatch")
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-") as raw:
@@ -1706,6 +6738,22 @@ def main() -> int:
         unpack_archive(args.archive, root / "unpacked")
         cli = find_cli(root / "unpacked")
         manifest = load_native_manifest(root / "unpacked", cli, args.expected_version)
+        if args.expected_source_sha:
+            require(
+                manifest["source"]["commit"] == args.expected_source_sha,
+                "package source commit does not match --expected-source-sha",
+            )
+        if args.expected_source_tree:
+            require(
+                manifest["source"]["tree"] == args.expected_source_tree,
+                "package source tree does not match --expected-source-tree",
+            )
+        require_frozen = not args.version_only and args.proof_tier != "calibration"
+        measurement_contract = verify_package_server_contracts(
+            manifest,
+            args.measurement_protocol,
+            require_frozen=require_frozen,
+        )
         env = isolated_environment(root, args.engine_policy, args.offline)
         version = run([str(cli), "--version"], env=env, cwd=root, timeout=args.timeout_secs)
         require(args.expected_version in version["stdout"], f"CLI version does not contain {args.expected_version}")
@@ -1721,18 +6769,82 @@ def main() -> int:
             "package_contract": {
                 "manifest": manifest,
                 "answer_quality_claim": False,
+                "release_readiness_claim": False,
+                "measurement_contract": measurement_contract,
+                "highest_proof_tier": "package_structure",
             },
         }
         if not args.version_only:
             require(args.project is not None, "--project is required for the runtime proof")
             require(args.engine_policy is not None, "--engine-policy is required for the runtime proof")
-            runtime = prove_runtime(args, cli, env, root, args.out_dir)
+            runtime = prove_runtime(args, cli, env, root, args.out_dir, manifest)
+            qualification_cli = Path(
+                require_nonempty_string(
+                    runtime.get("_qualification_cli_path"),
+                    "runtime qualification executable",
+                )
+            )
+            if args.produce_qualification_evidence:
+                produce_qualification_evidence(
+                    args,
+                    qualification_cli,
+                    env,
+                    root,
+                    runtime,
+                    manifest,
+                    sha256(args.archive),
+                    measurement_contract,
+                )
+            runtime.pop("_qualification_cli_path", None)
+            runtime.pop("_qualification_projects", None)
+            runtime.pop("_memory_observations", None)
             summary["runtime"] = runtime
             summary["package_contract"]["runtime_evidence"] = verify_runtime_against_manifest(
                 manifest, runtime, args.engine_policy
             )
+            summary["package_contract"]["highest_proof_tier"] = (
+                "calibration" if args.proof_tier == "calibration" else "hosted_package"
+            )
+            if args.proof_tier != "calibration":
+                require(
+                    args.qualification_evidence is not None,
+                    f"{args.proof_tier} proof requires --qualification-evidence from the exact live scenario run",
+                )
+                try:
+                    retained = json.loads(args.qualification_evidence.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ProofFailure(f"qualification evidence is not valid JSON: {exc}") from exc
+                require(isinstance(retained, dict), "qualification evidence must be an object")
+                summary["qualification"] = verify_retained_qualification(
+                    retained,
+                    manifest=manifest,
+                    archive_sha256=sha256(args.archive),
+                    shared_identity=None,
+                    measurement_contract=measurement_contract,
+                    required_tier=args.proof_tier,
+                    installed_plugin=runtime.get("installed_plugin"),
+                    managed_runtime=runtime.get("managed_runtime"),
+                )
+                summary["package_contract"]["highest_proof_tier"] = args.proof_tier
+            elif args.qualification_evidence is not None and args.qualification_evidence.is_file():
+                try:
+                    calibration = json.loads(
+                        args.qualification_evidence.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError as exc:
+                    raise ProofFailure(
+                        f"calibration evidence is not valid JSON: {exc}"
+                    ) from exc
+                require(
+                    isinstance(calibration, dict)
+                    and calibration.get("schema_version") == 1
+                    and calibration.get("status") == "calibration"
+                    and calibration.get("tier") == "calibration",
+                    "calibration evidence has the wrong schema, status, or tier",
+                )
+                summary["qualification"] = calibration
         write_json(args.out_dir / "summary.json", summary)
-    print(f"packaged CodeStory proof passed: {args.out_dir / 'summary.json'}")
+    print(f"packaged CodeStory {args.proof_tier} proof passed: {args.out_dir / 'summary.json'}")
     return 0
 
 

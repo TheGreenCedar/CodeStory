@@ -180,7 +180,9 @@ impl PinnedRetrievalRead {
 }
 
 fn map_pinned_query_error(error: AnyhowError) -> ApiError {
-    if is_retrieval_publication_changed(&error) {
+    if let Some(pressure) = codestory_retrieval::embedding_capacity_pressure(&error) {
+        crate::services::embedding_capacity_api_error(pressure)
+    } else if is_retrieval_publication_changed(&error) {
         ApiError::new("publication_changed", error.to_string())
     } else {
         ApiError::new("cache_busy", error.to_string())
@@ -313,7 +315,8 @@ fn shadow_env_enabled() -> Option<bool> {
 ///
 /// - `CODESTORY_RETRIEVAL=1` requires the published agent retrieval generation.
 /// - `CODESTORY_RETRIEVAL=0` is unsupported; packet paths fail closed.
-/// - Unset: retrieval is available when the manifest exists and the in-process engine is healthy.
+/// - Unset: retrieval is available when the manifest exists and the shared
+///   per-user embedding server is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
     match retrieval_env_override() {
         Some(false) => {
@@ -701,7 +704,10 @@ pub(crate) enum SidecarPrimarySearchOutcome {
 }
 
 fn sidecar_primary_error_outcome(error: ApiError) -> SidecarPrimarySearchOutcome {
-    if matches!(error.code.as_str(), "cache_busy" | "publication_changed") {
+    if matches!(
+        error.code.as_str(),
+        "embedding_capacity" | "cache_busy" | "publication_changed"
+    ) {
         SidecarPrimarySearchOutcome::Retryable { error }
     } else {
         SidecarPrimarySearchOutcome::Unavailable {

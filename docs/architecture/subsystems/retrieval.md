@@ -9,7 +9,7 @@ adapter rendering.
 
 Inputs are a selected project runtime config, a current core store publication,
 a complete source inventory, graph-native search documents, embedding-free
-dense-anchor inputs, and the immutable process embedding policy. Outputs are:
+dense-anchor inputs, and the immutable embedding policy. Outputs are:
 
 - immutable lexical `lexical-index.sqlite3`, semantic `vectors.sqlite3`, and
   SCIP generations;
@@ -29,7 +29,8 @@ dense-anchor inputs, and the immutable process embedding policy. Outputs are:
 - `health.rs` and `mode.rs`: artifact classification and live readiness
 - `embedding_contract.rs`: model, prefix, pooling, normalization, dimension,
   batching, backend, and explicit CPU/accelerator policy
-- `in_process_embedding.rs`: process-wide engine initialization and reuse
+- `per_user_embedding.rs`: bounded protocol, compatibility, server scheduler,
+  leases, client replay boundary, and diagnostics
 - `retention.rs`: generation leases and owned cleanup
 - `config.rs`: frozen process defaults and per-project runtime config
 
@@ -46,10 +47,12 @@ engine residency, and final revalidation. Strict reader admission applies the
 same deep generation-evidence contract as writer reuse and promotion; admitted
 query execution then stays pinned to those verified files.
 
-The embedding engine is process-wide, while manifests and artifacts are
-project-local. An incompatible cache-root or CPU-policy request fails rather
-than replacing an already initialized engine. Policy disagreement reports the
-stable `embedding_backend_policy_mismatch` reason code in either direction.
+The embedding server is per-user, while manifests and artifacts are
+project-local. Its endpoint namespace is independent of project and cache
+roots. A compatible client joins the existing authority. An incompatible idle
+server drains before replacement; active work or leases return typed retry
+state. Clients never choose another endpoint, kill a remembered PID, or fall
+back to an in-process engine.
 
 Retrieval finalization holds an embedding residency lease across candidate
 build, validation, and publication. Manifest compatibility uses the stable
@@ -76,7 +79,7 @@ a live publication fence and is not persisted as vector compatibility.
 - `retrieval_mode=full` is treated as live engine proof;
 - deep row validation runs on every query;
 - cleanup recurses from a previously validated pathname;
-- a project silently reconfigures the process-wide engine.
+- a project silently reconfigures or bypasses the per-user server.
 
 See [retrieval design](../retrieval-design.md) and
 [retrieval verification](../../testing/retrieval-architecture.md).

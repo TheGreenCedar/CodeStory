@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "f9b07bfa384078571a8035e64d51879709025cd3f7db443bfeabaab82d419d0c",
+  "candidate_sha256": "3846bfb2d6a43d0f9b72908573845d844ad7b72bf207f808939fe721bc533856",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -16,8 +16,8 @@
     },
     {
       "path": "candidate-packet.json",
-      "sha256": "36a58d73c707aa938169edee01cfe49e0a723144be9696f22adbe073a3ab593d",
-      "bytes": 5324
+      "sha256": "7f519e5d3c2d69aca7d29872ccff103d12cccd863e81f3ddad6615f94a1fe031",
+      "bytes": 5515
     }
   ],
   "release_claim_evaluation": {

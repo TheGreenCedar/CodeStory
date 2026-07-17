@@ -45,9 +45,10 @@ before drawing conclusions:
 | Semantic embedding | Embedding backend wall time, batch/request shape, and request concurrency setting. |
 | Semantic persistence | Semantic-doc upsert, reload, prune, reuse, pending, embedded, and stale counts. |
 
-The in-process batching contract is fixed for product comparisons. Profile
-batch internals only after the baseline shows engine saturation rather than
-graph/store contention, and do not promote a runtime tuning switch.
+The shared embedding-server scheduling and batching contract is fixed for
+product comparisons. Profile batch internals only after the baseline shows
+engine saturation rather than graph/store contention, and do not promote a
+runtime tuning switch.
 
 Do not collapse these into one "index got faster/slower" claim unless the
 repo-scale e2e row shows the same project, cache state, semantic backend, and

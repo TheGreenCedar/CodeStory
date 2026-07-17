@@ -29,9 +29,10 @@ requires query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, holds the core read and generation leases, and
 revalidates before returning. Publication drift permits one bounded retry.
 
-The process-wide engine belongs to retrieval/llama-sys. Runtime may cause its
-lazy initialization, but cannot reconfigure it per project or infer readiness
-from `retrieval_mode` alone.
+The per-user engine authority belongs to retrieval/llama-sys and runs in the
+automatically managed embedding server. Runtime may cause lazy server and
+engine activation and hold publication leases, but cannot reconfigure the
+engine per project or infer readiness from `retrieval_mode` alone.
 
 ## Extension rules
 
@@ -45,4 +46,4 @@ from `retrieval_mode` alone.
 - CLI or MCP adapter composes product semantics;
 - candidate IDs resolve against whatever core database is current;
 - core indexing success is reported as full retrieval readiness;
-- a project operation mutates process-wide defaults.
+- a project operation mutates per-user server or process defaults.
