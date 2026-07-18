@@ -537,7 +537,7 @@ function normalizeCodestoryProjectManifest(filePath, value) {
     throw new Error(`Task manifest codestory_project_manifest.path must be relative: ${filePath}`);
   }
   const sourcePath = assertPathInside(
-    repoRoot,
+    path.dirname(filePath),
     path.resolve(path.dirname(filePath), declaredPath),
     "Task manifest codestory_project_manifest.path",
   );
@@ -1247,6 +1247,28 @@ async function installCodestoryProjectManifest(config, checkoutPath, opts) {
   };
 }
 
+async function scrubMaterializedCheckout(config, checkoutPath, opts) {
+  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+    timeoutMs: opts.timeoutMs,
+  });
+  await runCheckedProcess("git", ["-C", checkoutPath, "clean", "-ffdqx"], {
+    timeoutMs: opts.timeoutMs,
+  });
+  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, opts.timeoutMs)).toLowerCase();
+  if (head !== String(config.ref).toLowerCase()) {
+    throw new Error(`Materialized repo ${config.name} HEAD ${head} does not match pinned ref ${config.ref}`);
+  }
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  if (dirty) {
+    throw new Error(`Materialized repo ${config.name} is dirty after scrub: ${dirty}`);
+  }
+  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, opts.timeoutMs);
+  if (remaining) {
+    throw new Error(`Materialized repo ${config.name} retains untracked or ignored files after scrub: ${remaining}`);
+  }
+  config.installed_codestory_project_manifest = null;
+}
+
 async function materializeRepos(tasks, opts) {
   const repos = uniqueTaskRepos(tasks);
   if (!repos.size) {
@@ -1280,6 +1302,7 @@ async function materializeRepos(tasks, opts) {
     await runCheckedProcess("git", ["-C", checkoutPath, "checkout", "--detach", "FETCH_HEAD"], {
       timeoutMs: opts.timeoutMs,
     });
+    await scrubMaterializedCheckout(config, checkoutPath, opts);
     if (!existsSync(config.path)) {
       throw new Error(`Materialized repo ${name} is missing workspace path: ${config.path}`);
     }

@@ -1,6 +1,9 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -17,6 +20,7 @@ import {
   loadTaskForResult,
   loadTasks,
   manifestRepoMaterializationBlockers,
+  materializeRepos,
   MAX_REUSED_ARTIFACT_BYTES,
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
@@ -252,6 +256,12 @@ async function withManifestFile(manifest, callback) {
   }
 }
 
+function gitFixture(args, cwd) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
   assert.equal(commandCategory('"$CODESTORY_CLI" index --project . --refresh full'), "codestory_cli");
@@ -379,6 +389,82 @@ test("rejects manifest repo and workspace paths outside the cache", async () => 
       );
     },
   );
+
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "https://example.com/fixture.git",
+        ref: "main",
+        workspace_root: ".",
+        codestory_project_manifest: {
+          path: "../../outside.json",
+          sha256: "0".repeat(64),
+        },
+      },
+    }),
+    async (manifestPath, dir) => {
+      await assert.rejects(
+        () => loadTasks({ taskManifest: manifestPath, taskSuite: null, taskIds: null, repoCacheDir: path.join(dir, "repos") }),
+        /codestory_project_manifest\.path must stay inside/,
+      );
+    },
+  );
+});
+
+test("materialization scrubs reusable checkouts before installing the bound project manifest", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-materialized-project-"));
+  try {
+    const source = path.join(dir, "source");
+    const origin = path.join(dir, "origin.git");
+    const repoCacheDir = path.join(dir, "cache");
+    const templatePath = path.join(dir, "project.json");
+    const template = '{"name":"fixture","version":1,"source_groups":[]}\n';
+    await mkdir(source, { recursive: true });
+    gitFixture(["init", "-q"], source);
+    gitFixture(["config", "user.email", "fixture@example.invalid"], source);
+    gitFixture(["config", "user.name", "Fixture"], source);
+    await writeFile(path.join(source, "lib.rs"), "fn main() {}\n");
+    gitFixture(["add", "lib.rs"], source);
+    gitFixture(["commit", "-qm", "fixture"], source);
+    const ref = gitFixture(["rev-parse", "HEAD"], source);
+    gitFixture(["clone", "--bare", source, origin], dir);
+    await writeFile(templatePath, template, "utf8");
+    const manifestPath = path.join(dir, "fixture.task.json");
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify(manifestFixture({
+        repo: {
+          name: "scrub-fixture",
+          url: origin,
+          ref,
+          workspace_root: ".",
+          codestory_project_manifest: {
+            path: "project.json",
+            sha256: createHash("sha256").update(template).digest("hex"),
+          },
+        },
+      }), null, 2)}\n`,
+      "utf8",
+    );
+    const opts = { taskManifest: manifestPath, taskSuite: null, taskIds: null, repoCacheDir, timeoutMs: 10_000 };
+    const tasks = await loadTasks(opts);
+    await materializeRepos(tasks, opts);
+    const checkout = path.join(repoCacheDir, "scrub-fixture");
+    await writeFile(path.join(checkout, "untracked-source.rs"), "fn stale() {}\n");
+    await writeFile(path.join(checkout, ".git", "info", "exclude"), "/ignored-source.rs\n", "utf8");
+    await writeFile(path.join(checkout, "ignored-source.rs"), "fn stale_ignored() {}\n");
+
+    await materializeRepos(tasks, opts);
+
+    assert.equal(existsSync(path.join(checkout, "untracked-source.rs")), false);
+    assert.equal(existsSync(path.join(checkout, "ignored-source.rs")), false);
+    assert.equal(await readFile(path.join(checkout, "codestory_project.json"), "utf8"), template);
+    assert.equal(gitFixture(["status", "--porcelain"], checkout), "");
+    assert.equal(gitFixture(["rev-parse", "HEAD"], checkout), ref);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("packet-first command renders manifest text for host shells", () => {
