@@ -13,8 +13,8 @@
 
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{
-    AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind,
-    Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
+    AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
+    NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
 use codestory_store::Store as Storage;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1641,6 +1641,7 @@ impl WorkspaceIndexer {
                                 column: None,
                                 is_fatal: false,
                                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
                             },
                         );
                         Err(local_storage)
@@ -1665,6 +1666,7 @@ impl WorkspaceIndexer {
                                 column: None,
                                 is_fatal: false,
                                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
                             },
                         );
                         Err(local_storage)
@@ -1689,6 +1691,7 @@ impl WorkspaceIndexer {
                                 column: None,
                                 is_fatal: false,
                                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
                             },
                         );
                         Err(local_storage)
@@ -1712,6 +1715,7 @@ impl WorkspaceIndexer {
                         column: None,
                         is_fatal: true,
                         index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
                     },
                 );
                 return Err(local_storage);
@@ -1732,6 +1736,7 @@ impl WorkspaceIndexer {
                     column: None,
                     is_fatal: false,
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
                 },
             );
             return Err(local_storage);
@@ -1751,6 +1756,7 @@ impl WorkspaceIndexer {
                         column: None,
                         is_fatal: true,
                         index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
                     },
                 );
                 return Err(local_storage);
@@ -1841,6 +1847,7 @@ impl WorkspaceIndexer {
                                 column: None,
                                 is_fatal: false,
                                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
                             });
                             return Err(local_storage);
                         }
@@ -1859,6 +1866,7 @@ impl WorkspaceIndexer {
                                 column: None,
                                 is_fatal: false,
                                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
                             });
                             return Err(local_storage);
                         }
@@ -1942,6 +1950,7 @@ impl WorkspaceIndexer {
                         column: None,
                         is_fatal: true,
                         index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
                     },
                 );
                 return Err(local_storage);
@@ -1959,6 +1968,7 @@ impl WorkspaceIndexer {
                     column: None,
                     is_fatal: false,
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
                 },
             )
         })
@@ -2036,6 +2046,7 @@ impl WorkspaceIndexer {
                         column: None,
                         is_fatal: false,
                         index_step: codestory_contracts::graph::IndexStep::Indexing,
+                        coverage_reason: Some(FileCoverageReason::CollectorFailure),
                     },
                 );
                 if let Some(file_info) = local_storage.files.first_mut() {
@@ -2126,6 +2137,7 @@ fn changed_source_storage(
             column: None,
             is_fatal: false,
             index_step: codestory_contracts::graph::IndexStep::Indexing,
+            coverage_reason: Some(FileCoverageReason::SourceChanged),
         },
     )
 }
@@ -20402,6 +20414,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert!(storage.get_errors(None)?.iter().any(|error| {
             error.file_id == Some(NodeId(file.id))
                 && error.message.contains("Skipped oversized source file")
+                && error.coverage_reason == Some(FileCoverageReason::Oversized)
         }));
         Ok(())
     }
@@ -20433,6 +20446,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert!(result.local_storage.errors.iter().any(|error| {
             error.message.contains("Source changed while indexing")
                 && error.message.contains("retry required")
+                && error.coverage_reason == Some(FileCoverageReason::SourceChanged)
         }));
         assert!(
             result
@@ -20469,6 +20483,10 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(rejected.files.len(), 1);
         assert!(!rejected.files[0].complete);
         assert!(rejected.errors[0].message.contains("retry required"));
+        assert_eq!(
+            rejected.errors[0].coverage_reason,
+            Some(FileCoverageReason::SourceChanged)
+        );
         Ok(())
     }
 
@@ -20575,6 +20593,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let error = &errors[0];
         assert_eq!(error.file_id, Some(NodeId(oversized_file.id)));
         assert!(!error.is_fatal, "oversized skip should be nonfatal");
+        assert_eq!(error.coverage_reason, Some(FileCoverageReason::Oversized));
         assert!(
             error.message.contains("Skipped oversized source file"),
             "unexpected oversized error: {}",

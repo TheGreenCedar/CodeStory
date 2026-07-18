@@ -21,6 +21,14 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
 | Development comparison | A reused-baseline or local-real artifact informs tuning and diagnosis. | Fresh publishable promotion proof. |
 
+A parser-backed file can be publishable even when the selected grammar reports
+a partial tree. Runtime treats it as `parser_partial` only when the indexed bytes
+have a verified content hash, the file carries no file-level error, and storage
+does not require a retry. That row remains `complete=false` so diagnostics do
+not overstate parser coverage, but it does not block an otherwise atomic core
+publication. Unreadable, oversized, changed, incompletely discovered, or
+collector-failed source remains a publication blocker.
+
 ## Current Runtime Claims
 
 | Runtime claim | Languages | Evidence floor | Safe claim |

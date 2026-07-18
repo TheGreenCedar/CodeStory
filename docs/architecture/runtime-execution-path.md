@@ -59,6 +59,14 @@ agent activation or an explicit retrieval index operation may next finalize
 lexical, vector, and SCIP artifacts against that core publication. See the
 [indexing pipeline](indexing-pipeline.md).
 
+Managed activation enters through the summary-only core reader. It does not
+require the derived search generation that activation may need to repair. Once
+core freshness and the dense-anchor publication are coherent, runtime takes the
+project writer and search-generation locks, validates the generation against
+the exact core publication, rebuilds missing or corrupt search state, and
+publishes its completion marker last. The normal project reader remains
+fail-closed and never performs this repair.
+
 ## Broad retrieval read
 
 ```mermaid
@@ -109,6 +117,9 @@ usable, but their output must not be presented as a full packet/search result.
 - status and diagnostics never activate managed work;
 - project switching never rereads ambient process defaults;
 - core success never implies retrieval publication success;
+- internally repairable writer contention or publication drift returns a
+  stable `preparing` operation with a same-tool retry instead of terminal
+  unavailability;
 - stale, partial, ambiguous, non-`full`, or engine-mismatched broad evidence
   fails closed;
 - CLI rendering does not reimplement runtime orchestration.

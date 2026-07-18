@@ -1,6 +1,6 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{
-    AccessKind, EdgeKind, NodeId, NodeKind, OccurrenceKind, ResolutionCertainty,
+    AccessKind, EdgeKind, FileCoverageReason, NodeId, NodeKind, OccurrenceKind, ResolutionCertainty,
 };
 use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
@@ -135,6 +135,10 @@ fn test_failed_file_attempt_is_recorded_as_incomplete_with_attached_error() -> a
     let errors = storage.get_errors(None)?;
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].file_id, Some(NodeId(file.id)));
+    assert_eq!(
+        errors[0].coverage_reason,
+        Some(FileCoverageReason::Unreadable)
+    );
 
     run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
 
@@ -145,6 +149,10 @@ fn test_failed_file_attempt_is_recorded_as_incomplete_with_attached_error() -> a
         "reindexing the same failed file should replace, not duplicate, its error"
     );
     assert_eq!(errors[0].file_id, Some(NodeId(file.id)));
+    assert_eq!(
+        errors[0].coverage_reason,
+        Some(FileCoverageReason::Unreadable)
+    );
 
     fs::remove_dir(&file_path)?;
     fs::write(&file_path, "function broken( {\n")?;
@@ -164,6 +172,26 @@ fn test_failed_file_attempt_is_recorded_as_incomplete_with_attached_error() -> a
     );
     let inventory = storage.files().inventory()?;
     assert!(!inventory[0].retry_required);
+
+    Ok(())
+}
+
+#[test]
+fn test_template_collector_failure_records_typed_coverage_reason() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("broken.svelte");
+    fs::create_dir(&file_path)?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path])?;
+
+    let errors = storage.get_errors(None)?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].coverage_reason,
+        Some(FileCoverageReason::CollectorFailure)
+    );
 
     Ok(())
 }

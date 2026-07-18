@@ -21,8 +21,8 @@ fn file_role_classification_ignores_materialized_repo_cache_prefix() {
     );
 }
 use codestory_contracts::graph::{
-    AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
-    ResolutionCertainty, SourceLocation, TrailConfig, TrailDirection,
+    AccessKind, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId, NodeKind, Occurrence,
+    OccurrenceKind, ResolutionCertainty, SourceLocation, TrailConfig, TrailDirection,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1990,6 +1990,7 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
         column: Some(1),
         is_fatal: false,
         index_step: codestory_contracts::graph::IndexStep::Indexing,
+        coverage_reason: None,
     })?;
     storage.conn.execute(
         "INSERT INTO local_symbol (id, name, file_id) VALUES (?1, ?2, ?3)",
@@ -2625,6 +2626,42 @@ fn schema_24_adds_atomic_retrieval_rollback_without_losing_current() -> Result<(
         storage.get_retrieval_index_publication("proj")?,
         Some((current, None))
     );
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    Ok(())
+}
+
+#[test]
+fn schema_26_adds_nullable_error_coverage_reason_idempotently() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v26-error-coverage-reason-migration");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let storage = Storage::open(&db_path)?;
+        storage.conn.execute(
+            "INSERT INTO error (message, fatal, indexed) VALUES ('legacy error', 0, 1)",
+            [],
+        )?;
+        storage
+            .conn
+            .execute("ALTER TABLE error DROP COLUMN coverage_reason", [])?;
+        storage.set_schema_version(25)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(error)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(columns.iter().any(|column| column == "coverage_reason"));
+    let errors = storage.get_errors(None)?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].coverage_reason, None);
+
+    schema::migrate_v26_error_coverage_reason(&storage.conn)?;
+    schema::migrate_v26_error_coverage_reason(&storage.conn)?;
+
     drop(storage);
     let _ = cleanup_sqlite_sidecars(&db_path);
     Ok(())
@@ -3416,7 +3453,7 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
 }
 
 #[test]
-fn test_error_storage() -> Result<(), StorageError> {
+fn test_error_storage_round_trips_coverage_reason() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let info = FileInfo {
         id: 1,
@@ -3436,6 +3473,7 @@ fn test_error_storage() -> Result<(), StorageError> {
         column: Some(5),
         is_fatal: true,
         index_step: codestory_contracts::graph::IndexStep::Indexing,
+        coverage_reason: Some(FileCoverageReason::CollectorFailure),
     };
     storage.insert_error(&error)?;
     storage.insert_error(&codestory_contracts::graph::ErrorInfo {
@@ -3445,10 +3483,25 @@ fn test_error_storage() -> Result<(), StorageError> {
         column: Some(1),
         is_fatal: false,
         index_step: codestory_contracts::graph::IndexStep::Indexing,
+        coverage_reason: None,
     })?;
     let stats = storage.get_stats()?;
     assert_eq!(stats.error_count, 2);
     assert_eq!(stats.fatal_error_count, 1);
+    let errors = storage.get_errors(None)?;
+    let syntax_error = errors
+        .iter()
+        .find(|error| error.message == "Syntax error")
+        .expect("syntax error");
+    let warning = errors
+        .iter()
+        .find(|error| error.message == "Recoverable parse warning")
+        .expect("recoverable warning");
+    assert_eq!(
+        syntax_error.coverage_reason,
+        Some(FileCoverageReason::CollectorFailure)
+    );
+    assert_eq!(warning.coverage_reason, None);
     storage.refresh_grounding_summary_snapshots()?;
     assert!(storage.has_ready_grounding_summary_snapshots()?);
     let snapshot_stats = storage.get_stats()?;
@@ -3541,6 +3594,7 @@ fn test_delete_file_projection() -> Result<(), StorageError> {
         column: None,
         is_fatal: false,
         index_step: codestory_contracts::graph::IndexStep::Indexing,
+        coverage_reason: None,
     })?;
     storage.upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
         node_id: func_node.id,
@@ -3844,6 +3898,7 @@ fn test_get_errors() -> Result<(), StorageError> {
         column: None,
         is_fatal: true,
         index_step: codestory_contracts::graph::IndexStep::Indexing,
+        coverage_reason: Some(FileCoverageReason::SourceChanged),
     })?;
     storage.insert_error(&codestory_contracts::graph::ErrorInfo {
         message: "Warning".to_string(),
@@ -3852,11 +3907,25 @@ fn test_get_errors() -> Result<(), StorageError> {
         column: None,
         is_fatal: false,
         index_step: codestory_contracts::graph::IndexStep::Collection,
+        coverage_reason: None,
     })?;
 
     // Get all errors
     let errors = storage.get_errors(None)?;
     assert_eq!(errors.len(), 2);
+    let fatal = errors
+        .iter()
+        .find(|error| error.message == "Fatal error")
+        .expect("fatal error");
+    let warning = errors
+        .iter()
+        .find(|error| error.message == "Warning")
+        .expect("warning");
+    assert_eq!(
+        fatal.coverage_reason,
+        Some(FileCoverageReason::SourceChanged)
+    );
+    assert_eq!(warning.coverage_reason, None);
 
     // Get fatal errors only
     let filter = codestory_contracts::graph::ErrorFilter {

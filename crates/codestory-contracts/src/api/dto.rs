@@ -3,6 +3,7 @@ use super::types::{
     EdgeKind, IndexMode, LayoutDirection, MemberAccess, NodeKind, TrailCallerScope, TrailDirection,
     TrailMode,
 };
+use crate::graph::FileCoverageReason;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -967,6 +968,19 @@ pub struct IndexedFileDto {
     pub error_count: u32,
 }
 
+/// One file-level coverage limitation or source-integrity failure.
+///
+/// Parser-partial entries may retain verified source and a usable projection;
+/// source-integrity failures remain publication blockers.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct FileCoverageDiagnosticDto {
+    pub path: String,
+    pub reason: FileCoverageReason,
+    pub retryable: bool,
+    pub verified_source: bool,
+    pub projection_available: bool,
+}
+
 /// Per-language file count and support claim shown in indexed-file summaries.
 ///
 /// `support_mode` and `evidence_tier` are product evidence from
@@ -1012,6 +1026,8 @@ pub struct IndexedFilesDto {
     pub project_root: String,
     pub usable: bool,
     pub summary: IndexedFilesSummaryDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
     pub files: Vec<IndexedFileDto>,
 }
 

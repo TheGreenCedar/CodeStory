@@ -1,7 +1,7 @@
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
-    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, BookmarkCategoryDto,
-    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ApiErrorDetails,
+    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto, EmbeddingVectorPublicationIdentityDto,
     GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessStatusDto, IndexMode,
     IndexPublicationDto, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
@@ -85,6 +85,7 @@ pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> 
 pub enum ActivationStage {
     Discovery,
     CoreFreshness,
+    SearchPreparation,
     DensePreparation,
     Validation,
     Publication,
@@ -128,7 +129,11 @@ pub struct ActivationSnapshot {
     pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_retry: Option<EmbeddingRetryStateDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
     pub failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_details: Option<Box<ApiErrorDetails>>,
     pub capabilities: ActivationCapabilities,
 }
 
@@ -381,6 +386,8 @@ impl ActivationService {
             {
                 snapshot.attempt += 1;
                 snapshot.failure = None;
+                snapshot.failure_code = None;
+                snapshot.failure_details = None;
                 snapshot.embedding_capacity = None;
                 snapshot.embedding_retry = None;
                 snapshot.retry_after_ms = Some(250);
@@ -388,8 +395,14 @@ impl ActivationService {
                 snapshot.stage = ActivationStage::Discovery;
                 snapshot.operation_id.clone()
             } else {
+                let project_scope = target
+                    .project_id
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .take(12)
+                    .collect::<String>();
                 let operation_id = format!(
-                    "activation-{}",
+                    "activation-{project_scope}-{}",
                     self.coordinator.next_id.fetch_add(1, Ordering::Relaxed) + 1
                 );
                 state.current = Some(ActivationSnapshot {
@@ -400,7 +413,9 @@ impl ActivationService {
                     retry_after_ms: Some(250),
                     embedding_capacity: None,
                     embedding_retry: None,
+                    failure_code: None,
                     failure: None,
+                    failure_details: None,
                     capabilities: ActivationCapabilities {
                         local_navigation: ActivationCapabilityState::Unavailable,
                         broad_search: ActivationCapabilityState::Unavailable,
@@ -425,9 +440,10 @@ impl ActivationService {
             if let Err(error) = std::thread::Builder::new()
                 .name(format!("codestory-{operation_id}"))
                 .spawn(move || {
+                    let attempt = worker_operation.attempt();
                     let result = worker_service
                         .activate_once(&worker_operation, worker_project_root, worker_storage_path)
-                        .map_err(classify_activation_api_error);
+                        .map_err(|error| classify_activation_api_error_for_attempt(error, attempt));
                     worker_operation.finish(result.as_ref().err());
                 })
             {
@@ -542,11 +558,14 @@ impl ActivationService {
         operation.ensure_not_cancelled("project discovery")?;
         let mut summary = self
             .controller
-            .open_project_with_storage_path(project_root.clone(), storage_path.clone())?;
+            .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
 
         operation.set_stage(ActivationStage::CoreFreshness);
         let core_stale = summary.publication.is_none()
             || summary.stats.node_count == 0
+            || self
+                .controller
+                .complete_core_requires_dense_anchor_repair(&storage_path)?
             || summary
                 .freshness
                 .as_ref()
@@ -561,13 +580,17 @@ impl ActivationService {
             self.controller
                 .run_indexing_blocking_with_cancel(mode, &token)?;
             operation.ensure_not_cancelled("core publication validation")?;
-            summary = self
-                .controller
-                .open_project_with_storage_path(project_root.clone(), storage_path.clone())?;
+            summary = self.controller.open_project_summary_with_storage_path(
+                project_root.clone(),
+                storage_path.clone(),
+            )?;
         }
         let local_ready = summary.publication.is_some()
             && summary.stats.node_count > 0
             && summary.stats.fatal_error_count == 0
+            && !self
+                .controller
+                .complete_core_requires_dense_anchor_repair(&storage_path)?
             && summary
                 .freshness
                 .as_ref()
@@ -579,6 +602,12 @@ impl ActivationService {
             ));
         }
         operation.set_capability(false, ActivationCapabilityState::Ready);
+
+        operation.ensure_not_cancelled("search preparation")?;
+        operation.set_stage(ActivationStage::SearchPreparation);
+        let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
+        self.controller
+            .prepare_search_state_for_activation(&token)?;
 
         operation.ensure_not_cancelled("dense preparation")?;
         operation.set_stage(ActivationStage::DensePreparation);
@@ -629,16 +658,23 @@ fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
     let code = match snapshot.state {
         ActivationState::Cancelled => "cancelled",
         ActivationState::Retryable => "activation_retryable",
-        _ => "project_unavailable",
+        _ => snapshot
+            .failure_code
+            .as_deref()
+            .unwrap_or("project_unavailable"),
     };
-    activation_api_error(
+    let mut error = activation_api_error(
         code,
         snapshot.failure.clone().unwrap_or_else(|| {
             "project activation did not provide the requested capability".into()
         }),
         snapshot.embedding_retry.clone(),
         snapshot.embedding_capacity.clone(),
-    )
+    );
+    if let Some(details) = snapshot.failure_details.as_ref() {
+        error.details = Some(details.clone());
+    }
+    error
 }
 
 fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
@@ -660,41 +696,64 @@ fn map_activation_error(error: anyhow::Error) -> ApiError {
     if let Some(error) = embedding_api_error(&error) {
         return classify_activation_api_error(error);
     }
+    if codestory_retrieval::is_retrieval_index_cancelled(&error) {
+        return ApiError::new("cancelled", error.to_string());
+    }
+    if codestory_retrieval::is_retrieval_publication_changed(&error)
+        || codestory_retrieval::is_sidecar_input_changed(&error)
+    {
+        return classify_activation_api_error(ApiError::new(
+            "publication_changed",
+            error.to_string(),
+        ));
+    }
     classify_activation_api_error(ApiError::new("project_unavailable", error.to_string()))
 }
 
 fn classify_activation_api_error(mut error: ApiError) -> ApiError {
-    if matches!(
-        error.code.as_str(),
-        "embedding_capacity" | "embedding_retryable"
-    ) {
-        error.code = "activation_retryable".into();
+    match error.code.as_str() {
+        "embedding_capacity"
+        | "embedding_retryable"
+        | "cache_busy"
+        | "publication_changed"
+        | "source_changed" => {
+            let cause_code = error.code.clone();
+            match error.details.as_mut() {
+                Some(details) => {
+                    details.cause_code.get_or_insert(cause_code);
+                }
+                None => {
+                    error.details = Some(Box::new(ApiErrorDetails::cause(cause_code)));
+                }
+            }
+            error.code = "activation_retryable".into();
+            error
+        }
+        "cancelled" | "activation_preparing" | "activation_retryable" => error,
+        "source_unreadable"
+        | "source_oversized"
+        | "source_discovery_incomplete"
+        | "source_collector_failure"
+        | "source_verification_failed" => error,
+        _ => {
+            error.code = "project_unavailable".into();
+            error
+        }
+    }
+}
+
+fn classify_activation_api_error_for_attempt(mut error: ApiError, attempt: u32) -> ApiError {
+    if error.code == "source_changed" && attempt > 1 {
+        if let Some(details) = error.details.as_mut() {
+            for gap in &mut details.coverage_gaps {
+                if gap.reason == codestory_contracts::graph::FileCoverageReason::SourceChanged {
+                    gap.retryable = false;
+                }
+            }
+        }
         return error;
     }
-    if matches!(
-        error.code.as_str(),
-        "cancelled" | "activation_preparing" | "activation_retryable"
-    ) {
-        return error;
-    }
-    let normalized = error.message.to_ascii_lowercase();
-    if normalized.contains("cancel") {
-        ApiError::new("cancelled", error.message)
-    } else if [
-        "cache_busy",
-        "database is locked",
-        "database table is locked",
-        "writer lock",
-        "publication changed",
-        "input changed",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        ApiError::new("activation_retryable", error.message)
-    } else {
-        ApiError::new("project_unavailable", error.message)
-    }
+    classify_activation_api_error(error)
 }
 
 fn activation_api_error(
@@ -720,10 +779,13 @@ pub fn embedding_api_error(error: &anyhow::Error) -> Option<ApiError> {
 
 fn embedding_retry_api_error(retry: codestory_retrieval::EmbeddingRetryStateWire) -> ApiError {
     let capacity = retry.capacity.map(embedding_capacity_dto);
+    let cause_code = retry.code.clone();
     let public_code = if retry.code.contains("cancelled") {
         "cancelled"
     } else if capacity.is_some() {
         "embedding_capacity"
+    } else if retry.code == "native_model_not_embedded" {
+        "project_unavailable"
     } else if matches!(
         retry.retry_class.as_str(),
         "after_capacity_change"
@@ -736,7 +798,7 @@ fn embedding_retry_api_error(retry: codestory_retrieval::EmbeddingRetryStateWire
     } else {
         "project_unavailable"
     };
-    ApiError::embedding_retry(
+    let mut error = ApiError::embedding_retry(
         public_code,
         retry.message,
         EmbeddingRetryStateDto {
@@ -746,7 +808,13 @@ fn embedding_retry_api_error(retry: codestory_retrieval::EmbeddingRetryStateWire
             retry_condition: retry.retry_condition,
             capacity,
         },
-    )
+    );
+    if public_code == "project_unavailable"
+        && let Some(details) = error.details.as_mut()
+    {
+        details.cause_code = Some(cause_code);
+    }
+    error
 }
 
 fn embedding_capacity_dto(
@@ -993,6 +1061,18 @@ impl PublicOperationService {
 }
 
 impl ActivationOperation {
+    fn attempt(&self) -> u32 {
+        self.service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned")
+            .current
+            .as_ref()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+            .map_or(1, |snapshot| snapshot.attempt)
+    }
+
     pub fn ensure_not_cancelled(&self, boundary: &str) -> Result<(), ApiError> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(ApiError::new(
@@ -1083,6 +1163,8 @@ impl ActivationOperation {
                 .details
                 .as_deref()
                 .and_then(|details| details.embedding_retry.clone());
+            snapshot.failure_code = Some(error.code.clone());
+            snapshot.failure_details = error.details.clone();
             snapshot.retry_after_ms =
                 (capability == ActivationCapabilityState::Retryable).then(|| {
                     snapshot.embedding_retry.as_ref().map_or_else(
@@ -1634,6 +1716,132 @@ mod activation_tests {
     }
 
     #[test]
+    fn activation_repairs_complete_core_without_a_search_generation() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "// migrated core fixture\n",
+        )
+        .expect("write fixture");
+
+        let seeding_runtime = Runtime::new();
+        seeding_runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        seeding_runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let publication = Store::database_index_publication(&storage_path)
+            .expect("read core publication")
+            .expect("complete core publication");
+        let search_path =
+            crate::search_index_path_for_publication(&storage_path, Some(&publication))
+                .expect("search generation path");
+        fs::remove_dir_all(&search_path).expect("remove completed search generation");
+
+        let runtime = Runtime::new();
+        let error = runtime
+            .activation_service()
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("the unit-test runtime has no managed embedding server");
+
+        assert_eq!(error.code, "project_unavailable");
+        let snapshot = runtime.activation_service().snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready
+        );
+        assert!(
+            crate::read_search_generation_completion(&search_path, &publication.generation_id,)
+                .is_some(),
+            "activation must publish a completion marker for the repaired generation"
+        );
+        runtime
+            .project_service()
+            .open_project_with_storage_path(project.path().to_path_buf(), storage_path)
+            .expect("the strict reader must admit the repaired generation");
+    }
+
+    #[test]
+    fn activation_republishes_a_migrated_core_missing_dense_and_search_state() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "// migrated core fixture\n",
+        )
+        .expect("write fixture");
+
+        let seeding_runtime = Runtime::new();
+        seeding_runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        seeding_runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let previous = Store::database_index_publication(&storage_path)
+            .expect("read core publication")
+            .expect("complete core publication");
+        let previous_search =
+            crate::search_index_path_for_publication(&storage_path, Some(&previous))
+                .expect("search generation path");
+        fs::remove_dir_all(previous_search).expect("remove completed search generation");
+        Store::open(&storage_path)
+            .expect("open migrated core")
+            .get_connection()
+            .execute("DELETE FROM dense_anchor_publication", [])
+            .expect("remove dense-anchor publication marker");
+
+        let runtime = Runtime::new();
+        runtime
+            .activation_service()
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("the unit-test runtime has no managed embedding server");
+
+        let current = Store::database_index_publication(&storage_path)
+            .expect("read repaired publication")
+            .expect("repaired complete publication");
+        assert_eq!(current.generation, previous.generation + 1);
+        assert_eq!(
+            current.mode,
+            codestory_store::IndexPublicationMode::Incremental
+        );
+        let current_search =
+            crate::search_index_path_for_publication(&storage_path, Some(&current))
+                .expect("repaired search generation path");
+        assert!(
+            crate::read_search_generation_completion(&current_search, &current.generation_id)
+                .is_some(),
+            "incremental migration must publish the exact new search generation"
+        );
+        let storage = Store::open_read_only(&storage_path).expect("open repaired core");
+        storage
+            .validate_dense_anchor_publication(&current)
+            .expect("incremental migration must republish dense anchors");
+    }
+
+    #[test]
     fn activation_state_is_not_reused_across_project_targets() {
         let project_a = tempfile::tempdir().expect("project a");
         let project_b = tempfile::tempdir().expect("project b");
@@ -1667,6 +1875,75 @@ mod activation_tests {
             second.state,
             ActivationState::Preparing | ActivationState::Updating
         ));
+    }
+
+    #[test]
+    fn concurrent_cold_projects_keep_independent_activation_operations() {
+        let projects = (0..3)
+            .map(|index| {
+                let project = tempfile::tempdir().expect("project");
+                fs::write(
+                    project.path().join(format!("fixture-{index}.rs")),
+                    format!("pub fn project_{index}() {{}}\n"),
+                )
+                .expect("write project fixture");
+                project
+            })
+            .collect::<Vec<_>>();
+        let caches = (0..3)
+            .map(|_| tempfile::tempdir().expect("cache"))
+            .collect::<Vec<_>>();
+        let runtimes = (0..3).map(|_| Runtime::new()).collect::<Vec<_>>();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let workers = (0..3)
+            .map(|index| {
+                let runtime = runtimes[index].clone();
+                let project_root = projects[index].path().to_path_buf();
+                let storage_path = caches[index].path().join("codestory.db");
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let _ = runtime
+                        .activation_service()
+                        .activate_project_with_foreground_budget(
+                            &project_root,
+                            &storage_path,
+                            Arc::new(AtomicBool::new(false)),
+                            Duration::ZERO,
+                        );
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("join cold activation");
+        }
+
+        let operation_ids = runtimes
+            .iter()
+            .map(|runtime| {
+                runtime
+                    .activation_service()
+                    .snapshot()
+                    .expect("activation snapshot")
+                    .operation_id
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(operation_ids.len(), 3);
+
+        runtimes[0].activation_service().cancel_and_wait();
+        for runtime in runtimes.iter().skip(1) {
+            assert_ne!(
+                runtime
+                    .activation_service()
+                    .snapshot()
+                    .expect("independent activation snapshot")
+                    .state,
+                ActivationState::Cancelled,
+                "cancelling one project must not cancel another project"
+            );
+            runtime.activation_service().cancel_and_wait();
+        }
     }
 
     #[test]
@@ -1892,6 +2169,142 @@ mod activation_tests {
     }
 
     #[test]
+    fn activation_classification_uses_codes_instead_of_message_text() {
+        let diagnostic = codestory_contracts::api::FileCoverageDiagnosticDto {
+            path: "src/lib.rs".to_string(),
+            reason: codestory_contracts::graph::FileCoverageReason::SourceChanged,
+            retryable: true,
+            verified_source: false,
+            projection_available: false,
+        };
+        let retryable = classify_activation_api_error(ApiError::with_details(
+            "cache_busy",
+            "another writer owns the project cache",
+            codestory_contracts::api::ApiErrorDetails::source_coverage(vec![diagnostic.clone()]),
+        ));
+        assert_eq!(retryable.code, "activation_retryable");
+        assert_eq!(
+            retryable
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("cache_busy")
+        );
+        assert_eq!(
+            retryable
+                .details
+                .as_ref()
+                .map(|details| details.coverage_gaps.as_slice()),
+            Some([diagnostic].as_slice())
+        );
+
+        let drift = classify_activation_api_error(ApiError::new(
+            "publication_changed",
+            "the core identity changed during promotion",
+        ));
+        assert_eq!(drift.code, "activation_retryable");
+        assert_eq!(
+            drift
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("publication_changed")
+        );
+
+        let persistent_source_drift = classify_activation_api_error_for_attempt(
+            ApiError::source_coverage_failure(
+                "source_changed",
+                "source changed again while indexing",
+                vec![codestory_contracts::api::FileCoverageDiagnosticDto {
+                    path: "src/lib.rs".to_string(),
+                    reason: codestory_contracts::graph::FileCoverageReason::SourceChanged,
+                    retryable: true,
+                    verified_source: false,
+                    projection_available: false,
+                }],
+            ),
+            2,
+        );
+        assert_eq!(persistent_source_drift.code, "source_changed");
+        assert!(
+            persistent_source_drift
+                .details
+                .as_ref()
+                .is_some_and(|details| {
+                    details
+                        .coverage_gaps
+                        .iter()
+                        .all(|diagnostic| !diagnostic.retryable)
+                })
+        );
+
+        let terminal = classify_activation_api_error(ApiError::new(
+            "internal",
+            "cache_busy publication changed cancellation",
+        ));
+        assert_eq!(terminal.code, "project_unavailable");
+    }
+
+    #[test]
+    fn retrieval_cancellation_remains_typed_through_activation_mapping() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        let cancelled = AtomicBool::new(true);
+        let error = codestory_retrieval::finalize_index_for_runtime_with_cancel(
+            project.path(),
+            &storage_path,
+            &codestory_retrieval::SidecarRuntimeConfig::local(),
+            &cancelled,
+        )
+        .expect_err("pre-cancelled retrieval preparation");
+
+        let mapped = map_activation_error(error);
+
+        assert_eq!(mapped.code, "cancelled");
+    }
+
+    #[test]
+    fn terminal_source_failure_survives_activation_snapshot_round_trip() {
+        let diagnostic = codestory_contracts::api::FileCoverageDiagnosticDto {
+            path: "src/large.ts".to_string(),
+            reason: codestory_contracts::graph::FileCoverageReason::Oversized,
+            retryable: false,
+            verified_source: false,
+            projection_available: false,
+        };
+        let snapshot = ActivationSnapshot {
+            operation_id: "activation-source-failure".to_string(),
+            state: ActivationState::Unavailable,
+            stage: ActivationStage::CoreFreshness,
+            attempt: 1,
+            retry_after_ms: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            failure_code: Some("source_oversized".to_string()),
+            failure: Some("source exceeds the indexing limit".to_string()),
+            failure_details: Some(Box::new(ApiErrorDetails::source_coverage(vec![
+                diagnostic.clone(),
+            ]))),
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Unavailable,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+        };
+
+        let error = snapshot_error(&snapshot);
+
+        assert_eq!(error.code, "source_oversized");
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .map(|details| details.coverage_gaps.as_slice()),
+            Some([diagnostic].as_slice())
+        );
+    }
+
+    #[test]
     fn owner_idle_retry_metadata_survives_central_runtime_mapping() {
         let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
             code: "embedding_server_incompatible_active_owner".into(),
@@ -1967,6 +2380,29 @@ mod activation_tests {
     }
 
     #[test]
+    fn executable_without_an_embedded_model_is_terminal_for_activation() {
+        let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "native_model_not_embedded".into(),
+            message: "the executable has no embedded model".into(),
+            retry_class: "after_server_change".into(),
+            retry_after_ms: 0,
+            retry_condition: "the server instance changes".into(),
+            capacity: None,
+        });
+
+        let mapped = map_activation_error(source);
+
+        assert_eq!(mapped.code, "project_unavailable");
+        assert_eq!(
+            mapped
+                .details
+                .as_deref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("native_model_not_embedded")
+        );
+    }
+
+    #[test]
     fn failed_broad_activation_never_becomes_ready_but_can_preserve_local_capability() {
         let snapshot = ActivationSnapshot {
             operation_id: "activation-1".into(),
@@ -1976,7 +2412,9 @@ mod activation_tests {
             retry_after_ms: None,
             embedding_capacity: None,
             embedding_retry: None,
+            failure_code: Some("project_unavailable".into()),
             failure: Some("embedding backend unavailable".into()),
+            failure_details: None,
             capabilities: ActivationCapabilities {
                 local_navigation: ActivationCapabilityState::Ready,
                 broad_search: ActivationCapabilityState::Unavailable,

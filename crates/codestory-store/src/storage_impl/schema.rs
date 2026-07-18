@@ -84,6 +84,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         column INTEGER,
         fatal INTEGER DEFAULT 0,
         indexed INTEGER DEFAULT 0,
+        coverage_reason TEXT,
         FOREIGN KEY(file_id) REFERENCES file(id)
     )",
     "CREATE TABLE IF NOT EXISTS bookmark_category (
@@ -517,6 +518,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 25 {
         storage.set_schema_version(25)?;
     }
+    migrate_v26_error_coverage_reason(&storage.conn)?;
+    if stored_version < 26 {
+        storage.set_schema_version(26)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -847,6 +852,10 @@ pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), St
         "retrieval_index_manifest",
         "rollback_record_json TEXT",
     )
+}
+
+pub(super) fn migrate_v26_error_coverage_reason(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(conn, "error", "coverage_reason TEXT")
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {

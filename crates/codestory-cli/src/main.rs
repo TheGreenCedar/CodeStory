@@ -319,6 +319,7 @@ fn command_failure_envelope(
         code,
         message,
         ApiErrorDetails {
+            cause_code: None,
             failed_layer: Some(failed_layer.into()),
             project: None,
             next_commands: Vec::new(),
@@ -327,6 +328,7 @@ fn command_failure_envelope(
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            coverage_gaps: Vec::new(),
         },
     ))
     .with_context(context)
@@ -885,6 +887,7 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
             "smoke_failed",
             format!("smoke profile {} failed", output.profile),
             ApiErrorDetails {
+                cause_code: None,
                 failed_layer: Some("smoke".to_string()),
                 project: Some(output.project.clone()),
                 next_commands: output.repair_hints.clone(),
@@ -893,6 +896,7 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
                 readiness: None,
                 embedding_capacity: None,
                 embedding_retry: None,
+                coverage_gaps: Vec::new(),
             },
         ))
         .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
@@ -6024,6 +6028,7 @@ fn ambiguous_command_failure(
         output.error.code,
         message,
         ApiErrorDetails {
+            cause_code: None,
             failed_layer: Some(output.error.failed_layer.to_string()),
             project: Some(display::clean_path_string(&project_root.to_string_lossy())),
             next_commands: output.error.next_commands.clone(),
@@ -6032,6 +6037,7 @@ fn ambiguous_command_failure(
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            coverage_gaps: Vec::new(),
         },
     ))
     .with_context(serde_json::json!({
@@ -8537,6 +8543,7 @@ mod tests {
                 framework_route_coverage: Vec::new(),
                 coverage_notes: Vec::new(),
             },
+            coverage_gaps: Vec::new(),
             files: vec![IndexedFileDto {
                 path: "src/lib.rs".to_string(),
                 language: "rust".to_string(),

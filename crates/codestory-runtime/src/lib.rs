@@ -12,9 +12,9 @@ use codestory_contracts::api::{
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
-    EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto,
-    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
-    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
+    EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, FileCoverageDiagnosticDto,
+    FrameworkRouteCoverageDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
+    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
     GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
     IndexPublicationModeDto, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
@@ -37,7 +37,9 @@ use codestory_contracts::api::{
     WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
-use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
+use codestory_contracts::graph::{
+    AccessKind, Edge as GraphEdge, FileCoverageReason, Node as GraphNode,
+};
 use codestory_contracts::language_support::{
     LanguageSupportProfile, language_support_profile_for_ext,
     language_support_profile_for_language_name,
@@ -53,7 +55,7 @@ use codestory_store::{
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use codestory_workspace::{
-    RefreshExecutionPlan, RefreshInputs, WorkspaceInventoryOutcome, WorkspaceManifest,
+    RefreshExecutionPlan, RefreshInputs, RefreshMode, WorkspaceInventoryOutcome, WorkspaceManifest,
     WorkspacePathIdentity,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -4874,8 +4876,16 @@ fn build_search_state_for_runtime(
 
     let search_index_started = Instant::now();
     let mut node_names = HashMap::new();
-    let mut engine = SearchEngine::new(search_storage_path)
-        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+    let mut engine = SearchEngine::new(search_storage_path).map_err(|error| {
+        if search::engine::is_persisted_search_index_busy(&error) {
+            ApiError::new(
+                "cache_busy",
+                format!("Failed to init search engine: {error}"),
+            )
+        } else {
+            ApiError::internal(format!("Failed to init search engine: {error}"))
+        }
+    })?;
     let mut search_nodes = Vec::with_capacity(nodes.len().min(SEARCH_NODE_BATCH_SIZE));
     for node in &nodes {
         let display_name = node_display_name(node);
@@ -4981,23 +4991,177 @@ fn indexed_file_role(path: &Path) -> IndexedFileRoleDto {
     path_role_from_key(&normalize_path_key(&path.to_string_lossy()))
 }
 
-fn indexed_file_incomplete_reason(
+fn file_coverage_reason(
     file: &FileInfo,
-    errors_by_file: &HashMap<i64, u32>,
-) -> Option<(&'static str, &'static str)> {
+    errors_by_file: &HashMap<i64, Vec<FileCoverageReason>>,
+    has_verified_content: bool,
+) -> Option<FileCoverageReason> {
     if file.complete {
         return None;
     }
-    if errors_by_file.contains_key(&file.id) {
-        Some((
-            "index_error",
-            "recorded file-level index errors; inspect error_count or reindex the file",
-        ))
+    if let Some(reason) = errors_by_file
+        .get(&file.id)
+        .and_then(|reasons| reasons.first())
+    {
+        return Some(*reason);
+    }
+    if !file.complete && file.indexed && has_verified_content {
+        Some(FileCoverageReason::ParserPartial)
     } else {
-        Some((
-            "unknown",
-            "incomplete with no recorded file-level error; run a full reindex or inspect indexer logs",
-        ))
+        Some(FileCoverageReason::CollectorFailure)
+    }
+}
+
+fn file_coverage_retryable(reason: FileCoverageReason) -> bool {
+    matches!(
+        reason,
+        FileCoverageReason::SourceChanged
+            | FileCoverageReason::DiscoveryIncomplete
+            | FileCoverageReason::CollectorFailure
+    )
+}
+
+fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
+    match reason {
+        FileCoverageReason::ParserPartial => {
+            "stable verified source published with partial parser coverage"
+        }
+        FileCoverageReason::SourceChanged => "source changed while its projection was collected",
+        FileCoverageReason::Unreadable => "source bytes could not be read and verified",
+        FileCoverageReason::Oversized => "source exceeds the configured indexing size limit",
+        FileCoverageReason::DiscoveryIncomplete => {
+            "workspace discovery could not prove a complete source inventory"
+        }
+        FileCoverageReason::CollectorFailure => {
+            "a source collector or projection write failed before verification completed"
+        }
+    }
+}
+
+fn full_refresh_execution_plan_with_coverage(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+) -> Result<RefreshExecutionPlan, ApiError> {
+    let inventory = workspace.source_inventory().map_err(|error| {
+        ApiError::source_coverage_failure(
+            "source_collector_failure",
+            format!("Failed to collect the full source inventory: {error}"),
+            vec![FileCoverageDiagnosticDto {
+                path: ".".to_string(),
+                reason: FileCoverageReason::CollectorFailure,
+                retryable: true,
+                verified_source: false,
+                projection_available: false,
+            }],
+        )
+    })?;
+    if inventory.outcome != WorkspaceInventoryOutcome::Complete {
+        let reason = if inventory.outcome == WorkspaceInventoryOutcome::Unreadable {
+            FileCoverageReason::Unreadable
+        } else {
+            FileCoverageReason::DiscoveryIncomplete
+        };
+        let mut coverage_gaps = inventory
+            .issues
+            .iter()
+            .map(|issue| FileCoverageDiagnosticDto {
+                path: runtime_relative_path(root, &issue.path),
+                reason,
+                retryable: file_coverage_retryable(reason),
+                verified_source: false,
+                projection_available: false,
+            })
+            .collect::<Vec<_>>();
+        if coverage_gaps.is_empty() {
+            coverage_gaps.push(FileCoverageDiagnosticDto {
+                path: ".".to_string(),
+                reason,
+                retryable: file_coverage_retryable(reason),
+                verified_source: false,
+                projection_available: false,
+            });
+        }
+        return Err(ApiError::source_coverage_failure(
+            match reason {
+                FileCoverageReason::Unreadable => "source_unreadable",
+                _ => "source_discovery_incomplete",
+            },
+            format!(
+                "Full refresh requires a complete source inventory; discovery was {:?}.",
+                inventory.outcome
+            ),
+            coverage_gaps,
+        ));
+    }
+    Ok(RefreshExecutionPlan {
+        mode: RefreshMode::FullRefresh,
+        files_to_index: inventory.files,
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    })
+}
+
+fn stored_file_coverage_diagnostics(
+    root: &Path,
+    storage: &Store,
+) -> Result<Vec<FileCoverageDiagnosticDto>, ApiError> {
+    let files = storage.get_files().map_err(|error| {
+        ApiError::internal(format!("Failed to load staged file coverage: {error}"))
+    })?;
+    let verified_file_ids = storage
+        .files()
+        .inventory()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load staged verified source identities: {error}"
+            ))
+        })?
+        .into_iter()
+        .filter_map(|file| file.content_hash.map(|_| file.id))
+        .collect::<HashSet<_>>();
+    let mut errors_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
+    for error in storage.get_errors(None).map_err(|error| {
+        ApiError::internal(format!("Failed to load staged file errors: {error}"))
+    })? {
+        if let Some(file_id) = error.file_id {
+            errors_by_file.entry(file_id.0).or_default().push(
+                error
+                    .coverage_reason
+                    .unwrap_or(FileCoverageReason::CollectorFailure),
+            );
+        }
+    }
+    Ok(files
+        .iter()
+        .filter_map(|file| {
+            let verified_source = verified_file_ids.contains(&file.id);
+            file_coverage_reason(file, &errors_by_file, verified_source).map(|reason| {
+                FileCoverageDiagnosticDto {
+                    path: runtime_relative_path(root, &file.path),
+                    reason,
+                    retryable: file_coverage_retryable(reason),
+                    verified_source,
+                    projection_available: file.indexed && verified_source,
+                }
+            })
+        })
+        .collect())
+}
+
+fn source_coverage_failure_code(coverage_gaps: &[FileCoverageDiagnosticDto]) -> &'static str {
+    let Some(first) = coverage_gaps.first().map(|entry| entry.reason) else {
+        return "source_verification_failed";
+    };
+    if coverage_gaps.iter().any(|entry| entry.reason != first) {
+        return "source_verification_failed";
+    }
+    match first {
+        FileCoverageReason::ParserPartial => "source_verification_failed",
+        FileCoverageReason::SourceChanged => "source_changed",
+        FileCoverageReason::Unreadable => "source_unreadable",
+        FileCoverageReason::Oversized => "source_oversized",
+        FileCoverageReason::DiscoveryIncomplete => "source_discovery_incomplete",
+        FileCoverageReason::CollectorFailure => "source_collector_failure",
     }
 }
 
@@ -5018,6 +5182,9 @@ const INDEX_FRESHNESS_SAMPLE_LIMIT: usize = 8;
 const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
 #[cfg(test)]
 const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
+
+#[cfg(test)]
+type ActivationSearchRevalidateHook = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
 thread_local! {
@@ -5806,11 +5973,29 @@ enum PublicationTestAction {
 thread_local! {
     static PUBLICATION_TEST_FAULT: std::cell::RefCell<Option<(PublicationTestBoundary, PublicationTestAction)>> =
         const { std::cell::RefCell::new(None) };
+    static ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<ActivationSearchRevalidateHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn arm_publication_test_fault(boundary: PublicationTestBoundary, action: PublicationTestAction) {
     PUBLICATION_TEST_FAULT.with(|fault| *fault.borrow_mut() = Some((boundary, action)));
+}
+
+#[cfg(test)]
+fn arm_activation_search_before_revalidate_hook(hook: impl FnOnce(&Path) + 'static) {
+    ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_activation_search_before_revalidate_hook(storage_path: &Path) {
+    ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage_path);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -10833,6 +11018,7 @@ impl AppController {
                         false,
                         &self.runtime_config,
                         None,
+                        None,
                     )
                     .map(|result| CacheRefreshStats {
                         search_stats: result.search_stats,
@@ -10874,6 +11060,123 @@ impl AppController {
         let mut state = self.state.lock();
         state.index_freshness_cache = None;
         state.is_indexing = false;
+    }
+
+    pub(crate) fn prepare_search_state_for_activation(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), ApiError> {
+        let storage_path = self
+            .state
+            .lock()
+            .storage_path
+            .clone()
+            .ok_or_else(no_project_error)?;
+        let _writer_guard = IndexWriterGuard::try_acquire(&storage_path)?;
+        if cancel_token.is_cancelled() {
+            return Err(indexing_cancelled_error());
+        }
+
+        let mut storage = Storage::open(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open core storage for search preparation: {error}"
+            ))
+        })?;
+        let expected_publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read the complete core publication before search preparation: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "publication_changed",
+                    "The complete core publication disappeared before search preparation.",
+                )
+            })?;
+        let mut validate_before_completion =
+            |prepared_publication: &IndexPublicationRecord| -> Result<(), ApiError> {
+                if cancel_token.is_cancelled() {
+                    return Err(indexing_cancelled_error());
+                }
+
+                #[cfg(test)]
+                run_activation_search_before_revalidate_hook(&storage_path);
+
+                let live_publication = Store::database_index_publication(&storage_path).map_err(
+                    |error| {
+                        ApiError::internal(format!(
+                            "Failed to revalidate the core publication before search promotion: {error}"
+                        ))
+                    },
+                )?;
+                if prepared_publication != &expected_publication
+                    || live_publication.as_ref() != Some(&expected_publication)
+                {
+                    return Err(ApiError::new(
+                        "publication_changed",
+                        "The core publication changed while its search generation was being prepared.",
+                    ));
+                }
+                Ok(())
+            };
+        let prepared = rebuild_search_state_from_storage_for_runtime(
+            &mut storage,
+            &storage_path,
+            None,
+            false,
+            &self.runtime_config,
+            Some(cancel_token),
+            Some(&mut validate_before_completion),
+        )?;
+        if cancel_token.is_cancelled() {
+            return Err(indexing_cancelled_error());
+        }
+
+        let live_publication =
+            Store::database_index_publication(&storage_path).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to revalidate the core publication after search preparation: {error}"
+                ))
+            })?;
+        if prepared.publication.as_ref() != Some(&expected_publication)
+            || live_publication.as_ref() != Some(&expected_publication)
+        {
+            drop(prepared);
+            return Err(ApiError::new(
+                "publication_changed",
+                "The core publication changed while its search generation was being prepared.",
+            ));
+        }
+
+        publish_prepared_search_state(self, prepared);
+        Ok(())
+    }
+
+    pub(crate) fn complete_core_requires_dense_anchor_repair(
+        &self,
+        storage_path: &Path,
+    ) -> Result<bool, ApiError> {
+        if !storage_path.is_file() {
+            return Ok(false);
+        }
+        let storage = Store::open_read_only(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect dense-anchor publication readiness: {error}"
+            ))
+        })?;
+        let Some(publication) = storage.get_complete_index_publication().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect dense-anchor core publication: {error}"
+            ))
+        })?
+        else {
+            return Ok(false);
+        };
+        Ok(storage
+            .validate_dense_anchor_publication(&publication)
+            .is_err())
     }
 
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
@@ -11674,10 +11977,23 @@ impl AppController {
         let errors = storage
             .get_errors(None)
             .map_err(|e| ApiError::internal(format!("Failed to load index errors: {e}")))?;
+        let verified_file_ids = storage
+            .files()
+            .inventory()
+            .map_err(|e| ApiError::internal(format!("Failed to load file inventory: {e}")))?
+            .into_iter()
+            .filter_map(|file| file.content_hash.map(|_| file.id))
+            .collect::<HashSet<_>>();
         let mut errors_by_file = HashMap::<i64, u32>::new();
+        let mut coverage_reasons_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
         for error in errors {
             if let Some(file_id) = error.file_id {
                 *errors_by_file.entry(file_id.0).or_default() += 1;
+                coverage_reasons_by_file.entry(file_id.0).or_default().push(
+                    error
+                        .coverage_reason
+                        .unwrap_or(FileCoverageReason::CollectorFailure),
+                );
             }
         }
 
@@ -11691,13 +12007,32 @@ impl AppController {
             indexed_file_count += u32::from(file.indexed);
             incomplete_file_count += u32::from(!file.complete);
             error_file_count += u32::from(errors_by_file.contains_key(&file.id));
-            if let Some((reason, detail)) = indexed_file_incomplete_reason(file, &errors_by_file) {
+            if let Some(reason) = file_coverage_reason(
+                file,
+                &coverage_reasons_by_file,
+                verified_file_ids.contains(&file.id),
+            ) {
                 let entry = incomplete_reason_counts
-                    .entry(reason.to_string())
-                    .or_insert_with(|| (0, detail.to_string()));
+                    .entry(reason.as_str().to_string())
+                    .or_insert_with(|| (0, file_coverage_detail(reason).to_string()));
                 entry.0 += 1;
             }
         }
+        let coverage_gaps = files
+            .iter()
+            .filter_map(|file| {
+                let verified_source = verified_file_ids.contains(&file.id);
+                file_coverage_reason(file, &coverage_reasons_by_file, verified_source).map(
+                    |reason| FileCoverageDiagnosticDto {
+                        path: runtime_relative_path(&root, &file.path),
+                        reason,
+                        retryable: file_coverage_retryable(reason),
+                        verified_source,
+                        projection_available: file.indexed && verified_source,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
 
         let path_filter = req.path_contains.as_deref().map(normalize_path_key);
         let language_filter = req.language.as_deref().map(str::to_ascii_lowercase);
@@ -11782,6 +12117,7 @@ impl AppController {
                 framework_route_coverage: framework_route_coverage_matrix(),
                 coverage_notes,
             },
+            coverage_gaps,
             files: visible,
         })
     }
@@ -13601,9 +13937,7 @@ fn index_full_for_runtime(
         });
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-    let execution_plan = workspace
-        .full_refresh_execution_plan()
-        .map_err(|e| ApiError::internal(format!("Failed to collect files: {e}")))?;
+    let execution_plan = full_refresh_execution_plan_with_coverage(root, &workspace)?;
 
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
@@ -13637,32 +13971,26 @@ fn index_full_for_runtime(
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
         }
     };
-    let incomplete_paths = match staged.store_mut().get_files() {
-        Ok(files) => files
-            .into_iter()
-            .filter(|file| !file.complete)
-            .map(|file| file.path)
-            .collect::<Vec<_>>(),
+    let coverage_gaps = match stored_file_coverage_diagnostics(root, staged.store_mut()) {
+        Ok(coverage_gaps) => coverage_gaps,
         Err(error) => {
             let _ = staged.discard();
-            return Err(ApiError::internal(format!(
-                "Failed to verify staged full-refresh files: {error}"
-            )));
+            return Err(error);
         }
     };
-    if !incomplete_paths.is_empty() {
-        let sample = incomplete_paths
+    let blocking_gaps = coverage_gaps
+        .iter()
+        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !blocking_gaps.is_empty() {
+        let sample = blocking_gaps
             .iter()
             .take(3)
-            .map(|path| {
-                path.strip_prefix(root)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
+            .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
-        let remainder = incomplete_paths.len().saturating_sub(3);
+        let remainder = blocking_gaps.len().saturating_sub(3);
         let sample = if remainder > 0 {
             format!("{sample}, and {remainder} more")
         } else {
@@ -13677,13 +14005,15 @@ fn index_full_for_runtime(
         } else {
             "No core publication was created"
         };
-        let count = incomplete_paths.len();
+        let count = blocking_gaps.len();
+        let code = source_coverage_failure_code(&blocking_gaps);
         let _ = staged.discard();
-        return Err(ApiError::new(
-            "index_incomplete",
+        return Err(ApiError::source_coverage_failure(
+            code,
             format!(
-                "Full refresh could not verify {count} scheduled file(s): {sample}. {preserved_state}; fix unreadable, unstable, or oversized sources and retry."
+                "Full refresh could not verify {count} scheduled file(s): {sample}. {preserved_state}."
             ),
+            blocking_gaps,
         ));
     }
     if can_copy_forward {
@@ -13797,6 +14127,7 @@ fn index_full_for_runtime(
         false,
         runtime,
         cancel_token,
+        None,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -14335,6 +14666,7 @@ where
         false,
         runtime,
         cancel_token,
+        None,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -14640,8 +14972,12 @@ fn rebuild_search_state_from_storage(
         hydrate_semantic_docs,
         &test_sidecar_runtime_from_env(),
         None,
+        None,
     )
 }
+
+type SearchCompletionValidator<'a> =
+    &'a mut dyn FnMut(&IndexPublicationRecord) -> Result<(), ApiError>;
 
 fn rebuild_search_state_from_storage_for_runtime(
     storage: &mut Storage,
@@ -14650,6 +14986,7 @@ fn rebuild_search_state_from_storage_for_runtime(
     hydrate_semantic_docs: bool,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     cancel_token: Option<&CancellationToken>,
+    mut validate_before_completion: Option<SearchCompletionValidator<'_>>,
 ) -> Result<SearchStateBuildResult, ApiError> {
     let publication = storage.get_index_publication().map_err(|error| {
         ApiError::internal(format!(
@@ -14694,8 +15031,9 @@ fn rebuild_search_state_from_storage_for_runtime(
             hydrate_semantic_docs,
             runtime,
         )
-        .map_err(|e| {
-            ApiError::internal(format!("Failed to rebuild search state: {}", e.message))
+        .map_err(|mut error| {
+            error.message = format!("Failed to rebuild search state: {}", error.message);
+            error
         })?,
     };
     if is_indexing_cancelled(cancel_token) {
@@ -14713,6 +15051,13 @@ fn rebuild_search_state_from_storage_for_runtime(
     if built_new && let Some(publication) = publication.as_ref() {
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
+        }
+        if let Some(validate) = validate_before_completion.as_mut()
+            && let Err(error) = validate(publication)
+        {
+            drop(result);
+            discard_unpublished_search_generation(storage_path, publication);
+            return Err(error);
         }
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::SearchCompletion, cancel_token)?;
@@ -14761,6 +15106,7 @@ fn refresh_caches(
         llm_refresh_scope,
         true,
         &controller.runtime_config,
+        None,
         None,
     );
 
@@ -14811,6 +15157,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::MutexGuard as StdMutexGuard;
     use tempfile::tempdir;
+
+    #[path = "activation_coverage_tests.rs"]
+    mod activation_coverage_tests;
 
     fn all_permutations<T: Clone>(values: &[T]) -> Vec<Vec<T>> {
         fn visit<T: Clone>(values: &mut [T], index: usize, output: &mut Vec<Vec<T>>) {
@@ -16950,6 +17299,7 @@ mod tests {
                 column: None,
                 is_fatal: true,
                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                coverage_reason: Some(FileCoverageReason::Unreadable),
             })
             .expect("file error");
         let retry = index_freshness_from_storage(project.path(), &workspace, &storage);
@@ -20352,18 +20702,22 @@ fn build_llm_symbol_doc_text() -> String {
         {
             let storage = Storage::open(&storage_path).expect("open storage");
             for (id, path) in [(11, unknown_path), (12, error_path)] {
-                storage
-                    .insert_file(&FileInfo {
-                        id,
-                        path,
-                        language: "rust".to_string(),
-                        modification_time: 1,
-                        indexed: true,
-                        complete: false,
-                        line_count: 1,
-                        file_role: codestory_store::FileRole::Source,
-                    })
-                    .expect("insert file");
+                let file = FileInfo {
+                    id,
+                    path,
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: false,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                };
+                storage.insert_file(&file).expect("insert file");
+                if id == 11 {
+                    storage
+                        .update_file_metadata(&file, Some("verified-partial"))
+                        .expect("persist verified content hash");
+                }
             }
             storage
                 .insert_error(&codestory_contracts::graph::ErrorInfo {
@@ -20373,6 +20727,7 @@ fn build_llm_symbol_doc_text() -> String {
                     column: Some(1),
                     is_fatal: false,
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
                 })
                 .expect("insert error");
         }
@@ -20403,14 +20758,20 @@ fn build_llm_symbol_doc_text() -> String {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(reasons.get("index_error").map(|entry| entry.0), Some(1));
-        assert_eq!(reasons.get("unknown").map(|entry| entry.0), Some(1));
-        assert!(
-            reasons
-                .get("unknown")
-                .is_some_and(|entry| entry.1.contains("full reindex")),
-            "{reasons:?}"
+        assert_eq!(
+            reasons.get("collector_failure").map(|entry| entry.0),
+            Some(1)
         );
+        assert_eq!(reasons.get("parser_partial").map(|entry| entry.0), Some(1));
+        assert_eq!(output.coverage_gaps.len(), 2);
+        let partial = output
+            .coverage_gaps
+            .iter()
+            .find(|entry| entry.reason == FileCoverageReason::ParserPartial)
+            .expect("parser partial diagnostic");
+        assert!(!partial.retryable);
+        assert!(partial.verified_source);
+        assert!(partial.projection_available);
     }
 
     #[test]
@@ -21069,7 +21430,12 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("an incomplete first full refresh must not publish");
 
-        assert_eq!(error.code, "index_incomplete");
+        assert_eq!(error.code, "source_oversized");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details.coverage_gaps.iter().any(|entry| {
+                entry.reason == FileCoverageReason::Oversized && !entry.verified_source
+            })
+        }));
         assert!(
             error.message.contains("No core publication was created"),
             "first-publication failure should not claim that a previous publication was preserved: {}",
@@ -21224,7 +21590,7 @@ fn build_llm_symbol_doc_text() -> String {
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("incomplete full refresh must not replace the live publication");
-        assert_eq!(error.code, "index_incomplete");
+        assert_eq!(error.code, "source_oversized");
         assert!(
             error
                 .message
@@ -21302,7 +21668,7 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("incomplete recovery must preserve the fenced live index");
 
-        assert_eq!(error.code, "index_incomplete");
+        assert_eq!(error.code, "source_oversized");
         assert!(
             error
                 .message

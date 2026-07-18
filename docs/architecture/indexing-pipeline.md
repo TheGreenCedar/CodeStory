@@ -176,6 +176,13 @@ input. A mismatch, including one hidden by a restored timestamp, becomes an
 incomplete file-level retry error; stale graph output and artifact-cache writes
 are discarded.
 
+File diagnostics retain a typed coverage reason: `parser_partial`,
+`source_changed`, `unreadable`, `oversized`, `discovery_incomplete`, or
+`collector_failure`. Each entry reports whether the condition is retryable and
+whether verified source and projection data exist. A full candidate may publish
+a stable parser-partial projection; the other reasons remain source-integrity
+gaps and preserve the previous complete publication.
+
 ### 6. Parse and extract run in parallel
 
 Cache misses become `PreparedIndexInput` values and are parsed in parallel. Each file produces `IntermediateStorage`, which is the in-memory shape of a future store flush:

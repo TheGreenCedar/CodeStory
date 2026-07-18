@@ -1,5 +1,6 @@
 mod test_support;
 
+use fs4::fs_std::FileExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -400,6 +401,32 @@ fn assert_tool_error(response: &Value, id: Value) -> &Value {
     result
         .get("structuredContent")
         .expect("tools/call error should include structuredContent")
+}
+
+fn assert_search_repaired_before_terminal_model_absence(
+    server: &mut StdioServer,
+    error: &Value,
+    search_generations: &Path,
+    id: &str,
+) {
+    assert_eq!(error["code"], json!("codestory_unavailable"));
+    assert_eq!(error["cause_code"], json!("native_model_not_embedded"));
+    assert_eq!(error["retry_tool"], Value::Null);
+    assert!(
+        search_generations.is_dir(),
+        "search repair must complete before the terminal package limitation is reported"
+    );
+    let ground_id = format!("{id}-local-ground");
+    let ground = send_json(
+        server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": ground_id,
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&ground, json!(ground_id));
 }
 
 fn assert_tool_text_content<'a>(result: &'a Value, response: &Value) -> &'a str {
@@ -1169,6 +1196,122 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
             first_status.pointer(pointer),
             first_status_again.pointer(pointer),
             "A/B/A status identity drifted at {pointer}"
+        );
+    }
+}
+
+#[test]
+fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
+    let projects = (0..3)
+        .map(|index| {
+            let project = tempfile::tempdir().expect("project workspace");
+            write_tiny_rust_workspace(project.path());
+            fs::write(
+                project
+                    .path()
+                    .join("src")
+                    .join(format!("project_{index}.rs")),
+                format!("pub fn project_{index}() {{}}\n"),
+            )
+            .expect("write project-specific source");
+            project
+        })
+        .collect::<Vec<_>>();
+    let cache_root = tempfile::tempdir().expect("multi-project cache root");
+    let writer_locks = projects
+        .iter()
+        .map(|project| {
+            let root = fs::canonicalize(project.path()).expect("canonical project root");
+            let cache_dir = cache_root
+                .path()
+                .join(codestory_workspace::workspace_id_v3_for_root(&root));
+            fs::create_dir_all(&cache_dir).expect("create project cache dir");
+            let lock_path = cache_dir
+                .join("codestory.db")
+                .with_extension("index-writer.lock");
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)
+                .expect("open project writer lock");
+            assert!(
+                file.try_lock_exclusive().expect("take project writer lock"),
+                "test must own the project writer lock"
+            );
+            file
+        })
+        .collect::<Vec<_>>();
+    let mut server = spawn_multi_project_stdio_server(cache_root.path());
+    let packet_request = |id: &str, project: &Path| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {
+                    "project": project,
+                    "question": "How does AppController open a project?"
+                }
+            }
+        })
+    };
+
+    let mut operation_ids = Vec::new();
+    for (index, project) in projects.iter().enumerate() {
+        let id = format!("multi-packet-{index}");
+        let response = send_json(&mut server, packet_request(&id, project.path()));
+        let error = assert_tool_error(&response, json!(id));
+        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["cause_code"], json!("cache_busy"));
+        assert_eq!(error["retry_tool"], json!("packet"));
+        assert!(error["retry_after_ms"].as_u64().is_some());
+        operation_ids.push(
+            error["operation"]["operation_id"]
+                .as_str()
+                .expect("project activation operation id")
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        operation_ids.iter().collect::<BTreeSet<_>>().len(),
+        3,
+        "each project needs an independent activation operation"
+    );
+
+    let retry = send_json(
+        &mut server,
+        packet_request("multi-packet-first-retry", projects[0].path()),
+    );
+    let retry_error = assert_tool_error(&retry, json!("multi-packet-first-retry"));
+    assert_eq!(
+        retry_error["operation"]["operation_id"],
+        json!(operation_ids[0]),
+        "retrying one project must not adopt another project's operation"
+    );
+
+    drop(writer_locks);
+    for (index, project) in projects.iter().enumerate() {
+        let id = format!("multi-ground-after-lock-{index}");
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "ground",
+                    "arguments": {"project": project.path(), "budget": "strict"}
+                }
+            }),
+        );
+        let snapshot = assert_tool_success(&response, json!(id));
+        assert_eq!(
+            fs::canonicalize(snapshot["root"].as_str().expect("grounding root"))
+                .expect("canonical grounding root"),
+            fs::canonicalize(project.path()).expect("canonical expected root")
         );
     }
 }
@@ -4681,19 +4824,29 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         }),
     );
     let error = assert_tool_error(&search, json!("cold-search-unavailable"));
-    assert_eq!(error["code"], json!("codestory_preparing"));
-    assert_eq!(error["state"], json!("preparing"));
     assert_eq!(error["tool"], json!("search"));
-    assert_eq!(error["retry_tool"], json!("search"));
     assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
     assert_eq!(
         error["operation"]["capabilities"]["local_navigation"],
         json!("ready")
     );
-    assert_eq!(
-        error["operation"]["capabilities"]["broad_search"],
-        json!("retryable")
-    );
+    if error["cause_code"] == "native_model_not_embedded" {
+        assert_eq!(error["code"], json!("codestory_unavailable"));
+        assert_eq!(error["state"], json!("unavailable"));
+        assert_eq!(error["retry_tool"], Value::Null);
+        assert_eq!(
+            error["operation"]["capabilities"]["broad_search"],
+            json!("unavailable")
+        );
+    } else {
+        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["state"], json!("preparing"));
+        assert_eq!(error["retry_tool"], json!("search"));
+        assert_eq!(
+            error["operation"]["capabilities"]["broad_search"],
+            json!("retryable")
+        );
+    }
     assert_eq!(
         error["operation"]["embedding_retry"]["retry_class"],
         json!("after_server_change")
@@ -4715,7 +4868,136 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         }),
     );
     let error = assert_tool_error(&response, json!("migration-search-preparing"));
-    assert_eq!(error["code"], json!("codestory_preparing"));
-    assert_eq!(error["state"], json!("preparing"));
-    assert_eq!(error["retry_tool"], json!("search"));
+    if error["cause_code"] == "native_model_not_embedded" {
+        assert_eq!(error["code"], json!("codestory_unavailable"));
+        assert_eq!(error["state"], json!("unavailable"));
+        assert_eq!(error["retry_tool"], Value::Null);
+    } else {
+        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["state"], json!("preparing"));
+        assert_eq!(error["retry_tool"], json!("search"));
+    }
+}
+
+#[test]
+fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry() {
+    let fixture = indexed_fixture();
+    let search_generations = fixture
+        .cache_dir
+        .path()
+        .join("codestory.search-generations");
+    assert!(
+        search_generations.is_dir(),
+        "indexed fixture needs search state"
+    );
+    fs::remove_dir_all(&search_generations).expect("remove migrated search generations");
+    let mut server = spawn_stdio_server(&fixture);
+    let packet_request = |id: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {"question": "How does AppController open a project?"}
+            }
+        })
+    };
+
+    let first = send_json(&mut server, packet_request("packet-search-repair-first"));
+    if first.pointer("/result/isError") != Some(&json!(true)) {
+        assert_tool_success(&first, json!("packet-search-repair-first"));
+        return;
+    }
+    let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
+    if first_error["cause_code"] == "native_model_not_embedded" {
+        assert_search_repaired_before_terminal_model_absence(
+            &mut server,
+            first_error,
+            &search_generations,
+            "packet-search-repair-first",
+        );
+        return;
+    }
+    assert_eq!(first_error["code"], json!("codestory_preparing"));
+    assert_eq!(first_error["retry_tool"], json!("packet"));
+    assert!(first_error["retry_after_ms"].as_u64().is_some());
+    assert!(first_error["cause_code"].as_str().is_some());
+    let operation_id = first_error["operation"]["operation_id"]
+        .as_str()
+        .expect("stable activation operation id")
+        .to_string();
+    let mut last_error = first_error.clone();
+
+    let mut retry_after_ms = first_error["retry_after_ms"].as_u64().unwrap_or(250);
+    for attempt in 1..=8 {
+        thread::sleep(Duration::from_millis(retry_after_ms.min(1_000)));
+        let id = format!("packet-search-repair-retry-{attempt}");
+        let response = send_json(&mut server, packet_request(&id));
+        if response.pointer("/result/isError") != Some(&json!(true)) {
+            assert_tool_success(&response, json!(id));
+            assert!(
+                search_generations.is_dir(),
+                "activation must rebuild search state before packet succeeds"
+            );
+            return;
+        }
+        let error = assert_tool_error(&response, json!(id));
+        if error["cause_code"] == "native_model_not_embedded" {
+            assert_search_repaired_before_terminal_model_absence(
+                &mut server,
+                error,
+                &search_generations,
+                &id,
+            );
+            return;
+        }
+        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["retry_tool"], json!("packet"));
+        assert_eq!(
+            error["operation"]["operation_id"],
+            json!(operation_id),
+            "same-project retry must retain the repair operation id"
+        );
+        retry_after_ms = error["retry_after_ms"].as_u64().unwrap_or(250);
+        last_error = error.clone();
+    }
+    panic!("packet did not converge after the bounded same-tool retry sequence: {last_error}");
+}
+
+#[test]
+fn packet_preserves_typed_source_failure_diagnostics() {
+    let fixture = unindexed_fixture();
+    fs::write(
+        fixture.workspace.path().join("src/lib.rs"),
+        "x".repeat(1_000_001),
+    )
+    .expect("write oversized source fixture");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "packet-typed-source-failure",
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {"question": "How does AppController open a project?"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&response, json!("packet-typed-source-failure"));
+
+    assert_eq!(error["code"], json!("codestory_unavailable"));
+    assert_eq!(error["cause_code"], json!("source_oversized"));
+    assert_eq!(error["retry_tool"], Value::Null);
+    assert_eq!(
+        error.pointer("/details/coverage_gaps/0/reason"),
+        Some(&json!("oversized"))
+    );
+    assert_eq!(
+        error.pointer("/details/coverage_gaps/0/retryable"),
+        Some(&json!(false))
+    );
 }
