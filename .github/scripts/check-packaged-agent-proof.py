@@ -5475,10 +5475,9 @@ def derive_scenario_assertions(
     elif scenario_id == "cold_race":
         election_witnesses = {
             phase: [
-                observation["snapshot"]
+                observation
                 for observation in process_observations
                 if observation.get("phase") == phase
-                and observation.get("snapshot") is not None
             ]
             for phase in ("cold_race_first", "cold_race_second")
         }
@@ -5487,11 +5486,14 @@ def derive_scenario_assertions(
             "cold race must retain exactly one post-reset snapshot from each process",
         )
         election_snapshots = [
-            election_witnesses[phase][0]
+            election_witnesses[phase][0]["snapshot"]
             for phase in ("cold_race_first", "cold_race_second")
         ]
         require(
-            all(snapshot.get("engine") is not None for snapshot in election_snapshots),
+            all(
+                isinstance(snapshot, dict) and snapshot.get("engine") is not None
+                for snapshot in election_snapshots
+            ),
             "cold race post-reset snapshots must retain engine identity",
         )
         election_instances = {
@@ -9474,6 +9476,33 @@ def self_test() -> None:
             all(cold_assertions.values()),
             "retired pre-race owner contaminated post-reset election assertions",
         )
+        duplicate_phase_observations = json.loads(
+            json.dumps(cold_process_observations)
+        )
+        duplicate_phase_observations.insert(
+            -1, {"phase": "cold_race_first", "snapshot": None}
+        )
+        try:
+            derive_scenario_assertions(
+                "cold_race",
+                observations_by_kind=cold_transitions,
+                process_observations=duplicate_phase_observations,
+                invocations=[],
+                control_actions=[],
+                same_account={
+                    "relation": "same_os_account",
+                    "plugin_hosts": [{"pid": 101}, {"pid": 102}],
+                },
+                materialization={},
+            )
+        except ProofFailure as error:
+            require(
+                str(error)
+                == "cold race must retain exactly one post-reset snapshot from each process",
+                "duplicate cold-race phase changed its cardinality failure",
+            )
+        else:
+            raise ProofFailure("duplicate cold-race phase observation was accepted")
         split_process_observations = json.loads(
             json.dumps(cold_process_observations)
         )
