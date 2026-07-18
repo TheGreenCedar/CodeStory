@@ -91,21 +91,37 @@ function requireStepRun(violations, file, job, name, fragments) {
   }
 }
 
-function requireResolverSemantics(violations, file, job, exactLines) {
-  const run = executableRunText(stepRun(job, "Resolve trusted exact head"));
-  const lines = run.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+function normalizedExecutableRunText(run) {
+  return executableRunText(run)
+    .split(/\r?\n/u)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function requireExactResolverContract(violations, file, job, expectedDigest) {
+  const run = normalizedExecutableRunText(stepRun(job, "Resolve trusted exact head"));
+  const digest = createHash("sha256").update(run).digest("hex");
   add(
     violations,
-    !lines.some(line => /^true\s*\|\|/u.test(line) || /^if\s+false(?:\s|;|&&)/u.test(line)),
-    `${file} resolver must not short-circuit trusted branch or SHA checks`,
+    run.length > 0 && digest === expectedDigest,
+    `${file} resolver must match the exact normalized trusted resolver script contract`,
   );
-  for (const expected of exactLines) {
-    add(
-      violations,
-      lines.includes(expected),
-      `${file} resolver must execute exact line ${expected}`,
-    );
-  }
+}
+
+function requireUniqueCacheSaveLast(violations, file, job, cacheName, finalStepDescription) {
+  const steps = list(job?.steps).map(object);
+  const saves = steps.filter(step => typeof step.uses === "string" && step.uses.startsWith("actions/cache/save@"));
+  add(
+    violations,
+    saves.length === 1,
+    `${file} ${cacheName} must contain exactly one actions/cache/save action`,
+  );
+  add(
+    violations,
+    saves.length === 1 && steps.at(-1) === saves[0],
+    `${file} ${cacheName} unique cache save must run after every ${finalStepDescription}`,
+  );
 }
 
 function requireStepUses(violations, file, job, name, expected) {
@@ -139,6 +155,8 @@ const draftCachePaths = [
   "~/.cargo/git",
   "target",
 ];
+const sourceResolverContractDigest = "946592c43809ff6049df3b9bc6e1b2f7314c9c563b1a5d158c59327093d5960f";
+const platformResolverContractDigest = "db104676ffd2647b2dec25f88299374532ac45459fdb7903ebe77a52b75106c0";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -1221,15 +1239,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       'test "$GITHUB_SHA" = "$CALLER_REF"',
       "--ref $head_ref",
     ]);
-    requireResolverSemantics(violations, sourceFile, resolve, [
-      'if [ -n "$EVENT_PR_NUMBER" ]; then',
-      'test "$current_head" = "$EVENT_HEAD_SHA" || {',
-      'if [ -n "$PR_NUMBER" ]; then',
-      'test "$head_sha" = "$EXPECTED_HEAD_SHA" || {',
-      'test "$GITHUB_REF" = "refs/heads/$head_ref" || {',
-      'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
-      'test "$GITHUB_SHA" = "$CALLER_REF" || {',
-    ]);
+    requireExactResolverContract(violations, sourceFile, resolve, sourceResolverContractDigest);
     const full = requireJob(violations, sourceFile, source, "full-source-gate");
     add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
     const restore = namedStep(full, "Restore Cargo inputs and output");
@@ -1260,12 +1270,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && object(save?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
       `${sourceFile} source cache must save only a successful exact miss`,
     );
-    const fullSteps = list(full.steps).map(object);
-    add(
-      violations,
-      fullSteps.findIndex(step => step.name === "Save Cargo inputs and output") === fullSteps.length - 1,
-      `${sourceFile} source cache save must run after every proof step`,
-    );
+    requireUniqueCacheSaveLast(violations, sourceFile, full, "source cache", "proof step");
     requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
   }
@@ -1550,11 +1555,7 @@ function validatePackagedProof(workflows, violations, graph) {
       && object(packageSave?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
     `${file} native build cache must save only a successful exact miss`,
   );
-  add(
-    violations,
-    packageSteps.findIndex(step => step.name === "Save Cargo registry, git sources, and build output") === packageSteps.length - 1,
-    `${file} native build cache save must run after every proof and cleanup step`,
-  );
+  requireUniqueCacheSaveLast(violations, file, job, "native build cache", "proof and cleanup step");
   const linuxBuildDockerfile = fs.readFileSync(
     path.join(repositoryRoot, ".github", "docker", "linux-glibc-build.Dockerfile"),
     "utf8",
@@ -1894,17 +1895,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     'test "$GITHUB_SHA" = "$dev_head"',
     "--ref $head_ref",
   ]);
-  requireResolverSemantics(violations, file, route, [
-    'if [ "$mode" = "integration" ]; then',
-    'test "$INPUT_HEAD_SHA" = "$dev_head" || {',
-    'test "$GITHUB_REF" = "refs/heads/dev/codestory-next" || {',
-    'test "$GITHUB_SHA" = "$dev_head" || {',
-    'if [ -n "$EVENT_HEAD_REPO" ]; then',
-    'test "$current_head" = "$EVENT_HEAD_SHA" || {',
-    'test "$INPUT_HEAD_SHA" = "$current_head" || {',
-    'test "$GITHUB_REF" = "refs/heads/$head_ref" || {',
-    'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
-  ]);
+  requireExactResolverContract(violations, file, route, platformResolverContractDigest);
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
     '.path == ".github/workflows/source-proof.yml"',
@@ -1965,12 +1956,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && object(macosSave?.with).key === "${{ steps.macos-source-cache-restore.outputs.cache-primary-key }}",
     `${file} macOS source cache must save only a successful exact miss`,
   );
-  const macosSourceSteps = list(macosSource.steps).map(object);
-  add(
-    violations,
-    macosSourceSteps.findIndex(step => step.name === "Save exact-head macOS source cache") === macosSourceSteps.length - 1,
-    `${file} macOS source cache save must run after every proof step`,
-  );
+  requireUniqueCacheSaveLast(violations, file, macosSource, "macOS source cache", "proof step");
   const calibrationAssemble = requireJob(
     violations,
     file,

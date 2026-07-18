@@ -64,6 +64,14 @@ function moveNamedStepBefore(job, movedName, beforeName) {
   job.steps.splice(beforeIndex, 0, moved);
 }
 
+function cloneCacheSaveBefore(job, sourceName, beforeName) {
+  const clone = structuredClone(draftStep(job, sourceName));
+  clone.name = `${sourceName} clone`;
+  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
+  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
+  job.steps.splice(beforeIndex, 0, clone);
+}
+
 function runResolver(file, jobName, environment) {
   const workflow = loadWorkflows().get(file);
   const run = draftStep(workflow.jobs[jobName], "Resolve trusted exact head").run;
@@ -379,14 +387,21 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
           'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
           'true || test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
         );
-    }, /must not short-circuit/u],
+    }, /exact normalized trusted resolver script contract/u],
     ["source labeled branch disabled", sourceFile, workflow => {
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace(
           'if [ -n "$EVENT_PR_NUMBER" ]; then',
           'if false && [ -n "$EVENT_PR_NUMBER" ]; then',
         );
-    }, /must not short-circuit|must execute exact line/u],
+    }, /exact normalized trusted resolver script contract/u],
+    ["source resolver exits before trusted checks", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace(
+          "set -euo pipefail",
+          'set -euo pipefail\necho "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"\nexit 0',
+        );
+    }, /exact normalized trusted resolver script contract/u],
     ["source labeled job disabled", sourceFile, workflow => {
       workflow.jobs.resolve.if
         = "false && (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')";
@@ -405,14 +420,21 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
           'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
           'true || test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
         );
-    }, /must not short-circuit/u],
+    }, /exact normalized trusted resolver script contract/u],
     ["platform labeled branch disabled", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace(
           'if [ -n "$EVENT_HEAD_REPO" ]; then',
           'if false && [ -n "$EVENT_HEAD_REPO" ]; then',
         );
-    }, /must not short-circuit|must execute exact line/u],
+    }, /exact normalized trusted resolver script contract/u],
+    ["platform resolver exits before trusted checks", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          "set -euo pipefail",
+          'set -euo pipefail\necho "head_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"\nexit 0',
+        );
+    }, /exact normalized trusted resolver script contract/u],
     ["platform labeled job disabled", packagedCoordinatorFile, workflow => {
       workflow.jobs.route.if
         = "false && (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')";
@@ -439,7 +461,14 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         "Save Cargo inputs and output",
         "Test the complete workspace once",
       );
-    }, /source cache save must run after every proof step/u],
+    }, /source cache unique cache save must run after every proof step/u],
+    ["source cache clone before proof", sourceFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["full-source-gate"],
+        "Save Cargo inputs and output",
+        "Test the complete workspace once",
+      );
+    }, /source cache must contain exactly one actions\/cache\/save action/u],
     ["macOS source cache loses exact SHA", packagedCoordinatorFile, workflow => {
       const restore = draftStep(workflow.jobs["macos-source"], "Restore exact-head macOS source cache");
       restore.with.key = restore.with.key.replace("-${{ needs.route.outputs.head_sha }}", "");
@@ -450,7 +479,14 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         "Save exact-head macOS source cache",
         "Capture Rust cache identity",
       );
-    }, /macOS source cache save must run after every proof step/u],
+    }, /macOS source cache unique cache save must run after every proof step/u],
+    ["macOS source cache clone before proof", packagedCoordinatorFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["macos-source"],
+        "Save exact-head macOS source cache",
+        "Capture Rust cache identity",
+      );
+    }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
     ["packaged cache loses exact SHA", packagedProofFile, workflow => {
       const restore = draftStep(workflow.jobs.build, "Restore Cargo registry, git sources, and build output");
       restore.with.key = restore.with.key.replace("-${{ inputs.ref }}", "");
@@ -465,7 +501,14 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         "Save Cargo registry, git sources, and build output",
         "Build codestory-cli",
       );
-    }, /native build cache save must run after every proof and cleanup step/u],
+    }, /native build cache unique cache save must run after every proof and cleanup step/u],
+    ["packaged cache clone before proof", packagedProofFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs.build,
+        "Save Cargo registry, git sources, and build output",
+        "Build codestory-cli",
+      );
+    }, /native build cache must contain exactly one actions\/cache\/save action/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
