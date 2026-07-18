@@ -5473,6 +5473,47 @@ def derive_scenario_assertions(
             "no_server_replacement": len(snapshot_instances) == 1,
         }
     elif scenario_id == "cold_race":
+        election_witnesses = {
+            phase: [
+                observation["snapshot"]
+                for observation in process_observations
+                if observation.get("phase") == phase
+                and observation.get("snapshot") is not None
+            ]
+            for phase in ("cold_race_first", "cold_race_second")
+        }
+        require(
+            all(len(witnesses) == 1 for witnesses in election_witnesses.values()),
+            "cold race must retain exactly one post-reset snapshot from each process",
+        )
+        election_snapshots = [
+            election_witnesses[phase][0]
+            for phase in ("cold_race_first", "cold_race_second")
+        ]
+        require(
+            all(snapshot.get("engine") is not None for snapshot in election_snapshots),
+            "cold race post-reset snapshots must retain engine identity",
+        )
+        election_instances = {
+            snapshot["process"]["server_instance_id"]
+            for snapshot in election_snapshots
+        }
+        election_authorities = {
+            (
+                snapshot["authority"]["lifetime_authority_id"],
+                snapshot["authority"]["listener_id"],
+            )
+            for snapshot in election_snapshots
+        }
+        election_engines = {
+            (
+                snapshot["engine"]["engine_owner_id"],
+                snapshot["engine"]["native_worker_id"],
+                snapshot["engine"]["load_generation"],
+                snapshot["engine"]["model_load_count"],
+            )
+            for snapshot in election_snapshots
+        }
         independent = transition(
             "two_independent_processes",
             {
@@ -5513,20 +5554,20 @@ def derive_scenario_assertions(
                 )
             ),
             "one_lifetime_authority": (
-                len(snapshot_authorities) == 1
+                len(election_authorities) == 1
                 and converged["lifetime_authority_id"]
-                == next(iter(snapshot_authorities))[0]
+                == next(iter(election_authorities))[0]
             ),
-            "one_listener": len({identity[1] for identity in snapshot_authorities}) == 1,
+            "one_listener": len({identity[1] for identity in election_authorities}) == 1,
             "one_server": (
-                len(snapshot_instances) == 1
-                and converged["server_instance_id"] == next(iter(snapshot_instances))
+                len(election_instances) == 1
+                and converged["server_instance_id"] == next(iter(election_instances))
             ),
-            "one_engine_owner": len({identity[0] for identity in snapshot_engines}) == 1,
-            "one_native_worker": len({identity[1] for identity in snapshot_engines}) == 1,
-            "one_load_generation": len({identity[2] for identity in snapshot_engines}) == 1,
+            "one_engine_owner": len({identity[0] for identity in election_engines}) == 1,
+            "one_native_worker": len({identity[1] for identity in election_engines}) == 1,
+            "one_load_generation": len({identity[2] for identity in election_engines}) == 1,
             "one_model_load": (
-                len(snapshot_engines) == 1 and next(iter(snapshot_engines))[3] == 1
+                len(election_engines) == 1 and next(iter(election_engines))[3] == 1
             ),
         }
     elif scenario_id == "frozen_owner":
@@ -9372,6 +9413,108 @@ def self_test() -> None:
         )
         shared = shared_server_identity(first_snapshot, second_snapshot)
         require(shared["model_load_count"] == 1, "shared server identity self-test failed")
+        retired_snapshot = json.loads(json.dumps(first_snapshot))
+        retired_snapshot["process"]["server_instance_id"] = "retired-server"
+        retired_snapshot["authority"]["lifetime_authority_id"] = "retired-authority"
+        retired_snapshot["authority"]["listener_id"] = "retired-listener"
+        retired_snapshot["engine"]["engine_owner_id"] = "retired-engine-owner"
+        retired_snapshot["engine"]["native_worker_id"] = "retired-native-worker"
+        elected_snapshot = json.loads(json.dumps(first_snapshot))
+        cold_process_observations = [
+            {
+                "phase": "cold_race_no_owner_before",
+                "snapshot": retired_snapshot,
+            },
+            {"phase": "cold_race_no_owner", "snapshot": None},
+            {"phase": "cold_race_first", "snapshot": elected_snapshot},
+            {
+                "phase": "cold_race_second",
+                "snapshot": json.loads(json.dumps(elected_snapshot)),
+            },
+        ]
+        cold_transitions = {
+            "two_independent_processes": [
+                {
+                    "values": {
+                        "first_pid": 101,
+                        "second_pid": 102,
+                        "first_project_identity_sha256": "a" * 64,
+                        "second_project_identity_sha256": "b" * 64,
+                        "first_transport_peer_verified": True,
+                        "second_transport_peer_verified": True,
+                    }
+                }
+            ],
+            "single_server_convergence": [
+                {
+                    "values": {
+                        "server_instance_id": elected_snapshot["process"][
+                            "server_instance_id"
+                        ],
+                        "lifetime_authority_id": elected_snapshot["authority"][
+                            "lifetime_authority_id"
+                        ],
+                    }
+                }
+            ],
+        }
+        cold_assertions = derive_scenario_assertions(
+            "cold_race",
+            observations_by_kind=cold_transitions,
+            process_observations=cold_process_observations,
+            invocations=[],
+            control_actions=[],
+            same_account={
+                "relation": "same_os_account",
+                "plugin_hosts": [{"pid": 101}, {"pid": 102}],
+            },
+            materialization={},
+        )
+        require(
+            all(cold_assertions.values()),
+            "retired pre-race owner contaminated post-reset election assertions",
+        )
+        split_process_observations = json.loads(
+            json.dumps(cold_process_observations)
+        )
+        split_snapshot = split_process_observations[-1]["snapshot"]
+        split_snapshot["process"]["server_instance_id"] = "split-server"
+        split_snapshot["authority"]["lifetime_authority_id"] = "split-authority"
+        split_snapshot["authority"]["listener_id"] = "split-listener"
+        split_snapshot["engine"]["engine_owner_id"] = "split-engine-owner"
+        split_snapshot["engine"]["native_worker_id"] = "split-native-worker"
+        expected_split_failures = {
+            "one_engine_owner",
+            "one_lifetime_authority",
+            "one_listener",
+            "one_model_load",
+            "one_native_worker",
+            "one_server",
+        }
+        try:
+            derive_scenario_assertions(
+                "cold_race",
+                observations_by_kind=cold_transitions,
+                process_observations=split_process_observations,
+                invocations=[],
+                control_actions=[],
+                same_account={
+                    "relation": "same_os_account",
+                    "plugin_hosts": [{"pid": 101}, {"pid": 102}],
+                },
+                materialization={},
+            )
+        except ProofFailure as error:
+            require(
+                str(error)
+                == "qualification scenario cold_race raw evidence failed assertions: "
+                + ", ".join(sorted(expected_split_failures)),
+                "post-reset cold-race split changed its exact identity failures",
+            )
+        else:
+            raise ProofFailure(
+                "post-reset cold-race split escaped its exact identity assertions"
+            )
         measurement_contract = verify_package_server_contracts(
             manifest,
             MEASUREMENT_PROTOCOL,
