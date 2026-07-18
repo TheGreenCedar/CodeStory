@@ -205,6 +205,26 @@ jobs: { check: { runs-on: ubuntu-latest, steps: [ { uses: vendor/action@${fullSh
   assert.deepEqual(block, flow);
 });
 
+test("release workflows retain the closeout coordinator contract test", () => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const [file, jobName] of [
+    ["plugin-static.yml", "plugin-static"],
+    ["release.yml", "workflow-policy"],
+    ["auto-release.yml", "workflow-policy"],
+  ]) {
+    const workflows = loadWorkflows();
+    const step = workflows.get(file).jobs[jobName].steps.find(
+      ({ name }) => name === "Check release claim and evidence contracts",
+    );
+    step.run = step.run.replace("scripts/tests/codestory-release-closeout.test.mjs", "");
+    assert.ok(
+      validateWorkflows(workflows).some((message) =>
+        message.includes(file)
+          && message.includes("scripts/tests/codestory-release-closeout.test.mjs")),
+    );
+  }
+});
+
 test("third-party action policy reads only parsed uses values", () => {
   const valid = parseWorkflow(`
 on: { workflow_dispatch: null }

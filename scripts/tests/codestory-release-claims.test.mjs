@@ -98,6 +98,9 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
+  assert.equal(graph.graph_version, 3);
+  assert.deepEqual(graph.closeout.phases, ["pre_publish", "post_publish"]);
+  assert.equal(graph.closeout.cell_groups.length, 9);
   assert.deepEqual(
     graph.failure_controls.map(({ id }) => id).sort(),
     [
@@ -158,6 +161,22 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   malformedConstraint.evidence_types.find(({ id }) => id === "answer_quality")
     .identity_constraints.evaluation_contract = "unversioned";
   assert.throws(() => validateReleaseClaimGraph(malformedConstraint), /does not match versioned_contract/u);
+
+  const missingCloseoutCell = structuredClone(graph);
+  missingCloseoutCell.closeout.cell_groups = missingCloseoutCell.closeout.cell_groups
+    .filter(({ id }) => id !== "post_publish_bytes");
+  assert.throws(
+    () => validateReleaseClaimGraph(missingCloseoutCell),
+    /closeout must define exactly/u,
+  );
+
+  const aggregateCell = structuredClone(graph);
+  aggregateCell.closeout.cell_groups.find(({ id }) => id === "package_identity")
+    .required_identity.push("undeclared_identity");
+  assert.throws(
+    () => validateReleaseClaimGraph(aggregateCell),
+    /identity undeclared_identity must declare a format/u,
+  );
 
   for (const field of [
     "proof_run_sha_expression",

@@ -1,6 +1,6 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 2,
+  "graph_version": 3,
   "graph_id": "codestory-release-claims",
   "evidence_policy": {
     "selection": "all_matching_rows_must_pass",
@@ -31,7 +31,14 @@
       "baseline_sha256": "sha256",
       "candidate_sha256": "sha256",
       "release_key": "identifier",
-      "evaluation_contract": "versioned_contract"
+      "evaluation_contract": "versioned_contract",
+      "producer_workflow": "workflow_path",
+      "producer_run_id": "positive_integer",
+      "producer_run_attempt": "positive_integer",
+      "producer_artifact": "non_empty_text",
+      "native_engine": "identifier",
+      "calibration_sha256": "sha256",
+      "pre_publish_artifact_sha256": "sha256"
     }
   },
   "exception_policy": {
@@ -481,6 +488,285 @@
       "command": "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard"
     }
   ],
+  "closeout": {
+    "schema": "codestory.release-closeout/v1",
+    "manifest_schema": "codestory.release-cell-manifest/v1",
+    "ledger_schema": "codestory.release-closeout-ledger/v1",
+    "summary_schema": "codestory.release-closeout-summary/v1",
+    "phases": [
+      "pre_publish",
+      "post_publish"
+    ],
+    "cell_groups": [
+      {
+        "id": "source_behavior",
+        "phase": "pre_publish",
+        "claim": "source_behavior",
+        "evidence_type": "source_behavior",
+        "expansion": "singleton",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/source-proof.yml"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "package_identity",
+        "phase": "pre_publish",
+        "claim": "package_identity",
+        "evidence_type": "package_identity",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/packaged-platform-proof.yml"
+        },
+        "archive_role": "pre_publish"
+      },
+      {
+        "id": "accelerator_execution",
+        "phase": "pre_publish",
+        "claim": "accelerator_execution",
+        "evidence_type": "accelerator_execution",
+        "expansion": "instances",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "runner",
+          "backend",
+          "native_engine",
+          "calibration_sha256",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch",
+          "runner",
+          "backend",
+          "native_engine"
+        ],
+        "instances": [
+          {
+            "id": "macos-arm64-metal",
+            "identity_constraints": {
+              "target": "macos-arm64",
+              "host_os": "macOS",
+              "host_arch": "ARM64",
+              "runner": "codestory-metal",
+              "backend": "Metal",
+              "producer_workflow": ".github/workflows/macos-metal-proof.yml"
+            }
+          },
+          {
+            "id": "windows-x64-vulkan",
+            "identity_constraints": {
+              "target": "windows-x64",
+              "host_os": "Windows",
+              "host_arch": "X64",
+              "runner": "codestory-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/windows-vulkan-proof.yml"
+            }
+          }
+        ],
+        "archive_role": "none"
+      },
+      {
+        "id": "retrieval_readiness",
+        "phase": "pre_publish",
+        "claim": "retrieval_readiness",
+        "evidence_type": "retrieval_readiness",
+        "expansion": "singleton",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "profile",
+          "corpus_id",
+          "cache_id",
+          "machine_fingerprint",
+          "release_key",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/release-candidate-evidence.yml"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "performance",
+        "phase": "pre_publish",
+        "claim": "performance",
+        "evidence_type": "performance",
+        "expansion": "singleton",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "profile",
+          "corpus_id",
+          "cache_id",
+          "machine_fingerprint",
+          "baseline_id",
+          "baseline_sha256",
+          "release_key",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/release-candidate-evidence.yml"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "answer_quality",
+        "phase": "pre_publish",
+        "claim": "answer_quality",
+        "evidence_type": "answer_quality",
+        "expansion": "singleton",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "profile",
+          "corpus_id",
+          "cache_id",
+          "machine_fingerprint",
+          "release_key",
+          "artifact_sha256",
+          "evaluation_contract",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/release-candidate-evidence.yml"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "platform_support",
+        "phase": "post_publish",
+        "claim": "platform_support",
+        "evidence_type": "platform_support",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/post-publish-release-smoke.yml"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "installed_runtime_behavior",
+        "phase": "post_publish",
+        "claim": "installed_runtime_behavior",
+        "evidence_type": "installed_runtime_behavior",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "installer",
+          "runtime_version",
+          "native_engine",
+          "calibration_sha256",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch",
+          "installer",
+          "native_engine"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/post-publish-release-smoke.yml"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "post_publish_bytes",
+        "phase": "post_publish",
+        "claim": "package_identity",
+        "evidence_type": "package_identity",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "pre_publish_artifact_sha256",
+          "producer_version",
+          "target",
+          "producer_workflow",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/post-publish-release-smoke.yml"
+        },
+        "archive_role": "post_publish_compare"
+      }
+    ]
+  },
   "workflow_policy": {
     "artifact_retention_days": 30,
     "package_matrix": [

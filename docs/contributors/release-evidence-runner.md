@@ -198,3 +198,24 @@ candidate, approval when supplied, and report files that exist. Runner
 provisioning alone does not establish a baseline, execute the real-repo drill,
 or prove a candidate acceptable. The release remains blocked until the selected
 profile exists as an approved, release-eligible baseline.
+
+## Closeout handoff
+
+Release-evidence output is one input to the exact-head closeout ledger; it is
+not the ledger itself. Each producer supplies one
+`codestory.release-cell-manifest/v1` document for its graph-owned cell. The
+manifest carries the claim evidence row plus its workflow, run, attempt and
+artifact identity. Native cells also carry the applicable target, concrete
+host, runtime/native engine and calibration identities. The coordinator
+derives the required inventory from `release-claims.json`, so operators must
+not maintain a separate target checklist or combine multiple hosts into one
+manifest.
+
+First evaluate and retain the `pre_publish` ledger. Package rows preserve the
+archive name, byte count and SHA-256 used by publication. After the GitHub
+release exists, run the `post_publish` phase with that accepted ledger; every
+published download must name its pre-publish package cell and match its
+retained manifest and archive digests exactly. Keep the per-cell manifests and
+evaluations with both ledgers. A missing, duplicate, expired, failed,
+cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
+an operator override.

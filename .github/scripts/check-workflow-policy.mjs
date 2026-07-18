@@ -1111,8 +1111,10 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       ".github/actionlint.yaml",
       "release-claims.json",
       "scripts/codestory-release-claims.mjs",
+      "scripts/codestory-release-closeout.mjs",
       "scripts/codestory-release-evidence-gate.mjs",
       "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
       "scripts/tests/fixtures/release-claims/**",
       "benchmarks/release-evidence/**",
@@ -1156,6 +1158,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     ]);
     requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
       "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
     ]);
     requireStepRun(violations, pluginFile, job, "Check CI proof routing fixtures", ["node .github/scripts/route-ci-proof.mjs --self-test"]);
@@ -1304,6 +1307,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
     "scripts/tests/codestory-release-claims.test.mjs",
+    "scripts/tests/codestory-release-closeout.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
   ]);
   requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
@@ -2068,6 +2072,7 @@ function validateRemainingWorkflows(workflows, violations) {
     ]);
     requireStepRun(violations, autoFile, policy, "Check release claim and evidence contracts", [
       "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
     ]);
     requireStepRun(violations, autoFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
