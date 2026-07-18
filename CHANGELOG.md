@@ -12,6 +12,8 @@
   uses the same bounded 30-minute per-run proof ceiling as the other protected
   qualification lanes and records its monotonic and suspend-inclusive clocks
   with the canonical identifiers required by the checked measurement protocol.
+  True-idle measurement also retains only a resident, positive-generation
+  owner identity before timing the server's exit.
 - Cold project activation now keeps one election stable when its exact storage
   path appears during indexing, while still using native filesystem identity
   to match distinct aliases.
