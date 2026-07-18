@@ -1140,7 +1140,7 @@ mod platform {
         }
         #[cfg(target_os = "linux")]
         {
-            "clock_gettime(CLOCK_MONOTONIC)"
+            "CLOCK_MONOTONIC"
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -1155,7 +1155,7 @@ mod platform {
         }
         #[cfg(target_os = "linux")]
         {
-            "clock_gettime(CLOCK_BOOTTIME)"
+            "CLOCK_BOOTTIME"
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -2497,6 +2497,20 @@ mod platform {
             assert_eq!(fail_closed_clock_value(Some(7), "test"), 7);
             let failure = std::panic::catch_unwind(|| fail_closed_clock_value(None, "test"));
             assert!(failure.is_err());
+        }
+
+        #[test]
+        fn embedding_clock_labels_match_the_measurement_protocol() {
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(clock_api(), "CLOCK_MONOTONIC");
+                assert_eq!(inclusive_clock_api(), "CLOCK_BOOTTIME");
+            }
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(clock_api(), "mach_absolute_time");
+                assert_eq!(inclusive_clock_api(), "mach_continuous_time");
+            }
         }
     }
 }
