@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "corpus_id": "codestory-release-corpus-v0.16-axios-ripgrep-rust-v1",
+  "task_ids": [
+    "axios-request-dispatch",
+    "ripgrep-search-pipeline"
+  ],
+  "task_manifests": {
+    "axios-request-dispatch": {
+      "path": "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json",
+      "sha256": "3dfb002f0dd0b0683c8bca2314a405dc0d728aeeb8533247a6b17e316aed81c0"
+    },
+    "ripgrep-search-pipeline": {
+      "path": "benchmarks/tasks/holdout-retrieval/ripgrep-search-pipeline.task.json",
+      "sha256": "3b3f1c803a062c7aa532c4152eaa16279c77cb920bf42134e495273b1ac94422"
+    }
+  },
+  "project_manifests": {
+    "ripgrep-search-pipeline": {
+      "path": "benchmarks/tasks/holdout-retrieval/ripgrep-rust-codestory-project.json",
+      "sha256": "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a"
+    }
+  }
+}

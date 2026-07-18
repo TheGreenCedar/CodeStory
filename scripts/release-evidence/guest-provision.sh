@@ -39,6 +39,12 @@ rustup_sha=$(get '.guest.rust.rustup_init_sha256')
 snapshot=$(get '.guest.apt_snapshot')
 drill_repository=$(get '.drill.repository')
 drill_commit=$(get '.drill.commit')
+drill_project_manifest_sha=$(get '.drill.project_manifest_sha256')
+drill_project_manifest_source="$(dirname "$contract")/serde-json-codestory-project.json"
+
+test -f "$drill_project_manifest_source"
+test "$(sha256sum "$drill_project_manifest_source" | awk '{print $1}')" = \
+  "$drill_project_manifest_sha"
 
 test "$snapshot" = "$bootstrap_snapshot"
 test "$(get '.guest.apt_packages.jq')" = "$bootstrap_jq_version"
@@ -160,6 +166,17 @@ sudo -u codestory-runner git -C "$drill_repo" checkout --detach --force "$drill_
 sudo -u codestory-runner git -C "$drill_repo" reset --hard "$drill_commit"
 sudo -u codestory-runner git -C "$drill_repo" clean -ffdqx
 test "$(sudo -u codestory-runner git -C "$drill_repo" rev-parse HEAD)" = "$drill_commit"
+test -z "$(sudo -u codestory-runner git -C "$drill_repo" status --porcelain)"
+
+sudo -u codestory-runner grep -qxF /codestory_project.json \
+  "$drill_repo/.git/info/exclude" \
+  || printf '%s\n' /codestory_project.json \
+    | sudo -u codestory-runner tee -a "$drill_repo/.git/info/exclude" >/dev/null
+sudo install -o codestory-runner -g codestory-runner -m 0640 \
+  "$drill_project_manifest_source" "$drill_repo/codestory_project.json"
+test "$(sudo -u codestory-runner sha256sum "$drill_repo/codestory_project.json" \
+  | awk '{print $1}')" = "$drill_project_manifest_sha"
+sudo -u codestory-runner git -C "$drill_repo" check-ignore -q codestory_project.json
 test -z "$(sudo -u codestory-runner git -C "$drill_repo" status --porcelain)"
 
 manifest="$runner_root/drills/real-repo-drill-cases.json"

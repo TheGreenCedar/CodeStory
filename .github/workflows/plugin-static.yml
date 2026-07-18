@@ -51,6 +51,7 @@ on:
       - crates/codestory-llama-sys/Cargo.toml
       - crates/codestory-llama-sys/tests/model_staging.rs
       - scripts/release-evidence/machine-contract.json
+      - scripts/release-evidence/serde-json-codestory-project.json
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - .codex/environments/environment.toml
@@ -107,6 +108,7 @@ on:
       - crates/codestory-llama-sys/Cargo.toml
       - crates/codestory-llama-sys/tests/model_staging.rs
       - scripts/release-evidence/machine-contract.json
+      - scripts/release-evidence/serde-json-codestory-project.json
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - .codex/environments/environment.toml

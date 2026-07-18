@@ -91,6 +91,7 @@
   },
   "drill": {
     "repository": "https://github.com/serde-rs/json.git",
-    "commit": "827a315bf2198558f0325b07bcc1e2cd973aba2f"
+    "commit": "827a315bf2198558f0325b07bcc1e2cd973aba2f",
+    "project_manifest_sha256": "cccd6fdbd3ee5f288315ed015d9fd3ce0e4a3c9b3398a017038e77b91f4c46e7"
   }
 }

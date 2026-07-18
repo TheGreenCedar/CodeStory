@@ -4,6 +4,27 @@ CodeStory release-candidate measurements run on one repository-scoped Linux
 runner so baseline identity, cache state, model bytes, and toolchain remain
 stable between candidates. Ordinary pull requests must not target this runner.
 
+## v0.16 corpus boundary
+
+The v0.16 profile uses
+`codestory-release-corpus-v0.16-axios-js-ts-v1`: one Axios
+JavaScript/TypeScript task with three cold CLI packet repeats. The checked
+corpus contract binds the exact task-manifest bytes and rejects missing,
+substituted, or extra task rows. Ripgrep's pinned Rust task and project template
+remain available for follow-up diagnostics, but a retained three-repeat run
+did not meet its preregistered file and citation recall thresholds, so v0.16
+makes no Ripgrep or general Rust packet-quality claim. Redis/C, shell dialects,
+and general parser completeness are also outside this release-evidence claim.
+The approved baseline profile records the corpus-contract path and SHA-256, so
+candidate evidence cannot silently widen, narrow, or replace that scope.
+
+Cold CLI packet provenance is taken from the packet process that actually ran.
+It binds the packet's executed semantic stage, full sidecar diagnostics, and
+zero semantic fallback to the exact semantic generation prepared by the
+harness. A later status process cannot supply the earlier process-local
+embedding-engine instance identity; warm-process evidence still requires that
+live identity directly.
+
 ## Machine contract
 
 The approved host shape for the 0.16 in-process retrieval baseline is:
@@ -22,6 +43,7 @@ The approved host shape for the 0.16 in-process retrieval baseline is:
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
 | Drill manifest | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
+| Drill project manifest | `scripts/release-evidence/serde-json-codestory-project.json` |
 
 The profile ID is a stable comparison key, not evidence about the current
 machine. Provisioning records the observed host, generated Colima VM shape,
@@ -60,7 +82,9 @@ Provisioning is idempotent. It:
 - disables automatic runner updates so baseline changes are deliberate;
 - verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and
   linked embedding engine without provisioning either one;
-- prepares a source-backed `serde_json` drill at an exact commit;
+- prepares a source-backed `serde_json` drill at an exact commit and installs
+  the checksum-bound project manifest that excludes its intentionally malformed
+  compiler UI fixtures from the valid-source corpus;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
 - keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
   under the proof-owned volume.

@@ -12,6 +12,12 @@ runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
 data_root=$(get '.runner.data_root')
 drill_commit=$(get '.drill.commit')
+drill_project_manifest_sha=$(get '.drill.project_manifest_sha256')
+drill_project_manifest_source="$(dirname "$contract")/serde-json-codestory-project.json"
+
+test -f "$drill_project_manifest_source"
+test "$(sha256sum "$drill_project_manifest_source" | awk '{print $1}')" = \
+  "$drill_project_manifest_sha"
 
 mount_table=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | sort)
 printf '%s\n' "$mount_table"
@@ -109,7 +115,16 @@ jq -e --arg profile_id "$profile_id" --arg repository "$repository" \
   ' "$ownership" >/dev/null
 
 test "$(git -C "$runner_root/drills/serde-json" rev-parse HEAD)" = "$drill_commit"
+test "$(sha256sum "$runner_root/drills/serde-json/codestory_project.json" \
+  | awk '{print $1}')" = "$drill_project_manifest_sha"
+git -C "$runner_root/drills/serde-json" check-ignore -q codestory_project.json
 test -z "$(git -C "$runner_root/drills/serde-json" status --porcelain)"
+jq -e '
+  .name == "serde-json-release-evidence" and
+  .source_groups[0].source_paths == ["."] and
+  .source_groups[0].exclude_patterns ==
+    ["**/.git/**", "**/target/**", "tests/ui/**"]
+  ' "$runner_root/drills/serde-json/codestory_project.json" >/dev/null
 jq -e '.cases[0].anchors == ["from_reader", "Deserializer::from_reader", "Value"]' \
   "$runner_root/drills/real-repo-drill-cases.json" >/dev/null
 test -f "$runner_root/validation/source-sha"
@@ -120,6 +135,8 @@ printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{40}$'
 memory_bytes=$(awk '/MemTotal/{printf "%.0f", $2 * 1024}' /proc/meminfo)
 workspace_free_bytes=$(df --output=avail -B1 "$runner_root" | tail -1 | tr -d ' ')
 manifest_sha=$(sha256sum "$runner_root/drills/real-repo-drill-cases.json" | awk '{print $1}')
+project_manifest_sha=$(sha256sum \
+  "$runner_root/drills/serde-json/codestory_project.json" | awk '{print $1}')
 os_pretty=$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release)
 node_version=$(node --version)
 cargo_version=$(cargo --version)
@@ -147,6 +164,7 @@ jq -n --slurpfile observed "$observed_identity" \
   --arg repository "$repository" --arg runner_name "$runner_name" \
   --arg runner_version "$runner_version" --argjson runner_id "$agent_id" \
   --arg drill_commit "$drill_commit" --arg manifest_sha "$manifest_sha" \
+  --arg project_manifest_sha "$project_manifest_sha" \
   --arg source_sha "$source_sha" --argjson memory_bytes "$memory_bytes" \
   --argjson workspace_free_bytes "$workspace_free_bytes" '
   {
@@ -158,7 +176,9 @@ jq -n --slurpfile observed "$observed_identity" \
     capacity:{observed_memory_bytes:$memory_bytes,observed_workspace_free_bytes:$workspace_free_bytes},
     drill:{repository:"https://github.com/serde-rs/json.git",commit:$drill_commit,
       manifest:"/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
-      manifest_sha256:$manifest_sha},
+      manifest_sha256:$manifest_sha,
+      project_manifest:"/srv/codestory-release-evidence/drills/serde-json/codestory_project.json",
+      project_manifest_sha256:$project_manifest_sha},
     validation_source:{repository:"https://github.com/TheGreenCedar/CodeStory.git",commit:$source_sha},
     root:"/srv/codestory-release-evidence"
   }' | tee "$runner_root/artifacts/provisioning.json" >/dev/null
