@@ -67,6 +67,84 @@ fn durable_sqlite_state(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
 }
 
 #[test]
+fn file_identity_lookup_batches_above_default_bind_limit_with_set_semantics()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(40_000),
+        kind: NodeKind::FILE,
+        serialized_name: "large.rs".to_string(),
+        ..Default::default()
+    }])?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "early_match".to_string(),
+            file_node_id: Some(NodeId(40_000)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(500),
+            kind: NodeKind::CLASS,
+            serialized_name: "direct_match".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(40_001),
+            kind: NodeKind::METHOD,
+            serialized_name: "late_match".to_string(),
+            file_node_id: Some(NodeId(40_000)),
+            ..Default::default()
+        },
+    ])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 64)?;
+    assert!(previous_limit >= 64);
+
+    // Two bindings per candidate made the former single query exceed SQLite's
+    // 32,766 default once this set grew past 16,383 IDs.
+    let mut candidates = (0_i64..=32_766).collect::<Vec<_>>();
+    candidates.extend([40_000, 40_000, 50_000]);
+    let node_kinds = storage.get_node_kinds_for_files(&candidates)?;
+
+    assert_eq!(
+        node_kinds,
+        vec![
+            (NodeId(1), NodeKind::FUNCTION),
+            (NodeId(500), NodeKind::CLASS),
+            (NodeId(40_000), NodeKind::FILE),
+            (NodeId(40_001), NodeKind::METHOD),
+        ]
+    );
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    Ok(())
+}
+
+#[test]
+fn file_identity_lookup_rejects_runtime_limit_below_two_bindings() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 1)?;
+
+    let error = storage
+        .get_node_kinds_for_files(&[1])
+        .expect_err("two-predicate lookup must reject a one-variable runtime limit");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot support the two file identity predicates"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn observational_open_preserves_current_database_bytes_without_sidecars() {
     let path = unique_temp_db_path("observational-current");
     create_versioned_observation_fixture(&path, SCHEMA_VERSION);

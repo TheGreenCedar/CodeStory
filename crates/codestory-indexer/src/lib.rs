@@ -870,6 +870,9 @@ impl WorkspaceIndexer {
             });
         }
         let mut stats = IncrementalIndexingStats::default();
+        if Self::is_cancelled(cancel_token) {
+            return Ok(stats);
+        }
         let total_files = plan.files_to_index.len();
         let processed_count = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -884,6 +887,9 @@ impl WorkspaceIndexer {
         )?;
         stats.setup_existing_projection_ids_ms =
             duration_ms_u64(existing_projection_setup_started.elapsed());
+        if Self::is_cancelled(cancel_token) {
+            return Ok(stats);
+        }
 
         let mut replaced_projection_ids = HashSet::new();
         let symbol_seed_started = Instant::now();
@@ -20683,6 +20689,78 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             "indexing should flush edges"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_run_skips_file_identity_lookups_and_projection_writes() -> Result<()> {
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("cancelled.rs");
+        std::fs::write(&path, "fn must_not_publish() {}\n")?;
+        let mut storage = Storage::new_in_memory()?;
+        storage.get_connection().execute("DROP TABLE node", [])?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            Some(&cancel_token),
+        )?;
+
+        assert_eq!(stats.setup_existing_projection_ids_ms, 0);
+        assert_eq!(stats.setup_seed_symbol_table_ms, 0);
+        assert!(!stats.resolution_ran);
+        assert!(storage.get_files()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn file_identity_lookup_errors_retain_indexer_stage_context_without_writes() -> Result<()> {
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("lookup.rs");
+        let storage = Storage::new_in_memory()?;
+        storage.get_connection().execute("DROP TABLE node", [])?;
+
+        let identity_error = WorkspaceIndexer::existing_projection_file_ids(
+            &storage,
+            dir.path(),
+            std::slice::from_ref(&path),
+            &HashMap::new(),
+        )
+        .expect_err("missing node storage must fail identity discovery");
+        assert!(
+            identity_error
+                .to_string()
+                .contains("Storage file identity lookup error"),
+            "unexpected identity error: {identity_error:#}"
+        );
+
+        let symbol_error = WorkspaceIndexer::seed_symbol_table(
+            &storage,
+            &SymbolTable::new(),
+            codestory_workspace::BuildMode::Incremental,
+            &HashSet::from([1]),
+        )
+        .expect_err("missing node storage must fail symbol seeding");
+        assert!(
+            symbol_error
+                .to_string()
+                .contains("Storage symbol seed error"),
+            "unexpected symbol error: {symbol_error:#}"
+        );
+        assert!(storage.get_files()?.is_empty());
         Ok(())
     }
 
