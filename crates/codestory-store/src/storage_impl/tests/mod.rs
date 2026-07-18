@@ -1210,6 +1210,50 @@ fn test_resolution_support_snapshot_round_trip_and_invalidation() -> Result<(), 
 }
 
 #[test]
+fn test_resolution_support_snapshot_read_classifies_runtime_capacity() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage.put_resolution_support_snapshot(1, &vec![b'x'; 2_048])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, 1_024)?;
+    assert!(matches!(
+        storage.get_resolution_support_snapshot(1),
+        Err(StorageError::ResolutionSupportSnapshotTooBig)
+    ));
+    storage.invalidate_resolution_support_snapshot()?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, previous_limit)?;
+    assert!(!storage.has_ready_resolution_support_snapshot(1)?);
+
+    Ok(())
+}
+
+#[test]
+fn test_resolution_support_snapshot_write_classifies_runtime_row_capacity()
+-> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let snapshot_blob = vec![b'x'; 1_024];
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, snapshot_blob.len() as i32)?;
+
+    assert!(matches!(
+        storage.put_resolution_support_snapshot(1, &snapshot_blob),
+        Err(StorageError::ResolutionSupportSnapshotTooBig)
+    ));
+    storage.invalidate_resolution_support_snapshot()?;
+
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, previous_limit)?;
+    assert!(!storage.has_ready_resolution_support_snapshot(1)?);
+
+    Ok(())
+}
+
+#[test]
 fn test_update_file_metadata_preserves_resolution_support_snapshot() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     storage.insert_file(&FileInfo {

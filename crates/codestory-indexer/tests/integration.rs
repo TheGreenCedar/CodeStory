@@ -5,6 +5,7 @@ use codestory_contracts::graph::{
 use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
 use codestory_store::Store as Storage;
+use rusqlite::limits::Limit;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -306,6 +307,9 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
     assert_eq!(first_stats.artifact_cache_hits, 0);
     assert_eq!(first_stats.artifact_cache_misses, 1);
     assert!(!first_stats.resolution_support_snapshot_hit);
+    assert!(first_stats.resolution_support_snapshot_limit_bytes > 0);
+    assert!(first_stats.resolution_support_snapshot_stored);
+    assert!(!first_stats.resolution_support_snapshot_skipped_oversize);
     assert!(storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
 
     let second_stats = run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
@@ -314,9 +318,171 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
 
     let resolution_stats = ResolutionPass::new().run(&mut storage)?;
     assert!(resolution_stats.telemetry.support_snapshot_hit);
+    assert!(!resolution_stats.telemetry.support_snapshot_stored);
+    assert!(!resolution_stats.telemetry.support_snapshot_skipped_oversize);
 
     let nodes = storage.get_nodes()?;
     assert!(nodes.iter().any(|node| node.serialized_name == "run"));
+
+    Ok(())
+}
+
+#[test]
+fn test_resolution_skips_oversized_optional_snapshot_without_changing_results() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("main.rs");
+    fs::write(&file_path, "fn helper() {}\nfn run() { helper(); }\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path])?;
+
+    let nodes = storage.get_nodes()?;
+    let file_node_id = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing file node"))?;
+    let helper_id = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "helper")
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing helper node"))?;
+    let run_id = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "run")
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing run node"))?;
+    let original_call = storage
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .ok_or_else(|| anyhow::anyhow!("missing run-to-helper call"))?;
+    assert_eq!(original_call.resolved_target, Some(helper_id));
+
+    let noise_nodes = (0..32)
+        .map(|index| codestory_contracts::graph::Node {
+            id: NodeId(9_000_000 + index),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("unrelated_snapshot_candidate_{index}"),
+            qualified_name: Some(format!("fixture::unrelated_snapshot_candidate_{index}")),
+            file_node_id: Some(file_node_id),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    storage.insert_nodes_batch(&noise_nodes)?;
+    storage
+        .put_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION, &vec![b'x'; 2_048])?;
+    storage.get_connection().execute(
+        "UPDATE edge
+         SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
+         WHERE id = ?1",
+        [original_call.id.0],
+    )?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, 1_024)?;
+    let result = ResolutionPass::new().run(&mut storage);
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, previous_limit)?;
+    let stats = result?;
+
+    assert_eq!(stats.resolved_calls, 1);
+    assert_eq!(stats.telemetry.support_snapshot_limit_bytes, 1_024);
+    assert!(stats.telemetry.support_snapshot_skipped_oversize);
+    assert!(!stats.telemetry.support_snapshot_stored);
+    assert!(!stats.telemetry.support_snapshot_hit);
+    assert!(!storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
+
+    let resolved_call = storage
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == original_call.id)
+        .ok_or_else(|| anyhow::anyhow!("missing resolved call"))?;
+    assert_eq!(resolved_call.resolved_target, original_call.resolved_target);
+    assert_eq!(storage.get_nodes()?, {
+        let mut expected = nodes;
+        expected.extend(noise_nodes);
+        expected.sort_by_key(|node| node.id);
+        expected
+    });
+
+    Ok(())
+}
+
+#[test]
+fn test_resolution_skips_snapshot_rejected_by_sqlite_row_capacity_without_changing_results()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("main.rs");
+    fs::write(&file_path, "fn helper() {}\nfn run() { helper(); }\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path])?;
+
+    let nodes = storage.get_nodes()?;
+    let helper_id = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "helper")
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing helper node"))?;
+    let run_id = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "run")
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing run node"))?;
+    let original_call = storage
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .ok_or_else(|| anyhow::anyhow!("missing run-to-helper call"))?;
+    assert_eq!(original_call.resolved_target, Some(helper_id));
+
+    let snapshot_blob = storage
+        .get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
+        .ok_or_else(|| anyhow::anyhow!("missing initial resolution support snapshot"))?;
+    storage.invalidate_resolution_support_snapshot()?;
+    storage.get_connection().execute(
+        "UPDATE edge
+         SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
+         WHERE id = ?1",
+        [original_call.id.0],
+    )?;
+
+    // The rebuilt JSON is identical to the snapshot above and therefore fits
+    // this value limit exactly. SQLite still rejects the complete row because
+    // its record header and the other columns also count toward LENGTH.
+    let snapshot_limit = i32::try_from(snapshot_blob.len())?;
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, snapshot_limit)?;
+    let result = ResolutionPass::new().run(&mut storage);
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, previous_limit)?;
+    let stats = result?;
+
+    assert_eq!(stats.resolved_calls, 1);
+    assert_eq!(
+        stats.telemetry.support_snapshot_limit_bytes,
+        snapshot_blob.len() as u64
+    );
+    assert!(stats.telemetry.support_snapshot_skipped_oversize);
+    assert!(!stats.telemetry.support_snapshot_stored);
+    assert!(!stats.telemetry.support_snapshot_hit);
+    assert!(!storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
+
+    let resolved_call = storage
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == original_call.id)
+        .ok_or_else(|| anyhow::anyhow!("missing resolved call"))?;
+    assert_eq!(resolved_call.resolved_target, original_call.resolved_target);
+    assert_eq!(storage.get_nodes()?, nodes);
 
     Ok(())
 }

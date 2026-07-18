@@ -395,6 +395,17 @@ fn append_index_flush_timings(markdown: &mut String, timings: &IndexingPhaseTimi
 fn append_index_resolution_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
     append_index_resolution_core_timings(markdown, timings);
     append_index_resolution_index_timings(markdown, timings);
+    if let Some(limit_bytes) = timings.resolution_support_snapshot_limit_bytes {
+        let _ = writeln!(
+            markdown,
+            "resolution_support_snapshot: limit_bytes={} stored={} skipped_oversize={}",
+            limit_bytes,
+            timings.resolution_support_snapshot_stored.unwrap_or(false),
+            timings
+                .resolution_support_snapshot_skipped_oversize
+                .unwrap_or(false)
+        );
+    }
     append_index_resolution_detail_timings(markdown, timings);
     append_index_resolution_request_counts(markdown, timings);
 }
