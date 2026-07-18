@@ -6179,6 +6179,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static SOURCE_POLICY_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static SOURCE_POLICY_AFTER_PLAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -6212,6 +6214,22 @@ fn arm_source_policy_before_revalidate_hook(hook: impl FnOnce() + 'static) {
 #[cfg(test)]
 fn run_source_policy_before_revalidate_hook() {
     SOURCE_POLICY_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_source_policy_after_plan_hook(hook: impl FnOnce() + 'static) {
+    SOURCE_POLICY_AFTER_PLAN_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_source_policy_after_plan_hook() {
+    SOURCE_POLICY_AFTER_PLAN_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
         }
@@ -14283,6 +14301,9 @@ fn index_full_for_runtime(
         file_count: total_files,
     });
 
+    #[cfg(test)]
+    run_source_policy_after_plan_hook();
+
     let mut staged = SnapshotStore::open_staged(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
     let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
@@ -22262,6 +22283,56 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect_err("incompatible reader must fail closed");
             assert_eq!(error.code, "source_verification_failed");
         }
+    }
+
+    #[test]
+    fn special_collector_growth_after_planning_cannot_publish() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let source_path = workspace.path().join("schema.sql");
+        fs::write(&source_path, "CREATE TABLE drifted (id INTEGER);\n")
+            .expect("write below-cap structural source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            SourceIndexPolicy::oversized(64),
+        );
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+
+        let changed_path = source_path.clone();
+        arm_source_policy_after_plan_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("read planned structural source");
+            bytes.resize(65, b' ');
+            fs::write(&changed_path, bytes).expect("grow structural source after planning");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("post-plan oversized structural source must reject publication");
+        assert_eq!(error.code, "source_oversized");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details.coverage_gaps.iter().any(|gap| {
+                gap.path == "schema.sql"
+                    && gap.reason == FileCoverageReason::Oversized
+                    && !gap.verified_source
+                    && !gap.projection_available
+            })
+        }));
+        if storage_path.exists() {
+            assert!(
+                Storage::open(&storage_path)
+                    .expect("open rejected live storage")
+                    .get_index_publication()
+                    .expect("read rejected publication")
+                    .is_none()
+            );
+        }
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]
