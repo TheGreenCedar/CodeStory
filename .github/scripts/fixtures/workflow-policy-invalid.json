@@ -127,8 +127,8 @@
       "value": []
     },
     {
-      "id": "persistent-label",
-      "class_prefix": "[persistent_label]",
+      "id": "synchronize-proof-trigger",
+      "class_prefix": "[proof_identity]",
       "workflow": "source-proof.yml",
       "field": [
         "on",
@@ -136,8 +136,19 @@
         "types"
       ],
       "value": [
-        "labeled"
+        "labeled",
+        "synchronize"
       ]
+    },
+    {
+      "id": "pr-number-only-proof-concurrency",
+      "class_prefix": "[proof_identity]",
+      "workflow": "packaged-platform-pr.yml",
+      "field": [
+        "concurrency",
+        "group"
+      ],
+      "value": "proof-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || github.event.pull_request.number || 'dev' }}"
     }
   ]
 }

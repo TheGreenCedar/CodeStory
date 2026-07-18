@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -51,6 +53,60 @@ function draftStep(job, name) {
   const matches = job.steps.filter(step => step.name === name);
   assert.equal(matches.length, 1, `expected one ${name} step`);
   return matches[0];
+}
+
+function moveNamedStepBefore(job, movedName, beforeName) {
+  const movedIndex = job.steps.findIndex(step => step.name === movedName);
+  assert.notEqual(movedIndex, -1, `missing ${movedName}`);
+  const [moved] = job.steps.splice(movedIndex, 1);
+  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
+  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
+  job.steps.splice(beforeIndex, 0, moved);
+}
+
+function cloneCacheSaveBefore(job, sourceName, beforeName, uses) {
+  const clone = structuredClone(draftStep(job, sourceName));
+  clone.name = `${sourceName} clone`;
+  if (uses !== undefined) clone.uses = uses;
+  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
+  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
+  job.steps.splice(beforeIndex, 0, clone);
+}
+
+function runResolver(file, jobName, environment) {
+  const workflow = loadWorkflows().get(file);
+  const run = draftStep(workflow.jobs[jobName], "Resolve trusted exact head").run;
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-proof-resolver-"));
+  const fakeGh = path.join(directory, "gh");
+  const baseSha = "1".repeat(40);
+  writeFileSync(fakeGh, `#!/bin/sh
+case "$*" in
+  *"branches/dev/codestory-next"*) printf '%s\\n' '${fullSha}' ;;
+  *) printf '%s\\n' '${JSON.stringify({
+    head: {
+      repo: { full_name: "TheGreenCedar/CodeStory" },
+      sha: fullSha,
+      ref: "codex/exact-head",
+    },
+    base: { sha: baseSha, ref: "dev/codestory-next" },
+    labels: [{ name: "review-accepted" }],
+  })}' ;;
+esac
+`);
+  chmodSync(fakeGh, 0o755);
+  const output = path.join(directory, "github-output");
+  writeFileSync(output, "");
+  return spawnSync("bash", ["-c", run], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      GH_TOKEN: "test-token",
+      GITHUB_REPOSITORY: "TheGreenCedar/CodeStory",
+      GITHUB_OUTPUT: output,
+      ...environment,
+    },
+  });
 }
 
 function windowsManifestJob(workflow) {
@@ -163,6 +219,342 @@ jobs:
   const invalid = structuredClone(valid);
   invalid.jobs.check.steps[0].uses = "vendor/action@main";
   assert.match(basicWorkflowViolations("fixture.yml", invalid).join("\n"), /full-length SHA/u);
+});
+
+test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before proof work", async (t) => {
+  const otherSha = "2".repeat(40);
+  const sourceEnvironment = {
+    PR_NUMBER: "1230",
+    EXPECTED_HEAD_SHA: fullSha,
+    CALLER_REF: "",
+    EVENT_PR_NUMBER: "",
+    EVENT_HEAD_SHA: "",
+    EVENT_HEAD_REPO: "",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_SHA: fullSha,
+  };
+  await t.test("source PR dispatch", () => {
+    const rejected = runResolver("source-proof.yml", "resolve", {
+      ...sourceEnvironment,
+      GITHUB_REF: "refs/heads/main",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /--ref codex\/exact-head/u);
+
+    const wrongSha = runResolver("source-proof.yml", "resolve", {
+      ...sourceEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+      GITHUB_SHA: otherSha,
+    });
+    assert.notEqual(wrongSha.status, 0);
+    assert.match(wrongSha.stdout, /Workflow SHA .* is not reviewed PR head/u);
+
+    const accepted = runResolver("source-proof.yml", "resolve", {
+      ...sourceEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+    });
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+
+  await t.test("source labeled event", () => {
+    const environment = {
+      PR_NUMBER: "",
+      EXPECTED_HEAD_SHA: "",
+      CALLER_REF: "",
+      EVENT_PR_NUMBER: "1230",
+      EVENT_HEAD_SHA: fullSha,
+      EVENT_HEAD_REPO: "TheGreenCedar/CodeStory",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REF: "refs/pull/1230/merge",
+      GITHUB_SHA: fullSha,
+    };
+    const accepted = runResolver("source-proof.yml", "resolve", environment);
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+
+    const drifted = runResolver("source-proof.yml", "resolve", {
+      ...environment,
+      EVENT_HEAD_SHA: otherSha,
+    });
+    assert.notEqual(drifted.status, 0);
+    assert.match(drifted.stdout, /moved after the review-accepted label event/u);
+  });
+
+  const packagedEnvironment = {
+    INPUT_PR_NUMBER: "1230",
+    INPUT_HEAD_SHA: fullSha,
+    INPUT_MODE: "platform",
+    EVENT_PR_NUMBER: "",
+    EVENT_HEAD_SHA: "",
+    EVENT_HEAD_REPO: "",
+    INPUT_SOURCE_RUN_ID: "",
+    INPUT_CALIBRATION_ARTIFACT: "",
+    INPUT_CALIBRATION_RUN_ID: "",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_SHA: fullSha,
+  };
+  await t.test("platform PR dispatch", () => {
+    const rejected = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      GITHUB_REF: "refs/heads/main",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /--ref codex\/exact-head/u);
+
+    const wrongSha = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+      GITHUB_SHA: otherSha,
+    });
+    assert.notEqual(wrongSha.status, 0);
+    assert.match(wrongSha.stdout, /Workflow SHA .* is not accepted PR head/u);
+
+    const accepted = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+    });
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+
+  await t.test("platform labeled event", () => {
+    const environment = {
+      ...packagedEnvironment,
+      INPUT_PR_NUMBER: "",
+      INPUT_HEAD_SHA: "",
+      INPUT_MODE: "",
+      EVENT_PR_NUMBER: "1230",
+      EVENT_HEAD_SHA: fullSha,
+      EVENT_HEAD_REPO: "TheGreenCedar/CodeStory",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REF: "refs/pull/1230/merge",
+    };
+    const accepted = runResolver("packaged-platform-pr.yml", "route", environment);
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+
+    const drifted = runResolver("packaged-platform-pr.yml", "route", {
+      ...environment,
+      EVENT_HEAD_SHA: otherSha,
+    });
+    assert.notEqual(drifted.status, 0);
+    assert.match(drifted.stdout, /moved after the platform-proof label event/u);
+  });
+
+  await t.test("integration dispatch", () => {
+    const rejected = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      INPUT_PR_NUMBER: "",
+      INPUT_MODE: "integration",
+      GITHUB_REF: "refs/heads/main",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /--ref dev\/codestory-next/u);
+
+    const accepted = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      INPUT_PR_NUMBER: "",
+      INPUT_MODE: "integration",
+      GITHUB_REF: "refs/heads/dev/codestory-next",
+    });
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+});
+
+test("exact proof policy rejects trigger, identity, and cache downgrades", async (t) => {
+  const sourceFile = "source-proof.yml";
+  const packagedCoordinatorFile = "packaged-platform-pr.yml";
+  const packagedProofFile = "packaged-platform-proof.yml";
+  const sourceResolver = workflow => draftStep(workflow.jobs.resolve, "Resolve trusted exact head");
+  const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
+
+  const mutations = [
+    ["source synchronize trigger", sourceFile, workflow => {
+      workflow.on.pull_request.types.push("synchronize");
+    }, /trigger must be label-only/u],
+    ["platform synchronize trigger", packagedCoordinatorFile, workflow => {
+      workflow.on.pull_request.types.push("synchronize");
+    }, /trigger must be label-only/u],
+    ["source PR-number-only concurrency", sourceFile, workflow => {
+      workflow.concurrency.group = "source-proof-${{ inputs.pr_number || github.event.pull_request.number }}";
+    }, /concurrency must bind the Actions SHA/u],
+    ["platform PR-number-only concurrency", packagedCoordinatorFile, workflow => {
+      workflow.concurrency.group = "proof-${{ inputs.mode }}-${{ inputs.pr_number }}";
+    }, /concurrency must bind the Actions SHA/u],
+    ["source manual SHA equality", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace('test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
+    }, /GITHUB_SHA.*EXPECTED_HEAD_SHA/u],
+    ["source manual SHA short-circuit", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace(
+          'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
+          'true || test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["source labeled branch disabled", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace(
+          'if [ -n "$EVENT_PR_NUMBER" ]; then',
+          'if false && [ -n "$EVENT_PR_NUMBER" ]; then',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["source resolver exits before trusted checks", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace(
+          "set -euo pipefail",
+          'set -euo pipefail\necho "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"\nexit 0',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["source resolver blank line", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace("set -euo pipefail\n", "set -euo pipefail\n\n");
+    }, /exact normalized trusted resolver script contract/u],
+    ["source labeled job disabled", sourceFile, workflow => {
+      workflow.jobs.resolve.if
+        = "false && (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')";
+    }, /only review-accepted labeled PR runs/u],
+    ["source manual ref equality", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace('test "$GITHUB_REF" = "refs\/heads\/$head_ref"', 'test -n "$GITHUB_REF"');
+    }, /GITHUB_REF.*head_ref/u],
+    ["platform manual SHA equality", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace('test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
+    }, /GITHUB_SHA.*INPUT_HEAD_SHA/u],
+    ["platform manual SHA short-circuit", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
+          'true || test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["platform labeled branch disabled", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          'if [ -n "$EVENT_HEAD_REPO" ]; then',
+          'if false && [ -n "$EVENT_HEAD_REPO" ]; then',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["platform resolver exits before trusted checks", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          "set -euo pipefail",
+          'set -euo pipefail\necho "head_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"\nexit 0',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["platform resolver backslash continuation blank line", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n    ||',
+          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n\n    ||',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["platform labeled job disabled", packagedCoordinatorFile, workflow => {
+      workflow.jobs.route.if
+        = "false && (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')";
+    }, /only platform-proof labeled PR runs/u],
+    ["integration live dev SHA equality", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace('test "$GITHUB_SHA" = "$dev_head"', 'test -n "$GITHUB_SHA"');
+    }, /GITHUB_SHA.*dev_head/u],
+    ["source unversioned cache", sourceFile, workflow => {
+      const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
+      restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");
+    }, /versioned exact-SHA namespace/u],
+    ["source broad cache fallback", sourceFile, workflow => {
+      draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output")
+        .with["restore-keys"] = "Linux-source-proof-";
+    }, /must not use fallback restore keys/u],
+    ["source cache always-save", sourceFile, workflow => {
+      draftStep(workflow.jobs["full-source-gate"], "Save Cargo inputs and output").if
+        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
+    }, /save only a successful exact miss/u],
+    ["source cache save before final proof", sourceFile, workflow => {
+      moveNamedStepBefore(
+        workflow.jobs["full-source-gate"],
+        "Save Cargo inputs and output",
+        "Test the complete workspace once",
+      );
+    }, /source cache unique cache save must run after every proof step/u],
+    ["source cache clone before proof", sourceFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["full-source-gate"],
+        "Save Cargo inputs and output",
+        "Test the complete workspace once",
+      );
+    }, /source cache must contain exactly one actions\/cache\/save action/u],
+    ["source mixed-case cache clone before proof", sourceFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["full-source-gate"],
+        "Save Cargo inputs and output",
+        "Test the complete workspace once",
+        "Actions/Cache/Save@v5",
+      );
+    }, /source cache must contain exactly one actions\/cache\/save action/u],
+    ["macOS source cache loses exact SHA", packagedCoordinatorFile, workflow => {
+      const restore = draftStep(workflow.jobs["macos-source"], "Restore exact-head macOS source cache");
+      restore.with.key = restore.with.key.replace("-${{ needs.route.outputs.head_sha }}", "");
+    }, /macOS source cache must be an exact-SHA restore/u],
+    ["macOS source cache save before final proof", packagedCoordinatorFile, workflow => {
+      moveNamedStepBefore(
+        workflow.jobs["macos-source"],
+        "Save exact-head macOS source cache",
+        "Capture Rust cache identity",
+      );
+    }, /macOS source cache unique cache save must run after every proof step/u],
+    ["macOS source cache clone before proof", packagedCoordinatorFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["macos-source"],
+        "Save exact-head macOS source cache",
+        "Capture Rust cache identity",
+      );
+    }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
+    ["macOS source mixed-case cache clone before proof", packagedCoordinatorFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["macos-source"],
+        "Save exact-head macOS source cache",
+        "Capture Rust cache identity",
+        "Actions/Cache/Save@v5",
+      );
+    }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
+    ["packaged cache loses exact SHA", packagedProofFile, workflow => {
+      const restore = draftStep(workflow.jobs.build, "Restore Cargo registry, git sources, and build output");
+      restore.with.key = restore.with.key.replace("-${{ inputs.ref }}", "");
+    }, /native build cache.*exact SHA/u],
+    ["packaged cache always-save", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Save Cargo registry, git sources, and build output").if
+        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
+    }, /save only a successful exact miss/u],
+    ["packaged cache save before final proof", packagedProofFile, workflow => {
+      moveNamedStepBefore(
+        workflow.jobs.build,
+        "Save Cargo registry, git sources, and build output",
+        "Build codestory-cli",
+      );
+    }, /native build cache unique cache save must run after every proof and cleanup step/u],
+    ["packaged cache clone before proof", packagedProofFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs.build,
+        "Save Cargo registry, git sources, and build output",
+        "Build codestory-cli",
+      );
+    }, /native build cache must contain exactly one actions\/cache\/save action/u],
+    ["packaged mixed-case cache clone before proof", packagedProofFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs.build,
+        "Save Cargo registry, git sources, and build output",
+        "Build codestory-cli",
+        "Actions/Cache/Save@v5",
+      );
+    }, /native build cache must contain exactly one actions\/cache\/save action/u],
+  ];
+
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
 });
 
 test("hosted Linux calibration keeps its bounded per-run timeout", async (t) => {

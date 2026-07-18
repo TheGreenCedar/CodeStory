@@ -9,8 +9,7 @@ on:
         type: string
       ref:
         description: Exact source SHA to package.
-        required: false
-        default: ""
+        required: true
         type: string
       scope:
         description: Native package matrix scope (windows, macos, or full).
@@ -76,7 +75,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: packaged-platform-proof-${{ inputs.proof_key || github.event.pull_request.number || github.ref }}
+  group: packaged-platform-proof-${{ github.sha }}-${{ inputs.ref }}-${{ inputs.proof_key || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -141,7 +140,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v3-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}
+          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v4-${{ inputs.ref }}-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}
 
       - name: Prove native workspace path identity
         if: runner.os == 'Windows'

@@ -14,6 +14,12 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 
 ### Reliability and compatibility
 
+- Exact-head source and platform proof now require one coherent workflow ref,
+  reviewed SHA, Actions SHA, concurrency identity, checkout, and cache
+  namespace. PR coordinators are label-only; manual runs must select the live
+  same-repository PR branch (or current `dev/codestory-next` for integration),
+  and failed, cancelled, wrong-ref, or stale-head work cannot publish proof
+  caches.
 - Windows source builds now use stable file-handle identity and replace preexisting hard-linked DLLs before runtime staging, allowing Rust 1.97.1 builds to complete.
 - Managed activation now repairs migrated cores that are missing a completed
   search generation instead of entering through the fail-closed reader and

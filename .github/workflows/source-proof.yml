@@ -2,7 +2,7 @@ name: Exact-head source proof
 
 on:
   pull_request:
-    types: [labeled, synchronize]
+    types: [labeled]
   workflow_call:
     inputs:
       ref:
@@ -14,11 +14,11 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Same-repository pull request accepted by exact-head review.
+        description: Same-repository pull request accepted by exact-head review. Dispatch with --ref <same-repository PR head branch>.
         required: true
         type: string
       expected_head_sha:
-        description: Exact reviewed head SHA. The gate refuses a newer or older head.
+        description: Exact reviewed head SHA. The selected --ref, github.sha, and live PR head must match.
         required: true
         type: string
 
@@ -27,7 +27,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: source-proof-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'review-accepted' && github.event.label.name || 'candidate' }}
+  group: source-proof-${{ github.sha }}-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}
   cancel-in-progress: true
 
 jobs:
@@ -56,7 +56,12 @@ jobs:
               exit 1
             }
             pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EVENT_PR_NUMBER")"
+            head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"
             current_head="$(jq -r '.head.sha' <<<"$pr")"
+            test "$head_repo" = "$GITHUB_REPOSITORY" || {
+              echo "::error::Exact-head proof does not execute fork pull requests."
+              exit 1
+            }
             test "$current_head" = "$EVENT_HEAD_SHA" || {
               echo "::error::PR #$EVENT_PR_NUMBER moved after the review-accepted label event."
               exit 1
@@ -68,6 +73,7 @@ jobs:
             pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
             head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"
             head_sha="$(jq -r '.head.sha' <<<"$pr")"
+            head_ref="$(jq -r '.head.ref' <<<"$pr")"
             test "$head_repo" = "$GITHUB_REPOSITORY" || {
               echo "::error::Exact-head proof does not execute fork pull requests."
               exit 1
@@ -76,9 +82,21 @@ jobs:
               echo "::error::PR #$PR_NUMBER moved from reviewed head $EXPECTED_HEAD_SHA to $head_sha."
               exit 1
             }
+            test "$GITHUB_REF" = "refs/heads/$head_ref" || {
+              echo "::error::Exact-head proof must be dispatched with --ref $head_ref (the same-repository PR head branch), not $GITHUB_REF."
+              exit 1
+            }
+            test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {
+              echo "::error::Workflow SHA $GITHUB_SHA is not reviewed PR head $EXPECTED_HEAD_SHA. Dispatch with --ref $head_ref."
+              exit 1
+            }
             echo "ref=$head_sha" >> "$GITHUB_OUTPUT"
           else
             test -n "$CALLER_REF"
+            test "$GITHUB_SHA" = "$CALLER_REF" || {
+              echo "::error::Reusable source proof ref $CALLER_REF does not match workflow SHA $GITHUB_SHA."
+              exit 1
+            }
             echo "ref=$CALLER_REF" >> "$GITHUB_OUTPUT"
           fi
 
@@ -116,7 +134,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-source-proof-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-source-proof-v2-${{ needs.resolve.outputs.ref }}-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}
 
       - name: Test the complete workspace once
         run: cargo test --workspace --locked

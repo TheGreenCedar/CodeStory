@@ -91,6 +91,38 @@ function requireStepRun(violations, file, job, name, fragments) {
   }
 }
 
+function exactResolverRunText(run) {
+  return run.replace(/\r\n/gu, "\n");
+}
+
+function requireExactResolverContract(violations, file, job, expectedDigest) {
+  const run = exactResolverRunText(stepRun(job, "Resolve trusted exact head"));
+  const digest = createHash("sha256").update(run).digest("hex");
+  add(
+    violations,
+    run.length > 0 && digest === expectedDigest,
+    `${file} resolver must match the exact normalized trusted resolver script contract`,
+  );
+}
+
+function requireUniqueCacheSaveLast(violations, file, job, cacheName, finalStepDescription) {
+  const steps = list(job?.steps).map(object);
+  const saves = steps.filter(
+    step => typeof step.uses === "string"
+      && step.uses.toLowerCase().startsWith("actions/cache/save@"),
+  );
+  add(
+    violations,
+    saves.length === 1,
+    `${file} ${cacheName} must contain exactly one actions/cache/save action`,
+  );
+  add(
+    violations,
+    saves.length === 1 && steps.at(-1) === saves[0],
+    `${file} ${cacheName} unique cache save must run after every ${finalStepDescription}`,
+  );
+}
+
 function requireStepUses(violations, file, job, name, expected) {
   add(
     violations,
@@ -122,6 +154,8 @@ const draftCachePaths = [
   "~/.cargo/git",
   "target",
 ];
+const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
+const platformResolverContractDigest = "331ee01b021f17d3221c7bc482d256ba36314116284a6bc22a2df87bd7487843";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",
@@ -1060,7 +1094,7 @@ function validateIssueWorkflows(workflows, violations) {
   }
 }
 
-function validatePluginAndDraftWorkflows(workflows, violations) {
+function validatePluginAndDraftWorkflows(workflows, violations, graph) {
   const pluginFile = "plugin-static.yml";
   const plugin = workflows.get(pluginFile);
   if (!plugin) {
@@ -1165,16 +1199,77 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
   if (!source) {
     violations.push(`${sourceFile} must exist`);
   } else {
-    add(violations, sameMembers(at(source, "on", "pull_request", "types"), ["labeled", "synchronize"]), `${sourceFile} pull request types must be labeled and synchronize`);
+    const promotion = graph.workflow_policy.promotion;
+    const sourceConcurrency = [
+      "source-proof-",
+      promotion.proof_run_sha_expression,
+      "-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-",
+      "${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}",
+    ].join("");
+    add(
+      violations,
+      sameMembers(at(source, "on", "pull_request", "types"), promotion.required_events),
+      `${sourceFile} pull request trigger must be label-only`,
+    );
+    add(
+      violations,
+      at(source, "concurrency", "group") === sourceConcurrency,
+      `${sourceFile} concurrency must bind the Actions SHA, proof identity, and exact label`,
+    );
+    add(
+      violations,
+      String(at(source, "on", "workflow_dispatch", "inputs", "pr_number", "description") ?? "")
+        .includes(promotion.manual_pr_ref_hint),
+      `${sourceFile} manual PR input must require ${promotion.manual_pr_ref_hint}`,
+    );
     add(violations, trigger(source, "pull_request_target") === undefined, `${sourceFile} must not execute pull-request code through pull_request_target`);
     const resolve = requireJob(violations, sourceFile, source, "resolve");
-    add(violations, String(resolve.if ?? "").includes("review-accepted"), `${sourceFile} resolve job must require review-accepted`);
+    add(
+      violations,
+      resolve.if === "github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')",
+      `${sourceFile} resolve job must execute dispatch/call runs and only review-accepted labeled PR runs`,
+    );
     requireStepRun(violations, sourceFile, resolve, "Resolve trusted exact head", [
       'test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY"',
       'test "$current_head" = "$EVENT_HEAD_SHA"',
+      'head_ref="$(jq -r \'.head.ref\'',
+      'test "$GITHUB_REF" = "refs/heads/$head_ref"',
+      'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"',
+      'test "$GITHUB_SHA" = "$CALLER_REF"',
+      "--ref $head_ref",
     ]);
+    requireExactResolverContract(violations, sourceFile, resolve, sourceResolverContractDigest);
     const full = requireJob(violations, sourceFile, source, "full-source-gate");
     add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
+    const restore = namedStep(full, "Restore Cargo inputs and output");
+    const restoreWith = object(restore?.with);
+    const expectedSourceKey = [
+      "${{ runner.os }}-",
+      promotion.source_cache_namespace,
+      "-${{ needs.resolve.outputs.ref }}-${{ steps.rust-cache-key.outputs.version }}-",
+      "${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}",
+    ].join("");
+    add(
+      violations,
+      restore?.uses === "actions/cache/restore@v5"
+        && restore?.["continue-on-error"] === true
+        && restoreWith.key === expectedSourceKey,
+      `${sourceFile} source cache must use the versioned exact-SHA namespace`,
+    );
+    add(
+      violations,
+      restoreWith["restore-keys"] === undefined,
+      `${sourceFile} source cache must not use fallback restore keys`,
+    );
+    const save = namedStep(full, "Save Cargo inputs and output");
+    add(
+      violations,
+      save?.uses === "actions/cache/save@v5"
+        && save?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''"
+        && object(save?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
+      `${sourceFile} source cache must save only a successful exact miss`,
+    );
+    requireUniqueCacheSaveLast(violations, sourceFile, full, "source cache", "proof step");
     requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
   }
@@ -1346,6 +1441,12 @@ function validatePackagedProof(workflows, violations, graph) {
     return;
   }
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
+  const refInput = object(at(workflow, "on", "workflow_call", "inputs", "ref"));
+  add(
+    violations,
+    refInput.required === true && refInput.type === "string" && refInput.default === undefined,
+    `${file} must require one exact source SHA`,
+  );
   add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
   add(violations, object(workflow.permissions).actions === "read", `${file} must read the prior-run calibration artifact`);
   for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
@@ -1383,6 +1484,11 @@ function validatePackagedProof(workflows, violations, graph) {
     `${file} must pin the glslc build image`,
   );
   const job = requireJob(violations, file, workflow, "build");
+  add(
+    violations,
+    at(workflow, "concurrency", "group") === "packaged-platform-proof-${{ github.sha }}-${{ inputs.ref }}-${{ inputs.proof_key || github.ref }}",
+    `${file} concurrency must bind caller SHA, exact package SHA, and proof identity`,
+  );
   validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"), graph);
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
   const packageSteps = list(job.steps).map(object);
@@ -1426,11 +1532,29 @@ function validatePackagedProof(workflows, violations, graph) {
       && nativeIdentityIndex < linuxBuildIndex,
     `${file} native build identity must run immediately after Rust selection and before cache restore or any native build`,
   );
+  const expectedPackageKey = [
+    "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-",
+    "${{ matrix.rust_target }}-",
+    graph.workflow_policy.promotion.packaged_cache_namespace,
+    "-${{ inputs.ref }}-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-",
+    "ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-",
+    "${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}",
+  ].join("");
   add(
     violations,
-    object(packageRestore?.with).key === "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-native-v3-${{ steps.rust-cache-key.outputs.generator }}-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.lock', '.github/docker/linux-glibc-build.Dockerfile', '.github/docker/glslc') }}",
-    `${file} native build cache must bind generator, CMake, Ninja, target, features, and lock identity`,
+    object(packageRestore?.with).key === expectedPackageKey
+      && object(packageRestore?.with)["restore-keys"] === undefined,
+    `${file} native build cache must bind generator, CMake, Ninja, target, features, lock identity, and exact SHA/versioned namespace without fallbacks`,
   );
+  const packageSave = namedStep(job, "Save Cargo registry, git sources, and build output");
+  add(
+    violations,
+    packageSave?.uses === "actions/cache/save@v5"
+      && packageSave?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''"
+      && object(packageSave?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
+    `${file} native build cache must save only a successful exact miss`,
+  );
+  requireUniqueCacheSaveLast(violations, file, job, "native build cache", "proof and cleanup step");
   const linuxBuildDockerfile = fs.readFileSync(
     path.join(repositoryRoot, ".github", "docker", "linux-glibc-build.Dockerfile"),
     "utf8",
@@ -1703,14 +1827,36 @@ function validatePostPublish(workflows, violations, graph) {
   add(violations, !scalarStrings(workflow).some(value => value.includes("sha256sum")), `${file} must use the portable Python checksum gate`);
 }
 
-function validatePackagedCoordinator(workflows, violations) {
+function validatePackagedCoordinator(workflows, violations, graph) {
   const file = "packaged-platform-pr.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
     violations.push(`${file} must exist`);
     return;
   }
-  add(violations, sameMembers(at(workflow, "on", "pull_request", "types"), ["labeled", "synchronize"]), `${file} pull request types must be labeled and synchronize`);
+  const promotion = graph.workflow_policy.promotion;
+  const expectedConcurrency = [
+    "proof-",
+    promotion.proof_run_sha_expression,
+    "-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || github.event.pull_request.number || 'dev' }}-",
+    "${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}",
+  ].join("");
+  add(
+    violations,
+    sameMembers(at(workflow, "on", "pull_request", "types"), promotion.required_events),
+    `${file} pull request trigger must be label-only`,
+  );
+  add(
+    violations,
+    at(workflow, "concurrency", "group") === expectedConcurrency,
+    `${file} concurrency must bind the Actions SHA, mode, PR identity, and exact label`,
+  );
+  add(
+    violations,
+    String(at(workflow, "on", "workflow_dispatch", "inputs", "pr_number", "description") ?? "")
+      .includes(promotion.manual_pr_ref_hint),
+    `${file} manual PR input must require ${promotion.manual_pr_ref_hint}`,
+  );
   add(
     violations,
     sameMembers(
@@ -1731,12 +1877,24 @@ function validatePackagedCoordinator(workflows, violations) {
   add(violations, object(workflow.permissions).actions === "read", `${file} must read source-proof runs`);
   add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
   const route = requireJob(violations, file, workflow, "route");
+  add(
+    violations,
+    route.if === "github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')",
+    `${file} route job must execute dispatch runs and only platform-proof labeled PR runs`,
+  );
   requireStepRun(violations, file, route, "Resolve trusted exact head", [
     'test "$head_repo" = "$GITHUB_REPOSITORY"',
-    'test "$current_head" = "$expected_head"',
+    'test "$current_head" = "$EVENT_HEAD_SHA"',
+    'test "$INPUT_HEAD_SHA" = "$current_head"',
+    'test "$GITHUB_REF" = "refs/heads/$head_ref"',
+    'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"',
     'test "$base_ref" = "dev/codestory-next"',
-    'test "$GITHUB_SHA" = "$current_head"',
+    'test "$INPUT_HEAD_SHA" = "$dev_head"',
+    'test "$GITHUB_REF" = "refs/heads/dev/codestory-next"',
+    'test "$GITHUB_SHA" = "$dev_head"',
+    "--ref $head_ref",
   ]);
+  requireExactResolverContract(violations, file, route, platformResolverContractDigest);
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
     '.path == ".github/workflows/source-proof.yml"',
@@ -1752,6 +1910,13 @@ function validatePackagedCoordinator(workflows, violations) {
     'freeze_transition=false\nif [ -n "$BASE_SHA" ] \\\n  && [ "$base_frozen" = false ] \\\n  && [ "$frozen" = true ]; then',
   ]);
   requireCalibrationProducerAuthentication(violations, file, route);
+  const routeSteps = list(route.steps).map(object);
+  add(
+    violations,
+    routeSteps.findIndex(step => step.name === "Resolve trusted exact head") === 0
+      && routeSteps.findIndex(step => step.uses === "actions/checkout@v5") > 0,
+    `${file} must resolve exact workflow/ref identity before checkout`,
+  );
   const calibrationLinux = requireJob(violations, file, workflow, "calibration-linux");
   add(
     violations,
@@ -1766,6 +1931,31 @@ function validatePackagedCoordinator(workflows, violations) {
       && object(calibrationMacos.with).calibration_mode === true,
     `${file} protected macOS calibration must call Metal proof in calibration mode`,
   );
+  const macosSource = requireJob(violations, file, workflow, "macos-source");
+  const macosRestore = namedStep(macosSource, "Restore exact-head macOS source cache");
+  const expectedMacosKey = [
+    "${{ runner.os }}-",
+    promotion.macos_source_cache_namespace,
+    "-${{ needs.route.outputs.head_sha }}-${{ steps.rust-cache-key.outputs.version }}-",
+    "${{ matrix.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}",
+  ].join("");
+  add(
+    violations,
+    macosRestore?.uses === "actions/cache/restore@v5"
+      && macosRestore?.["continue-on-error"] === true
+      && object(macosRestore?.with).key === expectedMacosKey
+      && object(macosRestore?.with)["restore-keys"] === undefined,
+    `${file} macOS source cache must be an exact-SHA restore without fallbacks`,
+  );
+  const macosSave = namedStep(macosSource, "Save exact-head macOS source cache");
+  add(
+    violations,
+    macosSave?.uses === "actions/cache/save@v5"
+      && macosSave?.if === "success() && steps.macos-source-cache-restore.outputs.cache-hit != 'true' && steps.macos-source-cache-restore.outputs.cache-primary-key != ''"
+      && object(macosSave?.with).key === "${{ steps.macos-source-cache-restore.outputs.cache-primary-key }}",
+    `${file} macOS source cache must save only a successful exact miss`,
+  );
+  requireUniqueCacheSaveLast(violations, file, macosSource, "macOS source cache", "proof step");
   const calibrationAssemble = requireJob(
     violations,
     file,
@@ -2222,14 +2412,19 @@ export function releaseWorkflowContractViolations(
     add(
       violations,
       sameMembers(at(workflow, "on", "pull_request", "types"), policy.promotion.required_events),
-      `[persistent_label] ${file} must re-evaluate labels on ${policy.promotion.required_events.join(" and ")}`,
+      `[proof_identity] ${file} must use only ${policy.promotion.required_events.join(" and ")} pull-request events`,
+    );
+    add(
+      violations,
+      String(at(workflow, "concurrency", "group") ?? "").includes(policy.promotion.proof_run_sha_expression),
+      `[proof_identity] ${file} concurrency must bind ${policy.promotion.proof_run_sha_expression}`,
     );
     const resolver = findNamedStep(workflow, "Resolve trusted exact head");
     const run = executableRunText(String(resolver?.run ?? ""));
     add(
       violations,
-      run.includes("current_head") && (run.includes("EVENT_HEAD_SHA") || run.includes("expected_head")),
-      `[persistent_label] ${file} must resolve the current head and compare its exact SHA before executing labeled work`,
+      run.includes("current_head") && run.includes("EVENT_HEAD_SHA"),
+      `[proof_identity] ${file} must resolve the current head and compare its exact SHA before executing labeled work`,
     );
   }
   return violations;
@@ -2242,11 +2437,11 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   }
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
-  validatePluginAndDraftWorkflows(workflows, violations);
+  validatePluginAndDraftWorkflows(workflows, violations, graph);
   validateReleaseCoordinator(workflows, violations, graph);
   validatePackagedProof(workflows, violations, graph);
   validatePostPublish(workflows, violations, graph);
-  validatePackagedCoordinator(workflows, violations);
+  validatePackagedCoordinator(workflows, violations, graph);
   validateRemainingWorkflows(workflows, violations);
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;

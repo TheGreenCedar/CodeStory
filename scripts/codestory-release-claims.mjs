@@ -158,8 +158,8 @@ export function releaseClaimGraphDigest(graph) {
 
 export function validateReleaseClaimGraph(graph) {
   object(graph, "release claim graph");
-  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 1) {
-    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 1`);
+  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 2) {
+    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 2`);
   }
   nonEmptyText(graph.graph_id, "release claim graph.graph_id");
   const evidencePolicy = object(graph.evidence_policy, "release claim graph.evidence_policy");
@@ -357,6 +357,11 @@ export function validateReleaseClaimGraph(graph) {
   nonEmptyText(promotion.source_branch, "workflow_policy.promotion.source_branch");
   nonEmptyText(promotion.release_branch, "workflow_policy.promotion.release_branch");
   nonEmptyText(promotion.exact_sha_expression, "workflow_policy.promotion.exact_sha_expression");
+  nonEmptyText(promotion.proof_run_sha_expression, "workflow_policy.promotion.proof_run_sha_expression");
+  nonEmptyText(promotion.manual_pr_ref_hint, "workflow_policy.promotion.manual_pr_ref_hint");
+  nonEmptyText(promotion.source_cache_namespace, "workflow_policy.promotion.source_cache_namespace");
+  nonEmptyText(promotion.macos_source_cache_namespace, "workflow_policy.promotion.macos_source_cache_namespace");
+  nonEmptyText(promotion.packaged_cache_namespace, "workflow_policy.promotion.packaged_cache_namespace");
   stringArray(promotion.label_routed_workflows, "workflow_policy.promotion.label_routed_workflows", { nonEmpty: true });
   stringArray(promotion.required_events, "workflow_policy.promotion.required_events", { nonEmpty: true });
 

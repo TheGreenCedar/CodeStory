@@ -1,6 +1,6 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 1,
+  "graph_version": 2,
   "graph_id": "codestory-release-claims",
   "evidence_policy": {
     "selection": "all_matching_rows_must_pass",
@@ -632,13 +632,17 @@
       "source_branch": "dev/codestory-next",
       "release_branch": "main",
       "exact_sha_expression": "${{ github.sha }}",
+      "proof_run_sha_expression": "${{ github.sha }}",
+      "manual_pr_ref_hint": "--ref <same-repository PR head branch>",
+      "source_cache_namespace": "source-proof-v2",
+      "macos_source_cache_namespace": "macos-source-v2",
+      "packaged_cache_namespace": "codestory-cli-native-v4",
       "label_routed_workflows": [
         "source-proof.yml",
         "packaged-platform-pr.yml"
       ],
       "required_events": [
-        "labeled",
-        "synchronize"
+        "labeled"
       ]
     },
     "actionlint": {
