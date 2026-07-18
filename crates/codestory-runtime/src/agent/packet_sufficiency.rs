@@ -119,7 +119,7 @@ fn assemble_packet_sufficiency_with_route_probes(
     let min_citations = packet_sufficiency_min_citations(task_class);
     let min_claims = packet_sufficiency_min_claims(task_class);
     let flow_context = PacketFlowContext::new(question, task_class);
-    let route_stages = packet_route_proof_stages(question);
+    let route_stages = packet_route_proof_stages(question, selected_probes);
     let sufficiency_claims = supported_claims
         .iter()
         .filter(|claim| {
@@ -479,11 +479,11 @@ fn packet_route_proof_assessment(
     RouteProofAssessment::not_required()
 }
 
-fn packet_route_proof_stages(question: &str) -> Vec<String> {
-    packet_route_stage_labels(question)
+fn packet_route_proof_stages(question: &str, selected_probes: &[String]) -> Vec<String> {
+    packet_route_stage_labels(question, selected_probes)
 }
 
-fn packet_route_stage_labels(question: &str) -> Vec<String> {
+fn packet_route_stage_labels(question: &str, selected_probes: &[String]) -> Vec<String> {
     let question = question.replace('→', "->");
     let spans = if question.contains("->") {
         question.split("->").map(str::to_string).collect()
@@ -503,12 +503,19 @@ fn packet_route_stage_labels(question: &str) -> Vec<String> {
                     .then_some(index)
             })
             .collect::<Vec<_>>();
-        if markers.is_empty()
-            || (from.is_none()
-                && packet_route_word_is(route_words[markers[0]], "to")
-                && !route_words[..markers[0]]
-                    .iter()
-                    .any(|word| packet_route_token_is_explicit_identifier(word)))
+        if markers.is_empty() {
+            return Vec::new();
+        }
+        if from.is_none()
+            && packet_route_word_is(route_words[markers[0]], "to")
+            && !route_words[..markers[0]]
+                .iter()
+                .any(|word| packet_route_token_is_explicit_identifier(word))
+            && packet_route_selected_probe_stage_label(
+                &route_words[..markers[0]].join(" "),
+                selected_probes,
+            )
+            .is_none()
         {
             return Vec::new();
         }
@@ -524,20 +531,23 @@ fn packet_route_stage_labels(question: &str) -> Vec<String> {
     spans
         .iter()
         .enumerate()
-        .map(|(index, span)| packet_route_stage_label(span, index == 0))
+        .map(|(index, span)| packet_route_stage_label(span, index == 0, selected_probes))
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
 }
 
-fn packet_route_stage_label(span: &str, leading: bool) -> Option<String> {
+fn packet_route_stage_label(
+    span: &str,
+    leading: bool,
+    selected_probes: &[String],
+) -> Option<String> {
     let span = span.trim();
-    for quote in ['`', '\'', '"'] {
-        if let Some((_, rest)) = span.split_once(quote)
-            && let Some((label, _)) = rest.split_once(quote)
-            && !label.trim().is_empty()
-        {
-            return Some(label.trim().to_string());
-        }
+    let quoted_identifiers = packet_route_quoted_identifiers(span);
+    if quoted_identifiers.len() > 1 {
+        return None;
+    }
+    if let Some(label) = quoted_identifiers.into_iter().next() {
+        return Some(label);
     }
     let span = packet_route_clean_word(span);
     if span.is_empty() {
@@ -548,6 +558,9 @@ fn packet_route_stage_label(span: &str, leading: bool) -> Option<String> {
         if words.len() == 1 {
             return Some(packet_route_clean_word(words[0]).to_string());
         }
+        if let Some(label) = packet_route_selected_probe_stage_label(span, selected_probes) {
+            return Some(label);
+        }
         if let Some(identifier) = words
             .iter()
             .rev()
@@ -555,15 +568,48 @@ fn packet_route_stage_label(span: &str, leading: bool) -> Option<String> {
         {
             return Some(packet_route_clean_word(identifier).to_string());
         }
-        if words
-            .last()
-            .is_some_and(|word| packet_route_word_is(word, "main"))
-        {
-            return Some("main".to_string());
-        }
         return None;
     }
     Some(span.to_string())
+}
+
+fn packet_route_selected_probe_stage_label(
+    span: &str,
+    selected_probes: &[String],
+) -> Option<String> {
+    if packet_route_label_matches_selected_probe(span, selected_probes) {
+        return Some(span.to_string());
+    }
+    let words = span.split_whitespace().collect::<Vec<_>>();
+    for suffix_start in 1..words.len() {
+        let suffix = words[suffix_start..].join(" ");
+        if packet_route_label_matches_selected_probe(&suffix, selected_probes) {
+            return Some(suffix);
+        }
+    }
+    None
+}
+
+fn packet_route_quoted_identifiers(span: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut active_quote = None;
+    let mut current = String::new();
+    for character in span.chars() {
+        if let Some(quote) = active_quote {
+            if character == quote {
+                if !current.trim().is_empty() {
+                    identifiers.push(current.trim().to_string());
+                }
+                active_quote = None;
+                current.clear();
+            } else {
+                current.push(character);
+            }
+        } else if matches!(character, '`' | '\'' | '"') {
+            active_quote = Some(character);
+        }
+    }
+    identifiers
 }
 
 fn packet_route_token_is_explicit_identifier(token: &str) -> bool {
@@ -601,8 +647,12 @@ fn packet_route_claim_node_ids(
         .filter(|citation| {
             packet_route_label_matches_citation(stage, citation)
                 || selected_probes.iter().any(|probe| {
-                    packet_route_labels_overlap(stage, probe)
-                        && packet_route_label_matches_citation(probe, citation)
+                    packet_route_probe_candidate_labels(probe)
+                        .iter()
+                        .any(|candidate| {
+                            packet_route_labels_overlap(stage, candidate)
+                                && packet_route_label_matches_citation(candidate, citation)
+                        })
                 })
         })
         .map(|citation| citation.node_id.0.clone())
@@ -624,6 +674,53 @@ fn packet_route_labels_overlap(left: &str, right: &str) -> bool {
     !left.is_empty() && left == packet_route_identifier_tokens(right)
 }
 
+fn packet_route_label_matches_selected_probe(label: &str, selected_probes: &[String]) -> bool {
+    selected_probes.iter().any(|probe| {
+        packet_route_probe_candidate_labels(probe)
+            .iter()
+            .any(|candidate| packet_route_labels_overlap(label, candidate))
+    })
+}
+
+fn packet_route_probe_candidate_labels(probe: &str) -> Vec<String> {
+    let bare = packet_route_clean_word(probe.trim()).trim();
+    if bare.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![bare.to_string()];
+    let words = bare.split_whitespace().collect::<Vec<_>>();
+    let file_scoped = words.len() > 1
+        && words[..words.len() - 1]
+            .iter()
+            .any(|word| word.contains(['/', '\\']));
+    let has_terminal_symbol = file_scoped
+        || words.len() == 1
+        || words
+            .last()
+            .is_some_and(|word| word.contains("::") || word.contains('#'));
+    let symbol = has_terminal_symbol.then(|| words.last().copied()).flatten();
+
+    if let Some(symbol) = symbol {
+        let symbol = packet_route_clean_word(symbol);
+        if !symbol.is_empty() && !candidates.iter().any(|candidate| candidate == symbol) {
+            candidates.push(symbol.to_string());
+        }
+        let has_symbol_scope = symbol.contains("::")
+            || symbol.contains('#')
+            || (!symbol.contains(['/', '\\']) && symbol.contains('.'));
+        if has_symbol_scope
+            && let Some(terminal) = symbol
+                .rsplit(['.', ':', '#', '/', '\\'])
+                .find(|part| !part.is_empty())
+            && !candidates.iter().any(|candidate| candidate == terminal)
+        {
+            candidates.push(terminal.to_string());
+        }
+    }
+    candidates
+}
+
 fn packet_route_identifier_tokens(identifier: &str) -> Vec<String> {
     let characters = identifier.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
@@ -640,6 +737,7 @@ fn packet_route_identifier_tokens(identifier: &str) -> Vec<String> {
         let camel_boundary = character.is_ascii_uppercase()
             && previous.is_some_and(|previous| {
                 previous.is_ascii_lowercase()
+                    || previous.is_ascii_digit()
                     || (previous.is_ascii_uppercase()
                         && next.is_some_and(|next| next.is_ascii_lowercase()))
             });
@@ -3212,7 +3310,7 @@ mod tests {
     #[test]
     fn production_claims_prove_lowercase_arrow_route() {
         let (sufficiency, claims) = production_route_sufficiency(
-            "Trace main -> run",
+            "main -> run",
             &["main", "run", "RouteSupport"],
             &[("main", "run")],
         );
@@ -3226,6 +3324,92 @@ mod tests {
             claims
                 .iter()
                 .all(|claim| { claim.coverage_role.as_deref() != Some("route endpoint") })
+        );
+    }
+
+    #[test]
+    fn production_selected_probe_disambiguates_leading_lowercase_stage() {
+        let (sufficiency, claims) = production_route_sufficiency_with_probes(
+            "Trace start -> run",
+            &["start", "run", "RouteSupport"],
+            &[("start", "run")],
+            &["start".to_string()],
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "{sufficiency:?}"
+        );
+        assert!(
+            claims
+                .iter()
+                .all(|claim| claim.coverage_role.as_deref() != Some("route endpoint"))
+        );
+    }
+
+    #[test]
+    fn production_scoped_probes_disambiguate_leading_multiword_stage() {
+        for probe in ["router::dispatch_request", "src/router.rs dispatch_request"] {
+            let (sufficiency, claims) = production_route_sufficiency_with_probes(
+                "Trace request dispatch to CustomExit",
+                &["dispatch_request", "CustomExit", "RouteSupport"],
+                &[("dispatch_request", "CustomExit")],
+                &[probe.to_string()],
+            );
+
+            assert_eq!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Sufficient,
+                "probe {probe} should bind the production route: {sufficiency:?}"
+            );
+            assert!(claims.iter().any(|claim| {
+                claim.citations.iter().any(|citation| {
+                    citation.display_name == "dispatch_request"
+                        && claim.coverage_role.as_deref() != Some("route endpoint")
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn production_digit_boundary_probe_disambiguates_leading_stage() {
+        let (sufficiency, _) = production_route_sufficiency_with_probes(
+            "Trace sha256 digest -> DigestExit",
+            &["sha256Digest", "DigestExit", "RouteSupport"],
+            &[("sha256Digest", "DigestExit")],
+            &["sha256Digest".to_string()],
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "{sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn production_multiple_quoted_leading_identifiers_fail_closed() {
+        let (sufficiency, _) = production_route_sufficiency_with_probes(
+            "Trace `EntryOne` and \"EntryTwo\" -> ExitStage",
+            &["EntryOne", "EntryTwo", "ExitStage"],
+            &[("EntryOne", "ExitStage")],
+            &["EntryOne".to_string()],
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "{sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .expect("route sufficiency should include a coverage report")
+                .missing
+                .contains(&"route order: unresolved endpoints".to_string()),
+            "{sufficiency:?}"
         );
     }
 
@@ -3577,7 +3761,7 @@ mod tests {
             "question checkpoints must define the route independently of probe order: {sufficiency:?}"
         );
         assert_eq!(
-            packet_route_proof_stages(question),
+            packet_route_proof_stages(question, &[]),
             [
                 "IndexingEntrypoint",
                 "FileDiscovery",
@@ -3594,6 +3778,15 @@ mod tests {
             "dispatch_request"
         ));
         assert!(packet_route_labels_overlap("URL session", "urlSession"));
+        assert!(packet_route_labels_overlap("sha256 digest", "sha256Digest"));
+        assert!(packet_route_label_matches_selected_probe(
+            "request dispatch",
+            &["router::dispatch_request".to_string()]
+        ));
+        assert!(packet_route_label_matches_selected_probe(
+            "request dispatch",
+            &["src/router.rs dispatch_request".to_string()]
+        ));
         assert!(!packet_route_labels_overlap(
             "request dispatch",
             "request_handler"
