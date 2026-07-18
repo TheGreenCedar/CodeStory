@@ -334,6 +334,7 @@ fn packet_sufficiency_status(
 }
 
 const MAX_ROUTE_PROOF_STAGES: usize = 6;
+const MAX_ROUTE_STAGE_WORDS: usize = 6;
 const ROUTE_ORDER_GAP: &str = "RouteTracing packet could not resolve at least two ordered endpoints from explicit route syntax in the question.";
 const ROUTE_GRAPH_GAP: &str =
     "RouteTracing packet did not include a directed execution graph for the cited route endpoints.";
@@ -492,7 +493,10 @@ fn packet_route_stage_labels(question: &str, selected_probes: &[String]) -> Vec<
         let from = words
             .iter()
             .position(|word| packet_route_word_is(word, "from"));
-        let route_words = from.map_or(words.as_slice(), |index| &words[index + 1..]);
+        if from.is_some_and(|index| index != 0) {
+            return Vec::new();
+        }
+        let route_words = from.map_or(words.as_slice(), |_| &words[1..]);
         let markers = route_words
             .iter()
             .enumerate()
@@ -506,19 +510,6 @@ fn packet_route_stage_labels(question: &str, selected_probes: &[String]) -> Vec<
         if markers.is_empty() {
             return Vec::new();
         }
-        if from.is_none()
-            && packet_route_word_is(route_words[markers[0]], "to")
-            && !route_words[..markers[0]]
-                .iter()
-                .any(|word| packet_route_token_is_explicit_identifier(word))
-            && packet_route_selected_probe_stage_label(
-                &route_words[..markers[0]].join(" "),
-                selected_probes,
-            )
-            .is_none()
-        {
-            return Vec::new();
-        }
         let mut spans = Vec::new();
         let mut start = 0;
         for marker in markers {
@@ -530,76 +521,56 @@ fn packet_route_stage_labels(question: &str, selected_probes: &[String]) -> Vec<
     };
     spans
         .iter()
-        .enumerate()
-        .map(|(index, span)| packet_route_stage_label(span, index == 0, selected_probes))
+        .map(|span| packet_route_stage_label(span, selected_probes))
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
 }
 
-fn packet_route_stage_label(
-    span: &str,
-    leading: bool,
-    selected_probes: &[String],
-) -> Option<String> {
+fn packet_route_stage_label(span: &str, selected_probes: &[String]) -> Option<String> {
     let span = span.trim();
-    let quoted_identifiers = packet_route_quoted_identifiers(span);
-    if quoted_identifiers.len() > 1 {
-        return None;
-    }
-    if let Some(label) = quoted_identifiers.into_iter().next() {
-        return Some(label);
+    match packet_route_quoted_identifier(span) {
+        Ok(Some(label)) => return Some(label),
+        Ok(None) => {}
+        Err(()) => return None,
     }
     let span = packet_route_clean_word(span);
     if span.is_empty() {
         return None;
     }
-    if leading {
-        let words = span.split_whitespace().collect::<Vec<_>>();
-        if words.len() == 1 {
-            return Some(packet_route_clean_word(words[0]).to_string());
-        }
-        if let Some(label) = packet_route_selected_probe_stage_label(span, selected_probes) {
-            return Some(label);
-        }
-        if let Some(identifier) = words
+    let words = span
+        .split_whitespace()
+        .map(packet_route_clean_word)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.len() == 1 {
+        let word = words[0];
+        return (packet_route_token_is_explicit_identifier(word)
+            || packet_route_token_is_bare_lowercase(word))
+        .then(|| word.to_string());
+    }
+    if words.len() > MAX_ROUTE_STAGE_WORDS
+        || !words
             .iter()
-            .rev()
-            .find(|word| packet_route_token_is_explicit_identifier(word))
-        {
-            return Some(packet_route_clean_word(identifier).to_string());
-        }
+            .all(|word| packet_route_token_is_bare_lowercase(word))
+    {
         return None;
     }
-    Some(span.to_string())
+    let label = words.join(" ");
+    packet_route_label_matches_selected_probe(&label, selected_probes).then_some(label)
 }
 
-fn packet_route_selected_probe_stage_label(
-    span: &str,
-    selected_probes: &[String],
-) -> Option<String> {
-    if packet_route_label_matches_selected_probe(span, selected_probes) {
-        return Some(span.to_string());
-    }
-    let words = span.split_whitespace().collect::<Vec<_>>();
-    for suffix_start in 1..words.len() {
-        let suffix = words[suffix_start..].join(" ");
-        if packet_route_label_matches_selected_probe(&suffix, selected_probes) {
-            return Some(suffix);
-        }
-    }
-    None
-}
-
-fn packet_route_quoted_identifiers(span: &str) -> Vec<String> {
-    let mut identifiers = Vec::new();
+fn packet_route_quoted_identifier(span: &str) -> Result<Option<String>, ()> {
+    let mut identifier = None;
     let mut active_quote = None;
     let mut current = String::new();
+    let mut outside = String::new();
     for character in span.chars() {
         if let Some(quote) = active_quote {
             if character == quote {
-                if !current.trim().is_empty() {
-                    identifiers.push(current.trim().to_string());
+                if current.trim().is_empty() || identifier.is_some() {
+                    return Err(());
                 }
+                identifier = Some(current.trim().to_string());
                 active_quote = None;
                 current.clear();
             } else {
@@ -607,9 +578,17 @@ fn packet_route_quoted_identifiers(span: &str) -> Vec<String> {
             }
         } else if matches!(character, '`' | '\'' | '"') {
             active_quote = Some(character);
+        } else {
+            outside.push(character);
         }
     }
-    identifiers
+    if active_quote.is_some() {
+        return Err(());
+    }
+    if identifier.is_some() && !packet_route_clean_word(outside.trim()).is_empty() {
+        return Err(());
+    }
+    Ok(identifier)
 }
 
 fn packet_route_token_is_explicit_identifier(token: &str) -> bool {
@@ -620,6 +599,17 @@ fn packet_route_token_is_explicit_identifier(token: &str) -> bool {
             .chars()
             .skip(1)
             .any(|character| character.is_ascii_uppercase())
+}
+
+fn packet_route_token_is_bare_lowercase(token: &str) -> bool {
+    let token = packet_route_clean_word(token);
+    !token.is_empty()
+        && token
+            .chars()
+            .any(|character| character.is_ascii_lowercase())
+        && token
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
 }
 
 fn packet_route_clean_word(word: &str) -> &str {
@@ -647,12 +637,9 @@ fn packet_route_claim_node_ids(
         .filter(|citation| {
             packet_route_label_matches_citation(stage, citation)
                 || selected_probes.iter().any(|probe| {
-                    packet_route_probe_candidate_labels(probe)
-                        .iter()
-                        .any(|candidate| {
-                            packet_route_labels_overlap(stage, candidate)
-                                && packet_route_label_matches_citation(candidate, citation)
-                        })
+                    packet_route_probe_is_unscoped(probe)
+                        && packet_route_labels_overlap(stage, probe)
+                        && packet_route_label_matches_citation(probe, citation)
                 })
         })
         .map(|citation| citation.node_id.0.clone())
@@ -676,49 +663,16 @@ fn packet_route_labels_overlap(left: &str, right: &str) -> bool {
 
 fn packet_route_label_matches_selected_probe(label: &str, selected_probes: &[String]) -> bool {
     selected_probes.iter().any(|probe| {
-        packet_route_probe_candidate_labels(probe)
-            .iter()
-            .any(|candidate| packet_route_labels_overlap(label, candidate))
+        packet_route_probe_is_unscoped(probe) && packet_route_labels_overlap(label, probe)
     })
 }
 
-fn packet_route_probe_candidate_labels(probe: &str) -> Vec<String> {
+fn packet_route_probe_is_unscoped(probe: &str) -> bool {
     let bare = packet_route_clean_word(probe.trim()).trim();
-    if bare.is_empty() {
-        return Vec::new();
-    }
-
-    let mut candidates = vec![bare.to_string()];
-    let words = bare.split_whitespace().collect::<Vec<_>>();
-    let file_scoped = words.len() > 1
-        && words[..words.len() - 1]
-            .iter()
-            .any(|word| word.contains(['/', '\\']));
-    let has_terminal_symbol = file_scoped
-        || words.len() == 1
-        || words
-            .last()
-            .is_some_and(|word| word.contains("::") || word.contains('#'));
-    let symbol = has_terminal_symbol.then(|| words.last().copied()).flatten();
-
-    if let Some(symbol) = symbol {
-        let symbol = packet_route_clean_word(symbol);
-        if !symbol.is_empty() && !candidates.iter().any(|candidate| candidate == symbol) {
-            candidates.push(symbol.to_string());
-        }
-        let has_symbol_scope = symbol.contains("::")
-            || symbol.contains('#')
-            || (!symbol.contains(['/', '\\']) && symbol.contains('.'));
-        if has_symbol_scope
-            && let Some(terminal) = symbol
-                .rsplit(['.', ':', '#', '/', '\\'])
-                .find(|part| !part.is_empty())
-            && !candidates.iter().any(|candidate| candidate == terminal)
-        {
-            candidates.push(terminal.to_string());
-        }
-    }
-    candidates
+    !bare.is_empty()
+        && !bare.contains(['/', '\\', ':', '#', '.'])
+        && !bare.contains(['`', '\'', '"'])
+        && packet_route_identifier_tokens(bare).len() <= MAX_ROUTE_STAGE_WORDS
 }
 
 fn packet_route_identifier_tokens(identifier: &str) -> Vec<String> {
@@ -800,10 +754,11 @@ fn packet_execution_graphs(answer: &AgentAnswerDto) -> Vec<&GraphResponse> {
             GraphArtifactDto::Mermaid { .. } => None,
         })
         .filter(|graph| {
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.kind == EdgeKind::CALL && edge.source != edge.target)
+            graph.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && edge.source != edge.target
+                    && !crate::graph_builders::is_speculative_trail_edge(edge)
+            })
         })
         .collect()
 }
@@ -865,7 +820,10 @@ fn packet_execution_path_exists(graph: &GraphResponse, source: &str, target: &st
     let mut visited = HashSet::from([source.to_string()]);
     while let Some(current) = queue.pop_front() {
         for edge in graph.edges.iter().filter(|edge| {
-            edge.kind == EdgeKind::CALL && edge.source.0 == current && edge.source != edge.target
+            edge.kind == EdgeKind::CALL
+                && edge.source.0 == current
+                && edge.source != edge.target
+                && !crate::graph_builders::is_speculative_trail_edge(edge)
         }) {
             if edge.target.0 == target {
                 return true;
@@ -2933,13 +2891,23 @@ mod tests {
     }
 
     fn route_graph_edge(id: &str, source: &str, target: &str) -> GraphEdgeDto {
+        route_graph_edge_with_proof(id, source, target, Some("certain"), Some(1.0))
+    }
+
+    fn route_graph_edge_with_proof(
+        id: &str,
+        source: &str,
+        target: &str,
+        certainty: Option<&str>,
+        confidence: Option<f32>,
+    ) -> GraphEdgeDto {
         GraphEdgeDto {
             id: EdgeId(id.to_string()),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),
             kind: EdgeKind::CALL,
-            confidence: Some(1.0),
-            certainty: Some("certain".to_string()),
+            confidence,
+            certainty: certainty.map(str::to_string),
             callsite_identity: None,
             candidate_targets: Vec::new(),
         }
@@ -3032,6 +3000,23 @@ mod tests {
             extra_probes,
         );
         (sufficiency, claims)
+    }
+
+    fn assert_unresolved_route_order(sufficiency: &PacketSufficiencyDto) {
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "{sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .expect("route sufficiency should include a coverage report")
+                .missing
+                .contains(&"route order: unresolved endpoints".to_string()),
+            "{sufficiency:?}"
+        );
     }
 
     fn mark_full_retrieval_unavailable(answer: &mut AgentAnswerDto) {
@@ -3218,6 +3203,53 @@ mod tests {
     }
 
     #[test]
+    fn route_proof_rejects_speculative_call_edges() {
+        for (case, certainty, confidence) in [
+            ("speculative", Some("speculative"), Some(1.0)),
+            ("uncertain", Some("uncertain"), Some(1.0)),
+            ("probable", Some("probable"), Some(0.70)),
+            ("low-confidence", Some("certain"), Some(0.20)),
+        ] {
+            let question = "EndpointA -> EndpointB";
+            let mut answer = route_answer(
+                question,
+                &["EndpointA", "EndpointB", "RouteSupport"],
+                &[("EndpointA", "EndpointB")],
+            );
+            let GraphArtifactDto::Uml { graph, .. } = &mut answer.graphs[0] else {
+                unreachable!("route fixture must contain UML")
+            };
+            graph.edges[0] = route_graph_edge_with_proof(
+                "route-edge",
+                "EndpointA",
+                "EndpointB",
+                certainty,
+                confidence,
+            );
+
+            let sufficiency = route_sufficiency(
+                question,
+                &answer,
+                &budget_fixture(),
+                vec![route_claim("EndpointA"), route_claim("EndpointB")],
+            );
+
+            assert_eq!(
+                sufficiency.status,
+                PacketSufficiencyStatusDto::Partial,
+                "{case} CALL edge must not prove a route: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.contains("directed execution graph")),
+                "{case} CALL edge must produce an execution graph gap: {sufficiency:?}"
+            );
+        }
+    }
+
+    #[test]
     fn retained_false_safe_packet_shapes_fail_closed_without_route_proof() {
         let retained_shapes = [
             (
@@ -3328,54 +3360,42 @@ mod tests {
     }
 
     #[test]
-    fn production_selected_probe_disambiguates_leading_lowercase_stage() {
-        let (sufficiency, claims) = production_route_sufficiency_with_probes(
+    fn production_framed_and_suffix_routes_fail_closed() {
+        let (framed_single, _) = production_route_sufficiency_with_probes(
             "Trace start -> run",
             &["start", "run", "RouteSupport"],
             &[("start", "run")],
             &["start".to_string()],
         );
+        let (framed_phrase, _) = production_route_sufficiency_with_probes(
+            "Trace request dispatch -> CustomExit",
+            &["dispatch_request", "CustomExit", "RouteSupport"],
+            &[("dispatch_request", "CustomExit")],
+            &["dispatch_request".to_string()],
+        );
 
-        assert_eq!(
-            sufficiency.status,
-            PacketSufficiencyStatusDto::Sufficient,
-            "{sufficiency:?}"
-        );
-        assert!(
-            claims
-                .iter()
-                .all(|claim| claim.coverage_role.as_deref() != Some("route endpoint"))
-        );
+        assert_unresolved_route_order(&framed_single);
+        assert_unresolved_route_order(&framed_phrase);
     }
 
     #[test]
-    fn production_scoped_probes_disambiguate_leading_multiword_stage() {
+    fn production_scoped_probe_owner_mismatch_fails_closed() {
         for probe in ["router::dispatch_request", "src/router.rs dispatch_request"] {
-            let (sufficiency, claims) = production_route_sufficiency_with_probes(
-                "Trace request dispatch to CustomExit",
+            let (sufficiency, _) = production_route_sufficiency_with_probes(
+                "request dispatch -> CustomExit",
                 &["dispatch_request", "CustomExit", "RouteSupport"],
                 &[("dispatch_request", "CustomExit")],
                 &[probe.to_string()],
             );
 
-            assert_eq!(
-                sufficiency.status,
-                PacketSufficiencyStatusDto::Sufficient,
-                "probe {probe} should bind the production route: {sufficiency:?}"
-            );
-            assert!(claims.iter().any(|claim| {
-                claim.citations.iter().any(|citation| {
-                    citation.display_name == "dispatch_request"
-                        && claim.coverage_role.as_deref() != Some("route endpoint")
-                })
-            }));
+            assert_unresolved_route_order(&sufficiency);
         }
     }
 
     #[test]
-    fn production_digit_boundary_probe_disambiguates_leading_stage() {
+    fn production_exact_plain_phrase_matches_unscoped_probe() {
         let (sufficiency, _) = production_route_sufficiency_with_probes(
-            "Trace sha256 digest -> DigestExit",
+            "sha256 digest -> DigestExit",
             &["sha256Digest", "DigestExit", "RouteSupport"],
             &[("sha256Digest", "DigestExit")],
             &["sha256Digest".to_string()],
@@ -3397,25 +3417,29 @@ mod tests {
             &["EntryOne".to_string()],
         );
 
-        assert_eq!(
-            sufficiency.status,
-            PacketSufficiencyStatusDto::Partial,
-            "{sufficiency:?}"
+        assert_unresolved_route_order(&sufficiency);
+    }
+
+    #[test]
+    fn production_multiple_unquoted_and_unclosed_identifiers_fail_closed() {
+        let (multiple, _) = production_route_sufficiency(
+            "EntryOne EntryTwo -> ExitStage",
+            &["EntryOne", "EntryTwo", "ExitStage"],
+            &[("EntryOne", "ExitStage")],
         );
-        assert!(
-            sufficiency
-                .coverage_report
-                .as_ref()
-                .expect("route sufficiency should include a coverage report")
-                .missing
-                .contains(&"route order: unresolved endpoints".to_string()),
-            "{sufficiency:?}"
+        let (unclosed, _) = production_route_sufficiency(
+            "`EntryOne -> ExitStage",
+            &["EntryOne", "ExitStage", "RouteSupport"],
+            &[("EntryOne", "ExitStage")],
         );
+
+        assert_unresolved_route_order(&multiple);
+        assert_unresolved_route_order(&unclosed);
     }
 
     #[test]
     fn production_source_evidence_proves_explicit_marker_route() {
-        let question = "Trace CustomEntry through request dispatch to CustomExit";
+        let question = "from CustomEntry through request dispatch to CustomExit";
         let names = ["CustomEntry", "dispatch_request", "CustomExit"];
         let (sufficiency, claims) = production_route_sufficiency_with_probes(
             question,
@@ -3447,7 +3471,7 @@ mod tests {
 
     #[test]
     fn production_unrelated_probe_does_not_alias_explicit_route_stage() {
-        let question = "Trace CustomEntry through request dispatch to CustomExit";
+        let question = "from CustomEntry through request dispatch to CustomExit";
         let (sufficiency, _) = production_route_sufficiency_with_probes(
             question,
             &["CustomEntry", "request_handler", "CustomExit"],
@@ -3458,21 +3482,7 @@ mod tests {
             &["request_handler".to_string()],
         );
 
-        assert_eq!(
-            sufficiency.status,
-            PacketSufficiencyStatusDto::Partial,
-            "{sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .coverage_report
-                .as_ref()
-                .expect("route sufficiency should include a coverage report")
-                .missing
-                .iter()
-                .any(|missing| missing == "route endpoint: request dispatch"),
-            "{sufficiency:?}"
-        );
+        assert_unresolved_route_order(&sufficiency);
     }
 
     #[test]
@@ -3772,7 +3782,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_probe_aliases_require_exact_identifier_token_multisets() {
+    fn unscoped_selected_probe_aliases_require_exact_identifier_token_multisets() {
         assert!(packet_route_labels_overlap(
             "request dispatch",
             "dispatch_request"
@@ -3781,9 +3791,13 @@ mod tests {
         assert!(packet_route_labels_overlap("sha256 digest", "sha256Digest"));
         assert!(packet_route_label_matches_selected_probe(
             "request dispatch",
+            &["dispatch_request".to_string()]
+        ));
+        assert!(!packet_route_label_matches_selected_probe(
+            "request dispatch",
             &["router::dispatch_request".to_string()]
         ));
-        assert!(packet_route_label_matches_selected_probe(
+        assert!(!packet_route_label_matches_selected_probe(
             "request dispatch",
             &["src/router.rs dispatch_request".to_string()]
         ));
@@ -3872,11 +3886,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(
-            sufficiency.status,
-            PacketSufficiencyStatusDto::Sufficient,
-            "route control words must not become evidence stages: {sufficiency:?}"
-        );
+        assert_unresolved_route_order(&sufficiency);
     }
 
     #[test]
@@ -5690,9 +5700,8 @@ mod tests {
         assert!(
             report
                 .missing
-                .iter()
-                .any(|gap| gap.starts_with("route endpoint:")),
-            "selected probes without cited endpoints must now remain explicit route gaps: {report:?}"
+                .contains(&"route order: unresolved endpoints".to_string()),
+            "natural-language framing must fail closed before selected probes imply route order: {report:?}"
         );
         assert_eq!(report.unresolved, vec!["response send".to_string()]);
         assert!(

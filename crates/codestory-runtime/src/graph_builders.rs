@@ -443,7 +443,7 @@ fn hide_speculative_trail_edges(mut response: GraphResponse) -> GraphResponse {
     response
 }
 
-fn is_speculative_trail_edge(edge: &GraphEdgeDto) -> bool {
+pub(crate) fn is_speculative_trail_edge(edge: &GraphEdgeDto) -> bool {
     if is_speculative_certainty_label(edge.certainty.as_deref()) {
         return true;
     }
