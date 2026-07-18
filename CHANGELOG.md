@@ -8,6 +8,9 @@
   Ripgrep Rust corpus. The benchmark binds task and project-manifest bytes,
   installs the Rust-only Ripgrep manifest into its owned pinned checkout, and
   rejects evidence whose selected tasks or provenance drift from that scope.
+  Cache preparation, status capture, and packet measurement also share one
+  explicit agent retrieval namespace so the measured packets consume the
+  semantic generation prepared by the harness.
 - Affected analysis now resolves native workspace path identities once per
   bounded operation, preserving Unix device/inode and Windows volume/file
   identity without pairwise metadata scans or long-lived path caches.

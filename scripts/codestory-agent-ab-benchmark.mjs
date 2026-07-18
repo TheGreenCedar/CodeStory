@@ -2447,11 +2447,42 @@ function estimateCost(usage) {
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
 }
 
+const BENCHMARK_AGENT_RUN_ID = "shared-agent";
+
+function benchmarkAgentScopeArgs() {
+  return ["--profile", "agent", "--run-id", BENCHMARK_AGENT_RUN_ID];
+}
+
+function retrievalStatusCommandArgs(project) {
+  return [
+    "retrieval",
+    "status",
+    "--project",
+    project,
+    ...benchmarkAgentScopeArgs(),
+    "--format",
+    "json",
+  ];
+}
+
+function retrievalIndexCommandArgs(project) {
+  return [
+    "retrieval",
+    "index",
+    "--project",
+    project,
+    ...benchmarkAgentScopeArgs(),
+    "--refresh",
+    "auto",
+  ];
+}
+
 function packetCommandArgs(repoConfig, task, opts = {}) {
   const args = [
     "packet",
     "--project",
     repoConfig.path,
+    ...benchmarkAgentScopeArgs(),
     "--question",
     task?.prompt ?? repoConfig.prompt,
     "--budget",
@@ -3305,7 +3336,7 @@ async function codestoryRetrievalStatusSnapshot(
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
-    ["retrieval", "status", "--project", project, "--format", "json"],
+    retrievalStatusCommandArgs(project),
     { timeoutMs, env },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -3416,14 +3447,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       const retrievalStarted = performance.now();
       const retrievalIndex = await runProcess(
         codestoryCli,
-        [
-          "retrieval",
-          "index",
-          "--project",
-          config.path,
-          "--refresh",
-          "auto",
-        ],
+        retrievalIndexCommandArgs(config.path),
         {
           env: childEnv,
           timeoutMs: opts.prepareCodestoryTimeoutMs,
@@ -6953,6 +6977,9 @@ export {
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  benchmarkAgentScopeArgs,
+  retrievalIndexCommandArgs,
+  retrievalStatusCommandArgs,
   packetComposition,
   packetCommandArgs,
   packetForAgentPrompt,

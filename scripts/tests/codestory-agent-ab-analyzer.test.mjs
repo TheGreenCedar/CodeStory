@@ -12,6 +12,7 @@ import {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   baselineSearchPreludeStatus,
+  benchmarkAgentScopeArgs,
   benchmarkRunId,
   commandCategory,
   copyResultArtifact,
@@ -39,6 +40,8 @@ import {
   repoProvenanceBlockers,
   resolveRunArtifactPath,
   resolveCodeStoryCli,
+  retrievalIndexCommandArgs,
+  retrievalStatusCommandArgs,
   scoreQuality,
   summarizeCostAccounting,
   summarizePacketRuntimeRuns,
@@ -499,7 +502,7 @@ test("packet-first command renders manifest text for host shells", () => {
   );
 });
 
-test("packet command keeps manifest-derived extra probes diagnostic-only", () => {
+test("packet and cache preparation share one explicit agent retrieval namespace", () => {
   const task = {
     prompt: "Explain how Requests dispatch works.",
     task_class: "architecture_explanation",
@@ -522,8 +525,32 @@ test("packet command keeps manifest-derived extra probes diagnostic-only", () =>
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
-  assert.equal(args.includes("--profile"), false);
-  assert.equal(args.includes("--run-id"), false);
+  assert.deepEqual(benchmarkAgentScopeArgs(), ["--profile", "agent", "--run-id", "shared-agent"]);
+  assert.deepEqual(args.slice(3, 7), benchmarkAgentScopeArgs());
+  assert.deepEqual(retrievalIndexCommandArgs("C:\\repo"), [
+    "retrieval",
+    "index",
+    "--project",
+    "C:\\repo",
+    "--profile",
+    "agent",
+    "--run-id",
+    "shared-agent",
+    "--refresh",
+    "auto",
+  ]);
+  assert.deepEqual(retrievalStatusCommandArgs("C:\\repo"), [
+    "retrieval",
+    "status",
+    "--project",
+    "C:\\repo",
+    "--profile",
+    "agent",
+    "--run-id",
+    "shared-agent",
+    "--format",
+    "json",
+  ]);
 
   const diagnosticArgs = packetCommandArgs(
     { path: "C:\\repo" },
