@@ -1966,6 +1966,24 @@ test("publishable provenance requires full-SHA clean manifest checkout", () => {
     },
   };
   assert.deepEqual(repoProvenanceBlockers(clean), []);
+  const projectBound = structuredClone(clean);
+  projectBound.repo_provenance.manifest.codestory_project_manifest = {
+    path: "benchmarks/tasks/holdout-retrieval/ripgrep-rust-codestory-project.json",
+    sha256: "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a",
+  };
+  projectBound.repo_provenance.installed_codestory_project_manifest = {
+    source_path: "benchmarks/tasks/holdout-retrieval/ripgrep-rust-codestory-project.json",
+    declared_sha256: "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a",
+    installed_path: "codestory_project.json",
+    installed_sha256: "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a",
+    ignored: true,
+  };
+  assert.deepEqual(repoProvenanceBlockers(projectBound), []);
+  projectBound.repo_provenance.installed_codestory_project_manifest.installed_sha256 = "0".repeat(64);
+  assert.match(
+    repoProvenanceBlockers(projectBound).join("\n"),
+    /installed CodeStory project manifest bytes do not match declared hash/,
+  );
   assert.match(
     repoProvenanceBlockers({
       repo_provenance: {

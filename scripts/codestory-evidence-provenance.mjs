@@ -40,6 +40,10 @@ function normalizeImmutableCommitRef(ref) {
   return isImmutableCommitRef(value) ? value.toLowerCase() : null;
 }
 
+function isSha256(value) {
+  return /^[0-9a-f]{64}$/i.test(String(value ?? "").trim());
+}
+
 export function repoProvenanceBlockers(result) {
   const provenance = result.repo_provenance;
   if (!provenance) {
@@ -89,6 +93,31 @@ export function repoProvenanceBlockers(result) {
   }
   if (provenance.git_dirty !== false) {
     reasons.push(provenance.git_dirty ? "repo checkout is dirty" : "repo cleanliness is unknown");
+  }
+  const declaredProjectManifest = provenance.manifest?.codestory_project_manifest ?? null;
+  const installedProjectManifest = provenance.installed_codestory_project_manifest ?? null;
+  if (declaredProjectManifest) {
+    if (!isSha256(declaredProjectManifest.sha256) || !declaredProjectManifest.path) {
+      reasons.push("manifest CodeStory project manifest declaration is invalid");
+    }
+    if (!installedProjectManifest) {
+      reasons.push("missing installed CodeStory project manifest provenance");
+    } else {
+      if (installedProjectManifest.declared_sha256 !== declaredProjectManifest.sha256) {
+        reasons.push("installed CodeStory project manifest does not match declared manifest hash");
+      }
+      if (installedProjectManifest.installed_sha256 !== declaredProjectManifest.sha256) {
+        reasons.push("installed CodeStory project manifest bytes do not match declared hash");
+      }
+      if (installedProjectManifest.ignored !== true) {
+        reasons.push("installed CodeStory project manifest is not ignored by the checkout");
+      }
+      if (installedProjectManifest.installed_path !== "codestory_project.json") {
+        reasons.push("installed CodeStory project manifest is not rooted at codestory_project.json");
+      }
+    }
+  } else if (installedProjectManifest) {
+    reasons.push("unexpected installed CodeStory project manifest provenance");
   }
   return reasons;
 }

@@ -4,6 +4,10 @@
 
 ### Changed
 
+- v0.16 release evidence now uses a checked Axios JavaScript/TypeScript plus
+  Ripgrep Rust corpus. The benchmark binds task and project-manifest bytes,
+  installs the Rust-only Ripgrep manifest into its owned pinned checkout, and
+  rejects evidence whose selected tasks or provenance drift from that scope.
 - Affected analysis now resolves native workspace path identities once per
   bounded operation, preserving Unix device/inode and Windows volume/file
   identity without pairwise metadata scans or long-lived path caches.

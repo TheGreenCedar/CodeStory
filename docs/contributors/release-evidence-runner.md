@@ -4,6 +4,19 @@ CodeStory release-candidate measurements run on one repository-scoped Linux
 runner so baseline identity, cache state, model bytes, and toolchain remain
 stable between candidates. Ordinary pull requests must not target this runner.
 
+## v0.16 corpus boundary
+
+The v0.16 profile uses
+`codestory-release-corpus-v0.16-axios-ripgrep-rust-v1`: Axios
+JavaScript/TypeScript and Ripgrep Rust, each with three cold CLI packet repeats.
+The checked corpus contract binds the exact task-manifest bytes. Ripgrep also
+binds and installs a Rust-only `codestory_project.json` into the harness-owned,
+clean pinned checkout; the installed bytes and ignore proof are recorded in
+every packet row. Redis/C, shell dialects, and general parser completeness are
+outside this release-evidence claim and remain v0.16.1 fidelity work.
+The approved baseline profile records the corpus-contract path and SHA-256, so
+candidate evidence cannot silently widen, narrow, or replace that scope.
+
 ## Machine contract
 
 The approved host shape for the 0.16 in-process retrieval baseline is:

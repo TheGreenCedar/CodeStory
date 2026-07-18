@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { validatePacketCorpusContract } from "../codestory-release-evidence-gate.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const script = path.join(root, "scripts/codestory-release-evidence-gate.mjs");
@@ -31,6 +32,38 @@ function reattest(candidate, artifact, filePath) {
   candidate.artifacts[artifact].sha256 = createHash("sha256").update(bytes).digest("hex");
   candidate.artifacts[artifact].bytes = bytes.length;
 }
+
+test("v0.16 release corpus contract rejects an omitted or substituted packet task", () => {
+  const relativePath = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-ripgrep-rust-v1.json";
+  const bytes = readFileSync(path.join(root, relativePath));
+  const contract = JSON.parse(bytes);
+  const identity = {
+    corpus_id: contract.corpus_id,
+    cache_id: "cold-inprocess-v1",
+    machine_fingerprint: "fixture/fingerprint",
+  };
+  const provenance = {
+    corpus_contract: {
+      path: relativePath,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      corpus_id: contract.corpus_id,
+      task_ids: contract.task_ids,
+      task_manifests: contract.task_manifests,
+      project_manifests: contract.project_manifests,
+    },
+  };
+  const profile = { corpus_contract: { path: relativePath, sha256: provenance.corpus_contract.sha256 } };
+  const rows = contract.task_ids.map((task_id) => ({ task_id }));
+  assert.doesNotThrow(() => validatePacketCorpusContract(provenance, rows, root, identity, profile));
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, rows.slice(0, 1), root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, [...rows, { task_id: "redis-server-event-loop" }], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+});
 
 test("fingerprint prefers a validated provisioned machine identity", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-provisioning-"));

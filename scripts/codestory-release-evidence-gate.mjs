@@ -41,6 +41,12 @@ const SOURCE_RUN_PRODUCERS = new Map([
 const SELECTED_REF_PRODUCERS = new Set([
   ".github/workflows/packaged-platform-pr.yml",
 ]);
+const RELEASE_CORPUS_CONTRACTS = new Map([
+  [
+    "codestory-release-corpus-v0.16-axios-ripgrep-rust-v1",
+    "benchmarks/release-evidence/corpus-contracts/v0.16-axios-ripgrep-rust-v1.json",
+  ],
+]);
 
 function fail(message) { throw new Error(message); }
 function object(value, label) {
@@ -417,7 +423,49 @@ function statsContractFrom(repoRoot) {
   return contract;
 }
 
-function validateRawProvenance(stats, packet, commit, profileName, identity, statsContract) {
+function releaseCorpusContract(repoRoot, identity) {
+  const relativePath = RELEASE_CORPUS_CONTRACTS.get(identity.corpus_id);
+  if (!relativePath) return null;
+  const absolutePath = path.resolve(repoRoot, relativePath);
+  const bytes = readFileSync(absolutePath);
+  const contract = JSON.parse(bytes.toString("utf8"));
+  if (contract.schema_version !== 1 || contract.corpus_id !== identity.corpus_id) {
+    fail("release corpus contract is malformed or has the wrong corpus_id");
+  }
+  if (!Array.isArray(contract.task_ids) || contract.task_ids.length === 0) {
+    fail("release corpus contract must name selected task IDs");
+  }
+  const taskIds = [...new Set(contract.task_ids)].sort();
+  if (taskIds.length !== contract.task_ids.length || JSON.stringify(taskIds) !== JSON.stringify(contract.task_ids)) {
+    fail("release corpus contract task IDs must be sorted and unique");
+  }
+  return {
+    path: relativePath,
+    sha256: sha256(bytes),
+    corpus_id: contract.corpus_id,
+    task_ids: taskIds,
+    task_manifests: contract.task_manifests,
+    project_manifests: contract.project_manifests ?? {},
+  };
+}
+
+export function validatePacketCorpusContract(packetProvenance, rows, repoRoot, identity, profile) {
+  const expected = releaseCorpusContract(repoRoot, identity);
+  if (!expected) return;
+  const approved = object(profile.corpus_contract, "baseline profile corpus_contract");
+  if (approved.path !== expected.path || approved.sha256 !== expected.sha256) {
+    fail("checked-in release corpus contract does not match the approved baseline scope");
+  }
+  if (JSON.stringify(packetProvenance.corpus_contract) !== JSON.stringify(expected)) {
+    fail("raw packet corpus contract does not match the checked-in release scope");
+  }
+  const observedTaskIds = [...new Set(rows.map((row, index) => text(row.task_id, `packet row ${index} task_id`)))].sort();
+  if (JSON.stringify(observedTaskIds) !== JSON.stringify(expected.task_ids)) {
+    fail("raw packet rows do not exactly match the checked-in release task scope");
+  }
+}
+
+function validateRawProvenance(stats, packet, commit, profileName, identity, statsContract, repoRoot, profile) {
   if (fullSha(stats.commit, "stats.commit") !== commit) fail("raw stats commit does not match candidate");
   if (JSON.stringify(stats.evidence_identity) !== JSON.stringify(identity)) fail("raw stats identity does not match profile");
   if (stats.proof_tier !== "full_retrieval"
@@ -450,6 +498,7 @@ function validateRawProvenance(stats, packet, commit, profileName, identity, sta
   if (!Array.isArray(packetProvenance.publishable_blockers) || packetProvenance.publishable_blockers.length !== 0) fail("raw packet artifact contains publishable blockers");
   const rows = packetProvenance.rows;
   if (!Array.isArray(rows) || rows.length === 0) fail("raw packet artifact has no quality rows");
+  validatePacketCorpusContract(packetProvenance, rows, repoRoot, identity, profile);
   const repeats = new Map();
   for (const [index, row] of rows.entries()) {
     const sufficiency = row.sufficiency;
@@ -496,7 +545,7 @@ export function produceCandidate({ baselineDocument, baselineDir, profileName, s
     if (identity[key] !== profile.identity[key]) fail(`candidate ${key} does not match approved profile`);
   }
   const statsContract = statsContractFrom(repoRoot);
-  validateRawProvenance(stats, packet, commit, profileName, identity, statsContract);
+  validateRawProvenance(stats, packet, commit, profileName, identity, statsContract, repoRoot, profile);
   const baseDir = path.dirname(path.resolve(outPath));
   const measured = metricsFrom(stats, packet, profile);
   const baselineSha256 = sha256(Buffer.from(JSON.stringify(profile)));
@@ -561,7 +610,7 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
   const stats = readJson(statsPath, "stats artifact");
   const packet = readJson(packetPath, "packet artifact");
   const statsContract = statsContractFrom(repoRoot);
-  validateRawProvenance(stats, packet, commit, candidate.profile, profile.identity, statsContract);
+  validateRawProvenance(stats, packet, commit, candidate.profile, profile.identity, statsContract, repoRoot, profile);
   const measured = metricsFrom(stats, packet, profile);
   if (approvalDocument && approvalDocument.schema_version !== 3) fail("approval schema_version must be 3");
   const approvals = object(approvalDocument?.metrics ?? {}, "approval.metrics");
