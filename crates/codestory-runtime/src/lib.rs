@@ -56,10 +56,12 @@ use codestory_store::{
     Store, SymbolSearchDoc, SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
+#[cfg(test)]
+use codestory_workspace::{DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION};
 use codestory_workspace::{
-    DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION,
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInputs, RefreshMode,
-    WorkspaceInventoryOutcome, WorkspaceManifest, WorkspacePathIdentity, project_identity_v3,
+    SourceIndexPolicy, WorkspaceInventoryOutcome, WorkspaceManifest, WorkspacePathIdentity,
+    process_source_index_policy, project_identity_v3,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
@@ -5053,9 +5055,10 @@ fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
 fn full_refresh_execution_plan_with_coverage(
     root: &Path,
     workspace: &WorkspaceManifest,
+    policy: &SourceIndexPolicy,
 ) -> Result<(RefreshExecutionPlan, Vec<OversizedSourceExclusionCandidate>), ApiError> {
     let inventory = workspace
-        .source_inventory_with_oversized_policy()
+        .source_inventory_with_policy(policy)
         .map_err(|error| {
             ApiError::source_coverage_failure(
                 "source_collector_failure",
@@ -5123,6 +5126,7 @@ fn publish_source_policy_exclusions(
     root: &Path,
     publication: &IndexPublicationRecord,
     exclusions: &[OversizedSourceExclusionCandidate],
+    policy: &SourceIndexPolicy,
 ) -> Result<(), ApiError> {
     let identity = project_identity_v3(root);
     storage
@@ -5130,8 +5134,8 @@ fn publish_source_policy_exclusions(
             publication,
             &identity.project_id,
             &identity.workspace_id,
-            OVERSIZED_SOURCE_POLICY_VERSION,
-            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            &policy.policy_version,
+            policy.byte_cap,
             exclusions,
         )
         .map_err(|error| {
@@ -5142,10 +5146,28 @@ fn publish_source_policy_exclusions(
     Ok(())
 }
 
+fn revalidate_source_policy_exclusions(
+    workspace: &WorkspaceManifest,
+    exclusions: &[OversizedSourceExclusionCandidate],
+    policy: &SourceIndexPolicy,
+) -> Result<Vec<OversizedSourceExclusionCandidate>, ApiError> {
+    workspace
+        .revalidate_source_policy_exclusions(exclusions, policy)
+        .map_err(|error| {
+            ApiError::new(
+                "source_verification_failed",
+                format!(
+                    "Source policy exclusions changed before publication; the candidate core was discarded: {error}"
+                ),
+            )
+        })
+}
+
 fn validate_source_policy_exclusions(
     storage: &Store,
     root: &Path,
     publication: &IndexPublicationRecord,
+    policy: &SourceIndexPolicy,
 ) -> Result<(), ApiError> {
     let identity = project_identity_v3(root);
     storage
@@ -5153,8 +5175,8 @@ fn validate_source_policy_exclusions(
             publication,
             &identity.project_id,
             &identity.workspace_id,
-            OVERSIZED_SOURCE_POLICY_VERSION,
-            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            &policy.policy_version,
+            policy.byte_cap,
         )
         .map_err(|error| {
             ApiError::new(
@@ -5314,12 +5336,14 @@ fn index_freshness_observation_from_storage(
     root: &Path,
     workspace: &WorkspaceManifest,
     storage: &Storage,
+    policy: &SourceIndexPolicy,
 ) -> IndexFreshnessObservation {
     let mut identities = AffectedOperationIdentityIndex::native();
     index_freshness_observation_from_storage_with_identities(
         root,
         workspace,
         storage,
+        policy,
         &mut identities,
     )
 }
@@ -5328,6 +5352,7 @@ fn index_freshness_observation_from_storage_with_identities<R>(
     root: &Path,
     workspace: &WorkspaceManifest,
     storage: &Storage,
+    policy: &SourceIndexPolicy,
     identities: &mut AffectedOperationIdentityIndex<R>,
 ) -> IndexFreshnessObservation
 where
@@ -5361,7 +5386,9 @@ where
     }
     match storage.get_complete_index_publication() {
         Ok(Some(publication)) => {
-            if let Err(error) = validate_source_policy_exclusions(storage, root, &publication) {
+            if let Err(error) =
+                validate_source_policy_exclusions(storage, root, &publication, policy)
+            {
                 return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                     format!(
                         "source policy exclusion publication is incomplete: {}",
@@ -5431,9 +5458,10 @@ where
         stored_files,
         inventory: Default::default(),
     };
-    let refresh = match workspace.build_execution_outcome_bounded_with_oversized_policy(
+    let refresh = match workspace.build_execution_outcome_bounded_with_policy(
         &refresh_inputs,
         INDEX_FRESHNESS_CURRENT_FILE_CAP,
+        policy,
     ) {
         Ok(refresh) => refresh,
         Err(error) => {
@@ -5623,12 +5651,27 @@ where
     }
 }
 
+fn index_freshness_from_storage_with_policy(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    storage: &Storage,
+    policy: &SourceIndexPolicy,
+) -> IndexFreshnessDto {
+    index_freshness_observation_from_storage(root, workspace, storage, policy).freshness
+}
+
+#[cfg(test)]
 fn index_freshness_from_storage(
     root: &Path,
     workspace: &WorkspaceManifest,
     storage: &Storage,
 ) -> IndexFreshnessDto {
-    index_freshness_observation_from_storage(root, workspace, storage).freshness
+    index_freshness_from_storage_with_policy(
+        root,
+        workspace,
+        storage,
+        process_source_index_policy(),
+    )
 }
 
 fn workspace_member_index_summaries(
@@ -6134,6 +6177,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<ActivationSearchRevalidateHook>> =
         const { std::cell::RefCell::new(None) };
+    static SOURCE_POLICY_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -6153,6 +6198,22 @@ fn run_activation_search_before_revalidate_hook(storage_path: &Path) {
     ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook(storage_path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_source_policy_before_revalidate_hook(hook: impl FnOnce() + 'static) {
+    SOURCE_POLICY_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_source_policy_before_revalidate_hook() {
+    SOURCE_POLICY_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
         }
     });
 }
@@ -9846,6 +9907,7 @@ pub struct AppController {
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,
+    source_index_policy: Arc<SourceIndexPolicy>,
 }
 
 #[derive(Debug)]
@@ -9914,6 +9976,13 @@ impl AppController {
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        Self::new_with_source_index_policy(config, process_source_index_policy().clone())
+    }
+
+    fn new_with_source_index_policy(
+        config: codestory_retrieval::SidecarRuntimeConfig,
+        source_index_policy: SourceIndexPolicy,
+    ) -> Self {
         let (events_tx, events_rx) = unbounded();
         Self {
             state: Arc::new(Mutex::new(AppState {
@@ -9931,6 +10000,7 @@ impl AppController {
             events_tx,
             events_rx,
             runtime_config: Arc::new(config),
+            source_index_policy: Arc::new(source_index_policy),
         }
     }
 
@@ -10115,7 +10185,12 @@ impl AppController {
         let storage = self.open_storage_for_freshness()?;
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
-        Ok(index_freshness_from_storage(&root, &workspace, &storage))
+        Ok(index_freshness_from_storage_with_policy(
+            &root,
+            &workspace,
+            &storage,
+            &self.source_index_policy,
+        ))
     }
 
     fn resolve_project_file_path(
@@ -11027,6 +11102,7 @@ impl AppController {
                             &events_tx,
                             None,
                             &controller.runtime_config,
+                            &controller.source_index_policy,
                         ),
                         IndexMode::Incremental => index_incremental_for_runtime(
                             &root,
@@ -11034,6 +11110,7 @@ impl AppController {
                             &events_tx,
                             None,
                             &controller.runtime_config,
+                            &controller.source_index_policy,
                         ),
                     };
                     result.and_then(|summary| {
@@ -11099,6 +11176,7 @@ impl AppController {
                 &self.events_tx,
                 cancel_token,
                 &self.runtime_config,
+                &self.source_index_policy,
             ),
             IndexMode::Incremental => index_incremental_for_runtime(
                 &root,
@@ -11106,6 +11184,7 @@ impl AppController {
                 &self.events_tx,
                 cancel_token,
                 &self.runtime_config,
+                &self.source_index_policy,
             ),
         };
 
@@ -11342,7 +11421,13 @@ impl AppController {
             return Ok(true);
         }
         let root = self.require_project_root()?;
-        Ok(validate_source_policy_exclusions(&storage, &root, &publication).is_err())
+        Ok(validate_source_policy_exclusions(
+            &storage,
+            &root,
+            &publication,
+            &self.source_index_policy,
+        )
+        .is_err())
     }
 
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
@@ -11394,17 +11479,24 @@ impl AppController {
             mode
         };
         let execution_plan = match effective_mode {
-            IndexMode::Full => workspace.full_refresh_execution_plan().map_err(|e| {
-                ApiError::internal(format!("Failed to generate full refresh plan: {e}"))
-            })?,
+            IndexMode::Full => {
+                full_refresh_execution_plan_with_coverage(
+                    &root,
+                    &workspace,
+                    &self.source_index_policy,
+                )?
+                .0
+            }
             IndexMode::Incremental => {
                 workspace
-                    .build_execution_plan(&refresh_inputs)
+                    .build_execution_outcome_with_policy(&refresh_inputs, &self.source_index_policy)
                     .map_err(|e| {
                         ApiError::internal(format!(
                             "Failed to generate incremental refresh plan: {e}"
                         ))
                     })?
+                    .refresh
+                    .plan
             }
         };
         let members =
@@ -12148,7 +12240,12 @@ impl AppController {
                     "Indexed-file coverage requires a complete core publication.",
                 )
             })?;
-        validate_source_policy_exclusions(&storage, &root, &publication)?;
+        validate_source_policy_exclusions(
+            &storage,
+            &root,
+            &publication,
+            &self.source_index_policy,
+        )?;
         let source_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
             ApiError::internal(format!("Failed to load source policy exclusions: {error}"))
         })?;
@@ -12393,6 +12490,7 @@ impl AppController {
             &root,
             &workspace,
             &storage,
+            &self.source_index_policy,
             &mut path_identities,
         );
         let freshness = &freshness_observation.freshness;
@@ -13076,7 +13174,12 @@ impl AppController {
     ) -> IndexFreshnessDto {
         if !matches!(storage.has_incomplete_incremental_run(), Ok(false)) {
             self.state.lock().index_freshness_cache = None;
-            return index_freshness_from_storage(root, workspace, storage);
+            return index_freshness_from_storage_with_policy(
+                root,
+                workspace,
+                storage,
+                &self.source_index_policy,
+            );
         }
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
         let storage_fingerprint = storage_fingerprint(storage_path);
@@ -13092,7 +13195,12 @@ impl AppController {
             }
         }
 
-        let freshness = index_freshness_from_storage(root, workspace, storage);
+        let freshness = index_freshness_from_storage_with_policy(
+            root,
+            workspace,
+            storage,
+            &self.source_index_policy,
+        );
         let mut state = self.state.lock();
         state.index_freshness_cache = Some(CachedIndexFreshness {
             root: root.to_path_buf(),
@@ -14077,6 +14185,7 @@ fn index_full_for_runtime(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
     let previous_publication = if storage_path.exists() {
         Store::database_index_publication(storage_path).map_err(|error| {
@@ -14138,9 +14247,13 @@ fn index_full_for_runtime(
             match live.get_complete_index_publication() {
                 Ok(Some(publication)) if publication == *expected => {
                     match live.validate_dense_anchor_publication(&publication) {
-                        Ok(_) => {
-                            validate_source_policy_exclusions(&live, root, &publication).is_ok()
-                        }
+                        Ok(_) => validate_source_policy_exclusions(
+                            &live,
+                            root,
+                            &publication,
+                            source_index_policy,
+                        )
+                        .is_ok(),
                         Err(error) => {
                             tracing::debug!(
                                 path = %storage_path.display(),
@@ -14163,7 +14276,7 @@ fn index_full_for_runtime(
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let (execution_plan, policy_exclusions) =
-        full_refresh_execution_plan_with_coverage(root, &workspace)?;
+        full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
 
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
@@ -14176,7 +14289,8 @@ fn index_full_for_runtime(
 
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
-    let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
+    let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
+        .with_source_file_byte_cap(source_index_policy.byte_cap);
     let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
     drop(bus);
@@ -14340,9 +14454,26 @@ fn index_full_for_runtime(
             "Failed to publish complete dense anchor inputs: {error}"
         )));
     }
-    if let Err(error) =
-        publish_source_policy_exclusions(staged.store_mut(), root, &publication, &policy_exclusions)
-    {
+    #[cfg(test)]
+    run_source_policy_before_revalidate_hook();
+    let policy_exclusions = match revalidate_source_policy_exclusions(
+        &workspace,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_source_policy_exclusions(
+        staged.store_mut(),
+        root,
+        &publication,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
         let _ = staged.discard();
         return Err(error);
     }
@@ -14568,6 +14699,7 @@ fn index_incremental(
         events_tx,
         cancel_token,
         &test_sidecar_runtime_from_env(),
+        process_source_index_policy(),
     )
 }
 
@@ -14577,8 +14709,16 @@ fn index_incremental_for_runtime(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
-    run_incremental_indexing_common(root, storage_path, events_tx, cancel_token, runtime)
+    run_incremental_indexing_common(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        runtime,
+        source_index_policy,
+    )
 }
 
 fn spawn_progress_forwarder(
@@ -14609,6 +14749,7 @@ fn run_incremental_indexing_common(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
     let live_exists = storage_path.exists();
     let live_is_incomplete = live_exists
@@ -14620,7 +14761,14 @@ fn run_incremental_indexing_common(
             message: "A prior incremental index run was interrupted; rebuilding through staged full recovery."
                 .to_string(),
         });
-        return index_full_for_runtime(root, storage_path, events_tx, cancel_token, runtime);
+        return index_full_for_runtime(
+            root,
+            storage_path,
+            events_tx,
+            cancel_token,
+            runtime,
+            source_index_policy,
+        );
     }
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
@@ -14682,7 +14830,7 @@ fn run_incremental_indexing_common(
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
         let policy_refresh = workspace
-            .build_execution_outcome_with_oversized_policy(&refresh_inputs)
+            .build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
             .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))?;
         if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
             let reason = if policy_refresh.refresh.inventory_outcome
@@ -14790,7 +14938,8 @@ fn run_incremental_indexing_common(
             let _ = forwarder.join();
             return Err(indexing_cancelled_error());
         }
-        let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
+        let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
+            .with_source_file_byte_cap(source_index_policy.byte_cap);
         let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
         // Drop bus so forwarder unblocks.
@@ -14921,9 +15070,28 @@ fn run_incremental_indexing_common(
             "Failed to publish complete dense anchor inputs: {error}"
         )));
     }
-    if let Err(error) =
-        publish_source_policy_exclusions(staged.store_mut(), root, &publication, &policy_exclusions)
-    {
+    #[cfg(test)]
+    run_source_policy_before_revalidate_hook();
+    let workspace = WorkspaceManifest::open(root.to_path_buf())
+        .map_err(|error| ApiError::internal(format!("Failed to reopen project: {error}")))?;
+    let policy_exclusions = match revalidate_source_policy_exclusions(
+        &workspace,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_source_policy_exclusions(
+        staged.store_mut(),
+        root,
+        &publication,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
         let _ = staged.discard();
         return Err(error);
     }
@@ -21844,6 +22012,11 @@ fn build_llm_symbol_doc_text() -> String {
             .get_connection()
             .execute("DELETE FROM source_policy_exclusion_publication", [])
             .expect("corrupt exclusion publication identity");
+        assert!(
+            controller
+                .complete_core_requires_publication_repair(&storage_path)
+                .expect("missing migrated manifest requires writer repair")
+        );
         let incomplete =
             index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
         assert_eq!(incomplete.status, IndexFreshnessStatusDto::NotChecked);
@@ -21854,6 +22027,241 @@ fn build_llm_symbol_doc_text() -> String {
                 .is_some_and(|reason| reason.contains("source policy exclusion publication"))
         );
         assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_revalidates_excluded_bytes_at_identity_fence_and_preserves_live_core() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline core");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline core")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "full refresh identity-fence drift fixture",
+        );
+        let changed_path = source_path.clone();
+        arm_source_policy_before_revalidate_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("read classified exclusion");
+            bytes.extend_from_slice(b"\n// changed after classification\n");
+            fs::write(&changed_path, bytes).expect("mutate classified exclusion");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("changed exclusion must reject full candidate");
+        assert_eq!(error.code, "source_verification_failed");
+        let live = Storage::open(&storage_path).expect("reopen preserved live core");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline.clone())
+        );
+        let manifest = live
+            .validate_source_policy_exclusion_publication(
+                &baseline,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("baseline exclusion manifest remains valid");
+        assert_eq!(manifest.exclusion_count, 0);
+        assert!(
+            live.get_file_by_path(&source_path)
+                .expect("read preserved file projection")
+                .is_some()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn incremental_refresh_revalidates_excluded_bytes_at_identity_fence_and_preserves_live_core() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline core");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline core")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "incremental identity-fence drift fixture",
+        );
+        let changed_path = source_path.clone();
+        arm_source_policy_before_revalidate_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("read classified exclusion");
+            bytes.extend_from_slice(b"\n// changed after classification\n");
+            fs::write(&changed_path, bytes).expect("mutate classified exclusion");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("changed exclusion must reject incremental candidate");
+        assert_eq!(error.code, "source_verification_failed");
+        let live = Storage::open(&storage_path).expect("reopen preserved live core");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline.clone())
+        );
+        let manifest = live
+            .validate_source_policy_exclusion_publication(
+                &baseline,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("baseline exclusion manifest remains valid");
+        assert_eq!(manifest.exclusion_count, 0);
+        assert!(
+            live.get_file_by_path(&source_path)
+                .expect("read preserved file projection")
+                .is_some()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_readers() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let large_path = workspace.path().join("large.rs");
+        fs::write(workspace.path().join("small.rs"), "pub fn small() {}\n")
+            .expect("write small source");
+        fs::write(
+            &large_path,
+            "// oversized\n// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+        )
+        .expect("write policy source");
+        let policy = SourceIndexPolicy::oversized(64);
+        let manifest = WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace");
+        let inventory = manifest
+            .source_inventory_with_policy(&policy)
+            .expect("classify with explicit policy");
+        assert_eq!(inventory.policy_exclusions.len(), 1);
+        assert_eq!(inventory.policy_exclusions[0].normalized_path, "large.rs");
+        assert_eq!(inventory.policy_exclusions[0].byte_cap, 64);
+
+        let mut fallback = Storage::new_in_memory().expect("fallback storage");
+        let fallback_plan = RefreshExecutionPlan {
+            mode: RefreshMode::FullRefresh,
+            files_to_index: vec![large_path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        V2WorkspaceIndexer::new(workspace.path().to_path_buf())
+            .with_source_file_byte_cap(policy.byte_cap)
+            .run(&mut fallback, &fallback_plan, &EventBus::new(), None)
+            .expect("indexer fallback records oversized coverage");
+        assert!(
+            fallback
+                .get_errors(None)
+                .expect("fallback errors")
+                .iter()
+                .any(|error| error.coverage_reason == Some(FileCoverageReason::Oversized)),
+            "the parser fallback must enforce the same 64-byte cap"
+        );
+
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            policy.clone(),
+        );
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish non-default policy core");
+        let storage = Storage::open(&storage_path).expect("open policy core");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read policy publication")
+            .expect("complete policy publication");
+        let published = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                &policy.policy_version,
+                policy.byte_cap,
+            )
+            .expect("manifest uses the injected policy");
+        assert_eq!(published.byte_cap, 64);
+        assert_eq!(published.exclusion_count, 1);
+        let files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: Some("large.rs".into()),
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("matching policy reader accepts the manifest");
+        assert_eq!(files.policy_exclusions[0].byte_cap, 64);
+
+        for incompatible in [
+            SourceIndexPolicy::oversized(65),
+            SourceIndexPolicy {
+                policy_version: "oversized-source-v2".into(),
+                byte_cap: 64,
+            },
+        ] {
+            let reader = AppController::new_with_source_index_policy(
+                test_sidecar_runtime_from_env(),
+                incompatible,
+            );
+            reader
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("bind incompatible reader");
+            assert!(
+                reader
+                    .complete_core_requires_publication_repair(&storage_path)
+                    .expect("inspect repair requirement")
+            );
+            let error = reader
+                .indexed_files(IndexedFilesRequest {
+                    path_contains: None,
+                    language: None,
+                    role: None,
+                    limit: None,
+                })
+                .expect_err("incompatible reader must fail closed");
+            assert_eq!(error.code, "source_verification_failed");
+        }
     }
 
     #[test]

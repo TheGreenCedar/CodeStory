@@ -14,7 +14,8 @@ use anyhow::{Result, bail};
 pub use codestory_contracts::workspace::{
     BuildMode, DEFAULT_SOURCE_FILE_BYTE_CAP, IndexedFileRecord, OVERSIZED_SOURCE_POLICY_VERSION,
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInfo, RefreshInputs,
-    RefreshMode, RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
+    RefreshMode, RefreshPlan, SourceIndexPolicy, StoredFileRecord, StoredFileState,
+    WorkspaceInventory, process_source_index_policy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -423,11 +424,28 @@ impl WorkspaceManifest {
 
     /// Discover parser candidates and content-verified oversized policy exclusions.
     pub fn source_inventory_with_oversized_policy(&self) -> Result<WorkspacePolicyFileInventory> {
+        self.source_inventory_with_policy(process_source_index_policy())
+    }
+
+    /// Discover candidates using one caller-owned immutable source-index policy.
+    pub fn source_inventory_with_policy(
+        &self,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyFileInventory> {
         WorkspaceDiscovery.source_inventory_with_policy(
             self,
-            DEFAULT_SOURCE_FILE_BYTE_CAP,
-            OVERSIZED_SOURCE_POLICY_VERSION,
+            policy.byte_cap,
+            &policy.policy_version,
         )
+    }
+
+    /// Re-read every classified exclusion at the publication fence.
+    pub fn revalidate_source_policy_exclusions(
+        &self,
+        candidates: &[OversizedSourceExclusionCandidate],
+        policy: &SourceIndexPolicy,
+    ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
+        WorkspaceDiscovery.revalidate_source_policy_exclusions(self, candidates, policy)
     }
 
     /// Build a full-refresh plan that indexes every currently discovered file.
@@ -469,11 +487,20 @@ impl WorkspaceManifest {
         &self,
         inputs: &RefreshInputs,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
+        self.build_execution_outcome_with_policy(inputs, process_source_index_policy())
+    }
+
+    /// Build a refresh outcome using one caller-owned immutable source-index policy.
+    pub fn build_execution_outcome_with_policy(
+        &self,
+        inputs: &RefreshInputs,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
         WorkspaceDiscovery.build_refresh_outcome_with_policy(
             self,
             inputs,
-            DEFAULT_SOURCE_FILE_BYTE_CAP,
-            OVERSIZED_SOURCE_POLICY_VERSION,
+            policy.byte_cap,
+            &policy.policy_version,
         )
     }
 
@@ -483,12 +510,26 @@ impl WorkspaceManifest {
         inputs: &RefreshInputs,
         max_current_files: usize,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
+        self.build_execution_outcome_bounded_with_policy(
+            inputs,
+            max_current_files,
+            process_source_index_policy(),
+        )
+    }
+
+    /// Build a bounded refresh outcome using one caller-owned immutable policy.
+    pub fn build_execution_outcome_bounded_with_policy(
+        &self,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
         WorkspaceDiscovery.build_refresh_outcome_bounded_with_policy(
             self,
             inputs,
             max_current_files,
-            DEFAULT_SOURCE_FILE_BYTE_CAP,
-            OVERSIZED_SOURCE_POLICY_VERSION,
+            policy.byte_cap,
+            &policy.policy_version,
         )
     }
 
@@ -552,6 +593,53 @@ impl WorkspaceDiscovery {
         policy_version: &str,
     ) -> Result<WorkspacePolicyFileInventory> {
         self.source_inventory_with_policy_inner(manifest, byte_cap, policy_version, None)
+    }
+
+    /// Verify that classified exclusions still name the same stable bytes at publication time.
+    pub fn revalidate_source_policy_exclusions(
+        &self,
+        manifest: &WorkspaceManifest,
+        candidates: &[OversizedSourceExclusionCandidate],
+        policy: &SourceIndexPolicy,
+    ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
+        if policy.byte_cap == 0 || policy.policy_version.trim().is_empty() {
+            bail!("source index policy requires a non-zero cap and non-empty version");
+        }
+        let root = workspace_root(manifest);
+        let mut verified = candidates.to_vec();
+        verified.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        let mut previous_path: Option<&str> = None;
+        for candidate in &verified {
+            if candidate.policy_version != policy.policy_version
+                || candidate.byte_cap != policy.byte_cap
+                || previous_path == Some(candidate.normalized_path.as_str())
+            {
+                bail!(
+                    "source policy exclusion `{}` does not match the active policy",
+                    candidate.normalized_path
+                );
+            }
+            previous_path = Some(candidate.normalized_path.as_str());
+            let path = root.join(&candidate.normalized_path);
+            let normalized_path = normalized_policy_path(&root, &path)?;
+            if normalized_path != candidate.normalized_path {
+                bail!(
+                    "source policy exclusion path changed from `{}` to `{normalized_path}`",
+                    candidate.normalized_path
+                );
+            }
+            let (content_hash, observed_size) = current_content_identity(&path)?;
+            if content_hash != candidate.content_hash
+                || observed_size != candidate.observed_size
+                || observed_size <= policy.byte_cap
+            {
+                bail!(
+                    "source policy exclusion `{}` changed before publication",
+                    candidate.normalized_path
+                );
+            }
+        }
+        Ok(verified)
     }
 
     fn source_inventory_with_policy_inner(

@@ -15,10 +15,11 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 ### Reliability and compatibility
 
 - Source files larger than the parser byte cap are now hashed and classified
-  before parser scheduling. Complete builds publish their project, workspace,
-  and core-bound exclusion manifest atomically, while `files` diagnostics show
-  the retained source inventory without claiming graph or semantic coverage.
-  Partial discovery and unreadable or changing files still fail closed.
+  before parser scheduling. Complete builds revalidate those bytes at the
+  identity fence and publish their project, workspace, and core-bound exclusion
+  manifest atomically, while `files` diagnostics show the retained source
+  inventory without claiming graph or semantic coverage. Partial discovery and
+  unreadable or changing files still fail closed.
 - Release closeout now derives its exact source, package, protected hardware,
   installed runtime, retrieval, performance, quality, platform and
   post-publish byte-comparison cells from the release claim graph. The generic

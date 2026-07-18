@@ -4,6 +4,10 @@ use codestory_contracts::graph::{
     ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use codestory_contracts::workspace::OversizedSourceExclusionCandidate;
+#[cfg(test)]
+use codestory_contracts::workspace::{
+    DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION,
+};
 use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
@@ -57,7 +61,8 @@ const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
 const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
-const PROMOTION_JOURNAL_VERSION: u32 = 1;
+const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
+const PROMOTION_JOURNAL_VERSION: u32 = 2;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -197,6 +202,7 @@ struct SourcePolicyExclusionRollbackIdentity {
     workspace_id: String,
     core_generation_id: String,
     core_run_id: String,
+    core_published_at_epoch_ms: i64,
     exclusion_count: u64,
     exclusion_digest: String,
     policy_version: String,
@@ -225,7 +231,8 @@ fn read_source_policy_exclusion_rollback_identity(
     let identity = conn
         .query_row(
             "SELECT project_id, workspace_id, core_generation_id, core_run_id,
-                    exclusion_count, exclusion_digest, policy_version, byte_cap
+                    published_at_epoch_ms, exclusion_count, exclusion_digest,
+                    policy_version, byte_cap
              FROM source_policy_exclusion_publication
              WHERE id = 1 AND complete = 1 AND schema_version = ?1",
             params![SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION as i64],
@@ -236,9 +243,10 @@ fn read_source_policy_exclusion_rollback_identity(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
@@ -248,6 +256,7 @@ fn read_source_policy_exclusion_rollback_identity(
         workspace_id,
         core_generation_id,
         core_run_id,
+        core_published_at_epoch_ms,
         exclusion_count,
         exclusion_digest,
         policy_version,
@@ -261,6 +270,7 @@ fn read_source_policy_exclusion_rollback_identity(
         workspace_id,
         core_generation_id,
         core_run_id,
+        core_published_at_epoch_ms,
         exclusion_count: u64::try_from(exclusion_count)
             .map_err(|_| promotion_error("Source policy exclusion rollback count is invalid"))?,
         exclusion_digest,
@@ -271,6 +281,7 @@ fn read_source_policy_exclusion_rollback_identity(
     let records = read_source_policy_exclusions(&conn)?;
     if identity.core_generation_id != publication.generation_id
         || identity.core_run_id != publication.run_id
+        || identity.core_published_at_epoch_ms != publication.published_at_epoch_ms
         || identity.exclusion_count != records.len() as u64
         || identity.exclusion_digest != source_policy_exclusion_digest(&records)
         || records.iter().any(|record| {
@@ -306,6 +317,21 @@ fn require_recorded_source_policy_identity(
         )));
     }
     Ok(())
+}
+
+fn require_candidate_source_policy_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<SourcePolicyExclusionRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Err(promotion_error(format!(
+            "{role} source policy exclusion manifest is missing for {}",
+            path.display()
+        )));
+    }
+    require_recorded_source_policy_identity(path, publication, expected, role)
 }
 
 fn promotion_lock_path(path: &Path) -> PathBuf {
@@ -445,7 +471,10 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
     let bytes = fs::read(path).map_err(|error| promotion_path_error("read", path, error))?;
     let journal: PromotionJournal = serde_json::from_slice(&bytes)
         .map_err(|error| promotion_path_error("parse", path, error))?;
-    if journal.version != PROMOTION_JOURNAL_VERSION {
+    if !matches!(
+        journal.version,
+        LEGACY_PROMOTION_JOURNAL_VERSION | PROMOTION_JOURNAL_VERSION
+    ) {
         return Err(promotion_error(format!(
             "Unsupported promotion journal {}: version={}",
             path.display(),
@@ -602,12 +631,21 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
                 path.display()
             )));
         }
-        require_recorded_source_policy_identity(
-            path,
-            &live_identity,
-            &committed.candidate_source_policy,
-            "Committed live database",
-        )?;
+        if committed.version >= PROMOTION_JOURNAL_VERSION {
+            require_candidate_source_policy_identity(
+                path,
+                &live_identity,
+                &committed.candidate_source_policy,
+                "Committed live database",
+            )?;
+        } else {
+            require_recorded_source_policy_identity(
+                path,
+                &live_identity,
+                &committed.candidate_source_policy,
+                "Legacy committed live database",
+            )?;
+        }
         if let Err(error) = cleanup_committed_promotion_artifacts(path) {
             tracing::warn!(
                 live_path = %path.display(),
@@ -640,6 +678,12 @@ fn rollback_prepared_promotion(
     live_path: &Path,
     prepared: &PromotionJournal,
 ) -> Result<(), StorageError> {
+    if prepared.version >= PROMOTION_JOURNAL_VERSION && prepared.candidate_source_policy.is_none() {
+        return Err(promotion_error(format!(
+            "Prepared promotion candidate source policy identity is missing for {}",
+            live_path.display()
+        )));
+    }
     let backup_path = live_path.with_extension("sqlite.backup");
     let prepared_path = promotion_prepared_journal_path(live_path);
     let live_identity = read_recovery_database_identity(live_path)?;
@@ -654,12 +698,14 @@ fn rollback_prepared_promotion(
     }
     if let Some(live_identity) = live_identity.as_ref() {
         if live_identity == &prepared.candidate {
-            require_recorded_source_policy_identity(
-                live_path,
-                live_identity,
-                &prepared.candidate_source_policy,
-                "Prepared candidate",
-            )?;
+            if prepared.candidate_source_policy.is_some() {
+                require_candidate_source_policy_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.candidate_source_policy,
+                    "Prepared candidate",
+                )?;
+            }
         } else if prepared.previous.as_ref() == Some(live_identity) {
             require_recorded_source_policy_identity(
                 live_path,
@@ -3244,6 +3290,12 @@ impl Storage {
         )?;
         let candidate_source_policy =
             read_source_policy_exclusion_rollback_identity(staged_path, &candidate)?;
+        if candidate_source_policy.is_none() {
+            return Err(promotion_error(format!(
+                "Staged promotion candidate {} has no complete source policy exclusion manifest",
+                staged_path.display()
+            )));
+        }
         let previous = read_recovery_database_identity(live_path)?;
         let previous_source_policy = match previous.as_ref() {
             Some(previous) => read_source_policy_exclusion_rollback_identity(live_path, previous)?,
@@ -3337,7 +3389,7 @@ impl Storage {
                 staged_path.display()
             )));
         }
-        if let Err(error) = require_recorded_source_policy_identity(
+        if let Err(error) = require_candidate_source_policy_identity(
             live_path,
             &published,
             &candidate_source_policy,

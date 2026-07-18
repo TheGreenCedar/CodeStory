@@ -237,6 +237,19 @@ mod tests {
         root
     }
 
+    fn publish_empty_source_policy(store: &mut Store, publication: &crate::IndexPublicationRecord) {
+        store
+            .publish_source_policy_exclusion_generation(
+                publication,
+                "test-project",
+                "test-workspace",
+                codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION,
+                codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+                &[],
+            )
+            .expect("publish empty source policy identity");
+    }
+
     #[test]
     fn snapshot_store_refresh_and_invalidate_cycle_is_visible_through_metadata() {
         let store = Store::new_in_memory().expect("in-memory store");
@@ -285,16 +298,18 @@ mod tests {
             .snapshots()
             .finalize_staged()
             .expect("prepare staged publish");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "prepared-generation".to_string(),
+            run_id: "prepared-run".to_string(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
         staged
             .store_mut()
-            .put_index_publication(&crate::IndexPublicationRecord {
-                generation: 1,
-                generation_id: "prepared-generation".to_string(),
-                run_id: "prepared-run".to_string(),
-                mode: crate::IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            })
+            .put_index_publication(&publication)
             .expect("identify staged publication");
+        publish_empty_source_policy(staged.store_mut(), &publication);
         staged.publish(&live_path).expect("promote staged snapshot");
 
         let live = Store::open(&live_path).expect("open live store");
@@ -434,14 +449,16 @@ mod tests {
                 },
             ])
             .expect("seed old generation");
-            live.put_index_publication(&crate::IndexPublicationRecord {
+            let publication = crate::IndexPublicationRecord {
                 generation: 1,
                 generation_id: "old-generation".to_string(),
                 run_id: "old-run".to_string(),
                 mode: crate::IndexPublicationMode::Full,
                 published_at_epoch_ms: 1,
-            })
-            .expect("identify old generation");
+            };
+            live.put_index_publication(&publication)
+                .expect("identify old generation");
+            publish_empty_source_policy(&mut live, &publication);
             live.snapshots()
                 .refresh_all()
                 .expect("finalize old snapshots");
@@ -491,16 +508,18 @@ mod tests {
             .snapshots()
             .refresh_all()
             .expect("finalize new snapshots");
+        let publication = crate::IndexPublicationRecord {
+            generation: 2,
+            generation_id: "new-generation".to_string(),
+            run_id: "new-run".to_string(),
+            mode: crate::IndexPublicationMode::Incremental,
+            published_at_epoch_ms: 2,
+        };
         staged
             .store_mut()
-            .put_index_publication(&crate::IndexPublicationRecord {
-                generation: 2,
-                generation_id: "new-generation".to_string(),
-                run_id: "new-run".to_string(),
-                mode: crate::IndexPublicationMode::Incremental,
-                published_at_epoch_ms: 2,
-            })
+            .put_index_publication(&publication)
             .expect("identify new generation");
+        publish_empty_source_policy(staged.store_mut(), &publication);
         let staged_path = staged.path().to_path_buf();
         let racing_live_path = live_path.clone();
         let (old_observed_tx, old_observed_rx) = mpsc::channel();

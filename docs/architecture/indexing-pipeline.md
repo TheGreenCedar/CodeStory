@@ -28,13 +28,13 @@ sequenceDiagram
     Runtime->>Workspace: full refresh plan or diff-based refresh plan
     Workspace-->>Runtime: RefreshExecutionPlan + verified policy exclusions
     Runtime->>Store: open staged store for full refresh or live store for incremental
-    Runtime->>Store: publish candidate exclusion manifest
     Runtime->>Indexer: WorkspaceIndexer::run(plan, store)
     Indexer->>Store: flush files, nodes, edges, occurrences, component access, callable projection state
     Indexer->>Store: run post-flush resolution updates
     Runtime->>Store: finalize staged snapshot or refresh live snapshots
     Runtime->>Search: rebuild lexical projection, symbol docs, component reports, and dense anchors
     Search->>Store: reuse unchanged anchor metadata or upsert selected embedding-free inputs
+    Runtime->>Store: revalidate and publish the bound exclusion manifest at the identity fence
     Runtime-->>CLI: indexing summary and phase timings
 ```
 

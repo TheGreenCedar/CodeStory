@@ -3111,13 +3111,22 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             line_count: 10,
             file_role: FileRole::Source,
         }])?;
-        seed.put_index_publication(&IndexPublicationRecord {
+        let live_publication = IndexPublicationRecord {
             generation: 1,
             generation_id: "live-generation".to_string(),
             run_id: "live-run".to_string(),
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 1,
-        })?;
+        };
+        seed.put_index_publication(&live_publication)?;
+        seed.publish_source_policy_exclusion_generation(
+            &live_publication,
+            "test-project",
+            "test-workspace",
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            &[],
+        )?;
         drop(seed);
         let live = Storage::open_read_only(&live_path)?;
 
@@ -3133,13 +3142,22 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
                 line_count: 20,
                 file_role: FileRole::Source,
             }])?;
-            staged.put_index_publication(&IndexPublicationRecord {
+            let staged_publication = IndexPublicationRecord {
                 generation: 2,
                 generation_id: "staged-generation".to_string(),
                 run_id: "staged-run".to_string(),
                 mode: IndexPublicationMode::Full,
                 published_at_epoch_ms: 2,
-            })?;
+            };
+            staged.put_index_publication(&staged_publication)?;
+            staged.publish_source_policy_exclusion_generation(
+                &staged_publication,
+                "test-project",
+                "test-workspace",
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+                &[],
+            )?;
             staged.finalize_staged_snapshot()?;
         }
 
@@ -3232,13 +3250,22 @@ fn seed_promotion_file_with_identity(
         file_role: FileRole::Source,
     }])?;
     if publish {
-        storage.put_index_publication(&IndexPublicationRecord {
+        let publication = IndexPublicationRecord {
             generation: id.max(0) as u64,
             generation_id: format!("generation-{id}"),
             run_id: format!("run-{id}"),
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: id.max(0),
-        })?;
+        };
+        storage.put_index_publication(&publication)?;
+        storage.publish_source_policy_exclusion_generation(
+            &publication,
+            "test-project",
+            "test-workspace",
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            &[],
+        )?;
     }
     storage.finalize_staged_snapshot()
 }
@@ -3249,6 +3276,28 @@ fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageEr
 
 fn seed_unpublished_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
     seed_promotion_file_with_identity(path, id, name, false)
+}
+
+fn publish_nonempty_test_source_policy(path: &Path, generation: u64) -> Result<(), StorageError> {
+    let mut storage = Storage::open(path)?;
+    let publication = storage
+        .get_complete_index_publication()?
+        .expect("seeded publication");
+    storage.publish_source_policy_exclusion_generation(
+        &publication,
+        "test-project",
+        "test-workspace",
+        OVERSIZED_SOURCE_POLICY_VERSION,
+        DEFAULT_SOURCE_FILE_BYTE_CAP,
+        &[OversizedSourceExclusionCandidate {
+            normalized_path: format!("vendor/registers-{generation}.h"),
+            content_hash: format!("{generation:064x}"),
+            observed_size: DEFAULT_SOURCE_FILE_BYTE_CAP + generation,
+            policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+            byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+        }],
+    )?;
+    Ok(())
 }
 
 fn promotion_journal(
@@ -3312,11 +3361,123 @@ fn promotion_journal_binds_source_policy_exclusion_count_and_digest() -> Result<
         .expect("candidate exclusion rollback identity");
     assert_eq!(previous.exclusion_count, 1);
     assert_eq!(candidate.exclusion_count, 1);
+    assert_eq!(previous.core_published_at_epoch_ms, 1);
+    assert_eq!(candidate.core_published_at_epoch_ms, 2);
     assert_ne!(previous.exclusion_digest, candidate.exclusion_digest);
 
     cleanup_sqlite_sidecars(&previous_path)?;
     cleanup_sqlite_sidecars(&candidate_path)?;
     Ok(())
+}
+
+#[test]
+fn staged_promotion_rejects_missing_corrupt_or_timestamp_drifted_candidate_manifest() {
+    for corruption in ["missing", "digest", "timestamp"] {
+        let live_path = unique_temp_db_path(&format!("promotion-policy-live-{corruption}"));
+        let staged_path = unique_temp_db_path(&format!("promotion-policy-staged-{corruption}"));
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed live publication");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged publication");
+        let staged = Storage::open(&staged_path).expect("open staged publication");
+        match corruption {
+            "missing" => {
+                staged
+                    .get_connection()
+                    .execute("DELETE FROM source_policy_exclusion_publication", [])
+                    .expect("remove candidate manifest");
+            }
+            "digest" => {
+                staged
+                    .get_connection()
+                    .execute(
+                        "UPDATE source_policy_exclusion_publication SET exclusion_digest = ?1",
+                        params!["0".repeat(64)],
+                    )
+                    .expect("corrupt candidate digest");
+            }
+            "timestamp" => {
+                staged
+                    .get_connection()
+                    .execute(
+                        "UPDATE source_policy_exclusion_publication SET published_at_epoch_ms = published_at_epoch_ms + 1",
+                        [],
+                    )
+                    .expect("drift candidate timestamp");
+            }
+            _ => unreachable!(),
+        }
+        drop(staged);
+
+        let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+            .expect_err("invalid candidate manifest must block promotion");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("source policy exclusion"),
+            "unexpected promotion error: {error}"
+        );
+        let live = Storage::open(&live_path).expect("reopen preserved live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("live publication")
+                .expect("complete live publication")
+                .generation_id,
+            "generation-1"
+        );
+        assert_eq!(
+            live.get_files().expect("live files")[0].path,
+            PathBuf::from("old.rs")
+        );
+
+        cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
+    }
+}
+
+#[test]
+fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_repair() {
+    let live_path = unique_temp_db_path("legacy-committed-policy-live");
+    seed_promotion_file(&live_path, 1, "legacy.rs").expect("seed legacy live publication");
+    let live = Storage::open(&live_path).expect("open legacy live publication");
+    let candidate = live
+        .get_complete_index_publication()
+        .expect("read legacy publication")
+        .expect("complete legacy publication");
+    live.get_connection()
+        .execute("DELETE FROM source_policy_exclusion_publication", [])
+        .expect("remove post-v27 policy identity from legacy fixture");
+    drop(live);
+
+    let committed_path = promotion_committed_journal_path(&live_path);
+    write_promotion_journal(
+        &committed_path,
+        &PromotionJournal {
+            version: LEGACY_PROMOTION_JOURNAL_VERSION,
+            previous: None,
+            candidate: candidate.clone(),
+            previous_source_policy: None,
+            candidate_source_policy: None,
+        },
+    )
+    .expect("write legacy committed journal");
+
+    let recovered = Storage::open(&live_path).expect("recover legacy committed promotion");
+    assert_eq!(
+        recovered
+            .get_complete_index_publication()
+            .expect("recovered publication"),
+        Some(candidate)
+    );
+    assert!(
+        recovered
+            .get_source_policy_exclusion_manifest()
+            .expect("legacy policy manifest")
+            .is_none(),
+        "store recovery must not synthesize policy evidence"
+    );
+    assert!(!committed_path.exists());
+
+    cleanup_sqlite_sidecars(&live_path).expect("clean legacy fixture");
 }
 
 #[test]
@@ -3340,6 +3501,9 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
     let committed_path = promotion_committed_journal_path(&live_path);
     seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
     seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+    publish_nonempty_test_source_policy(&live_path, 1).expect("publish live exclusion identity");
+    publish_nonempty_test_source_policy(&staged_path, 2)
+        .expect("publish staged exclusion identity");
 
     let status =
         std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))
@@ -3379,6 +3543,12 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
         live.get_files().expect("read live generation")[0].path,
         PathBuf::from("old.rs")
     );
+    assert_eq!(
+        live.get_source_policy_exclusions()
+            .expect("read rolled-back exclusions")[0]
+            .normalized_path,
+        "vendor/registers-1.h"
+    );
     drop(live);
     assert!(
         staged_path.exists(),
@@ -3397,6 +3567,12 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
     assert_eq!(
         live.get_files().expect("read recovered generation")[0].path,
         PathBuf::from("new.rs")
+    );
+    assert_eq!(
+        live.get_source_policy_exclusions()
+            .expect("read promoted exclusions")[0]
+            .normalized_path,
+        "vendor/registers-2.h"
     );
     drop(live);
     for artifact in sqlite_sidecar_paths(&staged_path)
@@ -3429,6 +3605,11 @@ fn retained_committed_promotion_stays_live_and_blocks_the_next_writer() {
     seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
     seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
     seed_promotion_file(&second_staged_path, 3, "newer.rs").expect("seed second staged generation");
+    publish_nonempty_test_source_policy(&live_path, 1).expect("publish live exclusion identity");
+    publish_nonempty_test_source_policy(&staged_path, 2)
+        .expect("publish staged exclusion identity");
+    publish_nonempty_test_source_policy(&second_staged_path, 3)
+        .expect("publish second staged exclusion identity");
     std::fs::write(&cleanup_failure_path, b"blocked").expect("inject cleanup failure");
 
     Storage::promote_staged_snapshot(&staged_path, &live_path)
@@ -3444,6 +3625,13 @@ fn retained_committed_promotion_stays_live_and_blocks_the_next_writer() {
     assert_eq!(
         reopened.get_files().expect("read committed generation")[0].path,
         PathBuf::from("new.rs")
+    );
+    assert_eq!(
+        reopened
+            .get_source_policy_exclusions()
+            .expect("read committed exclusions")[0]
+            .normalized_path,
+        "vendor/registers-2.h"
     );
     drop(reopened);
     assert!(!backup_path.exists() && !committed_path.exists());
