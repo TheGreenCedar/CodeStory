@@ -5645,6 +5645,12 @@ version = "0.11.20"
             text.contains(REPO_CONTENT_BOUNDARY_LINE),
             "stdio packet text should preserve the repo-content boundary: {text}"
         );
+        assert!(
+            text.contains(
+                "unsafe_to_claim: true - resolve gaps, open_next, or follow_up_commands before proof claims"
+            ),
+            "partial packet text must fail closed for proof claims: {text}"
+        );
         assert!(text.contains("gaps: none"), "{text}");
         assert!(text.len() <= STDIO_TEXT_MAX_BYTES, "{text}");
     }

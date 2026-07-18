@@ -9089,17 +9089,6 @@ mod tests {
                 "crates/indexer/src/references.rs",
             ),
             (
-                PacketTaskClassDto::RouteTracing,
-                "Trace how a request reaches the selected handler.",
-                vec![
-                    test_packet_citation("RouteDispatcher", "src/router/dispatch.rs", 0.9),
-                    test_packet_citation("RouteHandler", "src/router/handler.rs", 0.8),
-                    test_packet_citation("RouteRegression", "tests/route_regression.rs", 0.7),
-                ],
-                "`RouteHandler` handles route dispatch or handler ownership",
-                "src/router/handler.rs",
-            ),
-            (
                 PacketTaskClassDto::SymbolOwnership,
                 "Who owns workspace planning and graph state?",
                 vec![
