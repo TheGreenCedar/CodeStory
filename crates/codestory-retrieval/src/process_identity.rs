@@ -1,4 +1,8 @@
-#[cfg(any(test, windows, all(unix, not(target_os = "linux"))))]
+#[cfg(any(
+    test,
+    windows,
+    all(unix, not(any(target_os = "linux", target_os = "macos")))
+))]
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -8,23 +12,26 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 #[cfg(target_os = "linux")]
 use std::path::Path;
-#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "macos")))))]
 use std::process::Command;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 use std::process::Output;
-#[cfg(any(all(unix, not(target_os = "linux")), all(test, windows)))]
+#[cfg(any(
+    all(unix, not(any(target_os = "linux", target_os = "macos"))),
+    all(test, windows)
+))]
 use std::process::Stdio;
 use std::sync::OnceLock;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 use std::thread;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 use std::time::{Duration, Instant};
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const PROCESS_PROBE_REAP_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const PROCESS_PROBE_POLL: Duration = Duration::from_millis(10);
 
 #[cfg(windows)]
@@ -89,19 +96,19 @@ pub fn probe_process_start_identity(pid: u32) -> ProcessStartProbe {
     probe
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn bounded_process_command_output(command: &mut Command) -> Result<Output> {
     bounded_process_command_output_with_timeout(command, PROCESS_PROBE_TIMEOUT)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PsProbeOutputStatus {
     Success,
     ProcessMissing,
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) fn classify_ps_probe_output(output: &Output) -> Result<PsProbeOutputStatus> {
     if output.status.success() {
         return Ok(PsProbeOutputStatus::Success);
@@ -116,7 +123,7 @@ pub(crate) fn classify_ps_probe_output(output: &Output) -> Result<PsProbeOutputS
     )
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn bounded_process_command_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -151,7 +158,7 @@ fn bounded_process_command_output_with_timeout(
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn terminate_bounded_probe(child: &mut std::process::Child) {
     let _ = child.kill();
     let reap_deadline = Instant::now() + PROCESS_PROBE_REAP_TIMEOUT;
@@ -293,7 +300,7 @@ fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
     let mut command = Command::new("ps");
     command
@@ -325,6 +332,41 @@ fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
     }
     ProcessStartProbe::Running {
         start_identity: format!("unix:{identity}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            expected,
+        )
+    };
+    if read == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOENT) => ProcessStartProbe::NotRunning,
+            _ => ProcessStartProbe::Unknown {
+                reason: error.to_string(),
+            },
+        };
+    }
+    if read != expected || info.pbi_pid != pid {
+        return ProcessStartProbe::Unknown {
+            reason: "macOS process identity was incomplete".into(),
+        };
+    }
+    ProcessStartProbe::Running {
+        start_identity: format!(
+            "macos-proc:{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ),
     }
 }
 
@@ -371,7 +413,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     #[test]
     fn ps_status_distinguishes_missing_process_from_probe_failure() {
         use std::os::unix::process::ExitStatusExt;
@@ -405,6 +447,8 @@ mod tests {
         let pid = child.id();
         let expected_prefix = if cfg!(target_os = "linux") {
             "linux:"
+        } else if cfg!(target_os = "macos") {
+            "macos-proc:"
         } else {
             "unix:"
         };

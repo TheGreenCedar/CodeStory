@@ -46,9 +46,10 @@ One stdio process can therefore serve repositories A, B, then A again:
   configuration, graph, and retrieval publication;
 - process startup defaults are captured once and are not reread when projects
   switch;
-- the in-process embedding engine and materialized model are shared;
-- the heavy model and accelerator allocation sleep after 60 idle seconds and
-  wake automatically on the next product request;
+- the private per-user embedding server and materialized model are shared
+  across compatible CodeStory processes;
+- the server exits after 60 seconds with no queued, active, or leased work and
+  is spawned again automatically by the next product request;
 - small request-local and project-local caches are reset or selected explicitly,
   rather than leaking the prior project.
 
@@ -56,16 +57,19 @@ One stdio process can therefore serve repositories A, B, then A again:
 flowchart LR
     Stdio["one stdio process"] --> A["RuntimeContext A"]
     Stdio --> B["RuntimeContext B"]
+    Other["another CodeStory process"] --> Server
     A --> CacheA["project cache A"]
     B --> CacheB["project cache B"]
-    A --> Engine["shared CodeRankEmbed engine"]
-    B --> Engine
+    A --> Server["per-user embedding server"]
+    B --> Server
+    Server --> Engine["one CodeRankEmbed worker"]
 ```
 
-Switching projects changes the selected runtime and cache, not the engine
-owner. Returning to A during an active burst reuses the warm model. Returning
-after the idle window reloads the same verified model automatically without
-making either project's state visible to the other.
+Switching projects changes the selected runtime and cache, not the server
+authority. Returning to A during an active burst reuses the warm model.
+Returning after true idle spawns the same verified executable and reuses the
+content-addressed materialization without making either project's state visible
+to the other.
 
 ## Managed activation
 
@@ -77,8 +81,8 @@ they do not own another readiness or repair state machine.
 
 Cold status and resource reads are observational. Missing or incompatible
 storage is reported as unavailable without creating directories, initializing
-SQLite, migrating schema, loading the embedding engine, or starting refresh.
-Project tool calls own activation.
+SQLite, migrating schema, starting or waking the embedding server, extending
+its idle lifetime, or starting refresh. Project tool calls own activation.
 
 Status and diagnostics are observational. They can report installed version,
 local graph state, retrieval publication state, and engine diagnostics, but

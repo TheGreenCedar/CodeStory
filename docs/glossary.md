@@ -14,7 +14,7 @@ imply broad packet/search readiness.
 ### agent packet/search readiness
 
 The project has a current complete retrieval publication, a matching live
-in-process embedding engine, and an allowed packet/search/context surface.
+per-user embedding server/engine identity, and an allowed packet/search/context surface.
 `retrieval_mode=full` is necessary but is not sufficient on its own.
 
 ### retrieval mode
@@ -46,8 +46,8 @@ remain available.
 
 ### process scope
 
-State captured once for a CodeStory process: startup defaults and the shared
-embedding engine.
+State captured once for a CodeStory process: startup defaults and its client
+identity for the shared per-user embedding server.
 
 ### project scope
 
@@ -136,8 +136,8 @@ the native stdio process.
 
 ### retrieval engine
 
-The process-wide in-process llama.cpp/ggml model and accelerator context shared
-by every project in one CodeStory process.
+The llama.cpp/ggml model and accelerator context owned by the private per-user
+embedding server and shared by compatible CodeStory client processes.
 
 ### workspace
 

@@ -6,7 +6,7 @@ benchmarks, packaging, or accelerator claims. Match the proof to the claim.
 | Rollout layer | Trustworthy proof | Claim boundary |
 | --- | --- | --- |
 | Indexer coverage | `cargo test --locked -p codestory-indexer --test fidelity_regression`; `cargo test --locked -p codestory-indexer --test tictactoe_language_coverage` | Parser-backed graph and document coverage only |
-| Retrieval engine | `cargo test --locked -p codestory-retrieval`; a live `retrieval index`; status with `retrieval_mode="full"`, exact model/build identity, backend, adapter, policy, and timed smoke | In-process engine and manifest coherence only |
+| Retrieval engine | `cargo test --locked -p codestory-retrieval`; focused server/transport tests; a live `retrieval index`; status with `retrieval_mode="full"`, exact server/model/build identity, backend, adapter, policy, and timed smoke | Source-level server, engine, and manifest coherence only |
 | Runtime | Runtime library, generalization, and retrieval-eval lanes | Packet/search admission and result behavior |
 | CLI and plugin | Focused CLI protocol tests plus plugin static tests | Transport and user-facing capability state |
 | Performance | Same-build incumbent/candidate rows for cold initialization, warm search, bulk indexing, RSS, GPU memory, vector parity, quality, and multi-repository reuse | Promotion only when no repeatable regression exceeds the 5% noise allowance |
@@ -24,12 +24,16 @@ lifecycle. Maintainer JSON owns backend details.
 3. Run graph indexing and `retrieval index --refresh full`.
 4. Require `retrieval_mode="full"` and validate the engine identity fields.
 5. Run search and packet through the plugin launcher.
-6. Open a second repository in the same stdio process and require one engine
-   instance and one model load.
-7. Restart the process and require content-addressed model reuse without a
-   rewrite.
-8. Reject any helper executable, download, endpoint, port, PID, repair worker,
-   or interactive setup state.
+6. Open a second repository from an independent plugin host and require one
+   endpoint authority, listener, server, engine owner, native worker, load
+   generation, and model load.
+7. Exercise client death, server crash, worker stall, mixed queues,
+   incompatible and frozen owners, true-idle exit, and automatic respawn under
+   the preregistered qualification protocol.
+8. Reject any separate helper executable, download, TCP endpoint, port, PID
+   ownership, owner manifest, in-process fallback, repair worker, or interactive
+   setup state. Private local IPC and the same executable's hidden server mode
+   are the product path.
 
 Hosted CI sets `CODESTORY_EMBED_ALLOW_CPU=1` and must report `cpu_explicit`.
 Protected Apple Silicon proof must report Metal and verified accelerator

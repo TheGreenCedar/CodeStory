@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Prove an accepted PR head, run release evidence, or prove current dev.
+        description: Prove an accepted PR head, collect pre-freeze calibration, run release evidence, or prove current dev.
         required: true
         default: platform
         type: choice
-        options: [platform, release-evidence, integration]
+        options: [platform, calibration, release-evidence, integration]
       pr_number:
         description: Same-repository pull request for platform mode.
         required: false
@@ -20,13 +20,21 @@ on:
         required: true
         type: string
       scope:
-        description: Auto-detect proof scope or select a coordinator package scope.
+        description: Auto-detect proof scope or select a coordinator package scope; server excludes Windows runtime proof.
         required: true
         default: auto
         type: choice
-        options: [auto, windows, macos, full]
+        options: [auto, server, windows, macos, full]
       source_run_id:
         description: Optional prior rejected release-evidence run to re-evaluate.
+        required: false
+        type: string
+      calibration_bundle_artifact:
+        description: Frozen calibration bundle artifact name.
+        required: false
+        type: string
+      calibration_bundle_run_id:
+        description: Workflow run that produced the frozen calibration bundle artifact.
         required: false
         type: string
 
@@ -45,10 +53,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       head_sha: ${{ steps.resolve.outputs.head_sha }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
       mode: ${{ steps.resolve.outputs.mode }}
       proof_key: ${{ steps.resolve.outputs.proof_key }}
       scope: ${{ steps.scope.outputs.scope }}
       version: ${{ steps.version.outputs.version }}
+      constants_frozen: ${{ steps.constants.outputs.frozen }}
+      freeze_transition: ${{ steps.constants.outputs.freeze_transition }}
     steps:
       - name: Resolve trusted exact head
         id: resolve
@@ -61,6 +72,9 @@ jobs:
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          INPUT_CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          INPUT_CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
         run: |
           set -euo pipefail
           mode="${INPUT_MODE:-platform}"
@@ -80,7 +94,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          test "$mode" = "platform" || test "$mode" = "release-evidence"
+          test "$mode" = "platform" || test "$mode" = "calibration" || test "$mode" = "release-evidence"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
           expected_head="${EVENT_HEAD_SHA:-$INPUT_HEAD_SHA}"
           test -n "$pr_number" && test -n "$expected_head"
@@ -100,16 +114,30 @@ jobs:
             echo "::error::PR #$pr_number moved from promoted head $expected_head to $current_head."
             exit 1
           }
-          if [ "$mode" = "release-evidence" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            test "$GITHUB_SHA" = "$current_head" || {
+              echo "::error::Workflow ref $GITHUB_SHA is not exact PR head $current_head."
+              exit 1
+            }
+          fi
+          if [ "$mode" = "release-evidence" ] || [ "$mode" = "calibration" ]; then
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
             test "$base_ref" = "dev/codestory-next" || {
-              echo "::error::Release evidence requires a PR into dev/codestory-next, not $base_ref."
+              echo "::error::$mode requires a PR into dev/codestory-next, not $base_ref."
               exit 1
             }
             jq -e 'any(.labels[]; .name == "review-accepted")' <<<"$pr" >/dev/null || {
               echo "::error::PR #$pr_number does not carry the review-accepted label."
               exit 1
             }
+          fi
+          if [ "$mode" = "calibration" ]; then
+            if [ -n "$INPUT_SOURCE_RUN_ID" ] \
+              || [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
+              || [ -n "$INPUT_CALIBRATION_RUN_ID" ]; then
+              echo "::error::Calibration collection does not consume prior proof artifacts."
+              exit 1
+            fi
           fi
           {
             echo "head_sha=$current_head"
@@ -147,6 +175,30 @@ jobs:
             exit 1
           }
 
+      - name: Authenticate calibration bundle producer
+        if: inputs.calibration_bundle_artifact != '' || inputs.calibration_bundle_run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
+        run: |
+          set -euo pipefail
+          test -n "$CALIBRATION_ARTIFACT" && test -n "$CALIBRATION_RUN_ID"
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID")"
+          producer_sha="$(jq -r '.head_sha' <<<"$run")"
+          test "$(jq -r '.head_repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.path' <<<"$run")" = ".github/workflows/packaged-platform-pr.yml"
+          test "$(jq -r '.event' <<<"$run")" = workflow_dispatch
+          test "$(jq -r '.conclusion' <<<"$run")" = success
+          test "$CALIBRATION_ARTIFACT" = "embedding-calibration-bundle-$producer_sha"
+          artifact_count="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID/artifacts?per_page=100" \
+              | jq --arg name "$CALIBRATION_ARTIFACT" \
+                '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+          )"
+          test "$artifact_count" = 1
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ steps.resolve.outputs.head_sha }}
@@ -163,13 +215,42 @@ jobs:
           set -euo pipefail
           if [ "${{ steps.resolve.outputs.mode }}" = "integration" ]; then
             scope=full
+          elif [ "${{ steps.resolve.outputs.mode }}" = "calibration" ]; then
+            scope=none
           elif [ "${{ steps.resolve.outputs.mode }}" = "release-evidence" ]; then
             scope=none
+          elif [ "$REQUESTED_SCOPE" = "server" ]; then
+            scope=server
           else
             scope="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" | node .github/scripts/route-ci-proof.mjs --stdin --requested "$REQUESTED_SCOPE")"
           fi
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "Selected $scope platform proof."
+
+      - name: Read qualification constant-set state
+        id: constants
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
+        run: |
+          constant_set_path=docs/testing/per-user-embedding-server-constant-set.json
+          frozen="$(jq -r '.status == "frozen"' "$constant_set_path")"
+          test "$frozen" = true || test "$frozen" = false
+          base_frozen=false
+          if [ -n "$BASE_SHA" ] \
+            && git cat-file -e "$BASE_SHA:$constant_set_path" 2>/dev/null; then
+            base_frozen="$(git show "$BASE_SHA:$constant_set_path" \
+              | jq -r '.status == "frozen"')"
+          fi
+          test "$base_frozen" = true || test "$base_frozen" = false
+          freeze_transition=false
+          if [ -n "$BASE_SHA" ] \
+            && [ "$base_frozen" = false ] \
+            && [ "$frozen" = true ]; then
+            freeze_transition=true
+          fi
+          echo "frozen=$frozen" >> "$GITHUB_OUTPUT"
+          echo "freeze_transition=$freeze_transition" >> "$GITHUB_OUTPUT"
 
       - name: Verify package version surfaces
         if: steps.resolve.outputs.mode != 'release-evidence'
@@ -179,6 +260,119 @@ jobs:
           version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
           python .github/scripts/check-codestory-release.py --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  calibration-linux:
+    if: needs.route.outputs.mode == 'calibration'
+    needs: route
+    uses: ./.github/workflows/packaged-platform-proof.yml
+    with:
+      version: ${{ needs.route.outputs.version }}
+      ref: ${{ needs.route.outputs.head_sha }}
+      scope: full
+      proof_key: calibration-linux-${{ needs.route.outputs.head_sha }}
+      calibration_mode: true
+
+  calibration-macos:
+    if: needs.route.outputs.mode == 'calibration'
+    needs: route
+    uses: ./.github/workflows/macos-metal-proof.yml
+    with:
+      version: ${{ needs.route.outputs.version }}
+      ref: ${{ needs.route.outputs.head_sha }}
+      proof_key: calibration-macos-${{ needs.route.outputs.head_sha }}
+      use_packaged_cli_artifact: false
+      calibration_mode: true
+
+  calibration-assemble:
+    if: >-
+      always() &&
+      needs.route.result == 'success' &&
+      needs.route.outputs.mode == 'calibration' &&
+      needs.calibration-linux.result == 'success' &&
+      needs.calibration-macos.result == 'success'
+    needs:
+      - route
+      - calibration-linux
+      - calibration-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact calibration head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.route.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Download hosted Linux calibration runs
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: embedding-calibration-linux-${{ needs.route.outputs.version }}
+          path: target/calibration-inputs/linux
+
+      - name: Download protected macOS calibration runs
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: embedding-calibration-macos-${{ needs.route.outputs.version }}
+          path: target/calibration-inputs/macos
+
+      - name: Assemble frozen calibration candidate
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.route.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+          mapfile -t runs < <(
+            find target/calibration-inputs -type f \
+              \( -name 'run-1.json' -o -name 'run-2.json' -o -name 'run-3.json' \) \
+              -print | sort
+          )
+          test "${#runs[@]}" = 6
+          run_args=()
+          for run in "${runs[@]}"; do
+            run_args+=(--calibration-run "$run")
+          done
+          mkdir -p target/calibration-freeze
+          python .github/scripts/check-packaged-agent-proof.py \
+            --assemble-calibration-bundle \
+            "${run_args[@]}" \
+            --calibration-bundle-output target/calibration-freeze/calibration-bundle.json \
+            --frozen-constant-set-output target/calibration-freeze/per-user-embedding-server-constant-set.json \
+            --freeze-selected-at "github-actions-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}" \
+            --calibration-producer-repository "$GITHUB_REPOSITORY" \
+            --calibration-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
+            --calibration-producer-run-id "$GITHUB_RUN_ID" \
+            --calibration-producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --calibration-producer-artifact "embedding-calibration-bundle-${EXPECTED_HEAD_SHA}" \
+            > target/calibration-freeze/assembly.json
+          jq \
+            --arg source_head_sha "$EXPECTED_HEAD_SHA" \
+            --arg source_tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg producer_run_id "$GITHUB_RUN_ID" \
+            --arg producer_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '. + {
+              source_head_sha: $source_head_sha,
+              source_tree: $source_tree,
+              producer_run_id: $producer_run_id,
+              producer_run_attempt: $producer_run_attempt
+            }' \
+            target/calibration-freeze/assembly.json \
+            > target/calibration-freeze/manifest.json
+          jq -e \
+            --arg source_head_sha "$EXPECTED_HEAD_SHA" \
+            --arg producer_run_id "$GITHUB_RUN_ID" \
+            '.selection_source.commit == $source_head_sha
+             and .run_count == 6
+             and .matrix_cell_count == 2
+             and .producer_run_id == $producer_run_id' \
+            target/calibration-freeze/manifest.json >/dev/null
+
+      - name: Upload calibration bundle and frozen constant candidate
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: embedding-calibration-bundle-${{ needs.route.outputs.head_sha }}
+          path: target/calibration-freeze
+          if-no-files-found: error
+          retention-days: 30
 
   macos-source:
     if: needs.route.outputs.scope == 'macos'
@@ -218,7 +412,7 @@ jobs:
       - run: test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh
 
   repo-scale-stats:
-    if: needs.route.outputs.mode != 'release-evidence'
+    if: needs.route.outputs.mode != 'release-evidence' && needs.route.outputs.mode != 'calibration'
     needs: route
     uses: ./.github/workflows/repo-scale-stats.yml
     with:
@@ -226,7 +420,11 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
 
   release-evidence:
-    if: needs.route.outputs.mode == 'release-evidence'
+    if: >-
+      needs.route.outputs.mode == 'release-evidence' ||
+      (needs.route.outputs.mode != 'calibration' &&
+       needs.route.outputs.scope != 'server' &&
+       needs.route.outputs.constants_frozen == 'true')
     needs: route
     uses: ./.github/workflows/release-candidate-evidence.yml
     with:
@@ -250,10 +448,15 @@ jobs:
       needs.route.result == 'success' &&
       needs.route.outputs.scope != 'none' &&
       (needs.macos-source.result == 'success' || needs.macos-source.result == 'skipped') &&
-      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped'))
+      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped')) &&
+      (needs.release-evidence.result == 'success' ||
+       ((needs.route.outputs.constants_frozen != 'true' ||
+         needs.route.outputs.scope == 'server') &&
+        needs.release-evidence.result == 'skipped'))
     needs:
       - route
       - macos-source
+      - release-evidence
       - source-proof
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
@@ -262,22 +465,33 @@ jobs:
       scope: ${{ needs.route.outputs.scope }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       sign_macos: false
+      quality_evidence_artifact: ${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
+      enforce_calibration_freeze_lineage: ${{ needs.route.outputs.freeze_transition == 'true' }}
+      candidate_installed_proof: true
 
   macos-metal-proof:
     if: >-
       always() &&
       needs.route.result == 'success' &&
       needs.packaged-proof.result == 'success' &&
-      (needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'full')
+      (needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'server' || needs.route.outputs.scope == 'full')
     needs:
       - route
       - packaged-proof
+      - release-evidence
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
+      quality_evidence_artifact: ${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
+      candidate_installed_proof: true
+      server_behavior_only: ${{ needs.route.outputs.scope == 'server' }}
 
   windows-vulkan-proof:
     if: >-
@@ -288,20 +502,29 @@ jobs:
     needs:
       - route
       - packaged-proof
+      - release-evidence
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
+      quality_evidence_artifact: ${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
 
   closeout:
-    if: always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence'
+    if: >-
+      always() &&
+      needs.route.result != 'skipped' &&
+      needs.route.outputs.mode != 'release-evidence' &&
+      needs.route.outputs.mode != 'calibration'
     needs:
       - route
       - macos-source
       - source-proof
       - repo-scale-stats
+      - release-evidence
       - packaged-proof
       - macos-metal-proof
       - windows-vulkan-proof
@@ -318,6 +541,8 @@ jobs:
           MACOS_SOURCE_RESULT: ${{ needs.macos-source.result }}
           SOURCE_RESULT: ${{ needs.source-proof.result }}
           STATS_RESULT: ${{ needs.repo-scale-stats.result }}
+          EVIDENCE_RESULT: ${{ needs.release-evidence.result }}
+          CONSTANTS_FROZEN: ${{ needs.route.outputs.constants_frozen }}
           PACKAGE_RESULT: ${{ needs.packaged-proof.result }}
           METAL_RESULT: ${{ needs.macos-metal-proof.result }}
           VULKAN_RESULT: ${{ needs.windows-vulkan-proof.result }}
@@ -331,6 +556,11 @@ jobs:
           }
           require_result "$ROUTE_RESULT" success routing
           require_result "$STATS_RESULT" success repo-scale-stats
+          if [ "$CONSTANTS_FROZEN" = true ] && [ "$SCOPE" != server ]; then
+            require_result "$EVIDENCE_RESULT" success release-evidence
+          else
+            require_result "$EVIDENCE_RESULT" skipped release-evidence
+          fi
           if [ "$MODE" = integration ]; then
             require_result "$SOURCE_RESULT" success source-proof
           else
@@ -351,6 +581,9 @@ jobs:
               require_result "$METAL_RESULT" skipped macos-metal-proof
               require_result "$VULKAN_RESULT" success windows-vulkan-proof
             elif [ "$SCOPE" = macos ]; then
+              require_result "$METAL_RESULT" success macos-metal-proof
+              require_result "$VULKAN_RESULT" skipped windows-vulkan-proof
+            elif [ "$SCOPE" = server ]; then
               require_result "$METAL_RESULT" success macos-metal-proof
               require_result "$VULKAN_RESULT" skipped windows-vulkan-proof
             else

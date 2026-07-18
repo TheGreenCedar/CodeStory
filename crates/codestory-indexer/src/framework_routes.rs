@@ -1384,10 +1384,10 @@ fn commonjs_router_bindings(node: Node<'_>, source: &str) -> HashSet<String> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "shorthand_property_identifier_pattern" => {
-                if node_text(child, source).as_deref() == Some("Router") {
-                    bindings.insert("Router".to_string());
-                }
+            "shorthand_property_identifier_pattern"
+                if node_text(child, source).as_deref() == Some("Router") =>
+            {
+                bindings.insert("Router".to_string());
             }
             "pair_pattern" => {
                 let key = child
@@ -1411,10 +1411,10 @@ fn commonjs_fastify_bindings(node: Node<'_>, source: &str) -> HashSet<String> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "shorthand_property_identifier_pattern" => {
-                if node_text(child, source).as_deref() == Some("fastify") {
-                    bindings.insert("fastify".to_string());
-                }
+            "shorthand_property_identifier_pattern"
+                if node_text(child, source).as_deref() == Some("fastify") =>
+            {
+                bindings.insert("fastify".to_string());
             }
             "pair_pattern" => {
                 let key = child

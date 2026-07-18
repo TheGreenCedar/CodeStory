@@ -33,7 +33,7 @@ ceremony.
 4. Preserve cited anchors in source claims. Read focused source only for the
    remaining evidence gaps.
 
-CodeStory prepares its local repository map and in-process retrieval runtime
+CodeStory prepares its local repository map and shared per-user retrieval server
 automatically. `status` and
 `codestory://status` are optional diagnostics for a failed or unexpectedly slow
 request, not prerequisites for normal grounding.

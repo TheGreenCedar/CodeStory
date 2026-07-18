@@ -26,6 +26,31 @@
 - Direct CLI JSON failures now retain runtime API error codes and details across
   packet, search, activation, and retrieval indexing instead of collapsing
   typed failures into a generic `command_failed` envelope.
+- Compatible CodeStory processes for one OS user now share one automatically
+  spawned embedding server over a private Unix-domain socket or Windows named
+  pipe. The exact CLI owns one bounded query/bulk scheduler and one native
+  worker; typed capacity state explains when retrying can help without exposing
+  project paths or request text. True idle exits the server after 60 seconds,
+  and the next product call starts it again without consent or repair. The
+  persisted embedding-runtime identity changes with this ownership boundary, so
+  existing semantic generations rebuild once instead of being mislabeled as
+  in-process output. Qualification keeps its authority in the exact private
+  control directory while using an identity-derived bounded Unix socket path,
+  and a failed server bootstrap now reports the retained child cause instead of
+  collapsing into a generic start timeout.
+- Release packages now bind source/tree, executable, server protocol, constant
+  set, and measurement-protocol identities. Server qualification is
+  preregistered and fail-closed: calibration cannot satisfy package, protected
+  hardware, installed-plugin, or release claims, and installed evidence must
+  prove either the isolated exact candidate package during accepted-PR proof or
+  the managed marketplace plugin/runtime after publication rather than a direct
+  CLI override. Frozen calibration consumers authenticate the exact successful
+  coordinator run and artifact before trusting the bundle. The PR coordinator
+  can select a fail-closed server-behavior scope that proves package and
+  candidate-managed runtime behavior without making retrieval-quality,
+  qualification-tier, or release-readiness claims. Linux glibc-2.31 packages
+  use a pinned Bullseye Clang toolchain whose x86 dispatch flags are proved in
+  the image and whose Docker inputs are part of the native build cache identity.
 - The manual Windows manifest-missing readiness lane now installs the
   checksum-pinned Vulkan SDK before running the real locked `ready_command`
   contract with explicit CPU runtime permission. Windows source-build proof
@@ -78,9 +103,9 @@
 
 ### Highlights
 
-- CodeStory now carries its search model and embedding engine inside the executable. There is no Docker service, helper server, model download, endpoint, port, or repair step to manage.
+- CodeStory carries its search model and embedding engine inside the executable. The same verified CLI may run a hidden per-user server over private local IPC; there is no Docker service, TCP endpoint, model download, port, or repair step to manage.
 - The first repository question prepares the local map and broader search automatically. If a large project needs more time, the agent retries the same request; users are never asked to approve or repair an internal retrieval component.
-- Repositories handled by the same CodeStory process share one warm model without sharing indexes or readiness state. Separate idle task processes release the model and GPU memory after a short quiet period, then reload automatically when search is needed again.
+- Repositories handled by compatible CodeStory processes for the same OS user share one warm model without sharing indexes or readiness state. After 60 seconds with no queued, active, or leased work, the server exits and releases model/GPU memory; search starts it again automatically.
 - Apple Silicon uses Metal, and Windows x64 uses Vulkan on supported physical GPUs. Linux packages are Vulkan-capable, but this release makes no Linux GPU claim. Production never silently falls back to CPU.
 - CodeStory reports broad search ready only after its model, physical accelerator, live embedding check, and repository publication agree. Local navigation remains available while broader search prepares.
 
@@ -101,7 +126,7 @@
 - Retrieval query execution and numeric candidate resolution share one pinned session and expose its full publication identity. A concurrent core, retrieval, vector, or engine identity change returns a typed retry instead of mixing candidates inside that session.
 - CodeRankEmbed replaces BGE. In a fixed same-machine comparison, it improved ranking quality by 36% and the first-result hit rate by 55%. It uses more memory and indexes more slowly, so inactive task processes now unload it instead of holding that cost indefinitely.
 - Existing semantic indexes rebuild once after upgrade. The last complete index stays available during safe refreshes, and CodeStory refuses to mix results from different generations.
-- The packaged executable works offline after installation, reuses its verified model material across restarts, and does not start helper processes or open retrieval ports. Packaged restart proof accepts only exact preparing or updating retry envelopes, requires the installed ready search projection, retains every restart MCP attempt, and leaves full-readiness proof with status and activation diagnostics.
+- The packaged executable works offline after installation, reuses verified model material across server restarts, and opens no retrieval port. Package, hardware, and installed-runtime proof retain separate identities and claims; installed proof requires two independent managed plugin hosts and the complete server fault/measurement contract.
 - Everyday plugin messages say whether broader search is ready, preparing, or unavailable. Model, backend, adapter, and timing details stay in maintainer diagnostics.
 - Source release builds now use one checked-in contract for acquisition, embedding semantics, producer identity, and model-license provenance. Producer name/version bind both runtime and persisted vector compatibility, so implementation upgrades rebuild instead of reusing incompatible vectors. Model acquisition is an explicit pre-Cargo step; Cargo verifies only the supplied regular file, publishes it through a create-new/no-clobber staging path, and never starts Node.js or performs network access. Executable fault tests prove partial writes and racing destinations cannot publish or clobber model bytes.
 

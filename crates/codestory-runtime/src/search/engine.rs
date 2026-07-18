@@ -58,7 +58,7 @@ pub struct EmbeddingProfileContract {
 fn fixed_embedding_contract() -> EmbeddingProfileContract {
     EmbeddingProfileContract {
         profile: EMBEDDING_PROFILE.into(),
-        backend: "inprocess".into(),
+        backend: "per_user_server".into(),
         model_id: EMBEDDING_MODEL_ID.into(),
         cache_key: codestory_retrieval::embedding_runtime_id(),
         dimension: Some(EMBEDDING_DIM as u32),
@@ -314,7 +314,7 @@ pub struct EmbeddingRuntime {
 #[derive(Debug, Clone)]
 enum EmbeddingBackend {
     #[cfg(not(any(test, feature = "test-support")))]
-    InProcess(codestory_retrieval::InProcessEmbeddingClient),
+    PerUser(codestory_retrieval::PerUserEmbeddingClient),
     #[cfg(any(test, feature = "test-support"))]
     HashProjection,
 }
@@ -331,8 +331,8 @@ impl EmbeddingRuntime {
             codestory_retrieval::ensure_product_embedding_backend_for_runtime(runtime)?;
             Ok(Self {
                 model_id: codestory_retrieval::embedding_runtime_id(),
-                backend: EmbeddingBackend::InProcess(
-                    codestory_retrieval::InProcessEmbeddingClient::new(runtime),
+                backend: EmbeddingBackend::PerUser(
+                    codestory_retrieval::PerUserEmbeddingClient::for_runtime(runtime)?,
                 ),
             })
         }
@@ -348,7 +348,7 @@ impl EmbeddingRuntime {
         }
         match &self.backend {
             #[cfg(not(any(test, feature = "test-support")))]
-            EmbeddingBackend::InProcess(client) => client.embed_query(query),
+            EmbeddingBackend::PerUser(client) => client.embed_query(query),
             #[cfg(any(test, feature = "test-support"))]
             EmbeddingBackend::HashProjection => {
                 Ok(embed_text_with_hash_projection(query, EMBEDDING_DIM))

@@ -58,7 +58,7 @@ flowchart LR
     Core --> Inputs["symbol docs, reports, reusable dense inputs"]
     Files --> RetrievalBuild["build immutable retrieval generation"]
     Inputs --> RetrievalBuild
-    Engine["process-wide embedding engine"] --> RetrievalBuild
+    Engine["per-user embedding server"] --> RetrievalBuild
     RetrievalBuild --> Retrieval["publish lexical + vectors + SCIP + manifest"]
 ```
 

@@ -25,6 +25,37 @@ pub struct ApiErrorDetails {
     pub full_repair: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_retry: Option<EmbeddingRetryStateDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingCapacityPressureDto {
+    pub reason: String,
+    pub queue_class: String,
+    pub capacity: u64,
+    pub depth: u64,
+    pub retry_after_ms: u64,
+    pub retry_condition: String,
+    pub owner_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_request_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingRetryStateDto {
+    pub code: String,
+    pub retry_class: String,
+    pub retry_after_ms: u64,
+    pub retry_condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<EmbeddingCapacityPressureDto>,
 }
 
 pub const COMMAND_FAILURE_SCHEMA_VERSION: u32 = 1;
@@ -62,6 +93,8 @@ impl ApiErrorDetails {
             full_repair: next_commands.clone(),
             next_commands,
             readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
         }
     }
 
@@ -124,6 +157,53 @@ impl ApiError {
             ApiErrorDetails::retrieval_unavailable(project, next_commands),
         )
     }
+
+    pub fn embedding_capacity(
+        message: impl Into<String>,
+        pressure: EmbeddingCapacityPressureDto,
+    ) -> Self {
+        Self::with_details(
+            "embedding_capacity",
+            message,
+            ApiErrorDetails {
+                failed_layer: Some("embedding_admission".into()),
+                project: None,
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+                embedding_capacity: Some(pressure.clone()),
+                embedding_retry: Some(EmbeddingRetryStateDto {
+                    code: "embedding_capacity".into(),
+                    retry_class: "after_capacity_change".into(),
+                    retry_after_ms: pressure.retry_after_ms,
+                    retry_condition: pressure.retry_condition.clone(),
+                    capacity: Some(pressure),
+                }),
+            },
+        )
+    }
+
+    pub fn embedding_retry(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retry: EmbeddingRetryStateDto,
+    ) -> Self {
+        Self::with_details(
+            code,
+            message,
+            ApiErrorDetails {
+                failed_layer: Some("embedding_runtime".into()),
+                project: None,
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+                embedding_capacity: retry.capacity.clone(),
+                embedding_retry: Some(retry),
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +254,63 @@ mod tests {
 
         assert_eq!(decoded, envelope);
         assert_eq!(decoded.schema_version, COMMAND_FAILURE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn embedding_capacity_is_typed_and_has_no_repair_commands() {
+        let error = ApiError::embedding_capacity(
+            "embedding query capacity is unavailable",
+            EmbeddingCapacityPressureDto {
+                reason: "queue_full".into(),
+                queue_class: "query".into(),
+                capacity: 64,
+                depth: 64,
+                retry_after_ms: 25,
+                retry_condition: "a query slot becomes available".into(),
+                owner_state: "ready".into(),
+                active_scope_id: Some("opaque-scope".into()),
+                active_request_id: Some("opaque-request".into()),
+                active_request_class: Some("bulk".into()),
+            },
+        );
+
+        let value = serde_json::to_value(error).expect("serialize capacity error");
+        assert_eq!(value["code"], "embedding_capacity");
+        assert_eq!(
+            value["details"]["embedding_capacity"]["retry_condition"],
+            "a query slot becomes available"
+        );
+        assert_eq!(
+            value["details"]["embedding_retry"]["retry_class"],
+            "after_capacity_change"
+        );
+        assert!(value["details"].get("project").is_none());
+        assert!(value["details"].get("next_commands").is_none());
+        assert!(value["details"].get("minimum_next").is_none());
+        assert!(value["details"].get("full_repair").is_none());
+    }
+
+    #[test]
+    fn generic_embedding_retry_is_typed_without_repair_commands() {
+        let error = ApiError::embedding_retry(
+            "embedding_retryable",
+            "the active owner must become idle",
+            EmbeddingRetryStateDto {
+                code: "embedding_server_incompatible_active_owner".into(),
+                retry_class: "after_owner_idle".into(),
+                retry_after_ms: 0,
+                retry_condition: "the incompatible server exits while fully idle".into(),
+                capacity: None,
+            },
+        );
+
+        let value = serde_json::to_value(error).expect("serialize retry error");
+        assert_eq!(value["code"], "embedding_retryable");
+        assert_eq!(
+            value["details"]["embedding_retry"]["retry_condition"],
+            "the incompatible server exits while fully idle"
+        );
+        assert!(value["details"].get("embedding_capacity").is_none());
+        assert!(value["details"].get("next_commands").is_none());
     }
 }

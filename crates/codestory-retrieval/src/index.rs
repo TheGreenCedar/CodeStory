@@ -35,8 +35,16 @@ use codestory_store::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(not(feature = "test-support"), test))]
+use std::fs::{self, File, OpenOptions};
+#[cfg(any(not(feature = "test-support"), test))]
+use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(any(not(feature = "test-support"), test))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(not(feature = "test-support"), test))]
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -103,6 +111,302 @@ struct PreparedGenerationRetention {
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
+#[cfg(any(not(feature = "test-support"), test))]
+const EMBEDDING_QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
+#[cfg(any(not(feature = "test-support"), test))]
+const EMBEDDING_QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
+#[cfg(any(not(feature = "test-support"), test))]
+const PUBLICATION_QUALIFICATION_SCHEMA_VERSION: u32 = 1;
+#[cfg(any(not(feature = "test-support"), test))]
+const PUBLICATION_QUALIFICATION_MAX_CONTROL_BYTES: u64 = 16 * 1024;
+#[cfg(any(not(feature = "test-support"), test))]
+const PUBLICATION_QUALIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(not(feature = "test-support"), test))]
+const PUBLICATION_QUALIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[cfg(any(not(feature = "test-support"), test))]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationQualificationCommand {
+    schema_version: u32,
+    nonce_sha256: String,
+    correlation_id: String,
+    action: String,
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+#[derive(Debug, serde::Serialize)]
+struct PublicationQualificationEventClock {
+    domain: &'static str,
+    api: &'static str,
+    elapsed_ns: u64,
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+#[derive(Debug, serde::Serialize)]
+struct PublicationQualificationEvent<'a> {
+    schema_version: u32,
+    sequence: u64,
+    correlation_id: &'a str,
+    action: &'a str,
+    status: &'a str,
+    clock: PublicationQualificationEventClock,
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+struct PublicationQualificationHook {
+    directory: PathBuf,
+    nonce_sha256: String,
+    correlation_id: String,
+    events: File,
+    started: Instant,
+    sequence: u64,
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+impl PublicationQualificationHook {
+    #[cfg(not(feature = "test-support"))]
+    fn from_environment() -> Result<Option<Self>> {
+        Self::from_environment_values(
+            std::env::var_os(EMBEDDING_QUALIFICATION_DIR_ENV),
+            std::env::var(EMBEDDING_QUALIFICATION_NONCE_ENV).ok(),
+        )
+    }
+
+    fn from_environment_values(
+        directory: Option<std::ffi::OsString>,
+        nonce: Option<String>,
+    ) -> Result<Option<Self>> {
+        match (directory, nonce) {
+            (None, None) => Ok(None),
+            (Some(directory), Some(nonce)) => Self::from_gate(&PathBuf::from(directory), &nonce),
+            _ => bail!(
+                "embedding_publication_qualification_gate_incomplete: both \
+                 {EMBEDDING_QUALIFICATION_DIR_ENV} and \
+                 {EMBEDDING_QUALIFICATION_NONCE_ENV} are required"
+            ),
+        }
+    }
+
+    fn from_gate(directory: &Path, nonce: &str) -> Result<Option<Self>> {
+        if nonce.is_empty()
+            || nonce.len() > 128
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("embedding_publication_qualification_nonce_invalid");
+        }
+        let directory = validate_publication_qualification_directory(directory)?;
+        let nonce_sha256 = hex_sha256(nonce.as_bytes());
+        let control_path = directory.join(format!("publication-pause-{nonce_sha256}.json"));
+        let Some(command) =
+            read_publication_qualification_command(&control_path, "pause_before_manifest_commit")?
+        else {
+            return Ok(None);
+        };
+        if command.nonce_sha256 != nonce_sha256 {
+            bail!("embedding_publication_qualification_nonce_mismatch");
+        }
+        validate_publication_qualification_correlation_id(&command.correlation_id)?;
+        let events_path = directory.join(format!(
+            "publication-events-{}.jsonl",
+            command.correlation_id
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let events = options
+            .open(&events_path)
+            .context("create private publication qualification event log")?;
+        Ok(Some(Self {
+            directory,
+            nonce_sha256,
+            correlation_id: command.correlation_id,
+            events,
+            started: Instant::now(),
+            sequence: 0,
+        }))
+    }
+
+    fn pause_before_lease_revalidation(&mut self) -> Result<()> {
+        self.record("pause_before_manifest_commit", "waiting_for_resume")?;
+        let resume_path = self
+            .directory
+            .join(format!("publication-resume-{}.json", self.correlation_id));
+        let deadline = self.started + PUBLICATION_QUALIFICATION_WAIT_TIMEOUT;
+        loop {
+            if Instant::now() >= deadline {
+                self.record("resume_manifest_commit", "timed_out")?;
+                bail!("embedding_publication_qualification_resume_timeout");
+            }
+            match read_publication_qualification_command(&resume_path, "resume_manifest_commit")? {
+                Some(command)
+                    if command.nonce_sha256 == self.nonce_sha256
+                        && command.correlation_id == self.correlation_id =>
+                {
+                    self.record("resume_manifest_commit", "observed")?;
+                    return Ok(());
+                }
+                Some(_) => {
+                    self.record("resume_manifest_commit", "rejected")?;
+                    bail!("embedding_publication_qualification_resume_mismatch");
+                }
+                None => std::thread::sleep(PUBLICATION_QUALIFICATION_POLL_INTERVAL),
+            }
+        }
+    }
+
+    fn record(&mut self, action: &str, status: &str) -> Result<()> {
+        let elapsed_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let event = PublicationQualificationEvent {
+            schema_version: PUBLICATION_QUALIFICATION_SCHEMA_VERSION,
+            sequence: self.sequence,
+            correlation_id: &self.correlation_id,
+            action,
+            status,
+            clock: PublicationQualificationEventClock {
+                domain: "process_monotonic",
+                api: "std::time::Instant",
+                elapsed_ns,
+            },
+        };
+        serde_json::to_writer(&mut self.events, &event)
+            .context("encode publication qualification event")?;
+        self.events
+            .write_all(b"\n")
+            .context("terminate publication qualification event")?;
+        self.events
+            .flush()
+            .context("flush publication qualification event")?;
+        self.events
+            .sync_all()
+            .context("sync publication qualification event")?;
+        self.sequence = self.sequence.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+fn validate_publication_qualification_directory(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("embedding_publication_qualification_directory_not_absolute");
+    }
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "inspect publication qualification directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("embedding_publication_qualification_directory_untrusted");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            bail!("embedding_publication_qualification_directory_untrusted");
+        }
+    }
+    fs::canonicalize(path).with_context(|| {
+        format!(
+            "canonicalize publication qualification directory {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+fn read_publication_qualification_command(
+    path: &Path,
+    expected_action: &str,
+) -> Result<Option<PublicationQualificationCommand>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect publication qualification control {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > PUBLICATION_QUALIFICATION_MAX_CONTROL_BYTES
+    {
+        bail!("embedding_publication_qualification_control_untrusted");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            bail!("embedding_publication_qualification_control_untrusted");
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("open publication qualification control {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file
+            .metadata()
+            .context("inspect opened publication qualification control")?;
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.uid() != metadata.uid()
+            || opened.mode() & 0o077 != 0
+        {
+            bail!("embedding_publication_qualification_control_replaced");
+        }
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(PUBLICATION_QUALIFICATION_MAX_CONTROL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read publication qualification control")?;
+    if bytes.len() as u64 > PUBLICATION_QUALIFICATION_MAX_CONTROL_BYTES {
+        bail!("embedding_publication_qualification_control_too_large");
+    }
+    let command: PublicationQualificationCommand =
+        serde_json::from_slice(&bytes).context("parse publication qualification control")?;
+    if command.schema_version != PUBLICATION_QUALIFICATION_SCHEMA_VERSION
+        || command.action != expected_action
+    {
+        bail!("embedding_publication_qualification_control_invalid");
+    }
+    Ok(Some(command))
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+fn validate_publication_qualification_correlation_id(value: &str) -> Result<()> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("embedding_publication_qualification_correlation_invalid");
+    }
+    Ok(())
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 fn ensure_retrieval_index_not_cancelled(
     cancelled: &AtomicBool,
@@ -654,8 +958,7 @@ fn ensure_semantic_index(
                 },
                 || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
-                    let client =
-                        crate::embeddings::InProcessEmbeddingClient::new(retention.runtime);
+                    let client = crate::embeddings::ProductEmbeddingClient::new(retention.runtime);
                     for batch in
                         anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
                     {
@@ -665,7 +968,9 @@ fn ensure_semantic_index(
                             .map(|anchor| anchor.text.clone())
                             .collect::<Vec<_>>();
                         let vectors = client
-                            .embed_documents(&texts)
+                            .embed_documents_with_control(&texts, None, &|| {
+                                cancelled.load(Ordering::Acquire)
+                            })
                             .context("embed pinned dense anchor batch")?;
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
@@ -952,7 +1257,9 @@ fn persist_finalized_manifest(
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    let _prepared_retention = with_embedding_publication_residency(
+    #[cfg(not(feature = "test-support"))]
+    let mut publication_qualification = PublicationQualificationHook::from_environment()?;
+    let prepared_retention_result = with_embedding_publication_residency(
         &retention_context.embedding_residency,
         || {
             promote_retrieval_manifest_with_cancel(
@@ -1000,10 +1307,68 @@ fn persist_finalized_manifest(
                     prepare_generation_retention(retention_context, &project_id, &manifest, storage)
                 },
                 |prepared| Ok(prepared.verified_previous.clone()),
-                || ensure_retrieval_index_not_cancelled(cancelled, "retrieval publication commit"),
+                || {
+                    ensure_retrieval_index_not_cancelled(
+                        cancelled,
+                        "retrieval publication commit",
+                    )?;
+                    #[cfg(not(feature = "test-support"))]
+                    {
+                        if let Some(hook) = publication_qualification.as_mut() {
+                            hook.pause_before_lease_revalidation()?;
+                        }
+                        let lease_identity =
+                            match retention_context.embedding_residency.revalidate() {
+                                Ok(identity) => identity,
+                                Err(error) => {
+                                    if let Some(hook) = publication_qualification.as_mut() {
+                                        hook.record("lease_revalidation", "failed")?;
+                                    }
+                                    return Err(error).context(
+                                        "revalidate embedding server lease before publication",
+                                    );
+                                }
+                            };
+                        let lease_matches = embedding_identity_matches(
+                            retention_context
+                                .embedding_residency
+                                .identity()
+                                .context("embedding publication fence is missing its identity")?,
+                            &lease_identity,
+                        );
+                        if let Some(hook) = publication_qualification.as_mut() {
+                            hook.record(
+                                "lease_revalidation",
+                                if lease_matches { "matched" } else { "changed" },
+                            )?;
+                        }
+                        if !lease_matches {
+                            bail!(
+                                "embedding engine load generation changed before manifest publication"
+                            );
+                        }
+                    }
+                    Ok(())
+                },
             )
         },
-    )?;
+    );
+    match prepared_retention_result {
+        Ok(_prepared_retention) =>
+        {
+            #[cfg(not(feature = "test-support"))]
+            if let Some(hook) = publication_qualification.as_mut() {
+                hook.record("manifest_commit", "committed")?;
+            }
+        }
+        Err(error) => {
+            #[cfg(not(feature = "test-support"))]
+            if let Some(hook) = publication_qualification.as_mut() {
+                hook.record("manifest_commit", "returned_error")?;
+            }
+            return Err(error);
+        }
+    }
 
     let marker_error = match publish_derived_retention_marker(
         &storage,
@@ -1137,8 +1502,8 @@ struct CandidateGenerationEvidence {
     semantic_zero_dense_policy: bool,
     embedding_device: crate::embeddings::EmbeddingDeviceReadiness,
     embedding_accelerator_smoke_elapsed_ms: Option<u64>,
-    embedding_identity_before: crate::in_process_embedding::ProcessEmbeddingIdentity,
-    embedding_identity_after: crate::in_process_embedding::ProcessEmbeddingIdentity,
+    embedding_identity_before: crate::embedding_server_compat::ProductEmbeddingIdentity,
+    embedding_identity_after: crate::embedding_server_compat::ProductEmbeddingIdentity,
     retrieval_mode: String,
     degraded_reason: Option<String>,
 }
@@ -1198,13 +1563,13 @@ fn validate_candidate_generation_evidence(
     let device_policy_valid = if evidence.embedding_device.cpu_allowed && runtime_cpu_allowed {
         evidence.embedding_device.full_retrieval_allowed
             && evidence.embedding_device.observed_state == "cpu_explicit"
-            && evidence.embedding_device.observation_source == "inprocess_engine"
+            && evidence.embedding_device.observation_source == "per_user_server"
             && evidence.embedding_accelerator_smoke_elapsed_ms.is_none()
     } else if !evidence.embedding_device.cpu_allowed && !runtime_cpu_allowed {
         evidence.embedding_accelerator_smoke_elapsed_ms.is_some()
             && evidence.embedding_device.accelerator_requested
             && evidence.embedding_device.observed_state == "accelerated"
-            && evidence.embedding_device.observation_source == "inprocess_engine"
+            && evidence.embedding_device.observation_source == "per_user_server"
     } else {
         false
     };
@@ -1222,8 +1587,8 @@ fn validate_candidate_generation_evidence(
 }
 
 fn embedding_identity_matches(
-    before: &crate::in_process_embedding::ProcessEmbeddingIdentity,
-    after: &crate::in_process_embedding::ProcessEmbeddingIdentity,
+    before: &crate::embedding_server_compat::ProductEmbeddingIdentity,
+    after: &crate::embedding_server_compat::ProductEmbeddingIdentity,
 ) -> bool {
     before.instance_id == after.instance_id
         && before.load_generation == after.load_generation
@@ -1243,9 +1608,9 @@ fn embedding_identity_matches(
 }
 
 fn embedding_identity_matches_lease(
-    lease: &crate::in_process_embedding::ProcessEmbeddingIdentity,
-    before: &crate::in_process_embedding::ProcessEmbeddingIdentity,
-    after: &crate::in_process_embedding::ProcessEmbeddingIdentity,
+    lease: &crate::embedding_server_compat::ProductEmbeddingIdentity,
+    before: &crate::embedding_server_compat::ProductEmbeddingIdentity,
+    after: &crate::embedding_server_compat::ProductEmbeddingIdentity,
 ) -> bool {
     embedding_identity_matches(lease, before) && embedding_identity_matches(before, after)
 }
@@ -1262,11 +1627,9 @@ fn validate_candidate_generation(
         .as_deref()
         .context("mandatory sidecar manifest is missing its generation")?;
     let scip_dir = context.layout.scip_project_dir(generation);
-    let embedding_identity_before = crate::in_process_embedding::process_embedding_identity(
-        &context.runtime.cache_root,
-        context.runtime.embedding.allow_cpu,
-    )
-    .context("validate in-process embedding identity before final probes")?;
+    let embedding_identity_before =
+        crate::embedding_server_compat::product_embedding_identity(context.runtime)
+            .context("validate managed per-user embedding server identity before final probes")?;
     let semantic_generation = SemanticGeneration {
         layout: context.layout,
         collection: &manifest.semantic_generation,
@@ -1293,11 +1656,9 @@ fn validate_candidate_generation(
         &embedding_device,
         context.runtime,
     );
-    let embedding_identity_after = crate::in_process_embedding::process_embedding_identity(
-        &context.runtime.cache_root,
-        context.runtime.embedding.allow_cpu,
-    )
-    .context("validate in-process embedding identity after final probes")?;
+    let embedding_identity_after =
+        crate::embedding_server_compat::product_embedding_identity(context.runtime)
+            .context("validate managed per-user embedding server identity after final probes")?;
     if let Some(lease_identity) = context.embedding_residency.identity() {
         if !embedding_identity_matches_lease(
             lease_identity,
@@ -1712,11 +2073,186 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    fn secure_test_directory(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("secure qualification directory");
+        }
+    }
+
+    fn write_private_control(path: &Path, value: &serde_json::Value) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(path).expect("create private control");
+        serde_json::to_writer(&mut file, value).expect("write private control");
+        file.write_all(b"\n").expect("terminate private control");
+        file.sync_all().expect("sync private control");
+    }
+
+    #[test]
+    fn publication_qualification_hook_is_absent_when_gate_is_closed() {
+        assert!(
+            PublicationQualificationHook::from_environment_values(None, None)
+                .expect("closed environment gate")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn publication_qualification_hook_is_absent_without_a_pause_control() {
+        let directory = TempDir::new().expect("qualification directory");
+        secure_test_directory(directory.path());
+        assert!(
+            PublicationQualificationHook::from_gate(directory.path(), "test-nonce")
+                .expect("closed hook")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn publication_qualification_hook_emits_only_correlated_raw_events() {
+        let directory = TempDir::new().expect("qualification directory");
+        secure_test_directory(directory.path());
+        let nonce = "qualification-secret";
+        let nonce_sha256 = hex_sha256(nonce.as_bytes());
+        let correlation_id = "0123456789abcdef0123456789abcdef";
+        let pause_path = directory
+            .path()
+            .join(format!("publication-pause-{nonce_sha256}.json"));
+        write_private_control(
+            &pause_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "nonce_sha256": nonce_sha256,
+                "correlation_id": correlation_id,
+                "action": "pause_before_manifest_commit"
+            }),
+        );
+        let mut hook = PublicationQualificationHook::from_gate(directory.path(), nonce)
+            .expect("open hook")
+            .expect("pause control enables hook");
+        let resume_path = directory
+            .path()
+            .join(format!("publication-resume-{correlation_id}.json"));
+        let nonce_sha256_for_resume = nonce_sha256.clone();
+        let correlation_for_resume = correlation_id.to_string();
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            write_private_control(
+                &resume_path,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "nonce_sha256": nonce_sha256_for_resume,
+                    "correlation_id": correlation_for_resume,
+                    "action": "resume_manifest_commit"
+                }),
+            );
+        });
+        hook.pause_before_lease_revalidation()
+            .expect("resume qualification hook");
+        hook.record("lease_revalidation", "failed")
+            .expect("record lease failure");
+        hook.record("manifest_commit", "returned_error")
+            .expect("record publication result");
+        resume.join().expect("resume writer");
+        drop(hook);
+
+        let events_path = directory
+            .path()
+            .join(format!("publication-events-{correlation_id}.jsonl"));
+        let raw = fs::read_to_string(events_path).expect("read raw event log");
+        assert!(!raw.contains(nonce), "raw event log leaked the nonce");
+        assert!(
+            !raw.contains(directory.path().to_string_lossy().as_ref()),
+            "raw event log leaked its private directory"
+        );
+        let events = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse event"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["sequence"], 0);
+        assert_eq!(events[0]["action"], "pause_before_manifest_commit");
+        assert_eq!(events[0]["status"], "waiting_for_resume");
+        assert_eq!(events[1]["sequence"], 1);
+        assert_eq!(events[1]["action"], "resume_manifest_commit");
+        assert_eq!(events[1]["status"], "observed");
+        assert_eq!(events[2]["action"], "lease_revalidation");
+        assert_eq!(events[2]["status"], "failed");
+        assert_eq!(events[3]["action"], "manifest_commit");
+        assert_eq!(events[3]["status"], "returned_error");
+        assert!(
+            events.iter().all(|event| {
+                event["correlation_id"] == correlation_id
+                    && event["clock"]["domain"] == "process_monotonic"
+                    && event["clock"]["api"] == "std::time::Instant"
+                    && event["clock"]["elapsed_ns"].is_u64()
+            }),
+            "raw events omitted their local monotonic clock or correlation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_qualification_hook_rejects_a_broad_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TempDir::new().expect("qualification directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+            .expect("broaden qualification directory");
+        let error = PublicationQualificationHook::from_gate(directory.path(), "test-nonce")
+            .err()
+            .expect("broad directory must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("embedding_publication_qualification_directory_untrusted")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_qualification_hook_rejects_a_symlink_control() {
+        use std::os::unix::fs::symlink;
+        let directory = TempDir::new().expect("qualification directory");
+        secure_test_directory(directory.path());
+        let nonce = "qualification-secret";
+        let nonce_sha256 = hex_sha256(nonce.as_bytes());
+        let target = directory.path().join("target.json");
+        write_private_control(
+            &target,
+            &serde_json::json!({
+                "schema_version": 1,
+                "nonce_sha256": nonce_sha256,
+                "correlation_id": "0123456789abcdef0123456789abcdef",
+                "action": "pause_before_manifest_commit"
+            }),
+        );
+        let control = directory
+            .path()
+            .join(format!("publication-pause-{nonce_sha256}.json"));
+        symlink(&target, &control).expect("create control symlink");
+        let error = PublicationQualificationHook::from_gate(directory.path(), nonce)
+            .err()
+            .expect("symlink control must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("embedding_publication_qualification_control_untrusted")
+        );
+    }
+
     fn test_embedding_identity(
         policy: &'static str,
-    ) -> crate::in_process_embedding::ProcessEmbeddingIdentity {
+    ) -> crate::embedding_server_compat::ProductEmbeddingIdentity {
         let accelerated = policy == "accelerated";
-        crate::in_process_embedding::ProcessEmbeddingIdentity {
+        crate::embedding_server_compat::ProductEmbeddingIdentity {
             instance_id: "inprocess:test".into(),
             load_generation: 1,
             model_load_count: 1,
@@ -2025,7 +2561,7 @@ mod tests {
         let device = crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "accelerated",
-            observation_source: "inprocess_engine",
+            observation_source: "per_user_server",
             detected_provider: Some("metal".into()),
             detected_gpu: Some("test accelerator".into()),
             accelerator_requested: true,
@@ -2565,7 +3101,7 @@ mod tests {
             embedding_device: crate::embeddings::EmbeddingDeviceReadiness {
                 requested_policy: "accelerator_required",
                 observed_state: "accelerated",
-                observation_source: "inprocess_engine",
+                observation_source: "per_user_server",
                 detected_provider: Some("test".into()),
                 detected_gpu: Some("test accelerator".into()),
                 accelerator_requested: true,
@@ -2653,7 +3189,7 @@ mod tests {
         cpu_evidence.embedding_device = crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "cpu_explicit",
             observed_state: "cpu_explicit",
-            observation_source: "inprocess_engine",
+            observation_source: "per_user_server",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,

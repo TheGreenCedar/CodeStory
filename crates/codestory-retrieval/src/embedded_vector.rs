@@ -1,7 +1,7 @@
 use crate::candidate::{CandidateHit, CandidateSource};
 use crate::config::{SidecarLayout, SidecarRuntimeConfig};
-use crate::embeddings::{EmbeddingDeviceReadiness, InProcessEmbeddingClient};
-use crate::in_process_embedding::ProcessEmbeddingIdentity;
+use crate::embedding_server_compat::ProductEmbeddingIdentity;
+use crate::embeddings::{EmbeddingDeviceReadiness, ProductEmbeddingClient};
 use crate::sidecar_search::SearchExecutionContext;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -141,7 +141,7 @@ impl VectorEvidenceContract {
 
 pub(crate) fn build_vector_producer_evidence(
     embedding_device: &EmbeddingDeviceReadiness,
-    live_identity: Option<&ProcessEmbeddingIdentity>,
+    live_identity: Option<&ProductEmbeddingIdentity>,
     embedding_dim: u32,
     publication: EmbeddingVectorPublicationIdentityDto,
 ) -> EmbeddingVectorProducerEvidenceDto {
@@ -222,7 +222,7 @@ pub(crate) fn build_vector_producer_evidence(
 
 pub(crate) fn vector_producer_compatibility_identity(
     embedding_device: &EmbeddingDeviceReadiness,
-    live_identity: Option<&ProcessEmbeddingIdentity>,
+    live_identity: Option<&ProductEmbeddingIdentity>,
     embedding_dim: u32,
 ) -> Result<String> {
     let evidence = build_vector_producer_evidence(
@@ -326,7 +326,7 @@ pub(crate) fn validate_generation_evidence_for_publication(
     publication: &codestory_store::IndexPublicationRecord,
     runtime: &SidecarRuntimeConfig,
     embedding_device: &EmbeddingDeviceReadiness,
-    live_identity: Option<&ProcessEmbeddingIdentity>,
+    live_identity: Option<&ProductEmbeddingIdentity>,
 ) -> Result<VectorGenerationManifest> {
     let generation = manifest
         .sidecar_generation
@@ -448,7 +448,7 @@ fn validate_execution_evidence_for_runtime(
     evidence: &EmbeddingVectorProducerEvidenceDto,
     runtime: &SidecarRuntimeConfig,
     embedding_device: &EmbeddingDeviceReadiness,
-    live_identity: Option<&ProcessEmbeddingIdentity>,
+    live_identity: Option<&ProductEmbeddingIdentity>,
 ) -> Result<()> {
     if !embedding_device.full_retrieval_allowed {
         bail!("current embedding execution is not eligible for full retrieval");
@@ -521,7 +521,7 @@ pub(crate) struct EmbeddedVectorIndex {
     path: PathBuf,
     generation: String,
     input_hash: String,
-    embedding: InProcessEmbeddingClient,
+    embedding: ProductEmbeddingClient,
 }
 
 impl EmbeddedVectorIndex {
@@ -530,7 +530,7 @@ impl EmbeddedVectorIndex {
         collection: &str,
         generation: &str,
         input_hash: &str,
-        embedding: InProcessEmbeddingClient,
+        embedding: ProductEmbeddingClient,
     ) -> Self {
         Self {
             path: index_path(layout, collection),
@@ -753,8 +753,10 @@ impl EmbeddedVectorIndex {
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        context.timeout(std::time::Duration::from_secs(2))?;
-        let vector = self.embedding.embed_query(query)?;
+        let timeout = context.timeout(std::time::Duration::from_secs(2))?;
+        let vector = self
+            .embedding
+            .embed_query_with_control(query, Some(timeout), &|| context.is_cancelled())?;
         context.check_cancelled()?;
         let context = context.clone();
         search_database(
@@ -1509,7 +1511,7 @@ mod tests {
         EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "accelerated",
-            observation_source: "inprocess_engine",
+            observation_source: "per_user_server",
             detected_provider: Some("metal".into()),
             detected_gpu: Some("test accelerator".into()),
             accelerator_requested: true,
@@ -1521,8 +1523,8 @@ mod tests {
         }
     }
 
-    fn accelerated_identity() -> ProcessEmbeddingIdentity {
-        ProcessEmbeddingIdentity {
+    fn accelerated_identity() -> ProductEmbeddingIdentity {
+        ProductEmbeddingIdentity {
             instance_id: "inprocess:test".into(),
             load_generation: 1,
             model_load_count: 1,
@@ -1648,7 +1650,7 @@ mod tests {
         manifest: &RetrievalIndexManifest,
         publication: &IndexPublicationRecord,
         device: &EmbeddingDeviceReadiness,
-        identity: &ProcessEmbeddingIdentity,
+        identity: &ProductEmbeddingIdentity,
         mutate_evidence: impl FnOnce(&mut EmbeddingVectorProducerEvidenceDto),
     ) -> VectorGenerationManifest {
         let mut evidence = build_vector_producer_evidence(

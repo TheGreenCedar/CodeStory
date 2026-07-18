@@ -14,7 +14,9 @@ on:
       - crates/codestory-llama-sys/**
       - crates/codestory-retrieval/src/embeddings.rs
       - crates/codestory-retrieval/src/health.rs
-      - crates/codestory-retrieval/src/in_process_embedding.rs
+      - crates/codestory-retrieval/src/per_user_embedding.rs
+      - crates/codestory-retrieval/src/embedding_server_compat.rs
+      - crates/codestory-cli/src/embedding_server_transport.rs
       - crates/codestory-retrieval/src/index.rs
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs
@@ -41,7 +43,9 @@ on:
       - crates/codestory-llama-sys/**
       - crates/codestory-retrieval/src/embeddings.rs
       - crates/codestory-retrieval/src/health.rs
-      - crates/codestory-retrieval/src/in_process_embedding.rs
+      - crates/codestory-retrieval/src/per_user_embedding.rs
+      - crates/codestory-retrieval/src/embedding_server_compat.rs
+      - crates/codestory-cli/src/embedding_server_transport.rs
       - crates/codestory-retrieval/src/index.rs
       - crates/codestory-retrieval/src/query.rs
       - crates/codestory-cli/src/readiness.rs

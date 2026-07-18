@@ -88,4 +88,4 @@ problems.
 
 Claude Code provides the session hook, but MCP setup is normally manual and
 skill exposure depends on the host. Once MCP is connected, repository
-preparation and the in-process retrieval engine behave the same as in Codex.
+preparation and the per-user retrieval server behave the same as in Codex.

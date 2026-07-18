@@ -47,6 +47,7 @@ The most useful fields are:
 | `local_refresh` | Local map state and the complete publication retained during refresh. |
 | `state`, `capabilities`, `current_operation`, `retry_after_ms`, `failure` | Uncached activation progress layered onto the observational status read, including one stable operation id, stage, attempt, retry delay, and terminal failure. |
 | `retrieval_mode` | Persisted broad-search classification; `full` is required for trustworthy broad results. |
+| `embedding_server` in maintainer diagnostics | Endpoint authority, listener, server process, query/bulk capacity and depth, opaque active request/phase, engine owner/native worker, load generation, and model-load identity. Project paths and request text are never included. |
 | `readiness_lanes.agent_packet_search` | Current broad-search capability state. |
 | `runtime_update` | Non-blocking installed-runtime update advisory. |
 
@@ -72,7 +73,7 @@ physical non-software adapter, and verified accelerator work.
 CLI status, doctor, install records, and
 `codestory://diagnostics/retrieval-engine` are maintainer surfaces. The engine
 diagnostic reports the live model digest, linked ggml build, selected adapter,
-policy, smoke timing, and process-wide model-load identity. It is intentionally
+policy, smoke timing, and per-user server/model-load identity. It is intentionally
 absent from the normal resource catalog and user flow. Use these surfaces only
 after automatic retries stop converging or when collecting an explicit proof
 transcript. `CODESTORY_CLI` remains a local-development override; installed

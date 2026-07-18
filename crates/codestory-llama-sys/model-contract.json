@@ -16,7 +16,7 @@
     ]
   },
   "runtime": {
-    "embedding_family": "inprocess:coderank-embed:q8_0",
+    "embedding_family": "per-user-server:coderank-embed:q8_0",
     "llama_cpp_crate_version": "0.1.151",
     "llama_cpp_source_commit": "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66"
   },

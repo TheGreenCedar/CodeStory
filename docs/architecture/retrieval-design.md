@@ -14,20 +14,29 @@ required. Retrieval performs no runtime model, backend, or helper download.
 Development builds may deliberately omit the embedded model; they cannot claim
 product retrieval readiness.
 
-One lazily initialized engine serves every project in a multi-project stdio
-process. Initialization freezes process-level cache-root and CPU-policy
-compatibility; a later project cannot silently reconfigure the shared engine.
-One-shot CLI processes pay cold initialization themselves.
+Compatible CodeStory processes for one OS user connect to a stable private
+local endpoint. If no authority exists, an activating client spawns its exact
+verified `codestory-cli` in hidden `internal-embedding-server` mode and retries.
+Concurrent starters race for one OS-backed authority; losers connect or exit
+before loading the model. The server receives an opaque scope ID, never a
+project root, cache root, or request text.
 
-The existing model worker also owns residency. It keeps the verified backend,
-model, and context warm while requests are active, then drops all three after
-60 seconds without a completed request or publication lease. The lightweight
-worker and its last verified identity remain. A later product request reloads
-the content-addressed model, reruns the timed accelerator smoke, and continues
-without a download, repair command, or consent step.
+The server owns one model worker, one 64-entry query queue, and one 64-entry
+bulk queue. Each class is FIFO. Queries are preferred between bulk batches;
+bulk resumes when the query queue permits. V1 does not round-robin by project,
+repository, tenant, or scope and does not promise bounded bulk starvation under
+arbitrary sustained query traffic. Capacity pressure names the queue, depth,
+opaque active request and phase, retry delay, and the condition that makes a
+retry useful.
 
-The engine has one model worker with bounded interactive-query and bulk queues.
-Interactive queries take priority, including between bulk batches. Embedding
+At 60 seconds with no queued, active, or leased work, admission closes, the
+engine and endpoint shut down, and the server exits. Idle connections and
+observational diagnostics do not extend that lifetime. A later product request
+spawns the exact current CLI, reuses the verified content-addressed model,
+reruns the timed accelerator smoke, and continues without a download, repair
+command, or consent step.
+
+Embedding
 uses the pinned CodeRank tokenizer, the
 `Represent this query for searching relevant code: ` query prefix, no document
 prefix, CLS pooling, L2 normalization, 768-dimensional vectors, and the product
@@ -62,7 +71,7 @@ the published vector generation.
 
 ```mermaid
 flowchart LR
-    Engine["one process-wide CodeRankEmbed engine"] --> BuildA["build generation A"]
+    Engine["one per-user CodeRankEmbed server"] --> BuildA["build generation A"]
     Engine --> BuildB["build generation B"]
     SourceA["repository A"] --> BuildA
     SourceB["repository B"] --> BuildB
@@ -107,8 +116,17 @@ project-local retrieval publication, not evidence of an external service.
    the complete candidate and manifest.
 
 The writer holds one embedding residency lease from backend validation through
-candidate publication. The lease pins the owner and load generation, so the
-idle policy cannot divide one publication across two runtime instances.
+candidate publication. The lease binds its authenticated connection, server
+instance, and load generation. Before manifest-last publication the client
+revalidates the connection, peer and executable, protocol, server instance,
+lease, producer/model/backend/policy/execution, load generation, source, core,
+retrieval, and candidate identity. Drift blocks commit and leaves the previous
+publication usable.
+
+After server loss, only a pure embedding RPC may replay inside the client, at
+most once. Lease operations do not replay. A lost publication lease forces the
+whole candidate operation to restart or fail under the existing runtime retry
+boundary.
 
 Failure, cancellation, incomplete discovery, or source drift never authorizes a
 partial publication or deletion inferred from absence. Retention removes only
@@ -152,7 +170,7 @@ session identity as a complete-operation pin.
 publication. Broad agent surfaces additionally require:
 
 - a current core and source identity;
-- the exact in-process producer identity;
+- the exact server and producer identity;
 - a current or automatically restorable timed embedding smoke;
 - `accelerated` or explicitly permitted `cpu_explicit` policy;
 - an allowed packet/search/context surface.
@@ -166,10 +184,10 @@ Status and doctor observe this state. A broad product call may initialize the
 engine and build a missing generation automatically; it never asks the user to
 approve or repair an internal subsystem.
 
-Sleeping is healthy because the owner, packaged model, immutable policy, and
-last verified adapter identity remain available for automatic wake. A failed
-wake records the load error and blocks broad retrieval until a later product
-request proves a successful reload.
+An absent server after true idle is healthy because the packaged model,
+immutable policy, and verified materialization remain available for automatic
+spawn. A failed spawn or engine load records typed retry or failure state and
+blocks broad retrieval without weakening local navigation.
 
 ## Ownership and evidence
 

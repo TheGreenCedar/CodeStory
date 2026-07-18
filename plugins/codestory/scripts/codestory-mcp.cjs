@@ -132,6 +132,43 @@ function pluginDataDir() {
     || inferredCodexPluginDataDir();
 }
 
+function candidateQualificationArchiveSha256() {
+  const archiveSha256 = process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256 || '';
+  const qualificationDir = process.env.CODESTORY_EMBED_QUALIFICATION_DIR || '';
+  const nonce = process.env.CODESTORY_EMBED_QUALIFICATION_NONCE || '';
+  if (
+    !/^[0-9a-f]{64}$/iu.test(archiveSha256) ||
+    !path.isAbsolute(qualificationDir) ||
+    !/^[0-9a-f]{64}$/iu.test(nonce)
+  ) {
+    return null;
+  }
+  try {
+    const directoryStat = fs.lstatSync(qualificationDir);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return null;
+    if (process.platform !== 'win32' && (directoryStat.mode & 0o077) !== 0) return null;
+    if (fs.realpathSync(qualificationDir) !== path.resolve(qualificationDir)) return null;
+    const markerPath = path.join(qualificationDir, 'candidate-managed-install.json');
+    const markerStat = fs.lstatSync(markerPath);
+    if (!markerStat.isFile() || markerStat.isSymbolicLink()) return null;
+    const marker = readJson(markerPath);
+    const nonceSha256 = createHash('sha256').update(nonce, 'utf8').digest('hex');
+    if (
+      marker?.schema_version !== 1 ||
+      marker?.purpose !== 'codestory-candidate-managed-install' ||
+      marker?.archive_sha256 !== archiveSha256 ||
+      marker?.qualification_nonce_sha256 !== nonceSha256 ||
+      Object.keys(marker).sort().join(',') !==
+        'archive_sha256,purpose,qualification_nonce_sha256,schema_version'
+    ) {
+      return null;
+    }
+    return archiveSha256;
+  } catch {
+    return null;
+  }
+}
+
 
 function resolveManifest(manifestPath) {
   const manifest = readJson(manifestPath);
@@ -1012,14 +1049,23 @@ function verifyPublishedManagedCli(
   if (!verified.verified) return verified;
   const manifest = readJson(path.join(versionDir, 'manifest.json'));
   const expectedAsset = archiveName(version, expectedTarget);
+  const candidateArchiveSha256 = candidateQualificationArchiveSha256() || '';
+  const releaseMetadataValid =
+    manifest.build_source === 'github_release' &&
+    manifest.repo_ref === `v${version}` &&
+    manifest.archive_url === redactedReleaseFileUrl(version, expectedAsset);
+  const candidateMetadataValid =
+    /^[0-9a-f]{64}$/iu.test(candidateArchiveSha256) &&
+    manifest.build_source === 'candidate_archive' &&
+    /^[0-9a-f]{40}$/iu.test(String(manifest.repo_ref || '')) &&
+    manifest.archive_sha256 === candidateArchiveSha256 &&
+    manifest.archive_url === `candidate-archive:${candidateArchiveSha256}`;
   if (
-    manifest.build_source !== 'github_release' ||
-    manifest.repo_ref !== `v${version}` ||
+    (!releaseMetadataValid && !candidateMetadataValid) ||
     manifest.archive !== expectedAsset ||
     manifest.target !== expectedTarget ||
     manifest.stdio_initialize_verified !== true ||
-    !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || '')) ||
-    manifest.archive_url !== redactedReleaseFileUrl(version, expectedAsset)
+    !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || ''))
   ) {
     return { verified: false, reason: 'manifest_release_metadata_invalid' };
   }

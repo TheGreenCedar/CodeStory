@@ -5,9 +5,9 @@ call paths, and bounded answer packets when broad search is ready. Quality depen
 on your **language mix**, **repo size**, and **readiness lane**, not on a single
 global score.
 
-The map and retrieval generations are stored per repository. One host process
-can serve several repositories and reuse one warm embedding engine, but it does
-not mix their indexes, publications, or readiness state.
+The map and retrieval generations are stored per repository. Compatible host
+processes for one OS user can reuse one warm embedding server, but it does not
+receive repository paths or mix indexes, publications, or readiness state.
 
 ## Language coverage (plain language)
 

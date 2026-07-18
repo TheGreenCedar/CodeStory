@@ -3,8 +3,9 @@
 CodeStory is one local executable that turns a checkout into cited graph and
 retrieval evidence. A host plugin may provision the matching executable, but
 the executable owns indexing, retrieval, and serving. The CodeRankEmbed Q8
-model and accelerator backend are compiled into the release; runtime work does
-not depend on Docker, an embedding server, a port, or a user-managed service.
+model and accelerator backend are compiled into the release. The same verified
+executable can run a hidden per-user embedding-server mode; runtime work does
+not depend on Docker, TCP, a model download, or a user-managed service.
 
 ## Runtime topology
 
@@ -16,7 +17,8 @@ flowchart LR
     Select --> Runtime["project RuntimeContext"]
     Runtime --> Graph["core graph and local navigation"]
     Runtime --> Retrieval["retrieval publication and broad evidence"]
-    Retrieval --> Engine["one sleeping or resident engine owner"]
+    Retrieval --> Server["one per-user embedding server"]
+    Server --> Engine["one native model worker"]
 ```
 
 The launcher provisions only the exact CodeStory executable required by the
@@ -24,12 +26,14 @@ installed plugin. It validates the archive, checksum, version, and stdio
 handshake, then hands requests to that executable. It does not provision a
 model or backend separately.
 
-Every MCP request carries an absolute project root. The stdio process retains
-one isolated runtime context per project while all projects share one embedding
-owner. Its model and accelerator context stay warm during active request bursts
-and are released after 60 idle seconds. The next product request restores them
-automatically. Hook-written active-project files are diagnostics; they never
-route requests.
+Every MCP request carries an absolute project root. Each stdio process retains
+isolated project runtime contexts, while all compatible CodeStory clients for
+the current OS user connect to one stable private Unix-domain socket or Windows
+named pipe. The server owns the only query and bulk queues and the only native
+model worker. At 60 seconds with no queued, active, or leased work, the server
+closes admission and exits. The next product request spawns the exact current
+CLI automatically. Hook-written active-project files are diagnostics; they
+never route requests.
 
 ## Data topology
 
@@ -39,7 +43,7 @@ flowchart LR
     CoreStage --> Core["published codestory.db"]
     Core --> RetrievalStage["staged retrieval generation"]
     Source --> RetrievalStage
-    Engine["shared embedding engine"] --> RetrievalStage
+    Engine["per-user embedding server"] --> RetrievalStage
     RetrievalStage --> Lexical["lexical-index.sqlite3"]
     RetrievalStage --> Vectors["vectors.sqlite3"]
     RetrievalStage --> Scip["SCIP generation"]
@@ -67,7 +71,8 @@ evidence.
 
 | Scope | Identity and state | Lifetime |
 | --- | --- | --- |
-| Process | captured startup defaults and one embedding owner | one CLI or stdio process |
+| User server | endpoint authority, protocol, scheduler, native worker, load generation | one elected server across compatible CodeStory processes |
+| Process | captured startup defaults and server client identity | one CLI or stdio process |
 | Project | repository identity, cache namespace, immutable runtime config | retained across requests in multi-project stdio |
 | Publication | core generation/run plus retrieval generation/input/producer | one atomic old-or-new published view |
 | Request | explicit project, tool arguments, task and retry budget | one tool or CLI call |

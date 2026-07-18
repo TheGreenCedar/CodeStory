@@ -51,7 +51,9 @@ versions and any terminal provisioning error.
 This network activity installs or updates the CodeStory CLI package. It is not
 an embedding-runtime download: the verified CLI already contains its model and
 linked backend. Once installed, repository indexing and retrieval require no
-model download, helper server, endpoint, port, or user approval.
+model download, separate helper executable, TCP endpoint, port, or user
+approval. The same verified CLI automatically runs its hidden per-user server
+over private local IPC.
 
 ## Codex install
 

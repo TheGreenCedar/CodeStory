@@ -3163,6 +3163,26 @@ fn read_stdio_resource(
 
 fn read_stdio_retrieval_engine_diagnostics(runtime: &RuntimeContext) -> Result<serde_json::Value> {
     let infrastructure = codestory_retrieval::probe_infrastructure_health(&runtime.sidecar);
+    let embedding_server = match codestory_retrieval::PerUserEmbeddingClient::for_runtime(
+        &runtime.sidecar,
+    )
+    .and_then(|client| client.observe())
+    {
+        Ok(Some(snapshot)) => serde_json::to_value(snapshot)
+            .context("serialize observational embedding server snapshot")?,
+        Ok(None) => serde_json::Value::Null,
+        Err(error) => serde_json::json!({
+            "schema_version": codestory_retrieval::PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
+            "lifecycle": "unavailable",
+            "failure": {
+                "code": "embedding_server_observation_failed",
+                "retry_class": "after_server_change",
+                "retry_after_ms": 0,
+                "retry_condition": "the per-user server lifetime authority changes",
+                "message": error.to_string(),
+            }
+        }),
+    };
     let status = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -3172,6 +3192,7 @@ fn read_stdio_retrieval_engine_diagnostics(runtime: &RuntimeContext) -> Result<s
         "retrieval_mode": status.retrieval_mode,
         "degraded_reason": status.degraded_reason,
         "engine": infrastructure,
+        "embedding_server": embedding_server,
     }))
 }
 
@@ -3764,7 +3785,8 @@ fn stdio_active_state_fresh(active_state_path: &Path) -> bool {
 }
 
 fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_json::Value {
-    let plugin_runtime = stdio_plugin_runtime_status();
+    let (_, executable_sha256, _) = stdio_server_executable_status();
+    let plugin_runtime = stdio_plugin_runtime_status(executable_sha256.as_deref());
     let diagnostic = stdio_workspace_mismatch_diagnostic(mismatch, &plugin_runtime);
     let local_refresh = serde_json::json!({
         "state": "blocked",
@@ -3955,7 +3977,7 @@ fn read_stdio_status_resource(
         stdio_server_executable_status();
     let runtime_update = stdio_runtime_update_advisory(server_executable.as_deref());
     let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
-    let plugin_runtime = stdio_plugin_runtime_status();
+    let plugin_runtime = stdio_plugin_runtime_status(server_executable_sha256.as_deref());
     let readiness =
         build_stdio_status_readiness(runtime, &summary, local_refresh, &retrieval_status);
     let surfaces = build_stdio_status_surfaces(runtime, &readiness, &plugin_runtime);
@@ -4563,7 +4585,7 @@ fn stdio_server_executable_status() -> (Option<String>, Option<String>, Vec<Stri
     }
 }
 
-fn stdio_plugin_runtime_status() -> serde_json::Value {
+fn stdio_plugin_runtime_status(executable_sha256: Option<&str>) -> serde_json::Value {
     let cli_source = env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE")
         .unwrap_or_else(|| "direct_cli_launch".to_string());
     let warnings = env_nonempty("CODESTORY_PLUGIN_CLI_WARNINGS")
@@ -4578,6 +4600,14 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
     let managed_cli_retention = env_nonempty("CODESTORY_PLUGIN_CLI_RETENTION")
         .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
         .filter(|value| !value.is_null());
+    let process_start_id =
+        match codestory_retrieval::probe_process_start_identity(std::process::id()) {
+            codestory_retrieval::ProcessStartProbe::Running { start_identity } => {
+                Some(start_identity)
+            }
+            codestory_retrieval::ProcessStartProbe::NotRunning
+            | codestory_retrieval::ProcessStartProbe::Unknown { .. } => None,
+        };
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
         "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
@@ -4596,6 +4626,11 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         "managed_binary_sha256": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_SHA256") } else { None },
         "managed_manifest_path": env_nonempty("CODESTORY_PLUGIN_CLI_MANIFEST_PATH"),
         "managed_cli_retention": managed_cli_retention,
+        "client_process": {
+            "pid": std::process::id(),
+            "process_start_id": process_start_id,
+            "executable_sha256": executable_sha256,
+        },
         "warnings": warnings
     })
 }
@@ -5033,6 +5068,34 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    #[test]
+    fn plugin_runtime_reports_a_bounded_live_client_process_identity() {
+        let executable_sha256 = "a".repeat(64);
+        let runtime = stdio_plugin_runtime_status(Some(&executable_sha256));
+        let process = runtime["client_process"]
+            .as_object()
+            .expect("client process identity");
+
+        assert_eq!(process.len(), 3);
+        assert!(process.contains_key("pid"));
+        assert!(process.contains_key("process_start_id"));
+        assert!(process.contains_key("executable_sha256"));
+        assert_eq!(process["pid"], json!(std::process::id()));
+        assert_eq!(process["executable_sha256"], json!(executable_sha256));
+        assert!(
+            process["process_start_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            serde_json::to_string(process)
+                .expect("serialize client process identity")
+                .find(std::env::current_dir().unwrap().to_string_lossy().as_ref())
+                .is_none(),
+            "client process identity leaked a filesystem path"
+        );
+    }
 
     #[test]
     fn affected_transport_truncation_downgrades_stronger_nested_completeness_with_field_totals() {
@@ -6242,6 +6305,8 @@ version = "0.11.20"
                     attempt: 1,
                     retry_after_ms: None,
                     failure: Some(format!("retained-{index}")),
+                    embedding_capacity: None,
+                    embedding_retry: None,
                     capabilities: codestory_runtime::ActivationCapabilities {
                         local_navigation: codestory_runtime::ActivationCapabilityState::Unavailable,
                         broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,
@@ -6756,6 +6821,8 @@ version = "0.11.20"
                 attempt: 1,
                 retry_after_ms: Some(375),
                 failure: None,
+                embedding_capacity: None,
+                embedding_retry: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
@@ -6795,6 +6862,14 @@ version = "0.11.20"
                 attempt: 2,
                 retry_after_ms: Some(250),
                 failure: Some("publication changed".to_string()),
+                embedding_capacity: None,
+                embedding_retry: Some(codestory_contracts::api::EmbeddingRetryStateDto {
+                    code: "embedding_server_incompatible_active_owner".into(),
+                    retry_class: "after_owner_idle".into(),
+                    retry_after_ms: 250,
+                    retry_condition: "the incompatible owner exits while fully idle".into(),
+                    capacity: None,
+                }),
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
@@ -6809,6 +6884,10 @@ version = "0.11.20"
         assert_eq!(
             retry.pointer("/current_operation/attempt"),
             Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            retry.pointer("/current_operation/embedding_retry/retry_class"),
+            Some(&serde_json::json!("after_owner_idle"))
         );
         assert_eq!(retry.get("retry_after_ms"), Some(&serde_json::json!(250)));
         assert_eq!(
@@ -6833,6 +6912,8 @@ version = "0.11.20"
                 attempt: 3,
                 retry_after_ms: None,
                 failure: Some("managed retrieval unavailable".to_string()),
+                embedding_capacity: None,
+                embedding_retry: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,

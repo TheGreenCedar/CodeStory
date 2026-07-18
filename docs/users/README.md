@@ -51,14 +51,16 @@ a model, start a service, choose a port, or run a repair command.
 ## What runs locally
 
 The released CodeStory executable includes its search model and embedding
-engine. It does not download a model or backend, start a helper process, or use
-Docker. Apple Silicon uses Metal; supported Windows hardware uses Vulkan.
-Production never silently changes from GPU to CPU.
+engine. When semantic work is needed, that exact executable automatically runs
+one hidden server for the current OS user over private local IPC. It does not
+download a model or backend, expose a TCP port, or use Docker. Apple Silicon
+uses Metal; supported Windows hardware uses Vulkan. Production never silently
+changes from GPU to CPU.
 
-Each repository has its own cache and publication identity. A host process may
-serve several repositories at once, but every request names its repository
-explicitly. The repositories share one warm embedding engine without sharing
-their indexes or readiness state.
+Each repository has its own cache and publication identity. Compatible host
+processes share one warm embedding server, but every request still names its
+repository explicitly and the server never receives that path. Repositories do
+not share indexes or readiness state.
 
 Source and index data stay local by default. Remote summaries are a separate,
 explicit trusted-operator feature; repository-controlled network configuration

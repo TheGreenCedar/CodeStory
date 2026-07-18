@@ -2,20 +2,20 @@ use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, BookmarkCategoryDto,
     BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
-    EmbeddingVectorPublicationIdentityDto, GroundingBudgetDto, GroundingSnapshotDto,
-    IndexDryRunDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexedFilesDto,
-    IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
-    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto,
-    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
+    EmbeddingCapacityPressureDto, EmbeddingRetryStateDto, EmbeddingVectorPublicationIdentityDto,
+    GroundingBudgetDto, GroundingSnapshotDto, IndexDryRunDto, IndexFreshnessStatusDto, IndexMode,
+    IndexPublicationDto, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit,
+    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto,
 };
 
 use crate::AppController;
 use codestory_indexer::CancellationToken;
 use codestory_store::{IndexPublicationRecord, Store};
 use serde::Serialize;
-#[cfg(any(test, feature = "test-support"))]
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,6 +48,37 @@ fn run_before_retrieval_pin_test_hook() {
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_before_retrieval_pin_test_hook() {}
+
+thread_local! {
+    static ACTIVE_PUBLIC_OPERATION_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> =
+        const { RefCell::new(None) };
+}
+
+struct ActivePublicOperationCancellationGuard {
+    previous: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for ActivePublicOperationCancellationGuard {
+    fn drop(&mut self) {
+        ACTIVE_PUBLIC_OPERATION_CANCELLATION.with(|active| {
+            active.replace(self.previous.take());
+        });
+    }
+}
+
+fn with_public_operation_cancellation<T>(
+    cancelled: Arc<AtomicBool>,
+    build: impl FnOnce() -> T,
+) -> T {
+    let previous =
+        ACTIVE_PUBLIC_OPERATION_CANCELLATION.with(|active| active.replace(Some(cancelled)));
+    let _guard = ActivePublicOperationCancellationGuard { previous };
+    build()
+}
+
+pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> {
+    ACTIVE_PUBLIC_OPERATION_CANCELLATION.with(|active| active.borrow().clone())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +124,10 @@ pub struct ActivationSnapshot {
     pub stage: ActivationStage,
     pub attempt: u32,
     pub retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_retry: Option<EmbeddingRetryStateDto>,
     pub failure: Option<String>,
     pub capabilities: ActivationCapabilities,
 }
@@ -342,6 +377,8 @@ impl ActivationService {
             {
                 snapshot.attempt += 1;
                 snapshot.failure = None;
+                snapshot.embedding_capacity = None;
+                snapshot.embedding_retry = None;
                 snapshot.retry_after_ms = Some(250);
                 snapshot.state = ActivationState::Preparing;
                 snapshot.stage = ActivationStage::Discovery;
@@ -357,6 +394,8 @@ impl ActivationService {
                     stage: ActivationStage::Discovery,
                     attempt: 1,
                     retry_after_ms: Some(250),
+                    embedding_capacity: None,
+                    embedding_retry: None,
                     failure: None,
                     capabilities: ActivationCapabilities {
                         local_navigation: ActivationCapabilityState::Unavailable,
@@ -588,16 +627,18 @@ fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
         ActivationState::Retryable => "activation_retryable",
         _ => "project_unavailable",
     };
-    ApiError::new(
+    activation_api_error(
         code,
         snapshot.failure.clone().unwrap_or_else(|| {
             "project activation did not provide the requested capability".into()
         }),
+        snapshot.embedding_retry.clone(),
+        snapshot.embedding_capacity.clone(),
     )
 }
 
 fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
-    ApiError::new(
+    activation_api_error(
         "activation_preparing",
         format!(
             "project activation {} is still {:?} at {:?}; retry after {}ms",
@@ -606,14 +647,26 @@ fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
             snapshot.stage,
             snapshot.retry_after_ms.unwrap_or(250)
         ),
+        snapshot.embedding_retry.clone(),
+        snapshot.embedding_capacity.clone(),
     )
 }
 
 fn map_activation_error(error: anyhow::Error) -> ApiError {
+    if let Some(error) = embedding_api_error(&error) {
+        return classify_activation_api_error(error);
+    }
     classify_activation_api_error(ApiError::new("project_unavailable", error.to_string()))
 }
 
-fn classify_activation_api_error(error: ApiError) -> ApiError {
+fn classify_activation_api_error(mut error: ApiError) -> ApiError {
+    if matches!(
+        error.code.as_str(),
+        "embedding_capacity" | "embedding_retryable"
+    ) {
+        error.code = "activation_retryable".into();
+        return error;
+    }
     if matches!(
         error.code.as_str(),
         "cancelled" | "activation_preparing" | "activation_retryable"
@@ -637,6 +690,75 @@ fn classify_activation_api_error(error: ApiError) -> ApiError {
         ApiError::new("activation_retryable", error.message)
     } else {
         ApiError::new("project_unavailable", error.message)
+    }
+}
+
+fn activation_api_error(
+    code: &str,
+    message: String,
+    retry: Option<EmbeddingRetryStateDto>,
+    pressure: Option<EmbeddingCapacityPressureDto>,
+) -> ApiError {
+    if let Some(retry) = retry {
+        return ApiError::embedding_retry(code, message, retry);
+    }
+    let Some(pressure) = pressure else {
+        return ApiError::new(code, message);
+    };
+    let mut error = ApiError::embedding_capacity(message, pressure);
+    error.code = code.into();
+    error
+}
+
+pub fn embedding_api_error(error: &anyhow::Error) -> Option<ApiError> {
+    codestory_retrieval::embedding_retry_state(error).map(embedding_retry_api_error)
+}
+
+fn embedding_retry_api_error(retry: codestory_retrieval::EmbeddingRetryStateWire) -> ApiError {
+    let capacity = retry.capacity.map(embedding_capacity_dto);
+    let public_code = if retry.code.contains("cancelled") {
+        "cancelled"
+    } else if capacity.is_some() {
+        "embedding_capacity"
+    } else if matches!(
+        retry.retry_class.as_str(),
+        "after_capacity_change"
+            | "after_delay"
+            | "after_owner_idle"
+            | "after_server_change"
+            | "same_rpc_once"
+    ) {
+        "embedding_retryable"
+    } else {
+        "project_unavailable"
+    };
+    ApiError::embedding_retry(
+        public_code,
+        retry.message,
+        EmbeddingRetryStateDto {
+            code: retry.code,
+            retry_class: retry.retry_class,
+            retry_after_ms: retry.retry_after_ms,
+            retry_condition: retry.retry_condition,
+            capacity,
+        },
+    )
+}
+
+fn embedding_capacity_dto(
+    pressure: codestory_retrieval::EmbeddingCapacityPressureWire,
+) -> EmbeddingCapacityPressureDto {
+    EmbeddingCapacityPressureDto {
+        reason: pressure.reason,
+        queue_class: pressure.queue_class,
+        capacity: pressure.capacity,
+        depth: pressure.depth,
+        retry_after_ms: pressure.retry_after_ms,
+        retry_condition: pressure.retry_condition,
+        owner_state: pressure.owner_state,
+        active_scope_id: pressure.active_scope_id,
+        active_request_id: pressure.active_request_id,
+        active_request_class: pressure.active_request_class,
     }
 }
 
@@ -740,7 +862,8 @@ impl PublicOperationService {
                             format!("request cancelled before {operation}"),
                         ));
                     }
-                    let value = build()?;
+                    let value =
+                        with_public_operation_cancellation(Arc::clone(&cancelled), &mut build)?;
                     if cancelled.load(Ordering::Acquire) {
                         return Err(ApiError::new(
                             "cancelled",
@@ -820,7 +943,8 @@ impl PublicOperationService {
                     ));
                 }
                 let mut run = || {
-                    let value = build()?;
+                    let value =
+                        with_public_operation_cancellation(Arc::clone(&cancelled), &mut build)?;
                     if cancelled.load(Ordering::Acquire) {
                         return Err(ApiError::new(
                             "cancelled",
@@ -929,9 +1053,10 @@ impl ActivationOperation {
         if let Some(error) = error {
             let capability = match error.code.as_str() {
                 "cancelled" => ActivationCapabilityState::Cancelled,
-                "activation_retryable" | "cache_busy" | "publication_changed" => {
-                    ActivationCapabilityState::Retryable
-                }
+                "activation_retryable"
+                | "embedding_capacity"
+                | "cache_busy"
+                | "publication_changed" => ActivationCapabilityState::Retryable,
                 _ => ActivationCapabilityState::Unavailable,
             };
             if snapshot.capabilities.local_navigation != ActivationCapabilityState::Ready {
@@ -946,13 +1071,32 @@ impl ActivationOperation {
                 ActivationCapabilityState::Cancelled => ActivationState::Cancelled,
                 ActivationCapabilityState::Ready => ActivationState::Ready,
             };
+            snapshot.embedding_capacity = error
+                .details
+                .as_deref()
+                .and_then(|details| details.embedding_capacity.clone());
+            snapshot.embedding_retry = error
+                .details
+                .as_deref()
+                .and_then(|details| details.embedding_retry.clone());
             snapshot.retry_after_ms =
-                (capability == ActivationCapabilityState::Retryable).then_some(250);
+                (capability == ActivationCapabilityState::Retryable).then(|| {
+                    snapshot.embedding_retry.as_ref().map_or_else(
+                        || {
+                            snapshot
+                                .embedding_capacity
+                                .as_ref()
+                                .map_or(250, |pressure| pressure.retry_after_ms)
+                        },
+                        |retry| retry.retry_after_ms,
+                    )
+                });
             snapshot.failure = Some(error.message.clone());
         } else {
             snapshot.state = ActivationState::Ready;
             snapshot.stage = ActivationStage::Ready;
             snapshot.retry_after_ms = None;
+            snapshot.embedding_capacity = None;
             snapshot.failure = None;
         }
         let snapshot = snapshot.clone();
@@ -1694,6 +1838,120 @@ mod activation_tests {
     }
 
     #[test]
+    fn embedding_capacity_stays_typed_and_never_suggests_repair() {
+        let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_capacity".into(),
+            message: "embedding query capacity is unavailable".into(),
+            retry_class: "after_capacity_change".into(),
+            retry_after_ms: 25,
+            retry_condition: "a query slot becomes available".into(),
+            capacity: Some(codestory_retrieval::EmbeddingCapacityPressureWire {
+                reason: "queue_full".into(),
+                queue_class: "query".into(),
+                capacity: 64,
+                depth: 64,
+                retry_after_ms: 25,
+                retry_condition: "a query slot becomes available".into(),
+                owner_state: "ready".into(),
+                active_scope_id: Some("opaque-scope".into()),
+                active_request_id: Some("opaque-request".into()),
+                active_request_class: Some("bulk".into()),
+            }),
+        });
+        let error = embedding_api_error(&source).expect("typed capacity error");
+        let classified = classify_activation_api_error(error);
+        let details = classified.details.as_deref().expect("capacity details");
+
+        assert_eq!(classified.code, "activation_retryable");
+        assert!(details.project.is_none());
+        assert!(details.next_commands.is_empty());
+        assert!(details.minimum_next.is_empty());
+        assert!(details.full_repair.is_empty());
+        assert_eq!(
+            details
+                .embedding_capacity
+                .as_ref()
+                .map(|pressure| pressure.retry_condition.as_str()),
+            Some("a query slot becomes available")
+        );
+    }
+
+    #[test]
+    fn owner_idle_retry_metadata_survives_central_runtime_mapping() {
+        let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_server_incompatible_active_owner".into(),
+            message: "the live owner is incompatible".into(),
+            retry_class: "after_owner_idle".into(),
+            retry_after_ms: 0,
+            retry_condition: "the incompatible server exits while fully idle".into(),
+            capacity: None,
+        });
+
+        let mapped = embedding_api_error(&source).expect("typed embedding error");
+        let retry = mapped
+            .details
+            .as_deref()
+            .and_then(|details| details.embedding_retry.as_ref())
+            .expect("retry details");
+        assert_eq!(mapped.code, "embedding_retryable");
+        assert_eq!(retry.code, "embedding_server_incompatible_active_owner");
+        assert_eq!(retry.retry_class, "after_owner_idle");
+        assert_eq!(
+            retry.retry_condition,
+            "the incompatible server exits while fully idle"
+        );
+        assert!(retry.capacity.is_none());
+    }
+
+    #[test]
+    fn activation_classification_preserves_embedding_retry_details() {
+        let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_server_owner_unresponsive".into(),
+            message: "the owner did not respond".into(),
+            retry_class: "after_server_change".into(),
+            retry_after_ms: 25,
+            retry_condition: "the lifetime authority changes".into(),
+            capacity: None,
+        });
+
+        let mapped = map_activation_error(source);
+        assert_eq!(mapped.code, "activation_retryable");
+        let retry = mapped
+            .details
+            .as_deref()
+            .and_then(|details| details.embedding_retry.as_ref())
+            .expect("retry details");
+        assert_eq!(retry.code, "embedding_server_owner_unresponsive");
+        assert_eq!(retry.retry_class, "after_server_change");
+        assert_eq!(retry.retry_after_ms, 25);
+        assert_eq!(retry.retry_condition, "the lifetime authority changes");
+        assert!(retry.capacity.is_none());
+    }
+
+    #[test]
+    fn terminal_embedding_error_remains_unavailable_with_typed_diagnostics() {
+        let source = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_server_protocol_mismatch".into(),
+            message: "the protocol changed".into(),
+            retry_class: "terminal".into(),
+            retry_after_ms: 0,
+            retry_condition: "the request or compatible executable changes".into(),
+            capacity: None,
+        });
+
+        let mapped = embedding_api_error(&source).expect("typed embedding error");
+        assert_eq!(mapped.code, "project_unavailable");
+        assert_eq!(
+            mapped
+                .details
+                .as_deref()
+                .and_then(|details| details.embedding_retry.as_ref())
+                .map(|retry| retry.retry_class.as_str()),
+            Some("terminal")
+        );
+    }
+
+    #[test]
     fn failed_broad_activation_never_becomes_ready_but_can_preserve_local_capability() {
         let snapshot = ActivationSnapshot {
             operation_id: "activation-1".into(),
@@ -1701,6 +1959,8 @@ mod activation_tests {
             stage: ActivationStage::Validation,
             attempt: 1,
             retry_after_ms: None,
+            embedding_capacity: None,
+            embedding_retry: None,
             failure: Some("embedding backend unavailable".into()),
             capabilities: ActivationCapabilities {
                 local_navigation: ActivationCapabilityState::Ready,

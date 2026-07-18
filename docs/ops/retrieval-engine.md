@@ -1,9 +1,11 @@
-# In-process retrieval engine
+# Per-user embedding server
 
 CodeStory ships semantic retrieval inside the native CLI. The release
 executable contains the checksum-pinned CodeRankEmbed Q8 model and links the
-llama.cpp/ggml engine. There is no embedding server, network endpoint, backend
-download, port lease, PID supervisor, or user-controlled repair lifecycle.
+llama.cpp/ggml engine. Activating clients connect to a private same-user local
+endpoint and, when no authority exists, spawn that exact executable in hidden
+server mode. There is no TCP endpoint, backend download, port lease, PID-file
+supervisor, or user-controlled repair lifecycle.
 Each release archive also contains `codestory-native-manifest.json`, which binds
 the executable digest, native format and architecture, linkage/loading mode,
 inspected native dependencies, packaged runtime artifacts, compiled backend
@@ -18,19 +20,21 @@ that same tool while it reports `preparing`.
 
 ```mermaid
 flowchart LR
-  host["One CodeStory CLI process"] --> engine["Process-wide embedding engine"]
+  hostA["CodeStory client A"] --> server["Per-user embedding server"]
+  hostB["CodeStory client B"] --> server
+  server --> engine["One native model worker"]
   engine --> model["Verified embedded model"]
-  host --> a["Repository A publication"]
-  host --> b["Repository B publication"]
+  hostA --> a["Repository A publication"]
+  hostB --> b["Repository B publication"]
   a --> a1["Core SQLite + lexical/vector generation + SCIP"]
   b --> b1["Core SQLite + lexical/vector generation + SCIP"]
 ```
 
-The engine initializes lazily on the first semantic operation. All repositories
-opened by that CLI process share its model and accelerator context. Repository
-configuration, caches, generations, and publication leases remain isolated.
-Every MCP request carries an absolute `project` root; no global active-project
-file routes requests.
+The server is elected lazily on the first semantic operation. Compatible
+CodeStory processes for the current OS user share its model, scheduler, and
+accelerator context. Repository configuration, caches, generations, and
+publication state remain in the clients. Every MCP request carries an absolute
+`project` root; the server receives only an opaque admission scope.
 
 Retrieval chooses one explicit backend/device-class request and supplies model,
 pooling, dimension, batching, and smoke parameters to the native binding. The
@@ -57,18 +61,21 @@ cache materialization, not a runtime download.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Uninitialized
-  Uninitialized --> Initializing: first semantic request
-  Initializing --> Ready: model, backend, adapter, smoke verified
-  Initializing --> Unavailable: policy or engine proof fails
-  Ready --> Ready: later repository reuses engine
-  Ready --> [*]: process exits
+  [*] --> Absent
+  Absent --> Listening: activating client wins authority
+  Listening --> Resident: model, backend, adapter, smoke verified
+  Listening --> Unavailable: policy or engine proof fails
+  Resident --> Resident: admitted query, bulk work, or lease
+  Listening --> Draining: 60 seconds true idle
+  Resident --> Draining: 60 seconds true idle
+  Draining --> Absent: endpoint closed and server exits
+  Absent --> Listening: later product request
 ```
 
 Repository activation and engine initialization are separate:
 
 1. Local discovery and indexing publish a complete core database.
-2. The process-wide engine verifies its model and execution policy.
+2. The per-user server verifies its model and execution policy.
 3. Retrieval builds lexical, vector, and SCIP artifacts for that repository.
 4. The writer validates a complete candidate and atomically publishes its
    manifest.
@@ -129,8 +136,8 @@ That path must report `cpu_explicit` and carries no Metal or Vulkan claim.
 ## Diagnostics
 
 `doctor`, `retrieval status`, and MCP status are observational. They do not
-initialize the model or start a retrieval build merely to fill diagnostic
-fields.
+spawn or wake the server, initialize the model, extend idle lifetime, or start
+a retrieval build merely to fill diagnostic fields.
 
 ```sh
 codestory-cli doctor --project <repo> --format json
@@ -146,10 +153,12 @@ codestory://diagnostics/retrieval-engine
 ```
 
 The resource is intentionally omitted from ordinary user routing. It reports
-backend, adapter, model/build identity, policy, smoke timing, backend-observed
-execution and residency, successful encodes, model loads, and materialization
-reuse. Process-memory and GPU-memory deltas are diagnostics, not accelerator
-authorization.
+the endpoint authority, listener, server process, scheduler, engine owner and
+native worker, load generation, backend, adapter, model/build identity, policy,
+smoke timing, backend-observed execution and residency, successful encodes,
+model loads, and materialization reuse. It never reports project paths or
+request text. Process-memory and GPU-memory deltas are diagnostics, not
+accelerator authorization.
 
 ## Failure isolation
 
@@ -157,7 +166,12 @@ authorization.
 | --- | --- | --- |
 | Engine still initializing | Same tool returns `preparing` with a retry delay | Let the owner finish; do not start another engine |
 | Unsupported or software adapter | Broad search returns unavailable; local map remains usable | Capture diagnostics and verify the packaged platform policy |
-| Process CPU/accelerator policy differs from the initialized engine | Request fails with `embedding_backend_policy_mismatch`; the existing engine remains loaded | Use one explicit policy for the process; do not replace the owner or infer fallback |
+| Queue full or soft deadline elapsed | Typed capacity state reports class, capacity, depth, opaque active phase, retry delay, and a useful retry condition | Retry the same product call after the named condition; do not run doctor or reindex |
+| Incompatible server is fully idle | The server closes admission and exits before the exact requesting CLI can win authority | Retry the same operation |
+| Incompatible server has active work or leases | Request returns typed `after_owner_idle` state; no second server starts | Wait for the named idle condition |
+| Server process crashes | A pure embedding RPC may reconnect and replay once; lease operations do not replay | Let the whole product operation retry when its publication lease was lost |
+| Native worker stops making progress | The independent watchdog fail-stops the server | Retain the event evidence; the next product call elects a replacement |
+| Whole server is frozen | Client returns bounded `owner_unresponsive`; it does not unlink, kill, take over, or start a second engine | Restore or terminate the exact frozen process deliberately |
 | Model materialization mismatch | Engine fails closed before use | Preserve the path and digest evidence; let the next verified materialization replace only owned state |
 | Retrieval producer changed | Old semantic generation is not admitted | Run normal full retrieval publication and verify the new identity |
 | Core or retrieval publication changes during query | Query returns `cache_busy` | Retry once against the new complete publication |
@@ -170,7 +184,7 @@ name alone.
 ## Publication and cleanup
 
 The retrieval manifest binds project/workspace identity, the core generation,
-the lexical/vector SQLite generation, the in-process producer, and the SCIP
+the lexical/vector SQLite generation, the per-user server producer, and the SCIP
 artifact. Writers stage and validate a full candidate before changing the live
 pointer. Readers hold publication and generation leases for the duration of a
 query.
@@ -187,11 +201,13 @@ ownership identity is current and unambiguous.
 
 ## Proof boundary
 
-Hosted CPU proof validates source, package, and protocol behavior. An
-acceleration claim requires the packaged executable on physical hardware.
-Measure cold initialization, warm query latency, bulk embedding throughput,
-process RSS, GPU memory, vector parity, retrieval quality, multi-repository
-reuse, and restart materialization reuse separately.
+Hosted CPU proof validates source, package, protocol, same-user IPC, and the
+explicit CPU runtime path. An acceleration claim requires the same manifest-
+bound package on physical hardware. Installed-runtime qualification additionally
+requires two independent plugin hosts, all preregistered server fault scenarios,
+frozen thresholds, and exact source/tree/archive/executable/host/session/
+protocol/constant identities. See
+[the qualification contract](../testing/per-user-embedding-server-qualification.md).
 
 See [retrieval architecture](../testing/retrieval-architecture.md),
 [retrieval design](../architecture/retrieval-design.md), and the

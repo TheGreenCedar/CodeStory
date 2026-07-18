@@ -51,6 +51,8 @@ mod config;
 mod display;
 mod drill_targeting;
 mod embedding_config;
+mod embedding_qualification;
+mod embedding_server_transport;
 mod explore;
 mod file_state;
 mod http_transport;
@@ -164,7 +166,6 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let _embedding_shutdown = ProcessEmbeddingShutdown;
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let json = json_output_requested(&raw_args);
     let cli = match Cli::try_parse_from(&raw_args) {
@@ -225,15 +226,11 @@ async fn main() -> ExitCode {
     }
 }
 
-struct ProcessEmbeddingShutdown;
-
-impl Drop for ProcessEmbeddingShutdown {
-    fn drop(&mut self) {
-        codestory_retrieval::shutdown_process_embedding_engine();
-    }
-}
-
 async fn run_cli(cli: Cli) -> Result<()> {
+    if !matches!(&cli.command, Command::InternalEmbeddingServer) {
+        embedding_server_transport::install_client_transport()
+            .context("install native embedding server transport")?;
+    }
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
@@ -270,6 +267,17 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::InternalOwnedDelete(cmd) => run_internal_owned_delete(cmd),
+        Command::InternalEmbeddingServer => {
+            embedding_server_transport::run_internal_embedding_server()
+        }
+        Command::InternalEmbeddingQualification(cmd) => {
+            embedding_qualification::run_internal_embedding_qualification(cmd)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
+        Command::InternalEmbeddingQualificationWorker(cmd) => {
+            embedding_qualification::run_internal_embedding_qualification_worker(cmd)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
     }
 }
 
@@ -317,6 +325,8 @@ fn command_failure_envelope(
             minimum_next: Vec::new(),
             full_repair: Vec::new(),
             readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
         },
     ))
     .with_context(context)
@@ -401,12 +411,17 @@ fn open_agent_surface(
     let opened = runtime.ensure_open_from_summary(refresh, before.clone())?;
     ensure_index_ready(&opened, surface)?;
     codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
+        .map_err(map_embedding_preflight_error)
         .with_context(|| format!("initialize retrieval for {surface}"))?;
     Ok(OpenedAgentSurface {
         runtime,
         before,
         opened,
     })
+}
+
+fn map_embedding_preflight_error(error: anyhow::Error) -> anyhow::Error {
+    codestory_runtime::embedding_api_error(&error).map_or(error, map_api_error)
 }
 
 fn run_cache(cmd: CacheCommand) -> Result<()> {
@@ -876,6 +891,8 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
                 minimum_next: output.repair_hints.iter().take(1).cloned().collect(),
                 full_repair: output.repair_hints.clone(),
                 readiness: None,
+                embedding_capacity: None,
+                embedding_retry: None,
             },
         ))
         .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
@@ -6013,6 +6030,8 @@ fn ambiguous_command_failure(
             minimum_next: output.error.next_commands.iter().take(1).cloned().collect(),
             full_repair: output.error.next_commands.clone(),
             readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
         },
     ))
     .with_context(serde_json::json!({
@@ -8460,7 +8479,7 @@ mod tests {
         retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
         retrieval.current_embedding = Some(codestory_contracts::api::EmbeddingProfileContractDto {
             profile: "coderank-embed".to_string(),
-            backend: "inprocess".to_string(),
+            backend: "per_user_server".to_string(),
             model_id: "nomic-ai/CodeRankEmbed".to_string(),
             cache_key: "current".to_string(),
             dimension: Some(768),
@@ -8470,7 +8489,7 @@ mod tests {
             Some(codestory_contracts::api::StoredSemanticDocsContractDto {
                 doc_count: 1,
                 embedding_profile: Some("unexpected-profile".to_string()),
-                embedding_backend: Some("inprocess".to_string()),
+                embedding_backend: Some("per_user_server".to_string()),
                 cache_key: Some("old".to_string()),
                 dimension: Some(768),
                 doc_version: Some(5),
@@ -10429,6 +10448,40 @@ mod tests {
         assert_eq!(
             relative_path(root, "\\\\?\\UNC\\server\\share\\file.rs"),
             "//server/share/file.rs"
+        );
+    }
+
+    #[test]
+    fn embedding_preflight_preserves_typed_capacity_for_json_failures() {
+        let error = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_capacity".into(),
+            message: "query queue is full".into(),
+            retry_class: "after_capacity_change".into(),
+            retry_after_ms: 25,
+            retry_condition: "a query slot becomes available".into(),
+            capacity: Some(codestory_retrieval::EmbeddingCapacityPressureWire {
+                reason: "queue_full".into(),
+                queue_class: "query".into(),
+                capacity: 64,
+                depth: 64,
+                retry_after_ms: 25,
+                retry_condition: "a query slot becomes available".into(),
+                owner_state: "ready".into(),
+                active_scope_id: None,
+                active_request_id: None,
+                active_request_class: None,
+            }),
+        });
+
+        let mapped = map_embedding_preflight_error(error);
+        let api = runtime::api_error_in_chain(&mapped).expect("typed CLI API error");
+        assert_eq!(api.code, "embedding_capacity");
+        assert_eq!(
+            api.details
+                .as_deref()
+                .and_then(|details| details.embedding_capacity.as_ref())
+                .map(|pressure| pressure.retry_condition.as_str()),
+            Some("a query slot becomes available")
         );
     }
 

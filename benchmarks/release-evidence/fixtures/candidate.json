@@ -19,8 +19,8 @@
     },
     "packet": {
       "path": "candidate-packet.json",
-      "sha256": "36a58d73c707aa938169edee01cfe49e0a723144be9696f22adbe073a3ab593d",
-      "bytes": 5324
+      "sha256": "7f519e5d3c2d69aca7d29872ccff103d12cccd863e81f3ddad6615f94a1fe031",
+      "bytes": 5515
     }
   },
   "metrics": {
@@ -62,7 +62,7 @@
   },
   "release_claims": {
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
+    "graph_sha256": "4f10bcec540fddaea2a962e7fccec222050bed470c596a4cb213ab2697e9492c",
     "observed_at": "2026-07-16T11:00:00.000Z",
     "expires_at": "2026-07-17T11:00:00.000Z",
     "requested_claims": [
@@ -91,7 +91,7 @@
         "type": "retrieval_readiness",
         "tier": "live_behavior",
         "status": "pass",
-        "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
+        "graph_sha256": "4f10bcec540fddaea2a962e7fccec222050bed470c596a4cb213ab2697e9492c",
         "observed_at": "2026-07-16T11:00:00.000Z",
         "expires_at": "2026-07-17T11:00:00.000Z",
         "identity": {
@@ -110,7 +110,7 @@
         "type": "performance",
         "tier": "live_behavior",
         "status": "measured",
-        "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
+        "graph_sha256": "4f10bcec540fddaea2a962e7fccec222050bed470c596a4cb213ab2697e9492c",
         "observed_at": "2026-07-16T11:00:00.000Z",
         "expires_at": "2026-07-17T11:00:00.000Z",
         "identity": {
@@ -131,7 +131,7 @@
         "type": "answer_quality",
         "tier": "answer_quality",
         "status": "pass",
-        "graph_sha256": "240bb77be8f9ffa2fac1399efee660fa542f0ccfa9bef1acb58abd50a16eed97",
+        "graph_sha256": "4f10bcec540fddaea2a962e7fccec222050bed470c596a4cb213ab2697e9492c",
         "observed_at": "2026-07-16T11:00:00.000Z",
         "expires_at": "2026-07-17T11:00:00.000Z",
         "identity": {
@@ -143,7 +143,7 @@
           "cache_id": "cold-full-retrieval-v1",
           "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
           "release_key": "ci-contract-v1",
-          "artifact_sha256": "36a58d73c707aa938169edee01cfe49e0a723144be9696f22adbe073a3ab593d",
+          "artifact_sha256": "7f519e5d3c2d69aca7d29872ccff103d12cccd863e81f3ddad6615f94a1fe031",
           "evaluation_contract": "publishable-three-repeat-packet/v1"
         }
       }

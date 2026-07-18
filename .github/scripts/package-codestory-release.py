@@ -8,6 +8,7 @@ import json
 import shutil
 import stat
 import struct
+import subprocess
 import tarfile
 import tempfile
 import zipfile
@@ -22,8 +23,22 @@ from native_binary_contract import (
 NORMALIZED_MTIME = 315532800  # 1980-01-01T00:00:00Z, valid for zip and tar.
 NATIVE_ENGINE_MARKER_PREFIX = b"codestory-native-engine-v1|"
 NATIVE_ENGINE_MARKER_SUFFIX = b"|end"
+SERVER_PROOF_MARKER_PREFIX = b"codestory-embedding-server-proof-v1|"
+SERVER_PROOF_MARKER_SUFFIX = b"|end"
 NATIVE_MANIFEST_FILE = "codestory-native-manifest.json"
 NATIVE_RUNTIME_FILE_LIST = "codestory-native-runtime-files-v1.txt"
+MEASUREMENT_PROTOCOL = "docs/testing/per-user-embedding-server-measurement-protocol.json"
+SERVER_PROTOCOL = "docs/testing/per-user-embedding-server-protocol.json"
+SERVER_CONSTANT_SET = "docs/testing/per-user-embedding-server-constant-set.json"
+LOWER_TIER_NONCLAIMS = [
+    "answer_quality",
+    "bounded_bulk_starvation",
+    "cross_session_sharing",
+    "cross_user_sharing",
+    "linux_gpu_execution",
+    "release_readiness",
+    "whole_server_takeover",
+]
 
 TARGET_CONTRACTS = {
     "linux-x64": {
@@ -110,7 +125,7 @@ def require(condition: bool, message: str) -> None:
         raise PackageContractError(message)
 
 
-def native_engine_markers(path: Path) -> list[str]:
+def binary_markers(path: Path, prefix: bytes, suffix: bytes, label: str) -> list[str]:
     markers: set[bytes] = set()
     overlap = b""
     with path.open("rb") as handle:
@@ -118,13 +133,13 @@ def native_engine_markers(path: Path) -> list[str]:
             block = overlap + chunk
             offset = 0
             while True:
-                start = block.find(NATIVE_ENGINE_MARKER_PREFIX, offset)
+                start = block.find(prefix, offset)
                 if start < 0:
                     break
-                end = block.find(NATIVE_ENGINE_MARKER_SUFFIX, start)
+                end = block.find(suffix, start)
                 if end < 0:
                     break
-                end += len(NATIVE_ENGINE_MARKER_SUFFIX)
+                end += len(suffix)
                 markers.add(block[start:end])
                 offset = end
             overlap = block[-4096:]
@@ -133,8 +148,26 @@ def native_engine_markers(path: Path) -> list[str]:
         try:
             decoded.append(marker.decode("ascii"))
         except UnicodeDecodeError as exc:
-            raise PackageContractError("native engine build marker is not ASCII") from exc
+            raise PackageContractError(f"{label} marker is not ASCII") from exc
     return decoded
+
+
+def native_engine_markers(path: Path) -> list[str]:
+    return binary_markers(
+        path,
+        NATIVE_ENGINE_MARKER_PREFIX,
+        NATIVE_ENGINE_MARKER_SUFFIX,
+        "native engine build",
+    )
+
+
+def server_proof_markers(path: Path) -> list[str]:
+    return binary_markers(
+        path,
+        SERVER_PROOF_MARKER_PREFIX,
+        SERVER_PROOF_MARKER_SUFFIX,
+        "embedding server proof",
+    )
 
 
 def parse_native_engine_marker(marker: str) -> dict[str, str]:
@@ -165,6 +198,106 @@ def parse_native_engine_marker(marker: str) -> dict[str, str]:
     missing = sorted(required - fields.keys())
     require(not missing, "native engine marker is missing fields: " + ", ".join(missing))
     return fields
+
+
+def parse_server_proof_marker(marker: str) -> dict[str, object]:
+    parts = marker.split("|")
+    require(
+        parts[0] == "codestory-embedding-server-proof-v1",
+        "embedding server proof marker schema is unsupported",
+    )
+    require(parts[-1] == "end", "embedding server proof marker terminator is missing")
+    raw: dict[str, str] = {}
+    for part in parts[1:-1]:
+        require("=" in part, f"malformed embedding server proof marker field: {part!r}")
+        key, value = part.split("=", 1)
+        require(bool(key) and bool(value), f"empty embedding server proof marker field: {part!r}")
+        require(key not in raw, f"duplicate embedding server proof marker field: {key}")
+        raw[key] = value
+    required = {
+        "bootstrap",
+        "protocol_schema",
+        "protocol_sha256",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
+        "clock_policy",
+        "query_capacity",
+        "bulk_capacity",
+        "idle_timeout_ms",
+    }
+    require(set(raw) == required, "embedding server proof marker fields do not match schema")
+    for field in ("protocol_sha256", "constant_set_sha256", "measurement_protocol_sha256"):
+        digest = raw[field]
+        require(
+            len(digest) == 64
+            and digest != "0" * 64
+            and all(char in "0123456789abcdef" for char in digest),
+            f"embedding server proof {field} is not a lowercase SHA-256 digest",
+        )
+    require(raw["clock_policy"] == "awake_monotonic", "embedding server clock policy is unsupported")
+    numbers: dict[str, int] = {}
+    for field in ("bootstrap", "protocol_schema", "query_capacity", "bulk_capacity", "idle_timeout_ms"):
+        try:
+            numbers[field] = int(raw[field])
+        except ValueError as exc:
+            raise PackageContractError(f"embedding server proof {field} is not an integer") from exc
+        require(numbers[field] > 0, f"embedding server proof {field} must be positive")
+    require(numbers["bootstrap"] == 1, "embedding server bootstrap version is unsupported")
+    require(numbers["protocol_schema"] == 1, "embedding server protocol schema is unsupported")
+    require(numbers["query_capacity"] == 64, "embedding server query capacity is not accepted")
+    require(numbers["bulk_capacity"] == 64, "embedding server bulk capacity is not accepted")
+    require(numbers["idle_timeout_ms"] == 60_000, "embedding server idle timeout is not accepted")
+    return {
+        "schema_version": 1,
+        "bootstrap_version": numbers["bootstrap"],
+        "protocol_schema_version": numbers["protocol_schema"],
+        "protocol_sha256": raw["protocol_sha256"],
+        "constant_set_sha256": raw["constant_set_sha256"],
+        "measurement_protocol_sha256": raw["measurement_protocol_sha256"],
+        "clock_policy": raw["clock_policy"],
+        "query_capacity": numbers["query_capacity"],
+        "bulk_capacity": numbers["bulk_capacity"],
+        "idle_timeout_ms": numbers["idle_timeout_ms"],
+        "lower_tier_nonclaims": LOWER_TIER_NONCLAIMS,
+    }
+
+
+def source_identity(root: Path) -> dict[str, object]:
+    def git(*args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        require(completed.returncode == 0, f"could not resolve package source identity: {completed.stderr.strip()}")
+        return completed.stdout.strip()
+
+    commit = git("rev-parse", "HEAD")
+    tree = git("rev-parse", "HEAD^{tree}")
+    require(len(commit) == 40 and all(char in "0123456789abcdef" for char in commit), "package source commit is invalid")
+    require(len(tree) == 40 and all(char in "0123456789abcdef" for char in tree), "package source tree is invalid")
+    dirty = bool(git("status", "--porcelain", "--untracked-files=all"))
+    require(
+        not dirty,
+        "release package source has tracked modifications or untracked inputs",
+    )
+    for relative in (
+        "docs/testing/per-user-embedding-server-protocol.json",
+        "docs/testing/per-user-embedding-server-constant-set.json",
+        "docs/testing/per-user-embedding-server-measurement-protocol.json",
+    ):
+        tracked = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", relative],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        require(
+            tracked.returncode == 0,
+            f"release package contract is not tracked by the recorded source tree: {relative}",
+        )
+    return {"commit": commit, "tree": tree, "tracked_dirty": False}
 
 
 def load_model_contract(root: Path) -> dict:
@@ -270,7 +403,13 @@ def runtime_artifacts_for(
     return artifacts
 
 
-def native_release_manifest(version: str, target: str, binary: Path, root: Path) -> dict:
+def native_release_manifest(
+    version: str,
+    target: str,
+    binary: Path,
+    root: Path,
+    source: dict[str, object] | None = None,
+) -> dict:
     target_contract = TARGET_CONTRACTS.get(target)
     require(target_contract is not None, f"unsupported release target: {target}")
 
@@ -304,6 +443,36 @@ def native_release_manifest(version: str, target: str, binary: Path, root: Path)
     require(len(markers) == 1, f"binary must contain one native engine identity; found {len(markers)}")
     marker = markers[0]
     fields = parse_native_engine_marker(marker)
+    server_markers = server_proof_markers(binary)
+    require(
+        len(server_markers) == 1,
+        f"binary must contain one embedding server proof identity; found {len(server_markers)}",
+    )
+    server_proof = parse_server_proof_marker(server_markers[0])
+    measurement_protocol = root / MEASUREMENT_PROTOCOL
+    protocol_contract = root / SERVER_PROTOCOL
+    constant_set = root / SERVER_CONSTANT_SET
+    require(measurement_protocol.is_file(), "embedding server measurement protocol is missing")
+    require(protocol_contract.is_file(), "embedding server protocol contract is missing")
+    require(constant_set.is_file(), "embedding server constant set is missing")
+    require(
+        sha256_file(measurement_protocol) == server_proof["measurement_protocol_sha256"],
+        "binary embedding server proof names a different measurement protocol",
+    )
+    require(
+        sha256_file(protocol_contract) == server_proof["protocol_sha256"],
+        "binary embedding server proof names a different protocol contract",
+    )
+    require(
+        sha256_file(constant_set) == server_proof["constant_set_sha256"],
+        "binary embedding server proof names a different constant set",
+    )
+    try:
+        constant_set_document = json.loads(constant_set.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PackageContractError(f"embedding server constant set is not valid JSON: {exc}") from exc
+    require(isinstance(constant_set_document, dict), "embedding server constant set is not an object")
+    server_proof["constant_set_status"] = constant_set_document.get("status")
     require(fields["target"] == target_contract["target_triple"], "native engine target triple does not match package target")
     require(fields["os"] == target_contract["target_os"], "native engine OS does not match package target")
     require(fields["arch"] == target_contract["target_arch"], "native engine architecture does not match package target")
@@ -351,9 +520,10 @@ def native_release_manifest(version: str, target: str, binary: Path, root: Path)
     )
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "release_version": version,
         "asset_target": target,
+        "source": source or source_identity(root),
         "binary": {
             "name": target_contract["binary_name"],
             "sha256": sha256_file(binary),
@@ -397,6 +567,7 @@ def native_release_manifest(version: str, target: str, binary: Path, root: Path)
             "expected_protected_backend": target_contract["expected_protected_backend"],
             "non_claim_reason": target_contract["non_claim_reason"],
         },
+        "server_proof": server_proof,
     }
 
 
@@ -472,7 +643,13 @@ def sha256_file(path: Path) -> str:
 
 
 def package_release(
-    version: str, target: str, binary: Path, out_dir: Path, root: Path
+    version: str,
+    target: str,
+    binary: Path,
+    out_dir: Path,
+    root: Path,
+    *,
+    source: dict[str, object] | None = None,
 ) -> Path:
     if not binary.is_file():
         raise FileNotFoundError(f"binary does not exist: {binary}")
@@ -490,7 +667,7 @@ def package_release(
         stage_root.mkdir(parents=True)
 
         binary_name = target_contract["binary_name"]
-        manifest = native_release_manifest(version, target, binary, root)
+        manifest = native_release_manifest(version, target, binary, root, source)
         shutil.copy2(binary, stage_root / binary_name)
         for descriptor in manifest["runtime_artifacts"]:
             name = descriptor["name"]
@@ -541,9 +718,33 @@ def native_marker(
     )
 
 
+TEST_MEASUREMENT_PROTOCOL = b'{"protocol_id":"self-test","schema_version":1}\n'
+TEST_SERVER_PROTOCOL = b'{"protocol_id":"self-test-wire","schema_version":1}\n'
+TEST_CONSTANT_SET = b'{"schema_version":1,"status":"frozen"}\n'
+
+
+def server_proof_marker(
+    measurement_protocol_sha256: str = hashlib.sha256(TEST_MEASUREMENT_PROTOCOL).hexdigest(),
+    protocol_sha256: str = hashlib.sha256(TEST_SERVER_PROTOCOL).hexdigest(),
+    constant_set_sha256: str = hashlib.sha256(TEST_CONSTANT_SET).hexdigest(),
+) -> str:
+    return (
+        "codestory-embedding-server-proof-v1|"
+        "bootstrap=1|protocol_schema=1|"
+        f"protocol_sha256={protocol_sha256}|constant_set_sha256={constant_set_sha256}|"
+        f"measurement_protocol_sha256={measurement_protocol_sha256}|"
+        "clock_policy=awake_monotonic|query_capacity=64|bulk_capacity=64|"
+        "idle_timeout_ms=60000|end"
+    )
+
+
 def synthetic_binary(
     binary_format: str, arch: str, marker: str, needed: tuple[str, ...] = ()
 ) -> bytes:
+    if marker.startswith("codestory-native-engine-v1|") and (
+        "codestory-embedding-server-proof-v1|" not in marker
+    ):
+        marker = marker + "\0" + server_proof_marker()
     if binary_format == "elf":
         header = bytearray(4096)
         header[:6] = b"\x7fELF\x02\x01"
@@ -697,6 +898,11 @@ def run_self_test() -> None:
         (repo_root / "LICENSE").write_text("license\n", encoding="utf-8")
         (repo_root / "docs/glossary.md").write_text("glossary\n", encoding="utf-8")
         (repo_root / "docs/users/guide.md").write_text("guide\n", encoding="utf-8")
+        measurement_protocol = repo_root / MEASUREMENT_PROTOCOL
+        measurement_protocol.parent.mkdir(parents=True, exist_ok=True)
+        measurement_protocol.write_bytes(TEST_MEASUREMENT_PROTOCOL)
+        (repo_root / SERVER_PROTOCOL).write_bytes(TEST_SERVER_PROTOCOL)
+        (repo_root / SERVER_CONSTANT_SET).write_bytes(TEST_CONSTANT_SET)
         (repo_root / "plugins/codestory/skills/codestory-grounding/SKILL.md").write_text(
             "skill\n", encoding="utf-8"
         )
@@ -708,7 +914,7 @@ def run_self_test() -> None:
                 "sha256": "a" * 64,
             },
             "runtime": {
-                "embedding_family": "inprocess:test",
+                "embedding_family": "per-user-server:test",
                 "llama_cpp_crate_version": "0.1.151",
                 "llama_cpp_source_commit": "test-commit",
             },
@@ -740,6 +946,11 @@ def run_self_test() -> None:
             embedding_descriptor,
             model_contract["tokenizer_config"],
         )
+        fixture_source = {
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "tracked_dirty": False,
+        }
 
         linux_binary = temp_root / "linux-x64-runtime/codestory-cli"
         write_synthetic_runtime(
@@ -842,8 +1053,22 @@ def run_self_test() -> None:
             ("macos-x64", macos_x64_binary),
             ("macos-arm64", macos_binary),
         ]:
-            first = package_release("0.0.0", target, binary, temp_root / f"{target}-1", repo_root)
-            second = package_release("0.0.0", target, binary, temp_root / f"{target}-2", repo_root)
+            first = package_release(
+                "0.0.0",
+                target,
+                binary,
+                temp_root / f"{target}-1",
+                repo_root,
+                source=fixture_source,
+            )
+            second = package_release(
+                "0.0.0",
+                target,
+                binary,
+                temp_root / f"{target}-2",
+                repo_root,
+                source=fixture_source,
+            )
             first_digest = sha256_file(first)
             second_digest = sha256_file(second)
             if first_digest != second_digest:
@@ -888,7 +1113,12 @@ def run_self_test() -> None:
         )
         try:
             package_release(
-                "0.0.0", "linux-x64", linux_binary, temp_root / "stale-contract", repo_root
+                "0.0.0",
+                "linux-x64",
+                linux_binary,
+                temp_root / "stale-contract",
+                repo_root,
+                source=fixture_source,
             )
         except PackageContractError:
             pass
@@ -929,7 +1159,14 @@ def run_self_test() -> None:
             )
         )
         try:
-            package_release("0.0.0", "linux-x64", hostile, temp_root / "hostile", repo_root)
+            package_release(
+                "0.0.0",
+                "linux-x64",
+                hostile,
+                temp_root / "hostile",
+                repo_root,
+                source=fixture_source,
+            )
         except PackageContractError:
             pass
         else:
@@ -953,7 +1190,12 @@ def run_self_test() -> None:
         (missing_cpu.parent / "libggml-cpu.so").unlink()
         try:
             package_release(
-                "0.0.0", "linux-x64", missing_cpu, temp_root / "missing-cpu", repo_root
+                "0.0.0",
+                "linux-x64",
+                missing_cpu,
+                temp_root / "missing-cpu",
+                repo_root,
+                source=fixture_source,
             )
         except PackageContractError:
             pass
@@ -982,7 +1224,12 @@ def run_self_test() -> None:
         )
         try:
             package_release(
-                "0.0.0", "linux-x64", poisoned_cpu, temp_root / "poisoned-cpu", repo_root
+                "0.0.0",
+                "linux-x64",
+                poisoned_cpu,
+                temp_root / "poisoned-cpu",
+                repo_root,
+                source=fixture_source,
             )
         except PackageContractError:
             pass
@@ -1004,7 +1251,14 @@ def run_self_test() -> None:
             )
         )
         try:
-            package_release("0.0.0", "linux-x64", wrong_arch, temp_root / "wrong-arch", repo_root)
+            package_release(
+                "0.0.0",
+                "linux-x64",
+                wrong_arch,
+                temp_root / "wrong-arch",
+                repo_root,
+                source=fixture_source,
+            )
         except PackageContractError:
             pass
         else:
