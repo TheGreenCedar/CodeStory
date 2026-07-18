@@ -4,6 +4,11 @@
 
 ### Changed
 
+- True-idle package qualification now binds materialization reuse to the
+  replacement server's own engine identity, model digest, load generation, and
+  single model load instead of inheriting the original cold server's startup
+  state. The respawn proof also requires unique absence/replacement witnesses
+  and the exact successful product query between them.
 - v0.16 release evidence now uses a checked Axios JavaScript/TypeScript corpus
   with three cold CLI repeats. The benchmark binds the exact task-manifest
   bytes and rejects missing, substituted, or extra packet rows. Ripgrep's

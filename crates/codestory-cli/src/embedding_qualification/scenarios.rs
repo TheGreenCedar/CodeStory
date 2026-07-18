@@ -2499,12 +2499,35 @@ impl<'a> ScenarioRunner<'a> {
         if before.process.server_instance_id == after.process.server_instance_id {
             bail!("embedding_qualification_true_idle_owner_not_replaced");
         }
+        let after_engine = after.engine.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("embedding_qualification_true_idle_respawn_engine_missing")
+        })?;
+        let respawn_identity =
+            PerUserEmbeddingClient::for_runtime(self.primary_runtime())?.ensure_resident()?;
+        if respawn_identity.server_instance_id != after.process.server_instance_id
+            || respawn_identity.load_generation != after_engine.load_generation
+            || respawn_identity.model_load_count != after_engine.model_load_count
+        {
+            bail!("embedding_qualification_true_idle_respawn_identity_changed");
+        }
         self.transition(
             "server_respawned",
-            btree([(
-                "new_server_instance_id",
-                json!(after.process.server_instance_id),
-            )]),
+            btree([
+                (
+                    "new_server_instance_id",
+                    json!(after.process.server_instance_id),
+                ),
+                ("load_generation", json!(respawn_identity.load_generation)),
+                ("model_load_count", json!(respawn_identity.model_load_count)),
+                (
+                    "materialized_model_sha256",
+                    json!(respawn_identity.materialized_model_sha256),
+                ),
+                (
+                    "materialized_reused",
+                    json!(respawn_identity.materialized_reused),
+                ),
+            ]),
         );
         Ok(())
     }
