@@ -154,6 +154,31 @@ const TABLE_STATEMENTS: &[&str] = &[
         migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
         published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
     )",
+    "CREATE TABLE IF NOT EXISTS source_policy_exclusion (
+        normalized_path TEXT PRIMARY KEY CHECK(length(normalized_path) > 0),
+        project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+        workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        observed_size INTEGER NOT NULL CHECK(observed_size > 0),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0)
+    )",
+    "CREATE TABLE IF NOT EXISTS source_policy_exclusion_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+        workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        exclusion_count INTEGER NOT NULL CHECK(exclusion_count >= 0),
+        exclusion_digest TEXT NOT NULL CHECK(length(exclusion_digest) = 64),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS symbol_search_doc (
         node_id INTEGER PRIMARY KEY,
         file_node_id INTEGER,
@@ -522,6 +547,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 26 {
         storage.set_schema_version(26)?;
     }
+    migrate_v27_source_policy_exclusions(&storage.conn)?;
+    if stored_version < 27 {
+        storage.set_schema_version(27)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -856,6 +885,41 @@ pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), St
 
 pub(super) fn migrate_v26_error_coverage_reason(conn: &Connection) -> Result<(), StorageError> {
     try_add_column(conn, "error", "coverage_reason TEXT")
+}
+
+pub(super) fn migrate_v27_source_policy_exclusions(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS source_policy_exclusion (
+            normalized_path TEXT PRIMARY KEY CHECK(length(normalized_path) > 0),
+            project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+            workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+            content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+            observed_size INTEGER NOT NULL CHECK(observed_size > 0),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS source_policy_exclusion_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+            workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            exclusion_count INTEGER NOT NULL CHECK(exclusion_count >= 0),
+            exclusion_digest TEXT NOT NULL CHECK(length(exclusion_digest) = 64),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    Ok(())
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {

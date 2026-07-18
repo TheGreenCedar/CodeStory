@@ -984,6 +984,26 @@ pub struct FileCoverageDiagnosticDto {
     pub projection_available: bool,
 }
 
+/// Verified source intentionally excluded from parser scheduling.
+///
+/// These records are source-inventory evidence only. They never imply parser-backed graph or
+/// semantic coverage.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SourcePolicyExclusionDto {
+    pub path: String,
+    pub role: IndexedFileRoleDto,
+    pub content_hash: String,
+    pub observed_size: u64,
+    pub policy_version: String,
+    pub byte_cap: u64,
+    pub project_id: String,
+    pub workspace_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub graph_coverage: bool,
+    pub semantic_coverage: bool,
+}
+
 /// Per-language file count and support claim shown in indexed-file summaries.
 ///
 /// `support_mode` and `evidence_tier` are product evidence from
@@ -1015,6 +1035,8 @@ pub struct IndexedFilesSummaryDto {
     pub incomplete_file_count: u32,
     pub error_file_count: u32,
     #[serde(default)]
+    pub policy_exclusion_count: u32,
+    #[serde(default)]
     pub incomplete_reason_counts: Vec<IndexedFileIncompleteReasonCountDto>,
     pub truncated: bool,
     pub language_counts: Vec<IndexedFileLanguageCountDto>,
@@ -1031,6 +1053,8 @@ pub struct IndexedFilesDto {
     pub summary: IndexedFilesSummaryDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_exclusions: Vec<SourcePolicyExclusionDto>,
     pub files: Vec<IndexedFileDto>,
 }
 

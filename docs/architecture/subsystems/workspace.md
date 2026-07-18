@@ -24,11 +24,18 @@ and schedule deletion. `workspace_relative_path` is the shared boundary for
 mapping existing candidates into a project without cross-root or
 case-folding mistakes.
 
+The shared oversized-source policy classifies stable, content-hashed bytes
+above the parser cap before indexer scheduling. Classification is based on
+verified content and the versioned policy, not path role. Partial discovery or
+a file that changes while being hashed cannot produce a deletion-capable
+exclusion set.
+
 ## Refresh planning
 
 Refresh plans compare discovered files with stored inventory using metadata and
 verified source hashes where available. They identify new, changed, retained,
-and removable files without depending on a live store handle.
+removable, and verified policy-excluded files without depending on a live store
+handle.
 
 ## Filesystem safety
 

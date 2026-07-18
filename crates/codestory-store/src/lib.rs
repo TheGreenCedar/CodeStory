@@ -24,8 +24,10 @@ pub use storage_impl::{
     GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
     ProjectionFlushBreakdown, RetrievalIndexManifest, RetrievalIndexRollbackRecord,
-    SearchSymbolProjection, SearchSymbolProjectionDetail, Storage as Store, StorageError,
-    StorageOpenMode, StorageStats, SymbolSearchDoc, SymbolSummaryRecord,
+    SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, SearchSymbolProjection,
+    SearchSymbolProjectionDetail, SourcePolicyExclusionManifest, SourcePolicyExclusionRecord,
+    Storage as Store, StorageError, StorageOpenMode, StorageStats, SymbolSearchDoc,
+    SymbolSummaryRecord,
 };
 
 impl Store {

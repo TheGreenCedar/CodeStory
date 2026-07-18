@@ -16,6 +16,7 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
+use codestory_contracts::workspace::process_source_index_policy;
 use codestory_store::Store as Storage;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -69,9 +70,6 @@ struct IndexFeatureFlags {
     legacy_edge_identity: bool,
     lazy_graph_execution: bool,
 }
-
-const DEFAULT_SOURCE_FILE_BYTE_CAP: u64 = 1_000_000;
-const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
 
 struct PostProcessedIndexResults {
     nodes: Vec<Node>,
@@ -810,7 +808,7 @@ impl WorkspaceIndexer {
             compilation_db,
             compilation_db_warning,
             batch_config: IncrementalIndexingConfig::default(),
-            source_file_byte_cap: configured_source_file_byte_cap(),
+            source_file_byte_cap: process_source_index_policy().byte_cap,
         }
     }
 
@@ -2193,14 +2191,6 @@ fn file_modification_time(path: &Path) -> i64 {
 
 fn duration_ms_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
-}
-
-fn configured_source_file_byte_cap() -> u64 {
-    std::env::var(SOURCE_FILE_BYTE_CAP_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|cap| *cap > 0)
-        .unwrap_or(DEFAULT_SOURCE_FILE_BYTE_CAP)
 }
 
 fn accumulate_flush_breakdown(
