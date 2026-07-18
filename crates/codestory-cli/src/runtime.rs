@@ -532,13 +532,38 @@ pub(crate) fn resolve_target(
     target: TargetSelection,
     file_filter: Option<&str>,
 ) -> Result<ResolvedTarget> {
+    resolve_target_with(target, file_filter, |target, file_filter| {
+        runtime.browser.resolve_target(target, file_filter)
+    })
+}
+
+/// Resolve an exact source-navigation target while retaining typed query
+/// filtering for query selectors.
+pub(crate) fn resolve_source_target(
+    runtime: &RuntimeContext,
+    target: TargetSelection,
+    file_filter: Option<&str>,
+) -> Result<ResolvedTarget> {
+    resolve_target_with(target, file_filter, |target, file_filter| {
+        runtime.browser.resolve_source_target(target, file_filter)
+    })
+}
+
+fn resolve_target_with(
+    target: TargetSelection,
+    file_filter: Option<&str>,
+    resolve: impl FnOnce(
+        codestory_runtime::TargetSelection,
+        Option<&str>,
+    ) -> std::result::Result<TargetResolution, ApiError>,
+) -> Result<ResolvedTarget> {
     let target = match target {
         TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
         TargetSelection::Query { query, choose } => {
             codestory_runtime::TargetSelection::Query { query, choose }
         }
     };
-    match runtime.browser.resolve_target(target, file_filter) {
+    match resolve(target, file_filter) {
         Ok(TargetResolution::Resolved(target)) => Ok(ResolvedTarget::from_runtime(*target)),
         Ok(TargetResolution::Ambiguous(ambiguous)) => Err(AmbiguousTargetError {
             query: ambiguous.query,

@@ -38,7 +38,9 @@ use crate::http_transport::{
 use crate::output::{
     REPO_CONTENT_BOUNDARY_LINE, UNTRUSTED_REPO_EVIDENCE_TRUST, context_packet_json,
 };
-use crate::runtime::{AmbiguousTargetError, RuntimeContext, map_api_error, resolve_target};
+use crate::runtime::{
+    AmbiguousTargetError, RuntimeContext, map_api_error, resolve_source_target, resolve_target,
+};
 use crate::stdio_catalog::{
     is_tool_name as is_stdio_tool_name, prompt_get_json as stdio_prompt_get_json,
     prompts_list_json as stdio_prompts_list_json,
@@ -2911,7 +2913,7 @@ fn handle_stdio_snippet(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    resolve_target(runtime, stdio_target_selection(request), None)
+    resolve_source_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
             runtime
                 .browser

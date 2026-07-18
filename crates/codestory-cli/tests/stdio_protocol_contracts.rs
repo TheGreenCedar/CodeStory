@@ -2415,6 +2415,82 @@ fn ground_tool_returns_budgeted_grounding_snapshot() {
 }
 
 #[test]
+fn snippet_tool_exact_id_navigates_structural_evidence_but_query_stays_typed() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ground_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-structural-snippet",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "balanced"}}
+        }),
+    );
+    let grounding = assert_tool_success(&ground_response, json!("ground-structural-snippet"));
+    let node_id = grounding["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            grounding["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("tiny-stdio-contract-fixture @ "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("grounding should expose the Cargo package: {grounding:#}"))
+        .to_string();
+
+    let snippet_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-structural-id",
+            "method": "tools/call",
+            "params": {"name": "snippet", "arguments": {"id": node_id}}
+        }),
+    );
+    let snippet = assert_tool_success(&snippet_response, json!("snippet-structural-id"));
+    assert!(
+        snippet["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("Cargo.toml"))
+            && snippet["snippet"]
+                .as_str()
+                .is_some_and(|source| source.contains("[package]")),
+        "stdio snippet should navigate the exact structural source range: {snippet:#}"
+    );
+
+    let query_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-structural-query",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"query": "tiny-stdio-contract-fixture"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&query_response, json!("snippet-structural-query"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No symbol matched query")),
+        "stdio query snippet should retain typed graph filtering: {error:#}"
+    );
+}
+
+#[test]
 fn files_tool_lists_indexed_files_without_sidecars() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);

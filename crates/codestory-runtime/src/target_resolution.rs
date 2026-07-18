@@ -576,6 +576,27 @@ impl AppController {
         }
     }
 
+    /// Resolve a target for exact source navigation.
+    ///
+    /// Exact ids may name source-range-only diagnostic evidence from structural
+    /// collectors or endpoint schemas. Query selectors still use typed graph
+    /// resolution so snippets cannot silently select diagnostic search hits.
+    pub fn resolve_source_target(
+        &self,
+        target: TargetSelection,
+        file_filter: Option<&str>,
+    ) -> Result<TargetResolution, ApiError> {
+        match target {
+            TargetSelection::Id(id) => {
+                let details = self.node_details(NodeDetailsRequest { id: id.clone() })?;
+                Ok(resolve_source_id_target(id, &details))
+            }
+            TargetSelection::Query { query, choose } => {
+                self.resolve_query_target(query, choose, file_filter)
+            }
+        }
+    }
+
     fn resolve_query_target(
         &self,
         query: String,
@@ -796,6 +817,14 @@ fn resolve_id_target(id: NodeId, details: &NodeDetailsDto) -> TargetResolution {
             id.0
         ));
     }
+    resolved_id_target(id, selected)
+}
+
+fn resolve_source_id_target(id: NodeId, details: &NodeDetailsDto) -> TargetResolution {
+    resolved_id_target(id, search_hit_from_node(details))
+}
+
+fn resolved_id_target(id: NodeId, selected: SearchHit) -> TargetResolution {
     TargetResolution::Resolved(Box::new(ResolvedTarget {
         selector: TargetSelector::Id,
         requested: id.0,
@@ -1027,6 +1056,16 @@ mod tests {
             TargetResolution::Rejected(message)
                 if message.contains("source-range-only diagnostic evidence")
         ));
+        let TargetResolution::Resolved(source_target) =
+            resolve_source_id_target(details.id.clone(), &details)
+        else {
+            panic!("an exact structural id should remain source-navigable");
+        };
+        assert_eq!(source_target.selected.node_id, details.id);
+        assert_eq!(
+            source_target.selected.resolution_status,
+            Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
     }
 
     #[test]
@@ -1065,6 +1104,16 @@ mod tests {
             TargetResolution::Rejected(message)
                 if message.contains("source-range-only diagnostic evidence")
         ));
+        let TargetResolution::Resolved(source_target) =
+            resolve_source_id_target(details.id.clone(), &details)
+        else {
+            panic!("an exact OpenAPI id should remain source-navigable");
+        };
+        assert_eq!(source_target.selected.node_id, details.id);
+        assert_eq!(
+            source_target.selected.evidence_tier,
+            Some(PacketEvidenceTierDto::ExactSource)
+        );
     }
 
     #[test]

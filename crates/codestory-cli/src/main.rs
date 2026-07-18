@@ -104,7 +104,7 @@ use output::{
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
-    resolve_refresh_request, resolve_target,
+    resolve_refresh_request, resolve_source_target, resolve_target,
 };
 use serde::Deserialize;
 #[cfg(test)]
@@ -5104,7 +5104,7 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
     let operation = runtime.run_public_operation(operation, || {
-        let target = resolve_target_or_emit_ambiguity(
+        let target = resolve_source_target_or_emit_ambiguity(
             &runtime,
             cmd.target.selection()?,
             file_filter.as_deref(),
@@ -5997,6 +5997,29 @@ fn resolve_target_or_emit_ambiguity(
     output_file: Option<&std::path::Path>,
 ) -> Result<runtime::ResolvedTarget> {
     match resolve_target(runtime, target, file_filter) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+                return structured_ambiguous_target_failure(
+                    runtime,
+                    ambiguous.clone(),
+                    format,
+                    output_file,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn resolve_source_target_or_emit_ambiguity(
+    runtime: &RuntimeContext,
+    target: args::TargetSelection,
+    file_filter: Option<&str>,
+    format: args::OutputFormat,
+    output_file: Option<&std::path::Path>,
+) -> Result<runtime::ResolvedTarget> {
+    match resolve_source_target(runtime, target, file_filter) {
         Ok(target) => Ok(target),
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
