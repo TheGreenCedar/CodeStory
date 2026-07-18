@@ -3542,6 +3542,38 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
   };
 }
 
+function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
+  const trace = packet?.answer?.retrieval_trace ?? null;
+  const diagnostics = Array.isArray(trace?.packet_sidecar_diagnostics)
+    ? trace.packet_sidecar_diagnostics
+    : [];
+  const stageTimings = Array.isArray(trace?.retrieval_shadow?.stage_timings)
+    ? trace.retrieval_shadow.stage_timings
+    : [];
+  const fullDiagnosticCount = diagnostics.filter(
+    (diagnostic) => diagnostic?.retrieval_mode === "full",
+  ).length;
+  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
+  return {
+    source: "packet.answer.retrieval_trace",
+    transport_mode: transportMode,
+    retrieval_contract: retrievalContract?.retrieval_contract ?? null,
+    embedding_engine: retrievalContract?.embedding_engine ?? null,
+    embedding_policy: retrievalContract?.execution_policy ?? null,
+    retrieval_mode:
+      diagnostics.length > 0 && fullDiagnosticCount === diagnostics.length ? "full" : null,
+    diagnostic_count: diagnostics.length,
+    full_diagnostic_count: fullDiagnosticCount,
+    semantic_stage_count: stageTimings.filter(
+      (timing) => timing?.stage === "stage1b_semantic",
+    ).length,
+    semantic_fallback_count: trace?.semantic_fallback_count ?? null,
+    semantic_generation: trace?.retrieval_publication?.semantic_generation ?? null,
+    prepared_semantic_generation:
+      cachePreparation?.retrieval_status?.semantic_generation ?? null,
+  };
+}
+
 async function codestoryCacheProvenance(opts, config, observations = {}) {
   let codestoryCli;
   try {
@@ -3588,12 +3620,16 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
     codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
     cache_preparation: compactCachePreparation(observations.cache_preparation),
+    packet_embedding_execution: observations.packet_embedding_execution ?? null,
     transport_mode: observations.transport_mode ?? null,
     retrieval_status: retrievalStatus,
     retrieval_mode: retrievalStatus.retrieval_mode ?? null,
     semantic_generation: retrievalStatus.semantic_generation ?? null,
     embedding_engine_instance_id: retrievalStatus.embedding_engine_instance_id ?? null,
-    embedding_policy: retrievalStatus.embedding_policy ?? null,
+    embedding_policy:
+      retrievalStatus.embedding_policy
+      ?? observations.packet_embedding_execution?.embedding_policy
+      ?? null,
     manifest_embedding_backend: retrievalStatus.manifest_embedding_backend ?? null,
     doctor_status: doctor.status,
     doctor_exit_code: doctor.exit_code,
@@ -4396,11 +4432,6 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(
-    opts,
-    repoConfig,
-    packetRuntimeCacheObservations(opts, task.repo, "cold_cli_packet"),
-  );
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -4417,6 +4448,21 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
       parseError = error.message;
     }
   }
+  const cacheObservations = packetRuntimeCacheObservations(
+    opts,
+    task.repo,
+    "cold_cli_packet",
+  );
+  cacheObservations.packet_embedding_execution = packetEmbeddingExecutionProof(
+    packet,
+    cacheObservations.cache_preparation,
+    cacheObservations.transport_mode,
+  );
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    cacheObservations,
+  );
   const quality = packet
     ? scoreQualityFromText(packetPayloadText(packet), JSON.stringify(packet), task)
     : null;
@@ -6988,6 +7034,7 @@ export {
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
+  packetEmbeddingExecutionProof,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   cacheProvenanceBlockers,

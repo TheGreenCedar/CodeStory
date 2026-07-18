@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "corpus_id": "codestory-release-corpus-v0.16-axios-js-ts-v1",
+  "task_ids": [
+    "axios-request-dispatch"
+  ],
+  "task_manifests": {
+    "axios-request-dispatch": {
+      "path": "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json",
+      "sha256": "3dfb002f0dd0b0683c8bca2314a405dc0d728aeeb8533247a6b17e316aed81c0"
+    }
+  },
+  "project_manifests": {}
+}

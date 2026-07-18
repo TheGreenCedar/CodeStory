@@ -7,15 +7,23 @@ stable between candidates. Ordinary pull requests must not target this runner.
 ## v0.16 corpus boundary
 
 The v0.16 profile uses
-`codestory-release-corpus-v0.16-axios-ripgrep-rust-v1`: Axios
-JavaScript/TypeScript and Ripgrep Rust, each with three cold CLI packet repeats.
-The checked corpus contract binds the exact task-manifest bytes. Ripgrep also
-binds and installs a Rust-only `codestory_project.json` into the harness-owned,
-clean pinned checkout; the installed bytes and ignore proof are recorded in
-every packet row. Redis/C, shell dialects, and general parser completeness are
-outside this release-evidence claim and remain v0.16.1 fidelity work.
+`codestory-release-corpus-v0.16-axios-js-ts-v1`: one Axios
+JavaScript/TypeScript task with three cold CLI packet repeats. The checked
+corpus contract binds the exact task-manifest bytes and rejects missing,
+substituted, or extra task rows. Ripgrep's pinned Rust task and project template
+remain available for follow-up diagnostics, but a retained three-repeat run
+did not meet its preregistered file and citation recall thresholds, so v0.16
+makes no Ripgrep or general Rust packet-quality claim. Redis/C, shell dialects,
+and general parser completeness are also outside this release-evidence claim.
 The approved baseline profile records the corpus-contract path and SHA-256, so
 candidate evidence cannot silently widen, narrow, or replace that scope.
+
+Cold CLI packet provenance is taken from the packet process that actually ran.
+It binds the packet's executed semantic stage, full sidecar diagnostics, and
+zero semantic fallback to the exact semantic generation prepared by the
+harness. A later status process cannot supply the earlier process-local
+embedding-engine instance identity; warm-process evidence still requires that
+live identity directly.
 
 ## Machine contract
 

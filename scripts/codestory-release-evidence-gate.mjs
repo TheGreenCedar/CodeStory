@@ -43,8 +43,8 @@ const SELECTED_REF_PRODUCERS = new Set([
 ]);
 const RELEASE_CORPUS_CONTRACTS = new Map([
   [
-    "codestory-release-corpus-v0.16-axios-ripgrep-rust-v1",
-    "benchmarks/release-evidence/corpus-contracts/v0.16-axios-ripgrep-rust-v1.json",
+    "codestory-release-corpus-v0.16-axios-js-ts-v1",
+    "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json",
   ],
 ]);
 

@@ -28,6 +28,7 @@ import {
   packetComposition,
   packetCommandArgs,
   packetRuntimeCacheObservations,
+  packetEmbeddingExecutionProof,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
@@ -49,6 +50,7 @@ import {
   qualityFailureReasons,
   taskSnapshotForResult,
   cachePolicyForRun,
+  cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
@@ -118,6 +120,53 @@ test("packet-runtime cache observations preserve prepared cache provenance", () 
     assert.equal(observations.cache_preparation, cachePreparation[0]);
     assert.equal(cachePolicyForRun(observations), "prepared-retrieval-cache-read-only");
   }
+});
+
+test("cold packet embedding execution binds full retrieval to the prepared semantic generation", () => {
+  const preparation = {
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "cpu_explicit",
+    },
+    retrieval_status: { semantic_generation: "semantic-1" },
+  };
+  const packet = {
+    answer: {
+      retrieval_trace: {
+        retrieval_publication: { semantic_generation: "semantic-1" },
+        semantic_fallback_count: 0,
+        packet_sidecar_diagnostics: [
+          { retrieval_mode: "full" },
+          { retrieval_mode: "full" },
+        ],
+        retrieval_shadow: {
+          stage_timings: [
+            { stage: "stage1_lexical" },
+            { stage: "stage1b_semantic" },
+          ],
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(
+    packetEmbeddingExecutionProof(packet, preparation, "cold_cli_packet"),
+    {
+      source: "packet.answer.retrieval_trace",
+      transport_mode: "cold_cli_packet",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "cpu_explicit",
+      retrieval_mode: "full",
+      diagnostic_count: 2,
+      full_diagnostic_count: 2,
+      semantic_stage_count: 1,
+      semantic_fallback_count: 0,
+      semantic_generation: "semantic-1",
+      prepared_semantic_generation: "semantic-1",
+    },
+  );
 });
 
 test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
@@ -1821,6 +1870,67 @@ function localCacheProvenance(overrides = {}) {
     ...overrides,
   };
 }
+
+function localColdPacketCacheProvenance(overrides = {}) {
+  return localCacheProvenance({
+    embedding_engine_instance_id: null,
+    embedding_policy: "cpu_explicit",
+    semantic_ready: false,
+    packet_embedding_execution: {
+      source: "packet.answer.retrieval_trace",
+      transport_mode: "cold_cli_packet",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "cpu_explicit",
+      retrieval_mode: "full",
+      diagnostic_count: 2,
+      full_diagnostic_count: 2,
+      semantic_stage_count: 1,
+      semantic_fallback_count: 0,
+      semantic_generation: "proj-current",
+      prepared_semantic_generation: "proj-current",
+    },
+    ...overrides,
+  });
+}
+
+test("cold packet execution proof replaces only unavailable process-local identity", () => {
+  assert.deepEqual(
+    cacheProvenanceBlockers({
+      codestory_cache_provenance: localColdPacketCacheProvenance(),
+    }),
+    [],
+  );
+
+  for (const [field, value, message] of [
+    ["source", "status", /source=status/],
+    ["transport_mode", "warm_stdio_packet", /transport=warm_stdio_packet/],
+    ["embedding_engine", "other", /embedding engine=other/],
+    ["embedding_policy", "accelerated", /embedding policy does not match cache provenance/],
+    ["retrieval_mode", null, /retrieval mode=unknown/],
+    ["diagnostic_count", 0, /no sidecar diagnostics/],
+    ["full_diagnostic_count", 1, /non-full sidecar diagnostic/],
+    ["semantic_stage_count", 0, /no semantic stage/],
+    ["semantic_fallback_count", 1, /semantic fallback count=1/],
+    ["semantic_generation", "semantic-2", /does not match the prepared generation/],
+  ]) {
+    const provenance = localColdPacketCacheProvenance();
+    provenance.packet_embedding_execution[field] = value;
+    const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: provenance });
+    assert.match(blockers.join("\n"), message);
+  }
+});
+
+test("warm process provenance still requires live engine identity and semantic readiness", () => {
+  const blockers = cacheProvenanceBlockers({
+    codestory_cache_provenance: localCacheProvenance({
+      embedding_engine_instance_id: null,
+      semantic_ready: false,
+    }),
+  });
+  assert.match(blockers.join("\n"), /missing CodeStory embedding engine identity/);
+  assert.match(blockers.join("\n"), /CodeStory semantic docs are not ready/);
+});
 
 function publishableWithCodeStoryResult(overrides = {}) {
   return {

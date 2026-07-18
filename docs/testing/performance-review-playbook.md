@@ -188,6 +188,23 @@ contract and attestation so the drill corpus includes valid Rust source while
 excluding `tests/ui/**`; production parser and publication completeness remain
 unchanged.
 
+Protected run `29623187686` stopped before measurement after detecting a stale
+retrieval namespace in the harness. Run `29624645979` at
+`dd14e2d0e29b9e09438a0aa4f9a6ea6250e69738` then completed the source and Serde
+gates plus all six cold packet rows. Axios passed all three repeats. Ripgrep
+failed all three at 0.60 file recall and 0.60 citation coverage against the
+fixed 0.70 thresholds, and a later status process could not report the packet
+process's local engine identity. Those failures are retained; they do not
+define a baseline.
+
+Before another protected measurement, v0.16 is narrowed to the new hash-bound
+`codestory-release-corpus-v0.16-axios-js-ts-v1` contract: exactly the Axios task
+and three repeats. Ripgrep remains outside the v0.16 packet-quality claim. The
+harness now proves cold embedding execution from the measured packet's semantic
+stage, full sidecar diagnostics, zero fallback, and semantic-generation match,
+rather than asking a later process to recreate process-local identity. The
+budgets below are unchanged by that scope decision.
+
 Before observing the v2 measurements, its operational budgets are fixed as
 follows:
 

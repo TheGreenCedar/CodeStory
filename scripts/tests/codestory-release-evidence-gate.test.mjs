@@ -34,7 +34,7 @@ function reattest(candidate, artifact, filePath) {
 }
 
 test("v0.16 release corpus contract rejects an omitted or substituted packet task", () => {
-  const relativePath = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-ripgrep-rust-v1.json";
+  const relativePath = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json";
   const bytes = readFileSync(path.join(root, relativePath));
   const contract = JSON.parse(bytes);
   const identity = {
@@ -56,7 +56,11 @@ test("v0.16 release corpus contract rejects an omitted or substituted packet tas
   const rows = contract.task_ids.map((task_id) => ({ task_id }));
   assert.doesNotThrow(() => validatePacketCorpusContract(provenance, rows, root, identity, profile));
   assert.throws(
-    () => validatePacketCorpusContract(provenance, rows.slice(0, 1), root, identity, profile),
+    () => validatePacketCorpusContract(provenance, [], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, [{ task_id: "ripgrep-search-pipeline" }], root, identity, profile),
     /do not exactly match the checked-in release task scope/,
   );
   assert.throws(

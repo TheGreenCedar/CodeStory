@@ -151,7 +151,9 @@ export function cacheProvenanceBlockers(result) {
       `CodeStory embedding runtime=${provenance.manifest_embedding_backend ?? "unknown"}; expected the pinned in-process CodeRankEmbed runtime`,
     );
   }
-  if (!provenance.embedding_engine_instance_id) {
+  const packetExecutionReasons = packetEmbeddingExecutionProofBlockers(provenance);
+  const packetExecutionProven = packetExecutionReasons.length === 0;
+  if (!provenance.embedding_engine_instance_id && !packetExecutionProven) {
     reasons.push("missing CodeStory embedding engine identity");
   }
   if (!["accelerated", "cpu_explicit"].includes(provenance.embedding_policy)) {
@@ -169,11 +171,79 @@ export function cacheProvenanceBlockers(result) {
   if (provenance.freshness_status !== "fresh") {
     reasons.push(`CodeStory cache freshness=${provenance.freshness_status ?? "unknown"}`);
   }
-  if (provenance.semantic_ready !== true) {
+  if (provenance.semantic_ready !== true && !packetExecutionProven) {
     reasons.push("CodeStory semantic docs are not ready");
+  }
+  if (provenance.packet_embedding_execution && !packetExecutionProven) {
+    reasons.push(...packetExecutionReasons);
   }
   if (provenance.indexing_in_timed_run == null) {
     reasons.push("missing timed-run indexing provenance");
+  }
+  return reasons;
+}
+
+export function packetEmbeddingExecutionProofBlockers(provenance) {
+  const proof = provenance?.packet_embedding_execution;
+  if (!proof) {
+    return ["missing cold packet embedding execution proof"];
+  }
+  const reasons = [];
+  if (proof.source !== "packet.answer.retrieval_trace") {
+    reasons.push(`cold packet embedding execution source=${proof.source ?? "unknown"}; expected packet.answer.retrieval_trace`);
+  }
+  if (proof.transport_mode !== "cold_cli_packet") {
+    reasons.push(`cold packet embedding execution transport=${proof.transport_mode ?? "unknown"}; expected cold_cli_packet`);
+  }
+  if (proof.retrieval_contract !== "in_process_v1") {
+    reasons.push(`cold packet retrieval contract=${proof.retrieval_contract ?? "unknown"}; expected in_process_v1`);
+  }
+  if (proof.embedding_engine !== "process_shared") {
+    reasons.push(`cold packet embedding engine=${proof.embedding_engine ?? "unknown"}; expected process_shared`);
+  }
+  if (!["accelerated", "cpu_explicit"].includes(proof.embedding_policy)) {
+    reasons.push(`cold packet embedding policy=${proof.embedding_policy ?? "unknown"}; expected accelerated or cpu_explicit`);
+  }
+  if (proof.retrieval_mode !== "full") {
+    reasons.push(`cold packet retrieval mode=${proof.retrieval_mode ?? "unknown"}; expected full`);
+  }
+  if (!Number.isInteger(proof.diagnostic_count) || proof.diagnostic_count <= 0) {
+    reasons.push("cold packet embedding execution has no sidecar diagnostics");
+  }
+  if (proof.full_diagnostic_count !== proof.diagnostic_count) {
+    reasons.push("cold packet embedding execution contains a non-full sidecar diagnostic");
+  }
+  if (!Number.isInteger(proof.semantic_stage_count) || proof.semantic_stage_count <= 0) {
+    reasons.push("cold packet embedding execution has no semantic stage");
+  }
+  if (proof.semantic_fallback_count !== 0) {
+    reasons.push(`cold packet semantic fallback count=${proof.semantic_fallback_count ?? "unknown"}; expected 0`);
+  }
+  if (!proof.semantic_generation || !proof.prepared_semantic_generation) {
+    reasons.push("cold packet embedding execution is missing semantic generation identity");
+  } else if (proof.semantic_generation !== proof.prepared_semantic_generation) {
+    reasons.push("cold packet semantic generation does not match the prepared generation");
+  }
+  if (
+    provenance?.semantic_generation
+    && proof.prepared_semantic_generation
+    && provenance.semantic_generation !== proof.prepared_semantic_generation
+  ) {
+    reasons.push("cold packet prepared semantic generation does not match cache provenance");
+  }
+  if (
+    provenance?.transport_mode
+    && proof.transport_mode
+    && provenance.transport_mode !== proof.transport_mode
+  ) {
+    reasons.push("cold packet transport does not match cache provenance");
+  }
+  if (
+    provenance?.embedding_policy
+    && proof.embedding_policy
+    && provenance.embedding_policy !== proof.embedding_policy
+  ) {
+    reasons.push("cold packet embedding policy does not match cache provenance");
   }
   return reasons;
 }
