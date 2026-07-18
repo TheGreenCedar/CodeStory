@@ -220,6 +220,17 @@ is one identity-bound observation except for the required three publishable
 packet repeats. Do not tune a multiplier after reading the run, substitute v1
 values, or rerun a valid measurement to seek a more favorable sample.
 
+Protected run `29626819203` at
+`56cfed37439c34c8e01710074a2f5cb72284d521` is the accepted v2 measurement.
+It passed the full-retrieval and Serde producers, resolved all three Serde
+anchors with zero failed commands, and passed all three scoped Axios packet
+rows with no publishable blocker. The workflow's candidate step failed only
+because the v2 profile did not exist yet; its always-uploaded artifact
+`8424291310` has archive digest
+`d3bb8113ac29059978780e4099c8cff292fc00ff73225f6635aa06271f6640a6`.
+The approved registry derives the fixed budgets from those retained raw bytes.
+That measurement is not repeated after registration.
+
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
 reported hashes and values in the short-lived repository Actions secret

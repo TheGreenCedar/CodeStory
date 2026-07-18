@@ -64,6 +64,42 @@
         "indexing_seconds": { "reference": 14.496289933, "threshold": 18.13, "unit": "seconds", "aggregation": "cold full-refresh wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
         "storage_growth_ratio": { "reference": 1, "threshold": 1.1, "reference_bytes": 617172808, "unit": "ratio", "aggregation": "candidate bytes divided by approved same-corpus bytes", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" }
       }
+    },
+    "codestory-release-evidence-linux-arm64-v2": {
+      "baseline_id": "codestory-release-evidence-linux-arm64-v2@56cfed37439c34c8e01710074a2f5cb72284d521",
+      "status": "approved",
+      "release_eligible": true,
+      "commit": "56cfed37439c34c8e01710074a2f5cb72284d521",
+      "git_state": "clean",
+      "identity": {
+        "corpus_id": "codestory-release-corpus-v0.16-axios-js-ts-v1",
+        "cache_id": "cold-inprocess-v1",
+        "machine_fingerprint": "codestory-release-evidence-linux-arm64-v2/f9c76f5dd049f937f7fe4307747a466e65db4f05ccb65ad792a404f6f13140dd"
+      },
+      "corpus_contract": {
+        "path": "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json",
+        "sha256": "cca8326d9a10cf980778bc70e18864de012172c4a7c180d0e2c51a6704f605c2"
+      },
+      "approval": {
+        "owner": "Albert Najjar",
+        "approved_at": "2026-07-17",
+        "rationale": "Protected run 29626819203 on the provisioned Linux ARM64 v2 profile passed full-retrieval stats, resolved all 3 Serde anchors with zero failed commands, and passed all 3 scoped Axios packet rows with no publishable blockers. Thresholds use the preregistered multipliers and upward 0.01-second rounding rule."
+      },
+      "artifacts": [
+        {
+          "path": "baselines/linux-arm64-v2-56cfed37.json",
+          "sha256": "835fa7a9d3d7ac5533047cd41ed31c040b5fb8b8d27102d0e4dcb4463112d308"
+        }
+      ],
+      "metrics": {
+        "status_seconds": { "reference": 0.014995754, "threshold": 0.02, "unit": "seconds", "aggregation": "full-retrieval command wall time", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" },
+        "local_grounding_seconds": { "reference": 0.046535663, "threshold": 0.06, "unit": "seconds", "aggregation": "full-retrieval command wall time", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" },
+        "convergence_seconds": { "reference": 15.438115102, "threshold": 17.76, "unit": "seconds", "aggregation": "unchanged-corpus repeat full-refresh wall time", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" },
+        "packet_seconds": { "reference": 1.974697, "threshold": 2.18, "unit": "seconds", "aggregation": "worst quality-gated packet median wall time", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" },
+        "search_seconds": { "reference": 6.573140943, "threshold": 8.22, "unit": "seconds", "aggregation": "full-retrieval command wall time", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" },
+        "indexing_seconds": { "reference": 20.151733549, "threshold": 25.19, "unit": "seconds", "aggregation": "cold full-refresh wall time", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" },
+        "storage_growth_ratio": { "reference": 1, "threshold": 1.1, "reference_bytes": 609245502, "unit": "ratio", "aggregation": "candidate bytes divided by approved same-corpus bytes", "direction": "max", "source": "linux-arm64-v2-56cfed37.json" }
+      }
     }
   }
 }
