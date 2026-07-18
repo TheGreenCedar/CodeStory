@@ -162,6 +162,15 @@ test("cell inventory is derived only from the release claim graph", () => {
     prePublish.filter(({ group_id }) => group_id === "package_identity").map(({ identity_constraints }) => identity_constraints.target),
     graph.workflow_policy.package_matrix.map(({ asset_target: assetTarget }) => assetTarget).sort(),
   );
+  assert.deepEqual(
+    postPublish.find(({ id }) => id === "platform_support:linux-arm64").identity_constraints,
+    {
+      producer_workflow: ".github/workflows/post-publish-release-smoke.yml",
+      target: "linux-arm64",
+      host_os: "Linux",
+      host_arch: "ARM64",
+    },
+  );
 
   const changed = structuredClone(graph);
   changed.workflow_policy.package_matrix[0].asset_target = "linux-future";
@@ -208,6 +217,72 @@ test("post-publish closeout compares every downloaded archive with the retained 
   const rejected = evaluate("post_publish", changed, prePublish.ledger);
   assert.equal(rejected.decision, "reject");
   assert.ok(rejected.summary.failed_cells.includes("post_publish_bytes:linux-x64"));
+});
+
+test("hostile post-publish A/B split cannot replace the retained package used by platform proof", () => {
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+  const manifests = manifestsFor("post_publish", prePublish.ledger);
+  const replacementSha256 = "d".repeat(64);
+  for (const cellId of [
+    "package_identity:linux-x64",
+    "platform_support:linux-x64",
+    "installed_runtime_behavior:linux-x64",
+  ]) {
+    const manifest = manifests.find(({ cell_id: id }) => id === cellId);
+    manifest.evidence.identity.artifact_sha256 = replacementSha256;
+    if (manifest.archive) manifest.archive.sha256 = replacementSha256;
+  }
+
+  const rejected = evaluate("post_publish", manifests, prePublish.ledger);
+  assert.equal(rejected.decision, "reject");
+  for (const cellId of [
+    "package_identity:linux-x64",
+    "platform_support:linux-x64",
+    "installed_runtime_behavior:linux-x64",
+  ]) {
+    assert.ok(rejected.summary.failed_cells.includes(cellId));
+  }
+  assert.ok(rejected.evaluations.get("package_identity:linux-x64").value.failures.some((message) =>
+    message.includes("retained pre-publish manifest")));
+  assert.ok(rejected.evaluations.get("platform_support:linux-x64").value.failures.some((message) =>
+    message.includes("dependency cell package_identity:linux-x64")));
+});
+
+test("hostile producer and runtime semver claims must equal the independently supplied closeout version", () => {
+  const preManifests = manifestsFor("pre_publish");
+  preManifests.find(({ cell_id: id }) => id === "package_identity:linux-x64")
+    .evidence.identity.producer_version = "0.15.0";
+  const rejectedPrePublish = evaluate("pre_publish", preManifests);
+  assert.equal(rejectedPrePublish.decision, "reject");
+  assert.ok(rejectedPrePublish.summary.failed_cells.includes("package_identity:linux-x64"));
+
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+  const postManifests = manifestsFor("post_publish", prePublish.ledger);
+  postManifests.find(({ cell_id: id }) => id === "installed_runtime_behavior:windows-x64")
+    .evidence.identity.runtime_version = "0.15.0";
+  const rejectedPostPublish = evaluate("post_publish", postManifests, prePublish.ledger);
+  assert.equal(rejectedPostPublish.decision, "reject");
+  assert.ok(rejectedPostPublish.summary.failed_cells.includes("installed_runtime_behavior:windows-x64"));
+  assert.ok(rejectedPostPublish.evaluations.get("installed_runtime_behavior:windows-x64").value.failures.some(
+    (message) => message.includes("producer_version and runtime_version must match"),
+  ));
+});
+
+test("hostile platform and installed manifests cannot contradict the package target host", () => {
+  const prePublish = evaluate("pre_publish", manifestsFor("pre_publish"));
+  const platformMismatch = manifestsFor("post_publish", prePublish.ledger);
+  platformMismatch.find(({ cell_id: id }) => id === "platform_support:linux-x64")
+    .evidence.identity.host_os = "Windows";
+  const rejectedPlatform = evaluate("post_publish", platformMismatch, prePublish.ledger);
+  assert.equal(rejectedPlatform.decision, "reject");
+  assert.ok(rejectedPlatform.summary.failed_cells.includes("platform_support:linux-x64"));
+
+  const installedMismatch = manifestsFor("post_publish", prePublish.ledger);
+  installedMismatch.find(({ cell_id: id }) => id === "installed_runtime_behavior:macos-arm64")
+    .evidence.identity.host_arch = "X64";
+  const rejectedInstalled = evaluate("post_publish", installedMismatch, prePublish.ledger);
+  assert.equal(rejectedInstalled.decision, "reject");
+  assert.ok(rejectedInstalled.summary.failed_cells.includes("installed_runtime_behavior:macos-arm64"));
 });
 
 test("missing, duplicate, stale, failed, aggregate, and reused evidence fail closed", async (t) => {

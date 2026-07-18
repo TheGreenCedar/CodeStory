@@ -214,8 +214,9 @@ manifest.
 First evaluate and retain the `pre_publish` ledger. Package rows preserve the
 archive name, byte count and SHA-256 used by publication. After the GitHub
 release exists, run the `post_publish` phase with that accepted ledger; every
-published download must name its pre-publish package cell and match its
-retained manifest and archive digests exactly. Keep the per-cell manifests and
-evaluations with both ledgers. A missing, duplicate, expired, failed,
+current package row and published download must match its retained manifest and
+archive digests exactly. Producer and runtime versions bind to the closeout
+version, and platform hosts bind to the package matrix target. Keep the per-cell
+manifests and evaluations with both ledgers. A missing, duplicate, expired, failed,
 cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
 an operator override.

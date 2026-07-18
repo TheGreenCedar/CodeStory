@@ -61,6 +61,26 @@ function phaseIndex(closeout, phase) {
   return index;
 }
 
+function packageHostIdentity(row) {
+  const rustTarget = text(row.rust_target, "workflow_policy.package_matrix rust_target");
+  const hostArch = rustTarget.startsWith("x86_64-")
+    ? "X64"
+    : rustTarget.startsWith("aarch64-")
+      ? "ARM64"
+      : null;
+  const hostOs = rustTarget.includes("-unknown-linux-")
+    ? "Linux"
+    : rustTarget.includes("-pc-windows-")
+      ? "Windows"
+      : rustTarget.endsWith("-apple-darwin")
+        ? "macOS"
+        : null;
+  if (hostOs === null || hostArch === null) {
+    fail(`package target ${row.asset_target} uses unsupported Rust target ${rustTarget}`);
+  }
+  return { host_os: hostOs, host_arch: hostArch };
+}
+
 export function deriveReleaseCells(graph, phase) {
   const closeout = object(graph.closeout, "release claim graph.closeout");
   const selectedPhase = text(phase, "phase");
@@ -89,7 +109,12 @@ export function deriveReleaseCells(graph, phase) {
       add(null);
     } else if (group.expansion === "package_matrix") {
       for (const row of graph.workflow_policy.package_matrix) {
-        add(row.asset_target, { target: row.asset_target });
+        const constraints = { target: row.asset_target };
+        const hostIdentity = packageHostIdentity(row);
+        for (const key of ["host_os", "host_arch"]) {
+          if (group.required_identity.includes(key)) constraints[key] = hostIdentity[key];
+        }
+        add(row.asset_target, constraints);
       }
     } else if (group.expansion === "instances") {
       for (const instance of group.instances) add(instance.id, instance.identity_constraints);
@@ -138,6 +163,17 @@ function manifestProblems({ manifest, cell, graph, graphSha256, version }) {
     if (identity[key] !== expected) {
       problems.push(`manifest identity ${key} must equal ${expected}`);
     }
+  }
+  if (cell.required_identity.includes("producer_version") && identity.producer_version !== version) {
+    problems.push(`manifest identity producer_version must equal closeout version ${version}`);
+  }
+  if (cell.required_identity.includes("runtime_version") && identity.runtime_version !== version) {
+    problems.push(`manifest identity runtime_version must equal closeout version ${version}`);
+  }
+  if (cell.required_identity.includes("producer_version")
+      && cell.required_identity.includes("runtime_version")
+      && identity.producer_version !== identity.runtime_version) {
+    problems.push("manifest producer_version and runtime_version must match");
   }
   for (const key of cell.singleton_identity) {
     if (AGGREGATE_IDENTITY.test(String(identity[key] ?? ""))) {
@@ -257,7 +293,20 @@ function evaluateCell({ cell, cells, manifests, graph, gitIdentity, evaluatedAt 
   };
 }
 
-function comparePublishedArchive({ manifest, cell, prePublishLedger, graphSha256, gitIdentity, version }) {
+function dependencyValidationProblems({ cell, cells, manifests, graph, problemsByCell }) {
+  const focal = manifests.get(cell.id);
+  const problems = [];
+  for (const claim of transitiveClaims(graph, cell.claim)) {
+    if (claim.id === cell.claim) continue;
+    const dependency = dependencyCell(cells, claim.id, focal.evidence.identity.target);
+    if ((problemsByCell.get(dependency.id) ?? []).length > 0) {
+      problems.push(`dependency cell ${dependency.id} failed closeout validation`);
+    }
+  }
+  return problems;
+}
+
+function prePublishLedgerProblems({ prePublishLedger, graphSha256, gitIdentity, version }) {
   const problems = [];
   if (prePublishLedger === null) {
     return ["post-publish closeout requires the accepted pre-publish ledger"];
@@ -274,16 +323,65 @@ function comparePublishedArchive({ manifest, cell, prePublishLedger, graphSha256
       problems.push(`pre-publish ledger ${key} identity changed`);
     }
   }
-  const target = cell.identity_constraints.target;
+  return problems;
+}
+
+function retainedPackageRow({ prePublishLedger, target, problems }) {
+  if (prePublishLedger === null) return null;
   const packageCellId = `package_identity:${target}`;
   const packageRows = Array.isArray(prePublishLedger.cells)
     ? prePublishLedger.cells.filter(({ id }) => id === packageCellId)
     : [];
   if (packageRows.length !== 1) {
     problems.push(`pre-publish ledger must contain one ${packageCellId}`);
-    return problems;
+    return null;
   }
-  const packageRow = packageRows[0];
+  return packageRows[0];
+}
+
+function compareRetainedPackageManifest({
+  manifest,
+  cell,
+  prePublishLedger,
+  graphSha256,
+  gitIdentity,
+  version,
+}) {
+  const problems = prePublishLedgerProblems({
+    prePublishLedger,
+    graphSha256,
+    gitIdentity,
+    version,
+  });
+  const packageRow = retainedPackageRow({
+    prePublishLedger,
+    target: cell.identity_constraints.target,
+    problems,
+  });
+  if (packageRow === null) return problems;
+  const manifestSha256 = digest(canonicalJson(manifest));
+  if (manifestSha256 !== packageRow.manifest?.sha256) {
+    problems.push("post-publish package manifest does not match the retained pre-publish manifest");
+  }
+  for (const key of ["name", "sha256", "bytes"]) {
+    if (manifest.archive?.[key] !== packageRow.archive?.[key]) {
+      problems.push(`post-publish package archive ${key} does not match the retained pre-publish archive`);
+    }
+  }
+  return problems;
+}
+
+function comparePublishedArchive({ manifest, cell, prePublishLedger, graphSha256, gitIdentity, version }) {
+  const problems = prePublishLedgerProblems({
+    prePublishLedger,
+    graphSha256,
+    gitIdentity,
+    version,
+  });
+  const target = cell.identity_constraints.target;
+  const packageCellId = `package_identity:${target}`;
+  const packageRow = retainedPackageRow({ prePublishLedger, target, problems });
+  if (packageRow === null) return problems;
   const comparison = manifest.comparison ?? {};
   if (comparison.pre_publish_cell_id !== packageCellId) {
     problems.push(`comparison pre_publish_cell_id must be ${packageCellId}`);
@@ -377,6 +475,16 @@ export function evaluateReleaseCloseout({
         version,
       }));
     }
+    if (phase === "post_publish" && cell.archive_role === "pre_publish") {
+      problems.push(...compareRetainedPackageManifest({
+        manifest,
+        cell,
+        prePublishLedger,
+        graphSha256,
+        gitIdentity,
+        version,
+      }));
+    }
     manifests.set(cell.id, manifest);
     problemsByCell.set(cell.id, [...(problemsByCell.get(cell.id) ?? []), ...problems]);
   }
@@ -404,7 +512,14 @@ export function evaluateReleaseCloseout({
     };
     retainedManifests.set(cell.id, { value: manifest, bytes: manifestBytes, record: manifestRecord });
     let evaluation;
-    const problems = problemsByCell.get(cell.id) ?? [];
+    const problems = [...(problemsByCell.get(cell.id) ?? [])];
+    if (problems.length === 0) {
+      try {
+        problems.push(...dependencyValidationProblems({ cell, cells, manifests, graph, problemsByCell }));
+      } catch (error) {
+        problems.push(error.message);
+      }
+    }
     if (problems.length > 0) {
       evaluation = {
         schema: MANIFEST_EVALUATION_SCHEMA,

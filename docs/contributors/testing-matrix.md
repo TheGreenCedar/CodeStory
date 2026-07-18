@@ -319,8 +319,12 @@ protected hardware cells explicit, invokes the claim evaluator for each cell
 and its graph dependencies, then retains canonical copies under `manifests/`
 and `evaluations/` beside `ledger.json` and `summary.json`. A pre-publish run
 records each archive name, byte count, and SHA-256. A post-publish run requires
-that accepted pre-publish ledger and rejects any downloaded archive whose bytes
-do not match the retained digest. Do not use `matrix`, `mixed`, or another
+that accepted pre-publish ledger, requires its current package manifests to
+match the retained rows, and rejects any downloaded archive whose bytes do not
+match the retained digest. Producer and installed-runtime versions must equal
+the independently supplied closeout version. Platform and installed-runtime
+hosts must match the OS and architecture derived from the package matrix's Rust
+target. Do not use `matrix`, `mixed`, or another
 aggregate placeholder for a host, runner, backend, installer, or native-engine
 identity.
 

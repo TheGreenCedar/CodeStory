@@ -19,7 +19,8 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   post-publish byte-comparison cells from the release claim graph. The generic
   coordinator retains one manifest and evaluator result per cell plus a
   deterministic ledger and summary, and rejects stale, duplicate,
-  identity-incomplete, aggregate-host or cross-release evidence.
+  identity-incomplete, aggregate-host, cross-version, target-host-mismatched,
+  retained-package-mismatched or cross-release evidence.
 - Exact-head source and platform proof now require one coherent workflow ref,
   reviewed SHA, Actions SHA, concurrency identity, checkout, and cache
   namespace. PR coordinators are label-only; manual runs must select the live
