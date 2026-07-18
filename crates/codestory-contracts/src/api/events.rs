@@ -98,6 +98,12 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_import_semantic_index_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_support_snapshot_limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_support_snapshot_stored: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_support_snapshot_skipped_oversize: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_call_semantic_candidates_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_import_semantic_candidates_ms: Option<u32>,
@@ -235,6 +241,9 @@ mod tests {
             resolution_import_candidate_index_ms: None,
             resolution_call_semantic_index_ms: None,
             resolution_import_semantic_index_ms: None,
+            resolution_support_snapshot_limit_bytes: None,
+            resolution_support_snapshot_stored: None,
+            resolution_support_snapshot_skipped_oversize: None,
             resolution_call_semantic_candidates_ms: None,
             resolution_import_semantic_candidates_ms: None,
             resolution_call_semantic_requests: None,
@@ -288,6 +297,17 @@ mod tests {
         assert!(value.get("resolution_import_candidate_index_ms").is_none());
         assert!(value.get("resolution_call_semantic_index_ms").is_none());
         assert!(value.get("resolution_import_semantic_index_ms").is_none());
+        assert!(
+            value
+                .get("resolution_support_snapshot_limit_bytes")
+                .is_none()
+        );
+        assert!(value.get("resolution_support_snapshot_stored").is_none());
+        assert!(
+            value
+                .get("resolution_support_snapshot_skipped_oversize")
+                .is_none()
+        );
         assert!(
             value
                 .get("resolution_call_semantic_candidates_ms")

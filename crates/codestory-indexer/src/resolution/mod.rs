@@ -14,13 +14,14 @@ use crate::semantic::{
 };
 use anyhow::Result;
 use codestory_contracts::graph::{EdgeKind, NodeKind, ResolutionCertainty};
-use codestory_store::Store as Storage;
+use codestory_store::{StorageError, Store as Storage};
 use rayon::prelude::*;
 #[cfg(test)]
 use rusqlite::OptionalExtension;
-use rusqlite::{params, params_from_iter, types::Value};
+use rusqlite::{limits::Limit, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::sync::RwLock;
 use std::time::Instant;
 
@@ -196,6 +197,112 @@ struct ResolutionSupportSnapshot {
     node_names: Vec<(i64, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotCapacityExceeded {
+    limit_bytes: usize,
+    attempted_bytes: usize,
+}
+
+impl std::fmt::Display for SnapshotCapacityExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "resolution support snapshot exceeded its {0}-byte SQLite value limit while writing byte {1}",
+            self.limit_bytes, self.attempted_bytes
+        )
+    }
+}
+
+impl std::error::Error for SnapshotCapacityExceeded {}
+
+struct BoundedWriter<W> {
+    inner: W,
+    limit_bytes: usize,
+    written_bytes: usize,
+    capacity_exceeded: Option<SnapshotCapacityExceeded>,
+}
+
+impl<W> BoundedWriter<W> {
+    fn new(inner: W, limit_bytes: usize) -> Self {
+        Self {
+            inner,
+            limit_bytes,
+            written_bytes: 0,
+            capacity_exceeded: None,
+        }
+    }
+
+    fn written_bytes(&self) -> usize {
+        self.written_bytes
+    }
+
+    fn capacity_exceeded(&self) -> Option<SnapshotCapacityExceeded> {
+        self.capacity_exceeded
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let attempted_bytes = self.written_bytes.saturating_add(bytes.len());
+        if attempted_bytes > self.limit_bytes {
+            let capacity_exceeded = SnapshotCapacityExceeded {
+                limit_bytes: self.limit_bytes,
+                attempted_bytes,
+            };
+            self.capacity_exceeded = Some(capacity_exceeded);
+            return Err(io::Error::other(capacity_exceeded));
+        }
+
+        self.inner.write_all(bytes)?;
+        self.written_bytes = attempted_bytes;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+enum SnapshotSerialization {
+    Complete(Vec<u8>),
+    Oversized(SnapshotCapacityExceeded),
+}
+
+fn serialize_json_with_limit<T: Serialize>(
+    value: &T,
+    limit_bytes: usize,
+) -> Result<SnapshotSerialization> {
+    // Measure through a sink first. An oversized snapshot therefore never
+    // allocates a value larger than SQLite can accept merely to discover its
+    // serialized length.
+    let mut counter = BoundedWriter::new(io::sink(), limit_bytes);
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if let Some(capacity_exceeded) = counter.capacity_exceeded() {
+            return Ok(SnapshotSerialization::Oversized(capacity_exceeded));
+        }
+        return Err(error.into());
+    }
+
+    let measured_bytes = counter.written_bytes();
+    let mut snapshot_blob = Vec::new();
+    snapshot_blob.try_reserve_exact(measured_bytes)?;
+    let written_bytes = {
+        let mut writer = BoundedWriter::new(&mut snapshot_blob, limit_bytes);
+        if let Err(error) = serde_json::to_writer(&mut writer, value) {
+            if writer.capacity_exceeded().is_some() {
+                anyhow::bail!(
+                    "resolution support snapshot changed size between bounded measurement and serialization"
+                );
+            }
+            return Err(error.into());
+        }
+        writer.written_bytes()
+    };
+    debug_assert_eq!(written_bytes, measured_bytes);
+
+    Ok(SnapshotSerialization::Complete(snapshot_blob))
+}
+
 impl OverrideSupport {
     fn from_snapshot(
         override_members: Vec<OverrideMemberSnapshot>,
@@ -311,6 +418,9 @@ pub struct ResolutionPhaseTelemetry {
     pub support_snapshot_load_ms: u64,
     pub support_snapshot_store_ms: u64,
     pub support_snapshot_hit: bool,
+    pub support_snapshot_limit_bytes: u64,
+    pub support_snapshot_stored: bool,
+    pub support_snapshot_skipped_oversize: bool,
     pub call_prepare_ms: u64,
     pub call_cleanup_ms: u64,
     pub call_unresolved_load_ms: u64,
@@ -1383,10 +1493,21 @@ impl PreparedResolutionState {
         flags: ResolutionFlags,
         telemetry: &mut ResolutionPhaseTelemetry,
     ) -> Result<Self> {
+        let snapshot_limit_bytes =
+            usize::try_from(storage.get_connection().limit(Limit::SQLITE_LIMIT_LENGTH)?)?;
+        telemetry.support_snapshot_limit_bytes = snapshot_limit_bytes as u64;
         let snapshot_load_started = Instant::now();
-        if let Some(snapshot_blob) =
-            storage.get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
-        {
+        let snapshot_blob =
+            match storage.get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION) {
+                Ok(snapshot_blob) => snapshot_blob,
+                Err(StorageError::ResolutionSupportSnapshotTooBig) => {
+                    storage.invalidate_resolution_support_snapshot()?;
+                    telemetry.support_snapshot_skipped_oversize = true;
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
+        if let Some(snapshot_blob) = snapshot_blob {
             match serde_json::from_slice::<ResolutionSupportSnapshot>(&snapshot_blob) {
                 Ok(snapshot) if snapshot.enable_semantic == flags.enable_semantic => {
                     telemetry.support_snapshot_load_ms =
@@ -1454,9 +1575,26 @@ impl PreparedResolutionState {
         };
 
         let snapshot_store_started = Instant::now();
-        let snapshot_blob = serde_json::to_vec(&prepared.snapshot(flags))?;
-        storage
-            .put_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION, &snapshot_blob)?;
+        match serialize_json_with_limit(&prepared.snapshot(flags), snapshot_limit_bytes)? {
+            SnapshotSerialization::Complete(snapshot_blob) => {
+                match storage.put_resolution_support_snapshot(
+                    RESOLUTION_SUPPORT_SNAPSHOT_VERSION,
+                    &snapshot_blob,
+                ) {
+                    Ok(()) => telemetry.support_snapshot_stored = true,
+                    Err(StorageError::ResolutionSupportSnapshotTooBig) => {
+                        storage.invalidate_resolution_support_snapshot()?;
+                        telemetry.support_snapshot_skipped_oversize = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            SnapshotSerialization::Oversized(capacity_exceeded) => {
+                debug_assert_eq!(capacity_exceeded.limit_bytes, snapshot_limit_bytes);
+                storage.invalidate_resolution_support_snapshot()?;
+                telemetry.support_snapshot_skipped_oversize = true;
+            }
+        }
         telemetry.support_snapshot_store_ms = duration_ms_u64(snapshot_store_started.elapsed());
 
         Ok(prepared)
@@ -3256,6 +3394,7 @@ fn duration_ms_u64(duration: std::time::Duration) -> u64 {
 mod tests {
     use super::*;
     use rusqlite::{Connection, params};
+    use serde::Serializer;
     use std::collections::HashSet;
     use std::time::Instant;
     use tempfile::tempdir;
@@ -3272,6 +3411,103 @@ mod tests {
                 start_line INTEGER
             );",
         )?;
+        Ok(())
+    }
+
+    fn empty_resolution_support_snapshot() -> ResolutionSupportSnapshot {
+        ResolutionSupportSnapshot {
+            enable_semantic: false,
+            call_candidates: Vec::new(),
+            call_import_binding_node_ids: Vec::new(),
+            import_candidates: Vec::new(),
+            relative_import_candidates: Vec::new(),
+            call_semantic_nodes: Vec::new(),
+            import_semantic_nodes: Vec::new(),
+            override_members: Vec::new(),
+            override_inheritance: Vec::new(),
+            override_inheritance_by_name: Vec::new(),
+            node_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_serialization_stops_at_the_explicit_capacity() -> Result<()> {
+        let mut snapshot = empty_resolution_support_snapshot();
+        snapshot.node_names = vec![(1, "target".repeat(128))];
+        let expected = serde_json::to_vec(&snapshot)?;
+
+        let complete = serialize_json_with_limit(&snapshot, expected.len())?;
+        match complete {
+            SnapshotSerialization::Complete(blob) => assert_eq!(blob, expected),
+            SnapshotSerialization::Oversized(_) => {
+                anyhow::bail!("snapshot at the exact limit should fit")
+            }
+        }
+
+        let limit_bytes = expected.len() - 1;
+        let oversized = serialize_json_with_limit(&snapshot, limit_bytes)?;
+        match oversized {
+            SnapshotSerialization::Oversized(capacity) => {
+                assert_eq!(capacity.limit_bytes, limit_bytes);
+                assert!(capacity.attempted_bytes > capacity.limit_bytes);
+            }
+            SnapshotSerialization::Complete(_) => {
+                anyhow::bail!("snapshot beyond the limit should not allocate a result")
+            }
+        }
+
+        Ok(())
+    }
+
+    struct FailingSerialization;
+
+    impl Serialize for FailingSerialization {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    #[test]
+    fn test_snapshot_serialization_does_not_reclassify_real_errors_as_capacity() {
+        match serialize_json_with_limit(&FailingSerialization, 1_024) {
+            Err(error) => assert!(error.to_string().contains("injected serialization failure")),
+            Ok(_) => panic!("real serializer failure must remain fatal"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_persistence_failure_below_limit_remains_fatal() -> Result<()> {
+        let storage = Storage::new_in_memory()?;
+        storage.invalidate_resolution_support_snapshot()?;
+        storage.get_connection().execute_batch(
+            "CREATE TRIGGER reject_resolution_support_snapshot
+             BEFORE UPDATE ON resolution_support_snapshot
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected snapshot persistence failure');
+             END;",
+        )?;
+
+        let flags = ResolutionFlags {
+            legacy_mode: false,
+            enable_semantic: false,
+            store_candidates: false,
+            parallel_compute: false,
+        };
+        let mut telemetry = ResolutionPhaseTelemetry::default();
+        let error = match PreparedResolutionState::load(&storage, flags, &mut telemetry) {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("persistence failure below the capacity boundary must fail"),
+        };
+        assert!(
+            format!("{error:#}").contains("injected snapshot persistence failure"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!telemetry.support_snapshot_skipped_oversize);
+        assert!(!telemetry.support_snapshot_stored);
+
         Ok(())
     }
 
@@ -3295,19 +3531,7 @@ mod tests {
             },
         ])?;
 
-        let stale_snapshot = ResolutionSupportSnapshot {
-            enable_semantic: false,
-            call_candidates: Vec::new(),
-            call_import_binding_node_ids: Vec::new(),
-            import_candidates: Vec::new(),
-            relative_import_candidates: Vec::new(),
-            call_semantic_nodes: Vec::new(),
-            import_semantic_nodes: Vec::new(),
-            override_members: Vec::new(),
-            override_inheritance: Vec::new(),
-            override_inheritance_by_name: Vec::new(),
-            node_names: Vec::new(),
-        };
+        let stale_snapshot = empty_resolution_support_snapshot();
         storage.put_resolution_support_snapshot(
             RESOLUTION_SUPPORT_SNAPSHOT_VERSION,
             &serde_json::to_vec(&stale_snapshot)?,

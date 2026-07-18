@@ -8900,6 +8900,9 @@ mod tests {
             resolution_import_candidate_index_ms: Some(31),
             resolution_call_semantic_index_ms: Some(32),
             resolution_import_semantic_index_ms: Some(33),
+            resolution_support_snapshot_limit_bytes: Some(1_000_000_000),
+            resolution_support_snapshot_stored: Some(true),
+            resolution_support_snapshot_skipped_oversize: Some(false),
             resolution_call_semantic_candidates_ms: Some(34),
             resolution_import_semantic_candidates_ms: Some(35),
             resolution_call_semantic_requests: Some(36),
@@ -9099,6 +9102,9 @@ mod tests {
         ));
         assert!(markdown.contains(
             "resolution_indexes_ms: call_candidate=30 import_candidate=31 call_semantic=32 import_semantic=33"
+        ));
+        assert!(markdown.contains(
+            "resolution_support_snapshot: limit_bytes=1000000000 stored=true skipped_oversize=false"
         ));
         assert!(markdown.contains(
             "resolution_detail_ms: call_semantic_candidates=34 import_semantic_candidates=35 call_compute=42 import_compute=43 call_apply=44 import_apply=45 overrides=46"

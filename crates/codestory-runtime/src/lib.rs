@@ -4247,6 +4247,9 @@ struct OptionalResolutionTelemetry {
     resolution_import_candidate_index_ms: Option<u32>,
     resolution_call_semantic_index_ms: Option<u32>,
     resolution_import_semantic_index_ms: Option<u32>,
+    resolution_support_snapshot_limit_bytes: Option<u64>,
+    resolution_support_snapshot_stored: Option<bool>,
+    resolution_support_snapshot_skipped_oversize: Option<bool>,
     resolution_call_semantic_candidates_ms: Option<u32>,
     resolution_import_semantic_candidates_ms: Option<u32>,
     resolution_call_semantic_requests: Option<u32>,
@@ -4323,6 +4326,12 @@ impl OptionalResolutionTelemetry {
         self.resolution_import_semantic_index_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_import_semantic_index_ms,
         ));
+        self.resolution_support_snapshot_limit_bytes =
+            Some(index_stats.resolution_support_snapshot_limit_bytes);
+        self.resolution_support_snapshot_stored =
+            Some(index_stats.resolution_support_snapshot_stored);
+        self.resolution_support_snapshot_skipped_oversize =
+            Some(index_stats.resolution_support_snapshot_skipped_oversize);
         self.resolution_call_semantic_candidates_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_call_semantic_candidates_ms,
         ));
@@ -14280,6 +14289,12 @@ fn index_full_for_runtime(
                 .resolution_call_semantic_index_ms,
             resolution_import_semantic_index_ms: resolution_telemetry
                 .resolution_import_semantic_index_ms,
+            resolution_support_snapshot_limit_bytes: resolution_telemetry
+                .resolution_support_snapshot_limit_bytes,
+            resolution_support_snapshot_stored: resolution_telemetry
+                .resolution_support_snapshot_stored,
+            resolution_support_snapshot_skipped_oversize: resolution_telemetry
+                .resolution_support_snapshot_skipped_oversize,
             resolution_call_semantic_candidates_ms: resolution_telemetry
                 .resolution_call_semantic_candidates_ms,
             resolution_import_semantic_candidates_ms: resolution_telemetry
@@ -14817,6 +14832,12 @@ where
                 .resolution_call_semantic_index_ms,
             resolution_import_semantic_index_ms: resolution_telemetry
                 .resolution_import_semantic_index_ms,
+            resolution_support_snapshot_limit_bytes: resolution_telemetry
+                .resolution_support_snapshot_limit_bytes,
+            resolution_support_snapshot_stored: resolution_telemetry
+                .resolution_support_snapshot_stored,
+            resolution_support_snapshot_skipped_oversize: resolution_telemetry
+                .resolution_support_snapshot_skipped_oversize,
             resolution_call_semantic_candidates_ms: resolution_telemetry
                 .resolution_call_semantic_candidates_ms,
             resolution_import_semantic_candidates_ms: resolution_telemetry

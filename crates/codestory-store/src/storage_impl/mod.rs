@@ -727,6 +727,8 @@ fn outside_file_node_predicate(file_param: &str) -> String {
 pub enum StorageError {
     #[error("Database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("Resolution support snapshot exceeds the current SQLite value limit")]
+    ResolutionSupportSnapshotTooBig,
     #[error("Invalid enum value: {0}")]
     EnumConversion(#[from] EnumConversionError),
     #[error("Other error: {0}")]
@@ -2028,8 +2030,25 @@ impl Storage {
             snapshot_version,
             GroundingSnapshotState::Ready.db_value()
         ])?;
-        if let Some(row) = rows.next()? {
-            return Ok(Some(row.get(0)?));
+        let row = match rows.next() {
+            Ok(row) => row,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ffi::ErrorCode::TooBig =>
+            {
+                return Err(StorageError::ResolutionSupportSnapshotTooBig);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(row) = row {
+            return match row.get(0) {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ffi::ErrorCode::TooBig =>
+                {
+                    Err(StorageError::ResolutionSupportSnapshotTooBig)
+                }
+                Err(error) => Err(error.into()),
+            };
         }
         Ok(None)
     }
@@ -2039,7 +2058,7 @@ impl Storage {
         snapshot_version: i64,
         snapshot_blob: &[u8],
     ) -> Result<(), StorageError> {
-        self.conn.execute(
+        let result = self.conn.execute(
             "INSERT INTO resolution_support_snapshot (
                 id,
                 snapshot_version,
@@ -2059,8 +2078,16 @@ impl Storage {
                 snapshot_blob,
                 current_epoch_ms()
             ],
-        )?;
-        Ok(())
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ffi::ErrorCode::TooBig =>
+            {
+                Err(StorageError::ResolutionSupportSnapshotTooBig)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn invalidate_resolution_support_snapshot(&self) -> Result<(), StorageError> {

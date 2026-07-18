@@ -713,6 +713,9 @@ pub struct IncrementalIndexingStats {
     pub resolution_support_snapshot_load_ms: u64,
     pub resolution_support_snapshot_store_ms: u64,
     pub resolution_support_snapshot_hit: bool,
+    pub resolution_support_snapshot_limit_bytes: u64,
+    pub resolution_support_snapshot_stored: bool,
+    pub resolution_support_snapshot_skipped_oversize: bool,
     pub resolution_call_semantic_candidates_ms: u64,
     pub resolution_import_semantic_candidates_ms: u64,
     pub resolution_call_semantic_requests: usize,
@@ -1255,6 +1258,12 @@ impl WorkspaceIndexer {
             stats.resolution_support_snapshot_store_ms =
                 resolution_stats.telemetry.support_snapshot_store_ms;
             stats.resolution_support_snapshot_hit = resolution_stats.telemetry.support_snapshot_hit;
+            stats.resolution_support_snapshot_limit_bytes =
+                resolution_stats.telemetry.support_snapshot_limit_bytes;
+            stats.resolution_support_snapshot_stored =
+                resolution_stats.telemetry.support_snapshot_stored;
+            stats.resolution_support_snapshot_skipped_oversize =
+                resolution_stats.telemetry.support_snapshot_skipped_oversize;
             stats.resolution_call_semantic_candidates_ms =
                 resolution_stats.telemetry.call_semantic_candidates_ms;
             stats.resolution_import_semantic_candidates_ms =
