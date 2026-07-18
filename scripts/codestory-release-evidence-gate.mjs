@@ -41,6 +41,12 @@ const SOURCE_RUN_PRODUCERS = new Map([
 const SELECTED_REF_PRODUCERS = new Set([
   ".github/workflows/packaged-platform-pr.yml",
 ]);
+const RELEASE_CORPUS_CONTRACTS = new Map([
+  [
+    "codestory-release-corpus-v0.16-axios-js-ts-v1",
+    "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json",
+  ],
+]);
 
 function fail(message) { throw new Error(message); }
 function object(value, label) {
@@ -417,6 +423,104 @@ function statsContractFrom(repoRoot) {
   return contract;
 }
 
+function releaseCorpusContract(repoRoot, identity) {
+  const relativePath = RELEASE_CORPUS_CONTRACTS.get(identity.corpus_id);
+  if (!relativePath) return null;
+  const absolutePath = path.resolve(repoRoot, relativePath);
+  const bytes = readFileSync(absolutePath);
+  const contract = JSON.parse(bytes.toString("utf8"));
+  if (contract.schema_version !== 1 || contract.corpus_id !== identity.corpus_id) {
+    fail("release corpus contract is malformed or has the wrong corpus_id");
+  }
+  if (!Array.isArray(contract.task_ids) || contract.task_ids.length === 0) {
+    fail("release corpus contract must name selected task IDs");
+  }
+  const taskIds = [...new Set(contract.task_ids)].sort();
+  if (taskIds.length !== contract.task_ids.length || JSON.stringify(taskIds) !== JSON.stringify(contract.task_ids)) {
+    fail("release corpus contract task IDs must be sorted and unique");
+  }
+  const runtimeModes = Array.isArray(contract.runtime_modes)
+    ? [...new Set(contract.runtime_modes)].sort()
+    : [];
+  if (
+    runtimeModes.length === 0
+    || runtimeModes.length !== contract.runtime_modes.length
+    || JSON.stringify(runtimeModes) !== JSON.stringify(contract.runtime_modes)
+    || runtimeModes.some((mode) => ![...PACKET_RUNTIME_MODES.values()].includes(mode))
+  ) {
+    fail("release corpus contract runtime modes must be supported, sorted, and unique");
+  }
+  if (!Number.isInteger(contract.repeats) || contract.repeats < 1) {
+    fail("release corpus contract repeats must be a positive integer");
+  }
+  const taskManifestIds = Object.keys(object(contract.task_manifests, "release corpus task_manifests")).sort();
+  if (JSON.stringify(taskManifestIds) !== JSON.stringify(taskIds)) {
+    fail("release corpus contract task manifest keys must exactly match task IDs");
+  }
+  const taskRepositories = {};
+  for (const taskId of taskIds) {
+    const declaration = object(contract.task_manifests[taskId], `release corpus task manifest ${taskId}`);
+    const manifestPath = path.resolve(repoRoot, text(declaration.path, `release corpus task manifest path ${taskId}`));
+    const relativeManifestPath = path.relative(repoRoot, manifestPath);
+    if (relativeManifestPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeManifestPath)) {
+      fail(`release corpus task manifest path escapes the repository for ${taskId}`);
+    }
+    const manifestBytes = readFileSync(manifestPath);
+    if (sha256(manifestBytes) !== text(declaration.sha256, `release corpus task manifest hash ${taskId}`)) {
+      fail(`release corpus task manifest hash does not match for ${taskId}`);
+    }
+    const manifest = JSON.parse(manifestBytes.toString("utf8"));
+    if (manifest.id !== taskId) fail(`release corpus task manifest ID does not match ${taskId}`);
+    taskRepositories[taskId] = text(manifest.repo?.name, `release corpus task repository ${taskId}`);
+  }
+  return {
+    path: relativePath,
+    sha256: sha256(bytes),
+    corpus_id: contract.corpus_id,
+    task_ids: taskIds,
+    runtime_modes: runtimeModes,
+    repeats: contract.repeats,
+    task_manifests: contract.task_manifests,
+    task_repositories: taskRepositories,
+    project_manifests: contract.project_manifests ?? {},
+  };
+}
+
+export function validatePacketCorpusContract(packetProvenance, rows, repoRoot, identity, profile) {
+  const expected = releaseCorpusContract(repoRoot, identity);
+  if (!expected) return;
+  const approved = object(profile.corpus_contract, "baseline profile corpus_contract");
+  if (approved.path !== expected.path || approved.sha256 !== expected.sha256) {
+    fail("checked-in release corpus contract does not match the approved baseline scope");
+  }
+  if (JSON.stringify(packetProvenance.corpus_contract) !== JSON.stringify(expected)) {
+    fail("raw packet corpus contract does not match the checked-in release scope");
+  }
+  const expectedRows = [];
+  for (const taskId of expected.task_ids) {
+    for (const mode of expected.runtime_modes) {
+      for (let repeat = 1; repeat <= expected.repeats; repeat += 1) {
+        expectedRows.push(`${expected.task_repositories[taskId]}/${taskId}/${mode}/${repeat}`);
+      }
+    }
+  }
+  const observedRows = rows.map((row, index) => {
+    const repo = text(row.repo, `packet row ${index} repo`);
+    const taskId = text(row.task_id, `packet row ${index} task_id`);
+    const mode = text(row.mode, `packet row ${index} mode`);
+    if (!Number.isInteger(row.repeat) || row.repeat < 1) {
+      fail(`packet row ${index} repeat must be a positive integer`);
+    }
+    return `${repo}/${taskId}/${mode}/${row.repeat}`;
+  }).sort();
+  if (
+    new Set(observedRows).size !== observedRows.length
+    || JSON.stringify(observedRows) !== JSON.stringify(expectedRows.sort())
+  ) {
+    fail("raw packet rows do not exactly match the checked-in release task scope");
+  }
+}
+
 function validateRawProvenance(
   stats,
   packet,
@@ -425,6 +529,8 @@ function validateRawProvenance(
   profileName,
   identity,
   statsContract,
+  repoRoot,
+  profile,
 ) {
   if (fullSha(stats.commit, "stats.commit") !== commit) fail("raw stats commit does not match candidate");
   if (JSON.stringify(stats.evidence_identity) !== JSON.stringify(identity)) fail("raw stats identity does not match profile");
@@ -462,6 +568,7 @@ function validateRawProvenance(
   if (!Array.isArray(packetProvenance.publishable_blockers) || packetProvenance.publishable_blockers.length !== 0) fail("raw packet artifact contains publishable blockers");
   const rows = packetProvenance.rows;
   if (!Array.isArray(rows) || rows.length === 0) fail("raw packet artifact has no quality rows");
+  validatePacketCorpusContract(packetProvenance, rows, repoRoot, identity, profile);
   const repeats = new Map();
   for (const [index, row] of rows.entries()) {
     const sufficiency = row.sufficiency;
@@ -516,6 +623,8 @@ export function produceCandidate({ baselineDocument, baselineDir, profileName, s
     profileName,
     identity,
     statsContract,
+    repoRoot,
+    profile,
   );
   const baseDir = path.dirname(path.resolve(outPath));
   const measured = metricsFrom(stats, packet, profile);
@@ -589,6 +698,8 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
     candidate.profile,
     profile.identity,
     statsContract,
+    repoRoot,
+    profile,
   );
   const measured = metricsFrom(stats, packet, profile);
   if (approvalDocument && approvalDocument.schema_version !== 3) fail("approval schema_version must be 3");

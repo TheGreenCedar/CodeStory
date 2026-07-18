@@ -88,7 +88,7 @@ jobs:
           CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR: ${{ github.workspace }}/target/release-evidence/drill
           CODESTORY_RELEASE_EVIDENCE_STATS_PATH: ${{ github.workspace }}/target/release-evidence/stats.json
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
-          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
+          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v0.16-axios-js-ts-v1
           CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-inprocess-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_REAL_REPO_DRILL_CASES: ${{ inputs.drill_manifest }}
@@ -104,7 +104,8 @@ jobs:
         env:
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
           CODESTORY_RELEASE_EVIDENCE_PROFILE: ${{ inputs.profile }}
-          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
+          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v0.16-axios-js-ts-v1
+          CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT: benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json
           CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-inprocess-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_EMBED_ALLOW_CPU: "1"
@@ -116,6 +117,7 @@ jobs:
             --packet-runtime \
             --packet-runtime-mode cold-cli \
             --task-suite holdout-retrieval \
+            --task-ids axios-request-dispatch \
             --materialize-repos \
             --repeats 3 \
             --publishable \

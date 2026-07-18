@@ -1,6 +1,9 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -9,6 +12,7 @@ import {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   baselineSearchPreludeStatus,
+  benchmarkAgentScopeArgs,
   benchmarkRunId,
   commandCategory,
   copyResultArtifact,
@@ -17,12 +21,14 @@ import {
   loadTaskForResult,
   loadTasks,
   manifestRepoMaterializationBlockers,
+  materializeRepos,
   MAX_REUSED_ARTIFACT_BYTES,
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
   packetComposition,
   packetCommandArgs,
   packetRuntimeCacheObservations,
+  packetEmbeddingExecutionProof,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
@@ -35,6 +41,8 @@ import {
   repoProvenanceBlockers,
   resolveRunArtifactPath,
   resolveCodeStoryCli,
+  retrievalIndexCommandArgs,
+  retrievalStatusCommandArgs,
   scoreQuality,
   summarizeCostAccounting,
   summarizePacketRuntimeRuns,
@@ -42,6 +50,7 @@ import {
   qualityFailureReasons,
   taskSnapshotForResult,
   cachePolicyForRun,
+  cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
@@ -111,6 +120,64 @@ test("packet-runtime cache observations preserve prepared cache provenance", () 
     assert.equal(observations.cache_preparation, cachePreparation[0]);
     assert.equal(cachePolicyForRun(observations), "prepared-retrieval-cache-read-only");
   }
+});
+
+test("cold packet embedding execution binds full retrieval to the prepared semantic generation", () => {
+  const preparation = {
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "cpu_explicit",
+    },
+    retrieval_status: { semantic_generation: "semantic-1" },
+  };
+  const packet = {
+    answer: {
+      retrieval_trace: {
+        retrieval_publication: { semantic_generation: "semantic-1" },
+        semantic_fallback_count: 0,
+        packet_sidecar_diagnostics: [
+          { retrieval_mode: "full" },
+          { retrieval_mode: "full" },
+        ],
+        retrieval_shadow: {
+          stage_timings: [
+            { stage: "stage1_lexical" },
+            {
+              stage: "stage1b_semantic",
+              completion_status: "completed",
+              degraded: false,
+              stub_reason: null,
+              cancel_reason: null,
+            },
+          ],
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(
+    packetEmbeddingExecutionProof(packet, preparation, "cold_cli_packet"),
+    {
+      source: "packet.answer.retrieval_trace",
+      transport_mode: "cold_cli_packet",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "cpu_explicit",
+      retrieval_mode: "full",
+      diagnostic_count: 2,
+      full_diagnostic_count: 2,
+      semantic_stage_count: 1,
+      completed_semantic_stage_count: 1,
+      invalid_semantic_stage_count: 0,
+      shadow_degraded_reason: null,
+      shadow_error: null,
+      shadow_cancel_reason: null,
+      semantic_fallback_count: 0,
+      semantic_generation: "semantic-1",
+      prepared_semantic_generation: "semantic-1",
+    },
+  );
 });
 
 test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
@@ -252,6 +319,12 @@ async function withManifestFile(manifest, callback) {
   }
 }
 
+function gitFixture(args, cwd) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
   assert.equal(commandCategory('"$CODESTORY_CLI" index --project . --refresh full'), "codestory_cli");
@@ -379,6 +452,82 @@ test("rejects manifest repo and workspace paths outside the cache", async () => 
       );
     },
   );
+
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "https://example.com/fixture.git",
+        ref: "main",
+        workspace_root: ".",
+        codestory_project_manifest: {
+          path: "../../outside.json",
+          sha256: "0".repeat(64),
+        },
+      },
+    }),
+    async (manifestPath, dir) => {
+      await assert.rejects(
+        () => loadTasks({ taskManifest: manifestPath, taskSuite: null, taskIds: null, repoCacheDir: path.join(dir, "repos") }),
+        /codestory_project_manifest\.path must stay inside/,
+      );
+    },
+  );
+});
+
+test("materialization scrubs reusable checkouts before installing the bound project manifest", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-materialized-project-"));
+  try {
+    const source = path.join(dir, "source");
+    const origin = path.join(dir, "origin.git");
+    const repoCacheDir = path.join(dir, "cache");
+    const templatePath = path.join(dir, "project.json");
+    const template = '{"name":"fixture","version":1,"source_groups":[]}\n';
+    await mkdir(source, { recursive: true });
+    gitFixture(["init", "-q"], source);
+    gitFixture(["config", "user.email", "fixture@example.invalid"], source);
+    gitFixture(["config", "user.name", "Fixture"], source);
+    await writeFile(path.join(source, "lib.rs"), "fn main() {}\n");
+    gitFixture(["add", "lib.rs"], source);
+    gitFixture(["commit", "-qm", "fixture"], source);
+    const ref = gitFixture(["rev-parse", "HEAD"], source);
+    gitFixture(["clone", "--bare", source, origin], dir);
+    await writeFile(templatePath, template, "utf8");
+    const manifestPath = path.join(dir, "fixture.task.json");
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify(manifestFixture({
+        repo: {
+          name: "scrub-fixture",
+          url: origin,
+          ref,
+          workspace_root: ".",
+          codestory_project_manifest: {
+            path: "project.json",
+            sha256: createHash("sha256").update(template).digest("hex"),
+          },
+        },
+      }), null, 2)}\n`,
+      "utf8",
+    );
+    const opts = { taskManifest: manifestPath, taskSuite: null, taskIds: null, repoCacheDir, timeoutMs: 10_000 };
+    const tasks = await loadTasks(opts);
+    await materializeRepos(tasks, opts);
+    const checkout = path.join(repoCacheDir, "scrub-fixture");
+    await writeFile(path.join(checkout, "untracked-source.rs"), "fn stale() {}\n");
+    await writeFile(path.join(checkout, ".git", "info", "exclude"), "/ignored-source.rs\n", "utf8");
+    await writeFile(path.join(checkout, "ignored-source.rs"), "fn stale_ignored() {}\n");
+
+    await materializeRepos(tasks, opts);
+
+    assert.equal(existsSync(path.join(checkout, "untracked-source.rs")), false);
+    assert.equal(existsSync(path.join(checkout, "ignored-source.rs")), false);
+    assert.equal(await readFile(path.join(checkout, "codestory_project.json"), "utf8"), template);
+    assert.equal(gitFixture(["status", "--porcelain"], checkout), "");
+    assert.equal(gitFixture(["rev-parse", "HEAD"], checkout), ref);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("packet-first command renders manifest text for host shells", () => {
@@ -413,7 +562,7 @@ test("packet-first command renders manifest text for host shells", () => {
   );
 });
 
-test("packet command keeps manifest-derived extra probes diagnostic-only", () => {
+test("packet and cache preparation share one explicit agent retrieval namespace", () => {
   const task = {
     prompt: "Explain how Requests dispatch works.",
     task_class: "architecture_explanation",
@@ -436,8 +585,32 @@ test("packet command keeps manifest-derived extra probes diagnostic-only", () =>
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
-  assert.equal(args.includes("--profile"), false);
-  assert.equal(args.includes("--run-id"), false);
+  assert.deepEqual(benchmarkAgentScopeArgs(), ["--profile", "agent", "--run-id", "shared-agent"]);
+  assert.deepEqual(args.slice(3, 7), benchmarkAgentScopeArgs());
+  assert.deepEqual(retrievalIndexCommandArgs("C:\\repo"), [
+    "retrieval",
+    "index",
+    "--project",
+    "C:\\repo",
+    "--profile",
+    "agent",
+    "--run-id",
+    "shared-agent",
+    "--refresh",
+    "auto",
+  ]);
+  assert.deepEqual(retrievalStatusCommandArgs("C:\\repo"), [
+    "retrieval",
+    "status",
+    "--project",
+    "C:\\repo",
+    "--profile",
+    "agent",
+    "--run-id",
+    "shared-agent",
+    "--format",
+    "json",
+  ]);
 
   const diagnosticArgs = packetCommandArgs(
     { path: "C:\\repo" },
@@ -1709,6 +1882,119 @@ function localCacheProvenance(overrides = {}) {
   };
 }
 
+function localColdPacketCacheProvenance(overrides = {}) {
+  return localCacheProvenance({
+    embedding_engine_instance_id: null,
+    embedding_policy: "cpu_explicit",
+    semantic_ready: false,
+    packet_embedding_execution: {
+      source: "packet.answer.retrieval_trace",
+      transport_mode: "cold_cli_packet",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "cpu_explicit",
+      retrieval_mode: "full",
+      diagnostic_count: 2,
+      full_diagnostic_count: 2,
+      semantic_stage_count: 1,
+      completed_semantic_stage_count: 1,
+      invalid_semantic_stage_count: 0,
+      shadow_degraded_reason: null,
+      shadow_error: null,
+      shadow_cancel_reason: null,
+      semantic_fallback_count: 0,
+      semantic_generation: "proj-current",
+      prepared_semantic_generation: "proj-current",
+    },
+    ...overrides,
+  });
+}
+
+test("cold packet execution proof replaces only unavailable process-local identity", () => {
+  assert.deepEqual(
+    cacheProvenanceBlockers({
+      codestory_cache_provenance: localColdPacketCacheProvenance(),
+    }),
+    [],
+  );
+
+  for (const [field, value, message] of [
+    ["source", "status", /source=status/],
+    ["transport_mode", "warm_stdio_packet", /transport=warm_stdio_packet/],
+    ["embedding_engine", "other", /embedding engine=other/],
+    ["embedding_policy", "accelerated", /embedding policy does not match cache provenance/],
+    ["retrieval_mode", null, /retrieval mode=unknown/],
+    ["diagnostic_count", 0, /no sidecar diagnostics/],
+    ["full_diagnostic_count", 1, /non-full sidecar diagnostic/],
+    ["semantic_stage_count", 0, /no semantic stage/],
+    ["completed_semantic_stage_count", 0, /incomplete semantic stage/],
+    ["invalid_semantic_stage_count", 1, /degraded, stubbed, or cancelled semantic stage/],
+    ["shadow_degraded_reason", "degraded", /retrieval shadow is degraded/],
+    ["shadow_error", "failed", /retrieval shadow contains an error/],
+    ["shadow_cancel_reason", "deadline", /retrieval shadow was cancelled/],
+    ["semantic_fallback_count", 1, /semantic fallback count=1/],
+    ["semantic_generation", "semantic-2", /does not match the prepared generation/],
+  ]) {
+    const provenance = localColdPacketCacheProvenance();
+    provenance.packet_embedding_execution[field] = value;
+    const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: provenance });
+    assert.match(blockers.join("\n"), message);
+  }
+});
+
+test("skipped or degraded semantic stages cannot replace live engine identity", () => {
+  const preparation = {
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "cpu_explicit",
+    },
+    retrieval_status: { semantic_generation: "proj-current" },
+  };
+  const packet = {
+    answer: {
+      retrieval_trace: {
+        retrieval_publication: { semantic_generation: "proj-current" },
+        semantic_fallback_count: 0,
+        packet_sidecar_diagnostics: [{ retrieval_mode: "full" }],
+        retrieval_shadow: {
+          degraded_reason: "semantic_unavailable",
+          error: "semantic failed",
+          cancel_reason: "deadline",
+          stage_timings: [{
+            stage: "stage1b_semantic",
+            completion_status: "skipped",
+            degraded: true,
+            stub_reason: "stubbed",
+            cancel_reason: "deadline",
+          }],
+        },
+      },
+    },
+  };
+  const proof = packetEmbeddingExecutionProof(packet, preparation, "cold_cli_packet");
+  const provenance = localColdPacketCacheProvenance({ packet_embedding_execution: proof });
+  const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: provenance });
+
+  assert.equal(proof.completed_semantic_stage_count, 0);
+  assert.equal(proof.invalid_semantic_stage_count, 1);
+  assert.match(blockers.join("\n"), /incomplete semantic stage/);
+  assert.match(blockers.join("\n"), /retrieval shadow is degraded/);
+  assert.match(blockers.join("\n"), /retrieval shadow contains an error/);
+  assert.match(blockers.join("\n"), /retrieval shadow was cancelled/);
+});
+
+test("warm process provenance still requires live engine identity and semantic readiness", () => {
+  const blockers = cacheProvenanceBlockers({
+    codestory_cache_provenance: localCacheProvenance({
+      embedding_engine_instance_id: null,
+      semantic_ready: false,
+    }),
+  });
+  assert.match(blockers.join("\n"), /missing CodeStory embedding engine identity/);
+  assert.match(blockers.join("\n"), /CodeStory semantic docs are not ready/);
+});
+
 function publishableWithCodeStoryResult(overrides = {}) {
   return {
     repo: "codestory",
@@ -1966,6 +2252,24 @@ test("publishable provenance requires full-SHA clean manifest checkout", () => {
     },
   };
   assert.deepEqual(repoProvenanceBlockers(clean), []);
+  const projectBound = structuredClone(clean);
+  projectBound.repo_provenance.manifest.codestory_project_manifest = {
+    path: "benchmarks/tasks/holdout-retrieval/ripgrep-rust-codestory-project.json",
+    sha256: "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a",
+  };
+  projectBound.repo_provenance.installed_codestory_project_manifest = {
+    source_path: "benchmarks/tasks/holdout-retrieval/ripgrep-rust-codestory-project.json",
+    declared_sha256: "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a",
+    installed_path: "codestory_project.json",
+    installed_sha256: "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a",
+    ignored: true,
+  };
+  assert.deepEqual(repoProvenanceBlockers(projectBound), []);
+  projectBound.repo_provenance.installed_codestory_project_manifest.installed_sha256 = "0".repeat(64);
+  assert.match(
+    repoProvenanceBlockers(projectBound).join("\n"),
+    /installed CodeStory project manifest bytes do not match declared hash/,
+  );
   assert.match(
     repoProvenanceBlockers({
       repo_provenance: {

@@ -164,6 +164,74 @@ hardware-bound release-evidence gate separately re-evaluates repeat graph,
 semantic, and full-refresh limits from `repo-stats-contract.json` before an
 artifact can become release-eligible.
 
+### Linux ARM64 v2 baseline preregistration
+
+The `codestory-release-evidence-linux-arm64-v2` baseline is measured from the
+clean pre-server-change product tree at
+`54c8d51928e99b993a37afb21cfb9a79d6468fe3`, plus the source-bound Linux ARM64
+build compatibility shim in this baseline PR. Protected run `29614084988` at
+`2e25300b5d4899396eb55c3f46501bdc24a0951f` failed during CMake configuration.
+Run `29616049836` at `544ac0575b33d6e64b8183a0c1443623eaac4194`
+cleared that conflict but found that the pinned GCC toolchain cannot compile
+the upstream SME variants. Both stopped before any metric producer ran and
+observed no candidate measurements. Record the exact successful measurement
+commit in the approved profile; changes made afterward cannot define or move
+the reference values used to evaluate them.
+
+Protected run `29616984735` at
+`42b88537840a2fcb77cad523a5a0d4627f42961f` built the repaired native package
+and produced CodeStory self-corpus stats, then correctly rejected the Serde
+drill because its repository-wide synthetic manifest scheduled the intentional
+compiler-failure fixture `tests/ui/parse_expr.rs`. Packet production and
+candidate evaluation did not run, so those partial stats cannot define the v2
+baseline. The runner now binds a checked-in project manifest into its machine
+contract and attestation so the drill corpus includes valid Rust source while
+excluding `tests/ui/**`; production parser and publication completeness remain
+unchanged.
+
+Protected run `29623187686` stopped before measurement after detecting a stale
+retrieval namespace in the harness. Run `29624645979` at
+`dd14e2d0e29b9e09438a0aa4f9a6ea6250e69738` then completed the source and Serde
+gates plus all six cold packet rows. Axios passed all three repeats. Ripgrep
+failed all three at 0.60 file recall and 0.60 citation coverage against the
+fixed 0.70 thresholds, and a later status process could not report the packet
+process's local engine identity. Those failures are retained; they do not
+define a baseline.
+
+Before another protected measurement, v0.16 is narrowed to the new hash-bound
+`codestory-release-corpus-v0.16-axios-js-ts-v1` contract: exactly the Axios task
+and three repeats. Ripgrep remains outside the v0.16 packet-quality claim. The
+harness now proves cold embedding execution from the measured packet's semantic
+stage, full sidecar diagnostics, zero fallback, and semantic-generation match,
+rather than asking a later process to recreate process-local identity. The
+budgets below are unchanged by that scope decision.
+
+Before observing the v2 measurements, its operational budgets are fixed as
+follows:
+
+- status, local grounding, search, and cold indexing: reference multiplied by
+  `1.25`;
+- unchanged-corpus convergence: reference multiplied by `1.15`;
+- worst quality-gated packet median: reference multiplied by `1.10`;
+- same-corpus storage growth: reference bytes multiplied by `1.10`; and
+- second-based thresholds round upward to the next `0.01` seconds.
+
+These multipliers are release budgets, not confidence intervals. The baseline
+is one identity-bound observation except for the required three publishable
+packet repeats. Do not tune a multiplier after reading the run, substitute v1
+values, or rerun a valid measurement to seek a more favorable sample.
+
+Protected run `29626819203` at
+`56cfed37439c34c8e01710074a2f5cb72284d521` is the accepted v2 measurement.
+It passed the full-retrieval and Serde producers, resolved all three Serde
+anchors with zero failed commands, and passed all three scoped Axios packet
+rows with no publishable blocker. The workflow's candidate step failed only
+because the v2 profile did not exist yet; its always-uploaded artifact
+`8424291310` has archive digest
+`d3bb8113ac29059978780e4099c8cff292fc00ff73225f6635aa06271f6640a6`.
+The approved registry derives the fixed budgets from those retained raw bytes.
+That measurement is not repeated after registration.
+
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
 reported hashes and values in the short-lived repository Actions secret

@@ -1102,6 +1102,7 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "crates/codestory-llama-sys/model_staging.rs",
       "crates/codestory-llama-sys/Cargo.toml",
       "crates/codestory-llama-sys/tests/model_staging.rs",
+      "scripts/release-evidence/serde-json-codestory-project.json",
     ];
     for (const event of ["pull_request", "push"]) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -38,6 +39,7 @@ const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
@@ -511,6 +513,44 @@ function assertPathInside(base, candidate, label) {
   return path.resolve(candidate);
 }
 
+function sha256Bytes(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function normalizeSha256(value, label) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!SHA256_PATTERN.test(normalized)) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest`);
+  }
+  return normalized;
+}
+
+function normalizeCodestoryProjectManifest(filePath, value) {
+  if (value == null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Task manifest codestory_project_manifest must be an object: ${filePath}`);
+  }
+  const declaredPath = String(value.path ?? "").trim();
+  if (!declaredPath || path.isAbsolute(declaredPath) || path.win32.isAbsolute(declaredPath)) {
+    throw new Error(`Task manifest codestory_project_manifest.path must be relative: ${filePath}`);
+  }
+  const sourcePath = assertPathInside(
+    path.dirname(filePath),
+    path.resolve(path.dirname(filePath), declaredPath),
+    "Task manifest codestory_project_manifest.path",
+  );
+  if (!existsSync(sourcePath) || !statSync(sourcePath).isFile()) {
+    throw new Error(`Task manifest codestory_project_manifest.path does not name a file: ${filePath}`);
+  }
+  return {
+    declared_path: declaredPath.replaceAll(path.sep, "/"),
+    source_path: sourcePath,
+    sha256: normalizeSha256(value.sha256, `Task manifest codestory_project_manifest.sha256: ${filePath}`),
+  };
+}
+
 function normalizeWorkspaceRoot(filePath, value) {
   if (value == null || String(value).trim() === "" || String(value).trim() === ".") {
     return "";
@@ -557,6 +597,7 @@ function repoConfigFromManifest(repo, opts = {}) {
     ref: repo.ref ?? null,
     languages: Array.isArray(repo.languages) ? repo.languages : [],
     setup: Array.isArray(repo.setup) ? repo.setup : [],
+    codestory_project_manifest: normalizeCodestoryProjectManifest(filePath, repo.codestory_project_manifest),
     prompt: "",
   };
 }
@@ -587,6 +628,7 @@ function registerManifestRepo(repo, opts = {}) {
     manifest_ref: config.ref,
     manifest_workspace_root: config.workspace_root,
     manifest_checkout_path: config.checkout_path,
+    manifest_codestory_project_manifest: config.codestory_project_manifest,
     manifest_overridden_by_builtin: manifestOverriddenByBuiltIn,
     languages: activeConfig.languages?.length ? activeConfig.languages : config.languages,
     setup: activeConfig.setup?.length ? activeConfig.setup : config.setup,
@@ -847,6 +889,118 @@ async function loadTasks(opts) {
   return tasks;
 }
 
+function sortedUniqueStrings(values, label) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`${label} must be a non-empty array`);
+  }
+  const normalized = values.map((value) => String(value ?? "").trim());
+  if (normalized.some((value) => !MANIFEST_TASK_ID_PATTERN.test(value))) {
+    throw new Error(`${label} must contain benchmark task IDs`);
+  }
+  const sorted = [...new Set(normalized)].sort();
+  if (sorted.length !== normalized.length || JSON.stringify(sorted) !== JSON.stringify(normalized)) {
+    throw new Error(`${label} must be sorted and unique`);
+  }
+  return sorted;
+}
+
+async function loadReleaseEvidenceCorpusContract(tasks, opts) {
+  const declaredPath = process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT?.trim();
+  if (!process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT) {
+    if (declaredPath) {
+      throw new Error("CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT requires CODESTORY_RELEASE_EVIDENCE_COMMIT");
+    }
+    return null;
+  }
+  if (!declaredPath) {
+    throw new Error("release evidence requires CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT");
+  }
+  const contractPath = assertPathInside(repoRoot, path.resolve(repoRoot, declaredPath), "Release evidence corpus contract");
+  if (!existsSync(contractPath) || !statSync(contractPath).isFile()) {
+    throw new Error(`Release evidence corpus contract does not exist: ${declaredPath}`);
+  }
+  const bytes = await readFile(contractPath);
+  const contract = JSON.parse(bytes.toString("utf8"));
+  if (contract?.schema_version !== 1 || typeof contract?.corpus_id !== "string") {
+    throw new Error("Release evidence corpus contract must use schema_version 1 and name a corpus_id");
+  }
+  if (contract.corpus_id !== process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID) {
+    throw new Error("Release evidence corpus contract corpus_id does not match CODESTORY_RELEASE_EVIDENCE_CORPUS_ID");
+  }
+  const taskIds = sortedUniqueStrings(contract.task_ids, "Release evidence corpus contract task_ids");
+  const loadedTaskIds = [...new Set(tasks.map((task) => task.id))].sort();
+  if (JSON.stringify(taskIds) !== JSON.stringify(loadedTaskIds)) {
+    throw new Error(
+      `Release evidence task selection does not match corpus contract: expected ${taskIds.join(", ")}, got ${loadedTaskIds.join(", ")}`,
+    );
+  }
+  const selectedRuntimeModes = opts.packetRuntimeMode === "both"
+    ? ["cold_cli_packet", "warm_stdio_packet"]
+    : [`${opts.packetRuntimeMode.replaceAll("-", "_")}_packet`];
+  if (JSON.stringify(contract.runtime_modes) !== JSON.stringify(selectedRuntimeModes)) {
+    throw new Error("Release evidence packet runtime modes do not match corpus contract");
+  }
+  if (!Number.isInteger(contract.repeats) || contract.repeats < 1 || contract.repeats !== opts.repeats) {
+    throw new Error("Release evidence repeat count does not match corpus contract");
+  }
+  if (!contract.task_manifests || typeof contract.task_manifests !== "object" || Array.isArray(contract.task_manifests)) {
+    throw new Error("Release evidence corpus contract must bind task_manifests");
+  }
+  const taskManifests = {};
+  const taskRepositories = {};
+  for (const task of tasks) {
+    const declaration = contract.task_manifests[task.id];
+    if (!declaration || typeof declaration !== "object") {
+      throw new Error(`Release evidence corpus contract is missing task manifest for ${task.id}`);
+    }
+    const manifestPath = assertPathInside(repoRoot, path.resolve(repoRoot, declaration.path ?? ""), `Task manifest contract path for ${task.id}`);
+    if (path.resolve(task.manifest_path) !== manifestPath) {
+      throw new Error(`Release evidence task manifest path does not match loaded task for ${task.id}`);
+    }
+    const manifestBytes = await readFile(manifestPath);
+    const manifestSha256 = sha256Bytes(manifestBytes);
+    if (manifestSha256 !== normalizeSha256(declaration.sha256, `Task manifest contract hash for ${task.id}`)) {
+      throw new Error(`Release evidence task manifest hash does not match for ${task.id}`);
+    }
+    taskManifests[task.id] = {
+      path: path.relative(repoRoot, manifestPath).replaceAll(path.sep, "/"),
+      sha256: manifestSha256,
+    };
+    taskRepositories[task.id] = task.repo;
+  }
+  if (Object.keys(contract.task_manifests).some((taskId) => !taskIds.includes(taskId))) {
+    throw new Error("Release evidence corpus contract binds an unselected task manifest");
+  }
+  const projectManifests = {};
+  for (const task of tasks) {
+    const manifest = task.repo_metadata?.codestory_project_manifest;
+    if (!manifest) continue;
+    const config = ALL_REPOS[task.repo];
+    const normalized = config?.manifest_codestory_project_manifest;
+    if (!normalized || normalized.sha256 !== manifest.sha256) {
+      throw new Error(`Release evidence project manifest declaration is inconsistent for ${task.id}`);
+    }
+    projectManifests[task.id] = {
+      path: path.relative(repoRoot, normalized.source_path).replaceAll(path.sep, "/"),
+      sha256: normalized.sha256,
+    };
+  }
+  if (JSON.stringify(contract.project_manifests ?? {}) !== JSON.stringify(projectManifests)) {
+    throw new Error("Release evidence corpus contract project manifest bindings do not match selected tasks");
+  }
+  return {
+    path: path.relative(repoRoot, contractPath).replaceAll(path.sep, "/"),
+    sha256: sha256Bytes(bytes),
+    corpus_id: contract.corpus_id,
+    task_ids: taskIds,
+    runtime_modes: selectedRuntimeModes,
+    repeats: contract.repeats,
+    task_manifests: taskManifests,
+    task_repositories: taskRepositories,
+    project_manifests: projectManifests,
+  };
+}
+
 function publicCoreCorpusAudit(tasks) {
   const classCounts = new Map();
   const repos = new Set();
@@ -1047,6 +1201,88 @@ function assertManifestRepoMaterializationAllowed(tasks, opts = {}) {
   }
 }
 
+async function gitCheckedOutput(args, cwd, timeoutMs) {
+  const result = await runCheckedProcess("git", args, { cwd, timeoutMs });
+  return result.stdout.trim();
+}
+
+async function installCodestoryProjectManifest(config, checkoutPath, opts) {
+  const manifest = config.manifest_codestory_project_manifest ?? null;
+  if (!manifest) {
+    return null;
+  }
+  const workspacePath = path.resolve(config.path);
+  assertPathInside(checkoutPath, workspacePath, "CodeStory project manifest workspace path");
+  const destination = assertPathInside(
+    workspacePath,
+    path.join(workspacePath, "codestory_project.json"),
+    "CodeStory project manifest destination",
+  );
+  const relativeDestination = path.relative(checkoutPath, destination).replaceAll(path.sep, "/");
+  if (!relativeDestination || relativeDestination.startsWith("../") || path.isAbsolute(relativeDestination)) {
+    throw new Error(`CodeStory project manifest destination escapes checkout: ${destination}`);
+  }
+  const tracked = await runProcess("git", ["-C", checkoutPath, "ls-files", "--error-unmatch", "--", relativeDestination], {
+    timeoutMs: opts.timeoutMs,
+  });
+  if (tracked.exitCode === 0) {
+    throw new Error(`Refusing to replace upstream-tracked ${relativeDestination} in ${config.name}`);
+  }
+  const sourceBytes = await readFile(manifest.source_path);
+  const sourceSha256 = sha256Bytes(sourceBytes);
+  if (sourceSha256 !== manifest.sha256) {
+    throw new Error(
+      `CodeStory project manifest hash mismatch for ${config.name}: expected ${manifest.sha256}, got ${sourceSha256}`,
+    );
+  }
+  const infoExclude = path.join(checkoutPath, ".git", "info", "exclude");
+  const ignoreEntry = `/${relativeDestination}`;
+  const currentExclude = existsSync(infoExclude) ? await readFile(infoExclude, "utf8") : "";
+  if (!currentExclude.split(/\r?\n/u).includes(ignoreEntry)) {
+    await writeFile(infoExclude, `${currentExclude}${currentExclude.endsWith("\n") || !currentExclude ? "" : "\n"}${ignoreEntry}\n`, "utf8");
+  }
+  await writeFile(destination, sourceBytes);
+  const installedBytes = await readFile(destination);
+  const installedSha256 = sha256Bytes(installedBytes);
+  if (installedSha256 !== manifest.sha256) {
+    throw new Error(`Installed CodeStory project manifest hash mismatch for ${config.name}`);
+  }
+  await gitCheckedOutput(["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination], repoRoot, opts.timeoutMs);
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  if (dirty) {
+    throw new Error(`Installing CodeStory project manifest dirtied ${config.name}: ${dirty}`);
+  }
+  return {
+    source_path: path.relative(repoRoot, manifest.source_path).replaceAll(path.sep, "/"),
+    declared_sha256: manifest.sha256,
+    installed_path: relativeDestination,
+    installed_sha256: installedSha256,
+    ignored: true,
+  };
+}
+
+async function scrubMaterializedCheckout(config, checkoutPath, opts) {
+  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+    timeoutMs: opts.timeoutMs,
+  });
+  await runCheckedProcess("git", ["-C", checkoutPath, "clean", "-ffdqx"], {
+    timeoutMs: opts.timeoutMs,
+  });
+  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, opts.timeoutMs)).toLowerCase();
+  if (head !== String(config.ref).toLowerCase()) {
+    throw new Error(`Materialized repo ${config.name} HEAD ${head} does not match pinned ref ${config.ref}`);
+  }
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  if (dirty) {
+    throw new Error(`Materialized repo ${config.name} is dirty after scrub: ${dirty}`);
+  }
+  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, opts.timeoutMs);
+  if (remaining) {
+    throw new Error(`Materialized repo ${config.name} retains untracked or ignored files after scrub: ${remaining}`);
+  }
+  config.installed_codestory_project_manifest = null;
+}
+
 async function materializeRepos(tasks, opts) {
   const repos = uniqueTaskRepos(tasks);
   if (!repos.size) {
@@ -1080,9 +1316,11 @@ async function materializeRepos(tasks, opts) {
     await runCheckedProcess("git", ["-C", checkoutPath, "checkout", "--detach", "FETCH_HEAD"], {
       timeoutMs: opts.timeoutMs,
     });
+    await scrubMaterializedCheckout(config, checkoutPath, opts);
     if (!existsSync(config.path)) {
       throw new Error(`Materialized repo ${name} is missing workspace path: ${config.path}`);
     }
+    config.installed_codestory_project_manifest = await installCodestoryProjectManifest(config, checkoutPath, opts);
   }
 }
 
@@ -2223,11 +2461,42 @@ function estimateCost(usage) {
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
 }
 
+const BENCHMARK_AGENT_RUN_ID = "shared-agent";
+
+function benchmarkAgentScopeArgs() {
+  return ["--profile", "agent", "--run-id", BENCHMARK_AGENT_RUN_ID];
+}
+
+function retrievalStatusCommandArgs(project) {
+  return [
+    "retrieval",
+    "status",
+    "--project",
+    project,
+    ...benchmarkAgentScopeArgs(),
+    "--format",
+    "json",
+  ];
+}
+
+function retrievalIndexCommandArgs(project) {
+  return [
+    "retrieval",
+    "index",
+    "--project",
+    project,
+    ...benchmarkAgentScopeArgs(),
+    "--refresh",
+    "auto",
+  ];
+}
+
 function packetCommandArgs(repoConfig, task, opts = {}) {
   const args = [
     "packet",
     "--project",
     repoConfig.path,
+    ...benchmarkAgentScopeArgs(),
     "--question",
     task?.prompt ?? repoConfig.prompt,
     "--budget",
@@ -2961,6 +3230,12 @@ async function repoProvenance(config) {
       ref: config.manifest_ref ?? null,
       workspace_root: config.manifest_workspace_root ?? null,
       checkout_path: config.manifest_checkout_path ?? null,
+      codestory_project_manifest: config.manifest_codestory_project_manifest
+        ? {
+            path: config.manifest_codestory_project_manifest.declared_path,
+            sha256: config.manifest_codestory_project_manifest.sha256,
+          }
+        : null,
     },
     configured: {
       url: config.url ?? null,
@@ -2974,6 +3249,7 @@ async function repoProvenance(config) {
     ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
+    installed_codestory_project_manifest: config.installed_codestory_project_manifest ?? null,
   };
 }
 
@@ -3074,7 +3350,7 @@ async function codestoryRetrievalStatusSnapshot(
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
-    ["retrieval", "status", "--project", project, "--format", "json"],
+    retrievalStatusCommandArgs(project),
     { timeoutMs, env },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -3185,14 +3461,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       const retrievalStarted = performance.now();
       const retrievalIndex = await runProcess(
         codestoryCli,
-        [
-          "retrieval",
-          "index",
-          "--project",
-          config.path,
-          "--refresh",
-          "auto",
-        ],
+        retrievalIndexCommandArgs(config.path),
         {
           env: childEnv,
           timeoutMs: opts.prepareCodestoryTimeoutMs,
@@ -3287,6 +3556,51 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
   };
 }
 
+function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
+  const trace = packet?.answer?.retrieval_trace ?? null;
+  const diagnostics = Array.isArray(trace?.packet_sidecar_diagnostics)
+    ? trace.packet_sidecar_diagnostics
+    : [];
+  const stageTimings = Array.isArray(trace?.retrieval_shadow?.stage_timings)
+    ? trace.retrieval_shadow.stage_timings
+    : [];
+  const semanticStages = stageTimings.filter(
+    (timing) => timing?.stage === "stage1b_semantic",
+  );
+  const completedSemanticStages = semanticStages.filter(
+    (timing) =>
+      timing?.completion_status === "completed"
+      && timing?.degraded !== true
+      && !timing?.stub_reason
+      && !timing?.cancel_reason,
+  );
+  const fullDiagnosticCount = diagnostics.filter(
+    (diagnostic) => diagnostic?.retrieval_mode === "full",
+  ).length;
+  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
+  return {
+    source: "packet.answer.retrieval_trace",
+    transport_mode: transportMode,
+    retrieval_contract: retrievalContract?.retrieval_contract ?? null,
+    embedding_engine: retrievalContract?.embedding_engine ?? null,
+    embedding_policy: retrievalContract?.execution_policy ?? null,
+    retrieval_mode:
+      diagnostics.length > 0 && fullDiagnosticCount === diagnostics.length ? "full" : null,
+    diagnostic_count: diagnostics.length,
+    full_diagnostic_count: fullDiagnosticCount,
+    semantic_stage_count: semanticStages.length,
+    completed_semantic_stage_count: completedSemanticStages.length,
+    invalid_semantic_stage_count: semanticStages.length - completedSemanticStages.length,
+    shadow_degraded_reason: trace?.retrieval_shadow?.degraded_reason ?? null,
+    shadow_error: trace?.retrieval_shadow?.error ?? null,
+    shadow_cancel_reason: trace?.retrieval_shadow?.cancel_reason ?? null,
+    semantic_fallback_count: trace?.semantic_fallback_count ?? null,
+    semantic_generation: trace?.retrieval_publication?.semantic_generation ?? null,
+    prepared_semantic_generation:
+      cachePreparation?.retrieval_status?.semantic_generation ?? null,
+  };
+}
+
 async function codestoryCacheProvenance(opts, config, observations = {}) {
   let codestoryCli;
   try {
@@ -3333,12 +3647,16 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
     codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
     cache_preparation: compactCachePreparation(observations.cache_preparation),
+    packet_embedding_execution: observations.packet_embedding_execution ?? null,
     transport_mode: observations.transport_mode ?? null,
     retrieval_status: retrievalStatus,
     retrieval_mode: retrievalStatus.retrieval_mode ?? null,
     semantic_generation: retrievalStatus.semantic_generation ?? null,
     embedding_engine_instance_id: retrievalStatus.embedding_engine_instance_id ?? null,
-    embedding_policy: retrievalStatus.embedding_policy ?? null,
+    embedding_policy:
+      retrievalStatus.embedding_policy
+      ?? observations.packet_embedding_execution?.embedding_policy
+      ?? null,
     manifest_embedding_backend: retrievalStatus.manifest_embedding_backend ?? null,
     doctor_status: doctor.status,
     doctor_exit_code: doctor.exit_code,
@@ -4141,11 +4459,6 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(
-    opts,
-    repoConfig,
-    packetRuntimeCacheObservations(opts, task.repo, "cold_cli_packet"),
-  );
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -4162,6 +4475,21 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
       parseError = error.message;
     }
   }
+  const cacheObservations = packetRuntimeCacheObservations(
+    opts,
+    task.repo,
+    "cold_cli_packet",
+  );
+  cacheObservations.packet_embedding_execution = packetEmbeddingExecutionProof(
+    packet,
+    cacheObservations.cache_preparation,
+    cacheObservations.transport_mode,
+  );
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    cacheObservations,
+  );
   const quality = packet
     ? scoreQualityFromText(packetPayloadText(packet), JSON.stringify(packet), task)
     : null;
@@ -5137,6 +5465,7 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
               machine_fingerprint:
                 process.env.CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT,
             },
+            corpus_contract: opts.releaseEvidenceCorpusContract,
             publishable: opts.publishable === true,
             repeats: opts.repeats,
             quality_gate_status:
@@ -6581,6 +6910,7 @@ async function main() {
     return;
   }
   const tasks = await loadTasks(opts);
+  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(tasks, opts);
   if (opts.publishable) {
     validatePublishableShape(opts, tasks);
   }
@@ -6722,6 +7052,9 @@ export {
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  benchmarkAgentScopeArgs,
+  retrievalIndexCommandArgs,
+  retrievalStatusCommandArgs,
   packetComposition,
   packetCommandArgs,
   packetForAgentPrompt,
@@ -6730,6 +7063,7 @@ export {
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
+  packetEmbeddingExecutionProof,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   cacheProvenanceBlockers,

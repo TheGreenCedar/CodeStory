@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { validatePacketCorpusContract } from "../codestory-release-evidence-gate.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const script = path.join(root, "scripts/codestory-release-evidence-gate.mjs");
@@ -31,6 +32,54 @@ function reattest(candidate, artifact, filePath) {
   candidate.artifacts[artifact].sha256 = createHash("sha256").update(bytes).digest("hex");
   candidate.artifacts[artifact].bytes = bytes.length;
 }
+
+test("v0.16 release corpus contract rejects an omitted or substituted packet task", () => {
+  const relativePath = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json";
+  const bytes = readFileSync(path.join(root, relativePath));
+  const contract = JSON.parse(bytes);
+  const identity = {
+    corpus_id: contract.corpus_id,
+    cache_id: "cold-inprocess-v1",
+    machine_fingerprint: "fixture/fingerprint",
+  };
+  const provenance = {
+    corpus_contract: {
+      path: relativePath,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      corpus_id: contract.corpus_id,
+      task_ids: contract.task_ids,
+      runtime_modes: contract.runtime_modes,
+      repeats: contract.repeats,
+      task_manifests: contract.task_manifests,
+      task_repositories: { "axios-request-dispatch": "axios" },
+      project_manifests: contract.project_manifests,
+    },
+  };
+  const profile = { corpus_contract: { path: relativePath, sha256: provenance.corpus_contract.sha256 } };
+  const rows = Array.from({ length: contract.repeats }, (_, index) => ({
+    repo: "axios",
+    task_id: "axios-request-dispatch",
+    mode: "cold_cli_packet",
+    repeat: index + 1,
+  }));
+  assert.doesNotThrow(() => validatePacketCorpusContract(provenance, rows, root, identity, profile));
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, [], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, repo: "substitute" })), root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, [...rows, { ...rows[0], repo: "substitute" }], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, task_id: "ripgrep-search-pipeline" })), root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+});
 
 test("fingerprint prefers a validated provisioned machine identity", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-provisioning-"));

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "commit": "56cfed37439c34c8e01710074a2f5cb72284d521",
+  "evidence_identity": {
+    "corpus_id": "codestory-release-corpus-v0.16-axios-js-ts-v1",
+    "cache_id": "cold-inprocess-v1",
+    "machine_fingerprint": "codestory-release-evidence-linux-arm64-v2/f9c76f5dd049f937f7fe4307747a466e65db4f05ccb65ad792a404f6f13140dd"
+  },
+  "corpus_contract": {
+    "path": "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json",
+    "sha256": "cca8326d9a10cf980778bc70e18864de012172c4a7c180d0e2c51a6704f605c2",
+    "task_manifest": {
+      "path": "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json",
+      "sha256": "3dfb002f0dd0b0683c8bca2314a405dc0d728aeeb8533247a6b17e316aed81c0"
+    }
+  },
+  "source_artifacts": {
+    "workflow_run_id": 29626819203,
+    "hosted_artifact": {
+      "id": 8424291310,
+      "name": "release-evidence-56cfed37439c34c8e01710074a2f5cb72284d521",
+      "sha256": "d3bb8113ac29059978780e4099c8cff292fc00ff73225f6635aa06271f6640a6",
+      "bytes": 100547,
+      "expires_at": "2026-08-17T02:37:09Z"
+    },
+    "stats": {
+      "path": "stats.json",
+      "sha256": "a3ddb6724e39c09ba415d777bdb3e147bacb2347a6e3a657a3270f6c15f38dd5",
+      "bytes": 5593
+    },
+    "packet": {
+      "path": "packet/packet-runtime-summary.json",
+      "sha256": "f0dbdce5801848506df2b327bb995e06b6e436acc21674980b4210be86c7a03c",
+      "bytes": 97608
+    },
+    "drill": {
+      "path": "drill/drill-suite-report.json",
+      "sha256": "e2d81efa54d3943cab3101e8cc79145f38e6cadd994a9603785a7a5d69ac185d",
+      "bytes": 12273
+    },
+    "provisioning": {
+      "path": "provisioning.json",
+      "sha256": "1be3114dfd0a32d6766071f30efccaedd8092e740e6eaf48ebca5a4fad9e5bd9",
+      "bytes": 3105
+    }
+  },
+  "quality": {
+    "retrieval_status": "full",
+    "serde_anchor_resolution": "3/3",
+    "packet_rows": 3,
+    "packet_quality_pass_rows": 3,
+    "packet_publishable_blockers": []
+  },
+  "budget_policy": {
+    "command_seconds_multiplier": 1.25,
+    "convergence_seconds_multiplier": 1.15,
+    "packet_seconds_multiplier": 1.1,
+    "storage_growth_ratio": 1.1,
+    "seconds_rounding": "ceil to the next 0.01 seconds"
+  },
+  "metrics": {
+    "status_seconds": 0.014995754,
+    "local_grounding_seconds": 0.046535663,
+    "convergence_seconds": 15.438115102,
+    "packet_seconds": 1.974697,
+    "search_seconds": 6.573140943,
+    "indexing_seconds": 20.151733549,
+    "storage_bytes": 609245502
+  }
+}

@@ -4,6 +4,14 @@
 
 ### Changed
 
+- v0.16 release evidence now uses a checked Axios JavaScript/TypeScript corpus
+  with three cold CLI repeats. The benchmark binds the exact task-manifest
+  bytes and rejects missing, substituted, or extra packet rows. Ripgrep's
+  pinned Rust task and project template remain as follow-up diagnostics after a
+  retained run missed its preregistered packet-quality thresholds. Cache
+  preparation, status capture, and packet measurement share one explicit agent
+  retrieval namespace, while cold packet provenance binds an executed semantic
+  stage, full sidecar diagnostics, and zero fallback to the prepared generation.
 - Affected analysis now resolves native workspace path identities once per
   bounded operation, preserving Unix device/inode and Windows volume/file
   identity without pairwise metadata scans or long-lived path caches.
@@ -53,6 +61,13 @@
   protected Windows artifact records the same native tool versions when that
   lane builds from source. The hosted lane remains source/protocol evidence
   rather than a packaged or Vulkan-hardware claim.
+- Linux ARM64 release builds now resolve the pinned llama.cpp binding's
+  incompatible fixed-ARM and all-variant CMake selectors in the checked-in
+  Cargo build environment. Packages retain the portable runtime-loaded ARM CPU
+  backend beside Vulkan without runner-local patches.
+- Linux ARM64 release evidence now checksum-binds an explicit Serde project
+  manifest, keeping intentional compiler-failure UI fixtures outside the valid
+  source corpus without weakening fail-closed production indexing.
 - Draft source CI now restores exact-lock retrieval output or narrowly scoped
   prior-lock output before rebuilding. The base retrieval lane serially seeds
   the exact five test-profile targets used by draft proof, while a versioned

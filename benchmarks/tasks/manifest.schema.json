@@ -87,6 +87,25 @@
             "minLength": 1
           },
           "uniqueItems": true
+        },
+        "codestory_project_manifest": {
+          "description": "Optional checksum-bound project manifest installed only into a harness-owned pinned checkout before indexing.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
         }
       }
     },
