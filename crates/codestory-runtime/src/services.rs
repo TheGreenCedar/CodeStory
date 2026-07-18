@@ -178,7 +178,11 @@ impl ActivationTarget {
     fn matches(&self, other: &Self) -> bool {
         self.project_id == other.project_id
             && self.workspace_id == other.workspace_id
-            && codestory_workspace::same_workspace_path(&self.storage_path, &other.storage_path)
+            && (self.storage_path == other.storage_path
+                || codestory_workspace::same_workspace_path(
+                    &self.storage_path,
+                    &other.storage_path,
+                ))
     }
 }
 
@@ -1492,6 +1496,17 @@ mod activation_tests {
         let aliased = ActivationTarget::new(project.path(), &alias);
 
         assert!(target.matches(&aliased));
+    }
+
+    #[test]
+    fn activation_target_exact_storage_path_does_not_reobserve_filesystem_identity() {
+        let project = tempfile::tempdir().expect("project");
+        let storage = project.path().join("codestory\0.db");
+
+        let target = ActivationTarget::new(project.path(), &storage);
+        let same_target = target.clone();
+
+        assert!(target.matches(&same_target));
     }
 
     #[test]

@@ -165,6 +165,30 @@ jobs:
   assert.match(basicWorkflowViolations("fixture.yml", invalid).join("\n"), /full-length SHA/u);
 });
 
+test("hosted Linux calibration keeps its bounded per-run timeout", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  for (const [name, replacement] of [
+    ["removed", ""],
+    ["shortened", "--timeout-secs 900"],
+  ]) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      const packaged = workflows.get("packaged-platform-proof.yml");
+      const step = draftStep(
+        packaged.jobs.build,
+        "Packaged per-user server calibration or qualification",
+      );
+      step.run = step.run.replace("--timeout-secs 1800", replacement);
+
+      assert.match(
+        validateWorkflows(workflows).join("\n"),
+        /step Packaged per-user server calibration or qualification must run --timeout-secs 1800/u,
+      );
+    });
+  }
+});
+
 test("Cargo lock policy reads executable step commands", () => {
   const workflow = parseWorkflow(`
 on: { workflow_dispatch: null }
