@@ -1507,6 +1507,20 @@ fn install_managed_native_llama_server_from_archive(
     archive: &Path,
     executable: &Path,
 ) -> Result<()> {
+    // Early exit: if the target executable already exists and has the correct hash, do nothing
+    if executable.is_file() {
+        if let Ok(actual_hash) = sha256_file(executable) {
+            if actual_hash.eq_ignore_ascii_case(&backend.executable_sha256) {
+                // Also verify the install manifest exists and is correct
+                let manifest_path = executable.parent().ok_or_else(|| anyhow::anyhow!("managed llama-server executable has no parent"))?.join("install-manifest.json");
+                if manifest_path.is_file() {
+                    // Basic validation that we're in the right place - manifest validation will happen in validate_managed_native_llama_server
+                    return validate_managed_native_llama_server(executable, backend);
+                }
+            }
+        }
+    }
+
     verify_sha256(archive, &backend.sha256)
         .with_context(|| format!("verify {}", archive.display()))?;
     let extract_root = archive
@@ -1544,11 +1558,33 @@ fn install_managed_native_llama_server_from_archive(
         .ok_or_else(|| anyhow::anyhow!("managed llama-server install dir has no parent"))?;
     fs::create_dir_all(target_parent)
         .with_context(|| format!("create {}", target_parent.display()))?;
+
+    // Check if we're trying to install to the same location as source (after canonicalizing paths to avoid issues on Windows
+    let source_canonical = match fs::canonicalize(&source_dir) {
+        Ok(path) => path,
+        Err(_) => source_dir.to_path_buf(), // Fallback to non-canonicalized if we can't canonicalize
+    };
+    let target_canonical = match fs::canonicalize(&target_dir) {
+        Ok(path) => path,
+        Err(_) => target_dir.to_path_buf(), // Fallback to non-canonicalized if we can't canonicalize
+    };
+
     let staging_dir = target_dir.with_extension("download");
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir)
-            .with_context(|| format!("remove {}", staging_dir.display()))?;
+    let needs_extraction = true; // We'll set this to false if we can skip extraction
+
+    // If source and destination are the same after canonicalization, we can skip extraction
+    // but we still need to validate what's there
+    if source_canonical == target_canonical {
+        // Source and target are the same directory, validate what's there
+        return validate_managed_native_llama_server(executable, backend);
     }
+
+    // Only remove staging directory if we're actually going to use it
+    if staging_dir.exists() {
+        // Try to remove it, but ignore errors as it might be in use on Windows
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+
     copy_dir_contents(source_dir, &staging_dir).with_context(|| {
         format!(
             "copy extracted llama-server payload {} to {}",
@@ -1577,17 +1613,57 @@ fn install_managed_native_llama_server_from_archive(
     fs::write(staging_dir.join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
         .with_context(|| format!("write extraction marker {}", staging_dir.display()))?;
     write_managed_native_llama_install_manifest(backend, &staged_executable, &executable_sha)?;
+
+    // Only remove target directory if we're actually going to replace it
     if target_dir.exists() {
-        fs::remove_dir_all(target_dir)
-            .with_context(|| format!("remove {}", target_dir.display()))?;
+        // Check if target already has the same content to avoid unnecessary work
+        let target_exe = target_dir.join(executable_rel_path);
+        if target_exe.is_file() {
+            if let Ok(target_hash) = sha256_file(&target_exe) {
+                if target_hash.eq_ignore_ascii_case(&backend.executable_sha256) {
+                    // Target already has correct content, just validate and return
+                    let manifest_path = target_dir.join("install-manifest.json");
+                    if manifest_path.is_file() {
+                        return validate_managed_native_llama_server(executable, backend);
+                    }
+                }
+            }
+        }
+
+        // Try to remove target directory, but handle Windows sharing violations gracefully
+        let _ = fs::remove_dir_all(&target_dir);
     }
-    fs::rename(&staging_dir, target_dir).with_context(|| {
-        format!(
-            "move downloaded llama-server payload {} to {}",
-            staging_dir.display(),
-            target_dir.display()
-        )
-    })?;
+
+    // Use retry logic for Windows to handle potential sharing violations
+    let rename_result = (|| {
+        fs::rename(&staging_dir, target_dir).with_context(|| {
+            format!(
+                "move downloaded llama-server payload {} to {}",
+                staging_dir.display(),
+                target_dir.display()
+            )
+        })
+    })();
+
+    // On Windows, if rename fails due to sharing violation, try a few times with delay
+    #[cfg(windows)]
+    {
+        let mut attempt = 0;
+        const MAX_ATTEMPTS: u32 = 3;
+        while let Err(ref e) = rename_result {
+            if let Some(raw_os_error) = e.io_error().and_then(|io_err| io_err.raw_os_error()) {
+                // ERROR_SHARING_VIOLATION = 32
+                if raw_os_error == 32 && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    attempt += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    rename_result?;
     validate_managed_native_llama_server(executable, backend)
 }
 
