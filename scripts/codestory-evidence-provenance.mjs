@@ -216,6 +216,21 @@ export function packetEmbeddingExecutionProofBlockers(provenance) {
   if (!Number.isInteger(proof.semantic_stage_count) || proof.semantic_stage_count <= 0) {
     reasons.push("cold packet embedding execution has no semantic stage");
   }
+  if (proof.completed_semantic_stage_count !== proof.semantic_stage_count) {
+    reasons.push("cold packet embedding execution contains an incomplete semantic stage");
+  }
+  if (proof.invalid_semantic_stage_count !== 0) {
+    reasons.push("cold packet embedding execution contains a degraded, stubbed, or cancelled semantic stage");
+  }
+  if (proof.shadow_degraded_reason != null) {
+    reasons.push("cold packet retrieval shadow is degraded");
+  }
+  if (proof.shadow_error != null) {
+    reasons.push("cold packet retrieval shadow contains an error");
+  }
+  if (proof.shadow_cancel_reason != null) {
+    reasons.push("cold packet retrieval shadow was cancelled");
+  }
   if (proof.semantic_fallback_count !== 0) {
     reasons.push(`cold packet semantic fallback count=${proof.semantic_fallback_count ?? "unknown"}; expected 0`);
   }

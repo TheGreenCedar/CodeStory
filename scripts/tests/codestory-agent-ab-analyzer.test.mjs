@@ -143,7 +143,13 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
         retrieval_shadow: {
           stage_timings: [
             { stage: "stage1_lexical" },
-            { stage: "stage1b_semantic" },
+            {
+              stage: "stage1b_semantic",
+              completion_status: "completed",
+              degraded: false,
+              stub_reason: null,
+              cancel_reason: null,
+            },
           ],
         },
       },
@@ -162,6 +168,11 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
       diagnostic_count: 2,
       full_diagnostic_count: 2,
       semantic_stage_count: 1,
+      completed_semantic_stage_count: 1,
+      invalid_semantic_stage_count: 0,
+      shadow_degraded_reason: null,
+      shadow_error: null,
+      shadow_cancel_reason: null,
       semantic_fallback_count: 0,
       semantic_generation: "semantic-1",
       prepared_semantic_generation: "semantic-1",
@@ -1886,6 +1897,11 @@ function localColdPacketCacheProvenance(overrides = {}) {
       diagnostic_count: 2,
       full_diagnostic_count: 2,
       semantic_stage_count: 1,
+      completed_semantic_stage_count: 1,
+      invalid_semantic_stage_count: 0,
+      shadow_degraded_reason: null,
+      shadow_error: null,
+      shadow_cancel_reason: null,
       semantic_fallback_count: 0,
       semantic_generation: "proj-current",
       prepared_semantic_generation: "proj-current",
@@ -1911,6 +1927,11 @@ test("cold packet execution proof replaces only unavailable process-local identi
     ["diagnostic_count", 0, /no sidecar diagnostics/],
     ["full_diagnostic_count", 1, /non-full sidecar diagnostic/],
     ["semantic_stage_count", 0, /no semantic stage/],
+    ["completed_semantic_stage_count", 0, /incomplete semantic stage/],
+    ["invalid_semantic_stage_count", 1, /degraded, stubbed, or cancelled semantic stage/],
+    ["shadow_degraded_reason", "degraded", /retrieval shadow is degraded/],
+    ["shadow_error", "failed", /retrieval shadow contains an error/],
+    ["shadow_cancel_reason", "deadline", /retrieval shadow was cancelled/],
     ["semantic_fallback_count", 1, /semantic fallback count=1/],
     ["semantic_generation", "semantic-2", /does not match the prepared generation/],
   ]) {
@@ -1919,6 +1940,48 @@ test("cold packet execution proof replaces only unavailable process-local identi
     const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: provenance });
     assert.match(blockers.join("\n"), message);
   }
+});
+
+test("skipped or degraded semantic stages cannot replace live engine identity", () => {
+  const preparation = {
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "cpu_explicit",
+    },
+    retrieval_status: { semantic_generation: "proj-current" },
+  };
+  const packet = {
+    answer: {
+      retrieval_trace: {
+        retrieval_publication: { semantic_generation: "proj-current" },
+        semantic_fallback_count: 0,
+        packet_sidecar_diagnostics: [{ retrieval_mode: "full" }],
+        retrieval_shadow: {
+          degraded_reason: "semantic_unavailable",
+          error: "semantic failed",
+          cancel_reason: "deadline",
+          stage_timings: [{
+            stage: "stage1b_semantic",
+            completion_status: "skipped",
+            degraded: true,
+            stub_reason: "stubbed",
+            cancel_reason: "deadline",
+          }],
+        },
+      },
+    },
+  };
+  const proof = packetEmbeddingExecutionProof(packet, preparation, "cold_cli_packet");
+  const provenance = localColdPacketCacheProvenance({ packet_embedding_execution: proof });
+  const blockers = cacheProvenanceBlockers({ codestory_cache_provenance: provenance });
+
+  assert.equal(proof.completed_semantic_stage_count, 0);
+  assert.equal(proof.invalid_semantic_stage_count, 1);
+  assert.match(blockers.join("\n"), /incomplete semantic stage/);
+  assert.match(blockers.join("\n"), /retrieval shadow is degraded/);
+  assert.match(blockers.join("\n"), /retrieval shadow contains an error/);
+  assert.match(blockers.join("\n"), /retrieval shadow was cancelled/);
 });
 
 test("warm process provenance still requires live engine identity and semantic readiness", () => {

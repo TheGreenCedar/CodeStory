@@ -48,23 +48,35 @@ test("v0.16 release corpus contract rejects an omitted or substituted packet tas
       sha256: createHash("sha256").update(bytes).digest("hex"),
       corpus_id: contract.corpus_id,
       task_ids: contract.task_ids,
+      runtime_modes: contract.runtime_modes,
+      repeats: contract.repeats,
       task_manifests: contract.task_manifests,
+      task_repositories: { "axios-request-dispatch": "axios" },
       project_manifests: contract.project_manifests,
     },
   };
   const profile = { corpus_contract: { path: relativePath, sha256: provenance.corpus_contract.sha256 } };
-  const rows = contract.task_ids.map((task_id) => ({ task_id }));
+  const rows = Array.from({ length: contract.repeats }, (_, index) => ({
+    repo: "axios",
+    task_id: "axios-request-dispatch",
+    mode: "cold_cli_packet",
+    repeat: index + 1,
+  }));
   assert.doesNotThrow(() => validatePacketCorpusContract(provenance, rows, root, identity, profile));
   assert.throws(
     () => validatePacketCorpusContract(provenance, [], root, identity, profile),
     /do not exactly match the checked-in release task scope/,
   );
   assert.throws(
-    () => validatePacketCorpusContract(provenance, [{ task_id: "ripgrep-search-pipeline" }], root, identity, profile),
+    () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, repo: "substitute" })), root, identity, profile),
     /do not exactly match the checked-in release task scope/,
   );
   assert.throws(
-    () => validatePacketCorpusContract(provenance, [...rows, { task_id: "redis-server-event-loop" }], root, identity, profile),
+    () => validatePacketCorpusContract(provenance, [...rows, { ...rows[0], repo: "substitute" }], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, task_id: "ripgrep-search-pipeline" })), root, identity, profile),
     /do not exactly match the checked-in release task scope/,
   );
 });

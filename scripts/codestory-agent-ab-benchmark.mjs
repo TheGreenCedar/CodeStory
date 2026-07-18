@@ -904,7 +904,7 @@ function sortedUniqueStrings(values, label) {
   return sorted;
 }
 
-async function loadReleaseEvidenceCorpusContract(tasks) {
+async function loadReleaseEvidenceCorpusContract(tasks, opts) {
   const declaredPath = process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT?.trim();
   if (!process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT) {
     if (declaredPath) {
@@ -934,10 +934,20 @@ async function loadReleaseEvidenceCorpusContract(tasks) {
       `Release evidence task selection does not match corpus contract: expected ${taskIds.join(", ")}, got ${loadedTaskIds.join(", ")}`,
     );
   }
+  const selectedRuntimeModes = opts.packetRuntimeMode === "both"
+    ? ["cold_cli_packet", "warm_stdio_packet"]
+    : [`${opts.packetRuntimeMode.replaceAll("-", "_")}_packet`];
+  if (JSON.stringify(contract.runtime_modes) !== JSON.stringify(selectedRuntimeModes)) {
+    throw new Error("Release evidence packet runtime modes do not match corpus contract");
+  }
+  if (!Number.isInteger(contract.repeats) || contract.repeats < 1 || contract.repeats !== opts.repeats) {
+    throw new Error("Release evidence repeat count does not match corpus contract");
+  }
   if (!contract.task_manifests || typeof contract.task_manifests !== "object" || Array.isArray(contract.task_manifests)) {
     throw new Error("Release evidence corpus contract must bind task_manifests");
   }
   const taskManifests = {};
+  const taskRepositories = {};
   for (const task of tasks) {
     const declaration = contract.task_manifests[task.id];
     if (!declaration || typeof declaration !== "object") {
@@ -956,6 +966,7 @@ async function loadReleaseEvidenceCorpusContract(tasks) {
       path: path.relative(repoRoot, manifestPath).replaceAll(path.sep, "/"),
       sha256: manifestSha256,
     };
+    taskRepositories[task.id] = task.repo;
   }
   if (Object.keys(contract.task_manifests).some((taskId) => !taskIds.includes(taskId))) {
     throw new Error("Release evidence corpus contract binds an unselected task manifest");
@@ -982,7 +993,10 @@ async function loadReleaseEvidenceCorpusContract(tasks) {
     sha256: sha256Bytes(bytes),
     corpus_id: contract.corpus_id,
     task_ids: taskIds,
+    runtime_modes: selectedRuntimeModes,
+    repeats: contract.repeats,
     task_manifests: taskManifests,
+    task_repositories: taskRepositories,
     project_manifests: projectManifests,
   };
 }
@@ -3550,6 +3564,16 @@ function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) 
   const stageTimings = Array.isArray(trace?.retrieval_shadow?.stage_timings)
     ? trace.retrieval_shadow.stage_timings
     : [];
+  const semanticStages = stageTimings.filter(
+    (timing) => timing?.stage === "stage1b_semantic",
+  );
+  const completedSemanticStages = semanticStages.filter(
+    (timing) =>
+      timing?.completion_status === "completed"
+      && timing?.degraded !== true
+      && !timing?.stub_reason
+      && !timing?.cancel_reason,
+  );
   const fullDiagnosticCount = diagnostics.filter(
     (diagnostic) => diagnostic?.retrieval_mode === "full",
   ).length;
@@ -3564,9 +3588,12 @@ function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) 
       diagnostics.length > 0 && fullDiagnosticCount === diagnostics.length ? "full" : null,
     diagnostic_count: diagnostics.length,
     full_diagnostic_count: fullDiagnosticCount,
-    semantic_stage_count: stageTimings.filter(
-      (timing) => timing?.stage === "stage1b_semantic",
-    ).length,
+    semantic_stage_count: semanticStages.length,
+    completed_semantic_stage_count: completedSemanticStages.length,
+    invalid_semantic_stage_count: semanticStages.length - completedSemanticStages.length,
+    shadow_degraded_reason: trace?.retrieval_shadow?.degraded_reason ?? null,
+    shadow_error: trace?.retrieval_shadow?.error ?? null,
+    shadow_cancel_reason: trace?.retrieval_shadow?.cancel_reason ?? null,
     semantic_fallback_count: trace?.semantic_fallback_count ?? null,
     semantic_generation: trace?.retrieval_publication?.semantic_generation ?? null,
     prepared_semantic_generation:
@@ -6881,7 +6908,7 @@ async function main() {
     return;
   }
   const tasks = await loadTasks(opts);
-  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(tasks);
+  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(tasks, opts);
   if (opts.publishable) {
     validatePublishableShape(opts, tasks);
   }
