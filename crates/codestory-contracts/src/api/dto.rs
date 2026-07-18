@@ -1290,8 +1290,9 @@ pub struct GroundingSymbolDigestDto {
     pub summary: Option<String>,
     #[serde(default)]
     pub edge_digest: Vec<String>,
-    /// Collector-backed evidence metadata, when the symbol comes from a
-    /// structural source span rather than parser-backed graph coverage.
+    /// Diagnostic source-range evidence metadata, when the symbol comes from
+    /// a structural collector or endpoint schema rather than parser-backed
+    /// graph coverage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_tier: Option<PacketEvidenceTierDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

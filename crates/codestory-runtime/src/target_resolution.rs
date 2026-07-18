@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use codestory_contracts::api::{
-    ApiError, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, SearchHit, SearchHitOrigin,
-    SearchMatchQualityDto,
+    ApiError, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
 };
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
-use crate::agent::packet_evidence::decorate_search_hit_evidence;
+use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
 use crate::{
     AppController, compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank,
 };
@@ -122,7 +122,15 @@ pub(crate) fn is_graph_target_candidate(hit: &SearchHit) -> bool {
     !matches!(
         hit.match_quality,
         Some(SearchMatchQualityDto::SemanticSuggestion | SearchMatchQualityDto::RepoText)
-    )
+    ) && hit.evidence_tier != Some(PacketEvidenceTierDto::StructuralText)
+        && !matches!(
+            hit.resolution_status,
+            Some(
+                PacketEvidenceResolutionDto::SourceRangeOnly
+                    | PacketEvidenceResolutionDto::Unresolved
+                    | PacketEvidenceResolutionDto::DiagnosticOnly
+            )
+        )
 }
 
 pub(crate) fn is_name_resolvable_graph_target(query: &str, hit: &SearchHit) -> bool {
@@ -560,13 +568,7 @@ impl AppController {
         match target {
             TargetSelection::Id(id) => {
                 let details = self.node_details(NodeDetailsRequest { id: id.clone() })?;
-                Ok(TargetResolution::Resolved(Box::new(ResolvedTarget {
-                    selector: TargetSelector::Id,
-                    requested: id.0,
-                    file_filter: None,
-                    selected: search_hit_from_node(&details),
-                    alternatives: Vec::new(),
-                })))
+                Ok(resolve_id_target(id, &details))
             }
             TargetSelection::Query { query, choose } => {
                 self.resolve_query_target(query, choose, file_filter)
@@ -749,6 +751,8 @@ fn compare_resolution_candidates(
 }
 
 fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
+    let diagnostic_evidence =
+        diagnostic_source_evidence(node.file_path.as_deref(), node.canonical_id.as_deref());
     let mut hit = SearchHit {
         node_id: node.id.clone(),
         display_name: node.display_name.clone(),
@@ -759,16 +763,46 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         origin: SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
-        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        evidence_producer: Some("node_details".to_string()),
-        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        evidence_tier: Some(
+            diagnostic_evidence
+                .map(|evidence| evidence.tier)
+                .unwrap_or(PacketEvidenceTierDto::ResolvedGraph),
+        ),
+        evidence_producer: Some(
+            diagnostic_evidence
+                .map(|evidence| evidence.producer)
+                .unwrap_or("node_details")
+                .to_string(),
+        ),
+        resolution_status: Some(
+            diagnostic_evidence
+                .map(|evidence| evidence.resolution)
+                .unwrap_or(PacketEvidenceResolutionDto::Resolved),
+        ),
         loss_reason: None,
         coverage_role: None,
-        eligible_for_sufficiency: Some(true),
+        eligible_for_sufficiency: None,
         score_breakdown: None,
     };
     decorate_search_hit_evidence(&mut hit);
     hit
+}
+
+fn resolve_id_target(id: NodeId, details: &NodeDetailsDto) -> TargetResolution {
+    let selected = search_hit_from_node(details);
+    if !selected.resolvable || !is_graph_target_candidate(&selected) {
+        return TargetResolution::Rejected(format!(
+            "id_resolution: Node `{}` is source-range-only diagnostic evidence and cannot be selected as a typed graph target. Its cited source remains available through the node and snippet surfaces.",
+            id.0
+        ));
+    }
+    TargetResolution::Resolved(Box::new(ResolvedTarget {
+        selector: TargetSelector::Id,
+        requested: id.0,
+        file_filter: None,
+        selected,
+        alternatives: Vec::new(),
+    }))
 }
 
 fn no_query_match_error(project_root: &Path, query: &str, file_filter: Option<&str>) -> String {
@@ -955,7 +989,7 @@ mod tests {
 
     #[test]
     fn node_details_target_keeps_structural_text_evidence_explicit() {
-        let hit = search_hit_from_node(&NodeDetailsDto {
+        let details = NodeDetailsDto {
             id: NodeId("cargo-package".to_string()),
             kind: NodeKind::PACKAGE,
             display_name: "demo".to_string(),
@@ -969,7 +1003,8 @@ mod tests {
             end_col: Some(8),
             member_access: None,
             route_endpoint: None,
-        });
+        };
+        let hit = search_hit_from_node(&details);
 
         assert_eq!(
             hit.evidence_tier,
@@ -984,6 +1019,52 @@ mod tests {
             Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert!(hit.resolvable, "the cited source range remains navigable");
+        assert!(!is_graph_target_candidate(&hit));
+        assert!(!is_resolvable_graph_target("demo", &hit));
+        assert!(matches!(
+            resolve_id_target(details.id.clone(), &details),
+            TargetResolution::Rejected(message)
+                if message.contains("source-range-only diagnostic evidence")
+        ));
+    }
+
+    #[test]
+    fn direct_id_openapi_target_keeps_exact_source_identity_but_rejects_typed_resolution() {
+        let details = NodeDetailsDto {
+            id: NodeId("openapi-users".to_string()),
+            kind: NodeKind::FUNCTION,
+            display_name: "GET /api/users".to_string(),
+            serialized_name: "GET /api/users".to_string(),
+            qualified_name: None,
+            canonical_id: Some("openapi:endpoint:GET /api/users".to_string()),
+            file_path: Some("openapi.json".to_string()),
+            start_line: Some(8),
+            start_col: Some(1),
+            end_line: Some(8),
+            end_col: Some(16),
+            member_access: None,
+            route_endpoint: None,
+        };
+        let hit = search_hit_from_node(&details);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTierDto::ExactSource));
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert!(hit.resolvable, "the cited source range remains navigable");
+        assert!(!is_graph_target_candidate(&hit));
+        assert!(matches!(
+            resolve_id_target(details.id.clone(), &details),
+            TargetResolution::Rejected(message)
+                if message.contains("source-range-only diagnostic evidence")
+        ));
     }
 
     #[test]

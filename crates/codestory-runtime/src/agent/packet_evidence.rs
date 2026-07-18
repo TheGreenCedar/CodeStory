@@ -14,6 +14,31 @@ const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
 pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticSourceEvidence {
+    pub(crate) tier: PacketEvidenceTier,
+    pub(crate) producer: &'static str,
+    pub(crate) resolution: PacketEvidenceResolution,
+}
+
+pub(crate) fn diagnostic_source_evidence(
+    path: Option<&str>,
+    canonical_id: Option<&str>,
+) -> Option<DiagnosticSourceEvidence> {
+    if canonical_id.is_some_and(|value| value.starts_with("openapi:endpoint:")) {
+        return Some(DiagnosticSourceEvidence {
+            tier: PacketEvidenceTier::ExactSource,
+            producer: OPENAPI_ENDPOINT_SCHEMA_PRODUCER,
+            resolution: PacketEvidenceResolution::SourceRangeOnly,
+        });
+    }
+    structural_text_producer_for_path(path).map(|producer| DiagnosticSourceEvidence {
+        tier: PacketEvidenceTier::StructuralText,
+        producer,
+        resolution: PacketEvidenceResolution::SourceRangeOnly,
+    })
+}
+
 pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     let diagnostic_source_proof = hit_is_diagnostic_source_proof(hit);
     let tier = evidence_tier_for_hit(hit);

@@ -1,7 +1,5 @@
 use super::*;
-use crate::agent::packet_evidence::{
-    evidence_is_sufficiency_eligible, structural_text_producer_for_path,
-};
+use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
 use crate::trail_story::build_trail_story;
 use codestory_contracts::api::SearchHitOrigin;
 #[cfg(test)]
@@ -245,7 +243,8 @@ fn symbol_digest(
     } else {
         display_name.to_string()
     };
-    let evidence_producer = structural_text_producer_for_path(relative_file_path);
+    let diagnostic_evidence =
+        diagnostic_source_evidence(relative_file_path, node.canonical_id.as_deref());
 
     GroundingSymbolDigestDto {
         id: NodeId::from(node.id),
@@ -258,11 +257,9 @@ fn symbol_digest(
         member_count,
         summary: summaries.get(&node.id).map(|record| record.summary.clone()),
         edge_digest: edge_digests.get(&node.id).cloned().unwrap_or_default(),
-        evidence_tier: evidence_producer
-            .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
-        evidence_producer: evidence_producer.map(str::to_string),
-        resolution_status: evidence_producer
-            .map(|_| codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
+        evidence_tier: diagnostic_evidence.map(|evidence| evidence.tier),
+        evidence_producer: diagnostic_evidence.map(|evidence| evidence.producer.to_string()),
+        resolution_status: diagnostic_evidence.map(|evidence| evidence.resolution),
     }
 }
 
@@ -573,7 +570,7 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         .symbol
         .resolution_status
         .unwrap_or(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved);
-    SearchHit {
+    let mut hit = SearchHit {
         node_id: candidate.symbol.id.clone(),
         display_name: candidate.name.clone(),
         kind: candidate.symbol.kind,
@@ -592,10 +589,7 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         resolution_status: Some(resolution_status),
         loss_reason: None,
         coverage_role: None,
-        eligible_for_sufficiency: Some(evidence_is_sufficiency_eligible(
-            evidence_tier,
-            resolution_status,
-        )),
+        eligible_for_sufficiency: None,
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.45,
             semantic: 0.0,
@@ -607,7 +601,9 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
             final_rank_reason: None,
             provenance: Vec::new(),
         }),
-    }
+    };
+    decorate_search_hit_evidence(&mut hit);
+    hit
 }
 
 impl AppController {
@@ -1535,6 +1531,82 @@ mod tests {
         assert_eq!(
             hit.evidence_tier,
             Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn grounding_snapshot_preserves_openapi_endpoint_source_identity() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let schema = temp.path().join("openapi.json");
+        std::fs::write(&schema, "{\"openapi\":\"3.0.0\"}\n").expect("write schema");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                12,
+                &schema,
+                Node {
+                    id: CoreNodeId(102),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /api/users".to_string()),
+                    file_node_id: Some(CoreNodeId(12)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert OpenAPI endpoint node");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("grounding snapshot");
+        let symbol = snapshot
+            .files
+            .iter()
+            .flat_map(|file| file.symbols.iter())
+            .find(|symbol| symbol.label.starts_with("GET /api/users"))
+            .expect("OpenAPI endpoint symbol");
+
+        assert_eq!(
+            symbol.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+        );
+        assert_eq!(
+            symbol.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(
+            symbol.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+
+        let candidate = RecommendationCandidate {
+            symbol,
+            name: "GET /api/users".to_string(),
+            path: Some("openapi.json".to_string()),
+            order: 0,
+        };
+        let hit = search_hit_from_grounding_recommendation(&candidate);
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
         );
         assert_eq!(
             hit.resolution_status,
