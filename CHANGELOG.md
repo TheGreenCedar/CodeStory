@@ -34,7 +34,7 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 - Project switching now preserves isolated per-project state across A/B/A MCP routing. Requests require an explicit project, and status remains observational instead of activating or repairing a repository.
 - `affected` now handles native path identity, renames, copies, stale evidence, and bounded results more accurately across Unix and Windows.
 - CLI JSON failures retain their runtime error codes and details across search, packet, activation, and retrieval indexing.
-- Route-tracing packets now require cited executable endpoints, ordered claims, and one matching directed call graph before reporting sufficient. Self-edges, unrelated graph neighborhoods, generic helpers, fixture prose, and wrong-kind symbols fail closed with bounded follow-up gaps.
+- Route-tracing packets now require cited executable endpoints in explicit question order plus one matching directed call graph before reporting sufficient. Self-edges, unrelated graph neighborhoods, generic helpers, fixture prose, and wrong-kind symbols fail closed with bounded follow-up gaps.
 - Rust 2024 sources, including `unsafe extern` blocks and let-chains, are now accepted. Dart direct-call extraction has been updated for the current grammar shape.
 - Linux ARM64 packages retain the portable runtime-loaded CPU backend alongside Vulkan. Windows packages use architecture-matched Vulkan components rather than mutable runner-image contents.
 - Updated `serde_with` to 3.21.0, removing the affected `KeyValueMap` panic advisory while preserving CodeStory's existing DTO encoding.
