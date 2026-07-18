@@ -14,6 +14,7 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 
 ### Reliability and compatibility
 
+- Windows source builds now use stable file-handle identity and replace preexisting hard-linked DLLs before runtime staging, allowing Rust 1.97.1 builds to complete.
 - Safe refreshes preserve the last verified index. Incomplete reads, cancellation, or concurrent source changes cannot publish a partial generation or mix results from different generations.
 - Existing semantic indexes rebuild once after upgrading. The last complete index remains available while the replacement is prepared.
 - Project switching now preserves isolated per-project state across A/B/A MCP routing. Requests require an explicit project, and status remains observational instead of activating or repairing a repository.

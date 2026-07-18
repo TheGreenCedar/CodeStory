@@ -12,6 +12,9 @@ use codestory_llama_sys::{
     EmbeddingOwnerState, EmbeddingRequestClass, EmbeddingRequestContext, EngineError,
     EngineLifecycleSnapshot, NativeDeviceClass,
 };
+use codestory_workspace::{
+    WorkspacePathIdentity, workspace_file_identity, workspace_path_identity,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -1813,10 +1816,7 @@ struct PinnedQualificationDirectory {
     handle: File,
 }
 
-#[cfg(any(unix, windows))]
-type NativeFileIdentity = (u64, u64);
-#[cfg(not(any(unix, windows)))]
-type NativeFileIdentity = PathBuf;
+type NativeFileIdentity = WorkspacePathIdentity;
 
 #[derive(Debug)]
 struct ServerQualificationEventLog {
@@ -2508,7 +2508,7 @@ impl PinnedQualificationDirectory {
         let metadata = fs::symlink_metadata(&canonical)
             .context("reinspect canonical embedding qualification directory")?;
         validate_private_qualification_directory_metadata(&metadata)?;
-        let identity = native_metadata_identity(&metadata)?;
+        let identity = native_path_identity(&canonical)?;
         #[cfg(unix)]
         let handle = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -2521,7 +2521,7 @@ impl PinnedQualificationDirectory {
                 .metadata()
                 .context("inspect pinned embedding qualification directory")?;
             validate_private_qualification_directory_metadata(&opened)?;
-            if native_metadata_identity(&opened)? != identity {
+            if native_file_identity(&handle)? != identity {
                 bail!("embedding_qualification_directory_replaced");
             }
             handle
@@ -2540,7 +2540,7 @@ impl PinnedQualificationDirectory {
         let metadata = fs::symlink_metadata(&self.path)
             .context("revalidate embedding qualification directory")?;
         validate_private_qualification_directory_metadata(&metadata)?;
-        if native_metadata_identity(&metadata)? != self.identity {
+        if native_path_identity(&self.path)? != self.identity {
             bail!("embedding_qualification_directory_replaced");
         }
         #[cfg(unix)]
@@ -2550,7 +2550,7 @@ impl PinnedQualificationDirectory {
                 .metadata()
                 .context("revalidate pinned embedding qualification directory")?;
             validate_private_qualification_directory_metadata(&opened)?;
-            if native_metadata_identity(&opened)? != self.identity {
+            if native_file_identity(&self.handle)? != self.identity {
                 bail!("embedding_qualification_directory_replaced");
             }
         }
@@ -2605,14 +2605,14 @@ impl ServerQualificationEventLog {
             &metadata,
             SERVER_QUALIFICATION_MAX_EVENT_BYTES,
         )?;
-        let identity = native_metadata_identity(&metadata)?;
+        let identity = native_file_identity(&file)?;
         let path_metadata =
             fs::symlink_metadata(&path).context("reinspect embedding qualification event log")?;
         validate_private_qualification_file_metadata(
             &path_metadata,
             SERVER_QUALIFICATION_MAX_EVENT_BYTES,
         )?;
-        if native_metadata_identity(&path_metadata)? != identity {
+        if native_path_identity(&path)? != identity {
             bail!("embedding_qualification_event_log_replaced");
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -2669,8 +2669,8 @@ impl ServerQualificationEventLog {
             .file
             .metadata()
             .context("revalidate opened embedding qualification event log")?;
-        if native_metadata_identity(&path_metadata)? != self.identity
-            || native_metadata_identity(&opened)? != self.identity
+        if native_path_identity(&self.path)? != self.identity
+            || native_file_identity(&self.file)? != self.identity
             || opened.len() != self.bytes
         {
             bail!("embedding_qualification_event_log_replaced");
@@ -2701,8 +2701,8 @@ impl ServerQualificationEventLog {
             .file
             .metadata()
             .context("reinspect opened embedding qualification event log after append")?;
-        if native_metadata_identity(&path_metadata)? != self.identity
-            || native_metadata_identity(&opened)? != self.identity
+        if native_path_identity(&self.path)? != self.identity
+            || native_file_identity(&self.file)? != self.identity
             || path_metadata.len() != next_bytes
             || opened.len() != next_bytes
         {
@@ -2749,29 +2749,14 @@ fn validate_private_qualification_file_metadata(
     Ok(())
 }
 
-#[cfg(unix)]
-fn native_metadata_identity(metadata: &fs::Metadata) -> Result<NativeFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    Ok((metadata.dev(), metadata.ino()))
+fn native_path_identity(path: &Path) -> Result<NativeFileIdentity> {
+    workspace_path_identity(path)
+        .context("embedding qualification filesystem path identity is unavailable")
 }
 
-#[cfg(windows)]
-fn native_metadata_identity(metadata: &fs::Metadata) -> Result<NativeFileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-    Ok((
-        metadata
-            .volume_serial_number()
-            .context("embedding qualification filesystem volume identity is unavailable")?
-            as u64,
-        metadata
-            .file_index()
-            .context("embedding qualification filesystem file identity is unavailable")?,
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn native_metadata_identity(_metadata: &fs::Metadata) -> Result<NativeFileIdentity> {
-    bail!("embedding qualification filesystem identity is unsupported")
+fn native_file_identity(file: &File) -> Result<NativeFileIdentity> {
+    workspace_file_identity(file)
+        .context("embedding qualification filesystem file identity is unavailable")
 }
 
 fn read_server_qualification_command(
@@ -2792,7 +2777,7 @@ fn read_server_qualification_command(
         &path_metadata,
         SERVER_QUALIFICATION_MAX_COMMAND_BYTES,
     )?;
-    let identity = native_metadata_identity(&path_metadata)?;
+    let identity = native_path_identity(&path)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2807,7 +2792,7 @@ fn read_server_qualification_command(
         .metadata()
         .context("inspect opened embedding qualification command")?;
     validate_private_qualification_file_metadata(&opened, SERVER_QUALIFICATION_MAX_COMMAND_BYTES)?;
-    if native_metadata_identity(&opened)? != identity {
+    if native_file_identity(&file)? != identity {
         bail!("embedding_qualification_command_replaced");
     }
     control.directory.revalidate()?;
@@ -2824,7 +2809,7 @@ fn read_server_qualification_command(
         &path_metadata,
         SERVER_QUALIFICATION_MAX_COMMAND_BYTES,
     )?;
-    if native_metadata_identity(&path_metadata)? != identity {
+    if native_path_identity(&path)? != identity {
         bail!("embedding_qualification_command_replaced");
     }
     control.directory.revalidate()?;
@@ -7057,6 +7042,24 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn qualification_event_log_rejects_a_replaced_windows_path() {
+        let (_temporary, control) = test_qualification_control();
+        let mut events = control.events.lock().expect("event log");
+        let moved_event_path = events.path.with_extension("moved");
+        fs::rename(&events.path, &moved_event_path).expect("move pinned event log");
+        fs::write(&events.path, b"").expect("replacement event log");
+
+        assert!(
+            events
+                .record(&control.directory, &test_qualification_event())
+                .expect_err("replacement event logs are rejected")
+                .to_string()
+                .contains("embedding_qualification_event_log_replaced")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn qualification_restart_restores_the_last_durable_command_sequence() {
@@ -7220,13 +7223,15 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn test_qualification_control() -> (tempfile::TempDir, ServerQualificationControl) {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().expect("temporary qualification root");
         let directory = temporary.path().join("qualification");
         fs::create_dir(&directory).expect("qualification directory");
+        #[cfg(unix)]
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .expect("private qualification directory");
         let canonical = fs::canonicalize(&directory).expect("canonical qualification directory");
@@ -7239,7 +7244,7 @@ mod tests {
         (temporary, control)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn test_qualification_event() -> ServerQualificationEvent {
         ServerQualificationEvent {
             schema_version: 1,

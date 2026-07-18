@@ -4,6 +4,26 @@ use std::path::Path;
 
 const UPSTREAM_BUILD_SUPPORT_LIBRARY_NAMES: &[&str] = &["libllama-common.so"];
 
+/// Copy one Windows runtime DLL after removing any upstream hard link.
+pub(crate) fn stage_windows_runtime_file(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!(
+                    "native runtime destination is a directory: {}",
+                    destination.display()
+                ),
+            ));
+        }
+        Ok(_) => fs::remove_file(destination)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
 /// Stage real Linux shared-library files into every Cargo runtime directory.
 ///
 /// `llama-cpp-sys-2` hard-links only the unversioned `.so` symlinks into these
@@ -129,6 +149,26 @@ fn replace_with_real_hard_link(source: &Path, destination: &Path) -> io::Result<
     }
     fs::hard_link(source, destination)?;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn replaces_a_source_hard_link_with_an_independent_runtime_copy() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let source = temp.path().join("native.dll");
+        let destination = temp.path().join("target.dll");
+        fs::write(&source, b"native").expect("native DLL");
+        fs::hard_link(&source, &destination).expect("upstream hard link");
+
+        stage_windows_runtime_file(&source, &destination).expect("stage runtime DLL");
+        fs::write(&destination, b"staged").expect("replace staged bytes");
+
+        assert_eq!(fs::read(&source).expect("source DLL"), b"native");
+        assert_eq!(fs::read(&destination).expect("staged DLL"), b"staged");
+    }
 }
 
 #[cfg(all(test, unix))]

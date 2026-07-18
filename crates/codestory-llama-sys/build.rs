@@ -2,7 +2,7 @@ mod model_staging;
 mod native_staging;
 
 use model_staging::{ExpectedModel, stage_model, verify_model};
-use native_staging::stage_linux_shared_libraries;
+use native_staging::{stage_linux_shared_libraries, stage_windows_runtime_file};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -438,7 +438,7 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
     runtime_files.sort_by_key(|entry| entry.0.to_lowercase());
     if target_os == "windows" {
         for (name, source, _) in &runtime_files {
-            fs::copy(source, profile_dir.join(name)).unwrap_or_else(|error| {
+            stage_windows_runtime_file(source, &profile_dir.join(name)).unwrap_or_else(|error| {
                 panic!(
                     "failed to stage native runtime artifact {}: {error}",
                     source.display()
