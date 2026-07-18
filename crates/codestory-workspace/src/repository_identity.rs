@@ -652,6 +652,12 @@ pub fn workspace_path_identity(path: &Path) -> io::Result<WorkspacePathIdentity>
     }
 }
 
+/// Observe one already-open file using native filesystem identity.
+pub fn workspace_file_identity(file: &fs::File) -> io::Result<WorkspacePathIdentity> {
+    let metadata = file.metadata()?;
+    existing_workspace_file_identity(file, &metadata)
+}
+
 /// Compare workspace paths through [`workspace_path_identity`].
 ///
 /// The compatibility boolean fails closed when either identity is unavailable.
@@ -679,12 +685,34 @@ fn existing_workspace_path_identity(
     ))
 }
 
+#[cfg(unix)]
+fn existing_workspace_file_identity(
+    _file: &fs::File,
+    metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    existing_workspace_path_identity(Path::new(""), metadata)
+}
+
 #[cfg(windows)]
 fn existing_workspace_path_identity(
     path: &Path,
     _metadata: &fs::Metadata,
 ) -> io::Result<WorkspacePathIdentity> {
     let (volume_serial_number, file_id) = windows_file_identity(path)?;
+    Ok(WorkspacePathIdentity(
+        WorkspacePathIdentityKind::ExistingWindows {
+            volume_serial_number,
+            file_id,
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn existing_workspace_file_identity(
+    file: &fs::File,
+    _metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    let (volume_serial_number, file_id) = windows_file_handle_identity(file)?;
     Ok(WorkspacePathIdentity(
         WorkspacePathIdentityKind::ExistingWindows {
             volume_serial_number,
@@ -701,6 +729,17 @@ fn existing_workspace_path_identity(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "native workspace path identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn existing_workspace_file_identity(
+    _file: &fs::File,
+    _metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native workspace file identity is unsupported on this platform",
     ))
 }
 
@@ -756,9 +795,20 @@ fn missing_workspace_path_identity(_path: &Path) -> io::Result<WorkspacePathIden
 
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> io::Result<(u64, [u8; 16])> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    windows_file_handle_identity(&file)
+}
+
+#[cfg(windows)]
+fn windows_file_handle_identity(file: &fs::File) -> io::Result<(u64, [u8; 16])> {
     use std::ffi::c_void;
     use std::mem::MaybeUninit;
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -778,11 +828,6 @@ fn windows_file_identity(path: &Path) -> io::Result<(u64, [u8; 16])> {
     }
 
     const FILE_ID_INFO_CLASS: i32 = 18;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let file = fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
     let mut information = MaybeUninit::<FileIdInfo>::uninit();
     // SAFETY: `file` owns a valid handle for the duration of the call and the
     // output points to correctly sized, writable storage.
@@ -1348,6 +1393,19 @@ mod tests {
         );
         assert!(same_workspace_path(&file, &alias));
         assert!(!same_workspace_path(&file, &project.path().join("missing")));
+    }
+
+    #[test]
+    fn open_file_identity_matches_path_observation() {
+        let project = tempdir().expect("project");
+        let path = project.path().join("identity");
+        fs::write(&path, "identity").expect("identity file");
+        let file = fs::File::open(&path).expect("open identity file");
+
+        assert_eq!(
+            workspace_file_identity(&file).expect("open file identity"),
+            workspace_path_identity(&path).expect("path identity")
+        );
     }
 
     #[test]

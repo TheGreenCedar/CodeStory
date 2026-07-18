@@ -220,6 +220,13 @@ adapter to compensate for incorrect upstream state.
 
 - On Windows, invoke the Codex npm shim as `codex.cmd`; the extensionless shim
   can fail with `os error 193`.
+- On many Windows development hosts, source builds use Visual Studio 18
+  Community's bundled CMake and Ninja. Prepend its
+  `Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin` and
+  `Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja` directories to `PATH`,
+  set `CMAKE_GENERATOR=Ninja`, and set `CARGO_TARGET_DIR` to a short path such
+  as `C:\tmp\codestory-target`; the repository-local target path can exceed the
+  nested Vulkan build's CMake path limit.
 - Keep secrets out of the repository. Pass credentials through approved
   environment or protected CI secret surfaces, and keep private material out
   of logs, fixtures, generated artifacts, and comments.

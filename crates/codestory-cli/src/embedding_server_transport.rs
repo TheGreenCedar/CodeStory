@@ -52,17 +52,11 @@ impl ExactExecutable {
         let path = std::env::current_exe().context("resolve current CodeStory executable")?;
         let file = File::open(&path)
             .with_context(|| format!("open current executable {}", path.display()))?;
-        let before = executable_file_identity(
-            &file
-                .metadata()
-                .with_context(|| format!("inspect current executable {}", path.display()))?,
-        )?;
+        let before = executable_file_identity(&file)
+            .with_context(|| format!("inspect current executable {}", path.display()))?;
         let sha256 = sha256_reader(&file, &path)?;
-        let after = executable_file_identity(
-            &file
-                .metadata()
-                .with_context(|| format!("reinspect current executable {}", path.display()))?,
-        )?;
+        let after = executable_file_identity(&file)
+            .with_context(|| format!("reinspect current executable {}", path.display()))?;
         if before != after {
             bail!(
                 "embedding_executable_changed: current executable changed while it was being verified"
@@ -164,10 +158,10 @@ impl NativeEmbeddingClientTransport {
                 self.executable.path().display()
             )
         })?;
-        let before = executable_file_identity(&candidate.metadata()?)?;
+        let before = executable_file_identity(&candidate)?;
         #[cfg(windows)]
         let digest = sha256_reader(&candidate, self.executable.path())?;
-        let after = executable_file_identity(&candidate.metadata()?)?;
+        let after = executable_file_identity(&candidate)?;
         let digest_matches = {
             #[cfg(unix)]
             {
@@ -683,23 +677,22 @@ fn classify_windows_data_pipe_open_error(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableFileIdentity {
-    file_identity_a: u64,
-    file_identity_b: u64,
+    native_identity: codestory_workspace::WorkspacePathIdentity,
     file_size: u64,
     write_stamp: i128,
     change_stamp: i128,
 }
 
 #[cfg(unix)]
-fn executable_file_identity(metadata: &std::fs::Metadata) -> Result<ExecutableFileIdentity> {
+fn executable_file_identity(file: &File) -> Result<ExecutableFileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         bail!("expected a regular executable");
     }
     Ok(ExecutableFileIdentity {
-        file_identity_a: metadata.dev(),
-        file_identity_b: metadata.ino(),
+        native_identity: codestory_workspace::workspace_file_identity(file)?,
         file_size: metadata.len(),
         write_stamp: (i128::from(metadata.mtime()) << 64)
             | i128::from(metadata.mtime_nsec() as u64),
@@ -709,15 +702,15 @@ fn executable_file_identity(metadata: &std::fs::Metadata) -> Result<ExecutableFi
 }
 
 #[cfg(windows)]
-fn executable_file_identity(metadata: &std::fs::Metadata) -> Result<ExecutableFileIdentity> {
+fn executable_file_identity(file: &File) -> Result<ExecutableFileIdentity> {
     use std::os::windows::fs::MetadataExt;
 
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         bail!("expected a regular executable");
     }
     Ok(ExecutableFileIdentity {
-        file_identity_a: metadata.volume_serial_number().unwrap_or_default() as u64,
-        file_identity_b: metadata.file_index().unwrap_or_default(),
+        native_identity: codestory_workspace::workspace_file_identity(file)?,
         file_size: metadata.file_size(),
         write_stamp: i128::from(metadata.last_write_time()),
         change_stamp: 0,
@@ -2526,6 +2519,7 @@ mod platform {
     use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3590,8 +3584,7 @@ mod tests {
         let executable = ExactExecutable::capture().expect("capture exact executable");
         let file = File::open(executable.path()).expect("open exact executable");
         let identity =
-            executable_file_identity(&file.metadata().expect("read executable metadata"))
-                .expect("capture executable metadata identity");
+            executable_file_identity(&file).expect("capture executable metadata identity");
         assert_eq!(identity, executable.file_identity);
         assert!(identity.file_size > 0);
     }
