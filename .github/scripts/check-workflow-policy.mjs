@@ -91,16 +91,12 @@ function requireStepRun(violations, file, job, name, fragments) {
   }
 }
 
-function normalizedExecutableRunText(run) {
-  return executableRunText(run)
-    .split(/\r?\n/u)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .join("\n");
+function exactResolverRunText(run) {
+  return run.replace(/\r\n/gu, "\n");
 }
 
 function requireExactResolverContract(violations, file, job, expectedDigest) {
-  const run = normalizedExecutableRunText(stepRun(job, "Resolve trusted exact head"));
+  const run = exactResolverRunText(stepRun(job, "Resolve trusted exact head"));
   const digest = createHash("sha256").update(run).digest("hex");
   add(
     violations,
@@ -111,7 +107,10 @@ function requireExactResolverContract(violations, file, job, expectedDigest) {
 
 function requireUniqueCacheSaveLast(violations, file, job, cacheName, finalStepDescription) {
   const steps = list(job?.steps).map(object);
-  const saves = steps.filter(step => typeof step.uses === "string" && step.uses.startsWith("actions/cache/save@"));
+  const saves = steps.filter(
+    step => typeof step.uses === "string"
+      && step.uses.toLowerCase().startsWith("actions/cache/save@"),
+  );
   add(
     violations,
     saves.length === 1,
@@ -155,8 +154,8 @@ const draftCachePaths = [
   "~/.cargo/git",
   "target",
 ];
-const sourceResolverContractDigest = "946592c43809ff6049df3b9bc6e1b2f7314c9c563b1a5d158c59327093d5960f";
-const platformResolverContractDigest = "db104676ffd2647b2dec25f88299374532ac45459fdb7903ebe77a52b75106c0";
+const sourceResolverContractDigest = "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af";
+const platformResolverContractDigest = "331ee01b021f17d3221c7bc482d256ba36314116284a6bc22a2df87bd7487843";
 const draftProofCommands = [
   "cargo test --locked -p codestory-llama-sys --test native_staging",
   "cargo test --locked -p codestory-llama-sys --test model_staging",

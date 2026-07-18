@@ -64,9 +64,10 @@ function moveNamedStepBefore(job, movedName, beforeName) {
   job.steps.splice(beforeIndex, 0, moved);
 }
 
-function cloneCacheSaveBefore(job, sourceName, beforeName) {
+function cloneCacheSaveBefore(job, sourceName, beforeName, uses) {
   const clone = structuredClone(draftStep(job, sourceName));
   clone.name = `${sourceName} clone`;
+  if (uses !== undefined) clone.uses = uses;
   const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
   assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
   job.steps.splice(beforeIndex, 0, clone);
@@ -402,6 +403,10 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
           'set -euo pipefail\necho "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"\nexit 0',
         );
     }, /exact normalized trusted resolver script contract/u],
+    ["source resolver blank line", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace("set -euo pipefail\n", "set -euo pipefail\n\n");
+    }, /exact normalized trusted resolver script contract/u],
     ["source labeled job disabled", sourceFile, workflow => {
       workflow.jobs.resolve.if
         = "false && (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')";
@@ -433,6 +438,13 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         .replace(
           "set -euo pipefail",
           'set -euo pipefail\necho "head_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"\nexit 0',
+        );
+    }, /exact normalized trusted resolver script contract/u],
+    ["platform resolver backslash continuation blank line", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n    ||',
+          'if [ -n "$INPUT_SOURCE_RUN_ID" ] \\\n\n    ||',
         );
     }, /exact normalized trusted resolver script contract/u],
     ["platform labeled job disabled", packagedCoordinatorFile, workflow => {
@@ -469,6 +481,14 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         "Test the complete workspace once",
       );
     }, /source cache must contain exactly one actions\/cache\/save action/u],
+    ["source mixed-case cache clone before proof", sourceFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["full-source-gate"],
+        "Save Cargo inputs and output",
+        "Test the complete workspace once",
+        "Actions/Cache/Save@v5",
+      );
+    }, /source cache must contain exactly one actions\/cache\/save action/u],
     ["macOS source cache loses exact SHA", packagedCoordinatorFile, workflow => {
       const restore = draftStep(workflow.jobs["macos-source"], "Restore exact-head macOS source cache");
       restore.with.key = restore.with.key.replace("-${{ needs.route.outputs.head_sha }}", "");
@@ -485,6 +505,14 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         workflow.jobs["macos-source"],
         "Save exact-head macOS source cache",
         "Capture Rust cache identity",
+      );
+    }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
+    ["macOS source mixed-case cache clone before proof", packagedCoordinatorFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs["macos-source"],
+        "Save exact-head macOS source cache",
+        "Capture Rust cache identity",
+        "Actions/Cache/Save@v5",
       );
     }, /macOS source cache must contain exactly one actions\/cache\/save action/u],
     ["packaged cache loses exact SHA", packagedProofFile, workflow => {
@@ -507,6 +535,14 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
         workflow.jobs.build,
         "Save Cargo registry, git sources, and build output",
         "Build codestory-cli",
+      );
+    }, /native build cache must contain exactly one actions\/cache\/save action/u],
+    ["packaged mixed-case cache clone before proof", packagedProofFile, workflow => {
+      cloneCacheSaveBefore(
+        workflow.jobs.build,
+        "Save Cargo registry, git sources, and build output",
+        "Build codestory-cli",
+        "Actions/Cache/Save@v5",
       );
     }, /native build cache must contain exactly one actions\/cache\/save action/u],
   ];
