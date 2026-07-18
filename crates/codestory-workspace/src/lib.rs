@@ -12,8 +12,9 @@
 
 use anyhow::{Result, bail};
 pub use codestory_contracts::workspace::{
-    BuildMode, IndexedFileRecord, RefreshExecutionPlan, RefreshInfo, RefreshInputs, RefreshMode,
-    RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
+    BuildMode, DEFAULT_SOURCE_FILE_BYTE_CAP, IndexedFileRecord, OVERSIZED_SOURCE_POLICY_VERSION,
+    OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInfo, RefreshInputs,
+    RefreshMode, RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -205,12 +206,28 @@ pub struct WorkspaceFileInventory {
     pub issues: Vec<WorkspaceInventoryIssue>,
 }
 
+/// Complete discovery split into parser candidates and verified policy exclusions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePolicyFileInventory {
+    pub files: Vec<PathBuf>,
+    pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+    pub outcome: WorkspaceInventoryOutcome,
+    pub issues: Vec<WorkspaceInventoryIssue>,
+}
+
 /// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRefreshOutcome {
     pub plan: RefreshPlan,
     pub inventory_outcome: WorkspaceInventoryOutcome,
     pub inventory_issues: Vec<WorkspaceInventoryIssue>,
+}
+
+/// Refresh plan paired with the complete exclusion set for the same discovery pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePolicyRefreshOutcome {
+    pub refresh: WorkspaceRefreshOutcome,
+    pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +421,15 @@ impl WorkspaceManifest {
         WorkspaceDiscovery.source_inventory(self)
     }
 
+    /// Discover parser candidates and content-verified oversized policy exclusions.
+    pub fn source_inventory_with_oversized_policy(&self) -> Result<WorkspacePolicyFileInventory> {
+        WorkspaceDiscovery.source_inventory_with_policy(
+            self,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            OVERSIZED_SOURCE_POLICY_VERSION,
+        )
+    }
+
     /// Build a full-refresh plan that indexes every currently discovered file.
     pub fn full_refresh_plan(&self) -> Result<RefreshPlan> {
         Ok(RefreshPlan {
@@ -436,6 +462,34 @@ impl WorkspaceManifest {
         inputs: &RefreshInputs,
     ) -> Result<WorkspaceRefreshOutcome> {
         WorkspaceDiscovery.build_refresh_outcome(self, inputs)
+    }
+
+    /// Build a refresh plan that removes verified oversized sources before parser scheduling.
+    pub fn build_execution_outcome_with_oversized_policy(
+        &self,
+        inputs: &RefreshInputs,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        WorkspaceDiscovery.build_refresh_outcome_with_policy(
+            self,
+            inputs,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            OVERSIZED_SOURCE_POLICY_VERSION,
+        )
+    }
+
+    /// Build a policy-aware refresh outcome with the ordinary current-file discovery bound.
+    pub fn build_execution_outcome_bounded_with_oversized_policy(
+        &self,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        WorkspaceDiscovery.build_refresh_outcome_bounded_with_policy(
+            self,
+            inputs,
+            max_current_files,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            OVERSIZED_SOURCE_POLICY_VERSION,
+        )
     }
 
     /// Build an incremental refresh plan with a current-file discovery bound.
@@ -488,6 +542,104 @@ impl WorkspaceDiscovery {
     /// Discover source files while retaining traversal failures.
     pub fn source_inventory(&self, manifest: &WorkspaceManifest) -> Result<WorkspaceFileInventory> {
         self.source_inventory_inner(manifest, None)
+    }
+
+    /// Classify oversized sources only after complete discovery and stable content hashing.
+    pub fn source_inventory_with_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        byte_cap: u64,
+        policy_version: &str,
+    ) -> Result<WorkspacePolicyFileInventory> {
+        self.source_inventory_with_policy_inner(manifest, byte_cap, policy_version, None)
+    }
+
+    fn source_inventory_with_policy_inner(
+        &self,
+        manifest: &WorkspaceManifest,
+        byte_cap: u64,
+        policy_version: &str,
+        max_files: Option<usize>,
+    ) -> Result<WorkspacePolicyFileInventory> {
+        if byte_cap == 0 || policy_version.trim().is_empty() {
+            bail!("oversized source policy requires a non-zero cap and non-empty version");
+        }
+        let inventory = self.source_inventory_inner(manifest, max_files)?;
+        if !inventory.outcome.is_complete() {
+            return Ok(WorkspacePolicyFileInventory {
+                files: inventory.files,
+                policy_exclusions: Vec::new(),
+                outcome: inventory.outcome,
+                issues: inventory.issues,
+            });
+        }
+
+        let root = workspace_root(manifest);
+        let mut files = Vec::with_capacity(inventory.files.len());
+        let mut policy_exclusions = Vec::new();
+        let mut issues = inventory.issues;
+        for path in inventory.files {
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: format!("failed to inspect policy candidate: {error}"),
+                    });
+                    files.push(path);
+                    continue;
+                }
+            };
+            if metadata.len() <= byte_cap {
+                files.push(path);
+                continue;
+            }
+            let normalized_path = match normalized_policy_path(&root, &path) {
+                Ok(path) => path,
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    });
+                    files.push(path);
+                    continue;
+                }
+            };
+            let (content_hash, observed_size) = match current_content_identity(&path) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: format!("failed to verify oversized policy candidate: {error}"),
+                    });
+                    files.push(path);
+                    continue;
+                }
+            };
+            if observed_size <= byte_cap {
+                files.push(path);
+                continue;
+            }
+            policy_exclusions.push(OversizedSourceExclusionCandidate {
+                normalized_path,
+                content_hash,
+                observed_size,
+                policy_version: policy_version.to_string(),
+                byte_cap,
+            });
+        }
+        policy_exclusions.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        let outcome = if issues.is_empty() {
+            WorkspaceInventoryOutcome::Complete
+        } else {
+            WorkspaceInventoryOutcome::Partial
+        };
+        Ok(WorkspacePolicyFileInventory {
+            files,
+            policy_exclusions,
+            outcome,
+            issues,
+        })
     }
 
     fn source_inventory_inner(
@@ -642,6 +794,56 @@ impl WorkspaceDiscovery {
         self.build_refresh_outcome_inner(manifest, inputs, None)
     }
 
+    /// Build one refresh plan and complete exclusion set from the same inventory pass.
+    pub fn build_refresh_outcome_with_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        byte_cap: u64,
+        policy_version: &str,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let inventory = self.source_inventory_with_policy(manifest, byte_cap, policy_version)?;
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
+    /// Build a bounded policy-aware refresh outcome without losing completeness evidence.
+    pub fn build_refresh_outcome_bounded_with_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+        byte_cap: u64,
+        policy_version: &str,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let inventory = self.source_inventory_with_policy_inner(
+            manifest,
+            byte_cap,
+            policy_version,
+            Some(max_current_files),
+        )?;
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
     /// Compare current discovery with stored inventory unless discovery exceeds
     /// `max_current_files`.
     pub fn build_refresh_plan_bounded(
@@ -666,56 +868,87 @@ impl WorkspaceDiscovery {
         max_current_files: Option<usize>,
     ) -> Result<WorkspaceRefreshOutcome> {
         let inventory = self.source_inventory_inner(manifest, max_current_files)?;
-        let current_files = inventory.files;
-        let workspace_root = manifest.root_dir();
-        let stored_map = inputs.inventory_map();
-        let normalized_stored_map = stored_map
-            .into_values()
-            .map(|file| (normalized_compare_key(&workspace_root, &file.path), file))
-            .collect::<HashMap<_, _>>();
-
-        let mut files_to_index = Vec::new();
-        let mut files_to_remove = Vec::new();
-        let mut existing_file_ids = HashMap::new();
-        let mut current_file_keys = HashSet::with_capacity(current_files.len());
-
-        for path in current_files {
-            let normalized_key = normalized_compare_key(&workspace_root, &path);
-            current_file_keys.insert(normalized_key.clone());
-            let needs_index = match normalized_stored_map.get(&normalized_key) {
-                Some(file) => {
-                    existing_file_ids.insert(path.clone(), file.id);
-                    stored_file_needs_index(&path, file)
-                }
-                None => true,
-            };
-
-            if needs_index {
-                files_to_index.push(path);
-            }
-        }
-
-        if inventory.outcome.is_complete() {
-            for (normalized_key, stored) in normalized_stored_map {
-                if !current_file_keys.contains(&normalized_key) {
-                    files_to_remove.push(stored.id);
-                }
-            }
-        }
-        files_to_remove.sort_unstable();
-        files_to_remove.dedup();
-
-        Ok(WorkspaceRefreshOutcome {
-            plan: RefreshPlan {
-                mode: RefreshMode::Incremental,
-                files_to_index,
-                files_to_remove,
-                existing_file_ids,
-            },
-            inventory_outcome: inventory.outcome,
-            inventory_issues: inventory.issues,
-        })
+        build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )
     }
+}
+
+fn build_refresh_outcome_from_inventory(
+    manifest: &WorkspaceManifest,
+    inputs: &RefreshInputs,
+    current_files: Vec<PathBuf>,
+    inventory_outcome: WorkspaceInventoryOutcome,
+    inventory_issues: Vec<WorkspaceInventoryIssue>,
+) -> Result<WorkspaceRefreshOutcome> {
+    let workspace_root = manifest.root_dir();
+    let stored_map = inputs.inventory_map();
+    let normalized_stored_map = stored_map
+        .into_values()
+        .map(|file| (normalized_compare_key(&workspace_root, &file.path), file))
+        .collect::<HashMap<_, _>>();
+
+    let mut files_to_index = Vec::new();
+    let mut files_to_remove = Vec::new();
+    let mut existing_file_ids = HashMap::new();
+    let mut current_file_keys = HashSet::with_capacity(current_files.len());
+
+    for path in current_files {
+        let normalized_key = normalized_compare_key(&workspace_root, &path);
+        current_file_keys.insert(normalized_key.clone());
+        let needs_index = match normalized_stored_map.get(&normalized_key) {
+            Some(file) => {
+                existing_file_ids.insert(path.clone(), file.id);
+                stored_file_needs_index(&path, file)
+            }
+            None => true,
+        };
+
+        if needs_index {
+            files_to_index.push(path);
+        }
+    }
+
+    if inventory_outcome.is_complete() {
+        for (normalized_key, stored) in normalized_stored_map {
+            if !current_file_keys.contains(&normalized_key) {
+                files_to_remove.push(stored.id);
+            }
+        }
+    }
+    files_to_remove.sort_unstable();
+    files_to_remove.dedup();
+
+    Ok(WorkspaceRefreshOutcome {
+        plan: RefreshPlan {
+            mode: RefreshMode::Incremental,
+            files_to_index,
+            files_to_remove,
+            existing_file_ids,
+        },
+        inventory_outcome,
+        inventory_issues,
+    })
+}
+
+fn normalized_policy_path(workspace_root: &Path, path: &Path) -> Result<String> {
+    let relative = workspace_relative_path(workspace_root, path)
+        .ok_or_else(|| anyhow::anyhow!("oversized policy candidate escapes the workspace root"))?;
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("oversized policy candidate path is not valid UTF-8"))?
+        .replace('\\', "/");
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative.split('/').any(|component| component == "..")
+    {
+        bail!("oversized policy candidate has an invalid normalized path");
+    }
+    Ok(relative)
 }
 
 fn record_walk_error(
@@ -783,6 +1016,10 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
 }
 
 fn current_content_hash(path: &Path) -> Result<String> {
+    current_content_identity(path).map(|(content_hash, _)| content_hash)
+}
+
+fn current_content_identity(path: &Path) -> Result<(String, u64)> {
     let mut file = fs::File::open(path)?;
     let before = file.metadata()?;
     let mut hasher = Sha256::new();
@@ -798,7 +1035,7 @@ fn current_content_hash(path: &Path) -> Result<String> {
     if before.len() != after.len() || before.modified()? != after.modified()? {
         bail!("source metadata changed while hashing {}", path.display());
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok((format!("{:x}", hasher.finalize()), before.len()))
 }
 
 fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
@@ -1186,6 +1423,97 @@ mod tests {
         assert_eq!(plan.mode, RefreshMode::Incremental);
         assert_eq!(plan.files_to_index, vec![file]);
         assert!(plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_generated_vendor_and_ordinary_oversized_sources_before_scheduling() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("generated"))?;
+        fs::create_dir_all(root.join("vendor"))?;
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("generated/registers.h"), vec![b'g'; 96])?;
+        fs::write(root.join("vendor/bundle.js"), vec![b'v'; 80])?;
+        fs::write(root.join("src/ordinary.rs"), vec![b'o'; 65])?;
+        fs::write(root.join("src/small.rs"), b"fn small() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(inventory.files, vec![root.join("src/small.rs")]);
+        assert_eq!(inventory.policy_exclusions.len(), 3);
+        assert_eq!(
+            inventory
+                .policy_exclusions
+                .iter()
+                .map(|entry| entry.normalized_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "generated/registers.h",
+                "src/ordinary.rs",
+                "vendor/bundle.js"
+            ]
+        );
+        assert!(inventory.policy_exclusions.iter().all(|entry| {
+            entry.content_hash.len() == 64
+                && entry.observed_size > entry.byte_cap
+                && entry.policy_version == "test-policy-v1"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_oversized_content_produces_a_new_verified_identity() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized = root.join("src/large.rs");
+        fs::write(&oversized, vec![b'a'; 65])?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let first =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+        fs::write(&oversized, vec![b'b'; 66])?;
+        let second =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+        let changed_policy =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v2")?;
+
+        assert_ne!(
+            first.policy_exclusions[0].content_hash,
+            second.policy_exclusions[0].content_hash
+        );
+        assert_eq!(second.policy_exclusions[0].observed_size, 66);
+        assert_eq!(
+            changed_policy.policy_exclusions[0].content_hash,
+            second.policy_exclusions[0].content_hash
+        );
+        assert_eq!(
+            changed_policy.policy_exclusions[0].policy_version,
+            "test-policy-v2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_discovery_never_classifies_a_deletion_capable_exclusion_set() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized = root.join("src/large.rs");
+        fs::write(&oversized, vec![b'a'; 65])?;
+        write_repo_manifest(&root, vec![PathBuf::from("src"), PathBuf::from("missing")])?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
+        assert!(inventory.policy_exclusions.is_empty());
+        assert_eq!(inventory.files, vec![oversized]);
+        assert!(!inventory.issues.is_empty());
         Ok(())
     }
 

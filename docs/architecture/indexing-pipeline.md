@@ -26,8 +26,9 @@ sequenceDiagram
 
     CLI->>Runtime: parse `index` command and open project
     Runtime->>Workspace: full refresh plan or diff-based refresh plan
-    Workspace-->>Runtime: RefreshExecutionPlan
+    Workspace-->>Runtime: RefreshExecutionPlan + verified policy exclusions
     Runtime->>Store: open staged store for full refresh or live store for incremental
+    Runtime->>Store: publish candidate exclusion manifest
     Runtime->>Indexer: WorkspaceIndexer::run(plan, store)
     Indexer->>Store: flush files, nodes, edges, occurrences, component access, callable projection state
     Indexer->>Store: run post-flush resolution updates
@@ -125,6 +126,9 @@ The indexer does not know whether the store is staged or live.
 
 - `source_files` walks the configured source groups from the workspace manifest, follows directories, applies exclude globs, sorts the result, and removes duplicates
 - `source_inventory` retains whether that walk was complete, partial, unreadable, or stopped by its candidate bound, plus any traversal failures
+- `source_inventory_with_oversized_policy` hashes stable source bytes above the
+  shared parser cap and classifies them before parser scheduling, independent
+  of whether they are generated, vendored, or ordinary project files
 - `build_refresh_plan` compares discovered files against stored inventory and only plans stored-file deletion from a complete inventory. Stored parser-backed rows carry the verified SHA-256 identity of the bytes that produced their projection, so matching millisecond mtimes do not hide changed content
 
 For incremental work, a file is reindexed when:
@@ -139,10 +143,17 @@ fallback. Content comparison reads only rows that already carry a verified
 source hash; it does not add hashing for structural, text-only, or oversized
 files that did not produce one.
 
+Verified oversized candidates are removed from parser scheduling and published
+as a complete exclusion manifest bound to the project, workspace, candidate
+core generation/run, policy version, byte cap, row count, and digest. The rows
+remain source inventory only: they make no parser graph or semantic coverage
+claim. A content or policy change forces reclassification.
+
 Files that disappeared from a complete discovery are collected into
-`files_to_remove`. Partial, unreadable, and bounded inventories retain observed
-files for safe reindexing but never infer deletion from absence. Runtime
-freshness reports those incomplete inventories as `not_checked`.
+`files_to_remove`. Partial, unreadable, bounded, or concurrently changing
+inventories retain observed files for safe reindexing but never infer deletion
+or a complete exclusion set from absence. Runtime treats them as source
+coverage blockers and preserves the previous complete publication.
 
 ### 4. The indexer prepares file work
 

@@ -5526,6 +5526,7 @@ fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> 
     markdown.push_str("# indexed files\n\n");
     render_files_summary(&mut markdown, output);
     render_framework_route_coverage(&mut markdown, output);
+    render_source_policy_exclusions(&mut markdown, output);
     render_indexed_file_rows(&mut markdown, output);
     markdown
 }
@@ -5534,11 +5535,12 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
     let status = if output.usable { "usable" } else { "empty" };
     let _ = writeln!(
         markdown,
-        "- index: {status}; whole index files: {}; indexed: {}; incomplete: {}; error files: {}; filtered files: {}; visible rows: {}; truncated: {}",
+        "- index: {status}; whole index files: {}; indexed: {}; incomplete: {}; error files: {}; policy exclusions: {}; filtered files: {}; visible rows: {}; truncated: {}",
         output.summary.file_count,
         output.summary.indexed_file_count,
         output.summary.incomplete_file_count,
         output.summary.error_file_count,
+        output.summary.policy_exclusion_count,
         output.summary.filtered_file_count,
         output.summary.visible_file_count,
         output.summary.truncated
@@ -5578,6 +5580,31 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
     }
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");
+    }
+}
+
+fn render_source_policy_exclusions(
+    markdown: &mut String,
+    output: &codestory_contracts::api::IndexedFilesDto,
+) {
+    if output.policy_exclusions.is_empty() {
+        return;
+    }
+    markdown.push_str(
+        "\nverified policy exclusions (source inventory only; no graph or semantic coverage):\n",
+    );
+    for exclusion in &output.policy_exclusions {
+        let _ = writeln!(
+            markdown,
+            "- {} ({:?}, {} bytes, policy={} cap={}, core={}/{})",
+            exclusion.path,
+            exclusion.role,
+            exclusion.observed_size,
+            exclusion.policy_version,
+            exclusion.byte_cap,
+            exclusion.core_generation_id,
+            exclusion.core_run_id,
+        );
     }
 }
 
@@ -8042,7 +8069,7 @@ mod tests {
         PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto,
         PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
         ProjectSummary, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-        SemanticModeDto, StorageStatsDto, TrailContextDto,
+        SemanticModeDto, SourcePolicyExclusionDto, StorageStatsDto, TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8568,6 +8595,7 @@ mod tests {
                 visible_file_count: 1,
                 incomplete_file_count: 1,
                 error_file_count: 0,
+                policy_exclusion_count: 0,
                 incomplete_reason_counts: vec![IndexedFileIncompleteReasonCountDto {
                     reason: "unknown".to_string(),
                     file_count: 1,
@@ -8580,6 +8608,7 @@ mod tests {
                 coverage_notes: Vec::new(),
             },
             coverage_gaps: Vec::new(),
+            policy_exclusions: Vec::new(),
             files: vec![IndexedFileDto {
                 path: "src/lib.rs".to_string(),
                 language: "rust".to_string(),
@@ -8601,6 +8630,55 @@ mod tests {
             markdown.contains("run a full reindex"),
             "incomplete counts need operator-actionable reason text: {markdown}"
         );
+    }
+
+    #[test]
+    fn files_markdown_labels_verified_policy_exclusions_as_non_graph_evidence() {
+        let output = IndexedFilesDto {
+            project_root: "/repo".into(),
+            usable: true,
+            summary: IndexedFilesSummaryDto {
+                file_count: 1,
+                indexed_file_count: 1,
+                filtered_file_count: 1,
+                visible_file_count: 1,
+                incomplete_file_count: 0,
+                error_file_count: 0,
+                policy_exclusion_count: 1,
+                incomplete_reason_counts: Vec::new(),
+                truncated: false,
+                language_counts: Vec::new(),
+                framework_route_coverage: Vec::new(),
+                coverage_notes: vec![
+                    "1 verified source policy exclusion has no parser-backed graph or semantic coverage"
+                        .into(),
+                ],
+            },
+            coverage_gaps: Vec::new(),
+            policy_exclusions: vec![SourcePolicyExclusionDto {
+                path: "vendor/registers.h".into(),
+                role: IndexedFileRoleDto::Vendor,
+                content_hash: "a".repeat(64),
+                observed_size: 2_000_000,
+                policy_version: "oversized-source-v1".into(),
+                byte_cap: 1_000_000,
+                project_id: "project".into(),
+                workspace_id: "workspace".into(),
+                core_generation_id: "generation".into(),
+                core_run_id: "run".into(),
+                graph_coverage: false,
+                semantic_coverage: false,
+            }],
+            files: Vec::new(),
+        };
+
+        let markdown = render_files_markdown(&output);
+        assert!(markdown.contains("policy exclusions: 1"), "{markdown}");
+        assert!(
+            markdown.contains("source inventory only; no graph or semantic coverage"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("vendor/registers.h"), "{markdown}");
     }
 
     #[test]

@@ -565,7 +565,7 @@ impl ActivationService {
             || summary.stats.node_count == 0
             || self
                 .controller
-                .complete_core_requires_dense_anchor_repair(&storage_path)?
+                .complete_core_requires_publication_repair(&storage_path)?
             || summary
                 .freshness
                 .as_ref()
@@ -590,7 +590,7 @@ impl ActivationService {
             && summary.stats.fatal_error_count == 0
             && !self
                 .controller
-                .complete_core_requires_dense_anchor_repair(&storage_path)?
+                .complete_core_requires_publication_repair(&storage_path)?
             && summary
                 .freshness
                 .as_ref()

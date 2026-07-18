@@ -16,6 +16,7 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
+use codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP;
 use codestory_store::Store as Storage;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -70,7 +71,6 @@ struct IndexFeatureFlags {
     lazy_graph_execution: bool,
 }
 
-const DEFAULT_SOURCE_FILE_BYTE_CAP: u64 = 1_000_000;
 const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
 
 struct PostProcessedIndexResults {

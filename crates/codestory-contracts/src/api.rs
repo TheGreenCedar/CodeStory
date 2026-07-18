@@ -57,11 +57,12 @@ pub use dto::{
     SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto, SearchPlanSubqueryDto,
     SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
     SearchResultsDto, SemanticFallbackRecordDto, SemanticModeDto, SetUiLayoutRequest,
-    SnippetContextDto, SnippetScopeDto, SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto,
-    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto, TrailStoryDto,
-    TrailStoryStepDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WorkspaceMemberIndexDto, WriteFileDataUrlRequest, WriteFileResponse, WriteFileTextRequest,
+    SnippetContextDto, SnippetScopeDto, SourceOccurrenceDto, SourcePolicyExclusionDto,
+    StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto, SummaryGenerationDto,
+    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
+    TrailFilterOptionsDto, TrailStoryDto, TrailStoryStepDto, UpdateBookmarkCategoryRequest,
+    UpdateBookmarkRequest, WorkspaceMemberIndexDto, WriteFileDataUrlRequest, WriteFileResponse,
+    WriteFileTextRequest,
 };
 pub use errors::{
     ApiError, ApiErrorDetails, COMMAND_FAILURE_SCHEMA_VERSION, CommandFailureEnvelope,

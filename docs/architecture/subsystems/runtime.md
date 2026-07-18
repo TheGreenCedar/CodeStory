@@ -8,6 +8,8 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 - project open, summary, and refresh orchestration;
 - full and incremental indexing across workspace, indexer, and store;
+- complete source-inventory classification and publication of verified
+  source-policy exclusions before parser scheduling;
 - graph-native symbol-document and dense-anchor synchronization;
 - grounding, trails, symbol workflows, target context, search, and packet
   assembly;
@@ -33,6 +35,12 @@ The per-user engine authority belongs to retrieval/llama-sys and runs in the
 automatically managed embedding server. Runtime may cause lazy server and
 engine activation and hold publication leases, but cannot reconfigure the
 engine per project or infer readiness from `retrieval_mode` alone.
+
+Runtime accepts an oversized-source exclusion set only from a complete
+inventory, publishes it with the candidate core, and requires its bound
+manifest on freshness and read surfaces. `files` exposes those paths as source
+inventory with explicit false graph and semantic coverage; packet and search
+never treat them as indexed evidence.
 
 ## Extension rules
 

@@ -3,6 +3,7 @@ use codestory_contracts::graph::{
     EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
+use codestory_contracts::workspace::OversizedSourceExclusionCandidate;
 use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
@@ -32,7 +33,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 26;
+const SCHEMA_VERSION: u32 = 27;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -184,6 +185,127 @@ struct PromotionJournal {
     version: u32,
     previous: Option<IndexPublicationRecord>,
     candidate: IndexPublicationRecord,
+    #[serde(default)]
+    previous_source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+    #[serde(default)]
+    candidate_source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourcePolicyExclusionRollbackIdentity {
+    project_id: String,
+    workspace_id: String,
+    core_generation_id: String,
+    core_run_id: String,
+    exclusion_count: u64,
+    exclusion_digest: String,
+    policy_version: String,
+    byte_cap: u64,
+}
+
+fn read_source_policy_exclusion_rollback_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<Option<SourcePolicyExclusionRollbackIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'source_policy_exclusion_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(None);
+    }
+    let identity = conn
+        .query_row(
+            "SELECT project_id, workspace_id, core_generation_id, core_run_id,
+                    exclusion_count, exclusion_digest, policy_version, byte_cap
+             FROM source_policy_exclusion_publication
+             WHERE id = 1 AND complete = 1 AND schema_version = ?1",
+            params![SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        project_id,
+        workspace_id,
+        core_generation_id,
+        core_run_id,
+        exclusion_count,
+        exclusion_digest,
+        policy_version,
+        byte_cap,
+    )) = identity
+    else {
+        return Ok(None);
+    };
+    let identity = SourcePolicyExclusionRollbackIdentity {
+        project_id,
+        workspace_id,
+        core_generation_id,
+        core_run_id,
+        exclusion_count: u64::try_from(exclusion_count)
+            .map_err(|_| promotion_error("Source policy exclusion rollback count is invalid"))?,
+        exclusion_digest,
+        policy_version,
+        byte_cap: u64::try_from(byte_cap)
+            .map_err(|_| promotion_error("Source policy exclusion rollback cap is invalid"))?,
+    };
+    let records = read_source_policy_exclusions(&conn)?;
+    if identity.core_generation_id != publication.generation_id
+        || identity.core_run_id != publication.run_id
+        || identity.exclusion_count != records.len() as u64
+        || identity.exclusion_digest != source_policy_exclusion_digest(&records)
+        || records.iter().any(|record| {
+            record.project_id != identity.project_id
+                || record.workspace_id != identity.workspace_id
+                || record.core_generation_id != identity.core_generation_id
+                || record.core_run_id != identity.core_run_id
+                || record.policy_version != identity.policy_version
+                || record.byte_cap != identity.byte_cap
+        })
+    {
+        return Err(promotion_error(format!(
+            "Source policy exclusion rollback identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(Some(identity))
+}
+
+fn require_recorded_source_policy_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<SourcePolicyExclusionRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Ok(());
+    }
+    if &read_source_policy_exclusion_rollback_identity(path, publication)? != expected {
+        return Err(promotion_error(format!(
+            "{role} source policy exclusion identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn promotion_lock_path(path: &Path) -> PathBuf {
@@ -480,6 +602,12 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
                 path.display()
             )));
         }
+        require_recorded_source_policy_identity(
+            path,
+            &live_identity,
+            &committed.candidate_source_policy,
+            "Committed live database",
+        )?;
         if let Err(error) = cleanup_committed_promotion_artifacts(path) {
             tracing::warn!(
                 live_path = %path.display(),
@@ -524,6 +652,23 @@ fn rollback_prepared_promotion(
             live_path.display()
         )));
     }
+    if let Some(live_identity) = live_identity.as_ref() {
+        if live_identity == &prepared.candidate {
+            require_recorded_source_policy_identity(
+                live_path,
+                live_identity,
+                &prepared.candidate_source_policy,
+                "Prepared candidate",
+            )?;
+        } else if prepared.previous.as_ref() == Some(live_identity) {
+            require_recorded_source_policy_identity(
+                live_path,
+                live_identity,
+                &prepared.previous_source_policy,
+                "Prepared previous live database",
+            )?;
+        }
+    }
 
     match prepared.previous.as_ref() {
         Some(expected_previous) => {
@@ -535,6 +680,12 @@ fn rollback_prepared_promotion(
                     live_path.display()
                 )));
             }
+            require_recorded_source_policy_identity(
+                &backup_path,
+                &backup_identity,
+                &prepared.previous_source_policy,
+                "Prepared recovery backup",
+            )?;
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
@@ -545,6 +696,12 @@ fn rollback_prepared_promotion(
                     live_path.display()
                 )));
             }
+            require_recorded_source_policy_identity(
+                live_path,
+                &restored,
+                &prepared.previous_source_policy,
+                "Restored live database",
+            )?;
             remove_promotion_file(&prepared_path)?;
             cleanup_sqlite_sidecars(&backup_path)
         }
@@ -1593,6 +1750,113 @@ fn dense_anchor_content_summary(
         count = count.saturating_add(1);
     }
     Ok((count, format!("{:x}", hasher.finalize()), policies))
+}
+
+pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+const SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
+    b"codestory-source-policy-exclusion-publication-v1\0";
+
+/// One verified source excluded from parser scheduling by an explicit policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourcePolicyExclusionRecord {
+    pub normalized_path: String,
+    pub project_id: String,
+    pub workspace_id: String,
+    pub content_hash: String,
+    pub observed_size: u64,
+    pub policy_version: String,
+    pub byte_cap: u64,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+}
+
+/// Complete exclusion set published with one core generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourcePolicyExclusionManifest {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub project_id: String,
+    pub workspace_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub exclusion_count: u64,
+    pub exclusion_digest: String,
+    pub policy_version: String,
+    pub byte_cap: u64,
+    pub published_at_epoch_ms: i64,
+}
+
+fn source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN);
+    for record in records {
+        for value in [
+            record.normalized_path.as_bytes(),
+            record.project_id.as_bytes(),
+            record.workspace_id.as_bytes(),
+            record.content_hash.as_bytes(),
+            record.policy_version.as_bytes(),
+            record.core_generation_id.as_bytes(),
+            record.core_run_id.as_bytes(),
+        ] {
+            hash_dense_anchor_part(&mut hasher, value);
+        }
+        hash_dense_anchor_part(&mut hasher, &record.observed_size.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.byte_cap.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn read_source_policy_exclusions(
+    conn: &Connection,
+) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_path, project_id, workspace_id, content_hash,
+                observed_size, policy_version, byte_cap, core_generation_id, core_run_id
+         FROM source_policy_exclusion ORDER BY normalized_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size,
+            policy_version,
+            byte_cap,
+            core_generation_id,
+            core_run_id,
+        ) = row?;
+        Ok(SourcePolicyExclusionRecord {
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size: u64::try_from(observed_size).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid observed size".into())
+            })?,
+            policy_version,
+            byte_cap: u64::try_from(byte_cap).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid byte cap".into())
+            })?,
+            core_generation_id,
+            core_run_id,
+        })
+    })
+    .collect()
 }
 
 /// Graph-native symbol-search document used by retrieval sidecars.
@@ -2724,6 +2988,8 @@ impl Storage {
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
         tx.execute("DELETE FROM dense_anchor_input", [])?;
         tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion", [])?;
         tx.execute("DELETE FROM symbol_search_doc", [])?;
         tx.execute("DELETE FROM symbol_summary", [])?;
         tx.execute("DELETE FROM search_symbol_projection", [])?;
@@ -2976,7 +3242,13 @@ impl Storage {
             staged_path,
             "Staged promotion candidate",
         )?;
+        let candidate_source_policy =
+            read_source_policy_exclusion_rollback_identity(staged_path, &candidate)?;
         let previous = read_recovery_database_identity(live_path)?;
+        let previous_source_policy = match previous.as_ref() {
+            Some(previous) => read_source_policy_exclusion_rollback_identity(live_path, previous)?,
+            None => None,
+        };
         cleanup_sqlite_sidecars(&backup_path)?;
 
         if previous.is_some() {
@@ -2996,12 +3268,20 @@ impl Storage {
                     live_path.display()
                 )));
             }
+            require_recorded_source_policy_identity(
+                &backup_path,
+                &backup_identity,
+                &previous_source_policy,
+                "Promotion backup",
+            )?;
         }
 
         let prepared = PromotionJournal {
             version: PROMOTION_JOURNAL_VERSION,
             previous: previous.clone(),
             candidate: candidate.clone(),
+            previous_source_policy,
+            candidate_source_policy: candidate_source_policy.clone(),
         };
         if let Err(error) = write_promotion_journal(&prepared_path, &prepared) {
             if !prepared_path.exists() {
@@ -3056,6 +3336,15 @@ impl Storage {
                 "Promoted live database identity does not match staged candidate {}",
                 staged_path.display()
             )));
+        }
+        if let Err(error) = require_recorded_source_policy_identity(
+            live_path,
+            &published,
+            &candidate_source_policy,
+            "Promoted live database",
+        ) {
+            let _ = rollback_prepared_promotion(live_path, &prepared);
+            return Err(error);
         }
 
         if let Err(error) = commit_promotion_journal(&prepared_path, &committed_path) {
@@ -4532,6 +4821,255 @@ impl Storage {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn get_source_policy_exclusions(
+        &self,
+    ) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
+        read_source_policy_exclusions(&self.conn)
+    }
+
+    pub fn get_source_policy_exclusion_manifest(
+        &self,
+    ) -> Result<Option<SourcePolicyExclusionManifest>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT schema_version, complete, project_id, workspace_id,
+                        core_generation_id, core_run_id, exclusion_count,
+                        exclusion_digest, policy_version, byte_cap, published_at_epoch_ms
+                 FROM source_policy_exclusion_publication WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    schema_version,
+                    complete,
+                    project_id,
+                    workspace_id,
+                    core_generation_id,
+                    core_run_id,
+                    exclusion_count,
+                    exclusion_digest,
+                    policy_version,
+                    byte_cap,
+                    published_at_epoch_ms,
+                )| {
+                    Ok(SourcePolicyExclusionManifest {
+                        schema_version: u32::try_from(schema_version).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid schema".into(),
+                            )
+                        })?,
+                        complete: complete == 1,
+                        project_id,
+                        workspace_id,
+                        core_generation_id,
+                        core_run_id,
+                        exclusion_count: u64::try_from(exclusion_count).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid count".into(),
+                            )
+                        })?,
+                        exclusion_digest,
+                        policy_version,
+                        byte_cap: u64::try_from(byte_cap).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid byte cap".into(),
+                            )
+                        })?,
+                        published_at_epoch_ms,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    /// Atomically replace and publish the complete policy-exclusion set in the staged core.
+    pub fn publish_source_policy_exclusion_generation(
+        &mut self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy_version: &str,
+        byte_cap: u64,
+        candidates: &[OversizedSourceExclusionCandidate],
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || project_id.trim().is_empty()
+            || workspace_id.trim().is_empty()
+            || policy_version.trim().is_empty()
+            || byte_cap == 0
+            || byte_cap > i64::MAX as u64
+        {
+            return Err(StorageError::Other(
+                "source policy exclusion publication identity is invalid".into(),
+            ));
+        }
+        let mut candidates = candidates.to_vec();
+        candidates.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        let mut records = Vec::with_capacity(candidates.len());
+        let mut previous_path: Option<&str> = None;
+        for candidate in &candidates {
+            let path = candidate.normalized_path.as_str();
+            if path.trim().is_empty()
+                || path.starts_with('/')
+                || path.contains('\\')
+                || path
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "..")
+                || previous_path == Some(path)
+                || candidate.content_hash.len() != 64
+                || !candidate
+                    .content_hash
+                    .bytes()
+                    .all(|value| value.is_ascii_hexdigit())
+                || candidate.observed_size <= byte_cap
+                || candidate.observed_size > i64::MAX as u64
+                || candidate.policy_version != policy_version
+                || candidate.byte_cap != byte_cap
+            {
+                return Err(StorageError::Other(format!(
+                    "invalid source policy exclusion candidate: {path}"
+                )));
+            }
+            previous_path = Some(path);
+            records.push(SourcePolicyExclusionRecord {
+                normalized_path: candidate.normalized_path.clone(),
+                project_id: project_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                content_hash: candidate.content_hash.clone(),
+                observed_size: candidate.observed_size,
+                policy_version: candidate.policy_version.clone(),
+                byte_cap: candidate.byte_cap,
+                core_generation_id: publication.generation_id.clone(),
+                core_run_id: publication.run_id.clone(),
+            });
+        }
+
+        let exclusion_digest = source_policy_exclusion_digest(&records);
+        let manifest = SourcePolicyExclusionManifest {
+            schema_version: SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            project_id: project_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            exclusion_count: records.len() as u64,
+            exclusion_digest,
+            policy_version: policy_version.to_string(),
+            byte_cap,
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM source_policy_exclusion_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO source_policy_exclusion (
+                    normalized_path, project_id, workspace_id, content_hash,
+                    observed_size, policy_version, byte_cap, core_generation_id, core_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for record in &records {
+                stmt.execute(params![
+                    &record.normalized_path,
+                    &record.project_id,
+                    &record.workspace_id,
+                    &record.content_hash,
+                    record.observed_size as i64,
+                    &record.policy_version,
+                    record.byte_cap as i64,
+                    &record.core_generation_id,
+                    &record.core_run_id,
+                ])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO source_policy_exclusion_publication (
+                id, schema_version, complete, project_id, workspace_id,
+                core_generation_id, core_run_id, exclusion_count, exclusion_digest,
+                policy_version, byte_cap, published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                manifest.schema_version as i64,
+                &manifest.project_id,
+                &manifest.workspace_id,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.exclusion_count as i64,
+                &manifest.exclusion_digest,
+                &manifest.policy_version,
+                manifest.byte_cap as i64,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(manifest)
+    }
+
+    pub fn validate_source_policy_exclusion_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy_version: &str,
+        byte_cap: u64,
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        let manifest = self
+            .get_source_policy_exclusion_manifest()?
+            .ok_or_else(|| {
+                StorageError::Other("source policy exclusion manifest is missing".into())
+            })?;
+        if manifest.schema_version != SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION
+            || !manifest.complete
+            || manifest.project_id != project_id
+            || manifest.workspace_id != workspace_id
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.policy_version != policy_version
+            || manifest.byte_cap != byte_cap
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+        {
+            return Err(StorageError::Other(
+                "source policy exclusion manifest does not match the complete core publication"
+                    .into(),
+            ));
+        }
+        let records = read_source_policy_exclusions(&self.conn)?;
+        if manifest.exclusion_count != records.len() as u64
+            || manifest.exclusion_digest != source_policy_exclusion_digest(&records)
+            || records.iter().any(|record| {
+                record.project_id != manifest.project_id
+                    || record.workspace_id != manifest.workspace_id
+                    || record.core_generation_id != manifest.core_generation_id
+                    || record.core_run_id != manifest.core_run_id
+                    || record.policy_version != manifest.policy_version
+                    || record.byte_cap != manifest.byte_cap
+                    || record.observed_size <= record.byte_cap
+            })
+        {
+            return Err(StorageError::Other(
+                "source policy exclusion rows do not match their complete manifest".into(),
+            ));
+        }
+        Ok(manifest)
     }
 
     /// Rebind every carried-forward row and atomically publish its complete manifest.

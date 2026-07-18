@@ -712,6 +712,149 @@ fn index_publication_identity_round_trips_through_typed_and_read_only_reads()
 }
 
 #[test]
+fn source_policy_exclusion_publication_binds_complete_rows_to_core_identity()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let publication = IndexPublicationRecord {
+        generation: 4,
+        generation_id: "generation-4".into(),
+        run_id: "run-4".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 44,
+    };
+    let candidates = vec![
+        OversizedSourceExclusionCandidate {
+            normalized_path: "src/generated/registers.h".into(),
+            content_hash: "a".repeat(64),
+            observed_size: 4_000_000,
+            policy_version: "oversized-source-v1".into(),
+            byte_cap: 1_000_000,
+        },
+        OversizedSourceExclusionCandidate {
+            normalized_path: "vendor/ordinary.rs".into(),
+            content_hash: "b".repeat(64),
+            observed_size: 1_000_001,
+            policy_version: "oversized-source-v1".into(),
+            byte_cap: 1_000_000,
+        },
+    ];
+
+    let manifest = storage.publish_source_policy_exclusion_generation(
+        &publication,
+        "project-4",
+        "workspace-4",
+        "oversized-source-v1",
+        1_000_000,
+        &candidates,
+    )?;
+    assert_eq!(manifest.exclusion_count, 2);
+    assert_eq!(manifest.exclusion_digest.len(), 64);
+    assert_eq!(storage.get_source_policy_exclusions()?.len(), 2);
+    assert_eq!(
+        storage.validate_source_policy_exclusion_publication(
+            &publication,
+            "project-4",
+            "workspace-4",
+            "oversized-source-v1",
+            1_000_000,
+        )?,
+        manifest
+    );
+
+    storage.conn.execute(
+        "UPDATE source_policy_exclusion SET content_hash = ?1 WHERE normalized_path = ?2",
+        params!["c".repeat(64), "vendor/ordinary.rs"],
+    )?;
+    assert!(
+        storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                "project-4",
+                "workspace-4",
+                "oversized-source-v1",
+                1_000_000,
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let first_publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "generation-1".into(),
+        run_id: "run-1".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 11,
+    };
+    let first = vec![OversizedSourceExclusionCandidate {
+        normalized_path: "vendor/first.h".into(),
+        content_hash: "a".repeat(64),
+        observed_size: 2_000_000,
+        policy_version: "oversized-source-v1".into(),
+        byte_cap: 1_000_000,
+    }];
+    let expected = storage.publish_source_policy_exclusion_generation(
+        &first_publication,
+        "project",
+        "workspace",
+        "oversized-source-v1",
+        1_000_000,
+        &first,
+    )?;
+    storage.conn.execute_batch(
+        "CREATE TRIGGER reject_second_policy_exclusion
+         BEFORE INSERT ON source_policy_exclusion
+         WHEN NEW.normalized_path = 'vendor/reject.h'
+         BEGIN
+           SELECT RAISE(ABORT, 'injected exclusion write failure');
+         END;",
+    )?;
+    let second_publication = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "generation-2".into(),
+        run_id: "run-2".into(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 22,
+    };
+    let second = vec![OversizedSourceExclusionCandidate {
+        normalized_path: "vendor/reject.h".into(),
+        content_hash: "b".repeat(64),
+        observed_size: 3_000_000,
+        policy_version: "oversized-source-v1".into(),
+        byte_cap: 1_000_000,
+    }];
+    assert!(
+        storage
+            .publish_source_policy_exclusion_generation(
+                &second_publication,
+                "project",
+                "workspace",
+                "oversized-source-v1",
+                1_000_000,
+                &second,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        storage.get_source_policy_exclusion_manifest()?,
+        Some(expected)
+    );
+    assert_eq!(storage.get_source_policy_exclusions()?.len(), 1);
+    storage.validate_source_policy_exclusion_publication(
+        &first_publication,
+        "project",
+        "workspace",
+        "oversized-source-v1",
+        1_000_000,
+    )?;
+    Ok(())
+}
+
+#[test]
 fn index_publication_identity_rejects_negative_published_timestamp() {
     assert!(
         index_publication_record_from_values(
@@ -2790,6 +2933,37 @@ fn schema_26_adds_nullable_error_coverage_reason_idempotently() -> Result<(), St
 }
 
 #[test]
+fn schema_27_adds_source_policy_tables_without_synthesizing_publication() -> Result<(), StorageError>
+{
+    let db_path = unique_temp_db_path("v27-source-policy-exclusion-migration");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let storage = Storage::open(&db_path)?;
+        storage
+            .conn
+            .execute("DROP TABLE source_policy_exclusion_publication", [])?;
+        storage
+            .conn
+            .execute("DROP TABLE source_policy_exclusion", [])?;
+        storage.set_schema_version(26)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert!(storage.get_source_policy_exclusions()?.is_empty());
+    assert!(
+        storage.get_source_policy_exclusion_manifest()?.is_none(),
+        "migration cannot manufacture verified exclusion evidence"
+    );
+    schema::migrate_v27_source_policy_exclusions(&storage.conn)?;
+    schema::migrate_v27_source_policy_exclusions(&storage.conn)?;
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    Ok(())
+}
+
+#[test]
 fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_column()
 -> Result<(), StorageError> {
     for source_version in [19, 20] {
@@ -3081,11 +3255,68 @@ fn promotion_journal(
     previous_path: &Path,
     candidate_path: &Path,
 ) -> Result<PromotionJournal, StorageError> {
+    let previous = read_recovery_database_identity(previous_path)?;
+    let candidate = require_complete_promotion_database_identity(candidate_path, "Test candidate")?;
     Ok(PromotionJournal {
         version: PROMOTION_JOURNAL_VERSION,
-        previous: read_recovery_database_identity(previous_path)?,
-        candidate: require_complete_promotion_database_identity(candidate_path, "Test candidate")?,
+        previous_source_policy: previous
+            .as_ref()
+            .map(|publication| {
+                read_source_policy_exclusion_rollback_identity(previous_path, publication)
+            })
+            .transpose()?
+            .flatten(),
+        candidate_source_policy: read_source_policy_exclusion_rollback_identity(
+            candidate_path,
+            &candidate,
+        )?,
+        previous,
+        candidate,
     })
+}
+
+#[test]
+fn promotion_journal_binds_source_policy_exclusion_count_and_digest() -> Result<(), StorageError> {
+    let previous_path = unique_temp_db_path("promotion-policy-previous");
+    let candidate_path = unique_temp_db_path("promotion-policy-candidate");
+    seed_promotion_file(&previous_path, 1, "old")?;
+    seed_promotion_file(&candidate_path, 2, "new")?;
+
+    for (path, generation) in [(&previous_path, 1_u64), (&candidate_path, 2_u64)] {
+        let mut storage = Storage::open(path)?;
+        let publication = storage
+            .get_complete_index_publication()?
+            .expect("seeded publication");
+        storage.publish_source_policy_exclusion_generation(
+            &publication,
+            "project",
+            "workspace",
+            "oversized-source-v1",
+            1_000_000,
+            &[OversizedSourceExclusionCandidate {
+                normalized_path: format!("vendor/registers-{generation}.h"),
+                content_hash: format!("{generation:x}").repeat(64),
+                observed_size: 1_000_000 + generation,
+                policy_version: "oversized-source-v1".into(),
+                byte_cap: 1_000_000,
+            }],
+        )?;
+    }
+
+    let journal = promotion_journal(&previous_path, &candidate_path)?;
+    let previous = journal
+        .previous_source_policy
+        .expect("previous exclusion rollback identity");
+    let candidate = journal
+        .candidate_source_policy
+        .expect("candidate exclusion rollback identity");
+    assert_eq!(previous.exclusion_count, 1);
+    assert_eq!(candidate.exclusion_count, 1);
+    assert_ne!(previous.exclusion_digest, candidate.exclusion_digest);
+
+    cleanup_sqlite_sidecars(&previous_path)?;
+    cleanup_sqlite_sidecars(&candidate_path)?;
+    Ok(())
 }
 
 #[test]

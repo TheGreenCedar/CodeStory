@@ -32,10 +32,11 @@ use codestory_contracts::api::{
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
     SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
+    SourceOccurrenceDto, SourcePolicyExclusionDto, StartIndexingRequest, StorageStatsDto,
+    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{
@@ -56,8 +57,9 @@ use codestory_store::{
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use codestory_workspace::{
-    RefreshExecutionPlan, RefreshInputs, RefreshMode, WorkspaceInventoryOutcome, WorkspaceManifest,
-    WorkspacePathIdentity,
+    DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION,
+    OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInputs, RefreshMode,
+    WorkspaceInventoryOutcome, WorkspaceManifest, WorkspacePathIdentity, project_identity_v3,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
@@ -5051,20 +5053,22 @@ fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
 fn full_refresh_execution_plan_with_coverage(
     root: &Path,
     workspace: &WorkspaceManifest,
-) -> Result<RefreshExecutionPlan, ApiError> {
-    let inventory = workspace.source_inventory().map_err(|error| {
-        ApiError::source_coverage_failure(
-            "source_collector_failure",
-            format!("Failed to collect the full source inventory: {error}"),
-            vec![FileCoverageDiagnosticDto {
-                path: ".".to_string(),
-                reason: FileCoverageReason::CollectorFailure,
-                retryable: true,
-                verified_source: false,
-                projection_available: false,
-            }],
-        )
-    })?;
+) -> Result<(RefreshExecutionPlan, Vec<OversizedSourceExclusionCandidate>), ApiError> {
+    let inventory = workspace
+        .source_inventory_with_oversized_policy()
+        .map_err(|error| {
+            ApiError::source_coverage_failure(
+                "source_collector_failure",
+                format!("Failed to collect the full source inventory: {error}"),
+                vec![FileCoverageDiagnosticDto {
+                    path: ".".to_string(),
+                    reason: FileCoverageReason::CollectorFailure,
+                    retryable: true,
+                    verified_source: false,
+                    projection_available: false,
+                }],
+            )
+        })?;
     if inventory.outcome != WorkspaceInventoryOutcome::Complete {
         let reason = if inventory.outcome == WorkspaceInventoryOutcome::Unreadable {
             FileCoverageReason::Unreadable
@@ -5103,12 +5107,62 @@ fn full_refresh_execution_plan_with_coverage(
             coverage_gaps,
         ));
     }
-    Ok(RefreshExecutionPlan {
-        mode: RefreshMode::FullRefresh,
-        files_to_index: inventory.files,
-        files_to_remove: Vec::new(),
-        existing_file_ids: HashMap::new(),
-    })
+    Ok((
+        RefreshExecutionPlan {
+            mode: RefreshMode::FullRefresh,
+            files_to_index: inventory.files,
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        inventory.policy_exclusions,
+    ))
+}
+
+fn publish_source_policy_exclusions(
+    storage: &mut Store,
+    root: &Path,
+    publication: &IndexPublicationRecord,
+    exclusions: &[OversizedSourceExclusionCandidate],
+) -> Result<(), ApiError> {
+    let identity = project_identity_v3(root);
+    storage
+        .publish_source_policy_exclusion_generation(
+            publication,
+            &identity.project_id,
+            &identity.workspace_id,
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            exclusions,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to publish complete source policy exclusions: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn validate_source_policy_exclusions(
+    storage: &Store,
+    root: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<(), ApiError> {
+    let identity = project_identity_v3(root);
+    storage
+        .validate_source_policy_exclusion_publication(
+            publication,
+            &identity.project_id,
+            &identity.workspace_id,
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+        )
+        .map_err(|error| {
+            ApiError::new(
+                "source_verification_failed",
+                format!("Source policy exclusion publication is incomplete or stale: {error}"),
+            )
+        })?;
+    Ok(())
 }
 
 fn stored_file_coverage_diagnostics(
@@ -5305,6 +5359,28 @@ where
             ));
         }
     }
+    match storage.get_complete_index_publication() {
+        Ok(Some(publication)) => {
+            if let Err(error) = validate_source_policy_exclusions(storage, root, &publication) {
+                return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                    format!(
+                        "source policy exclusion publication is incomplete: {}",
+                        error.message
+                    ),
+                    0,
+                    started_at,
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                format!("failed to read complete core publication: {error}"),
+                0,
+                started_at,
+            ));
+        }
+    }
     #[cfg(test)]
     run_after_index_freshness_fence_test_hook();
     let files = match storage.get_files() {
@@ -5355,9 +5431,10 @@ where
         stored_files,
         inventory: Default::default(),
     };
-    let refresh = match workspace
-        .build_execution_outcome_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
-    {
+    let refresh = match workspace.build_execution_outcome_bounded_with_oversized_policy(
+        &refresh_inputs,
+        INDEX_FRESHNESS_CURRENT_FILE_CAP,
+    ) {
         Ok(refresh) => refresh,
         Err(error) => {
             return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
@@ -5367,8 +5444,9 @@ where
             ));
         }
     };
-    if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+    if refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         let detail = refresh
+            .refresh
             .inventory_issues
             .first()
             .map(|issue| format!("{}: {}", issue.path.display(), issue.message));
@@ -5376,18 +5454,19 @@ where
             match detail {
                 Some(detail) => format!(
                     "current workspace inventory is {:?}: {detail}",
-                    refresh.inventory_outcome
+                    refresh.refresh.inventory_outcome
                 ),
                 None => format!(
                     "current workspace inventory is {:?} (>{})",
-                    refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
+                    refresh.refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
                 ),
             },
             indexed_file_count,
             started_at,
         ));
     }
-    let plan = refresh.plan;
+    let current_policy_exclusions = refresh.policy_exclusions;
+    let plan = refresh.refresh.plan;
 
     let mut changed_file_count = 0u32;
     let mut new_file_count = 0u32;
@@ -5412,7 +5491,68 @@ where
         }
     }
 
-    let removed_file_count = clamp_usize_to_u32(plan.files_to_remove.len());
+    let stored_policy_exclusions = match storage.get_source_policy_exclusions() {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                format!("failed to read source policy exclusions: {error}"),
+                indexed_file_count,
+                started_at,
+            ));
+        }
+    };
+    let previous_policy_by_path = stored_policy_exclusions
+        .iter()
+        .map(|entry| (entry.normalized_path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let current_policy_paths = current_policy_exclusions
+        .iter()
+        .map(|entry| entry.normalized_path.as_str())
+        .collect::<HashSet<_>>();
+    let planned_paths = plan
+        .files_to_index
+        .iter()
+        .map(|path| runtime_relative_path(root, path))
+        .collect::<HashSet<_>>();
+    for exclusion in &current_policy_exclusions {
+        let kind = match previous_policy_by_path.get(exclusion.normalized_path.as_str()) {
+            Some(previous)
+                if previous.content_hash == exclusion.content_hash
+                    && previous.observed_size == exclusion.observed_size
+                    && previous.policy_version == exclusion.policy_version
+                    && previous.byte_cap == exclusion.byte_cap =>
+            {
+                continue;
+            }
+            Some(_) => {
+                changed_file_count = changed_file_count.saturating_add(1);
+                IndexFreshnessChangeKindDto::Changed
+            }
+            None => {
+                new_file_count = new_file_count.saturating_add(1);
+                IndexFreshnessChangeKindDto::New
+            }
+        };
+        if samples.len() < INDEX_FRESHNESS_SAMPLE_LIMIT {
+            samples.push(IndexFreshnessSampleDto {
+                kind,
+                path: exclusion.normalized_path.clone(),
+            });
+        }
+    }
+
+    let removed_policy_exclusions = stored_policy_exclusions
+        .iter()
+        .filter(|entry| {
+            !current_policy_paths.contains(entry.normalized_path.as_str())
+                && !planned_paths.contains(&entry.normalized_path)
+        })
+        .collect::<Vec<_>>();
+    let removed_file_count = clamp_usize_to_u32(
+        plan.files_to_remove
+            .len()
+            .saturating_add(removed_policy_exclusions.len()),
+    );
     for removed_id in &plan.files_to_remove {
         if samples.len() >= INDEX_FRESHNESS_SAMPLE_LIMIT {
             break;
@@ -5423,6 +5563,15 @@ where
                 path: runtime_relative_path(root, path),
             });
         }
+    }
+    for removed in removed_policy_exclusions {
+        if samples.len() >= INDEX_FRESHNESS_SAMPLE_LIMIT {
+            break;
+        }
+        samples.push(IndexFreshnessSampleDto {
+            kind: IndexFreshnessChangeKindDto::Removed,
+            path: removed.normalized_path.clone(),
+        });
     }
 
     let status = if changed_file_count == 0 && new_file_count == 0 && removed_file_count == 0 {
@@ -11166,7 +11315,7 @@ impl AppController {
         Ok(())
     }
 
-    pub(crate) fn complete_core_requires_dense_anchor_repair(
+    pub(crate) fn complete_core_requires_publication_repair(
         &self,
         storage_path: &Path,
     ) -> Result<bool, ApiError> {
@@ -11186,9 +11335,14 @@ impl AppController {
         else {
             return Ok(false);
         };
-        Ok(storage
+        if storage
             .validate_dense_anchor_publication(&publication)
-            .is_err())
+            .is_err()
+        {
+            return Ok(true);
+        }
+        let root = self.require_project_root()?;
+        Ok(validate_source_policy_exclusions(&storage, &root, &publication).is_err())
     }
 
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
@@ -11981,6 +12135,23 @@ impl AppController {
         self.ensure_consistent_read_state("Files")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
+        let publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read source policy exclusion publication identity: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "source_verification_failed",
+                    "Indexed-file coverage requires a complete core publication.",
+                )
+            })?;
+        validate_source_policy_exclusions(&storage, &root, &publication)?;
+        let source_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
+            ApiError::internal(format!("Failed to load source policy exclusions: {error}"))
+        })?;
         let mut files = storage
             .get_files()
             .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
@@ -12048,6 +12219,39 @@ impl AppController {
 
         let path_filter = req.path_contains.as_deref().map(normalize_path_key);
         let language_filter = req.language.as_deref().map(str::to_ascii_lowercase);
+        let policy_exclusion_count = source_policy_exclusions.len().min(u32::MAX as usize) as u32;
+        let mut policy_exclusions = source_policy_exclusions
+            .into_iter()
+            .filter(|entry| {
+                let role = path_role_from_key(&normalize_path_key(&entry.normalized_path));
+                req.role.is_none_or(|requested| requested == role)
+                    && path_filter.as_deref().is_none_or(|needle| {
+                        normalize_path_key(&entry.normalized_path).contains(needle)
+                    })
+                    && language_filter.as_deref().is_none_or(|language| {
+                        indexed_file_matches_language_filter(
+                            "unknown",
+                            Path::new(&entry.normalized_path),
+                            language,
+                        )
+                    })
+            })
+            .map(|entry| SourcePolicyExclusionDto {
+                role: path_role_from_key(&normalize_path_key(&entry.normalized_path)),
+                path: entry.normalized_path,
+                content_hash: entry.content_hash,
+                observed_size: entry.observed_size,
+                policy_version: entry.policy_version,
+                byte_cap: entry.byte_cap,
+                project_id: entry.project_id,
+                workspace_id: entry.workspace_id,
+                core_generation_id: entry.core_generation_id,
+                core_run_id: entry.core_run_id,
+                graph_coverage: false,
+                semantic_coverage: false,
+            })
+            .collect::<Vec<_>>();
+        policy_exclusions.truncate(5_000);
         let mut visible = files
             .into_iter()
             .filter(|file| {
@@ -12084,6 +12288,11 @@ impl AppController {
             ));
         } else {
             coverage_notes.push("index usable; no file-level index errors recorded".to_string());
+        }
+        if policy_exclusion_count > 0 {
+            coverage_notes.push(format!(
+                "{policy_exclusion_count} verified source policy exclusions have no parser-backed graph or semantic coverage"
+            ));
         }
         let language_counts = language_counts
             .into_iter()
@@ -12123,6 +12332,7 @@ impl AppController {
                 visible_file_count,
                 incomplete_file_count,
                 error_file_count,
+                policy_exclusion_count,
                 incomplete_reason_counts,
                 truncated,
                 language_counts,
@@ -12130,6 +12340,7 @@ impl AppController {
                 coverage_notes,
             },
             coverage_gaps,
+            policy_exclusions,
             files: visible,
         })
     }
@@ -13927,7 +14138,9 @@ fn index_full_for_runtime(
             match live.get_complete_index_publication() {
                 Ok(Some(publication)) if publication == *expected => {
                     match live.validate_dense_anchor_publication(&publication) {
-                        Ok(_) => true,
+                        Ok(_) => {
+                            validate_source_policy_exclusions(&live, root, &publication).is_ok()
+                        }
                         Err(error) => {
                             tracing::debug!(
                                 path = %storage_path.display(),
@@ -13949,7 +14162,8 @@ fn index_full_for_runtime(
         });
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-    let execution_plan = full_refresh_execution_plan_with_coverage(root, &workspace)?;
+    let (execution_plan, policy_exclusions) =
+        full_refresh_execution_plan_with_coverage(root, &workspace)?;
 
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
@@ -14125,6 +14339,12 @@ fn index_full_for_runtime(
         return Err(ApiError::internal(format!(
             "Failed to publish complete dense anchor inputs: {error}"
         )));
+    }
+    if let Err(error) =
+        publish_source_policy_exclusions(staged.store_mut(), root, &publication, &policy_exclusions)
+    {
+        let _ = staged.discard();
+        return Err(error);
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -14358,18 +14578,7 @@ fn index_incremental_for_runtime(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<IndexingRunSummary, ApiError> {
-    run_incremental_indexing_common(
-        root,
-        storage_path,
-        events_tx,
-        cancel_token,
-        runtime,
-        |workspace, inputs| {
-            workspace
-                .build_execution_plan(inputs)
-                .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))
-        },
-    )
+    run_incremental_indexing_common(root, storage_path, events_tx, cancel_token, runtime)
 }
 
 fn spawn_progress_forwarder(
@@ -14394,17 +14603,13 @@ fn spawn_progress_forwarder(
     })
 }
 
-fn run_incremental_indexing_common<F>(
+fn run_incremental_indexing_common(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
-    refresh_builder: F,
-) -> Result<IndexingRunSummary, ApiError>
-where
-    F: FnOnce(&WorkspaceManifest, &RefreshInputs) -> Result<RefreshExecutionPlan, ApiError>,
-{
+) -> Result<IndexingRunSummary, ApiError> {
     let live_exists = storage_path.exists();
     let live_is_incomplete = live_exists
         && Store::database_has_incomplete_incremental_run(storage_path).map_err(|e| {
@@ -14458,189 +14663,234 @@ where
     )?;
     let dense_anchor_source_identity =
         format!("core:{}:{}", publication.generation_id, publication.run_id);
-    let staged_result =
-        (|| {
-            staged.store_mut().begin_incremental_run().map_err(|e| {
+    let staged_result = (|| {
+        staged.store_mut().begin_incremental_run().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to persist staged incomplete index marker: {e}"
+            ))
+        })?;
+        staged
+            .store_mut()
+            .invalidate_grounding_snapshots()
+            .map_err(|e| {
                 ApiError::internal(format!(
-                    "Failed to persist staged incomplete index marker: {e}"
+                    "Failed to invalidate staged derived index snapshots: {e}"
                 ))
             })?;
+
+        let workspace = WorkspaceManifest::open(root.to_path_buf())
+            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
+        let policy_refresh = workspace
+            .build_execution_outcome_with_oversized_policy(&refresh_inputs)
+            .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))?;
+        if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+            let reason = if policy_refresh.refresh.inventory_outcome
+                == WorkspaceInventoryOutcome::Unreadable
+            {
+                FileCoverageReason::Unreadable
+            } else {
+                FileCoverageReason::DiscoveryIncomplete
+            };
+            let mut gaps = policy_refresh
+                .refresh
+                .inventory_issues
+                .iter()
+                .map(|issue| FileCoverageDiagnosticDto {
+                    path: runtime_relative_path(root, &issue.path),
+                    reason,
+                    retryable: file_coverage_retryable(reason),
+                    verified_source: false,
+                    projection_available: false,
+                })
+                .collect::<Vec<_>>();
+            if gaps.is_empty() {
+                gaps.push(FileCoverageDiagnosticDto {
+                    path: ".".into(),
+                    reason,
+                    retryable: file_coverage_retryable(reason),
+                    verified_source: false,
+                    projection_available: false,
+                });
+            }
+            return Err(ApiError::source_coverage_failure(
+                source_coverage_failure_code(&gaps),
+                format!(
+                    "Incremental refresh requires a complete source inventory; discovery was {:?}.",
+                    policy_refresh.refresh.inventory_outcome
+                ),
+                gaps,
+            ));
+        }
+        let execution_plan = policy_refresh.refresh.plan;
+        let policy_exclusions = policy_refresh.policy_exclusions;
+        let mut planned_semantic_seed_file_ids = execution_plan
+            .files_to_remove
+            .iter()
+            .copied()
+            .map(codestory_contracts::graph::NodeId)
+            .collect::<HashSet<_>>();
+        for path in &execution_plan.files_to_index {
+            let normalized_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            };
+            if let Some(file_info) = staged
+                .store_mut()
+                .get_file_by_path(&normalized_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve previous semantic scope for {}: {error}",
+                        normalized_path.display()
+                    ))
+                })?
+            {
+                planned_semantic_seed_file_ids
+                    .insert(codestory_contracts::graph::NodeId(file_info.id));
+            }
+        }
+        let previous_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
+            staged.store_mut(),
+            &planned_semantic_seed_file_ids,
+        )?;
+        let existing_file_paths = semantic_file_table_path_map(
             staged
                 .store_mut()
-                .invalidate_grounding_snapshots()
-                .map_err(|e| {
+                .get_files()
+                .map_err(|error| ApiError::internal(format!("Failed to load files: {error}")))?,
+        );
+        let mut removed_component_keys = HashSet::new();
+        for file_id in &execution_plan.files_to_remove {
+            let path = existing_file_paths
+                .get(&codestory_contracts::graph::NodeId(*file_id))
+                .ok_or_else(|| {
                     ApiError::internal(format!(
-                        "Failed to invalidate staged derived index snapshots: {e}"
+                        "Removed file is missing from staged component scope: {file_id}"
                     ))
                 })?;
-
-            let workspace = WorkspaceManifest::open(root.to_path_buf())
-                .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-            let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
-            let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
-            let mut planned_semantic_seed_file_ids = execution_plan
-                .files_to_remove
-                .iter()
-                .copied()
-                .map(codestory_contracts::graph::NodeId)
-                .collect::<HashSet<_>>();
-            for path in &execution_plan.files_to_index {
-                let normalized_path = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    root.join(path)
-                };
-                if let Some(file_info) = staged
-                    .store_mut()
-                    .get_file_by_path(&normalized_path)
-                    .map_err(|error| {
-                        ApiError::internal(format!(
-                            "Failed to resolve previous semantic scope for {}: {error}",
-                            normalized_path.display()
-                        ))
-                    })?
-                {
-                    planned_semantic_seed_file_ids
-                        .insert(codestory_contracts::graph::NodeId(file_info.id));
-                }
+            if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
+                removed_component_keys.insert(component_key);
             }
-            let previous_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
-                staged.store_mut(),
-                &planned_semantic_seed_file_ids,
-            )?;
-            let existing_file_paths =
-                semantic_file_table_path_map(staged.store_mut().get_files().map_err(|error| {
-                    ApiError::internal(format!("Failed to load files: {error}"))
-                })?);
-            let mut removed_component_keys = HashSet::new();
-            for file_id in &execution_plan.files_to_remove {
-                let path = existing_file_paths
-                    .get(&codestory_contracts::graph::NodeId(*file_id))
-                    .ok_or_else(|| {
-                        ApiError::internal(format!(
-                            "Removed file is missing from staged component scope: {file_id}"
-                        ))
-                    })?;
-                if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
-                    removed_component_keys.insert(component_key);
-                }
-            }
-            let component_report_refresh = ComponentReportRefreshScope {
-                previous_file_paths: existing_file_paths,
-                removed_component_keys,
-            };
+        }
+        let component_report_refresh = ComponentReportRefreshScope {
+            previous_file_paths: existing_file_paths,
+            removed_component_keys,
+        };
 
-            let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
-            let _ = events_tx.send(AppEventPayload::IndexingStarted {
-                file_count: total_files,
-            });
+        let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
+        let _ = events_tx.send(AppEventPayload::IndexingStarted {
+            file_count: total_files,
+        });
 
-            let bus = EventBus::new();
-            let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
-            if is_indexing_cancelled(cancel_token) {
-                drop(bus);
-                let _ = forwarder.join();
-                return Err(indexing_cancelled_error());
-            }
-            let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-            let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
-
-            // Drop bus so forwarder unblocks.
+        let bus = EventBus::new();
+        let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+        if is_indexing_cancelled(cancel_token) {
             drop(bus);
             let _ = forwarder.join();
+            return Err(indexing_cancelled_error());
+        }
+        let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
+        let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
-            let index_stats = match result {
-                Ok(_) if is_indexing_cancelled(cancel_token) => {
-                    return Err(indexing_cancelled_error());
-                }
-                Ok(stats) => stats,
-                Err(_) if is_indexing_cancelled(cancel_token) => {
-                    return Err(indexing_cancelled_error());
-                }
-                Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+        // Drop bus so forwarder unblocks.
+        drop(bus);
+        let _ = forwarder.join();
+
+        let index_stats = match result {
+            Ok(_) if is_indexing_cancelled(cancel_token) => {
+                return Err(indexing_cancelled_error());
+            }
+            Ok(stats) => stats,
+            Err(_) if is_indexing_cancelled(cancel_token) => {
+                return Err(indexing_cancelled_error());
+            }
+            Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+        };
+        let mut semantic_refresh_seed_file_ids = HashSet::new();
+        for path in &execution_plan.files_to_index {
+            let normalized_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
             };
-            let mut semantic_refresh_seed_file_ids = HashSet::new();
-            for path in &execution_plan.files_to_index {
-                let normalized_path = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    root.join(path)
-                };
-                let file_info = staged
-                    .store_mut()
-                    .get_file_by_path(&normalized_path)
-                    .map_err(|error| {
-                        ApiError::internal(format!(
-                            "Failed to resolve indexed semantic scope for {}: {error}",
-                            normalized_path.display()
-                        ))
-                    })?;
-                // Workspace refresh plans include discovered files that have no graph
-                // collector, while incomplete reads preserve the last verified graph.
-                // Only complete files can prove that their semantic projection changed.
-                if let Some(file_info) = file_info
-                    && file_info.complete
-                {
-                    semantic_refresh_seed_file_ids
-                        .insert(codestory_contracts::graph::NodeId(file_info.id));
-                }
+            let file_info = staged
+                .store_mut()
+                .get_file_by_path(&normalized_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve indexed semantic scope for {}: {error}",
+                        normalized_path.display()
+                    ))
+                })?;
+            // Workspace refresh plans include discovered files that have no graph
+            // collector, while incomplete reads preserve the last verified graph.
+            // Only complete files can prove that their semantic projection changed.
+            if let Some(file_info) = file_info
+                && file_info.complete
+            {
+                semantic_refresh_seed_file_ids
+                    .insert(codestory_contracts::graph::NodeId(file_info.id));
             }
-            for file_id in &execution_plan.files_to_remove {
-                semantic_refresh_seed_file_ids.insert(codestory_contracts::graph::NodeId(*file_id));
+        }
+        for file_id in &execution_plan.files_to_remove {
+            semantic_refresh_seed_file_ids.insert(codestory_contracts::graph::NodeId(*file_id));
+        }
+        let current_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
+            staged.store_mut(),
+            &semantic_refresh_seed_file_ids,
+        )?;
+        let mut llm_refresh_scope = semantic_refresh_seed_file_ids.clone();
+        for seed_file_id in &semantic_refresh_seed_file_ids {
+            if let Some(file_ids) = previous_semantic_dependents_by_seed.get(seed_file_id) {
+                llm_refresh_scope.extend(file_ids.iter().copied());
             }
-            let current_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
-                staged.store_mut(),
-                &semantic_refresh_seed_file_ids,
-            )?;
-            let mut llm_refresh_scope = semantic_refresh_seed_file_ids.clone();
-            for seed_file_id in &semantic_refresh_seed_file_ids {
-                if let Some(file_ids) = previous_semantic_dependents_by_seed.get(seed_file_id) {
-                    llm_refresh_scope.extend(file_ids.iter().copied());
-                }
-                if let Some(file_ids) = current_semantic_dependents_by_seed.get(seed_file_id) {
-                    llm_refresh_scope.extend(file_ids.iter().copied());
-                }
+            if let Some(file_ids) = current_semantic_dependents_by_seed.get(seed_file_id) {
+                llm_refresh_scope.extend(file_ids.iter().copied());
             }
-            let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
-                staged.store_mut(),
-                (!rebuild_complete_dense_anchor_set).then_some(&llm_refresh_scope),
-                (!rebuild_complete_dense_anchor_set).then_some(&component_report_refresh),
-                &dense_anchor_source_identity,
-                cancel_token,
-                runtime,
-            )?;
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to finalize staged incremental storage: {e}"
-                ))
-            })?;
-            let detail_started = Instant::now();
-            staged.snapshots().refresh_detail().map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to refresh staged grounding detail snapshot: {e}"
-                ))
-            })?;
-            let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            Ok((
-                index_stats,
-                staged_finalize_stats,
-                detail_snapshot_ms,
-                llm_refresh_scope,
-                staged_semantic_stats,
+        }
+        let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
+            staged.store_mut(),
+            (!rebuild_complete_dense_anchor_set).then_some(&llm_refresh_scope),
+            (!rebuild_complete_dense_anchor_set).then_some(&component_report_refresh),
+            &dense_anchor_source_identity,
+            cancel_token,
+            runtime,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to finalize staged incremental storage: {e}"
             ))
-        })();
+        })?;
+        let detail_started = Instant::now();
+        staged.snapshots().refresh_detail().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to refresh staged grounding detail snapshot: {e}"
+            ))
+        })?;
+        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        Ok((
+            index_stats,
+            staged_finalize_stats,
+            detail_snapshot_ms,
+            llm_refresh_scope,
+            staged_semantic_stats,
+            policy_exclusions,
+        ))
+    })();
     let (
         index_stats,
         staged_finalize_stats,
         detail_snapshot_ms,
         llm_refresh_scope,
         staged_semantic_stats,
+        policy_exclusions,
     ) = match staged_result {
         Ok(result) => result,
         Err(error) => {
@@ -14670,6 +14920,12 @@ where
         return Err(ApiError::internal(format!(
             "Failed to publish complete dense anchor inputs: {error}"
         )));
+    }
+    if let Err(error) =
+        publish_source_policy_exclusions(staged.store_mut(), root, &publication, &policy_exclusions)
+    {
+        let _ = staged.discard();
+        return Err(error);
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -21455,13 +21711,11 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     fn make_source_exceed_default_index_byte_cap(path: &Path, reason: &str) {
-        const DEFAULT_INDEX_SOURCE_FILE_BYTE_CAP: usize = 1_000_000;
-
         let mut source = fs::read_to_string(path).expect("read source");
         source.push_str("\n// ");
         source.push_str(reason);
         source.push_str("\n// ");
-        let padding = DEFAULT_INDEX_SOURCE_FILE_BYTE_CAP
+        let padding = (DEFAULT_SOURCE_FILE_BYTE_CAP as usize)
             .saturating_sub(source.len())
             .saturating_add(1);
         source.push_str(&"x".repeat(padding));
@@ -21470,13 +21724,13 @@ fn build_llm_symbol_doc_text() -> String {
 
         let size = fs::metadata(path).expect("oversized source metadata").len();
         assert!(
-            size > DEFAULT_INDEX_SOURCE_FILE_BYTE_CAP as u64,
+            size > DEFAULT_SOURCE_FILE_BYTE_CAP,
             "fixture source must exceed the default index byte cap: {size}"
         );
     }
 
     #[test]
-    fn incomplete_first_full_refresh_creates_no_core_or_dense_publication() {
+    fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_coverage() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -21484,6 +21738,18 @@ fn build_llm_symbol_doc_text() -> String {
             &workspace.path().join("rust_tictactoe.rs"),
             "first full-refresh candidate is deliberately oversized",
         );
+        fs::create_dir_all(workspace.path().join("generated")).expect("generated fixture dir");
+        fs::create_dir_all(workspace.path().join("vendor")).expect("vendor fixture dir");
+        fs::write(
+            workspace.path().join("generated/registers.h"),
+            vec![b'g'; DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1],
+        )
+        .expect("generated oversized fixture");
+        fs::write(
+            workspace.path().join("vendor/bundle.js"),
+            vec![b'v'; DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1],
+        )
+        .expect("vendor oversized fixture");
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
             .open_project_summary_with_storage_path(
@@ -21491,47 +21757,158 @@ fn build_llm_symbol_doc_text() -> String {
                 storage_path.clone(),
             )
             .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("verified oversized source should not block first publication");
+
+        let storage = Storage::open(&storage_path).expect("open published storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read publication")
+            .expect("complete publication");
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("verified exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 3);
+        let exclusions = storage
+            .get_source_policy_exclusions()
+            .expect("source exclusions");
+        assert_eq!(
+            exclusions
+                .iter()
+                .map(|entry| entry.normalized_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "generated/registers.h",
+                "rust_tictactoe.rs",
+                "vendor/bundle.js"
+            ]
+        );
+        assert!(
+            exclusions
+                .iter()
+                .all(|entry| entry.observed_size > entry.byte_cap)
+        );
+        assert!(
+            storage
+                .get_file_by_path(&workspace.path().join("rust_tictactoe.rs"))
+                .expect("excluded file lookup")
+                .is_none(),
+            "policy exclusion must not create parser-backed file coverage"
+        );
+        let files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: Some("rust_tictactoe.rs".into()),
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("agent-facing file coverage");
+        assert!(files.coverage_gaps.is_empty());
+        assert_eq!(files.policy_exclusions.len(), 1);
+        assert!(!files.policy_exclusions[0].graph_coverage);
+        assert!(!files.policy_exclusions[0].semantic_coverage);
+        let all_files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: None,
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("all agent-facing file coverage");
+        assert_eq!(all_files.summary.policy_exclusion_count, 3);
+        assert!(
+            all_files
+                .policy_exclusions
+                .iter()
+                .any(|entry| entry.role == IndexedFileRoleDto::Generated)
+        );
+        assert!(
+            all_files
+                .policy_exclusions
+                .iter()
+                .any(|entry| entry.role == IndexedFileRoleDto::Vendor)
+        );
+        let workspace_manifest =
+            WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+        let freshness =
+            index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        storage
+            .get_connection()
+            .execute("DELETE FROM source_policy_exclusion_publication", [])
+            .expect("corrupt exclusion publication identity");
+        let incomplete =
+            index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
+        assert_eq!(incomplete.status, IndexFreshnessStatusDto::NotChecked);
+        assert!(
+            incomplete
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("source policy exclusion publication"))
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn partial_discovery_keeps_oversized_candidates_blocking_and_publishes_nothing() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        fs::write(
+            workspace.path().join("src/large.rs"),
+            vec![b'x'; DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1],
+        )
+        .expect("oversized source");
+        fs::write(
+            workspace.path().join("codestory_workspace.json"),
+            r#"{"members":["src","missing"]}"#,
+        )
+        .expect("partial workspace manifest");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open partial project");
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect_err("an incomplete first full refresh must not publish");
+            .expect_err("partial discovery cannot authorize exclusions");
 
-        assert_eq!(error.code, "source_oversized");
+        assert_eq!(error.code, "source_discovery_incomplete");
         assert!(error.details.as_ref().is_some_and(|details| {
-            details.coverage_gaps.iter().any(|entry| {
-                entry.reason == FileCoverageReason::Oversized && !entry.verified_source
-            })
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::DiscoveryIncomplete)
         }));
-        assert!(
-            error.message.contains("No core publication was created"),
-            "first-publication failure should not claim that a previous publication was preserved: {}",
-            error.message
-        );
         if storage_path.exists() {
-            let storage = Storage::open(&storage_path).expect("open empty live storage");
-            assert_eq!(
-                storage
-                    .get_index_publication()
-                    .expect("empty core publication"),
-                None
-            );
+            let storage = Storage::open(&storage_path).expect("partial storage");
             assert!(
                 storage
-                    .get_dense_anchor_publication_manifest()
-                    .expect("empty dense publication")
+                    .get_source_policy_exclusion_manifest()
+                    .expect("partial exclusion manifest")
                     .is_none()
             );
             assert!(
                 storage
-                    .get_dense_anchor_inputs_batch_after(None, 1)
-                    .expect("empty dense inputs")
-                    .is_empty()
+                    .get_index_publication()
+                    .expect("partial core publication")
+                    .is_none()
             );
         }
         assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]
-    fn incomplete_incremental_source_preserves_last_verified_dense_anchors() {
+    fn changed_source_is_reevaluated_into_a_new_verified_exclusion() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -21552,9 +21929,6 @@ fn build_llm_symbol_doc_text() -> String {
             .get_complete_index_publication()
             .expect("first publication")
             .expect("complete first publication");
-        let first_manifest = first_storage
-            .validate_dense_anchor_publication(&first_publication)
-            .expect("first dense manifest");
         let first_file_id = first_storage
             .get_file_by_path(&source_path)
             .expect("first file lookup")
@@ -21579,34 +21953,72 @@ fn build_llm_symbol_doc_text() -> String {
         );
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("incomplete incremental index");
+            .expect("incremental exclusion publication");
 
         let storage = Storage::open(&storage_path).expect("incremental storage");
-        let file = storage
-            .get_file_by_path(&source_path)
-            .expect("file lookup")
-            .expect("source file");
-        assert!(!file.complete, "the source must remain scheduled for retry");
+        assert!(
+            storage
+                .get_file_by_path(&source_path)
+                .expect("file lookup")
+                .is_none(),
+            "excluded source must not retain parser-backed file coverage"
+        );
         let publication = storage
             .get_complete_index_publication()
             .expect("incremental publication")
             .expect("complete incremental publication");
-        let manifest = storage
-            .validate_dense_anchor_publication(&publication)
-            .expect("retained dense publication");
-        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_ne!(publication, first_publication);
+        let identity = project_identity_v3(workspace.path());
+        storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("complete exclusion publication");
+        let first_exclusion = storage
+            .get_source_policy_exclusions()
+            .expect("first exclusions")
+            .into_iter()
+            .find(|entry| entry.normalized_path == "rust_tictactoe.rs")
+            .expect("Rust exclusion");
         let retained_anchors = storage
             .get_dense_anchor_inputs_batch_after(None, 10_000)
-            .expect("retained anchors")
+            .expect("current anchors")
             .into_iter()
-            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(file.id)))
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file_id)))
             .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
             .collect::<HashSet<_>>();
-        assert_eq!(retained_anchors, first_anchors);
+        assert!(retained_anchors.is_empty());
+        assert!(!first_anchors.is_empty());
+        drop(storage);
+
+        fs::write(
+            &source_path,
+            format!(
+                "{}\n// changed oversized content\n",
+                fs::read_to_string(&source_path).unwrap()
+            ),
+        )
+        .expect("change oversized source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("changed exclusion reevaluation");
+        let changed = Storage::open(&storage_path)
+            .expect("changed storage")
+            .get_source_policy_exclusions()
+            .expect("changed exclusions")
+            .into_iter()
+            .find(|entry| entry.normalized_path == "rust_tictactoe.rs")
+            .expect("changed Rust exclusion");
+        assert_ne!(changed.content_hash, first_exclusion.content_hash);
+        assert!(changed.observed_size > first_exclusion.observed_size);
     }
 
     #[test]
-    fn incomplete_full_refresh_preserves_the_previous_live_publication() {
+    fn full_refresh_replaces_previous_graph_with_verified_exclusion() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -21627,9 +22039,6 @@ fn build_llm_symbol_doc_text() -> String {
             .get_complete_index_publication()
             .expect("first publication")
             .expect("complete first publication");
-        let first_manifest = first_storage
-            .validate_dense_anchor_publication(&first_publication)
-            .expect("first dense manifest");
         let first_file = first_storage
             .get_file_by_path(&source_path)
             .expect("first file lookup")
@@ -21652,47 +22061,47 @@ fn build_llm_symbol_doc_text() -> String {
             &source_path,
             "scheduled but deliberately oversized for this full refresh",
         );
-        let error = controller
+        controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect_err("incomplete full refresh must not replace the live publication");
-        assert_eq!(error.code, "source_oversized");
-        assert!(
-            error
-                .message
-                .contains("previous complete publication was preserved")
-        );
+            .expect("full refresh should publish the verified exclusion");
 
-        let storage = Storage::open(&storage_path).expect("preserved live storage");
-        let file = storage
-            .get_file_by_path(&source_path)
-            .expect("preserved file lookup")
-            .expect("preserved source file");
+        let storage = Storage::open(&storage_path).expect("replacement live storage");
         assert!(
-            file.complete,
-            "the incomplete candidate must not replace the verified live file row"
+            storage
+                .get_file_by_path(&source_path)
+                .expect("replacement file lookup")
+                .is_none(),
+            "excluded content cannot retain a parser-backed file row"
         );
         let publication = storage
             .get_complete_index_publication()
-            .expect("preserved publication")
-            .expect("complete preserved publication");
-        assert_eq!(publication, first_publication);
+            .expect("replacement publication")
+            .expect("complete replacement publication");
+        assert_ne!(publication, first_publication);
+        let identity = project_identity_v3(workspace.path());
         let manifest = storage
-            .validate_dense_anchor_publication(&publication)
-            .expect("preserved dense publication");
-        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
-        assert_eq!(manifest.anchor_count, first_manifest.anchor_count);
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("replacement exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 1);
         let retained_anchors = storage
             .get_dense_anchor_inputs_batch_after(None, 10_000)
-            .expect("preserved anchors")
+            .expect("replacement anchors")
             .into_iter()
-            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(file.id)))
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file.id)))
             .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
             .collect::<HashSet<_>>();
-        assert_eq!(retained_anchors, first_anchors);
+        assert!(retained_anchors.is_empty());
+        assert!(!first_anchors.is_empty());
     }
 
     #[test]
-    fn incomplete_full_recovery_preserves_prior_anchors_and_recovery_fence() {
+    fn full_recovery_publishes_verified_exclusion_and_clears_recovery_fence() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -21713,13 +22122,6 @@ fn build_llm_symbol_doc_text() -> String {
             .get_complete_index_publication()
             .expect("first publication")
             .expect("complete first publication");
-        let first_manifest = first_storage
-            .validate_dense_anchor_publication(&first_publication)
-            .expect("first dense manifest");
-        let first_anchors = first_storage
-            .get_dense_anchor_inputs_batch_after(None, 10_000)
-            .expect("first anchors");
-        assert!(!first_anchors.is_empty(), "fixture needs dense anchors");
         first_storage
             .begin_incremental_run()
             .expect("mark interrupted incremental run");
@@ -21729,52 +22131,33 @@ fn build_llm_symbol_doc_text() -> String {
             &source_path,
             "recovery candidate is deliberately oversized",
         );
-        let error = controller
+        controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect_err("incomplete recovery must preserve the fenced live index");
+            .expect("verified exclusion should complete full recovery");
 
-        assert_eq!(error.code, "source_oversized");
+        let storage = Storage::open(&storage_path).expect("recovered storage");
         assert!(
-            error
-                .message
-                .contains("incomplete-run recovery fence were preserved"),
-            "recovery failure should describe the preserved fence: {}",
-            error.message
-        );
-        let storage = Storage::open(&storage_path).expect("preserved fenced storage");
-        assert_eq!(
-            storage
-                .get_index_publication()
-                .expect("preserved raw publication"),
-            Some(first_publication.clone()),
-            "an incomplete recovery must not advance the raw generation"
-        );
-        assert!(
-            storage
+            !storage
                 .has_incomplete_incremental_run()
-                .expect("preserved recovery fence"),
-            "the interrupted-run fence must remain until a complete recovery publishes"
+                .expect("cleared recovery fence"),
+            "complete recovery must clear the interrupted-run fence"
         );
-        assert_eq!(
-            storage
-                .get_complete_index_publication()
-                .expect("fenced complete publication"),
-            None,
-            "a fenced live index must remain unavailable as a complete publication"
-        );
-        assert_eq!(
-            storage
-                .validate_dense_anchor_publication(&first_publication)
-                .expect("preserved dense manifest"),
-            first_manifest
-        );
-        assert_eq!(
-            storage
-                .get_dense_anchor_inputs_batch_after(None, 10_000)
-                .expect("preserved dense anchors"),
-            first_anchors,
-            "unreadable recovery discovery must not create anchor deletion evidence"
-        );
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("recovered complete publication")
+            .expect("complete recovered publication");
+        assert_ne!(publication, first_publication);
+        let identity = project_identity_v3(workspace.path());
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("recovered exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 1);
         assert_no_staged_publication_artifacts(&storage_path);
     }
 
@@ -25234,6 +25617,79 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(storage_has_symbol(&storage, "old_generation"));
         assert!(!storage_has_symbol(&storage, "new_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn cancelled_full_refresh_preserves_previous_verified_exclusion_manifest() {
+        let workspace = tempdir().expect("workspace dir");
+        let ordinary = workspace.path().join("lib.rs");
+        let oversized = workspace.path().join("generated.rs");
+        fs::write(&ordinary, "pub fn stable() -> i32 { 1 }\n").expect("write ordinary source");
+        fs::write(&oversized, "pub fn generated() {}\n").expect("write generated source");
+        make_source_exceed_default_index_byte_cap(&oversized, "baseline exclusion");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open exclusion cancellation baseline");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish exclusion cancellation baseline");
+        let baseline_storage = Storage::open(&storage_path).expect("baseline storage");
+        let baseline_publication = baseline_storage
+            .get_complete_index_publication()
+            .expect("baseline publication")
+            .expect("complete baseline publication");
+        let baseline_manifest = baseline_storage
+            .get_source_policy_exclusion_manifest()
+            .expect("baseline exclusion manifest")
+            .expect("complete baseline exclusion manifest");
+        let baseline_exclusions = baseline_storage
+            .get_source_policy_exclusions()
+            .expect("baseline exclusions");
+        drop(baseline_storage);
+
+        fs::write(
+            &oversized,
+            format!("{}\n// changed\n", fs::read_to_string(&oversized).unwrap()),
+        )
+        .expect("change excluded source");
+        let cancel_token = CancellationToken::new();
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestAction::Cancel,
+        );
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh_with_cancel(
+                IndexMode::Full,
+                &cancel_token,
+            )
+            .expect_err("cancelled exclusion refresh must fail visibly");
+        assert_eq!(error.code, "cancelled");
+
+        let storage = Storage::open(&storage_path).expect("cancelled exclusion storage");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("preserved complete publication"),
+            Some(baseline_publication)
+        );
+        assert_eq!(
+            storage
+                .get_source_policy_exclusion_manifest()
+                .expect("preserved exclusion manifest"),
+            Some(baseline_manifest)
+        );
+        assert_eq!(
+            storage
+                .get_source_policy_exclusions()
+                .expect("preserved exclusions"),
+            baseline_exclusions
+        );
         assert_no_staged_publication_artifacts(&storage_path);
     }
 

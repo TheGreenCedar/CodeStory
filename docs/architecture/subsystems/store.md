@@ -9,6 +9,8 @@ recovery.
 - file, node, edge, occurrence, component, callable, bookmark, and trail rows;
 - grounding snapshots and search projections;
 - graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
+- verified source-policy exclusion rows and their project/workspace/core-bound
+  count-and-digest manifest;
 - core `generation_id`/`run_id` and retrieval-manifest records;
 - schema migrations and a versioned promotion journal.
 
@@ -30,6 +32,11 @@ The dense-anchor manifest is part of the core publication boundary. It binds
 the complete row count and digest, policy version, migration state, and every
 row's source identity to the current core generation/run. A migrated cache has
 no complete manifest until core indexing republishes it.
+
+The source-policy exclusion manifest follows the same fail-closed rule. Rows
+and manifest replace together in one SQLite transaction, and staged promotion
+records their candidate and rollback identities. A schema migration creates no
+synthetic manifest; runtime must republish from a complete verified inventory.
 
 Schema v25 also stores the current retrieval manifest and its deeply verified
 rollback record in the same SQLite row. They change in one transaction. The

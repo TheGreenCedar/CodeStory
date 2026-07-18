@@ -1,6 +1,24 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Versioned policy that permits a verified source to remain outside parser scheduling.
+pub const OVERSIZED_SOURCE_POLICY_VERSION: &str = "oversized-source-v1";
+/// Parser input bound shared by workspace planning and the indexer fallback guard.
+pub const DEFAULT_SOURCE_FILE_BYTE_CAP: u64 = 1_000_000;
+
+/// Content-verified oversized source classified before parser scheduling.
+///
+/// Project, workspace, and core-publication identity are deliberately absent here. The
+/// runtime binds those identities only when the complete candidate set is published.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OversizedSourceExclusionCandidate {
+    pub normalized_path: String,
+    pub content_hash: String,
+    pub observed_size: u64,
+    pub policy_version: String,
+    pub byte_cap: u64,
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum RefreshMode {
     Incremental,
