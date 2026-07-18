@@ -2,7 +2,7 @@ name: Platform and integration proof
 
 on:
   pull_request:
-    types: [labeled, synchronize]
+    types: [labeled]
   workflow_dispatch:
     inputs:
       mode:
@@ -12,11 +12,11 @@ on:
         type: choice
         options: [platform, calibration, release-evidence, integration]
       pr_number:
-        description: Same-repository pull request for platform mode.
+        description: Same-repository pull request. Dispatch PR modes with --ref <same-repository PR head branch>.
         required: false
         type: string
       expected_head_sha:
-        description: Exact accepted head SHA.
+        description: Exact accepted head SHA. The selected --ref, github.sha, and live PR or dev head must match.
         required: true
         type: string
       scope:
@@ -44,7 +44,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: proof-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || github.event.pull_request.number || 'dev' }}-${{ github.event.action == 'labeled' && github.event.label.name != 'platform-proof' && github.event.label.name || 'candidate' }}
+  group: proof-${{ github.sha }}-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || github.event.pull_request.number || 'dev' }}-${{ github.event.action == 'labeled' && github.event.label.name || 'dispatch' }}
   cancel-in-progress: true
 
 jobs:
@@ -86,6 +86,14 @@ jobs:
               echo "::error::Integration proof requires current dev head $dev_head, not $INPUT_HEAD_SHA."
               exit 1
             }
+            test "$GITHUB_REF" = "refs/heads/dev/codestory-next" || {
+              echo "::error::Integration proof must be dispatched with --ref dev/codestory-next, not $GITHUB_REF."
+              exit 1
+            }
+            test "$GITHUB_SHA" = "$dev_head" || {
+              echo "::error::Workflow SHA $GITHUB_SHA is not current dev head $dev_head. Dispatch with --ref dev/codestory-next."
+              exit 1
+            }
             {
               echo "head_sha=$dev_head"
               echo "base_sha="
@@ -96,11 +104,11 @@ jobs:
           fi
           test "$mode" = "platform" || test "$mode" = "calibration" || test "$mode" = "release-evidence"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
-          expected_head="${EVENT_HEAD_SHA:-$INPUT_HEAD_SHA}"
-          test -n "$pr_number" && test -n "$expected_head"
+          test -n "$pr_number"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
           head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"
           current_head="$(jq -r '.head.sha' <<<"$pr")"
+          head_ref="$(jq -r '.head.ref' <<<"$pr")"
           base_sha="$(jq -r '.base.sha' <<<"$pr")"
           base_ref="$(jq -r '.base.ref' <<<"$pr")"
           test "$head_repo" = "$GITHUB_REPOSITORY" || {
@@ -109,14 +117,22 @@ jobs:
           }
           if [ -n "$EVENT_HEAD_REPO" ]; then
             test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY" || exit 1
-          fi
-          test "$current_head" = "$expected_head" || {
-            echo "::error::PR #$pr_number moved from promoted head $expected_head to $current_head."
-            exit 1
-          }
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            test "$GITHUB_SHA" = "$current_head" || {
-              echo "::error::Workflow ref $GITHUB_SHA is not exact PR head $current_head."
+            test "$current_head" = "$EVENT_HEAD_SHA" || {
+              echo "::error::PR #$pr_number moved after the platform-proof label event."
+              exit 1
+            }
+          else
+            test -n "$INPUT_HEAD_SHA"
+            test "$INPUT_HEAD_SHA" = "$current_head" || {
+              echo "::error::PR #$pr_number moved from promoted head $INPUT_HEAD_SHA to $current_head."
+              exit 1
+            }
+            test "$GITHUB_REF" = "refs/heads/$head_ref" || {
+              echo "::error::Platform proof must be dispatched with --ref $head_ref (the same-repository PR head branch), not $GITHUB_REF."
+              exit 1
+            }
+            test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {
+              echo "::error::Workflow SHA $GITHUB_SHA is not accepted PR head $INPUT_HEAD_SHA. Dispatch with --ref $head_ref."
               exit 1
             }
           fi
@@ -400,16 +416,29 @@ jobs:
         shell: bash
         run: |
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v5
+      - name: Restore exact-head macOS source cache
+        id: macos-source-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-macos-source-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-macos-source-v2-${{ needs.route.outputs.head_sha }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}
       - run: cargo check --workspace --locked
       - run: node --test scripts/tests/codex-worktree-setup.test.mjs
       - run: test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh
+      - name: Save exact-head macOS source cache
+        if: success() && steps.macos-source-cache-restore.outputs.cache-hit != 'true' && steps.macos-source-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.macos-source-cache-restore.outputs.cache-primary-key }}
 
   repo-scale-stats:
     if: needs.route.outputs.mode != 'release-evidence' && needs.route.outputs.mode != 'calibration'

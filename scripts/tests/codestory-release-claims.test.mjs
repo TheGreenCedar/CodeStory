@@ -109,6 +109,12 @@ test("versioned claim graph has one deterministic digest and all declared contro
     ],
   );
   assert.ok(graph.claims.every((claim) => claim.prerequisite_checks.every(({ command }) => command.length > 0)));
+  assert.deepEqual(graph.workflow_policy.promotion.required_events, ["labeled"]);
+  assert.equal(graph.workflow_policy.promotion.proof_run_sha_expression, "${{ github.sha }}");
+  assert.equal(graph.workflow_policy.promotion.manual_pr_ref_hint, "--ref <same-repository PR head branch>");
+  assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
+  assert.equal(graph.workflow_policy.promotion.macos_source_cache_namespace, "macos-source-v2");
+  assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
 });
 
 test("positive fixture evaluates deterministically", () => {
@@ -152,6 +158,21 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   malformedConstraint.evidence_types.find(({ id }) => id === "answer_quality")
     .identity_constraints.evaluation_contract = "unversioned";
   assert.throws(() => validateReleaseClaimGraph(malformedConstraint), /does not match versioned_contract/u);
+
+  for (const field of [
+    "proof_run_sha_expression",
+    "manual_pr_ref_hint",
+    "source_cache_namespace",
+    "macos_source_cache_namespace",
+    "packaged_cache_namespace",
+  ]) {
+    const incompletePromotion = structuredClone(graph);
+    delete incompletePromotion.workflow_policy.promotion[field];
+    assert.throws(
+      () => validateReleaseClaimGraph(incompletePromotion),
+      new RegExp(`workflow_policy\\.promotion\\.${field}`, "u"),
+    );
+  }
 });
 
 test("evaluation requires exact repository and source-tree identity", () => {

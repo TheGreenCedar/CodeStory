@@ -340,8 +340,11 @@ controlled-invalid fixtures must retain their class-prefixed diagnostics.
 
 Draft pushes run focused checks and one Linux source check. Exact-head review
 runs the broad source gate once. Packaged matrices and protected hardware run
-only through the coordinator/platform-proof gate. New pushes cancel stale runs,
-and each target is built once then reused by its proof steps.
+only through the coordinator/platform-proof gate. Draft pushes cancel stale
+draft work. Exact source and platform coordinators run only when their label is
+applied; their concurrency and cache identities include the exact Actions SHA,
+so a later push cannot cancel or populate proof for an accepted old head. Each
+target is built once then reused by its proof steps.
 
 Release signing, notarization, post-publish quarantine/Gatekeeper checks,
 installed plugin readback, and live full retrieval run only from the main

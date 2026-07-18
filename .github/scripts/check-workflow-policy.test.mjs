@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -51,6 +53,42 @@ function draftStep(job, name) {
   const matches = job.steps.filter(step => step.name === name);
   assert.equal(matches.length, 1, `expected one ${name} step`);
   return matches[0];
+}
+
+function runResolver(file, jobName, environment) {
+  const workflow = loadWorkflows().get(file);
+  const run = draftStep(workflow.jobs[jobName], "Resolve trusted exact head").run;
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-proof-resolver-"));
+  const fakeGh = path.join(directory, "gh");
+  const baseSha = "1".repeat(40);
+  writeFileSync(fakeGh, `#!/bin/sh
+case "$*" in
+  *"branches/dev/codestory-next"*) printf '%s\\n' '${fullSha}' ;;
+  *) printf '%s\\n' '${JSON.stringify({
+    head: {
+      repo: { full_name: "TheGreenCedar/CodeStory" },
+      sha: fullSha,
+      ref: "codex/exact-head",
+    },
+    base: { sha: baseSha, ref: "dev/codestory-next" },
+    labels: [{ name: "review-accepted" }],
+  })}' ;;
+esac
+`);
+  chmodSync(fakeGh, 0o755);
+  const output = path.join(directory, "github-output");
+  writeFileSync(output, "");
+  return spawnSync("bash", ["-c", run], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      GH_TOKEN: "test-token",
+      GITHUB_REPOSITORY: "TheGreenCedar/CodeStory",
+      GITHUB_OUTPUT: output,
+      ...environment,
+    },
+  });
 }
 
 function windowsManifestJob(workflow) {
@@ -163,6 +201,152 @@ jobs:
   const invalid = structuredClone(valid);
   invalid.jobs.check.steps[0].uses = "vendor/action@main";
   assert.match(basicWorkflowViolations("fixture.yml", invalid).join("\n"), /full-length SHA/u);
+});
+
+test("proof resolvers reject hostile workflow refs before proof work", async (t) => {
+  const sourceEnvironment = {
+    PR_NUMBER: "1230",
+    EXPECTED_HEAD_SHA: fullSha,
+    CALLER_REF: "",
+    EVENT_PR_NUMBER: "",
+    EVENT_HEAD_SHA: "",
+    EVENT_HEAD_REPO: "",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_SHA: fullSha,
+  };
+  await t.test("source PR dispatch", () => {
+    const rejected = runResolver("source-proof.yml", "resolve", {
+      ...sourceEnvironment,
+      GITHUB_REF: "refs/heads/main",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /--ref codex\/exact-head/u);
+
+    const accepted = runResolver("source-proof.yml", "resolve", {
+      ...sourceEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+    });
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+
+  const packagedEnvironment = {
+    INPUT_PR_NUMBER: "1230",
+    INPUT_HEAD_SHA: fullSha,
+    INPUT_MODE: "platform",
+    EVENT_PR_NUMBER: "",
+    EVENT_HEAD_SHA: "",
+    EVENT_HEAD_REPO: "",
+    INPUT_SOURCE_RUN_ID: "",
+    INPUT_CALIBRATION_ARTIFACT: "",
+    INPUT_CALIBRATION_RUN_ID: "",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_SHA: fullSha,
+  };
+  await t.test("platform PR dispatch", () => {
+    const rejected = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      GITHUB_REF: "refs/heads/main",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /--ref codex\/exact-head/u);
+
+    const accepted = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+    });
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+
+  await t.test("integration dispatch", () => {
+    const rejected = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      INPUT_PR_NUMBER: "",
+      INPUT_MODE: "integration",
+      GITHUB_REF: "refs/heads/main",
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stdout, /--ref dev\/codestory-next/u);
+
+    const accepted = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      INPUT_PR_NUMBER: "",
+      INPUT_MODE: "integration",
+      GITHUB_REF: "refs/heads/dev/codestory-next",
+    });
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+});
+
+test("exact proof policy rejects trigger, identity, and cache downgrades", async (t) => {
+  const sourceFile = "source-proof.yml";
+  const packagedCoordinatorFile = "packaged-platform-pr.yml";
+  const packagedProofFile = "packaged-platform-proof.yml";
+  const sourceResolver = workflow => draftStep(workflow.jobs.resolve, "Resolve trusted exact head");
+  const packagedResolver = workflow => draftStep(workflow.jobs.route, "Resolve trusted exact head");
+
+  const mutations = [
+    ["source synchronize trigger", sourceFile, workflow => {
+      workflow.on.pull_request.types.push("synchronize");
+    }, /trigger must be label-only/u],
+    ["platform synchronize trigger", packagedCoordinatorFile, workflow => {
+      workflow.on.pull_request.types.push("synchronize");
+    }, /trigger must be label-only/u],
+    ["source PR-number-only concurrency", sourceFile, workflow => {
+      workflow.concurrency.group = "source-proof-${{ inputs.pr_number || github.event.pull_request.number }}";
+    }, /concurrency must bind the Actions SHA/u],
+    ["platform PR-number-only concurrency", packagedCoordinatorFile, workflow => {
+      workflow.concurrency.group = "proof-${{ inputs.mode }}-${{ inputs.pr_number }}";
+    }, /concurrency must bind the Actions SHA/u],
+    ["source manual SHA equality", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace('test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
+    }, /GITHUB_SHA.*EXPECTED_HEAD_SHA/u],
+    ["source manual ref equality", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace('test "$GITHUB_REF" = "refs\/heads\/$head_ref"', 'test -n "$GITHUB_REF"');
+    }, /GITHUB_REF.*head_ref/u],
+    ["platform manual SHA equality", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace('test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
+    }, /GITHUB_SHA.*INPUT_HEAD_SHA/u],
+    ["integration live dev SHA equality", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace('test "$GITHUB_SHA" = "$dev_head"', 'test -n "$GITHUB_SHA"');
+    }, /GITHUB_SHA.*dev_head/u],
+    ["source unversioned cache", sourceFile, workflow => {
+      const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
+      restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");
+    }, /versioned exact-SHA namespace/u],
+    ["source broad cache fallback", sourceFile, workflow => {
+      draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output")
+        .with["restore-keys"] = "Linux-source-proof-";
+    }, /must not use fallback restore keys/u],
+    ["source cache always-save", sourceFile, workflow => {
+      draftStep(workflow.jobs["full-source-gate"], "Save Cargo inputs and output").if
+        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
+    }, /save only a successful exact miss/u],
+    ["macOS source cache loses exact SHA", packagedCoordinatorFile, workflow => {
+      const restore = draftStep(workflow.jobs["macos-source"], "Restore exact-head macOS source cache");
+      restore.with.key = restore.with.key.replace("-${{ needs.route.outputs.head_sha }}", "");
+    }, /macOS source cache must be an exact-SHA restore/u],
+    ["packaged cache loses exact SHA", packagedProofFile, workflow => {
+      const restore = draftStep(workflow.jobs.build, "Restore Cargo registry, git sources, and build output");
+      restore.with.key = restore.with.key.replace("-${{ inputs.ref }}", "");
+    }, /native build cache.*exact SHA/u],
+    ["packaged cache always-save", packagedProofFile, workflow => {
+      draftStep(workflow.jobs.build, "Save Cargo registry, git sources, and build output").if
+        = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
+    }, /save only a successful exact miss/u],
+  ];
+
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expectedReason);
+    });
+  }
 });
 
 test("hosted Linux calibration keeps its bounded per-run timeout", async (t) => {
