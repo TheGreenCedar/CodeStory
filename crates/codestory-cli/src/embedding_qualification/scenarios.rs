@@ -972,12 +972,14 @@ impl<'a> ScenarioRunner<'a> {
             "measurement_true_idle_ready",
             SNAPSHOT_TIMEOUT,
             |snapshot| {
-                snapshot.scheduler.active_request_count == 0
+                snapshot_has_resident_generation(snapshot)
+                    && snapshot.scheduler.active_request_count == 0
                     && snapshot.scheduler.query_depth == 0
                     && snapshot.scheduler.bulk_depth == 0
                     && snapshot.scheduler.lease_count == 0
             },
         )?;
+        let idle_owner_identity = raw_server_identity(&idle_owner)?;
         let idle_start = self.begin_measurement()?;
         self.wait_for_absence(
             "measurement_true_idle_absent",
@@ -994,7 +996,7 @@ impl<'a> ScenarioRunner<'a> {
                 repeat: 1,
                 runtime: self.context.qualification_runtime,
                 workload_id: "true_idle_60000_awake_ms_v1",
-                server_identity: raw_server_identity(&idle_owner)?,
+                server_identity: idle_owner_identity,
                 start_phase: "last_queued_active_or_leased_work_ended",
                 end_phase: "engine_and_server_absent",
                 operands: BTreeMap::new(),
@@ -3092,6 +3094,20 @@ fn raw_server_identity(snapshot: &EmbeddingServerSnapshot) -> Result<RawServerId
     })
 }
 
+fn snapshot_has_resident_generation(snapshot: &EmbeddingServerSnapshot) -> bool {
+    resident_generation_is_valid(
+        &snapshot.lifecycle,
+        snapshot
+            .engine
+            .as_ref()
+            .map(|engine| engine.load_generation),
+    )
+}
+
+fn resident_generation_is_valid(lifecycle: &str, load_generation: Option<u64>) -> bool {
+    lifecycle == "resident" && load_generation.is_some_and(|generation| generation > 0)
+}
+
 pub(super) fn run_worker(command: InternalEmbeddingQualificationCommand) -> Result<()> {
     let request_bytes = read_private_request(&command.request)?;
     let request: WorkerRequest =
@@ -4700,6 +4716,15 @@ mod tests {
         assert_eq!(first, duplicate);
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn true_idle_measurement_requires_a_resident_positive_generation() {
+        assert!(!resident_generation_is_valid("listening", None));
+        assert!(!resident_generation_is_valid("resident", None));
+        assert!(!resident_generation_is_valid("resident", Some(0)));
+        assert!(!resident_generation_is_valid("draining", Some(1)));
+        assert!(resident_generation_is_valid("resident", Some(1)));
     }
 
     #[test]

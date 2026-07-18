@@ -863,10 +863,14 @@ pub fn schedule_index(project_path: &str) -> usize {
     )
     .expect("modify indexed file after indexing");
 
-    let preflight = run_cli_json(
+    let preflight = run_cli_json_with_embedding_env(
         workspace.path(),
         cache_dir.path(),
         &["agent", "preflight", "--format", "json"],
+        &[(
+            "CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS",
+            "30000",
+        )],
     );
 
     assert_eq!(preflight["usable"], true, "{preflight:#}");
