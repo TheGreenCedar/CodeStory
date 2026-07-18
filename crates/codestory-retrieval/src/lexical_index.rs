@@ -578,13 +578,15 @@ where
             coverage,
         };
         if &actual != expected {
-            bail!(
-                "lexical input changed while building shard: expected {} documents with hash {}, collected {} documents with hash {}",
-                expected.file_count,
-                expected.hash,
-                actual.file_count,
-                actual.hash
-            );
+            return Err(crate::index::SidecarInputChanged::new(
+                "lexical shard build",
+                format!(
+                    "{} documents with hash {}",
+                    expected.file_count, expected.hash
+                ),
+                format!("{} documents with hash {}", actual.file_count, actual.hash),
+            )
+            .into());
         }
         let coverage_json = serde_json::to_string(&actual.coverage)?;
         let binding = metadata_binding(

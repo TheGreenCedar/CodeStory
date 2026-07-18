@@ -57,6 +57,43 @@ pub struct FinalizeIndexOutcome {
     pub generation_retention: GenerationRetentionApplyReport,
 }
 
+/// Typed signal that source-derived retrieval input drifted during preparation.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("sidecar generation input changed while {stage}: expected {expected}, observed {observed}")]
+pub struct SidecarInputChanged {
+    stage: String,
+    expected: String,
+    observed: String,
+}
+
+impl SidecarInputChanged {
+    pub(crate) fn new(
+        stage: impl Into<String>,
+        expected: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage: stage.into(),
+            expected: expected.into(),
+            observed: observed.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("retrieval index cancelled before {boundary}")]
+pub struct RetrievalIndexCancelled {
+    boundary: &'static str,
+}
+
+pub fn is_retrieval_index_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetrievalIndexCancelled>().is_some()
+}
+
+pub fn is_sidecar_input_changed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SidecarInputChanged>().is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidecarInputFingerprint {
     pub(crate) hash: String,
@@ -413,7 +450,7 @@ fn ensure_retrieval_index_not_cancelled(
     boundary: &'static str,
 ) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
-        bail!("retrieval index cancelled before {boundary}");
+        return Err(RetrievalIndexCancelled { boundary }.into());
     }
     Ok(())
 }
@@ -1411,7 +1448,12 @@ fn ensure_sidecar_input_unchanged(
     current: &SidecarInputFingerprint,
 ) -> Result<()> {
     if current != expected {
-        bail!("sidecar generation input changed before manifest publication");
+        return Err(SidecarInputChanged::new(
+            "manifest publication",
+            &expected.hash,
+            &current.hash,
+        )
+        .into());
     }
     Ok(())
 }
@@ -2336,6 +2378,7 @@ mod tests {
         )
         .expect_err("pre-cancelled finalize must fail before opening storage");
 
+        assert!(is_retrieval_index_cancelled(&error));
         assert!(error.to_string().contains("cancelled before preflight"));
         assert!(!storage_path.exists());
     }
@@ -3355,6 +3398,7 @@ mod tests {
             |_| Ok(None),
         )
         .expect_err("source drift during validation must reject publication");
+        assert!(is_sidecar_input_changed(&drifted));
         assert!(drifted.to_string().contains("input changed"));
         assert_eq!(
             storage

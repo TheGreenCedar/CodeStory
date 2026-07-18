@@ -68,7 +68,7 @@ impl<'a> FileStore<'a> {
 mod tests {
     use super::*;
     use crate::FileRole;
-    use codestory_contracts::graph::{ErrorInfo, IndexStep, NodeId};
+    use codestory_contracts::graph::{ErrorInfo, FileCoverageReason, IndexStep, NodeId};
 
     #[test]
     fn inventory_retries_file_errors_but_not_parser_partial_coverage() {
@@ -99,6 +99,7 @@ mod tests {
                 column: None,
                 is_fatal: true,
                 index_step: IndexStep::Indexing,
+                coverage_reason: Some(FileCoverageReason::Unreadable),
             })
             .expect("error");
 

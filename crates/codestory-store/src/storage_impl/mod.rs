@@ -1,7 +1,7 @@
 use codestory_contracts::graph::{
     AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeKind,
-    EnumConversionError, Node, NodeId, NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty,
-    TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
+    EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
+    ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
@@ -32,7 +32,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 25;
+const SCHEMA_VERSION: u32 = 26;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -6812,7 +6812,7 @@ impl Storage {
         error: &codestory_contracts::graph::ErrorInfo,
     ) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO error (message, file_id, line, column, fatal, indexed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 error.message,
                 error.file_id.map(|id| id.0),
@@ -6820,6 +6820,7 @@ impl Storage {
                 error.column,
                 error.is_fatal as i32,
                 (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                error.coverage_reason.map(FileCoverageReason::as_str),
             ],
         )?;
         self.invalidate_grounding_snapshots()?;
@@ -6837,8 +6838,8 @@ impl Storage {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for error in errors {
                 stmt.execute(params![
@@ -6848,6 +6849,7 @@ impl Storage {
                     error.column,
                     error.is_fatal as i32,
                     (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                    error.coverage_reason.map(FileCoverageReason::as_str),
                 ])?;
             }
         }
@@ -7143,7 +7145,8 @@ impl Storage {
         &self,
         filter: Option<&codestory_contracts::graph::ErrorFilter>,
     ) -> Result<Vec<codestory_contracts::graph::ErrorInfo>, StorageError> {
-        let base_query = "SELECT id, message, file_id, line, column, fatal, indexed FROM error";
+        let base_query =
+            "SELECT id, message, file_id, line, column, fatal, indexed, coverage_reason FROM error";
         let mut conditions = Vec::new();
 
         if let Some(f) = filter {
@@ -7168,6 +7171,11 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let fatal: i32 = row.get(5)?;
             let indexed: i32 = row.get(6)?;
+            let coverage_reason = row
+                .get::<_, Option<String>>(7)?
+                .as_deref()
+                .map(FileCoverageReason::try_from)
+                .transpose()?;
             errors.push(codestory_contracts::graph::ErrorInfo {
                 message: row.get(1)?,
                 file_id: row.get::<_, Option<i64>>(2)?.map(NodeId),
@@ -7179,6 +7187,7 @@ impl Storage {
                 } else {
                     codestory_contracts::graph::IndexStep::Collection
                 },
+                coverage_reason,
             });
         }
         Ok(errors)
@@ -7218,8 +7227,8 @@ impl Storage {
         }
         {
             let mut insert = tx.prepare(
-                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for error in errors {
                 insert.execute(params![
@@ -7229,6 +7238,7 @@ impl Storage {
                     error.column,
                     error.is_fatal as i32,
                     (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                    error.coverage_reason.map(FileCoverageReason::as_str),
                 ])?;
             }
         }

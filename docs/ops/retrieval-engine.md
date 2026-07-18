@@ -74,17 +74,26 @@ stateDiagram-v2
 
 Repository activation and engine initialization are separate:
 
-1. Local discovery and indexing publish a complete core database.
-2. The per-user server verifies its model and execution policy.
-3. Retrieval builds lexical, vector, and SCIP artifacts for that repository.
-4. The writer validates a complete candidate and atomically publishes its
+1. Summary-only discovery reads core metadata without requiring search state.
+2. Local discovery and indexing publish a complete core database and coherent
+   dense-anchor inputs.
+3. Runtime repairs a missing, corrupt, or core-mismatched local search
+   generation under the project writer and generation locks.
+4. The per-user server verifies its model and execution policy.
+5. Retrieval builds lexical, vector, and SCIP artifacts for that repository.
+6. The writer validates a complete candidate and atomically publishes its
    manifest.
-5. Packet/search readers pin one coherent core and retrieval publication.
+7. Packet/search readers pin one coherent core and retrieval publication.
 
 A cold request can return a bounded same-tool retry while these steps run. An
 existing complete publication remains readable during refresh. Concurrent
 publication drift returns `cache_busy` and permits one bounded retry rather
 than mixing generations.
+
+The bounded response is `codestory_preparing` with one stable operation ID, a
+non-null retry delay, and the attempted tool as `retry_tool`. Terminal
+`codestory_unavailable` is reserved for policy, protocol, or infrastructure
+conditions runtime cannot repair itself.
 
 ## Readiness contract
 

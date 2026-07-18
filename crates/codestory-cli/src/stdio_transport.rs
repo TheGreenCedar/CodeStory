@@ -821,6 +821,12 @@ fn handle_stdio_message(
                                 | "cache_busy"
                                 | "publication_changed"
                         );
+                        let cause_code = error
+                            .details
+                            .as_deref()
+                            .and_then(|details| details.cause_code.clone())
+                            .unwrap_or_else(|| error.code.clone());
+                        let details = error.details.clone();
                         let error = serde_json::json!({
                             "code": if error.code == "cancelled" {
                                 "cancelled"
@@ -830,6 +836,8 @@ fn handle_stdio_message(
                                 "codestory_unavailable"
                             },
                             "message": error.message,
+                            "cause_code": cause_code,
+                            "details": details,
                             "tool": name,
                             "state": if error.code == "cancelled" {
                                 "cancelled"
@@ -6304,7 +6312,9 @@ version = "0.11.20"
                     stage: codestory_runtime::ActivationStage::Validation,
                     attempt: 1,
                     retry_after_ms: None,
+                    failure_code: Some("project_unavailable".to_string()),
                     failure: Some(format!("retained-{index}")),
+                    failure_details: None,
                     embedding_capacity: None,
                     embedding_retry: None,
                     capabilities: codestory_runtime::ActivationCapabilities {
@@ -6820,7 +6830,9 @@ version = "0.11.20"
                 stage: codestory_runtime::ActivationStage::DensePreparation,
                 attempt: 1,
                 retry_after_ms: Some(375),
+                failure_code: None,
                 failure: None,
+                failure_details: None,
                 embedding_capacity: None,
                 embedding_retry: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
@@ -6861,7 +6873,9 @@ version = "0.11.20"
                 stage: codestory_runtime::ActivationStage::Validation,
                 attempt: 2,
                 retry_after_ms: Some(250),
+                failure_code: Some("activation_retryable".to_string()),
                 failure: Some("publication changed".to_string()),
+                failure_details: None,
                 embedding_capacity: None,
                 embedding_retry: Some(codestory_contracts::api::EmbeddingRetryStateDto {
                     code: "embedding_server_incompatible_active_owner".into(),
@@ -6911,7 +6925,9 @@ version = "0.11.20"
                 stage: codestory_runtime::ActivationStage::Validation,
                 attempt: 3,
                 retry_after_ms: None,
+                failure_code: Some("project_unavailable".to_string()),
                 failure: Some("managed retrieval unavailable".to_string()),
+                failure_details: None,
                 embedding_capacity: None,
                 embedding_retry: None,
                 capabilities: codestory_runtime::ActivationCapabilities {

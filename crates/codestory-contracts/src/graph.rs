@@ -21,7 +21,7 @@ pub mod token_component;
 
 pub use access::AccessKind;
 pub use definition::DefinitionKind;
-pub use error::{ErrorFilter, ErrorInfo, IndexStep};
+pub use error::{ErrorFilter, ErrorInfo, FileCoverageReason, IndexStep};
 pub use location_type::LocationType;
 pub use node_type::{BundleInfo, NodeType};
 pub use token_component::{Token, TokenComponent};
@@ -94,6 +94,8 @@ pub enum EnumConversionError {
     InvalidEdgeKind(i32),
     #[error("Invalid OccurrenceKind value: {0}")]
     InvalidOccurrenceKind(i32),
+    #[error("Invalid FileCoverageReason value: {0}")]
+    InvalidFileCoverageReason(String),
 }
 
 fn enum_from_i32<T: Copy>(value: i32, variants: &[T]) -> Option<T> {

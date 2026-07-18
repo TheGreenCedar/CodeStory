@@ -393,6 +393,29 @@ enum PersistedSearchIndexLockMode {
     Exclusive,
 }
 
+#[derive(Debug)]
+pub(crate) struct PersistedSearchIndexBusy {
+    path: PathBuf,
+    mode: PersistedSearchIndexLockMode,
+}
+
+impl std::fmt::Display for PersistedSearchIndexBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "search index {} is already locked in {:?} mode",
+            self.path.display(),
+            self.mode
+        )
+    }
+}
+
+impl std::error::Error for PersistedSearchIndexBusy {}
+
+pub(crate) fn is_persisted_search_index_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PersistedSearchIndexBusy>().is_some()
+}
+
 impl PersistedSearchIndexGuard {
     fn acquire_shared(search_dir: &Path) -> Result<Self> {
         Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
@@ -475,28 +498,29 @@ impl PersistedSearchIndexGuard {
             .open(&lock_path)
             .with_context(|| format!("Failed to open search index lock {}", lock_path.display()))?;
         let acquired = match mode {
-            PersistedSearchIndexLockMode::Shared => {
-                FileExt::try_lock_shared(&file).with_context(|| {
-                    format!(
-                        "Failed to take shared search index lock {}",
-                        search_dir.display()
-                    )
-                })?
+            PersistedSearchIndexLockMode::Shared => FileExt::try_lock_shared(&file),
+            PersistedSearchIndexLockMode::Exclusive => FileExt::try_lock_exclusive(&file),
+        }
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Ok(false)
+            } else {
+                Err(error)
             }
-            PersistedSearchIndexLockMode::Exclusive => FileExt::try_lock_exclusive(&file)
-                .with_context(|| {
-                    format!(
-                        "Failed to take exclusive search index lock {}",
-                        search_dir.display()
-                    )
-                })?,
-        };
+        })
+        .with_context(|| {
+            format!(
+                "Failed to take {:?} search index lock {}",
+                mode,
+                search_dir.display()
+            )
+        })?;
         if !acquired {
-            bail!(
-                "Search index {} is already locked in {:?} mode",
-                search_dir.display(),
-                mode
-            );
+            return Err(PersistedSearchIndexBusy {
+                path: search_dir.to_path_buf(),
+                mode,
+            }
+            .into());
         }
         Ok(Self {
             file,
@@ -1681,10 +1705,11 @@ mod tests {
         let mut engine = SearchEngine::new(Some(search_dir.as_path()))?;
         assert!(search_dir.exists());
         assert!(lock_path.exists());
-        assert!(
-            PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()).is_err(),
-            "new persisted engine should hold an exclusive search-index lock"
-        );
+        let busy = match PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()) {
+            Ok(_) => panic!("new persisted engine should hold an exclusive search-index lock"),
+            Err(error) => error,
+        };
+        assert!(is_persisted_search_index_busy(&busy));
         assert!(
             PersistedSearchIndexGuard::try_acquire_shared(search_dir.as_path()).is_err(),
             "exclusive search-index lock should block readers while rebuilding"

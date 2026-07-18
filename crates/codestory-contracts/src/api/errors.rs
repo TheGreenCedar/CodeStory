@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use super::dto::ReadinessVerdictDto;
+use super::dto::{FileCoverageDiagnosticDto, ReadinessVerdictDto};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ApiError {
@@ -13,6 +13,8 @@ pub struct ApiError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ApiErrorDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_layer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29,6 +31,8 @@ pub struct ApiErrorDetails {
     pub embedding_capacity: Option<EmbeddingCapacityPressureDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_retry: Option<EmbeddingRetryStateDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -84,9 +88,25 @@ impl CommandFailureEnvelope {
 }
 
 impl ApiErrorDetails {
+    pub fn cause(cause_code: impl Into<String>) -> Self {
+        Self {
+            cause_code: Some(cause_code.into()),
+            failed_layer: None,
+            project: None,
+            next_commands: Vec::new(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
+        }
+    }
+
     pub fn retrieval_unavailable(project: impl Into<String>, next_commands: Vec<String>) -> Self {
         let minimum_next = next_commands.iter().take(1).cloned().collect::<Vec<_>>();
         Self {
+            cause_code: None,
             failed_layer: Some("retrieval_engine".to_string()),
             project: Some(project.into()),
             minimum_next,
@@ -95,6 +115,7 @@ impl ApiErrorDetails {
             readiness: None,
             embedding_capacity: None,
             embedding_retry: None,
+            coverage_gaps: Vec::new(),
         }
     }
 
@@ -110,6 +131,21 @@ impl ApiErrorDetails {
         }
         self.readiness = Some(readiness);
         self
+    }
+
+    pub fn source_coverage(coverage_gaps: Vec<FileCoverageDiagnosticDto>) -> Self {
+        Self {
+            cause_code: None,
+            failed_layer: Some("source_verification".to_string()),
+            project: None,
+            next_commands: Vec::new(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps,
+        }
     }
 }
 
@@ -146,6 +182,18 @@ impl ApiError {
         Self::new("internal", message)
     }
 
+    pub fn source_coverage_failure(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        coverage_gaps: Vec<FileCoverageDiagnosticDto>,
+    ) -> Self {
+        Self::with_details(
+            code,
+            message,
+            ApiErrorDetails::source_coverage(coverage_gaps),
+        )
+    }
+
     pub fn retrieval_unavailable(
         message: impl Into<String>,
         project: impl Into<String>,
@@ -166,6 +214,7 @@ impl ApiError {
             "embedding_capacity",
             message,
             ApiErrorDetails {
+                cause_code: None,
                 failed_layer: Some("embedding_admission".into()),
                 project: None,
                 next_commands: Vec::new(),
@@ -180,6 +229,7 @@ impl ApiError {
                     retry_condition: pressure.retry_condition.clone(),
                     capacity: Some(pressure),
                 }),
+                coverage_gaps: Vec::new(),
             },
         )
     }
@@ -193,6 +243,7 @@ impl ApiError {
             code,
             message,
             ApiErrorDetails {
+                cause_code: None,
                 failed_layer: Some("embedding_runtime".into()),
                 project: None,
                 next_commands: Vec::new(),
@@ -201,6 +252,7 @@ impl ApiError {
                 readiness: None,
                 embedding_capacity: retry.capacity.clone(),
                 embedding_retry: Some(retry),
+                coverage_gaps: Vec::new(),
             },
         )
     }

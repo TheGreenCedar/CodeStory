@@ -15,6 +15,14 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 ### Reliability and compatibility
 
 - Windows source builds now use stable file-handle identity and replace preexisting hard-linked DLLs before runtime staging, allowing Rust 1.97.1 builds to complete.
+- Managed activation now repairs migrated cores that are missing a completed
+  search generation instead of entering through the fail-closed reader and
+  returning terminal unavailability. Repair remains writer-owned and bounded;
+  longer work returns a stable same-tool retry operation.
+- Stable parser-partial files with verified bytes and no file-level error now
+  publish as explicit coverage limitations. Typed file diagnostics distinguish
+  parser partial, source drift, unreadable and oversized source, incomplete
+  discovery, and collector failure without weakening source-integrity gates.
 - Safe refreshes preserve the last verified index. Incomplete reads, cancellation, or concurrent source changes cannot publish a partial generation or mix results from different generations.
 - Existing semantic indexes rebuild once after upgrading. The last complete index remains available while the replacement is prepared.
 - Project switching now preserves isolated per-project state across A/B/A MCP routing. Requests require an explicit project, and status remains observational instead of activating or repairing a repository.
