@@ -1547,6 +1547,7 @@ function validatePackagedProof(workflows, violations, graph) {
       'if [ "$PROOF_SCOPE" = server ]',
       "--server-behavior-only",
       'test -f "$quality_path"',
+      "--timeout-secs 1800",
     ],
   );
   const candidateStage = namedStep(job, "Stage isolated candidate-managed Linux install");

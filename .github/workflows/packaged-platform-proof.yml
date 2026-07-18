@@ -543,6 +543,7 @@ jobs:
             --qualification-matrix-cell hosted_linux_x64_cpu
             --expected-source-sha "$source_sha"
             --expected-source-tree "$source_tree"
+            --timeout-secs 1800
           )
           if [ "$CALIBRATION_MODE" = true ]; then
             test "$(jq -r .status docs/testing/per-user-embedding-server-constant-set.json)" = unfrozen

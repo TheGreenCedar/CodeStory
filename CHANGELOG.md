@@ -8,7 +8,12 @@
   replacement server's own engine identity, model digest, load generation, and
   single model load instead of inheriting the original cold server's startup
   state. The respawn proof also requires unique absence/replacement witnesses
-  and the exact successful product query between them.
+  and the exact successful product query between them. Hosted Linux calibration
+  uses the same bounded 30-minute per-run proof ceiling as the other protected
+  qualification lanes.
+- Cold project activation now keeps one election stable when its exact storage
+  path appears during indexing, while still using native filesystem identity
+  to match distinct aliases.
 - v0.16 release evidence now uses a checked Axios JavaScript/TypeScript corpus
   with three cold CLI repeats. The benchmark binds the exact task-manifest
   bytes and rejects missing, substituted, or extra packet rows. Ripgrep's
