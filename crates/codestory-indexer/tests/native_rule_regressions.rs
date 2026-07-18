@@ -536,6 +536,37 @@ typedef struct {
 }
 
 #[test]
+fn test_c_named_type_multi_alias_typedefs_emit_each_direct_usage_once() -> anyhow::Result<()> {
+    let (nodes, edges) = index_project(&[
+        (
+            "direct_aliases.h",
+            "typedef original_type first_alias_t, second_alias_t;\n",
+        ),
+        (
+            "mixed_aliases.h",
+            concat!(
+                "typedef descriptor_type direct_alias_t, *pointer_alias_t, ",
+                "other_alias_t, *other_pointer_alias_t;\n"
+            ),
+        ),
+    ])?;
+
+    for (alias, target) in [
+        ("first_alias_t", "original_type"),
+        ("second_alias_t", "original_type"),
+        ("direct_alias_t", "descriptor_type"),
+        ("other_alias_t", "descriptor_type"),
+    ] {
+        assert!(
+            edge_between(&nodes, &edges, EdgeKind::TYPE_USAGE, alias, target),
+            "expected {alias} -> {target} type-usage edge"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_cpp_template_structs_keep_inheritance_and_members() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
         "main.cpp",

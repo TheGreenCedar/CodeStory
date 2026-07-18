@@ -41,6 +41,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   publish as explicit coverage limitations. Typed file diagnostics distinguish
   parser partial, source drift, unreadable and oversized source, incomplete
   discovery, and collector failure without weakening source-integrity gates.
+- C headers with one named type and multiple direct `typedef` aliases now emit
+  one type-usage edge per alias instead of failing graph collection and
+  blocking the staged core publication.
 - Safe refreshes preserve the last verified index. Incomplete reads, cancellation, or concurrent source changes cannot publish a partial generation or mix results from different generations.
 - Large full and incremental refreshes now batch file-identity lookups against SQLite's runtime bind-variable limit without changing duplicate or missing-ID semantics.
 - Resolution now skips its optional support cache when the serialized snapshot exceeds SQLite's runtime value limit, while keeping the in-memory result and staged publication intact.

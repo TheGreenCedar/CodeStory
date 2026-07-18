@@ -198,6 +198,67 @@ fn test_template_collector_failure_records_typed_coverage_reason() -> anyhow::Re
 }
 
 #[test]
+fn test_c_multi_alias_typedef_persists_each_alias_once() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("include/aliases.h");
+    fs::create_dir_all(file_path.parent().expect("fixture parent"))?;
+    fs::write(
+        &file_path,
+        "typedef original_type first_alias_t, second_alias_t;\n",
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let errors = storage.get_errors(None)?;
+    assert!(
+        errors.is_empty(),
+        "a deterministic C graph query must not become a retryable collector failure: {errors:?}"
+    );
+    let files = storage.get_files()?;
+    assert_eq!(files.len(), 1);
+    assert!(files[0].indexed);
+    assert!(files[0].complete);
+    let inventory = storage.files().inventory()?;
+    assert_eq!(inventory.len(), 1);
+    assert!(inventory[0].content_hash.is_some());
+    assert!(!inventory[0].retry_required);
+
+    let nodes = storage.get_nodes()?;
+    let node_id = |suffix: &str| {
+        let matches = nodes
+            .iter()
+            .filter(|node| node.serialized_name.ends_with(suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "expected one persisted node for {suffix}");
+        matches[0].id
+    };
+    let target = node_id("original_type");
+    let first_alias = node_id("first_alias_t");
+    let second_alias = node_id("second_alias_t");
+    let type_usage = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::TYPE_USAGE)
+        .collect::<Vec<_>>();
+    assert_eq!(type_usage.len(), 2);
+    assert!(
+        type_usage
+            .iter()
+            .any(|edge| edge.source == first_alias && edge.target == target)
+    );
+    assert!(
+        type_usage
+            .iter()
+            .any(|edge| edge.source == second_alias && edge.target == target)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_svelte_tauri_invoke_surfaces_registered_rust_command_boundary() -> anyhow::Result<()> {
     let storage = index_project(&[
         (

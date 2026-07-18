@@ -79,6 +79,58 @@ fn full_refresh_publishes_verified_generic_tagged_template_parser_partial() {
 }
 
 #[test]
+fn full_refresh_publishes_verified_c_multi_alias_typedef() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    let source_path = workspace.path().join("aliases.h");
+    let storage_path = cache.path().join("codestory.db");
+    fs::write(
+        &source_path,
+        "typedef original_type first_alias_t, second_alias_t;\n",
+    )
+    .expect("write generic C multi-alias fixture");
+
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("deterministic C graph collection must publish on the first full refresh");
+
+    let storage = Storage::open(&storage_path).expect("open published storage");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read publication")
+        .expect("complete C graph collection must publish a core");
+    storage
+        .validate_dense_anchor_publication(&publication)
+        .expect("C graph collection must retain a coherent dense-anchor publication");
+    let file = storage
+        .get_file_by_path(&source_path)
+        .expect("read source row")
+        .expect("indexed C source");
+    assert!(file.indexed);
+    assert!(file.complete);
+    assert_eq!(file.language, "c");
+    let inventory = storage.files().inventory().expect("file inventory");
+    let stored = inventory
+        .iter()
+        .find(|entry| entry.id == file.id)
+        .expect("stored source inventory");
+    assert!(stored.content_hash.is_some());
+    assert!(!stored.retry_required);
+    assert!(
+        storage.get_errors(None).expect("file errors").is_empty(),
+        "persisted coverage must be clean before publication"
+    );
+}
+
+#[test]
 fn activation_search_repair_rejects_publication_drift_and_discards_the_candidate() {
     let _env = hybrid_test_env();
     let temp = tempdir().expect("create temp dir");
