@@ -3217,6 +3217,47 @@ mod tests {
     }
 
     #[test]
+    fn structural_text_cannot_prove_route_endpoints_or_transitions() {
+        let question = "EndpointA -> EndpointB";
+        let answer = route_answer(
+            question,
+            &["EndpointA", "EndpointB"],
+            &[("EndpointA", "EndpointB")],
+        );
+        let claims = [
+            ("EndpointA", "src/EndpointA.html"),
+            ("EndpointB", "src/EndpointB.html"),
+        ]
+        .into_iter()
+        .map(|(name, path)| {
+            let mut citation = cited_anchor(name);
+            citation.file_path = Some(path.to_string());
+            citation.evidence_tier = Some(PacketEvidenceTierDto::StructuralText);
+            citation.evidence_producer = Some("structural_html_collector".to_string());
+            citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+            citation.eligible_for_sufficiency = Some(true);
+            cited_claim(
+                &format!("`{name}` is a requested route endpoint."),
+                Some("route endpoint"),
+                citation,
+                Some(true),
+            )
+        })
+        .collect();
+
+        let sufficiency = route_sufficiency(question, &answer, &budget_fixture(), claims);
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("route endpoint")),
+            "a real graph transition cannot promote structural endpoint citations: {sufficiency:?}"
+        );
+    }
+
+    #[test]
     fn route_proof_rejects_speculative_call_edges() {
         for (case, certainty, confidence) in [
             ("speculative", Some("speculative"), Some(1.0)),

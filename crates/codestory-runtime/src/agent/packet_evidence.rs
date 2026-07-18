@@ -87,7 +87,7 @@ pub(crate) fn evidence_is_sufficiency_eligible(
 
 pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
     if citation_is_diagnostic_source_proof(citation) {
-        return citation.eligible_for_sufficiency.unwrap_or(false);
+        return false;
     }
     let tier = citation
         .evidence_tier
@@ -95,9 +95,10 @@ pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool
     let resolution = citation
         .resolution_status
         .unwrap_or_else(|| evidence_resolution_for_citation(citation));
-    citation
-        .eligible_for_sufficiency
-        .unwrap_or_else(|| evidence_is_sufficiency_eligible(tier, resolution))
+    if !evidence_is_sufficiency_eligible(tier, resolution) {
+        return false;
+    }
+    citation.eligible_for_sufficiency.unwrap_or(true)
 }
 
 pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
@@ -485,6 +486,12 @@ mod tests {
         );
         assert_eq!(citation.eligible_for_sufficiency, Some(false));
         assert!(!citation_sufficiency_eligible(&citation));
+
+        citation.eligible_for_sufficiency = Some(true);
+        assert!(
+            !citation_sufficiency_eligible(&citation),
+            "an adapter-provided eligibility flag must not promote structural evidence"
+        );
     }
 
     #[test]
