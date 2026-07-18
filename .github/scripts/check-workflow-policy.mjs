@@ -91,6 +91,23 @@ function requireStepRun(violations, file, job, name, fragments) {
   }
 }
 
+function requireResolverSemantics(violations, file, job, exactLines) {
+  const run = executableRunText(stepRun(job, "Resolve trusted exact head"));
+  const lines = run.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  add(
+    violations,
+    !lines.some(line => /^true\s*\|\|/u.test(line) || /^if\s+false(?:\s|;|&&)/u.test(line)),
+    `${file} resolver must not short-circuit trusted branch or SHA checks`,
+  );
+  for (const expected of exactLines) {
+    add(
+      violations,
+      lines.includes(expected),
+      `${file} resolver must execute exact line ${expected}`,
+    );
+  }
+}
+
 function requireStepUses(violations, file, job, name, expected) {
   add(
     violations,
@@ -1190,7 +1207,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     );
     add(violations, trigger(source, "pull_request_target") === undefined, `${sourceFile} must not execute pull-request code through pull_request_target`);
     const resolve = requireJob(violations, sourceFile, source, "resolve");
-    add(violations, String(resolve.if ?? "").includes("review-accepted"), `${sourceFile} resolve job must require review-accepted`);
+    add(
+      violations,
+      resolve.if === "github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')",
+      `${sourceFile} resolve job must execute dispatch/call runs and only review-accepted labeled PR runs`,
+    );
     requireStepRun(violations, sourceFile, resolve, "Resolve trusted exact head", [
       'test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY"',
       'test "$current_head" = "$EVENT_HEAD_SHA"',
@@ -1199,6 +1220,15 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"',
       'test "$GITHUB_SHA" = "$CALLER_REF"',
       "--ref $head_ref",
+    ]);
+    requireResolverSemantics(violations, sourceFile, resolve, [
+      'if [ -n "$EVENT_PR_NUMBER" ]; then',
+      'test "$current_head" = "$EVENT_HEAD_SHA" || {',
+      'if [ -n "$PR_NUMBER" ]; then',
+      'test "$head_sha" = "$EXPECTED_HEAD_SHA" || {',
+      'test "$GITHUB_REF" = "refs/heads/$head_ref" || {',
+      'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
+      'test "$GITHUB_SHA" = "$CALLER_REF" || {',
     ]);
     const full = requireJob(violations, sourceFile, source, "full-source-gate");
     add(violations, sameMembers(needs(full), ["resolve"]), `${sourceFile} full source gate must need resolve`);
@@ -1229,6 +1259,12 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
         && save?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''"
         && object(save?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
       `${sourceFile} source cache must save only a successful exact miss`,
+    );
+    const fullSteps = list(full.steps).map(object);
+    add(
+      violations,
+      fullSteps.findIndex(step => step.name === "Save Cargo inputs and output") === fullSteps.length - 1,
+      `${sourceFile} source cache save must run after every proof step`,
     );
     requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
@@ -1513,6 +1549,11 @@ function validatePackagedProof(workflows, violations, graph) {
       && packageSave?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''"
       && object(packageSave?.with).key === "${{ steps.cargo-cache-restore.outputs.cache-primary-key }}",
     `${file} native build cache must save only a successful exact miss`,
+  );
+  add(
+    violations,
+    packageSteps.findIndex(step => step.name === "Save Cargo registry, git sources, and build output") === packageSteps.length - 1,
+    `${file} native build cache save must run after every proof and cleanup step`,
   );
   const linuxBuildDockerfile = fs.readFileSync(
     path.join(repositoryRoot, ".github", "docker", "linux-glibc-build.Dockerfile"),
@@ -1836,6 +1877,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   add(violations, object(workflow.permissions).actions === "read", `${file} must read source-proof runs`);
   add(violations, object(workflow.permissions).contents === "read", `${file} must use read-only contents permission`);
   const route = requireJob(violations, file, workflow, "route");
+  add(
+    violations,
+    route.if === "github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')",
+    `${file} route job must execute dispatch runs and only platform-proof labeled PR runs`,
+  );
   requireStepRun(violations, file, route, "Resolve trusted exact head", [
     'test "$head_repo" = "$GITHUB_REPOSITORY"',
     'test "$current_head" = "$EVENT_HEAD_SHA"',
@@ -1847,6 +1893,17 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     'test "$GITHUB_REF" = "refs/heads/dev/codestory-next"',
     'test "$GITHUB_SHA" = "$dev_head"',
     "--ref $head_ref",
+  ]);
+  requireResolverSemantics(violations, file, route, [
+    'if [ "$mode" = "integration" ]; then',
+    'test "$INPUT_HEAD_SHA" = "$dev_head" || {',
+    'test "$GITHUB_REF" = "refs/heads/dev/codestory-next" || {',
+    'test "$GITHUB_SHA" = "$dev_head" || {',
+    'if [ -n "$EVENT_HEAD_REPO" ]; then',
+    'test "$current_head" = "$EVENT_HEAD_SHA" || {',
+    'test "$INPUT_HEAD_SHA" = "$current_head" || {',
+    'test "$GITHUB_REF" = "refs/heads/$head_ref" || {',
+    'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
   ]);
   requireStepRun(violations, file, route, "Require successful exact-head source proof", [
     "actions/runs?head_sha=$HEAD_SHA",
@@ -1907,6 +1964,12 @@ function validatePackagedCoordinator(workflows, violations, graph) {
       && macosSave?.if === "success() && steps.macos-source-cache-restore.outputs.cache-hit != 'true' && steps.macos-source-cache-restore.outputs.cache-primary-key != ''"
       && object(macosSave?.with).key === "${{ steps.macos-source-cache-restore.outputs.cache-primary-key }}",
     `${file} macOS source cache must save only a successful exact miss`,
+  );
+  const macosSourceSteps = list(macosSource.steps).map(object);
+  add(
+    violations,
+    macosSourceSteps.findIndex(step => step.name === "Save exact-head macOS source cache") === macosSourceSteps.length - 1,
+    `${file} macOS source cache save must run after every proof step`,
   );
   const calibrationAssemble = requireJob(
     violations,

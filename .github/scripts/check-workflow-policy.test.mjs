@@ -55,6 +55,15 @@ function draftStep(job, name) {
   return matches[0];
 }
 
+function moveNamedStepBefore(job, movedName, beforeName) {
+  const movedIndex = job.steps.findIndex(step => step.name === movedName);
+  assert.notEqual(movedIndex, -1, `missing ${movedName}`);
+  const [moved] = job.steps.splice(movedIndex, 1);
+  const beforeIndex = job.steps.findIndex(step => step.name === beforeName);
+  assert.notEqual(beforeIndex, -1, `missing ${beforeName}`);
+  job.steps.splice(beforeIndex, 0, moved);
+}
+
 function runResolver(file, jobName, environment) {
   const workflow = loadWorkflows().get(file);
   const run = draftStep(workflow.jobs[jobName], "Resolve trusted exact head").run;
@@ -203,7 +212,8 @@ jobs:
   assert.match(basicWorkflowViolations("fixture.yml", invalid).join("\n"), /full-length SHA/u);
 });
 
-test("proof resolvers reject hostile workflow refs before proof work", async (t) => {
+test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before proof work", async (t) => {
+  const otherSha = "2".repeat(40);
   const sourceEnvironment = {
     PR_NUMBER: "1230",
     EXPECTED_HEAD_SHA: fullSha,
@@ -222,11 +232,42 @@ test("proof resolvers reject hostile workflow refs before proof work", async (t)
     assert.notEqual(rejected.status, 0);
     assert.match(rejected.stdout, /--ref codex\/exact-head/u);
 
+    const wrongSha = runResolver("source-proof.yml", "resolve", {
+      ...sourceEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+      GITHUB_SHA: otherSha,
+    });
+    assert.notEqual(wrongSha.status, 0);
+    assert.match(wrongSha.stdout, /Workflow SHA .* is not reviewed PR head/u);
+
     const accepted = runResolver("source-proof.yml", "resolve", {
       ...sourceEnvironment,
       GITHUB_REF: "refs/heads/codex/exact-head",
     });
     assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+
+  await t.test("source labeled event", () => {
+    const environment = {
+      PR_NUMBER: "",
+      EXPECTED_HEAD_SHA: "",
+      CALLER_REF: "",
+      EVENT_PR_NUMBER: "1230",
+      EVENT_HEAD_SHA: fullSha,
+      EVENT_HEAD_REPO: "TheGreenCedar/CodeStory",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REF: "refs/pull/1230/merge",
+      GITHUB_SHA: fullSha,
+    };
+    const accepted = runResolver("source-proof.yml", "resolve", environment);
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+
+    const drifted = runResolver("source-proof.yml", "resolve", {
+      ...environment,
+      EVENT_HEAD_SHA: otherSha,
+    });
+    assert.notEqual(drifted.status, 0);
+    assert.match(drifted.stdout, /moved after the review-accepted label event/u);
   });
 
   const packagedEnvironment = {
@@ -250,11 +291,42 @@ test("proof resolvers reject hostile workflow refs before proof work", async (t)
     assert.notEqual(rejected.status, 0);
     assert.match(rejected.stdout, /--ref codex\/exact-head/u);
 
+    const wrongSha = runResolver("packaged-platform-pr.yml", "route", {
+      ...packagedEnvironment,
+      GITHUB_REF: "refs/heads/codex/exact-head",
+      GITHUB_SHA: otherSha,
+    });
+    assert.notEqual(wrongSha.status, 0);
+    assert.match(wrongSha.stdout, /Workflow SHA .* is not accepted PR head/u);
+
     const accepted = runResolver("packaged-platform-pr.yml", "route", {
       ...packagedEnvironment,
       GITHUB_REF: "refs/heads/codex/exact-head",
     });
     assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  });
+
+  await t.test("platform labeled event", () => {
+    const environment = {
+      ...packagedEnvironment,
+      INPUT_PR_NUMBER: "",
+      INPUT_HEAD_SHA: "",
+      INPUT_MODE: "",
+      EVENT_PR_NUMBER: "1230",
+      EVENT_HEAD_SHA: fullSha,
+      EVENT_HEAD_REPO: "TheGreenCedar/CodeStory",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REF: "refs/pull/1230/merge",
+    };
+    const accepted = runResolver("packaged-platform-pr.yml", "route", environment);
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+
+    const drifted = runResolver("packaged-platform-pr.yml", "route", {
+      ...environment,
+      EVENT_HEAD_SHA: otherSha,
+    });
+    assert.notEqual(drifted.status, 0);
+    assert.match(drifted.stdout, /moved after the platform-proof label event/u);
   });
 
   await t.test("integration dispatch", () => {
@@ -301,6 +373,24 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
     }, /GITHUB_SHA.*EXPECTED_HEAD_SHA/u],
+    ["source manual SHA short-circuit", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace(
+          'test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
+          'true || test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {',
+        );
+    }, /must not short-circuit/u],
+    ["source labeled branch disabled", sourceFile, workflow => {
+      sourceResolver(workflow).run = sourceResolver(workflow).run
+        .replace(
+          'if [ -n "$EVENT_PR_NUMBER" ]; then',
+          'if false && [ -n "$EVENT_PR_NUMBER" ]; then',
+        );
+    }, /must not short-circuit|must execute exact line/u],
+    ["source labeled job disabled", sourceFile, workflow => {
+      workflow.jobs.resolve.if
+        = "false && (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')";
+    }, /only review-accepted labeled PR runs/u],
     ["source manual ref equality", sourceFile, workflow => {
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace('test "$GITHUB_REF" = "refs\/heads\/$head_ref"', 'test -n "$GITHUB_REF"');
@@ -309,6 +399,24 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
     }, /GITHUB_SHA.*INPUT_HEAD_SHA/u],
+    ["platform manual SHA short-circuit", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          'test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
+          'true || test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {',
+        );
+    }, /must not short-circuit/u],
+    ["platform labeled branch disabled", packagedCoordinatorFile, workflow => {
+      packagedResolver(workflow).run = packagedResolver(workflow).run
+        .replace(
+          'if [ -n "$EVENT_HEAD_REPO" ]; then',
+          'if false && [ -n "$EVENT_HEAD_REPO" ]; then',
+        );
+    }, /must not short-circuit|must execute exact line/u],
+    ["platform labeled job disabled", packagedCoordinatorFile, workflow => {
+      workflow.jobs.route.if
+        = "false && (github.event.action == 'labeled' && github.event.label.name == 'platform-proof')";
+    }, /only platform-proof labeled PR runs/u],
     ["integration live dev SHA equality", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$dev_head"', 'test -n "$GITHUB_SHA"');
@@ -325,10 +433,24 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       draftStep(workflow.jobs["full-source-gate"], "Save Cargo inputs and output").if
         = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
     }, /save only a successful exact miss/u],
+    ["source cache save before final proof", sourceFile, workflow => {
+      moveNamedStepBefore(
+        workflow.jobs["full-source-gate"],
+        "Save Cargo inputs and output",
+        "Test the complete workspace once",
+      );
+    }, /source cache save must run after every proof step/u],
     ["macOS source cache loses exact SHA", packagedCoordinatorFile, workflow => {
       const restore = draftStep(workflow.jobs["macos-source"], "Restore exact-head macOS source cache");
       restore.with.key = restore.with.key.replace("-${{ needs.route.outputs.head_sha }}", "");
     }, /macOS source cache must be an exact-SHA restore/u],
+    ["macOS source cache save before final proof", packagedCoordinatorFile, workflow => {
+      moveNamedStepBefore(
+        workflow.jobs["macos-source"],
+        "Save exact-head macOS source cache",
+        "Capture Rust cache identity",
+      );
+    }, /macOS source cache save must run after every proof step/u],
     ["packaged cache loses exact SHA", packagedProofFile, workflow => {
       const restore = draftStep(workflow.jobs.build, "Restore Cargo registry, git sources, and build output");
       restore.with.key = restore.with.key.replace("-${{ inputs.ref }}", "");
@@ -337,6 +459,13 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       draftStep(workflow.jobs.build, "Save Cargo registry, git sources, and build output").if
         = "always() && steps.cargo-cache-restore.outputs.cache-hit != 'true'";
     }, /save only a successful exact miss/u],
+    ["packaged cache save before final proof", packagedProofFile, workflow => {
+      moveNamedStepBefore(
+        workflow.jobs.build,
+        "Save Cargo registry, git sources, and build output",
+        "Build codestory-cli",
+      );
+    }, /native build cache save must run after every proof and cleanup step/u],
   ];
 
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
