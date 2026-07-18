@@ -1597,6 +1597,7 @@ fn packet_claim_tier_label(claim: &PacketClaimDto) -> String {
 fn packet_evidence_tier_label(tier: PacketEvidenceTierDto) -> &'static str {
     match tier {
         PacketEvidenceTierDto::ExactSource => "exact_source",
+        PacketEvidenceTierDto::StructuralText => "structural_text",
         PacketEvidenceTierDto::ResolvedGraph => "resolved_graph",
         PacketEvidenceTierDto::LexicalSource => "lexical_source",
         PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
@@ -1610,6 +1611,7 @@ fn packet_evidence_tier_label(tier: PacketEvidenceTierDto) -> &'static str {
 fn packet_evidence_provenance_label(tier: PacketEvidenceTierDto) -> &'static str {
     match tier {
         PacketEvidenceTierDto::ExactSource => "exact",
+        PacketEvidenceTierDto::StructuralText => "structural_text",
         PacketEvidenceTierDto::ResolvedGraph => "graph_neighbor",
         PacketEvidenceTierDto::LexicalSource => "lexical_source",
         PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
@@ -2768,6 +2770,18 @@ mod tests {
     };
     use std::path::Path;
 
+    #[test]
+    fn structural_text_labels_stay_explicit_in_packet_diagnostics() {
+        assert_eq!(
+            packet_evidence_tier_label(PacketEvidenceTierDto::StructuralText),
+            "structural_text"
+        );
+        assert_eq!(
+            packet_evidence_provenance_label(PacketEvidenceTierDto::StructuralText),
+            "structural_text"
+        );
+    }
+
     fn claim(text: &str) -> PacketClaimDto {
         PacketClaimDto {
             claim: text.to_string(),
@@ -3199,6 +3213,47 @@ mod tests {
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("execution graph"))
+        );
+    }
+
+    #[test]
+    fn structural_text_cannot_prove_route_endpoints_or_transitions() {
+        let question = "EndpointA -> EndpointB";
+        let answer = route_answer(
+            question,
+            &["EndpointA", "EndpointB"],
+            &[("EndpointA", "EndpointB")],
+        );
+        let claims = [
+            ("EndpointA", "src/EndpointA.html"),
+            ("EndpointB", "src/EndpointB.html"),
+        ]
+        .into_iter()
+        .map(|(name, path)| {
+            let mut citation = cited_anchor(name);
+            citation.file_path = Some(path.to_string());
+            citation.evidence_tier = Some(PacketEvidenceTierDto::StructuralText);
+            citation.evidence_producer = Some("structural_html_collector".to_string());
+            citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+            citation.eligible_for_sufficiency = Some(true);
+            cited_claim(
+                &format!("`{name}` is a requested route endpoint."),
+                Some("route endpoint"),
+                citation,
+                Some(true),
+            )
+        })
+        .collect();
+
+        let sufficiency = route_sufficiency(question, &answer, &budget_fixture(), claims);
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("route endpoint")),
+            "a real graph transition cannot promote structural endpoint citations: {sufficiency:?}"
         );
     }
 

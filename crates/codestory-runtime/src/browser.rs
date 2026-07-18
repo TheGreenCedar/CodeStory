@@ -163,6 +163,21 @@ impl ReadOnlyBrowserService {
         })
     }
 
+    pub fn resolve_source_target(
+        &self,
+        target: TargetSelection,
+        file_filter: Option<&str>,
+    ) -> Result<TargetResolution, ApiError> {
+        let operation = match &target {
+            TargetSelection::Id(_) => "graph",
+            TargetSelection::Query { .. } => "resolution",
+        };
+        self.run_public(operation, || {
+            self.controller
+                .resolve_source_target(target.clone(), file_filter)
+        })
+    }
+
     pub fn symbol_workflow(
         &self,
         request: SymbolWorkflowRequest,

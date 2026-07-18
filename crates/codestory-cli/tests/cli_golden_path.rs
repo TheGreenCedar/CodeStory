@@ -1061,6 +1061,81 @@ fn app_controller_opens_project() {
 }
 
 #[test]
+fn snippet_exact_id_navigates_openapi_diagnostic_evidence_but_query_stays_typed() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_openapi_workspace(workspace.path());
+    let _search_dir_snapshot =
+        index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "openapi::GET /api/users",
+        Some("openapi.json"),
+    );
+
+    let snippet = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            &format!("--id={node_id}"),
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["evidence_tier"],
+        "exact_source"
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["evidence_producer"],
+        "openapi_endpoint_schema"
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["resolution_status"],
+        "source_range_only"
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["eligible_for_sufficiency"],
+        false
+    );
+    assert!(
+        snippet["snippet"]["snippet"]
+            .as_str()
+            .is_some_and(|source| source.contains("/api/users")),
+        "snippet should navigate the exact OpenAPI source range: {snippet:#}"
+    );
+
+    let query = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query=openapi::GET /api/users",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !query.status.success(),
+        "query snippets must not select source-range-only diagnostic evidence"
+    );
+    let failure: Value = serde_json::from_slice(&query.stdout)
+        .unwrap_or_else(|error| panic!("parse query snippet failure: {error}; output={query:#?}"));
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No symbol matched query")),
+        "query snippet should retain typed graph filtering: {failure:#}"
+    );
+}
+
+#[test]
 fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

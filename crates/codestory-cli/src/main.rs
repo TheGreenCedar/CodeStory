@@ -104,7 +104,7 @@ use output::{
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
-    resolve_refresh_request, resolve_target,
+    resolve_refresh_request, resolve_source_target, resolve_target,
 };
 use serde::Deserialize;
 #[cfg(test)]
@@ -2984,6 +2984,10 @@ fn drill_search_hit_from_packet_citation(
         origin: citation.origin,
         match_quality,
         resolvable: citation.resolvable,
+        evidence_tier: citation.evidence_tier,
+        evidence_producer: citation.evidence_producer.clone(),
+        resolution_status: citation.resolution_status,
+        eligible_for_sufficiency: citation.eligible_for_sufficiency,
         score_breakdown: citation.retrieval_score_breakdown.clone(),
         duplicate_of: None,
         excerpt: None,
@@ -3020,7 +3024,12 @@ fn drill_packet_verification_target(
 }
 
 fn drill_packet_citation_is_typed_resolvable(citation: &AgentCitationDto) -> bool {
-    citation.resolvable && citation.kind != NodeKind::UNKNOWN
+    citation.resolvable
+        && citation.kind != NodeKind::UNKNOWN
+        && citation.evidence_tier
+            != Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        && citation.resolution_status
+            != Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
 }
 
 fn drill_packet_verification_targets(
@@ -5095,7 +5104,7 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
     let operation = runtime.run_public_operation(operation, || {
-        let target = resolve_target_or_emit_ambiguity(
+        let target = resolve_source_target_or_emit_ambiguity(
             &runtime,
             cmd.target.selection()?,
             file_filter.as_deref(),
@@ -5988,6 +5997,29 @@ fn resolve_target_or_emit_ambiguity(
     output_file: Option<&std::path::Path>,
 ) -> Result<runtime::ResolvedTarget> {
     match resolve_target(runtime, target, file_filter) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+                return structured_ambiguous_target_failure(
+                    runtime,
+                    ambiguous.clone(),
+                    format,
+                    output_file,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn resolve_source_target_or_emit_ambiguity(
+    runtime: &RuntimeContext,
+    target: args::TargetSelection,
+    file_filter: Option<&str>,
+    format: args::OutputFormat,
+    output_file: Option<&std::path::Path>,
+) -> Result<runtime::ResolvedTarget> {
+    match resolve_source_target(runtime, target, file_filter) {
         Ok(target) => Ok(target),
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
@@ -7358,6 +7390,10 @@ fn build_search_hit_output(
             .match_quality
             .unwrap_or_else(|| search_match_quality(query, hit)),
         resolvable: hit.resolvable,
+        evidence_tier: hit.evidence_tier,
+        evidence_producer: hit.evidence_producer.clone(),
+        resolution_status: hit.resolution_status,
+        eligible_for_sufficiency: hit.eligible_for_sufficiency,
         score_breakdown,
         duplicate_of: None,
         excerpt: repo_text_excerpt(project_root, hit),
@@ -9136,6 +9172,147 @@ mod tests {
     }
 
     #[test]
+    fn cli_search_and_resolution_keep_structural_evidence_metadata() {
+        let root = Path::new("C:/repo");
+        let manifest = SearchHit {
+            node_id: NodeId("cargo-package".to_string()),
+            display_name: "demo".to_string(),
+            kind: NodeKind::PACKAGE,
+            file_path: Some("C:/repo/Cargo.toml".to_string()),
+            line: Some(2),
+            score: 0.9,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_cargo_manifest_collector".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            eligible_for_sufficiency: Some(false),
+            ..test_search_hit_defaults()
+        };
+        let workflow = SearchHit {
+            node_id: NodeId("workflow-job".to_string()),
+            display_name: "test".to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some("C:/repo/.github/workflows/ci.yml".to_string()),
+            line: Some(12),
+            score: 0.8,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            eligible_for_sufficiency: Some(false),
+            ..test_search_hit_defaults()
+        };
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "demo",
+            retrieval: &sample_retrieval(),
+            retrieval_shadow: None,
+            freshness: None,
+            symbol_hits: &[manifest.clone(), workflow.clone()],
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            query_assessment: None,
+            search_plan: None,
+            suggestions: &[],
+            occurrences_by_node: &HashMap::new(),
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
+                mode: RepoTextMode::Off,
+                enabled: false,
+            },
+            explain: false,
+        });
+
+        let search_json = serde_json::to_value(&output).expect("serialize CLI search output");
+        for (index, producer) in [
+            (0, "structural_cargo_manifest_collector"),
+            (1, "structural_github_actions_workflow_collector"),
+        ] {
+            let hit = &search_json["indexed_symbol_hits"][index];
+            assert_eq!(hit["evidence_tier"], "structural_text");
+            assert_eq!(hit["evidence_producer"], producer);
+            assert_eq!(hit["resolution_status"], "source_range_only");
+            assert_eq!(hit["eligible_for_sufficiency"], false);
+        }
+        let markdown = render_search_markdown(root, &output);
+        assert!(
+            markdown.contains("evidence_tier=structural_text"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("resolution_status=source_range_only"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("eligible_for_sufficiency=false"),
+            "{markdown}"
+        );
+
+        let target = runtime::ResolvedTarget {
+            selector: QuerySelectorOutput::Query,
+            requested: "demo".to_string(),
+            file_filter: None,
+            selected: manifest.clone(),
+            alternatives: vec![manifest, workflow.clone()],
+        };
+        let resolution = build_query_resolution_output(root, &target);
+        let resolution_json =
+            serde_json::to_value(&resolution).expect("serialize CLI query resolution output");
+        assert_eq!(
+            resolution_json["resolved"]["evidence_tier"],
+            "structural_text"
+        );
+        assert_eq!(
+            resolution_json["resolved"]["resolution_status"],
+            "source_range_only"
+        );
+        assert_eq!(
+            resolution_json["resolved"]["eligible_for_sufficiency"],
+            false
+        );
+        assert_eq!(
+            resolution_json["alternatives"][0]["evidence_producer"],
+            "structural_github_actions_workflow_collector"
+        );
+
+        let citation = AgentCitationDto {
+            node_id: workflow.node_id.clone(),
+            display_name: workflow.display_name.clone(),
+            kind: workflow.kind,
+            file_path: workflow.file_path.clone(),
+            line: workflow.line,
+            score: workflow.score,
+            origin: workflow.origin,
+            resolvable: workflow.resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: workflow.evidence_tier,
+            evidence_producer: workflow.evidence_producer.clone(),
+            resolution_status: workflow.resolution_status,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: workflow.eligible_for_sufficiency,
+        };
+        let drill_hit = drill_search_hit_from_packet_citation(root, "test", &citation);
+        assert_eq!(
+            drill_hit.evidence_producer.as_deref(),
+            Some("structural_github_actions_workflow_collector")
+        );
+        assert_eq!(
+            drill_hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(drill_hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
     fn build_search_output_marks_repo_text_why_as_diagnostic_navigation() {
         let root = Path::new("C:/repo");
         let repo_text_hits = vec![SearchHit {
@@ -10122,6 +10299,48 @@ mod tests {
             &[citation],
         );
         assert!(anchors[0].chosen_anchor.is_none());
+    }
+
+    #[test]
+    fn drill_packet_keeps_structural_source_ranges_navigable_but_not_typed() {
+        let project_root = Path::new("C:/repo");
+        let mut structural =
+            sample_task_brief_citation("Cargo package", NodeKind::PACKAGE, "Cargo.toml", 2);
+        structural.evidence_tier =
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText);
+        structural.evidence_producer = Some("structural_cargo_manifest_collector".to_string());
+        structural.resolution_status =
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly);
+
+        let navigable =
+            drill_search_hit_from_packet_citation(project_root, "Cargo package", &structural);
+        assert!(navigable.resolvable);
+        assert!(!drill_packet_citation_is_typed_resolvable(&structural));
+
+        let anchors = drill_packet_anchors(
+            project_root,
+            &["Cargo package".to_string()],
+            std::slice::from_ref(&structural),
+        );
+        assert_eq!(anchors[0].typed_hit_count, 0);
+        assert!(anchors[0].chosen_anchor.is_none());
+        assert!(anchors[0].verification_targets.is_empty());
+        assert!(drill_packet_verification_targets(project_root, &[structural.clone()]).is_empty());
+
+        let mut packet = sample_task_brief_packet();
+        packet.sufficiency.covered_claims[0].citations = vec![
+            structural,
+            sample_task_brief_citation("SearchService", NodeKind::STRUCT, "src/search.rs", 24),
+        ];
+        assert!(drill_packet_bridges(project_root, &packet).is_empty());
+
+        let mut source_range_only =
+            sample_task_brief_citation("source range", NodeKind::FUNCTION, "src/lib.rs", 8);
+        source_range_only.resolution_status =
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly);
+        assert!(!drill_packet_citation_is_typed_resolvable(
+            &source_range_only
+        ));
     }
 
     #[test]

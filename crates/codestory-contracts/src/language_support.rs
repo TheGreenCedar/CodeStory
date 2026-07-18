@@ -138,7 +138,7 @@ pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
     },
 ];
 
-/// Structural collector contract for exact-source, non-semantic proof.
+/// Structural collector contract for structural-text, non-semantic proof.
 ///
 /// Each row is a product evidence boundary. `semantic_proof_allowed = false`
 /// means the collector may support navigation or diagnostics, but must not be
@@ -191,7 +191,7 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         path_pattern: ".github/workflows/*.{yml,yaml}",
         emitted_node_kinds: GITHUB_ACTIONS_WORKFLOW_NODE_KINDS,
         source_span: "1-based source line and column span for the matched workflow, job, or step anchor",
-        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
         resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
         confidence: 1.0,
         unsupported_shape_notes: GITHUB_ACTIONS_WORKFLOW_UNSUPPORTED_SHAPES,
@@ -203,7 +203,7 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         path_pattern: "compose*.{yml,yaml}, docker-compose*.{yml,yaml}, docker/*-compose.{yml,yaml}",
         emitted_node_kinds: DOCKER_COMPOSE_NODE_KINDS,
         source_span: "1-based source line and column span for the matched stack, service, or service property anchor",
-        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
         resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
         confidence: 1.0,
         unsupported_shape_notes: DOCKER_COMPOSE_UNSUPPORTED_SHAPES,
@@ -227,7 +227,7 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         path_pattern: "**/Cargo.toml",
         emitted_node_kinds: CARGO_MANIFEST_NODE_KINDS,
         source_span: "1-based source line and column span for matched workspace member, package name, or direct dependency key anchors",
-        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
         resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
         confidence: 1.0,
         unsupported_shape_notes: CARGO_MANIFEST_UNSUPPORTED_SHAPES,
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_source_proof_contract_is_exact_source_not_semantic() {
+    fn structural_source_proof_contract_is_structural_text_not_semantic() {
         let contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
             .iter()
             .find(|contract| contract.collector_name == "github_actions_workflow")
@@ -566,7 +566,10 @@ mod tests {
         assert_eq!(contract.path_pattern, ".github/workflows/*.{yml,yaml}");
         assert!(contract.emitted_node_kinds.contains(&NodeKind::MODULE));
         assert!(contract.emitted_node_kinds.contains(&NodeKind::FUNCTION));
-        assert_eq!(contract.evidence_tier, PacketEvidenceTierDto::ExactSource);
+        assert_eq!(
+            contract.evidence_tier,
+            PacketEvidenceTierDto::StructuralText
+        );
         assert_eq!(
             contract.resolution,
             PacketEvidenceResolutionDto::SourceRangeOnly
@@ -601,7 +604,7 @@ mod tests {
         );
         assert_eq!(
             compose_contract.evidence_tier,
-            PacketEvidenceTierDto::ExactSource
+            PacketEvidenceTierDto::StructuralText
         );
         assert_eq!(
             compose_contract.resolution,
@@ -666,7 +669,7 @@ mod tests {
         );
         assert_eq!(
             cargo_contract.evidence_tier,
-            PacketEvidenceTierDto::ExactSource
+            PacketEvidenceTierDto::StructuralText
         );
         assert_eq!(
             cargo_contract.resolution,

@@ -4,6 +4,7 @@
 //! retrieval sidecar coordination. Packet/search methods are sidecar-primary: degraded retrieval
 //! is surfaced as diagnostics or errors, not as product-equivalent answer evidence.
 
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use codestory_contracts::api::{
     AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
@@ -10205,7 +10206,7 @@ impl AppController {
             .as_deref()
             .is_some_and(|value| value.starts_with("openapi:endpoint:"));
 
-        Some(SearchHit {
+        let mut hit = SearchHit {
             node_id: NodeId::from(id),
             display_name,
             kind: NodeKind::from(node.kind),
@@ -10237,7 +10238,9 @@ impl AppController {
             coverage_role: None,
             eligible_for_sufficiency: Some(!openapi_endpoint),
             score_breakdown: None,
-        })
+        };
+        decorate_search_hit_evidence(&mut hit);
+        Some(hit)
     }
 
     #[cfg(test)]
@@ -20684,6 +20687,47 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(
             hit.evidence_producer.as_deref(),
             Some("openapi_endpoint_schema")
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn build_search_hit_marks_structural_collectors_as_structural_text() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(40),
+                    kind: NodeKind::FILE,
+                    serialized_name: "crates/demo/Cargo.toml".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(41),
+                    kind: NodeKind::PACKAGE,
+                    serialized_name: "demo".to_string(),
+                    file_node_id: Some(CoreNodeId(40)),
+                    start_line: Some(2),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        let node_names = HashMap::from([(CoreNodeId(41), "demo".to_string())]);
+
+        let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(41), 1.0)
+            .expect("structural hit");
+
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_cargo_manifest_collector")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }

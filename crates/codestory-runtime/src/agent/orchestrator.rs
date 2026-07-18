@@ -14108,6 +14108,9 @@ mod tests {
                 member_count: None,
                 summary: None,
                 edge_digest: Vec::new(),
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
             });
 
         assert_eq!(hit.display_name, "AppController");

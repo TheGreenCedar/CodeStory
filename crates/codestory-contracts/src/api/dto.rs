@@ -137,15 +137,18 @@ pub enum SearchMatchQualityDto {
 
 /// Evidence provenance tier used by packet/search/citation surfaces.
 ///
-/// Tiers are compatibility values. `ExactSource`, `ResolvedGraph`,
-/// `LexicalSource`, `SymbolDoc`, `ComponentReport`, and `DenseSemantic` are
-/// product evidence from indexed or sidecar sources. `SyntheticSourceScan` and
-/// `GeneratedSummary` are diagnostic or presentation evidence and should not be
-/// treated as source truth without a follow-up read.
+/// Tiers are compatibility values. `ExactSource`, `StructuralText`,
+/// `ResolvedGraph`, `LexicalSource`, `SymbolDoc`, `ComponentReport`, and
+/// `DenseSemantic` are product evidence from indexed or sidecar sources.
+/// `StructuralText` identifies a collector-backed source span; it does not
+/// imply parser-backed graph coverage or semantic resolution. `SyntheticSourceScan`
+/// and `GeneratedSummary` are diagnostic or presentation evidence and should
+/// not be treated as source truth without a follow-up read.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketEvidenceTierDto {
     ExactSource,
+    StructuralText,
     ResolvedGraph,
     LexicalSource,
     SymbolDoc,
@@ -1287,6 +1290,15 @@ pub struct GroundingSymbolDigestDto {
     pub summary: Option<String>,
     #[serde(default)]
     pub edge_digest: Vec<String>,
+    /// Diagnostic source-range evidence metadata, when the symbol comes from
+    /// a structural collector or endpoint schema rather than parser-backed
+    /// graph coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2404,6 +2416,15 @@ pub struct BookmarkCategoryDto {
 #[cfg(test)]
 mod packet_tests {
     use super::*;
+
+    #[test]
+    fn structural_text_evidence_tier_serializes_as_a_named_public_contract() {
+        assert_eq!(
+            serde_json::to_value(PacketEvidenceTierDto::StructuralText)
+                .expect("serialize structural-text evidence tier"),
+            serde_json::json!("structural_text")
+        );
+    }
 
     fn producer_evidence() -> EmbeddingVectorProducerEvidenceDto {
         EmbeddingVectorProducerEvidenceDto {

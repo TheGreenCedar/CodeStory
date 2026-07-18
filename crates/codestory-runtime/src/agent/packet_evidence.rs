@@ -6,12 +6,38 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::language_support::{
     is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
+    structural_language_name_for_path,
 };
 
 const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
 pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticSourceEvidence {
+    pub(crate) tier: PacketEvidenceTier,
+    pub(crate) producer: &'static str,
+    pub(crate) resolution: PacketEvidenceResolution,
+}
+
+pub(crate) fn diagnostic_source_evidence(
+    path: Option<&str>,
+    canonical_id: Option<&str>,
+) -> Option<DiagnosticSourceEvidence> {
+    if canonical_id.is_some_and(|value| value.starts_with("openapi:endpoint:")) {
+        return Some(DiagnosticSourceEvidence {
+            tier: PacketEvidenceTier::ExactSource,
+            producer: OPENAPI_ENDPOINT_SCHEMA_PRODUCER,
+            resolution: PacketEvidenceResolution::SourceRangeOnly,
+        });
+    }
+    structural_text_producer_for_path(path).map(|producer| DiagnosticSourceEvidence {
+        tier: PacketEvidenceTier::StructuralText,
+        producer,
+        resolution: PacketEvidenceResolution::SourceRangeOnly,
+    })
+}
 
 pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     let diagnostic_source_proof = hit_is_diagnostic_source_proof(hit);
@@ -39,13 +65,18 @@ pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &
     citation.loss_reason = hit.loss_reason.clone();
     citation.coverage_role = hit.coverage_role.clone();
     if citation_is_diagnostic_source_proof(citation) {
-        citation.evidence_tier = Some(PacketEvidenceTier::ExactSource);
+        let structural_text = citation_is_structural_source_proof(citation);
+        citation.evidence_tier = Some(if structural_text {
+            PacketEvidenceTier::StructuralText
+        } else {
+            PacketEvidenceTier::ExactSource
+        });
         citation.resolution_status = Some(evidence_resolution_for_citation(citation));
-        if citation.evidence_producer.is_none() {
+        if structural_text {
             citation.evidence_producer = citation
                 .file_path
                 .as_deref()
-                .and_then(structural_source_proof_producer)
+                .and_then(|path| structural_text_producer_for_path(Some(path)))
                 .map(str::to_string);
         }
         citation.eligible_for_sufficiency = Some(false);
@@ -73,6 +104,7 @@ pub(crate) fn evidence_is_sufficiency_eligible(
     ) && !matches!(
         tier,
         PacketEvidenceTier::DenseSemantic
+            | PacketEvidenceTier::StructuralText
             | PacketEvidenceTier::SyntheticSourceScan
             | PacketEvidenceTier::GeneratedSummary
     )
@@ -80,7 +112,7 @@ pub(crate) fn evidence_is_sufficiency_eligible(
 
 pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
     if citation_is_diagnostic_source_proof(citation) {
-        return citation.eligible_for_sufficiency.unwrap_or(false);
+        return false;
     }
     let tier = citation
         .evidence_tier
@@ -88,14 +120,19 @@ pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool
     let resolution = citation
         .resolution_status
         .unwrap_or_else(|| evidence_resolution_for_citation(citation));
-    citation
-        .eligible_for_sufficiency
-        .unwrap_or_else(|| evidence_is_sufficiency_eligible(tier, resolution))
+    if !evidence_is_sufficiency_eligible(tier, resolution) {
+        return false;
+    }
+    citation.eligible_for_sufficiency.unwrap_or(true)
 }
 
 pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
     if hit_is_diagnostic_source_proof(hit) {
-        return PacketEvidenceTier::ExactSource;
+        return if hit_is_structural_source_proof(hit) {
+            PacketEvidenceTier::StructuralText
+        } else {
+            PacketEvidenceTier::ExactSource
+        };
     }
     if let Some(tier) = hit.evidence_tier {
         return tier;
@@ -149,10 +186,7 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
         return OPENAPI_ENDPOINT_SCHEMA_PRODUCER.to_string();
     }
     if hit_is_structural_source_proof(hit) {
-        return hit
-            .file_path
-            .as_deref()
-            .and_then(structural_source_proof_producer)
+        return structural_text_producer_for_path(hit.file_path.as_deref())
             .unwrap_or("structural_source_proof_collector")
             .to_string();
     }
@@ -172,7 +206,11 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
 
 pub(crate) fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
     if citation_is_diagnostic_source_proof(citation) {
-        return PacketEvidenceTier::ExactSource;
+        return if citation_is_structural_source_proof(citation) {
+            PacketEvidenceTier::StructuralText
+        } else {
+            PacketEvidenceTier::ExactSource
+        };
     }
     if let Some(tier) = citation.evidence_tier {
         return tier;
@@ -224,9 +262,7 @@ pub(crate) fn evidence_resolution_for_citation(
 }
 
 fn hit_is_structural_source_proof(hit: &SearchHit) -> bool {
-    hit.file_path
-        .as_deref()
-        .is_some_and(is_structural_source_proof_path)
+    structural_text_producer_for_path(hit.file_path.as_deref()).is_some()
 }
 
 fn hit_is_diagnostic_source_proof(hit: &SearchHit) -> bool {
@@ -238,10 +274,7 @@ fn hit_is_openapi_endpoint_schema(hit: &SearchHit) -> bool {
 }
 
 fn citation_is_structural_source_proof(citation: &AgentCitationDto) -> bool {
-    citation
-        .file_path
-        .as_deref()
-        .is_some_and(is_structural_source_proof_path)
+    structural_text_producer_for_path(citation.file_path.as_deref()).is_some()
 }
 
 fn citation_is_diagnostic_source_proof(citation: &AgentCitationDto) -> bool {
@@ -252,13 +285,12 @@ fn citation_is_openapi_endpoint_schema(citation: &AgentCitationDto) -> bool {
     citation.evidence_producer.as_deref() == Some(OPENAPI_ENDPOINT_SCHEMA_PRODUCER)
 }
 
-fn is_structural_source_proof_path(path: &str) -> bool {
-    is_github_actions_workflow_path(path)
-        || is_docker_compose_file_path(path)
-        || is_cargo_manifest_file_path(path)
-}
-
-fn structural_source_proof_producer(path: &str) -> Option<&'static str> {
+/// Return the stable producer label for an already-indexed structural collector
+/// path. This intentionally does not admit generic text formats: expansion of
+/// the collector inventory belongs to the structural indexing work, not result
+/// publication.
+pub(crate) fn structural_text_producer_for_path(path: Option<&str>) -> Option<&'static str> {
+    let path = path?;
     if is_github_actions_workflow_path(path) {
         return Some("structural_github_actions_workflow_collector");
     }
@@ -268,7 +300,12 @@ fn structural_source_proof_producer(path: &str) -> Option<&'static str> {
     if is_cargo_manifest_file_path(path) {
         return Some("structural_cargo_manifest_collector");
     }
-    None
+    match structural_language_name_for_path(Some(path)) {
+        Some("html") => Some("structural_html_collector"),
+        Some("css") => Some("structural_css_collector"),
+        Some("sql") => Some("structural_sql_collector"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -310,12 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn github_actions_structural_hit_is_exact_source_diagnostic() {
+    fn github_actions_structural_hit_is_structural_text_diagnostic() {
         let mut hit = workflow_hit();
 
         decorate_search_hit_evidence(&mut hit);
 
-        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::StructuralText));
         assert_eq!(
             hit.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
@@ -328,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_compose_structural_hit_is_exact_source_diagnostic() {
+    fn docker_compose_structural_hit_is_structural_text_diagnostic() {
         let mut hit = workflow_hit();
         hit.node_id = NodeId("compose-web".to_string());
         hit.display_name = "web".to_string();
@@ -337,7 +374,7 @@ mod tests {
 
         decorate_search_hit_evidence(&mut hit);
 
-        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::StructuralText));
         assert_eq!(
             hit.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
@@ -372,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_manifest_structural_hit_is_exact_source_diagnostic() {
+    fn cargo_manifest_structural_hit_is_structural_text_diagnostic() {
         let mut hit = workflow_hit();
         hit.node_id = NodeId("cargo-serde".to_string());
         hit.display_name = "serde".to_string();
@@ -381,7 +418,7 @@ mod tests {
 
         decorate_search_hit_evidence(&mut hit);
 
-        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::StructuralText));
         assert_eq!(
             hit.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
@@ -391,6 +428,95 @@ mod tests {
             Some("structural_cargo_manifest_collector")
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn structural_text_producers_cover_existing_collectors_without_admitting_generic_text() {
+        let cases = [
+            (
+                ".github/workflows/ci.yml",
+                "structural_github_actions_workflow_collector",
+            ),
+            (
+                "docker/stack-compose.yaml",
+                "structural_docker_compose_collector",
+            ),
+            (
+                "crates/runtime/Cargo.toml",
+                "structural_cargo_manifest_collector",
+            ),
+            ("web/index.html", "structural_html_collector"),
+            ("web/styles.css", "structural_css_collector"),
+            ("db/schema.sql", "structural_sql_collector"),
+        ];
+
+        for (path, expected_producer) in cases {
+            assert_eq!(
+                structural_text_producer_for_path(Some(path)),
+                Some(expected_producer),
+                "expected existing structural collector for {path}"
+            );
+        }
+
+        for path in [
+            "docs/design.md",
+            "config/service.yaml",
+            "config/service.toml",
+        ] {
+            assert_eq!(
+                structural_text_producer_for_path(Some(path)),
+                None,
+                "generic text remains outside this publication-only slice: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_text_citation_remains_source_range_only_and_non_sufficient() {
+        let mut hit = workflow_hit();
+        decorate_search_hit_evidence(&mut hit);
+        let mut citation = AgentCitationDto {
+            node_id: hit.node_id.clone(),
+            display_name: hit.display_name.clone(),
+            kind: hit.kind,
+            file_path: hit.file_path.clone(),
+            line: hit.line,
+            score: hit.score,
+            origin: hit.origin,
+            resolvable: hit.resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        };
+
+        decorate_citation_from_hit(&mut citation, &hit);
+
+        assert_eq!(
+            citation.evidence_tier,
+            Some(PacketEvidenceTier::StructuralText)
+        );
+        assert_eq!(
+            citation.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
+        assert_eq!(
+            citation.evidence_producer.as_deref(),
+            Some("structural_github_actions_workflow_collector")
+        );
+        assert_eq!(citation.eligible_for_sufficiency, Some(false));
+        assert!(!citation_sufficiency_eligible(&citation));
+
+        citation.eligible_for_sufficiency = Some(true);
+        assert!(
+            !citation_sufficiency_eligible(&citation),
+            "an adapter-provided eligibility flag must not promote structural evidence"
+        );
     }
 
     #[test]

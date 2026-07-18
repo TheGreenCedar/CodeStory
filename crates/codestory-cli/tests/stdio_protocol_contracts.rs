@@ -2080,6 +2080,61 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "SearchHit outputSchema should still advertise optional match_quality: {search_hit_schema}"
     );
 
+    let citation_schema = tool_output_schema(&tools, "context")
+        .pointer("/properties/citations/items")
+        .unwrap_or_else(|| panic!("context outputSchema should describe agent citations: {tools}"));
+    for (surface, schema) in [
+        ("search hit", search_hit_schema),
+        ("agent citation", citation_schema),
+    ] {
+        for field in [
+            "evidence_tier",
+            "evidence_producer",
+            "resolution_status",
+            "eligible_for_sufficiency",
+        ] {
+            assert!(
+                !required_fields(schema).contains(field),
+                "{surface} evidence field {field} must remain optional: {schema}"
+            );
+        }
+        assert_schema_enum_values(
+            schema,
+            "/properties/evidence_tier/enum",
+            &[
+                "exact_source",
+                "structural_text",
+                "resolved_graph",
+                "lexical_source",
+                "symbol_doc",
+                "component_report",
+                "dense_semantic",
+                "synthetic_source_scan",
+                "generated_summary",
+            ],
+        );
+        assert_schema_enum_values(
+            schema,
+            "/properties/resolution_status/enum",
+            &[
+                "resolved",
+                "source_range_only",
+                "unresolved",
+                "diagnostic_only",
+            ],
+        );
+        assert_eq!(
+            schema_property(schema, "evidence_producer")["type"],
+            "string",
+            "{surface} outputSchema should expose the evidence producer: {schema}"
+        );
+        assert_eq!(
+            schema_property(schema, "eligible_for_sufficiency")["type"],
+            "boolean",
+            "{surface} outputSchema should expose the sufficiency flag: {schema}"
+        );
+    }
+
     let related_hit_schema = tool_output_schema(&tools, "symbol")
         .pointer("/properties/related_hits/items")
         .unwrap_or_else(|| {
@@ -2356,6 +2411,82 @@ fn ground_tool_returns_budgeted_grounding_snapshot() {
             .as_str()
             .is_some_and(|message| message.contains("ground.budget")),
         "ground tool should fail closed on unknown budgets: {bad_response}"
+    );
+}
+
+#[test]
+fn snippet_tool_exact_id_navigates_structural_evidence_but_query_stays_typed() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ground_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-structural-snippet",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "balanced"}}
+        }),
+    );
+    let grounding = assert_tool_success(&ground_response, json!("ground-structural-snippet"));
+    let node_id = grounding["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            grounding["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("tiny-stdio-contract-fixture @ "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .unwrap_or_else(|| panic!("grounding should expose the Cargo package: {grounding:#}"))
+        .to_string();
+
+    let snippet_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-structural-id",
+            "method": "tools/call",
+            "params": {"name": "snippet", "arguments": {"id": node_id}}
+        }),
+    );
+    let snippet = assert_tool_success(&snippet_response, json!("snippet-structural-id"));
+    assert!(
+        snippet["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("Cargo.toml"))
+            && snippet["snippet"]
+                .as_str()
+                .is_some_and(|source| source.contains("[package]")),
+        "stdio snippet should navigate the exact structural source range: {snippet:#}"
+    );
+
+    let query_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "snippet-structural-query",
+            "method": "tools/call",
+            "params": {
+                "name": "snippet",
+                "arguments": {"query": "tiny-stdio-contract-fixture"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&query_response, json!("snippet-structural-query"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No symbol matched query")),
+        "stdio query snippet should retain typed graph filtering: {error:#}"
     );
 }
 
