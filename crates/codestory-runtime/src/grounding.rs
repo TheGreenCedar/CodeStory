@@ -2,7 +2,6 @@ use super::*;
 use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
 use crate::trail_story::build_trail_story;
 use codestory_contracts::api::SearchHitOrigin;
-#[cfg(test)]
 use codestory_store::FileRole;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -11,6 +10,7 @@ use std::path::Path;
 const RECOMMENDED_QUERY_LIMIT: usize = 5;
 const FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES: usize = 400;
 const FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES: usize = 40;
+const ROOT_CANDIDATE_MULTIPLIER: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -277,6 +277,59 @@ fn dedupe_grounding_node_records(nodes: Vec<GroundingNodeRecord>) -> Vec<Groundi
         }
     }
     deduped
+}
+
+fn is_production_file_role(role: Option<FileRole>) -> bool {
+    matches!(role, Some(FileRole::Source | FileRole::Entrypoint))
+}
+
+fn grounding_root_terminal_name(record: &GroundingNodeRecord) -> String {
+    let terminal = terminal_symbol_segment(&record.display_name);
+    if terminal.is_empty() {
+        normalize_symbol_query(&record.display_name)
+    } else {
+        terminal
+    }
+}
+
+fn diversify_grounding_root_records(
+    records: Vec<GroundingNodeRecord>,
+    file_roles: &HashMap<i64, FileRole>,
+) -> Vec<GroundingNodeRecord> {
+    // Preserve the structural ordering inside each tier, but spend the compact
+    // budget on verified production files and distinct names first.
+    let (production, secondary): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| {
+        is_production_file_role(
+            record
+                .node
+                .file_node_id
+                .and_then(|file_id| file_roles.get(&file_id.0).copied()),
+        )
+    });
+
+    let mut seen_names = HashSet::new();
+    let mut production_duplicates = Vec::new();
+    let mut secondary_duplicates = Vec::new();
+    let mut diversified = Vec::with_capacity(production.len() + secondary.len());
+
+    for record in production {
+        if seen_names.insert(grounding_root_terminal_name(&record)) {
+            diversified.push(record);
+        } else {
+            production_duplicates.push(record);
+        }
+    }
+    diversified.extend(production_duplicates);
+    for record in secondary {
+        if seen_names.insert(grounding_root_terminal_name(&record)) {
+            diversified.push(record);
+        } else {
+            secondary_duplicates.push(record);
+        }
+    }
+
+    diversified.extend(secondary_duplicates);
+    diversified
 }
 
 fn build_edge_digest_map(
@@ -712,10 +765,12 @@ impl AppController {
             .iter()
             .map(|bucket| bucket.symbol_count)
             .sum::<u32>();
-        let root_fetch_limit = config
-            .root_symbols
-            .saturating_mul(8)
-            .max(config.root_symbols);
+        // Every budget truncates the same bounded universe so stricter output
+        // remains an exact prefix as role and name diversity are applied.
+        let max_root_symbols = budget_config(GroundingBudgetDto::Max).root_symbols;
+        let root_fetch_limit = max_root_symbols
+            .saturating_mul(ROOT_CANDIDATE_MULTIPLIER)
+            .max(max_root_symbols);
         let mut root_records = Vec::new();
         let mut root_offset = 0usize;
         loop {
@@ -731,10 +786,38 @@ impl AppController {
             root_offset = root_offset.saturating_add(page.len());
             root_records.extend(page);
             root_records = dedupe_grounding_node_records(root_records);
-            if root_records.len() >= config.root_symbols || fetched < root_fetch_limit {
+            if root_records.len() >= max_root_symbols || fetched < root_fetch_limit {
                 break;
             }
         }
+        let mut root_file_paths = root_records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .file_path
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().to_string())
+            })
+            .collect::<Vec<_>>();
+        root_file_paths.sort();
+        root_file_paths.dedup();
+        let stored_file_roles = storage
+            .get_file_roles_by_paths(&root_file_paths)
+            .map_err(|e| ApiError::internal(format!("Failed to load grounding file roles: {e}")))?;
+        let file_roles = root_records
+            .iter()
+            .filter_map(|record| {
+                let file_id = record.node.file_node_id?;
+                let path = record.file_path.as_deref()?;
+                let path_key = path.to_string_lossy();
+                let role = stored_file_roles
+                    .get(path_key.as_ref())
+                    .copied()
+                    .unwrap_or_else(|| FileRole::classify_path(path));
+                Some((file_id.0, role))
+            })
+            .collect::<HashMap<_, _>>();
+        root_records = diversify_grounding_root_records(root_records, &file_roles);
         root_records.truncate(config.root_symbols);
 
         let mut structural_ids = displayed_file_nodes
@@ -1278,6 +1361,16 @@ mod tests {
         path: &Path,
         child: Node,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        insert_file_node_with_role(storage, file_id, path, FileRole::Source, child)
+    }
+
+    fn insert_file_node_with_role(
+        storage: &mut Storage,
+        file_id: i64,
+        path: &Path,
+        file_role: FileRole,
+        child: Node,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         storage.insert_file(&FileInfo {
             id: file_id,
             path: path.to_path_buf(),
@@ -1286,7 +1379,7 @@ mod tests {
             indexed: true,
             complete: true,
             line_count: 10,
-            file_role: FileRole::Source,
+            file_role,
         })?;
         storage.insert_nodes_batch(&[
             Node {
@@ -1903,6 +1996,265 @@ mod tests {
                 .root_symbols
                 .first()
                 .is_some_and(|symbol| symbol.label.starts_with("Widget"))
+        );
+    }
+
+    #[test]
+    fn grounding_snapshot_prefers_production_and_diversifies_fixture_roots() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            for fixture_index in 0..10_i64 {
+                let path = temp
+                    .path()
+                    .join("crates/codestory-indexer/tests/fixtures")
+                    .join(format!("fixture_{fixture_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                    .expect("create fixture parent");
+                std::fs::write(&path, "struct FixtureRoot;\n").expect("write fixture");
+                let name = if fixture_index < 7 {
+                    "Notifier".to_string()
+                } else {
+                    format!("FixtureRoot{fixture_index}")
+                };
+                let file_role = match fixture_index {
+                    7 => FileRole::Vendor,
+                    8 => FileRole::Generated,
+                    9 => FileRole::Benchmark,
+                    _ => FileRole::Test,
+                };
+                insert_file_node_with_role(
+                    &mut storage,
+                    100 + fixture_index,
+                    &path,
+                    file_role,
+                    Node {
+                        id: CoreNodeId(1_000 + fixture_index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: name,
+                        file_node_id: Some(CoreNodeId(100 + fixture_index)),
+                        start_line: Some(1 + fixture_index as u32),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert fixture root");
+            }
+            for source_index in 0..20_i64 {
+                let path = temp
+                    .path()
+                    .join("crates/codestory-runtime/src")
+                    .join(format!("production_{source_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("source parent"))
+                    .expect("create source parent");
+                std::fs::write(&path, "struct ProductionRoot;\n").expect("write source");
+                insert_file_node_with_role(
+                    &mut storage,
+                    200 + source_index,
+                    &path,
+                    if source_index == 0 {
+                        FileRole::Entrypoint
+                    } else {
+                        FileRole::Source
+                    },
+                    Node {
+                        id: CoreNodeId(2_000 + source_index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: format!("ProductionRoot{source_index}"),
+                        file_node_id: Some(CoreNodeId(200 + source_index)),
+                        start_line: Some(11 + source_index as u32),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert production root");
+            }
+
+            let previous_balanced = storage
+                .get_grounding_root_symbol_candidates(16, 0)
+                .expect("load unranked root candidates");
+            assert_eq!(previous_balanced.len(), 16);
+            assert_eq!(
+                previous_balanced
+                    .iter()
+                    .filter(|record| {
+                        record.file_path.as_deref().is_some_and(|path| {
+                            path.to_string_lossy()
+                                .replace('\\', "/")
+                                .contains("/tests/fixtures/")
+                        })
+                    })
+                    .count(),
+                10
+            );
+            assert_eq!(
+                previous_balanced
+                    .iter()
+                    .filter(|record| grounding_root_terminal_name(record) == "notifier")
+                    .count(),
+                7
+            );
+
+            storage
+                .snapshots()
+                .refresh_summary()
+                .expect("refresh summary snapshot");
+            storage
+                .snapshots()
+                .refresh_detail()
+                .expect("refresh detail snapshot");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let strict = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+        let balanced = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let max = controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+        let balanced_again = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("repeat balanced snapshot");
+
+        assert_eq!(strict.root_symbols.len(), 8);
+        assert_eq!(balanced.root_symbols.len(), 16);
+        assert_eq!(max.root_symbols.len(), 28);
+        assert!(balanced.root_symbols.iter().all(|symbol| {
+            symbol
+                .label
+                .contains("crates/codestory-runtime/src/production_")
+        }));
+        assert_eq!(
+            strict
+                .root_symbols
+                .iter()
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>(),
+            balanced
+                .root_symbols
+                .iter()
+                .take(strict.root_symbols.len())
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            balanced
+                .root_symbols
+                .iter()
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>(),
+            max.root_symbols
+                .iter()
+                .take(balanced.root_symbols.len())
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            balanced
+                .root_symbols
+                .iter()
+                .map(|symbol| (&symbol.id, &symbol.label))
+                .collect::<Vec<_>>(),
+            balanced_again
+                .root_symbols
+                .iter()
+                .map(|symbol| (&symbol.id, &symbol.label))
+                .collect::<Vec<_>>()
+        );
+
+        let notifier_positions = max
+            .root_symbols
+            .iter()
+            .enumerate()
+            .filter_map(|(index, symbol)| {
+                symbol
+                    .label
+                    .split_once(" @ ")
+                    .is_some_and(|(name, _)| name == "Notifier")
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notifier_positions.first(), Some(&20));
+        assert!(notifier_positions.iter().skip(1).all(|index| *index >= 24));
+    }
+
+    #[test]
+    fn grounding_snapshot_keeps_diversified_fixture_fallback_without_production_roots() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            for fixture_index in 0..12_i64 {
+                let path = temp
+                    .path()
+                    .join("tests/fixtures")
+                    .join(format!("fixture_{fixture_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                    .expect("create fixture parent");
+                std::fs::write(&path, "struct FixtureRoot;\n").expect("write fixture");
+                let name = if fixture_index < 7 {
+                    "Notifier".to_string()
+                } else {
+                    format!("Harness{fixture_index}")
+                };
+                insert_file_node_with_role(
+                    &mut storage,
+                    300 + fixture_index,
+                    &path,
+                    FileRole::Test,
+                    Node {
+                        id: CoreNodeId(3_000 + fixture_index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: name,
+                        file_node_id: Some(CoreNodeId(300 + fixture_index)),
+                        start_line: Some(1 + fixture_index as u32),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert fixture root");
+            }
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+
+        assert_eq!(snapshot.root_symbols.len(), 8);
+        assert!(
+            snapshot
+                .root_symbols
+                .iter()
+                .all(|symbol| symbol.label.contains("tests/fixtures/"))
+        );
+        assert_eq!(
+            snapshot
+                .root_symbols
+                .iter()
+                .take(6)
+                .map(|symbol| {
+                    symbol
+                        .label
+                        .split_once(" @ ")
+                        .map(|(name, _)| name)
+                        .expect("symbol label path")
+                })
+                .collect::<HashSet<_>>()
+                .len(),
+            6
         );
     }
 
