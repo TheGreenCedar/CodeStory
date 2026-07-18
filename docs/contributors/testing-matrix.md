@@ -266,7 +266,7 @@ Workflow edits run:
 ```sh
 npm ci --ignore-scripts
 node scripts/codestory-release-claims.mjs validate --repo .
-node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
+node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-closeout.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
 node --test .github/scripts/run-actionlint.test.mjs
 node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
@@ -312,6 +312,41 @@ prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The
 release evidence gate evaluates that graph; workflow policy consumes its
 runner, target, promotion, retention, and proof-chain facts. Update the graph
 instead of copying those facts into contributor prose.
+
+The same graph declares the exact release-closeout cells. The closeout
+coordinator expands native cells from `workflow_policy.package_matrix`, keeps
+protected hardware cells explicit, invokes the claim evaluator for each cell
+and its graph dependencies, then retains canonical copies under `manifests/`
+and `evaluations/` beside `ledger.json` and `summary.json`. A pre-publish run
+records each archive name, byte count, and SHA-256. A post-publish run requires
+that accepted pre-publish ledger, requires its current package manifests to
+match the retained rows, and rejects any downloaded archive whose bytes do not
+match the retained digest. Producer and installed-runtime versions must equal
+the independently supplied closeout version. Platform and installed-runtime
+hosts must match the OS and architecture derived from the package matrix's Rust
+target. Do not use `matrix`, `mixed`, or another
+aggregate placeholder for a host, runner, backend, installer, or native-engine
+identity.
+
+Run the coordinator only with retained producer manifests and a fresh output
+directory:
+
+```sh
+node scripts/codestory-release-closeout.mjs evaluate \
+  --repo . \
+  --expected-sha <full-commit> \
+  --version <version> \
+  --phase pre_publish \
+  --evaluated-at <canonical-ISO-timestamp> \
+  --manifest-dir <producer-manifests> \
+  --out-dir <new-closeout-directory>
+```
+
+For `--phase post_publish`, pass every graph-owned cell plus
+`--pre-publish-ledger <accepted-pre-publish-ledger.json>`. The framework can be
+tested and merged without final evidence; an accepted ledger still requires
+the frozen exact-head producer manifests and does not upgrade source or package
+proof into installed, protected-hardware, or live-behavior proof.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply

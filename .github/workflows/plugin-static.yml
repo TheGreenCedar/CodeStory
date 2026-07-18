@@ -18,8 +18,10 @@ on:
       - .github/actionlint.yaml
       - release-claims.json
       - scripts/codestory-release-claims.mjs
+      - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
       - scripts/tests/codestory-release-claims.test.mjs
+      - scripts/tests/codestory-release-closeout.test.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
       - scripts/tests/fixtures/release-claims/**
       - benchmarks/release-evidence/**
@@ -75,8 +77,10 @@ on:
       - .github/actionlint.yaml
       - release-claims.json
       - scripts/codestory-release-claims.mjs
+      - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
       - scripts/tests/codestory-release-claims.test.mjs
+      - scripts/tests/codestory-release-closeout.test.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
       - scripts/tests/fixtures/release-claims/**
       - benchmarks/release-evidence/**
@@ -147,6 +151,7 @@ jobs:
         run: >-
           node --test
           scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
 
       - name: Check workflow policy

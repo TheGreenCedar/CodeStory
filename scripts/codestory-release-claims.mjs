@@ -20,6 +20,8 @@ const IDENTITY_FORMATS = new Set([
   "semver",
   "sha256",
   "versioned_contract",
+  "workflow_path",
+  "positive_integer",
 ]);
 const REQUIRED_CLAIMS = [
   "accelerator_execution",
@@ -92,10 +94,14 @@ function identityMatchesFormat(value, format) {
     case "release_target": return /^[A-Za-z0-9][A-Za-z0-9._:/+-]*$/u.test(value);
     case "baseline_id": return /^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$/u.test(value);
     case "versioned_contract": return /^[A-Za-z0-9][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._+-]+)*\/v[1-9]\d*$/u.test(value);
+    case "workflow_path": return /^\.github\/workflows\/[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/u.test(value);
+    case "positive_integer": return /^[1-9]\d*$/u.test(value);
     case "non_empty_text": return value.length > 0;
     default: return false;
   }
 }
+
+export { identityMatchesFormat as releaseClaimIdentityMatchesFormat };
 
 function git(args, repoRoot) {
   const result = spawnSync("git", args, { cwd: repoRoot, encoding: "utf8" });
@@ -158,8 +164,8 @@ export function releaseClaimGraphDigest(graph) {
 
 export function validateReleaseClaimGraph(graph) {
   object(graph, "release claim graph");
-  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 2) {
-    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 2`);
+  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 3) {
+    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 3`);
   }
   nonEmptyText(graph.graph_id, "release claim graph.graph_id");
   const evidencePolicy = object(graph.evidence_policy, "release claim graph.evidence_policy");
@@ -309,6 +315,99 @@ export function validateReleaseClaimGraph(graph) {
     if (control.control !== "negative_gate") fail(`failure control ${id} must be a negative_gate`);
     const command = nonEmptyText(control.command, `failure control ${id}.command`);
     if (!command.startsWith("cargo test --locked ")) fail(`failure control ${id} must name a locked executable Cargo test`);
+  }
+
+  const closeout = object(graph.closeout, "release claim graph.closeout");
+  if (closeout.schema !== "codestory.release-closeout/v1") {
+    fail("release claim graph.closeout.schema must be codestory.release-closeout/v1");
+  }
+  for (const [key, expected] of Object.entries({
+    manifest_schema: "codestory.release-cell-manifest/v1",
+    ledger_schema: "codestory.release-closeout-ledger/v1",
+    summary_schema: "codestory.release-closeout-summary/v1",
+  })) {
+    if (closeout[key] !== expected) fail(`release claim graph.closeout.${key} must be ${expected}`);
+  }
+  const phases = stringArray(closeout.phases, "release claim graph.closeout.phases", { nonEmpty: true });
+  if (JSON.stringify(phases) !== JSON.stringify(["pre_publish", "post_publish"])) {
+    fail("release claim graph.closeout.phases must be pre_publish, post_publish");
+  }
+  const cellGroups = uniqueById(closeout.cell_groups, "release claim graph.closeout.cell_groups");
+  const requiredCellGroups = [
+    "accelerator_execution",
+    "answer_quality",
+    "installed_runtime_behavior",
+    "package_identity",
+    "performance",
+    "platform_support",
+    "post_publish_bytes",
+    "retrieval_readiness",
+    "source_behavior",
+  ];
+  if (JSON.stringify([...cellGroups.keys()].sort()) !== JSON.stringify(requiredCellGroups)) {
+    fail(`release claim graph closeout must define exactly ${requiredCellGroups.join(", ")}`);
+  }
+  for (const [id, group] of cellGroups) {
+    if (!phases.includes(group.phase)) fail(`closeout cell group ${id} has unknown phase ${String(group.phase)}`);
+    const claim = claims.get(nonEmptyText(group.claim, `closeout cell group ${id}.claim`));
+    if (!claim) fail(`closeout cell group ${id} references unknown claim ${group.claim}`);
+    const evidenceTypeId = nonEmptyText(group.evidence_type, `closeout cell group ${id}.evidence_type`);
+    const evidenceType = evidenceTypes.get(evidenceTypeId);
+    if (!evidenceType) fail(`closeout cell group ${id} references unknown evidence type ${evidenceTypeId}`);
+    if (!claim.required_evidence.includes(evidenceTypeId)) {
+      fail(`closeout cell group ${id} evidence type ${evidenceTypeId} does not satisfy claim ${group.claim}`);
+    }
+    if (!new Set(["singleton", "package_matrix", "instances"]).has(group.expansion)) {
+      fail(`closeout cell group ${id} has unknown expansion ${String(group.expansion)}`);
+    }
+    if (!new Set(["none", "pre_publish", "post_publish_compare"]).has(group.archive_role)) {
+      fail(`closeout cell group ${id} has unknown archive_role ${String(group.archive_role)}`);
+    }
+    const requiredIdentity = stringArray(
+      group.required_identity,
+      `closeout cell group ${id}.required_identity`,
+      { nonEmpty: true },
+    );
+    for (const key of evidenceType.required_identity) {
+      if (!requiredIdentity.includes(key)) {
+        fail(`closeout cell group ${id} must retain evidence identity ${key}`);
+      }
+    }
+    for (const key of requiredIdentity) {
+      if (!identityFormats[key]) fail(`closeout cell group ${id} identity ${key} must declare a format`);
+    }
+    const constraints = object(group.identity_constraints ?? {}, `closeout cell group ${id}.identity_constraints`);
+    for (const [key, value] of Object.entries(constraints)) {
+      if (!requiredIdentity.includes(key)) fail(`closeout cell group ${id} constrains non-required identity ${key}`);
+      if (!identityMatchesFormat(value, identityFormats[key])) {
+        fail(`closeout cell group ${id} constraint ${key} does not match ${identityFormats[key]}`);
+      }
+    }
+    for (const key of stringArray(group.singleton_identity ?? [], `closeout cell group ${id}.singleton_identity`)) {
+      if (!requiredIdentity.includes(key)) fail(`closeout cell group ${id} singleton identity ${key} is not required`);
+    }
+    if (group.expansion === "package_matrix" && !requiredIdentity.includes("target")) {
+      fail(`closeout cell group ${id} package_matrix expansion must require target`);
+    }
+    if (group.expansion === "instances") {
+      const instances = uniqueById(group.instances, `closeout cell group ${id}.instances`);
+      for (const [instanceId, instance] of instances) {
+        const instanceConstraints = object(
+          instance.identity_constraints,
+          `closeout cell group ${id} instance ${instanceId}.identity_constraints`,
+        );
+        for (const [key, value] of Object.entries(instanceConstraints)) {
+          if (!requiredIdentity.includes(key)) {
+            fail(`closeout cell group ${id} instance ${instanceId} constrains non-required identity ${key}`);
+          }
+          if (!identityMatchesFormat(value, identityFormats[key])) {
+            fail(`closeout cell group ${id} instance ${instanceId} constraint ${key} does not match ${identityFormats[key]}`);
+          }
+        }
+      }
+    } else if (group.instances !== undefined) {
+      fail(`closeout cell group ${id} may declare instances only with instances expansion`);
+    }
   }
 
   const policy = object(graph.workflow_policy, "release claim graph.workflow_policy");
