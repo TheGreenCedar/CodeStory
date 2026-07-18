@@ -9283,6 +9283,25 @@ def self_test() -> None:
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
+        self_protocol = root / SERVER_PROTOCOL.name
+        self_protocol.write_bytes(SERVER_PROTOCOL.read_bytes())
+        self_constant_set = root / SERVER_CONSTANT_SET.name
+        unfrozen_constant_set = json.loads(
+            SERVER_CONSTANT_SET.read_text(encoding="utf-8")
+        )
+        unfrozen_constant_set["status"] = "unfrozen"
+        unfrozen_constant_set["calibration_required_values"] = {
+            field: None
+            for field in unfrozen_constant_set["calibration_required_values"]
+        }
+        unfrozen_constant_set["qualification_thresholds"] = {
+            field: None
+            for field in unfrozen_constant_set["qualification_thresholds"]
+        }
+        unfrozen_constant_set["freeze_record"] = None
+        write_json(self_constant_set, unfrozen_constant_set)
+        self_measurement_protocol = root / MEASUREMENT_PROTOCOL.name
+        self_measurement_protocol.write_bytes(MEASUREMENT_PROTOCOL.read_bytes())
         retained_privacy_path = root / "retained-privacy.json"
         write_json(
             retained_privacy_path,
@@ -9331,9 +9350,9 @@ def self_test() -> None:
             f"embedding_contract_sha256={contract_sha256}|model_embedded=true|"
             "producer=test@0.0.0|end"
         )
-        protocol_sha256 = sha256(SERVER_PROTOCOL)
-        constant_set_sha256 = sha256(SERVER_CONSTANT_SET)
-        measurement_protocol_sha256 = sha256(MEASUREMENT_PROTOCOL)
+        protocol_sha256 = sha256(self_protocol)
+        constant_set_sha256 = sha256(self_constant_set)
+        measurement_protocol_sha256 = sha256(self_measurement_protocol)
         server_proof_identity = (
             "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=1|"
             f"protocol_sha256={protocol_sha256}|"
@@ -9914,7 +9933,7 @@ def self_test() -> None:
             raise ProofFailure("duplicate true-idle absence witness was accepted")
         measurement_contract = verify_package_server_contracts(
             manifest,
-            MEASUREMENT_PROTOCOL,
+            self_measurement_protocol,
             require_frozen=False,
         )
         (
@@ -9935,7 +9954,7 @@ def self_test() -> None:
         assembled_constant_path = root / "assembled-constant-set.json"
         assembled = assemble_calibration_bundle(
             argparse.Namespace(
-                measurement_protocol=MEASUREMENT_PROTOCOL,
+                measurement_protocol=self_measurement_protocol,
                 calibration_bundle_output=assembled_bundle_path,
                 frozen_constant_set_output=assembled_constant_path,
                 freeze_selected_at="self-test",
@@ -10447,7 +10466,7 @@ def self_test() -> None:
         try:
             verify_package_server_contracts(
                 manifest,
-                MEASUREMENT_PROTOCOL,
+                self_measurement_protocol,
                 require_frozen=True,
             )
         except ProofFailure:

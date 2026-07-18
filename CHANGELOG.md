@@ -2,150 +2,35 @@
 
 ## 0.16.0
 
-### Changed
-
-- True-idle package qualification now binds materialization reuse to the
-  replacement server's own engine identity, model digest, load generation, and
-  single model load instead of inheriting the original cold server's startup
-  state. The respawn proof also requires unique absence/replacement witnesses
-  and the exact successful product query between them. Hosted Linux calibration
-  uses the same bounded 30-minute per-run proof ceiling as the other protected
-  qualification lanes and records its monotonic and suspend-inclusive clocks
-  with the canonical identifiers required by the checked measurement protocol.
-  True-idle measurement also retains only a resident, positive-generation
-  owner identity before timing the server's exit.
-- Cold project activation now keeps one election stable when its exact storage
-  path appears during indexing, while still using native filesystem identity
-  to match distinct aliases.
-- v0.16 release evidence now uses a checked Axios JavaScript/TypeScript corpus
-  with three cold CLI repeats. The benchmark binds the exact task-manifest
-  bytes and rejects missing, substituted, or extra packet rows. Ripgrep's
-  pinned Rust task and project template remain as follow-up diagnostics after a
-  retained run missed its preregistered packet-quality thresholds. Cache
-  preparation, status capture, and packet measurement share one explicit agent
-  retrieval namespace, while cold packet provenance binds an executed semantic
-  stage, full sidecar diagnostics, and zero fallback to the prepared generation.
-- Affected analysis now resolves native workspace path identities once per
-  bounded operation, preserving Unix device/inode and Windows volume/file
-  identity without pairwise metadata scans or long-lived path caches.
-- Make `affected` validate and contain every current and previous MCP path
-  before activation, accept previous identity only for rename/copy records,
-  classify the current path from one complete workspace inventory, retain
-  bounded previous-identity graph seeds, propagate result caps into
-  completeness, and recommend refresh only when a requested path has exact
-  stale evidence.
-- Route tasks that already name an exact file, path, or static asset to direct
-  inspection instead of mechanically invoking broad repository grounding.
-- Direct CLI JSON failures now retain runtime API error codes and details across
-  packet, search, activation, and retrieval indexing instead of collapsing
-  typed failures into a generic `command_failed` envelope.
-- Compatible CodeStory processes for one OS user now share one automatically
-  spawned embedding server over a private Unix-domain socket or Windows named
-  pipe. The exact CLI owns one bounded query/bulk scheduler and one native
-  worker; typed capacity state explains when retrying can help without exposing
-  project paths or request text. True idle exits the server after 60 seconds,
-  and the next product call starts it again without consent or repair. The
-  persisted embedding-runtime identity changes with this ownership boundary, so
-  existing semantic generations rebuild once instead of being mislabeled as
-  in-process output. Qualification keeps its authority in the exact private
-  control directory while using an identity-derived bounded Unix socket path,
-  and a failed server bootstrap now reports the retained child cause instead of
-  collapsing into a generic start timeout.
-- Release packages now bind source/tree, executable, server protocol, constant
-  set, and measurement-protocol identities. Server qualification is
-  preregistered and fail-closed: calibration cannot satisfy package, protected
-  hardware, installed-plugin, or release claims, and installed evidence must
-  prove either the isolated exact candidate package during accepted-PR proof or
-  the managed marketplace plugin/runtime after publication rather than a direct
-  CLI override. Frozen calibration consumers authenticate the exact successful
-  coordinator run and artifact before trusting the bundle. The PR coordinator
-  can select a fail-closed server-behavior scope that proves package and
-  candidate-managed runtime behavior without making retrieval-quality,
-  qualification-tier, or release-readiness claims. Linux glibc-2.31 packages
-  use a pinned Bullseye Clang toolchain whose x86 dispatch flags are proved in
-  the image and whose Docker inputs are part of the native build cache identity.
-- The manual Windows manifest-missing readiness lane now installs the
-  checksum-pinned Vulkan SDK before running the real locked `ready_command`
-  contract with explicit CPU runtime permission. Windows source-build proof
-  pins the Ninja generator instead of inheriting the hosted Visual Studio
-  generator, and exact caches bind the generator plus CMake and Ninja versions
-  alongside the hosted platform, Rust and target identities, default native
-  feature and proof shape, workspace manifests, installer, and lockfile. The
-  protected Windows artifact records the same native tool versions when that
-  lane builds from source. The hosted lane remains source/protocol evidence
-  rather than a packaged or Vulkan-hardware claim.
-- Linux ARM64 release builds now resolve the pinned llama.cpp binding's
-  incompatible fixed-ARM and all-variant CMake selectors in the checked-in
-  Cargo build environment. Packages retain the portable runtime-loaded ARM CPU
-  backend beside Vulkan without runner-local patches.
-- Linux ARM64 release evidence now checksum-binds an explicit Serde project
-  manifest, keeping intentional compiler-failure UI fixtures outside the valid
-  source corpus without weakening fail-closed production indexing.
-- Draft source CI now restores exact-lock retrieval output or narrowly scoped
-  prior-lock output before rebuilding. The base retrieval lane serially seeds
-  the exact five test-profile targets used by draft proof, while a versioned
-  cache identity binds the runner, Rust toolchain, target, feature and proof
-  topology, workspace manifests, and lockfile. Partial restores are promoted
-  only after every unchanged serial proof succeeds.
-- Stdio/MCP now retains a bounded set of project contexts keyed by native
-  workspace identity and immutable configuration, so A/B/A routing preserves
-  isolated per-project state without rereading process defaults.
-- Project tool calls join one runtime-owned staged activation operation;
-  compact status and `codestory://status` expose its stable stage, retry, and
-  failure snapshot without caching live progress, keep local navigation visible
-  while broad retrieval prepares or fails, and broad responses report the
-  complete retrieval publication served by the runtime-owned retry.
-- Ordinary CLI, HTTP, and stdio public JSON responses now share the
-  runtime-owned complete core/retrieval publication pin and one canonical
-  metadata envelope across packet, search, context, drill, and every
-  query-resolved graph surface; markdown and graph text remain unchanged.
-- Multi-project and fallback MCP routing now requires an explicit absolute,
-  available project root; projectless status reports `no_project`, and native
-  cache/storage identity is normalized before context or activation reuse.
-- Cold status and MCP resources are observational: they no longer create cache
-  directories or databases, migrate stores, initialize engines, or activate a
-  project. Dirty-marker freshness compares only committed database and WAL
-  state, so reader-owned SHM metadata cannot falsely clear a stale marker.
-- Index freshness now reports a durably fenced incomplete core database as
-  stale without repairing it or exposing it through ordinary read,
-  publication, or retrieval surfaces.
-- Fail-open MCP advertises only the diagnostic resources and methods it can
-  serve while the native runtime is provisioning or unavailable.
-- Skill command syntax is generated from Clap help instead of being maintained
-  as a second option source.
+CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.
 
 ### Highlights
 
-- CodeStory carries its search model and embedding engine inside the executable. The same verified CLI may run a hidden per-user server over private local IPC; there is no Docker service, TCP endpoint, model download, port, or repair step to manage.
-- The first repository question prepares the local map and broader search automatically. If a large project needs more time, the agent retries the same request; users are never asked to approve or repair an internal retrieval component.
-- Repositories handled by compatible CodeStory processes for the same OS user share one warm model without sharing indexes or readiness state. After 60 seconds with no queued, active, or leased work, the server exits and releases model/GPU memory; search starts it again automatically.
-- Apple Silicon uses Metal, and Windows x64 uses Vulkan on supported physical GPUs. Linux packages are Vulkan-capable, but this release makes no Linux GPU claim. Production never silently falls back to CPU.
-- CodeStory reports broad search ready only after its model, physical accelerator, live embedding check, and repository publication agree. Local navigation remains available while broader search prepares.
+- **Better search ranking.** CodeRankEmbed replaces BGE. In a fixed same-machine comparison, ranking quality improved by 36% and the first-result hit rate by 55%.
+- **One warm model per user.** Compatible CodeStory processes now share one local embedding server without sharing repository indexes or readiness state. The server exits after 60 seconds of true idle and starts again on the next search.
+- **Private and offline after installation.** The model and engine are carried inside the executable. There is no Docker service, TCP port, runtime model download, or retrieval component to repair.
+- **Automatic preparation.** The first broad repository question prepares the local map and search index. Local navigation remains available while broader search is still preparing.
+- **Verified accelerator use.** Apple Silicon uses Metal, and Windows x64 uses Vulkan on supported physical GPUs. Linux packages are Vulkan-capable, but v0.16 makes no Linux GPU claim. Production never silently falls back to CPU.
 
-### Search quality and reliability
+### Reliability and compatibility
 
-- Updated `serde_with` to 3.21.0, removing the affected `KeyValueMap` panic advisory while preserving CodeStory's existing double-option DTO encoding.
-- The llama.cpp binding now exposes compiled and runtime capabilities and executes an exact caller request; retrieval owns model, pooling, normalization, dimension, batching, fallback, vector-schema, and persisted producer policy. Native failures carry stable reason codes and never trigger implicit CPU fallback. Windows and Linux runtime-load deterministic packaged core, CPU, and Vulkan modules without making the base executable depend on a Vulkan loader; packaging verifies actual PE/ELF/Mach-O dependencies and artifact digests. Protected hardware proof now requires post-encode backend observations, resident tensor evidence, full observed layer placement, and an advancing encode counter rather than requested settings or memory deltas. Telemetry inspects scheduled placement without requesting per-node synchronization, and layer totals count only tensors attributed to the selected device. Package evidence proves capability only, and Linux remains a GPU non-claim.
-- Tree-sitter and every wired language grammar now use their current compatible crate releases, including the vendored graph runtime's Tree-sitter 0.26 compatibility pin.
-- Dart bare and generic function calls now follow the grammar's 0.4
-  `method_invocation` shape. Member extraction stays separate; null-aware,
-  cascade, and chained-receiver methods remain explicit non-claims.
-- Windows contributor setup now names the LLVM/libclang, Vulkan, developer-shell, Ninja, and short-path requirements used by source builds.
-- Rust 2024 sources, including `unsafe extern` blocks and let-chains, now remain parser-complete. CodeStory uses the current Rust grammar and a compatible Tree-sitter runtime instead of rejecting valid modern Rust files and withholding a full publication.
-- Windows x64 and arm64 package builders now install and verify the architecture-matched, checksum-pinned LunarG Vulkan SDK instead of depending on mutable runner-image contents. The pinned glibc 2.31 Linux build also imports the Vulkan video headers that accompany its newer compile-time header set, and generic hosted managed-plugin checks use explicit offline CPU evidence instead of implying an unavailable accelerator claim.
-- Core publication now preserves the last verified generation when a scheduled source cannot be read completely: incremental refresh retains the affected projection, while full refresh discards its incomplete staged candidate. Incremental refresh also updates dense inputs for graph-dependent files as edges change and republishes path-bound dense inputs before retrieval after cache rehydrate.
-- Retrieval generations now bind immutable vector evidence to the exact core publication and producer compatibility identity, deep-validate reuse and final promotion including zero-dense generations, and select a distinct generation when model, engine, device, or execution proof changes. Current and deeply verified rollback pointers publish atomically in SQLite; cancellation leaves prior pointers intact, interrupted partial vector candidates rebuild on retry, and derived filesystem retention markers cannot authorize a corrupted rollback. Stdio request cancellation now reaches both core and retrieval refresh boundaries.
-- Core indexing now publishes deterministic, reusable embedding-free dense inputs with an atomic count, digest, policy, migration, and source-generation manifest. Retrieval alone loads the model, builds a distinct deeply validated immutable vector generation for each core publication, and records versioned evidence for the exact model bytes, vector semantics, engine/device execution, and core/retrieval generation.
-- Retrieval query execution and numeric candidate resolution share one pinned session and expose its full publication identity. A concurrent core, retrieval, vector, or engine identity change returns a typed retry instead of mixing candidates inside that session.
-- CodeRankEmbed replaces BGE. In a fixed same-machine comparison, it improved ranking quality by 36% and the first-result hit rate by 55%. It uses more memory and indexes more slowly, so inactive task processes now unload it instead of holding that cost indefinitely.
-- Existing semantic indexes rebuild once after upgrade. The last complete index stays available during safe refreshes, and CodeStory refuses to mix results from different generations.
-- The packaged executable works offline after installation, reuses verified model material across server restarts, and opens no retrieval port. Package, hardware, and installed-runtime proof retain separate identities and claims; installed proof requires two independent managed plugin hosts and the complete server fault/measurement contract.
-- Everyday plugin messages say whether broader search is ready, preparing, or unavailable. Model, backend, adapter, and timing details stay in maintainer diagnostics.
-- Source release builds now use one checked-in contract for acquisition, embedding semantics, producer identity, and model-license provenance. Producer name/version bind both runtime and persisted vector compatibility, so implementation upgrades rebuild instead of reusing incompatible vectors. Model acquisition is an explicit pre-Cargo step; Cargo verifies only the supplied regular file, publishes it through a create-new/no-clobber staging path, and never starts Node.js or performs network access. Executable fault tests prove partial writes and racing destinations cannot publish or clobber model bytes.
+- Safe refreshes preserve the last verified index. Incomplete reads, cancellation, or concurrent source changes cannot publish a partial generation or mix results from different generations.
+- Existing semantic indexes rebuild once after upgrading. The last complete index remains available while the replacement is prepared.
+- Project switching now preserves isolated per-project state across A/B/A MCP routing. Requests require an explicit project, and status remains observational instead of activating or repairing a repository.
+- `affected` now handles native path identity, renames, copies, stale evidence, and bounded results more accurately across Unix and Windows.
+- CLI JSON failures retain their runtime error codes and details across search, packet, activation, and retrieval indexing.
+- Rust 2024 sources, including `unsafe extern` blocks and let-chains, are now accepted. Dart direct-call extraction has been updated for the current grammar shape.
+- Linux ARM64 packages retain the portable runtime-loaded CPU backend alongside Vulkan. Windows packages use architecture-matched Vulkan components rather than mutable runner-image contents.
+- Updated `serde_with` to 3.21.0, removing the affected `KeyValueMap` panic advisory while preserving CodeStory's existing DTO encoding.
+- Everyday plugin messages now focus on whether broader search is ready, preparing, or unavailable; backend and timing detail stays in diagnostics.
+
+### Scope
+
+The v0.16 language changes are the Rust 2024 and Dart fixes listed above. This release makes no general cross-language parser-completeness claim; broader language-fidelity work continues in v0.16.1.
 
 ### Upgrade note
 
-Install the updated plugin package and start a fresh host session. The first broad-search call may take longer while CodeStory rebuilds the semantic generation once; no manual cleanup or migration command is required.
+Install the updated plugin package and start a fresh host session. The first broad-search call may take longer while CodeStory rebuilds the semantic index once. No manual cleanup or migration command is required.
 
 ## 0.15.0
 
