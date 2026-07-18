@@ -6,13 +6,13 @@ use codestory_contracts::graph::{
 use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
-    Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, params, params_from_iter,
-    types::Value,
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, limits::Limit, params,
+    params_from_iter, types::Value,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -6764,28 +6764,52 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let file_placeholders = question_placeholders(file_ids.len());
-        let sql = format!(
-            "SELECT id, kind
-             FROM node
-             WHERE id IN ({file_placeholders})
-                OR file_node_id IN ({file_placeholders})"
-        );
-        let params = file_ids
-            .iter()
-            .copied()
-            .chain(file_ids.iter().copied())
-            .collect::<Vec<_>>();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let raw_kind: i32 = row.get(1)?;
-            if let Ok(kind) = NodeKind::try_from(raw_kind) {
-                out.push((NodeId(row.get(0)?), kind));
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for file identity lookup"
+                        .to_string(),
+                )
+            })?;
+        let file_ids_per_batch = variable_limit / 2;
+        if file_ids_per_batch == 0 {
+            return Err(StorageError::Other(format!(
+                "SQLite bind-variable limit {variable_limit} cannot support the two file identity predicates"
+            )));
+        }
+
+        let mut unique_file_ids = file_ids.to_vec();
+        unique_file_ids.sort_unstable();
+        unique_file_ids.dedup();
+
+        // A row can match `id` in one batch and `file_node_id` in another. Keep
+        // one result per node, matching the set semantics of the former single
+        // SELECT, and return stable node-id order regardless of batch layout.
+        let mut node_kinds = BTreeMap::new();
+        for batch in unique_file_ids.chunks(file_ids_per_batch) {
+            let file_placeholders = question_placeholders(batch.len());
+            let sql = format!(
+                "SELECT id, kind
+                 FROM node
+                 WHERE id IN ({file_placeholders})
+                    OR file_node_id IN ({file_placeholders})"
+            );
+            let params = batch
+                .iter()
+                .copied()
+                .chain(batch.iter().copied())
+                .collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                let raw_kind: i32 = row.get(1)?;
+                if let Ok(kind) = NodeKind::try_from(raw_kind) {
+                    let node_id = NodeId(row.get(0)?);
+                    node_kinds.entry(node_id.0).or_insert((node_id, kind));
+                }
             }
         }
-        Ok(out)
+        Ok(node_kinds.into_values().collect())
     }
 
     pub fn get_nodes_for_file_line(
