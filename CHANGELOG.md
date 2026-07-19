@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- Full refresh now persists each ordered parser-artifact chunk in one SQLite
+  transaction instead of one autocommit per parsed file. Index telemetry
+  reports artifact-cache rows, transactions, and write time separately.
+
 ## 0.16.0
 
 CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.

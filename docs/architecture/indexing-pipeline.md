@@ -210,6 +210,13 @@ Cache misses become `PreparedIndexInput` values and are parsed in parallel. Each
 
 This phase is where the indexer builds unresolved edges and other graph artifacts. Resolution does not happen yet.
 
+Parsed artifact-cache writes retain Rayon result order and commit once per
+existing file chunk. Duplicate paths therefore keep ordered last-write
+semantics, while a row failure rolls back the whole cache chunk. Cancellation
+is observed at the next chunk boundary: an in-flight cache transaction either
+commits completely or rolls back, and a staged full refresh still cannot
+become live before the runtime publication fence.
+
 ### 7. The indexer flushes projection batches
 
 As file results are merged, `WorkspaceIndexer::run` flushes batches once file, node, edge, or occurrence counts cross the configured thresholds.

@@ -8930,6 +8930,9 @@ mod tests {
             edge_resolution_ms: 30,
             error_flush_ms: 4,
             cleanup_ms: 5,
+            artifact_cache_write_ms: Some(6),
+            artifact_cache_writes: Some(24),
+            artifact_cache_write_transactions: Some(1),
             cache_refresh_ms: Some(6),
             search_projection_rebuild_ms: Some(61),
             search_symbol_index_ms: Some(62),
@@ -9158,9 +9161,10 @@ mod tests {
 
         let markdown = render_index_markdown(&output);
 
-        assert!(
-            markdown.contains("cache_ms: search_projection=61 search_index=62 runtime_publish=63")
-        );
+        assert!(markdown.contains(
+            "cache_ms: artifact_write=6 search_projection=61 search_index=62 runtime_publish=63"
+        ));
+        assert!(markdown.contains("artifact_cache: writes=24 transactions=1"));
         assert!(
             markdown
                 .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")

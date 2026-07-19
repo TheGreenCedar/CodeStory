@@ -21,13 +21,13 @@ pub use storage_impl::{
     DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata,
     DenseAnchorPublicationManifest, DenseReasonCounts, FileContentHash, FileInfo,
     FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
-    GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState, IndexPublicationMode,
-    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, RetrievalIndexManifest, RetrievalIndexRollbackRecord,
-    SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, SearchSymbolProjection,
-    SearchSymbolProjectionDetail, SourcePolicyExclusionManifest, SourcePolicyExclusionRecord,
-    Storage as Store, StorageError, StorageOpenMode, StorageStats, SymbolSearchDoc,
-    SymbolSummaryRecord,
+    GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
+    IndexArtifactCacheWrite, IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc,
+    LlmSymbolDocReuseMetadata, LlmSymbolDocStats, ProjectionFlushBreakdown, RetrievalIndexManifest,
+    RetrievalIndexRollbackRecord, SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+    SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
+    SourcePolicyExclusionRecord, Storage as Store, StorageError, StorageOpenMode, StorageStats,
+    SymbolSearchDoc, SymbolSummaryRecord,
 };
 
 impl Store {

@@ -51,3 +51,8 @@ bench = false
 name = "browser_stress"
 harness = false
 bench = false
+
+[[bench]]
+name = "artifact_cache"
+harness = false
+bench = false

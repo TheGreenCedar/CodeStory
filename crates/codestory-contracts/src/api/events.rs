@@ -8,6 +8,12 @@ pub struct IndexingPhaseTimings {
     pub edge_resolution_ms: u32,
     pub error_flush_ms: u32,
     pub cleanup_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_cache_write_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_cache_writes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_cache_write_transactions: Option<u32>,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_projection_rebuild_ms: Option<u32>,
@@ -193,6 +199,9 @@ mod tests {
             edge_resolution_ms: 3,
             error_flush_ms: 4,
             cleanup_ms: 5,
+            artifact_cache_write_ms: None,
+            artifact_cache_writes: None,
+            artifact_cache_write_transactions: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -269,6 +278,9 @@ mod tests {
         };
 
         let value = serde_json::to_value(timings).expect("serialize timings");
+        assert!(value.get("artifact_cache_write_ms").is_none());
+        assert!(value.get("artifact_cache_writes").is_none());
+        assert!(value.get("artifact_cache_write_transactions").is_none());
         assert!(value.get("resolution_unresolved_counts_ms").is_none());
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
