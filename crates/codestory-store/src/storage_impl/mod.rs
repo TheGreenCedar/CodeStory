@@ -90,6 +90,16 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     }
 }
 
+fn canonical_search_symbol_batch_limit(
+    operation: &'static str,
+    limit: usize,
+) -> Result<i64, StorageError> {
+    if limit == 0 {
+        return Err(StorageError::InvalidBatchLimit(operation));
+    }
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
 fn uniform_optional_string(
     min_value: Option<String>,
     max_value: Option<String>,
@@ -972,6 +982,8 @@ fn upsert_index_artifact_cache_row(
 pub enum StorageError {
     #[error("Database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("{0} requires a non-zero batch limit")]
+    InvalidBatchLimit(&'static str),
     #[error("Resolution support snapshot exceeds the current SQLite value limit")]
     ResolutionSupportSnapshotTooBig,
     #[error("Invalid enum value: {0}")]
@@ -4935,6 +4947,103 @@ impl Storage {
                 .query_row("SELECT COUNT(*) FROM search_symbol_projection", [], |row| {
                     row.get::<_, i64>(0)
                 })?;
+        Ok(clamp_i64_to_u32(count))
+    }
+
+    /// Reads one ordered page of lexical-search symbols from the canonical node table.
+    pub fn get_canonical_search_symbol_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SearchSymbolProjection>, StorageError> {
+        let limit =
+            canonical_search_symbol_batch_limit("get_canonical_search_symbol_batch_after", limit)?;
+        let mut sql = String::from(
+            "SELECT
+                node.id,
+                CASE
+                    WHEN node.qualified_name IS NOT NULL
+                         AND TRIM(node.qualified_name) != ''
+                    THEN node.qualified_name
+                    ELSE node.serialized_name
+                END
+             FROM node",
+        );
+        let mut query_params = Vec::with_capacity(2);
+        if let Some(after_node_id) = after_node_id {
+            sql.push_str(" WHERE node.id > ?");
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        sql.push_str(" ORDER BY node.id ASC LIMIT ?");
+        query_params.push(Value::Integer(limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut symbols = Vec::new();
+        while let Some(row) = rows.next()? {
+            symbols.push(SearchSymbolProjection {
+                node_id: NodeId(row.get(0)?),
+                display_name: row.get(1)?,
+            });
+        }
+        Ok(symbols)
+    }
+
+    /// Reads one ordered page of canonical lexical-search symbols with source details.
+    pub fn get_canonical_search_symbol_detail_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SearchSymbolProjectionDetail>, StorageError> {
+        let limit = canonical_search_symbol_batch_limit(
+            "get_canonical_search_symbol_detail_batch_after",
+            limit,
+        )?;
+        let mut sql = String::from(
+            "SELECT
+                node.id,
+                CASE
+                    WHEN node.qualified_name IS NOT NULL
+                         AND TRIM(node.qualified_name) != ''
+                    THEN node.qualified_name
+                    ELSE node.serialized_name
+                END,
+                node.kind,
+                file.serialized_name,
+                node.start_line,
+                node.end_line
+             FROM node
+             LEFT JOIN node file ON file.id = node.file_node_id",
+        );
+        let mut query_params = Vec::with_capacity(2);
+        if let Some(after_node_id) = after_node_id {
+            sql.push_str(" WHERE node.id > ?");
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        sql.push_str(" ORDER BY node.id ASC LIMIT ?");
+        query_params.push(Value::Integer(limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut symbols = Vec::new();
+        while let Some(row) = rows.next()? {
+            symbols.push(SearchSymbolProjectionDetail {
+                node_id: NodeId(row.get(0)?),
+                display_name: row.get(1)?,
+                node_kind: row.get(2)?,
+                file_path: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+            });
+        }
+        Ok(symbols)
+    }
+
+    /// Counts lexical-search symbols in the canonical node table.
+    pub fn get_canonical_search_symbol_count(&self) -> Result<u32, StorageError> {
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get::<_, i64>(0))?;
         Ok(clamp_i64_to_u32(count))
     }
 

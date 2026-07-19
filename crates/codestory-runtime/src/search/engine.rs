@@ -942,6 +942,7 @@ impl SearchEngine {
         })
     }
 
+    #[cfg(any(test, feature = "benchmark-support"))]
     pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
         let mut session = self.begin_symbol_index()?;
         session.add_nodes(nodes)?;
@@ -954,6 +955,13 @@ impl SearchEngine {
         I: IntoIterator<Item = (NodeId, String)>,
     {
         self.symbols.clear();
+        self.extend_symbol_projection(symbols);
+    }
+
+    pub fn extend_symbol_projection<I>(&mut self, symbols: I)
+    where
+        I: IntoIterator<Item = (NodeId, String)>,
+    {
         self.symbols.extend(
             symbols
                 .into_iter()

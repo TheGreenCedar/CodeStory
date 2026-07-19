@@ -160,7 +160,8 @@ impl PinnedRetrievalRead {
         let session =
             PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
                 .map_err(map_pinned_query_error)?;
-        let node_names = crate::load_search_symbol_projection(session.storage(), 10_000)?.0;
+        let node_names =
+            crate::load_canonical_search_symbols(session.storage(), 10_000, None, |_| Ok(()))?.0;
         Ok(Self {
             session,
             project_root,

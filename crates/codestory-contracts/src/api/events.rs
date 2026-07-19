@@ -46,6 +46,12 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_projection_rebuild_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_stream_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_stream_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_stream_batches: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_symbol_index_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_symbol_index_docs_written: Option<u32>,
@@ -260,6 +266,9 @@ mod tests {
             full_refresh_chunk_planning_ms: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
+            search_symbol_stream_ms: None,
+            search_symbol_stream_rows: None,
+            search_symbol_stream_batches: None,
             search_symbol_index_ms: None,
             search_symbol_index_docs_written: None,
             search_symbol_index_writer_count: None,
@@ -368,6 +377,9 @@ mod tests {
         assert!(value.get("semantic_reload_ms").is_none());
         assert!(value.get("semantic_prune_ms").is_none());
         assert!(value.get("search_projection_rebuild_ms").is_none());
+        assert!(value.get("search_symbol_stream_ms").is_none());
+        assert!(value.get("search_symbol_stream_rows").is_none());
+        assert!(value.get("search_symbol_stream_batches").is_none());
         assert!(value.get("search_symbol_index_ms").is_none());
         assert!(value.get("search_symbol_index_docs_written").is_none());
         assert!(value.get("search_symbol_index_writer_count").is_none());
