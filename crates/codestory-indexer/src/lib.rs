@@ -806,8 +806,26 @@ impl ArtifactCacheAccess<'_> {
 struct PreparedIndexChunk {
     cache_writes: Vec<ArtifactCacheWrite>,
     storages: Vec<IntermediateStorage>,
+    progress_already_emitted: usize,
     #[cfg(test)]
     before_persist: Option<(usize, FullRefreshChunkTestHook)>,
+}
+
+#[derive(Clone, Copy)]
+struct IndexProgress<'a> {
+    processed_count: &'a AtomicUsize,
+    total_files: usize,
+    event_bus: &'a EventBus,
+}
+
+impl IndexProgress<'_> {
+    fn emit(self) {
+        let current = self.processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.event_bus.publish(Event::IndexingProgress {
+            current,
+            total: self.total_files,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -871,9 +889,7 @@ impl<'a> ProjectionWriter<'a> {
     fn accept_chunk(
         &mut self,
         chunk: PreparedIndexChunk,
-        processed_count: &AtomicUsize,
-        total_files: usize,
-        event_bus: &EventBus,
+        progress: IndexProgress<'_>,
     ) -> Result<()> {
         #[cfg(test)]
         if let Some((chunk_index, hook)) = &chunk.before_persist {
@@ -911,12 +927,10 @@ impl<'a> ProjectionWriter<'a> {
                 .saturating_add(1);
         }
 
+        for _ in chunk.progress_already_emitted..chunk.storages.len() {
+            progress.emit();
+        }
         for local_storage in chunk.storages {
-            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            event_bus.publish(Event::IndexingProgress {
-                current,
-                total: total_files,
-            });
             self.accept_storage(local_storage)?;
         }
         if self.pipeline_telemetry {
@@ -1460,6 +1474,7 @@ impl WorkspaceIndexer {
         symbol_table: &Arc<SymbolTable>,
         cancelled: &AtomicBool,
         cancel_token: Option<&CancellationToken>,
+        serial_progress: Option<IndexProgress<'_>>,
         stats: &mut IncrementalIndexingStats,
     ) -> PreparedIndexChunk {
         #[cfg(test)]
@@ -1490,11 +1505,22 @@ impl WorkspaceIndexer {
                 symbol_table,
                 stats,
             ) {
-                Ok(PreparedIndexWork::Immediate(local_storage)) => storages.push(local_storage),
+                Ok(PreparedIndexWork::Immediate(local_storage)) => {
+                    if let Some(progress) = serial_progress {
+                        progress.emit();
+                    }
+                    storages.push(local_storage);
+                }
                 Ok(PreparedIndexWork::Parse(prepared_input)) => parse_jobs.push(prepared_input),
-                Err(err_storage) => storages.push(err_storage),
+                Err(err_storage) => {
+                    if let Some(progress) = serial_progress {
+                        progress.emit();
+                    }
+                    storages.push(err_storage);
+                }
             }
         }
+        let progress_already_emitted = serial_progress.map_or(0, |_| storages.len());
         stats.artifact_cache_lookup_ms = stats
             .artifact_cache_lookup_ms
             .saturating_add(duration_ms_u64(lookup_started.elapsed()));
@@ -1536,6 +1562,7 @@ impl WorkspaceIndexer {
         PreparedIndexChunk {
             cache_writes,
             storages,
+            progress_already_emitted,
             #[cfg(test)]
             before_persist: self
                 .pipeline_test_hooks
@@ -1561,6 +1588,11 @@ impl WorkspaceIndexer {
         cancel_token: Option<&CancellationToken>,
         stats: &mut IncrementalIndexingStats,
     ) -> Result<ProjectionWriterOutput> {
+        let progress = IndexProgress {
+            processed_count,
+            total_files,
+            event_bus,
+        };
         let mut writer = ProjectionWriter::new(
             storage,
             plan.mode,
@@ -1585,10 +1617,11 @@ impl WorkspaceIndexer {
                     symbol_table,
                     cancelled,
                     cancel_token,
+                    Some(progress),
                     stats,
                 )
             };
-            writer.accept_chunk(chunk, processed_count, total_files, event_bus)?;
+            writer.accept_chunk(chunk, progress)?;
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
@@ -1653,6 +1686,7 @@ impl WorkspaceIndexer {
                             symbol_table,
                             cancelled,
                             cancel_token,
+                            None,
                             stats,
                         )
                     };
@@ -1728,6 +1762,11 @@ impl WorkspaceIndexer {
             existing_projection_file_ids,
             true,
         );
+        let progress = IndexProgress {
+            processed_count,
+            total_files,
+            event_bus,
+        };
         loop {
             let idle_started = Instant::now();
             match receiver.recv() {
@@ -1736,7 +1775,7 @@ impl WorkspaceIndexer {
                         .stats
                         .full_refresh_writer_idle_ms
                         .saturating_add(duration_ms_u64(idle_started.elapsed()));
-                    writer.accept_chunk(chunk, processed_count, total_files, event_bus)?;
+                    writer.accept_chunk(chunk, progress)?;
                 }
                 Err(_) => {
                     writer.stats.full_refresh_writer_idle_ms = writer
@@ -21972,6 +22011,74 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             "indexing should flush edges"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_immediate_progress_precedes_parse_and_preserves_cancellation_boundary()
+    -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let oversized = dir.path().join("oversized.rs");
+        let parsed = dir.path().join("parsed.rs");
+        fs::write(
+            &oversized,
+            format!("fn oversized() {{}}\n{}", "x".repeat(64)),
+        )?;
+        fs::write(&parsed, "fn parsed() {}\n")?;
+
+        let bus = EventBus::new();
+        let progress_rx = bus.receiver();
+        let cancel_token = CancellationToken::new();
+        let parse_cancel_token = cancel_token.clone();
+        let parse_hook_ran = Arc::new(AtomicBool::new(false));
+        let parse_hook_ran_from_hook = parse_hook_ran.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_prepare_chunk: None,
+            before_parse_job: Some(Arc::new(move |_| {
+                let (current, total) = loop {
+                    match progress_rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(Event::IndexingProgress { current, total }) => break (current, total),
+                        Ok(_) => {}
+                        Err(error) => panic!(
+                            "immediate progress must be observable before parser work: {error}"
+                        ),
+                    }
+                };
+                assert_eq!((current, total), (1, 2));
+                parse_hook_ran_from_hook.store(true, Ordering::SeqCst);
+                parse_cancel_token.cancel();
+            })),
+            before_writer_chunk: None,
+            on_send_timeout: None,
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(32)
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 2,
+                ..IncrementalIndexingConfig::default()
+            })
+            .with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![oversized.clone(), parsed.clone()],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+
+        let stats = indexer.run(&mut storage, &plan, &bus, Some(&cancel_token))?;
+
+        assert!(parse_hook_ran.load(Ordering::SeqCst));
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(stats.artifact_cache_writes, 0);
+        let files = storage.get_files()?;
+        assert!(files.iter().any(|file| file.path == oversized));
+        assert!(files.iter().all(|file| file.path != parsed));
         Ok(())
     }
 
