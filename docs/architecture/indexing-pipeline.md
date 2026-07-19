@@ -224,6 +224,16 @@ channel. This overlaps parser work with persistence while preserving one
 SQLite writer and applying backpressure instead of growing an unbounded result
 queue. Incremental indexing and in-memory fixtures retain the serial path.
 
+Full refresh chooses each chunk with an 8 MiB planned-source target and a
+120,000 projected-node target instead of a fixed small file count. The node
+projection uses the previous prepared chunk's observed node density, so tiny
+sparse files can fill a larger Rayon window while dense files reduce the next
+one. A 512-file ceiling bounds empty, tiny, unreadable, or unsupported inputs.
+One file always advances even when it alone exceeds a target; telemetry records
+that overrun plus planning time and the maximum files, planned bytes, and
+produced nodes seen in a chunk. Incremental indexing keeps its existing fixed
+serial window.
+
 At most three prepared chunks can be materialized at once: one owned by the
 writer, one queued, and one being prepared. A cancellation drops work that has
 not crossed the channel boundary; already accepted chunks finish their

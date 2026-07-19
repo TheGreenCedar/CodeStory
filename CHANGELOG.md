@@ -15,6 +15,10 @@
   dedicated staged SQLite writer through a capacity-one queue. Cancellation
   drains only accepted chunks, incremental indexing keeps its serial path, and
   telemetry reports queue pressure plus producer/writer wait time.
+- Full refresh now replaces the fixed small-file parse window with an adaptive
+  8 MiB source and 120,000 projected-node target plus a 512-file safety
+  ceiling. Completed output adjusts the next chunk's node-density estimate,
+  and telemetry reports planning time, observed maxima, and target overruns.
 
 ## 0.16.0
 

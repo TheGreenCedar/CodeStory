@@ -628,16 +628,143 @@ impl IncrementalIndexingConfig {
         match mode {
             codestory_workspace::BuildMode::Incremental => Self::default(),
             codestory_workspace::BuildMode::FullRefresh => Self {
-                // Full refresh is the highest-risk path for transient memory spikes,
-                // so keep batch sizes conservative even though the staged store can
-                // absorb larger write bursts.
-                file_batch_size: 24,
+                // Full-refresh file scheduling uses the separate adaptive byte/node
+                // budget below. This field remains the serial incremental window and
+                // an explicit caller-provided full-refresh safety ceiling.
+                file_batch_size: Self::default().file_batch_size,
                 node_batch_size: 120_000,
                 edge_batch_size: 120_000,
                 occurrence_batch_size: 120_000,
                 error_batch_size: 2_000,
             },
         }
+    }
+}
+
+const DEFAULT_FULL_REFRESH_CHUNK_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_FULL_REFRESH_CHUNK_PROJECTED_NODES: usize = 120_000;
+const DEFAULT_FULL_REFRESH_CHUNK_FILE_CEILING: usize = 512;
+
+#[derive(Debug, Clone, Copy)]
+struct FullRefreshChunkBudget {
+    source_bytes: u64,
+    projected_nodes: usize,
+    file_ceiling: usize,
+}
+
+impl Default for FullRefreshChunkBudget {
+    fn default() -> Self {
+        Self {
+            source_bytes: DEFAULT_FULL_REFRESH_CHUNK_SOURCE_BYTES,
+            projected_nodes: DEFAULT_FULL_REFRESH_CHUNK_PROJECTED_NODES,
+            file_ceiling: DEFAULT_FULL_REFRESH_CHUNK_FILE_CEILING,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FullRefreshChunkPlan {
+    start: usize,
+    end: usize,
+    source_bytes: u64,
+    projected_nodes: usize,
+}
+
+struct AdaptiveFullRefreshChunkPlanner {
+    budget: FullRefreshChunkBudget,
+    last_source_bytes: u64,
+    last_nodes: usize,
+    #[cfg(test)]
+    before_plan_file: Option<FullRefreshChunkTestHook>,
+}
+
+impl AdaptiveFullRefreshChunkPlanner {
+    fn new(budget: FullRefreshChunkBudget) -> Self {
+        Self {
+            budget: FullRefreshChunkBudget {
+                source_bytes: budget.source_bytes.max(1),
+                projected_nodes: budget.projected_nodes.max(1),
+                file_ceiling: budget.file_ceiling.max(1),
+            },
+            last_source_bytes: 0,
+            last_nodes: 0,
+            #[cfg(test)]
+            before_plan_file: None,
+        }
+    }
+
+    fn next_chunk(
+        &self,
+        files: &[PathBuf],
+        root: &Path,
+        start: usize,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<FullRefreshChunkPlan> {
+        if start >= files.len() {
+            return None;
+        }
+
+        let mut source_bytes = 0u64;
+        let mut projected_nodes = 0usize;
+        let mut end = start;
+        while end < files.len() && end - start < self.budget.file_ceiling {
+            #[cfg(test)]
+            if let Some(hook) = &self.before_plan_file {
+                hook(end);
+            }
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            let file_bytes =
+                std::fs::metadata(WorkspaceIndexer::normalize_index_path(root, &files[end]))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+            let file_projected_nodes = self.projected_nodes(file_bytes);
+            let next_source_bytes = source_bytes.saturating_add(file_bytes);
+            let next_projected_nodes = projected_nodes.saturating_add(file_projected_nodes);
+            if end > start
+                && (next_source_bytes > self.budget.source_bytes
+                    || next_projected_nodes > self.budget.projected_nodes)
+            {
+                break;
+            }
+            source_bytes = next_source_bytes;
+            projected_nodes = next_projected_nodes;
+            end += 1;
+        }
+
+        if end == start {
+            return None;
+        }
+
+        Some(FullRefreshChunkPlan {
+            start,
+            end,
+            source_bytes,
+            projected_nodes,
+        })
+    }
+
+    #[cfg(test)]
+    fn set_before_plan_file_hook(&mut self, hook: Option<FullRefreshChunkTestHook>) {
+        self.before_plan_file = hook;
+    }
+
+    fn observe(&mut self, source_bytes: u64, nodes: usize) {
+        self.last_source_bytes = source_bytes;
+        self.last_nodes = nodes;
+    }
+
+    fn projected_nodes(&self, source_bytes: u64) -> usize {
+        let (density_nodes, density_bytes) = if self.last_source_bytes == 0 {
+            (self.budget.projected_nodes, self.budget.source_bytes)
+        } else {
+            (self.last_nodes.max(1), self.last_source_bytes)
+        };
+        let numerator = u128::from(source_bytes.max(1)).saturating_mul(density_nodes as u128);
+        let projected = numerator.saturating_add(u128::from(density_bytes.saturating_sub(1)))
+            / u128::from(density_bytes);
+        usize::try_from(projected).unwrap_or(usize::MAX).max(1)
     }
 }
 
@@ -691,6 +818,14 @@ pub struct IncrementalIndexingStats {
     pub full_refresh_queue_high_water: usize,
     pub full_refresh_producer_blocked_ms: u64,
     pub full_refresh_writer_idle_ms: u64,
+    pub full_refresh_chunk_target_bytes: u64,
+    pub full_refresh_chunk_target_nodes: usize,
+    pub full_refresh_chunk_file_ceiling: usize,
+    pub full_refresh_chunk_max_files: usize,
+    pub full_refresh_chunk_max_planned_bytes: u64,
+    pub full_refresh_chunk_max_nodes: usize,
+    pub full_refresh_chunk_budget_overruns: usize,
+    pub full_refresh_chunk_planning_ms: u64,
     pub parse_index_ms: u64,
     pub projection_flush_ms: u64,
     pub flush_files_ms: u64,
@@ -811,6 +946,14 @@ struct PreparedIndexChunk {
     before_persist: Option<(usize, FullRefreshChunkTestHook)>,
 }
 
+impl PreparedIndexChunk {
+    fn node_count(&self) -> usize {
+        self.storages.iter().fold(0usize, |total, storage| {
+            total.saturating_add(storage.nodes.len())
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct IndexProgress<'a> {
     processed_count: &'a AtomicUsize,
@@ -831,9 +974,11 @@ impl IndexProgress<'_> {
 #[cfg(test)]
 #[derive(Clone, Default)]
 struct FullRefreshPipelineTestHooks {
+    before_plan_file: Option<FullRefreshChunkTestHook>,
     before_prepare_chunk: Option<FullRefreshChunkTestHook>,
     before_parse_job: Option<FullRefreshChunkTestHook>,
     before_writer_chunk: Option<FullRefreshChunkTestHook>,
+    after_send_chunk: Option<FullRefreshChunkTestHook>,
     on_send_timeout: Option<FullRefreshChunkTestHook>,
 }
 
@@ -1075,6 +1220,7 @@ pub struct WorkspaceIndexer {
     compilation_db: Option<compilation_database::CompilationDatabase>,
     compilation_db_warning: Option<String>,
     batch_config: IncrementalIndexingConfig,
+    full_refresh_chunk_budget: FullRefreshChunkBudget,
     source_file_byte_cap: u64,
     #[cfg(test)]
     pipeline_test_hooks: FullRefreshPipelineTestHooks,
@@ -1109,6 +1255,7 @@ impl WorkspaceIndexer {
             compilation_db,
             compilation_db_warning,
             batch_config: IncrementalIndexingConfig::default(),
+            full_refresh_chunk_budget: FullRefreshChunkBudget::default(),
             source_file_byte_cap: process_source_index_policy().byte_cap,
             #[cfg(test)]
             pipeline_test_hooks: FullRefreshPipelineTestHooks::default(),
@@ -1116,8 +1263,18 @@ impl WorkspaceIndexer {
     }
 
     /// Override incremental flush batch sizes.
+    ///
+    /// An explicit file batch size also becomes the full-refresh file-count
+    /// safety ceiling; normal full refreshes use the adaptive default.
     pub fn with_batch_config(mut self, batch_config: IncrementalIndexingConfig) -> Self {
         self.batch_config = batch_config;
+        self.full_refresh_chunk_budget.file_ceiling = batch_config.file_batch_size.max(1);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_full_refresh_chunk_budget(mut self, budget: FullRefreshChunkBudget) -> Self {
+        self.full_refresh_chunk_budget = AdaptiveFullRefreshChunkPlanner::new(budget).budget;
         self
     }
 
@@ -1180,6 +1337,9 @@ impl WorkspaceIndexer {
             });
         }
         let mut stats = IncrementalIndexingStats::default();
+        if plan.mode == codestory_workspace::BuildMode::FullRefresh {
+            Self::record_full_refresh_chunk_config(&mut stats, self.full_refresh_chunk_budget);
+        }
         if Self::is_cancelled(cancel_token) {
             return Ok(stats);
         }
@@ -1221,10 +1381,7 @@ impl WorkspaceIndexer {
         let batch_config = match plan.mode {
             codestory_workspace::BuildMode::Incremental => self.batch_config,
             codestory_workspace::BuildMode::FullRefresh => IncrementalIndexingConfig {
-                file_batch_size: self
-                    .batch_config
-                    .file_batch_size
-                    .min(full_refresh_defaults.file_batch_size),
+                file_batch_size: self.batch_config.file_batch_size,
                 node_batch_size: self
                     .batch_config
                     .node_batch_size
@@ -1600,30 +1757,80 @@ impl WorkspaceIndexer {
             existing_projection_file_ids,
             false,
         );
-        for (chunk_index, file_chunk) in plan
-            .files_to_index
-            .chunks(batch_config.file_batch_size.max(1))
-            .enumerate()
-        {
-            let chunk = {
-                let mut cache_access = ArtifactCacheAccess::Storage(writer.storage_mut());
-                self.prepare_index_chunk(
-                    &mut cache_access,
-                    chunk_index,
-                    file_chunk,
-                    root,
-                    plan.mode,
-                    existing_projection_file_ids,
-                    symbol_table,
-                    cancelled,
-                    cancel_token,
-                    Some(progress),
-                    stats,
-                )
-            };
-            writer.accept_chunk(chunk, progress)?;
-            if cancelled.load(Ordering::Relaxed) {
-                break;
+        if plan.mode == codestory_workspace::BuildMode::FullRefresh {
+            let mut planner = AdaptiveFullRefreshChunkPlanner::new(self.full_refresh_chunk_budget);
+            #[cfg(test)]
+            planner.set_before_plan_file_hook(self.pipeline_test_hooks.before_plan_file.clone());
+            let mut start = 0usize;
+            let mut chunk_index = 0usize;
+            let mut planning_duration = Duration::ZERO;
+            loop {
+                let planning_started = Instant::now();
+                let next_chunk =
+                    planner.next_chunk(&plan.files_to_index, root, start, cancel_token);
+                planning_duration = planning_duration.saturating_add(planning_started.elapsed());
+                if Self::is_cancelled(cancel_token) {
+                    cancelled.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let Some(chunk_plan) = next_chunk else {
+                    break;
+                };
+                let chunk = {
+                    let mut cache_access = ArtifactCacheAccess::Storage(writer.storage_mut());
+                    self.prepare_index_chunk(
+                        &mut cache_access,
+                        chunk_index,
+                        &plan.files_to_index[chunk_plan.start..chunk_plan.end],
+                        root,
+                        plan.mode,
+                        existing_projection_file_ids,
+                        symbol_table,
+                        cancelled,
+                        cancel_token,
+                        Some(progress),
+                        stats,
+                    )
+                };
+                let node_count = chunk.node_count();
+                Self::record_full_refresh_chunk(stats, planner.budget, chunk_plan, node_count);
+                planner.observe(chunk_plan.source_bytes, node_count);
+                writer.accept_chunk(chunk, progress)?;
+                start = chunk_plan.end;
+                chunk_index = chunk_index.saturating_add(1);
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            stats.full_refresh_chunk_planning_ms = stats
+                .full_refresh_chunk_planning_ms
+                .saturating_add(duration_ms_u64(planning_duration));
+        } else {
+            for (chunk_index, file_chunk) in plan
+                .files_to_index
+                .chunks(batch_config.file_batch_size.max(1))
+                .enumerate()
+            {
+                let chunk = {
+                    let mut cache_access = ArtifactCacheAccess::Storage(writer.storage_mut());
+                    self.prepare_index_chunk(
+                        &mut cache_access,
+                        chunk_index,
+                        file_chunk,
+                        root,
+                        plan.mode,
+                        existing_projection_file_ids,
+                        symbol_table,
+                        cancelled,
+                        cancel_token,
+                        Some(progress),
+                        stats,
+                    )
+                };
+                writer.accept_chunk(chunk, progress)?;
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         }
         writer.finish()
@@ -1666,20 +1873,32 @@ impl WorkspaceIndexer {
             });
 
             let producer_result = (|| -> Result<()> {
-                for (chunk_index, file_chunk) in files_to_index
-                    .chunks(batch_config.file_batch_size.max(1))
-                    .enumerate()
-                {
+                let mut planner =
+                    AdaptiveFullRefreshChunkPlanner::new(self.full_refresh_chunk_budget);
+                #[cfg(test)]
+                planner
+                    .set_before_plan_file_hook(self.pipeline_test_hooks.before_plan_file.clone());
+                let mut start = 0usize;
+                let mut chunk_index = 0usize;
+                let mut planning_duration = Duration::ZERO;
+                loop {
+                    let planning_started = Instant::now();
+                    let next_chunk = planner.next_chunk(files_to_index, root, start, cancel_token);
+                    planning_duration =
+                        planning_duration.saturating_add(planning_started.elapsed());
                     if Self::is_cancelled(cancel_token) {
                         cancelled.store(true, Ordering::Relaxed);
                         break;
                     }
+                    let Some(chunk_plan) = next_chunk else {
+                        break;
+                    };
                     let chunk = {
                         let mut cache_access = ArtifactCacheAccess::Reader(cache_reader);
                         self.prepare_index_chunk(
                             &mut cache_access,
                             chunk_index,
-                            file_chunk,
+                            &files_to_index[chunk_plan.start..chunk_plan.end],
                             root,
                             codestory_workspace::BuildMode::FullRefresh,
                             existing_projection_file_ids,
@@ -1694,17 +1913,24 @@ impl WorkspaceIndexer {
                         break;
                     }
 
+                    let node_count = chunk.node_count();
                     let blocked_started = Instant::now();
                     let mut pending_chunk = chunk;
+                    let mut accepted = false;
                     loop {
                         match sender.send_timeout(pending_chunk, SEND_RETRY) {
                             Ok(()) => {
+                                accepted = true;
                                 stats.full_refresh_chunks_produced =
                                     stats.full_refresh_chunks_produced.saturating_add(1);
                                 // A successful bounded send has one linearization
                                 // point at which the capacity-1 queue is occupied,
                                 // even if the receiver immediately dequeues it.
                                 stats.full_refresh_queue_high_water = 1;
+                                #[cfg(test)]
+                                if let Some(hook) = &self.pipeline_test_hooks.after_send_chunk {
+                                    hook(chunk_index);
+                                }
                                 break;
                             }
                             Err(SendTimeoutError::Timeout(chunk)) => {
@@ -1726,10 +1952,24 @@ impl WorkspaceIndexer {
                     stats.full_refresh_producer_blocked_ms = stats
                         .full_refresh_producer_blocked_ms
                         .saturating_add(duration_ms_u64(blocked_started.elapsed()));
+                    if accepted {
+                        Self::record_full_refresh_chunk(
+                            stats,
+                            planner.budget,
+                            chunk_plan,
+                            node_count,
+                        );
+                        planner.observe(chunk_plan.source_bytes, node_count);
+                        start = chunk_plan.end;
+                        chunk_index = chunk_index.saturating_add(1);
+                    }
                     if cancelled.load(Ordering::Relaxed) {
                         break;
                     }
                 }
+                stats.full_refresh_chunk_planning_ms = stats
+                    .full_refresh_chunk_planning_ms
+                    .saturating_add(duration_ms_u64(planning_duration));
                 Ok(())
             })();
             drop(sender);
@@ -1787,6 +2027,38 @@ impl WorkspaceIndexer {
             }
         }
         writer.finish()
+    }
+
+    fn record_full_refresh_chunk(
+        stats: &mut IncrementalIndexingStats,
+        budget: FullRefreshChunkBudget,
+        plan: FullRefreshChunkPlan,
+        node_count: usize,
+    ) {
+        Self::record_full_refresh_chunk_config(stats, budget);
+        stats.full_refresh_chunk_max_files = stats
+            .full_refresh_chunk_max_files
+            .max(plan.end.saturating_sub(plan.start));
+        stats.full_refresh_chunk_max_planned_bytes = stats
+            .full_refresh_chunk_max_planned_bytes
+            .max(plan.source_bytes);
+        stats.full_refresh_chunk_max_nodes = stats.full_refresh_chunk_max_nodes.max(node_count);
+        if plan.source_bytes > budget.source_bytes
+            || plan.projected_nodes > budget.projected_nodes
+            || node_count > budget.projected_nodes
+        {
+            stats.full_refresh_chunk_budget_overruns =
+                stats.full_refresh_chunk_budget_overruns.saturating_add(1);
+        }
+    }
+
+    fn record_full_refresh_chunk_config(
+        stats: &mut IncrementalIndexingStats,
+        budget: FullRefreshChunkBudget,
+    ) {
+        stats.full_refresh_chunk_target_bytes = budget.source_bytes;
+        stats.full_refresh_chunk_target_nodes = budget.projected_nodes;
+        stats.full_refresh_chunk_file_ceiling = budget.file_ceiling;
     }
 
     fn is_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
@@ -21243,6 +21515,166 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
+    fn test_adaptive_full_refresh_planner_tracks_dense_and_sparse_node_output() -> Result<()> {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..8 {
+            let path = dir.path().join(format!("planned_{index}.rs"));
+            fs::write(&path, vec![b'x'; 25])?;
+            files.push(path);
+        }
+        let mut planner = AdaptiveFullRefreshChunkPlanner::new(FullRefreshChunkBudget {
+            source_bytes: 100,
+            projected_nodes: 100,
+            file_ceiling: 10,
+        });
+
+        let initial = planner
+            .next_chunk(&files, dir.path(), 0, None)
+            .expect("initial chunk");
+        assert_eq!((initial.start, initial.end), (0, 4));
+        assert_eq!(initial.source_bytes, 100);
+
+        planner.observe(initial.source_bytes, 400);
+        let dense = planner
+            .next_chunk(&files, dir.path(), initial.end, None)
+            .expect("dense projection chunk");
+        assert_eq!((dense.start, dense.end), (4, 5));
+        assert_eq!(dense.projected_nodes, 100);
+
+        planner.observe(dense.source_bytes, 1);
+        let sparse = planner
+            .next_chunk(&files, dir.path(), dense.end, None)
+            .expect("sparse projection chunk");
+        assert_eq!((sparse.start, sparse.end), (5, 8));
+        assert_eq!(sparse.source_bytes, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_adaptive_budget_grows_beyond_legacy_file_window() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..40 {
+            let path = dir.path().join(format!("tiny_{index}.rs"));
+            fs::write(&path, format!("fn tiny_{index}() {{}}\n"))?;
+            files.push(path);
+        }
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert_eq!(stats.full_refresh_chunks_produced, 1);
+        assert_eq!(stats.full_refresh_chunks_persisted, 1);
+        assert_eq!(stats.full_refresh_chunk_target_bytes, 8 * 1024 * 1024);
+        assert_eq!(stats.full_refresh_chunk_target_nodes, 120_000);
+        assert_eq!(stats.full_refresh_chunk_file_ceiling, 512);
+        assert_eq!(stats.full_refresh_chunk_max_files, 40);
+        assert!(stats.full_refresh_chunk_max_files > 24);
+        assert!(stats.full_refresh_chunk_max_planned_bytes < 8 * 1024 * 1024);
+        assert!(stats.full_refresh_chunk_max_nodes < 120_000);
+        assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_full_refresh_reports_adaptive_chunk_config() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert_eq!(stats.full_refresh_chunk_target_bytes, 8 * 1024 * 1024);
+        assert_eq!(stats.full_refresh_chunk_target_nodes, 120_000);
+        assert_eq!(stats.full_refresh_chunk_file_ceiling, 512);
+        assert_eq!(stats.full_refresh_chunk_max_files, 0);
+        assert_eq!(stats.full_refresh_chunk_max_planned_bytes, 0);
+        assert_eq!(stats.full_refresh_chunk_max_nodes, 0);
+        assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_adaptive_budget_advances_one_over_budget_file() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let large = dir.path().join("large.rs");
+        let small = dir.path().join("small.rs");
+        fs::write(&large, format!("fn large() {{}}\n{}", "x".repeat(64)))?;
+        fs::write(&small, "fn small() {}\n")?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![large, small],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(256)
+            .with_full_refresh_chunk_budget(FullRefreshChunkBudget {
+                source_bytes: 32,
+                projected_nodes: 100,
+                file_ceiling: 10,
+            });
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(stats.full_refresh_chunks_produced, 2);
+        assert_eq!(stats.full_refresh_chunks_persisted, 2);
+        assert_eq!(stats.full_refresh_chunk_max_files, 1);
+        assert!(stats.full_refresh_chunk_max_planned_bytes > 32);
+        assert_eq!(stats.full_refresh_chunk_budget_overruns, 1);
+        assert!(
+            storage
+                .get_nodes()?
+                .iter()
+                .any(|node| node.serialized_name == "large")
+        );
+        assert!(
+            storage
+                .get_nodes()?
+                .iter()
+                .any(|node| node.serialized_name == "small")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_file_backed_full_refresh_duplicate_paths_keep_serial_cache_semantics() -> Result<()> {
         use codestory_store::Store as Storage;
         use tempfile::tempdir;
@@ -21383,6 +21815,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let writer_writer_has_chunk = writer_has_chunk.clone();
         let writer_release_writer = release_writer.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: Some(Arc::new(move |chunk_index| {
                 if chunk_index == 1 && !parse_barrier_entered_hook.swap(true, Ordering::SeqCst) {
@@ -21397,6 +21830,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                     writer_release_writer.wait();
                 }
             })),
+            after_send_chunk: None,
             on_send_timeout: None,
         };
 
@@ -21451,6 +21885,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let cancel_token = CancellationToken::new();
         let timeout_cancel_token = cancel_token.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: Some(Arc::new(move |chunk_index| {
                 if chunk_index == 1 {
                     prepare_writer_has_chunk.wait();
@@ -21463,6 +21898,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                     writer_release_writer.wait();
                 }
             })),
+            after_send_chunk: None,
             on_send_timeout: Some(Arc::new(move |chunk_index| {
                 if chunk_index == 2 {
                     timeout_cancel_token.cancel();
@@ -21541,6 +21977,55 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
+    fn test_full_refresh_cancellation_during_planning_drops_partial_chunk() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut paths = Vec::new();
+        for index in 0..40 {
+            let path = dir.path().join(format!("plan_cancel_{index}.rs"));
+            std::fs::write(&path, format!("fn plan_cancel_{index}() {{}}\n"))?;
+            paths.push(path);
+        }
+        let cancel_token = CancellationToken::new();
+        let planning_cancel_token = cancel_token.clone();
+        let planned_files = Arc::new(AtomicUsize::new(0));
+        let planned_files_from_hook = planned_files.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: Some(Arc::new(move |file_index| {
+                planned_files_from_hook.store(file_index.saturating_add(1), Ordering::SeqCst);
+                if file_index == 5 {
+                    planning_cancel_token.cancel();
+                }
+            })),
+            before_prepare_chunk: None,
+            before_parse_job: None,
+            before_writer_chunk: None,
+            after_send_chunk: None,
+            on_send_timeout: None,
+        };
+        let indexer =
+            WorkspaceIndexer::new(dir.path().to_path_buf()).with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(planned_files.load(Ordering::SeqCst), 6);
+        assert_eq!(stats.full_refresh_chunks_produced, 0);
+        assert_eq!(stats.full_refresh_chunks_persisted, 0);
+        assert!(storage.get_nodes()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_full_refresh_cancellation_during_parse_drops_unaccepted_chunk() -> Result<()> {
         use codestory_store::Store as Storage;
         use tempfile::tempdir;
@@ -21555,9 +22040,11 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let cancel_token = CancellationToken::new();
         let parse_cancel_token = cancel_token.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: Some(Arc::new(move |_| parse_cancel_token.cancel())),
             before_writer_chunk: None,
+            after_send_chunk: None,
             on_send_timeout: None,
         };
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
@@ -21602,16 +22089,18 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let cancel_token = CancellationToken::new();
         let writer_cancel_token = cancel_token.clone();
         let hooks = FullRefreshPipelineTestHooks {
-            before_prepare_chunk: Some(Arc::new(move |chunk_index| {
-                if chunk_index == 1 {
-                    producer_accepted.wait();
-                }
-            })),
+            before_plan_file: None,
+            before_prepare_chunk: None,
             before_parse_job: None,
             before_writer_chunk: Some(Arc::new(move |chunk_index| {
                 if chunk_index == 0 {
                     writer_cancel_token.cancel();
                     writer_accepted.wait();
+                }
+            })),
+            after_send_chunk: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 0 {
+                    producer_accepted.wait();
                 }
             })),
             on_send_timeout: None,
@@ -22038,6 +22527,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let parse_hook_ran = Arc::new(AtomicBool::new(false));
         let parse_hook_ran_from_hook = parse_hook_ran.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: Some(Arc::new(move |_| {
                 let (current, total) = loop {
@@ -22054,6 +22544,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                 parse_cancel_token.cancel();
             })),
             before_writer_chunk: None,
+            after_send_chunk: None,
             on_send_timeout: None,
         };
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())

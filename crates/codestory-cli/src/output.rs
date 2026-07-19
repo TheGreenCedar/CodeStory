@@ -354,6 +354,28 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             ("writer_idle_ms", timings.full_refresh_writer_idle_ms),
         ],
     );
+    if timings.full_refresh_chunk_target_bytes.is_some()
+        || timings.full_refresh_chunk_target_nodes.is_some()
+        || timings.full_refresh_chunk_file_ceiling.is_some()
+        || timings.full_refresh_chunk_max_files.is_some()
+        || timings.full_refresh_chunk_max_planned_bytes.is_some()
+        || timings.full_refresh_chunk_max_nodes.is_some()
+        || timings.full_refresh_chunk_budget_overruns.is_some()
+        || timings.full_refresh_chunk_planning_ms.is_some()
+    {
+        let _ = writeln!(
+            markdown,
+            "full_refresh_chunking: target_bytes={} target_nodes={} file_ceiling={} max_files={} max_planned_bytes={} max_nodes={} overruns={} planning_ms={}",
+            timings.full_refresh_chunk_target_bytes.unwrap_or(0),
+            timings.full_refresh_chunk_target_nodes.unwrap_or(0),
+            timings.full_refresh_chunk_file_ceiling.unwrap_or(0),
+            timings.full_refresh_chunk_max_files.unwrap_or(0),
+            timings.full_refresh_chunk_max_planned_bytes.unwrap_or(0),
+            timings.full_refresh_chunk_max_nodes.unwrap_or(0),
+            timings.full_refresh_chunk_budget_overruns.unwrap_or(0),
+            timings.full_refresh_chunk_planning_ms.unwrap_or(0),
+        );
+    }
     append_optional_timings_line(
         markdown,
         "symbol_index",

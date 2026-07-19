@@ -26,6 +26,22 @@ pub struct IndexingPhaseTimings {
     pub full_refresh_producer_blocked_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_refresh_writer_idle_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_target_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_target_nodes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_file_ceiling: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_max_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_max_planned_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_max_nodes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_budget_overruns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunk_planning_ms: Option<u32>,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_projection_rebuild_ms: Option<u32>,
@@ -228,6 +244,14 @@ mod tests {
             full_refresh_queue_high_water: None,
             full_refresh_producer_blocked_ms: None,
             full_refresh_writer_idle_ms: None,
+            full_refresh_chunk_target_bytes: None,
+            full_refresh_chunk_target_nodes: None,
+            full_refresh_chunk_file_ceiling: None,
+            full_refresh_chunk_max_files: None,
+            full_refresh_chunk_max_planned_bytes: None,
+            full_refresh_chunk_max_nodes: None,
+            full_refresh_chunk_budget_overruns: None,
+            full_refresh_chunk_planning_ms: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -317,6 +341,14 @@ mod tests {
         assert!(value.get("full_refresh_queue_high_water").is_none());
         assert!(value.get("full_refresh_producer_blocked_ms").is_none());
         assert!(value.get("full_refresh_writer_idle_ms").is_none());
+        assert!(value.get("full_refresh_chunk_target_bytes").is_none());
+        assert!(value.get("full_refresh_chunk_target_nodes").is_none());
+        assert!(value.get("full_refresh_chunk_file_ceiling").is_none());
+        assert!(value.get("full_refresh_chunk_max_files").is_none());
+        assert!(value.get("full_refresh_chunk_max_planned_bytes").is_none());
+        assert!(value.get("full_refresh_chunk_max_nodes").is_none());
+        assert!(value.get("full_refresh_chunk_budget_overruns").is_none());
+        assert!(value.get("full_refresh_chunk_planning_ms").is_none());
         assert!(value.get("resolution_unresolved_counts_ms").is_none());
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
