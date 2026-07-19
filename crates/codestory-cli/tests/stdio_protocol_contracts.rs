@@ -5100,10 +5100,10 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
 fn packet_preserves_typed_source_failure_diagnostics() {
     let fixture = unindexed_fixture();
     fs::write(
-        fixture.workspace.path().join("src/lib.rs"),
-        "x".repeat(1_000_001),
+        fixture.workspace.path().join("codestory_workspace.json"),
+        r#"{"members":["src","missing"]}"#,
     )
-    .expect("write oversized source fixture");
+    .expect("write incomplete discovery fixture");
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -5121,14 +5121,14 @@ fn packet_preserves_typed_source_failure_diagnostics() {
     let error = assert_tool_error(&response, json!("packet-typed-source-failure"));
 
     assert_eq!(error["code"], json!("codestory_unavailable"));
-    assert_eq!(error["cause_code"], json!("source_oversized"));
+    assert_eq!(error["cause_code"], json!("source_discovery_incomplete"));
     assert_eq!(error["retry_tool"], Value::Null);
     assert_eq!(
         error.pointer("/details/coverage_gaps/0/reason"),
-        Some(&json!("oversized"))
+        Some(&json!("discovery_incomplete"))
     );
     assert_eq!(
         error.pointer("/details/coverage_gaps/0/retryable"),
-        Some(&json!(false))
+        Some(&json!(true))
     );
 }
