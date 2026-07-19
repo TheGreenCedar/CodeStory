@@ -11,6 +11,14 @@ on:
       proof_key:
         required: true
         type: string
+      version:
+        required: false
+        default: ""
+        type: string
+      emit_release_cells:
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       pr_number:
@@ -141,6 +149,32 @@ jobs:
 
       - name: Lint every workspace target and feature once
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Emit authenticated source release cell
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ needs.resolve.outputs.ref }}" \
+            --version "${{ inputs.version }}" \
+            --cell-id source_behavior \
+            --producer-workflow .github/workflows/source-proof.yml \
+            --producer-job full-source-gate \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-prepublish-source-attempt-$GITHUB_RUN_ATTEMPT" \
+            --out target/release-cells/source_behavior.json
+
+      - name: Upload authenticated source release cell
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-source-attempt-${{ github.run_attempt }}
+          path: target/release-cells/source_behavior.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Save Cargo inputs and output
         if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

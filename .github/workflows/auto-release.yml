@@ -50,6 +50,7 @@ jobs:
         run: >-
           node --test
           scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-cell-manifest.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
 

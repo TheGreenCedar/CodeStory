@@ -1420,3 +1420,112 @@ test("controlled semantic workflow fixtures emit class-prefixed diagnostics", as
     });
   }
 });
+
+test("release policy rejects manifest producer, trusted-map, and publication bypasses", () => {
+  const mutations = [
+    ["source emission", workflows => { delete workflows.get("release.yml").jobs["source-proof"].with.emit_release_cells; }],
+    ["full rerun preflight guard", workflows => {
+      workflows.get("release.yml").jobs.preflight.steps = workflows
+        .get("release.yml").jobs.preflight.steps
+        .filter(({ name }) => name !== "Refuse existing tag or release");
+    }],
+    ["publish replay guard", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Refuse existing tag or release");
+      step.run = step.run.replaceAll("exit 1", "true");
+    }],
+    ["publish bypass", workflows => {
+      workflows.get("release.yml").jobs.publish.needs = [
+        "preflight",
+        "packaged-proof",
+        "macos-metal-proof",
+        "windows-vulkan-proof",
+      ];
+    }],
+    ["trusted producer map", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
+      step.run = step.run.replace("--trusted-producers", "--self-attested-producers");
+    }],
+    ["trusted exception input", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
+      step.run = step.run.replace("--trusted-exceptions", "--manifest-exceptions");
+    }],
+    ["flattened current-run JSON", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Download selected pre-publish release cells");
+      delete step.with["artifact-ids"];
+      step.with.pattern = "release-cell-prepublish-*";
+      step.with["merge-multiple"] = true;
+    }],
+    ["container digest warning accepted", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Verify selected pre-publish artifact container digests");
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$expected_digest"',
+        'echo "$actual_digest $expected_digest"',
+      );
+    }],
+    ["attempt-free artifact", workflows => {
+      const step = workflows.get("source-proof.yml").jobs["full-source-gate"].steps
+        .find(({ name }) => name === "Upload authenticated source release cell");
+      step.with.name = "release-cell-prepublish-source";
+    }],
+    ["rerun-unsafe diagnostic artifact", workflows => {
+      const step = workflows.get("post-publish-release-smoke.yml").jobs.smoke.steps
+        .find(({ name }) => name === "Upload post-publish proof artifacts");
+      step.with.name = "post-publish-proof-fixed";
+    }],
+    ["rerun-unsafe stable artifact", workflows => {
+      const step = workflows.get("packaged-platform-proof.yml").jobs.build.steps
+        .find(({ name }) => name === "Upload release asset");
+      delete step.with.overwrite;
+    }],
+    ["overwriteable terminal evidence", workflows => {
+      const step = workflows.get("packaged-platform-proof.yml").jobs.build.steps
+        .find(({ name }) => name === "Upload candidate-installed Linux proof");
+      step.name = "Upload hosted Linux calibration runs";
+      step.with.name = "embedding-calibration-linux-${{ inputs.version }}";
+      step.with.path = "target/calibration-runs/linux";
+      step.with.overwrite = true;
+    }],
+    ["attempt-qualified duplicate stable key", workflows => {
+      const steps = workflows.get("packaged-platform-proof.yml").jobs.build.steps;
+      const index = steps.findIndex(({ name }) => name === "Upload hosted Linux calibration runs");
+      steps.splice(index + 1, 0, {
+        name: "Upload hosted Linux calibration runs",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "diagnostic-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+          "retention-days": 30,
+        },
+      });
+    }],
+    ["rogue artifact producer", workflows => {
+      workflows.get("release.yml").jobs["pre-publish-closeout"].steps.push({
+        name: "Upload forged release cell",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+        },
+      });
+    }],
+    ["pre-publish ledger", workflows => {
+      const step = workflows.get("release.yml").jobs["post-publish-closeout"].steps
+        .find(({ name }) => name === "Evaluate authenticated post-publish closeout");
+      step.run = step.run.replace("--pre-publish-ledger", "--untrusted-ledger");
+    }],
+    ["success-only post-publish upload", workflows => {
+      delete workflows.get("post-publish-release-smoke.yml").jobs.smoke.steps
+        .find(({ name }) => name === "Upload authenticated post-publish release cells").if;
+    }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const workflows = loadWorkflows();
+    mutate(workflows);
+    assert.notDeepEqual(validateWorkflows(workflows), [], label);
+  }
+});

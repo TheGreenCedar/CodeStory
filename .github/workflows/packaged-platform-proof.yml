@@ -56,6 +56,11 @@ on:
         required: false
         default: false
         type: boolean
+      emit_release_cells:
+        description: Emit authenticated package cells for the production release coordinator.
+        required: false
+        default: false
+        type: boolean
     secrets:
       APPLE_DEVELOPER_ID_P12_BASE64:
         required: false
@@ -465,7 +470,7 @@ jobs:
         if: success() && matrix.asset_target == 'linux-x64'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: linux-glibc-2.31-baseline-proof
+          name: linux-glibc-2.31-baseline-proof-attempt-${{ github.run_attempt }}
           path: target/linux-glibc-baseline
           if-no-files-found: error
           retention-days: 30
@@ -609,12 +614,13 @@ jobs:
           path: target/calibration-runs/linux
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
       - name: Upload packaged agent proof artifacts
         if: always() && matrix.asset_target == 'linux-x64'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: packaged-agent-proof-${{ matrix.asset_target }}
+          name: packaged-agent-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: target/packaged-agent-proof
           if-no-files-found: warn
           retention-days: 30
@@ -719,7 +725,7 @@ jobs:
         if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.scope == 'server' || inputs.quality_evidence_artifact != '')
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: candidate-installed-linux-${{ inputs.version }}
+          name: candidate-installed-linux-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           path: target/candidate-installed-linux
           if-no-files-found: error
           retention-days: 30
@@ -766,7 +772,7 @@ jobs:
         if: always() && matrix.asset_target == 'macos-x64'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: packaged-intel-policy-proof-${{ matrix.asset_target }}
+          name: packaged-intel-policy-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: target/packaged-intel-policy-proof
           if-no-files-found: warn
           retention-days: 30
@@ -775,7 +781,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: packaged-version-proof-${{ matrix.asset_target }}
+          name: packaged-version-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: target/packaged-version-smoke/${{ matrix.asset_target }}
           if-no-files-found: warn
           retention-days: 30
@@ -806,9 +812,36 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: packaged-managed-proof-${{ matrix.asset_target }}
+          name: packaged-managed-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: target/packaged-managed-proof
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Emit authenticated package release cell
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "${{ inputs.version }}" \
+            --cell-id "package_identity:${{ matrix.asset_target }}" \
+            --producer-workflow .github/workflows/packaged-platform-proof.yml \
+            --producer-job build \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-$GITHUB_RUN_ATTEMPT" \
+            --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
+            --out "target/release-cells/package_identity-${{ matrix.asset_target }}.json"
+
+      - name: Upload authenticated package release cell
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
+          path: target/release-cells/package_identity-${{ matrix.asset_target }}.json
+          if-no-files-found: error
           retention-days: 30
 
       - name: Upload release asset
@@ -822,12 +855,13 @@ jobs:
             target/release-dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
       - name: Upload macOS notarization proof
         if: always() && runner.os == 'macOS' && inputs.sign_macos
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: macos-notarization-proof-${{ matrix.asset_target }}
+          name: macos-notarization-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: target/notarization-proof/${{ matrix.asset_target }}
           if-no-files-found: error
           retention-days: 30

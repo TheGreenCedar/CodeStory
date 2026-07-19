@@ -29,6 +29,10 @@ on:
         required: false
         default: ""
         type: string
+      emit_release_cells:
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -208,11 +212,48 @@ jobs:
             --timeout-secs 1800 `
             --out-dir target/windows-vulkan-proof/packaged-agent
 
+      - name: Emit authenticated Vulkan release cell
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          jq -n \
+            --arg native_engine coderank_q8_embedded \
+            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
+            '{native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            > target/windows-vulkan-proof/release-cell-identity.json
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "$version" \
+            --cell-id accelerator_execution:windows-x64-vulkan \
+            --producer-workflow .github/workflows/windows-vulkan-proof.yml \
+            --producer-job packaged-vulkan \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-prepublish-windows-x64-vulkan-attempt-$GITHUB_RUN_ATTEMPT" \
+            --identity target/windows-vulkan-proof/release-cell-identity.json \
+            --archive "target/release-dist/codestory-cli-v${version}-windows-x64.zip" \
+            --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
+
+      - name: Upload authenticated Vulkan release cell
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-cells/accelerator_execution-windows-x64-vulkan.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload Vulkan proof artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: windows-x64-vulkan-proof-${{ inputs.version }}
+          name: windows-x64-vulkan-proof-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           path: target/windows-vulkan-proof
           if-no-files-found: error
           retention-days: 30

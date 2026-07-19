@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Release
+
+- The production release chain now emits graph-owned, success-only proof-cell
+  manifests for exact source, release evidence, all six packages, protected
+  Metal and Vulkan execution, and all six post-publish hosts. Publication
+  depends only on an accepted authenticated 12-cell pre-publish ledger; the
+  retained 30-cell post-publish ledger also proves downloaded archive bytes
+  match the accepted package digests. Producer workflow, job, run, attempt and
+  artifact identity comes from current-run Actions artifact and per-attempt job
+  metadata instead of the manifest directory. Immutable attempt-qualified
+  containers support failed-job reruns without accepting a failed newer
+  execution or flattening unrelated JSON. Approved performance exceptions are
+  separately authenticated and evaluated with same-run answer-quality proof.
+- Candidate-installed proof remains outside pre-publish authorization. The
+  real installed-runtime tier, including its separate two-session/one-server
+  qualification, remains post-publish work owned by #1221.
+
 ### Performance
 
 - The sqlite-vec versus USearch evidence harness now freezes and independently

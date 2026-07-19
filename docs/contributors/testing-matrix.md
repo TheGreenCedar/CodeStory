@@ -266,7 +266,7 @@ Workflow edits run:
 ```sh
 npm ci --ignore-scripts
 node scripts/codestory-release-claims.mjs validate --repo .
-node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-closeout.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
+node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-cell-manifest.test.mjs scripts/tests/codestory-release-closeout.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
 node --test .github/scripts/run-actionlint.test.mjs
 node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
@@ -318,7 +318,11 @@ coordinator expands native cells from `workflow_policy.package_matrix`, keeps
 protected hardware cells explicit, invokes the claim evaluator for each cell
 and its graph dependencies, then retains canonical copies under `manifests/`
 and `evaluations/` beside `ledger.json` and `summary.json`. A pre-publish run
-records each archive name, byte count, and SHA-256. A post-publish run requires
+accepts 12 cells: exact source, six package targets, two protected-hardware
+targets, and the three release-evidence claims. A post-publish run accepts 30
+cells after adding platform, installed-runtime and downloaded-byte proof for
+all six targets. Package rows record each archive name, byte count, and SHA-256.
+A post-publish run requires
 that accepted pre-publish ledger, requires its current package manifests to
 match the retained rows, and rejects any downloaded archive whose bytes do not
 match the retained digest. Producer and installed-runtime versions must equal
@@ -327,6 +331,35 @@ hosts must match the OS and architecture derived from the package matrix's Rust
 target. Do not use `matrix`, `mixed`, or another
 aggregate placeholder for a host, runner, backend, installer, or native-engine
 identity.
+
+Production producers use `scripts/codestory-release-cell-manifest.mjs`. They
+emit cells only after their job succeeds and bind workflow, job, run, attempt
+and Actions artifact identity. Artifact names are immutable and attempt
+qualified. The closeout job queries the current run's Actions artifact and job
+APIs, selects the highest attempt in which each graph-owned job actually ran,
+requires that latest execution to have succeeded, and binds the selected
+container id, digest, creation window and unflattened directory to its cells in
+`codestory.release-actions-provenance/v1`. Loose JSON, expired or duplicate
+containers, a failed newer execution, and artifacts outside the selected job's
+time window are rejected. This permits **Re-run failed jobs** after a partial
+post-publish failure: cells from jobs that did not rerun retain their earlier
+attempt, while rerun cells use the newer successful attempt. Do not use
+**Re-run all jobs** as post-publish recovery; publication is intentionally not
+repeatable after the tag and release exist.
+
+Every other release-chain upload is rerun-safe as well. Retained diagnostics
+use attempt-qualified names. Stable intermediate artifacts that a later job
+downloads by name use explicit replacement from a policy-owned allowlist, so a
+retried producer cannot fail on an immutable same-name artifact before it emits
+its authenticated cell. Terminal evidence is never overwriteable.
+
+An accepted model-microbenchmark exception is a separate authenticated input,
+not a manifest assertion. The release-evidence container retains
+`codestory.release-closeout-exceptions/v1`; closeout verifies its producer,
+includes same-run `answer_quality` in the performance-cell evaluation, and
+passes the trusted exception map to the claim evaluator. Both closeout jobs
+retain the provenance map and exception input with canonical manifests,
+individual evaluations, ledger and summary.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -338,7 +371,9 @@ node scripts/codestory-release-closeout.mjs evaluate \
   --version <version> \
   --phase pre_publish \
   --evaluated-at <canonical-ISO-timestamp> \
-  --manifest-dir <producer-manifests> \
+  --trusted-producers <actions-provenance-map.json> \
+  --trusted-exceptions <selected-release-evidence-container/trusted-exceptions.json> \
+  --manifest-dir <unflattened-selected-artifact-directories> \
   --out-dir <new-closeout-directory>
 ```
 
@@ -347,6 +382,12 @@ For `--phase post_publish`, pass every graph-owned cell plus
 tested and merged without final evidence; an accepted ledger still requires
 the frozen exact-head producer manifests and does not upgrade source or package
 proof into installed, protected-hardware, or live-behavior proof.
+
+Pre-publish authorization deliberately has no candidate-installed cell. A
+marketplace install cannot exist until publication, and candidate-managed proof
+does not replace it. The six installed-runtime cells remain post-publish and
+the real two-session/one-server installed-runtime qualification remains the
+separate #1221 evidence tier.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply

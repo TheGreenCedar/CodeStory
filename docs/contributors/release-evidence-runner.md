@@ -205,7 +205,15 @@ Release-evidence output is one input to the exact-head closeout ledger; it is
 not the ledger itself. Each producer supplies one
 `codestory.release-cell-manifest/v1` document for its graph-owned cell. The
 manifest carries the claim evidence row plus its workflow, run, attempt and
-artifact identity. Native cells also carry the applicable target, concrete
+artifact identity. Production cells are emitted only on producer success, and
+each immutable Actions artifact name includes its run attempt. The closeout
+coordinator queries artifact and per-attempt job metadata for the current run,
+selects each graph-owned job's latest execution, and requires that execution to
+be successful before binding the container id, digest, creation window and
+unflattened directory to its manifests. A failed newer execution cannot fall
+back to older evidence; jobs absent from a failed-job rerun may retain their
+last successful attempt. Manifests cannot authenticate themselves. Native
+cells also carry the applicable target, concrete
 host, runtime/native engine and calibration identities. The coordinator
 derives the required inventory from `release-claims.json`, so operators must
 not maintain a separate target checklist or combine multiple hosts into one
@@ -220,3 +228,15 @@ version, and platform hosts bind to the package matrix target. Keep the per-cell
 manifests and evaluations with both ledgers. A missing, duplicate, expired, failed,
 cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
 an operator override.
+
+Approved model-microbenchmark exceptions use a separately authenticated
+`codestory.release-closeout-exceptions/v1` input from the selected
+release-evidence artifact. Performance closeout includes the same-run
+`answer_quality` cell and passes that trusted exception map to the claim
+evaluator. Flattened or loose manifest JSON is never a closeout input.
+
+The production pre-publish inventory is 12 cells and intentionally excludes a
+candidate-installed runtime. Publication is the prerequisite for the
+marketplace-managed tier. The six installed-runtime cells appear only in the
+30-cell post-publish ledger, while #1221 continues to own the real
+two-session/one-server installed-runtime qualification.
