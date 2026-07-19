@@ -274,6 +274,13 @@ Full-refresh timing output includes produced and persisted chunk counts, queue
 capacity and high-water mark, producer backpressure time, and writer idle time.
 Those fields are omitted for the serial incremental path.
 
+`source_prepare_ms` covers the cache-key source read, hashing, decode, and
+artifact lookup before a file is parsed or reused. `projection_batch_wall_ms`
+covers complete nonempty store flush calls, including transaction setup and
+commit; `projection_flush_ms` and its per-table breakdown are nested inside it.
+The accompanying transaction count is therefore a persistence boundary count,
+not a row count.
+
 ### 8. Resolution happens after flushes
 
 Once all batched projection data has been flushed, the indexer runs `ResolutionPass`.
@@ -407,12 +414,15 @@ and publishes the attested generation. Core indexing never loads the model.
 
 The index summary reports graph and semantic work separately:
 
-- `timings_ms.cache_refresh`: wrapper time for canonical symbol streaming, search indexing, semantic sync, and runtime publication
+- `full_refresh_wall_ms`: mutually exclusive full-refresh stages from live-state inspection through catalog publication. `core_refresh_ms` is their wall envelope and `unattributed_ms` is the raw-duration residual after subtracting the named siblings. This object is absent for incremental refresh.
+- `timings_ms.cache_refresh`: post-core runtime-cache installation. A prepared full publication has already built semantic and search state, so this is not their wrapper.
 - `cache_ms.search_projection`: compatibility timing for the retired SQLite search-symbol projection rebuild; fresh product builds report zero
 - `cache_ms.search_index`: runtime search index construction for symbol names
 - `symbol_index.stream_ms`, `stream_rows`, and `stream_batches`: nested canonical-node read telemetry; stream time is part of `cache_ms.search_index`, not an additive phase
-- `symbol_index`: documents written plus Tantivy writer, commit, and reader-reload counts; completed-generation reuse reports zero for each count
+- `symbol_index`: documents written plus Tantivy writer, commit, and reader-reload counts and final commit/reload durations; all are nested inside `cache_ms.search_index`, and completed-generation reuse reports zero
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
+- `semantic_ms.node_load` and `node_rows`: loading the complete staged node set before semantic selection
+- `semantic_ms.context`: loading the graph context used by generated semantic documents
 - `semantic_ms.doc_build`: generated semantic text and hashes
 - `semantic_ms.embedding`: always zero for core indexing; retained as a compatibility field
 - `semantic_ms.db_upsert`: SQLite writes for symbol docs and embedding-free dense inputs
@@ -424,6 +434,13 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
 - `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v1`
+
+Only the sibling fields inside `full_refresh_wall_ms` are additive. Indexer
+children, semantic diagnostics, search stream/commit/reload timings, snapshot
+timings, SQLite checkpoint/sync timings, and runtime-cache publication are
+nested diagnostics and must not be added again. The repo-scale evidence
+artifact retains the complete first and repeat `phase_timings` objects so new
+diagnostics are not silently lost by a hand-maintained field list.
 
 Use these fields before changing parser, graph, or SQLite code for a slow
 `index` run.

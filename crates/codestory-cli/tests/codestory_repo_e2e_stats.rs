@@ -21,6 +21,7 @@ struct RepoE2eStats {
     embed_batch_size: u32,
     search_dir_unchanged: bool,
     index_seconds: f64,
+    phase_timings: Value,
     graph_phase_seconds: f64,
     semantic_phase_seconds: f64,
     semantic_embedding_ms: u64,
@@ -37,6 +38,7 @@ struct RepoE2eStats {
     semantic_docs_pending: u64,
     semantic_docs_stale: u64,
     repeat_full_refresh_seconds: f64,
+    repeat_phase_timings: Value,
     repeat_graph_phase_seconds: f64,
     repeat_semantic_phase_seconds: f64,
     repeat_semantic_doc_build_ms: u64,
@@ -348,6 +350,29 @@ fn parse_repeat_full_refresh_seconds(value: &str) -> Option<f64> {
 fn parse_stats_seconds(value: &str) -> Option<f64> {
     let value = value.replace(',', "");
     value.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn retained_phase_timings(index_json: &Value) -> Value {
+    index_json
+        .get("phase_timings")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn retained_phase_timings_preserve_additive_diagnostics() {
+    let index_json = serde_json::json!({
+        "phase_timings": {
+            "parse_index_ms": 12,
+            "future_additive_diagnostic": {"rows": 34}
+        }
+    });
+
+    let retained = retained_phase_timings(&index_json);
+
+    assert_eq!(retained["parse_index_ms"], 12);
+    assert_eq!(retained["future_additive_diagnostic"]["rows"], 34);
 }
 
 #[derive(Debug)]
@@ -1044,6 +1069,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         embed_batch_size: 128,
         search_dir_unchanged,
         index_seconds,
+        phase_timings: retained_phase_timings(&index_json),
         graph_phase_seconds: graph_phase_ms as f64 / 1000.0,
         semantic_phase_seconds,
         semantic_embedding_ms: optional_u64_field(
@@ -1099,6 +1125,7 @@ fn codestory_repo_release_e2e_emits_stats() {
             &["phase_timings", "semantic_docs_stale"],
         ),
         repeat_full_refresh_seconds,
+        repeat_phase_timings: retained_phase_timings(&repeat_index_json),
         repeat_graph_phase_seconds: repeat_graph_phase_ms as f64 / 1000.0,
         repeat_semantic_phase_seconds: repeat_semantic_phase_ms as f64 / 1000.0,
         repeat_semantic_doc_build_ms,

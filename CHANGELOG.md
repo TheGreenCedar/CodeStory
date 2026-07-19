@@ -4,6 +4,11 @@
 
 ### Performance
 
+- Full-refresh telemetry now reconciles exclusive outer wall stages and exposes
+  previously hidden source preparation, complete projection transactions,
+  semantic node/context loading, and final Tantivy commit/reload time. The
+  repo-scale evidence artifact retains the complete first and repeat timing
+  payloads instead of dropping unrecognized diagnostics.
 - Full refresh now persists each ordered parser-artifact chunk in one SQLite
   transaction instead of one autocommit per parsed file. Index telemetry
   reports artifact-cache rows, transactions, and write time separately.

@@ -1,8 +1,27 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct FullRefreshWallTimings {
+    pub core_refresh_ms: u32,
+    pub live_inspection_ms: u32,
+    pub source_discovery_ms: u32,
+    pub stage_open_ms: u32,
+    pub indexer_execution_ms: u32,
+    pub coverage_validation_ms: u32,
+    pub copy_forward_ms: u32,
+    pub semantic_stage_ms: u32,
+    pub snapshot_stage_ms: u32,
+    pub publication_prepare_ms: u32,
+    pub search_generation_ms: u32,
+    pub catalog_publication_ms: u32,
+    pub unattributed_ms: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 pub struct IndexingPhaseTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_wall: Option<FullRefreshWallTimings>,
     pub parse_index_ms: u32,
     pub projection_flush_ms: u32,
     pub edge_resolution_ms: u32,
@@ -42,6 +61,12 @@ pub struct IndexingPhaseTimings {
     pub full_refresh_chunk_budget_overruns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_refresh_chunk_planning_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_prepare_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_batch_wall_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_batch_transactions: Option<u32>,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_projection_rebuild_ms: Option<u32>,
@@ -62,7 +87,17 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_symbol_index_reload_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_commit_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_reload_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_cache_publish_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_node_load_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_node_load_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_context_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_doc_build_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,6 +277,7 @@ mod tests {
     #[test]
     fn test_indexing_phase_timings_omits_optional_resolution_fields_when_none() {
         let timings = IndexingPhaseTimings {
+            full_refresh_wall: None,
             parse_index_ms: 1,
             projection_flush_ms: 2,
             edge_resolution_ms: 3,
@@ -264,6 +300,9 @@ mod tests {
             full_refresh_chunk_max_nodes: None,
             full_refresh_chunk_budget_overruns: None,
             full_refresh_chunk_planning_ms: None,
+            source_prepare_ms: None,
+            projection_batch_wall_ms: None,
+            projection_batch_transactions: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_stream_ms: None,
@@ -274,7 +313,12 @@ mod tests {
             search_symbol_index_writer_count: None,
             search_symbol_index_commit_count: None,
             search_symbol_index_reload_count: None,
+            search_symbol_index_commit_ms: None,
+            search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_node_load_ms: None,
+            semantic_node_load_rows: None,
+            semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
@@ -350,6 +394,7 @@ mod tests {
         };
 
         let value = serde_json::to_value(timings).expect("serialize timings");
+        assert!(value.get("full_refresh_wall").is_none());
         assert!(value.get("artifact_cache_write_ms").is_none());
         assert!(value.get("artifact_cache_writes").is_none());
         assert!(value.get("artifact_cache_write_transactions").is_none());
@@ -367,11 +412,17 @@ mod tests {
         assert!(value.get("full_refresh_chunk_max_nodes").is_none());
         assert!(value.get("full_refresh_chunk_budget_overruns").is_none());
         assert!(value.get("full_refresh_chunk_planning_ms").is_none());
+        assert!(value.get("source_prepare_ms").is_none());
+        assert!(value.get("projection_batch_wall_ms").is_none());
+        assert!(value.get("projection_batch_transactions").is_none());
         assert!(value.get("resolution_unresolved_counts_ms").is_none());
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
         assert!(value.get("resolution_cleanup_ms").is_none());
         assert!(value.get("semantic_doc_build_ms").is_none());
+        assert!(value.get("semantic_node_load_ms").is_none());
+        assert!(value.get("semantic_node_load_rows").is_none());
+        assert!(value.get("semantic_context_ms").is_none());
         assert!(value.get("semantic_embedding_ms").is_none());
         assert!(value.get("semantic_db_upsert_ms").is_none());
         assert!(value.get("semantic_reload_ms").is_none());
@@ -385,6 +436,8 @@ mod tests {
         assert!(value.get("search_symbol_index_writer_count").is_none());
         assert!(value.get("search_symbol_index_commit_count").is_none());
         assert!(value.get("search_symbol_index_reload_count").is_none());
+        assert!(value.get("search_symbol_index_commit_ms").is_none());
+        assert!(value.get("search_symbol_index_reload_ms").is_none());
         assert!(value.get("runtime_cache_publish_ms").is_none());
         assert!(value.get("semantic_docs_reused").is_none());
         assert!(value.get("semantic_docs_embedded").is_none());
@@ -457,5 +510,57 @@ mod tests {
         assert!(value.get("resolved_imports_global_unique").is_none());
         assert!(value.get("resolved_imports_fuzzy").is_none());
         assert!(value.get("resolved_imports_semantic").is_none());
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_accepts_legacy_json_without_full_refresh_wall() {
+        let timings: IndexingPhaseTimings = serde_json::from_value(serde_json::json!({
+            "parse_index_ms": 1,
+            "projection_flush_ms": 2,
+            "edge_resolution_ms": 3,
+            "error_flush_ms": 4,
+            "cleanup_ms": 5,
+            "cache_refresh_ms": null,
+            "unresolved_calls_start": 6,
+            "unresolved_imports_start": 7,
+            "resolved_calls": 8,
+            "resolved_imports": 9,
+            "unresolved_calls_end": 10,
+            "unresolved_imports_end": 11
+        }))
+        .expect("deserialize legacy timings");
+
+        assert!(timings.full_refresh_wall.is_none());
+        assert!(timings.semantic_node_load_ms.is_none());
+        assert!(timings.search_symbol_index_commit_ms.is_none());
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_round_trips_full_refresh_wall() {
+        let wall = FullRefreshWallTimings {
+            core_refresh_ms: 78,
+            live_inspection_ms: 1,
+            source_discovery_ms: 2,
+            stage_open_ms: 3,
+            indexer_execution_ms: 4,
+            coverage_validation_ms: 5,
+            copy_forward_ms: 6,
+            semantic_stage_ms: 7,
+            snapshot_stage_ms: 8,
+            publication_prepare_ms: 9,
+            search_generation_ms: 10,
+            catalog_publication_ms: 11,
+            unattributed_ms: 12,
+        };
+        let timings = IndexingPhaseTimings {
+            full_refresh_wall: Some(wall.clone()),
+            ..IndexingPhaseTimings::default()
+        };
+
+        let value = serde_json::to_value(&timings).expect("serialize timings");
+        assert_eq!(value["full_refresh_wall"]["core_refresh_ms"], 78);
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize timings");
+        assert_eq!(decoded.full_refresh_wall, Some(wall));
     }
 }

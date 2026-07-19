@@ -14,29 +14,29 @@ use codestory_contracts::api::{
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
     EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, FileCoverageDiagnosticDto,
-    FrameworkRouteCoverageDto, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
-    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
-    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
-    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
-    IndexPublicationModeDto, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
-    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
-    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
-    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
-    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    SourceOccurrenceDto, SourcePolicyExclusionDto, StartIndexingRequest, StorageStatsDto,
-    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
-    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
-    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
-    WriteFileResponse, WriteFileTextRequest,
+    FrameworkRouteCoverageDto, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphRequest,
+    GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto,
+    GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto,
+    IndexFreshnessDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode,
+    IndexPublicationDto, IndexPublicationModeDto, IndexedFileDto,
+    IndexedFileIncompleteReasonCountDto, IndexedFileLanguageCountDto, IndexedFileRoleDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
+    ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto, RouteEndpointKindDto,
+    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
+    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
+    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
+    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
+    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
+    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, SourceOccurrenceDto,
+    SourcePolicyExclusionDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
+    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
+    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
+    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{
@@ -4763,6 +4763,9 @@ fn read_line_capped<R: BufRead>(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SemanticProjectionStats {
     reported: bool,
+    node_load_ms: u32,
+    node_load_rows: u32,
+    context_ms: u32,
     doc_build_ms: u32,
     embedding_ms: u32,
     db_upsert_ms: u32,
@@ -4804,6 +4807,8 @@ struct SearchStateBuildStats {
     search_symbol_index_writer_count: u32,
     search_symbol_index_commit_count: u32,
     search_symbol_index_reload_count: u32,
+    search_symbol_index_commit_ms: u32,
+    search_symbol_index_reload_ms: u32,
 }
 
 struct SearchStateBuildResult {
@@ -4828,6 +4833,9 @@ fn apply_semantic_projection_stats(
     if !stats.reported {
         return;
     }
+    timings.semantic_node_load_ms = Some(stats.node_load_ms);
+    timings.semantic_node_load_rows = Some(stats.node_load_rows);
+    timings.semantic_context_ms = Some(stats.context_ms);
     timings.semantic_doc_build_ms = Some(stats.doc_build_ms);
     timings.semantic_embedding_ms = Some(stats.embedding_ms);
     timings.semantic_db_upsert_ms = Some(stats.db_upsert_ms);
@@ -4861,6 +4869,8 @@ fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRef
         Some(stats.search_stats.search_symbol_index_commit_count);
     timings.search_symbol_index_reload_count =
         Some(stats.search_stats.search_symbol_index_reload_count);
+    timings.search_symbol_index_commit_ms = Some(stats.search_stats.search_symbol_index_commit_ms);
+    timings.search_symbol_index_reload_ms = Some(stats.search_stats.search_symbol_index_reload_ms);
     timings.runtime_cache_publish_ms = stats.runtime_cache_publish_ms;
     apply_semantic_projection_stats(timings, stats.semantic_stats);
 }
@@ -4941,6 +4951,12 @@ fn build_search_state_for_nodes(
         search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
         search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
         search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
+        search_symbol_index_commit_ms: clamp_u128_to_u32(
+            symbol_write_stats.commit_duration.as_millis(),
+        ),
+        search_symbol_index_reload_ms: clamp_u128_to_u32(
+            symbol_write_stats.reload_duration.as_millis(),
+        ),
     };
     engine.index_llm_symbol_docs(Vec::new());
     Ok(SearchStateBuildResult {
@@ -8461,12 +8477,14 @@ fn sync_llm_symbol_projection_for_runtime(
     let component_access = storage
         .get_component_access_map_for_nodes(&semantic_node_ids)
         .map_err(|e| ApiError::internal(format!("Failed to load symbol access metadata: {e}")))?;
+    let context_started = Instant::now();
     let graph_context = SemanticDocGraphContext::build_for_scope(
         storage,
         &context_nodes,
         nodes,
         semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
     )?;
+    stats.context_ms = clamp_u128_to_u32(context_started.elapsed().as_millis());
     let file_cache_started = Instant::now();
     let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
     doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
@@ -8795,16 +8813,19 @@ fn finalize_staged_semantic_docs_for_runtime(
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
+    let node_load_started = Instant::now();
     let nodes = storage
         .get_nodes()
         .map_err(|error| ApiError::internal(format!("Failed to load staged nodes: {error}")))?;
+    let node_load_ms = clamp_u128_to_u32(node_load_started.elapsed().as_millis());
+    let node_load_rows = clamp_usize_to_u32(nodes.len());
     let node_names = nodes
         .iter()
         .map(|node| (node.id, node_display_name(node)))
         .collect::<HashMap<_, _>>();
     let mut engine = SearchEngine::new(None)
         .map_err(|error| ApiError::internal(format!("Failed to init semantic engine: {error}")))?;
-    sync_llm_symbol_projection_for_runtime(
+    let mut stats = sync_llm_symbol_projection_for_runtime(
         storage,
         &nodes,
         &node_names,
@@ -8817,7 +8838,10 @@ fn finalize_staged_semantic_docs_for_runtime(
         source_identity,
         cancel_token,
         runtime,
-    )
+    )?;
+    stats.node_load_ms = node_load_ms;
+    stats.node_load_rows = node_load_rows;
+    Ok(stats)
 }
 
 fn load_persisted_semantic_docs_for_runtime(
@@ -14148,6 +14172,58 @@ struct IndexingRunSummary {
     prepared_search_state: Option<SearchStateBuildResult>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FullRefreshWallDurations {
+    live_inspection: Duration,
+    source_discovery: Duration,
+    stage_open: Duration,
+    indexer_execution: Duration,
+    coverage_validation: Duration,
+    copy_forward: Duration,
+    semantic_stage: Duration,
+    snapshot_stage: Duration,
+    publication_prepare: Duration,
+    search_generation: Duration,
+    catalog_publication: Duration,
+}
+
+impl FullRefreshWallDurations {
+    fn finish(self, core_refresh: Duration) -> FullRefreshWallTimings {
+        let accounted = [
+            self.live_inspection,
+            self.source_discovery,
+            self.stage_open,
+            self.indexer_execution,
+            self.coverage_validation,
+            self.copy_forward,
+            self.semantic_stage,
+            self.snapshot_stage,
+            self.publication_prepare,
+            self.search_generation,
+            self.catalog_publication,
+        ]
+        .into_iter()
+        .fold(Duration::ZERO, Duration::saturating_add);
+        let unattributed = core_refresh.saturating_sub(accounted);
+
+        FullRefreshWallTimings {
+            core_refresh_ms: clamp_u128_to_u32(core_refresh.as_millis()),
+            live_inspection_ms: clamp_u128_to_u32(self.live_inspection.as_millis()),
+            source_discovery_ms: clamp_u128_to_u32(self.source_discovery.as_millis()),
+            stage_open_ms: clamp_u128_to_u32(self.stage_open.as_millis()),
+            indexer_execution_ms: clamp_u128_to_u32(self.indexer_execution.as_millis()),
+            coverage_validation_ms: clamp_u128_to_u32(self.coverage_validation.as_millis()),
+            copy_forward_ms: clamp_u128_to_u32(self.copy_forward.as_millis()),
+            semantic_stage_ms: clamp_u128_to_u32(self.semantic_stage.as_millis()),
+            snapshot_stage_ms: clamp_u128_to_u32(self.snapshot_stage.as_millis()),
+            publication_prepare_ms: clamp_u128_to_u32(self.publication_prepare.as_millis()),
+            search_generation_ms: clamp_u128_to_u32(self.search_generation.as_millis()),
+            catalog_publication_ms: clamp_u128_to_u32(self.catalog_publication.as_millis()),
+            unattributed_ms: clamp_u128_to_u32(unattributed.as_millis()),
+        }
+    }
+}
+
 fn next_index_publication(
     previous: Option<&IndexPublicationRecord>,
     mode: IndexPublicationMode,
@@ -14248,6 +14324,9 @@ fn index_full_for_runtime(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
+    let core_refresh_started = Instant::now();
+    let mut wall_durations = FullRefreshWallDurations::default();
+    let mut wall_stage_started = Instant::now();
     let previous_publication = if storage_path.exists() {
         Store::database_index_publication(storage_path).map_err(|error| {
             ApiError::internal(format!(
@@ -14334,11 +14413,15 @@ fn index_full_for_runtime(
                 }
             }
         });
+    wall_durations.live_inspection = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let (execution_plan, policy_exclusions) =
         full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
 
+    wall_durations.source_discovery = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
         file_count: total_files,
@@ -14357,6 +14440,8 @@ fn index_full_for_runtime(
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
         .with_source_file_byte_cap(source_index_policy.byte_cap);
+    wall_durations.stage_open = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
     drop(bus);
@@ -14377,6 +14462,8 @@ fn index_full_for_runtime(
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
         }
     };
+    wall_durations.indexer_execution = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let coverage_gaps = match stored_file_coverage_diagnostics(root, staged.store_mut()) {
         Ok(coverage_gaps) => coverage_gaps,
         Err(error) => {
@@ -14422,6 +14509,8 @@ fn index_full_for_runtime(
             blocking_gaps,
         ));
     }
+    wall_durations.coverage_validation = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     if can_copy_forward {
         match staged
             .store_mut()
@@ -14458,6 +14547,8 @@ fn index_full_for_runtime(
             }
         }
     }
+    wall_durations.copy_forward = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let staged_semantic_stats = match finalize_staged_semantic_docs_for_runtime(
         staged.store_mut(),
         None,
@@ -14476,6 +14567,8 @@ fn index_full_for_runtime(
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
     }
+    wall_durations.semantic_stage = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let staged_finalize_stats = match staged.snapshots().finalize_staged() {
         Ok(stats) => stats,
         Err(err) => {
@@ -14499,6 +14592,8 @@ fn index_full_for_runtime(
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
     }
+    wall_durations.snapshot_stage = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     if recovering_incomplete_run && let Err(err) = staged.store_mut().begin_incremental_run() {
         let _ = staged.discard();
         return Err(ApiError::internal(format!(
@@ -14549,6 +14644,8 @@ fn index_full_for_runtime(
             "Failed to persist staged full publication identity: {error}"
         )));
     }
+    wall_durations.publication_prepare = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let prepared_search_state = match rebuild_search_state_from_storage_for_runtime(
         staged.store_mut(),
         storage_path,
@@ -14571,6 +14668,8 @@ fn index_full_for_runtime(
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
+    wall_durations.search_generation = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let staged_path = staged.path().to_path_buf();
     #[cfg(test)]
     if let Err(error) =
@@ -14649,11 +14748,14 @@ fn index_full_for_runtime(
         }
     };
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
+    wall_durations.catalog_publication = wall_stage_started.elapsed();
+    let full_refresh_wall = wall_durations.finish(core_refresh_started.elapsed());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
     let full_refresh_pipeline_enabled = index_stats.full_refresh_queue_capacity > 0;
     let full_refresh_chunking_enabled = index_stats.full_refresh_chunk_target_bytes > 0;
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
+            full_refresh_wall: Some(full_refresh_wall),
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
             projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
             edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
@@ -14698,6 +14800,11 @@ fn index_full_for_runtime(
             ),
             full_refresh_chunk_planning_ms: full_refresh_chunking_enabled
                 .then_some(clamp_u64_to_u32(index_stats.full_refresh_chunk_planning_ms)),
+            source_prepare_ms: Some(clamp_u64_to_u32(index_stats.source_prepare_ms)),
+            projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
+            projection_batch_transactions: Some(clamp_usize_to_u32(
+                index_stats.projection_batch_transactions,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_stream_ms: None,
@@ -14708,7 +14815,12 @@ fn index_full_for_runtime(
             search_symbol_index_writer_count: None,
             search_symbol_index_commit_count: None,
             search_symbol_index_reload_count: None,
+            search_symbol_index_commit_ms: None,
+            search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_node_load_ms: None,
+            semantic_node_load_rows: None,
+            semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
@@ -15323,6 +15435,7 @@ fn run_incremental_indexing_common(
 
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
+            full_refresh_wall: None,
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
             projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
             edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
@@ -15347,6 +15460,11 @@ fn run_incremental_indexing_common(
             full_refresh_chunk_max_nodes: None,
             full_refresh_chunk_budget_overruns: None,
             full_refresh_chunk_planning_ms: None,
+            source_prepare_ms: Some(clamp_u64_to_u32(index_stats.source_prepare_ms)),
+            projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
+            projection_batch_transactions: Some(clamp_usize_to_u32(
+                index_stats.projection_batch_transactions,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_stream_ms: None,
@@ -15357,7 +15475,12 @@ fn run_incremental_indexing_common(
             search_symbol_index_writer_count: None,
             search_symbol_index_commit_count: None,
             search_symbol_index_reload_count: None,
+            search_symbol_index_commit_ms: None,
+            search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_node_load_ms: None,
+            semantic_node_load_rows: None,
+            semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
@@ -15657,6 +15780,12 @@ fn build_persisted_search_state_from_canonical_symbols(
             search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
             search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
             search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
+            search_symbol_index_commit_ms: clamp_u128_to_u32(
+                symbol_write_stats.commit_duration.as_millis(),
+            ),
+            search_symbol_index_reload_ms: clamp_u128_to_u32(
+                symbol_write_stats.reload_duration.as_millis(),
+            ),
         },
         semantic_stats,
     })
@@ -15858,6 +15987,21 @@ mod tests {
 
     #[path = "activation_coverage_tests.rs"]
     mod activation_coverage_tests;
+
+    #[test]
+    fn full_refresh_wall_residual_uses_raw_durations_before_millis_conversion() {
+        let wall = FullRefreshWallDurations {
+            live_inspection: Duration::from_micros(750),
+            source_discovery: Duration::from_micros(250),
+            ..FullRefreshWallDurations::default()
+        }
+        .finish(Duration::from_micros(1_500));
+
+        assert_eq!(wall.core_refresh_ms, 1);
+        assert_eq!(wall.live_inspection_ms, 0);
+        assert_eq!(wall.source_discovery_ms, 0);
+        assert_eq!(wall.unattributed_ms, 0);
+    }
 
     fn all_permutations<T: Clone>(values: &[T]) -> Vec<Vec<T>> {
         fn visit<T: Clone>(values: &mut [T], index: usize, output: &mut Vec<Vec<T>>) {
@@ -25531,6 +25675,33 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(full_timings.search_symbol_index_writer_count, Some(1));
         assert_eq!(full_timings.search_symbol_index_commit_count, Some(1));
         assert_eq!(full_timings.search_symbol_index_reload_count, Some(1));
+        assert!(full_timings.search_symbol_index_commit_ms.is_some());
+        assert!(full_timings.search_symbol_index_reload_ms.is_some());
+        assert!(full_timings.semantic_node_load_ms.is_some());
+        assert!(
+            full_timings
+                .semantic_node_load_rows
+                .is_some_and(|rows| rows > 0)
+        );
+        assert!(full_timings.semantic_context_ms.is_some());
+        let full_refresh_wall = full_timings
+            .full_refresh_wall
+            .as_ref()
+            .expect("full refresh wall accounting");
+        let accounted_ms = full_refresh_wall
+            .live_inspection_ms
+            .saturating_add(full_refresh_wall.source_discovery_ms)
+            .saturating_add(full_refresh_wall.stage_open_ms)
+            .saturating_add(full_refresh_wall.indexer_execution_ms)
+            .saturating_add(full_refresh_wall.coverage_validation_ms)
+            .saturating_add(full_refresh_wall.copy_forward_ms)
+            .saturating_add(full_refresh_wall.semantic_stage_ms)
+            .saturating_add(full_refresh_wall.snapshot_stage_ms)
+            .saturating_add(full_refresh_wall.publication_prepare_ms)
+            .saturating_add(full_refresh_wall.search_generation_ms)
+            .saturating_add(full_refresh_wall.catalog_publication_ms)
+            .saturating_add(full_refresh_wall.unattributed_ms);
+        assert!(accounted_ms <= full_refresh_wall.core_refresh_ms);
         assert_eq!(
             Storage::open(&storage_path)
                 .expect("open full publication")
@@ -25567,6 +25738,7 @@ fn build_llm_symbol_doc_text() -> String {
                 .is_none()
         );
         assert!(incremental_timings.full_refresh_chunk_planning_ms.is_none());
+        assert!(incremental_timings.full_refresh_wall.is_none());
         assert!(
             incremental_timings
                 .staged_sqlite_wal_autocheckpoint_bytes

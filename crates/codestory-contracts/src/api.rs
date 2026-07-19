@@ -68,7 +68,7 @@ pub use errors::{
     ApiError, ApiErrorDetails, COMMAND_FAILURE_SCHEMA_VERSION, CommandFailureEnvelope,
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto,
 };
-pub use events::{AppEventPayload, IndexingPhaseTimings};
+pub use events::{AppEventPayload, FullRefreshWallTimings, IndexingPhaseTimings};
 pub use ids::{EdgeId, NodeId};
 pub use types::{
     EdgeKind, IndexMode, LayoutDirection, MemberAccess, NodeKind, TrailCallerScope, TrailDirection,
