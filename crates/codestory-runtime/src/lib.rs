@@ -97,6 +97,10 @@ mod query_language;
 mod repository_identity;
 mod search;
 mod search_runtime;
+#[cfg(feature = "benchmark-support")]
+pub mod benchmark_support {
+    pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
+}
 mod semantic_doc_text;
 mod services;
 mod support;
@@ -4801,6 +4805,10 @@ struct SemanticRefreshScope<'a> {
 struct SearchStateBuildStats {
     search_projection_rebuild_ms: u32,
     search_symbol_index_ms: u32,
+    search_symbol_index_docs_written: u32,
+    search_symbol_index_writer_count: u32,
+    search_symbol_index_commit_count: u32,
+    search_symbol_index_reload_count: u32,
 }
 
 struct SearchStateBuildResult {
@@ -4847,6 +4855,14 @@ fn apply_semantic_projection_stats(
 fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRefreshStats) {
     timings.search_projection_rebuild_ms = Some(stats.search_stats.search_projection_rebuild_ms);
     timings.search_symbol_index_ms = Some(stats.search_stats.search_symbol_index_ms);
+    timings.search_symbol_index_docs_written =
+        Some(stats.search_stats.search_symbol_index_docs_written);
+    timings.search_symbol_index_writer_count =
+        Some(stats.search_stats.search_symbol_index_writer_count);
+    timings.search_symbol_index_commit_count =
+        Some(stats.search_stats.search_symbol_index_commit_count);
+    timings.search_symbol_index_reload_count =
+        Some(stats.search_stats.search_symbol_index_reload_count);
     timings.runtime_cache_publish_ms = stats.runtime_cache_publish_ms;
     apply_semantic_projection_stats(timings, stats.semantic_stats);
 }
@@ -4866,9 +4882,18 @@ fn build_search_state(
         nodes,
         llm_refresh_file_scope,
         semantic_projection_mode,
-        hydrate_semantic_docs,
-        &test_sidecar_runtime_from_env(),
+        SearchStateBuildContext {
+            hydrate_semantic_docs,
+            runtime: &test_sidecar_runtime_from_env(),
+            cancel_token: None,
+        },
     )
+}
+
+struct SearchStateBuildContext<'a> {
+    hydrate_semantic_docs: bool,
+    runtime: &'a codestory_retrieval::SidecarRuntimeConfig,
+    cancel_token: Option<&'a CancellationToken>,
 }
 
 fn build_search_state_for_runtime(
@@ -4877,9 +4902,13 @@ fn build_search_state_for_runtime(
     nodes: Vec<codestory_contracts::graph::Node>,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     semantic_projection_mode: SemanticProjectionMode,
-    hydrate_semantic_docs: bool,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    context: SearchStateBuildContext<'_>,
 ) -> Result<SearchStateBuildResult, ApiError> {
+    let SearchStateBuildContext {
+        hydrate_semantic_docs,
+        runtime,
+        cancel_token,
+    } = context;
     let projection_started = Instant::now();
     match llm_refresh_file_scope {
         Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
@@ -4900,22 +4929,36 @@ fn build_search_state_for_runtime(
             ApiError::internal(format!("Failed to init search engine: {error}"))
         }
     })?;
+    let mut symbol_session = engine.begin_symbol_index().map_err(|error| {
+        ApiError::internal(format!("Failed to start symbol index writer: {error}"))
+    })?;
     let mut search_nodes = Vec::with_capacity(nodes.len().min(SEARCH_NODE_BATCH_SIZE));
     for node in &nodes {
         let display_name = node_display_name(node);
         node_names.insert(node.id, display_name.clone());
         search_nodes.push((node.id, display_name));
         if search_nodes.len() >= SEARCH_NODE_BATCH_SIZE {
-            engine
-                .index_nodes(std::mem::take(&mut search_nodes))
+            symbol_session
+                .add_nodes(std::mem::take(&mut search_nodes))
                 .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
         }
     }
     if !search_nodes.is_empty() {
-        engine
-            .index_nodes(search_nodes)
+        symbol_session
+            .add_nodes(search_nodes)
             .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
     }
+    #[cfg(test)]
+    publication_test_checkpoint(PublicationTestBoundary::SearchIndexWrite, cancel_token)?;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let symbol_write_stats = symbol_session
+        .finish()
+        .map_err(|e| ApiError::internal(format!("Failed to commit symbol index: {e}")))?;
     if search_storage_path.is_some() && engine.full_text_doc_count() != nodes.len() {
         return Err(ApiError::internal(format!(
             "Persisted search generation validation failed: indexed {} docs for {} nodes",
@@ -4927,6 +4970,10 @@ fn build_search_state_for_runtime(
     let search_stats = SearchStateBuildStats {
         search_projection_rebuild_ms,
         search_symbol_index_ms,
+        search_symbol_index_docs_written: clamp_usize_to_u32(symbol_write_stats.docs_written),
+        search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
+        search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
+        search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
     };
     let semantic_stats = match semantic_projection_mode {
         SemanticProjectionMode::PersistBackedDocs => sync_llm_symbol_projection_for_runtime(
@@ -6156,6 +6203,7 @@ struct SearchGenerationCatalogGuard {
 enum PublicationTestBoundary {
     Identity,
     SearchBuild,
+    SearchIndexWrite,
     SearchValidation,
     SearchCompletion,
     CatalogLock,
@@ -14617,6 +14665,10 @@ fn index_full_for_runtime(
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
+            search_symbol_index_docs_written: None,
+            search_symbol_index_writer_count: None,
+            search_symbol_index_commit_count: None,
+            search_symbol_index_reload_count: None,
             runtime_cache_publish_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
@@ -15238,6 +15290,10 @@ fn run_incremental_indexing_common(
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
+            search_symbol_index_docs_written: None,
+            search_symbol_index_writer_count: None,
+            search_symbol_index_commit_count: None,
+            search_symbol_index_reload_count: None,
             runtime_cache_publish_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
@@ -15432,6 +15488,7 @@ fn reuse_completed_search_state(
         search_stats: SearchStateBuildStats {
             search_projection_rebuild_ms,
             search_symbol_index_ms,
+            ..SearchStateBuildStats::default()
         },
         semantic_stats,
     }))
@@ -15507,8 +15564,11 @@ fn rebuild_search_state_from_storage_for_runtime(
             nodes,
             llm_refresh_scope,
             SemanticProjectionMode::LoadPersistedDocs,
-            hydrate_semantic_docs,
-            runtime,
+            SearchStateBuildContext {
+                hydrate_semantic_docs,
+                runtime,
+                cancel_token,
+            },
         )
         .map_err(|mut error| {
             error.message = format!("Failed to rebuild search state: {}", error.message);
@@ -24284,6 +24344,42 @@ fn build_llm_symbol_doc_text() -> String {
         let finisher_state =
             rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
                 .expect("indexing finisher builds search generation");
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_docs_written,
+            3
+        );
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_writer_count,
+            1
+        );
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_commit_count,
+            1
+        );
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_reload_count,
+            1
+        );
+        let reused_state =
+            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+                .expect("indexing finisher reuses completed search generation");
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_docs_written,
+            0
+        );
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_writer_count,
+            0
+        );
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_commit_count,
+            0
+        );
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_reload_count,
+            0
+        );
+        drop(reused_state);
         env.push(EnvGuard::set(
             crate::search::engine::SYMBOL_FULL_TEXT_INDEX_ENV,
             "false",
@@ -25771,9 +25867,10 @@ fn build_llm_symbol_doc_text() -> String {
         }
     }
 
-    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 8] = [
+    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 9] = [
         PublicationTestBoundary::Identity,
         PublicationTestBoundary::SearchBuild,
+        PublicationTestBoundary::SearchIndexWrite,
         PublicationTestBoundary::SearchValidation,
         PublicationTestBoundary::SearchCompletion,
         PublicationTestBoundary::CatalogLock,
@@ -26107,6 +26204,70 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(storage_has_symbol(&storage, "old_generation"));
         assert!(!storage_has_symbol(&storage, "new_generation"));
         assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    fn assert_symbol_index_failure_preserves_previous_complete_publication(
+        fault: search::engine::SymbolIndexTestFault,
+        expected_error: &str,
+    ) {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open add-failure baseline");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("publish add-failure baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open add-failure baseline")
+            .get_complete_index_publication()
+            .expect("read add-failure baseline")
+            .expect("complete add-failure baseline");
+
+        fs::write(
+            &source_path,
+            "pub fn new_generation() -> i32 { 2 }\npub fn another_symbol() {}\n",
+        )
+        .expect("write replacement source");
+        search::engine::arm_symbol_index_test_fault(fault);
+        let error = controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect_err("symbol index failure must reject the candidate");
+
+        assert!(error.message.contains(expected_error));
+        let storage = Storage::open(&storage_path).expect("open preserved publication");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline)
+        );
+        assert!(storage_has_symbol(&storage, "old_generation"));
+        assert!(!storage_has_symbol(&storage, "new_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn symbol_index_add_failure_preserves_previous_complete_publication() {
+        assert_symbol_index_failure_preserves_previous_complete_publication(
+            search::engine::SymbolIndexTestFault::AddDocumentAfterOne,
+            "add-document failure",
+        );
+    }
+
+    #[test]
+    fn symbol_index_commit_failure_preserves_previous_complete_publication() {
+        assert_symbol_index_failure_preserves_previous_complete_publication(
+            search::engine::SymbolIndexTestFault::Commit,
+            "commit failure",
+        );
     }
 
     #[test]

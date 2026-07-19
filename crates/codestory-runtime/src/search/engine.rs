@@ -18,8 +18,8 @@ use std::sync::Arc;
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
-use tantivy::schema::Value;
 use tantivy::schema::{FAST, INDEXED, STORED, Schema, TEXT};
+use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
 pub const EMBEDDING_DIM: usize = codestory_retrieval::RETRIEVAL_EMBEDDING_DIM;
@@ -379,6 +379,61 @@ pub struct SearchEngine {
     #[cfg(test)]
     query_embedding_cache: HashMap<String, Vec<f32>>,
     _persisted_index_guard: Option<PersistedSearchIndexGuard>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SymbolIndexWriteStats {
+    pub docs_written: usize,
+    pub writer_count: usize,
+    pub commit_count: usize,
+    pub reload_count: usize,
+}
+
+pub struct SymbolIndexSession<'a> {
+    engine: &'a mut SearchEngine,
+    writer: Option<IndexWriter<TantivyDocument>>,
+    name_field: Field,
+    id_field: Field,
+    symbols_start_len: usize,
+    docs_written: usize,
+    finished: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SymbolIndexTestFault {
+    AddDocument,
+    AddDocumentAfterOne,
+    Commit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYMBOL_INDEX_TEST_FAULT: std::cell::Cell<Option<SymbolIndexTestFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_symbol_index_test_fault(fault: SymbolIndexTestFault) {
+    SYMBOL_INDEX_TEST_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+fn take_symbol_index_test_fault(expected: SymbolIndexTestFault) -> bool {
+    SYMBOL_INDEX_TEST_FAULT.with(|slot| {
+        if expected == SymbolIndexTestFault::AddDocument
+            && slot.get() == Some(SymbolIndexTestFault::AddDocumentAfterOne)
+        {
+            slot.set(Some(SymbolIndexTestFault::AddDocument));
+            return false;
+        }
+        if slot.get() == Some(expected) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 struct PersistedSearchIndexGuard {
@@ -794,6 +849,11 @@ impl SearchEngine {
         self.reader.searcher().num_docs() as usize
     }
 
+    #[cfg(feature = "benchmark-support")]
+    pub fn tantivy_segment_count(&self) -> usize {
+        self.reader.searcher().segment_readers().len()
+    }
+
     #[cfg(test)]
     pub fn semantic_index_ready(&self) -> bool {
         self.embedding_runtime.is_some() && !self.llm_docs.is_empty()
@@ -862,32 +922,30 @@ impl SearchEngine {
             .semantic_scores_for_query(query, query_embedding, semantic_limit)
     }
 
-    pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
-        if !self.full_text_index_enabled {
-            self.symbols.extend(
-                nodes
-                    .into_iter()
-                    .map(|(id, name)| (Utf32String::from(name.as_str()), id)),
-            );
-            return Ok(());
-        }
-
-        let mut index_writer: IndexWriter<TantivyDocument> =
-            self.index.writer(SEARCH_WRITER_HEAP_BYTES)?;
+    pub fn begin_symbol_index(&mut self) -> Result<SymbolIndexSession<'_>> {
+        let writer = self
+            .full_text_index_enabled
+            .then(|| self.index.writer(SEARCH_WRITER_HEAP_BYTES))
+            .transpose()?;
         let schema = self.index.schema();
         let name_field = schema.get_field("name")?;
         let id_field = schema.get_field("node_id")?;
+        let symbols_start_len = self.symbols.len();
+        Ok(SymbolIndexSession {
+            engine: self,
+            writer,
+            name_field,
+            id_field,
+            symbols_start_len,
+            docs_written: 0,
+            finished: false,
+        })
+    }
 
-        for (id, name) in nodes {
-            self.symbols.push((Utf32String::from(name.as_str()), id));
-            index_writer.add_document(doc!(
-                name_field => name,
-                id_field => id.0
-            ))?;
-        }
-
-        index_writer.commit()?;
-        self.reader.reload()?;
+    pub fn index_nodes(&mut self, nodes: Vec<(NodeId, String)>) -> Result<()> {
+        let mut session = self.begin_symbol_index()?;
+        session.add_nodes(nodes)?;
+        session.finish()?;
         Ok(())
     }
 
@@ -1013,6 +1071,62 @@ impl SearchEngine {
         }
 
         Ok(results)
+    }
+}
+
+impl SymbolIndexSession<'_> {
+    pub fn add_nodes<I>(&mut self, nodes: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (NodeId, String)>,
+    {
+        let start_count = self.docs_written;
+        for (id, name) in nodes {
+            #[cfg(test)]
+            if take_symbol_index_test_fault(SymbolIndexTestFault::AddDocument) {
+                bail!("injected symbol index add-document failure");
+            }
+            let fuzzy_name = Utf32String::from(name.as_str());
+            if let Some(writer) = self.writer.as_mut() {
+                writer.add_document(doc!(
+                    self.name_field => name,
+                    self.id_field => id.0
+                ))?;
+            }
+            self.engine.symbols.push((fuzzy_name, id));
+            self.docs_written = self.docs_written.saturating_add(1);
+        }
+        Ok(self.docs_written.saturating_sub(start_count))
+    }
+
+    pub fn finish(mut self) -> Result<SymbolIndexWriteStats> {
+        let writer_count = usize::from(self.writer.is_some());
+        let mut commit_count = 0;
+        let mut reload_count = 0;
+        if let Some(mut writer) = self.writer.take() {
+            #[cfg(test)]
+            if take_symbol_index_test_fault(SymbolIndexTestFault::Commit) {
+                bail!("injected symbol index commit failure");
+            }
+            writer.commit()?;
+            commit_count = 1;
+            self.engine.reader.reload()?;
+            reload_count = 1;
+        }
+        self.finished = true;
+        Ok(SymbolIndexWriteStats {
+            docs_written: self.docs_written,
+            writer_count,
+            commit_count,
+            reload_count,
+        })
+    }
+}
+
+impl Drop for SymbolIndexSession<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.engine.symbols.truncate(self.symbols_start_len);
+        }
     }
 }
 
@@ -1601,6 +1715,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn symbol_index_session_commits_and_reloads_once_across_windows() -> Result<()> {
+        let directory = tempdir()?;
+        let mut engine = SearchEngine::new(Some(directory.path()))?;
+        let stats = {
+            let mut session = engine.begin_symbol_index()?;
+            assert_eq!(
+                session.add_nodes(vec![(NodeId(1), "Alpha".to_string())])?,
+                1
+            );
+            assert_eq!(session.add_nodes(vec![(NodeId(2), "Beta".to_string())])?, 1);
+            session.finish()?
+        };
+
+        assert_eq!(stats.docs_written, 2);
+        assert_eq!(stats.writer_count, 1);
+        assert_eq!(stats.commit_count, 1);
+        assert_eq!(stats.reload_count, 1);
+        assert_eq!(engine.tantivy_doc_count(), 2);
+        assert_eq!(engine.search_symbol("Alpha"), vec![NodeId(1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn unfinished_symbol_index_session_restores_projection_without_committing() -> Result<()> {
+        let directory = tempdir()?;
+        let mut engine = SearchEngine::new(Some(directory.path()))?;
+        {
+            let mut session = engine.begin_symbol_index()?;
+            session.add_nodes(vec![(NodeId(1), "Partial".to_string())])?;
+        }
+
+        assert!(engine.symbols().is_empty());
+        assert_eq!(engine.tantivy_doc_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_index_add_failure_rolls_back_projection_and_uncommitted_docs() -> Result<()> {
+        let directory = tempdir()?;
+        let mut engine = SearchEngine::new(Some(directory.path()))?;
+        let error = {
+            let mut session = engine.begin_symbol_index()?;
+            session.add_nodes(vec![(NodeId(1), "Accepted".to_string())])?;
+            arm_symbol_index_test_fault(SymbolIndexTestFault::AddDocument);
+            session
+                .add_nodes(vec![(NodeId(2), "Rejected".to_string())])
+                .expect_err("injected add-document failure")
+        };
+
+        assert!(error.to_string().contains("add-document failure"));
+        assert!(engine.symbols().is_empty());
+        assert_eq!(engine.tantivy_doc_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_index_commit_failure_rolls_back_projection_and_uncommitted_docs() -> Result<()> {
+        let directory = tempdir()?;
+        let mut engine = SearchEngine::new(Some(directory.path()))?;
+        let error = {
+            let mut session = engine.begin_symbol_index()?;
+            session.add_nodes(vec![(NodeId(1), "Uncommitted".to_string())])?;
+            arm_symbol_index_test_fault(SymbolIndexTestFault::Commit);
+            session.finish().expect_err("injected commit failure")
+        };
+
+        assert!(error.to_string().contains("commit failure"));
+        assert!(engine.symbols().is_empty());
+        assert_eq!(engine.tantivy_doc_count(), 0);
+        Ok(())
     }
 
     #[test]

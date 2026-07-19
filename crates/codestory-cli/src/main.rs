@@ -8936,6 +8936,10 @@ mod tests {
             cache_refresh_ms: Some(6),
             search_projection_rebuild_ms: Some(61),
             search_symbol_index_ms: Some(62),
+            search_symbol_index_docs_written: Some(8192),
+            search_symbol_index_writer_count: Some(1),
+            search_symbol_index_commit_count: Some(1),
+            search_symbol_index_reload_count: Some(1),
             runtime_cache_publish_ms: Some(63),
             semantic_doc_build_ms: Some(7),
             semantic_embedding_ms: Some(8),
@@ -9165,6 +9169,7 @@ mod tests {
             "cache_ms: artifact_write=6 search_projection=61 search_index=62 runtime_publish=63"
         ));
         assert!(markdown.contains("artifact_cache: writes=24 transactions=1"));
+        assert!(markdown.contains("symbol_index: docs=8192 writers=1 commits=1 reloads=1"));
         assert!(
             markdown
                 .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")

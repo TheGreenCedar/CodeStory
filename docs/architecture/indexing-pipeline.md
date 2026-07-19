@@ -277,6 +277,15 @@ Full and incremental snapshot behavior are intentionally not symmetric.
 
 After graph and snapshot work, runtime rebuilds the search-symbol projection, opens or refreshes the persisted Tantivy search directory, writes graph-native symbol docs, writes deterministic component reports, and synchronizes selected dense-anchor docs. This is part of the default `index` contract.
 
+A new persisted symbol generation uses one 20 MB Tantivy writer across the
+existing 8,192-document checkpoints. Runtime checks cancellation after each
+checkpoint and immediately before the single commit/reload. Dropping an
+unfinished writer restores its in-memory fuzzy projection; the generation is
+not admitted until document-count validation and the completion marker both
+succeed. This protects process failure and cancellation. The completion-marker
+rename does not claim power-loss durability before its parent directory is
+synced.
+
 Semantic sync does these pieces of work:
 
 - build deterministic generated text for durable AST symbols and store it in `symbol_search_doc`
@@ -356,6 +365,7 @@ The index summary reports graph and semantic work separately:
 - `timings_ms.cache_refresh`: wrapper time for search projection, search indexing, semantic sync, and runtime publication
 - `cache_ms.search_projection`: SQLite search-symbol projection rebuild from persisted nodes
 - `cache_ms.search_index`: runtime search index construction for symbol names
+- `symbol_index`: documents written plus Tantivy writer, commit, and reader-reload counts; completed-generation reuse reports zero for each count
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
 - `semantic_ms.doc_build`: generated semantic text and hashes
 - `semantic_ms.embedding`: always zero for core indexing; retained as a compatibility field
