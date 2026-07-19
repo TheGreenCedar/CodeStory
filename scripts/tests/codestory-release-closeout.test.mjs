@@ -88,7 +88,8 @@ function identityFor(cell) {
       case "evaluation_contract": identity[key] = "publishable-three-repeat-packet/v1"; break;
       case "producer_run_id": identity[key] = "12345"; break;
       case "producer_run_attempt": identity[key] = "1"; break;
-      case "producer_artifact": identity[key] = target ? archiveName(target) : `${cell.id}.json`; break;
+      case "producer_job": identity[key] = cell.identity_constraints.producer_job; break;
+      case "producer_artifact": identity[key] = cell.identity_constraints.producer_artifact; break;
       case "native_engine": identity[key] = "coderank_q8"; break;
       case "calibration_sha256": identity[key] = "c".repeat(64); break;
       default: throw new Error(`test fixture has no identity value for ${key}`);
@@ -121,7 +122,7 @@ function manifestsFor(phase, prePublishLedger = null) {
     };
     if (cell.archive_role === "pre_publish") {
       manifest.archive = {
-        name: identity.producer_artifact,
+        name: archiveName(identity.target),
         sha256: identity.artifact_sha256,
         bytes: 1024,
       };
@@ -134,6 +135,7 @@ function manifestsFor(phase, prePublishLedger = null) {
         pre_publish_cell_id: packageCell.id,
         pre_publish_manifest_sha256: packageCell.manifest.sha256,
         pre_publish_artifact_sha256: packageCell.archive.sha256,
+        published_artifact_name: packageCell.archive.name,
         published_artifact_sha256: packageCell.archive.sha256,
       };
     }
@@ -141,7 +143,23 @@ function manifestsFor(phase, prePublishLedger = null) {
   });
 }
 
-function evaluate(phase, manifests, prePublishLedger = null) {
+function trustedProducersFor(phase) {
+  return {
+    schema: "codestory.release-producer-map/v1",
+    phase,
+    identity: gitIdentity,
+    producers: deriveReleaseCells(graph, phase).map((cell) => ({
+      cell_id: cell.id,
+      producer_workflow: cell.identity_constraints.producer_workflow,
+      producer_job: cell.identity_constraints.producer_job,
+      producer_run_id: "12345",
+      producer_run_attempt: "1",
+      producer_artifact: cell.identity_constraints.producer_artifact,
+    })),
+  };
+}
+
+function evaluate(phase, manifests, prePublishLedger = null, trustedProducers = trustedProducersFor(phase)) {
   return evaluateReleaseCloseout({
     graph,
     phase,
@@ -150,6 +168,7 @@ function evaluate(phase, manifests, prePublishLedger = null) {
     gitIdentity,
     manifests,
     prePublishLedger,
+    trustedProducers,
   });
 }
 
@@ -166,6 +185,8 @@ test("cell inventory is derived only from the release claim graph", () => {
     postPublish.find(({ id }) => id === "platform_support:linux-arm64").identity_constraints,
     {
       producer_workflow: ".github/workflows/post-publish-release-smoke.yml",
+      producer_job: "smoke",
+      producer_artifact: "release-cell-postpublish-linux-arm64",
       target: "linux-arm64",
       host_os: "Linux",
       host_arch: "ARM64",
@@ -321,4 +342,33 @@ test("missing, duplicate, stale, failed, aggregate, and reused evidence fail clo
       }
     });
   }
+});
+
+test("producer identity is accepted only from the separately trusted map", () => {
+  const manifests = manifestsFor("pre_publish");
+  const missingMap = evaluate("pre_publish", manifests, null, null);
+  assert.equal(missingMap.decision, "reject");
+  assert.ok(missingMap.summary.input_errors.includes("closeout requires a separately trusted producer map"));
+
+  for (const [key, value] of [
+    ["producer_workflow", ".github/workflows/arbitrary.yml"],
+    ["producer_run_id", "999"],
+    ["producer_run_attempt", "2"],
+  ]) {
+    const wrongProducer = trustedProducersFor("pre_publish");
+    wrongProducer.producers.find(({ cell_id: cellId }) => cellId === "source_behavior")[key] = value;
+    const rejected = evaluate("pre_publish", manifests, null, wrongProducer);
+    assert.equal(rejected.decision, "reject", key);
+    assert.ok(
+      rejected.summary.failed_cells.includes("source_behavior")
+        || rejected.summary.input_errors.some((message) => message.includes(key)),
+      key,
+    );
+  }
+
+  const wrongArtifact = trustedProducersFor("pre_publish");
+  wrongArtifact.producers.find(({ cell_id: cellId }) => cellId === "performance").producer_artifact = "wrong";
+  const rejectedArtifact = evaluate("pre_publish", manifests, null, wrongArtifact);
+  assert.equal(rejectedArtifact.decision, "reject");
+  assert.ok(rejectedArtifact.summary.input_errors.some((message) => message.includes("producer_artifact")));
 });

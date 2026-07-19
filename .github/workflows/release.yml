@@ -69,6 +69,7 @@ jobs:
         run: >-
           node --test
           scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-cell-manifest.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
 
@@ -142,8 +143,19 @@ jobs:
       profile: codestory-release-evidence-linux-arm64-v2
       drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
       source_run_id: ${{ inputs.source_run_id }}
+      version: ${{ needs.preflight.outputs.version }}
+      emit_release_cells: true
     secrets:
       CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: ${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}
+
+  source-proof:
+    needs: preflight
+    uses: ./.github/workflows/source-proof.yml
+    with:
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      version: ${{ needs.preflight.outputs.version }}
+      emit_release_cells: true
 
   packaged-proof:
     needs:
@@ -156,6 +168,7 @@ jobs:
       scope: full
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
+      emit_release_cells: true
       quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
@@ -183,6 +196,7 @@ jobs:
       quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      emit_release_cells: true
 
   windows-vulkan-proof:
     needs:
@@ -197,14 +211,71 @@ jobs:
       quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      emit_release_cells: true
+
+  pre-publish-closeout:
+    name: Authenticate pre-publish release cells
+    needs:
+      - preflight
+      - source-proof
+      - release-evidence
+      - packaged-proof
+      - macos-metal-proof
+      - windows-vulkan-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Download pre-publish release cells
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-cell-prepublish-*
+          path: target/release-cell-manifests
+          merge-multiple: true
+
+      - name: Evaluate authenticated pre-publish closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          evaluated_at="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+          node scripts/codestory-release-cell-manifest.mjs producer-map \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$GITHUB_SHA" \
+            --phase pre_publish \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --out target/release-closeout/trusted-pre-publish-producers.json
+          node scripts/codestory-release-closeout.mjs evaluate \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$GITHUB_SHA" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --phase pre_publish \
+            --evaluated-at "$evaluated_at" \
+            --trusted-producers target/release-closeout/trusted-pre-publish-producers.json \
+            --manifest-dir target/release-cell-manifests \
+            --out-dir target/release-closeout/pre_publish
+
+      - name: Upload accepted pre-publish closeout
+        if: success()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+          path: |
+            target/release-closeout/trusted-pre-publish-producers.json
+            target/release-closeout/pre_publish
+          if-no-files-found: error
+          retention-days: 30
 
   publish:
     name: Publish GitHub release
     needs:
       - preflight
-      - packaged-proof
-      - macos-metal-proof
-      - windows-vulkan-proof
+      - pre-publish-closeout
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -303,6 +374,72 @@ jobs:
       quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+      emit_release_cells: true
     permissions:
       actions: read
       contents: read
+
+  post-publish-closeout:
+    name: Authenticate post-publish release cells
+    needs:
+      - preflight
+      - pre-publish-closeout
+      - post-publish-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Download every release cell
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-cell-*
+          path: target/release-cell-manifests
+          merge-multiple: true
+
+      - name: Download accepted pre-publish closeout
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+          path: target/accepted-pre-publish-closeout
+
+      - name: Evaluate authenticated post-publish closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          ledger="$(find target/accepted-pre-publish-closeout -type f -name ledger.json -print)"
+          test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          evaluated_at="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
+          node scripts/codestory-release-cell-manifest.mjs producer-map \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$GITHUB_SHA" \
+            --phase post_publish \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --out target/release-closeout/trusted-post-publish-producers.json
+          node scripts/codestory-release-closeout.mjs evaluate \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "$GITHUB_SHA" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --phase post_publish \
+            --evaluated-at "$evaluated_at" \
+            --trusted-producers target/release-closeout/trusted-post-publish-producers.json \
+            --manifest-dir target/release-cell-manifests \
+            --pre-publish-ledger "$ledger" \
+            --out-dir target/release-closeout/post_publish
+
+      - name: Upload accepted post-publish closeout
+        if: success()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-closeout-post-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+          path: |
+            target/release-closeout/trusted-post-publish-producers.json
+            target/release-closeout/post_publish
+          if-no-files-found: error
+          retention-days: 30

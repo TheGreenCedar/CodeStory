@@ -1420,3 +1420,36 @@ test("controlled semantic workflow fixtures emit class-prefixed diagnostics", as
     });
   }
 });
+
+test("release policy rejects manifest producer, trusted-map, and publication bypasses", () => {
+  const mutations = [
+    ["source emission", workflows => { delete workflows.get("release.yml").jobs["source-proof"].with.emit_release_cells; }],
+    ["publish bypass", workflows => {
+      workflows.get("release.yml").jobs.publish.needs = [
+        "preflight",
+        "packaged-proof",
+        "macos-metal-proof",
+        "windows-vulkan-proof",
+      ];
+    }],
+    ["trusted producer map", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
+      step.run = step.run.replace("--trusted-producers", "--self-attested-producers");
+    }],
+    ["pre-publish ledger", workflows => {
+      const step = workflows.get("release.yml").jobs["post-publish-closeout"].steps
+        .find(({ name }) => name === "Evaluate authenticated post-publish closeout");
+      step.run = step.run.replace("--pre-publish-ledger", "--untrusted-ledger");
+    }],
+    ["success-only post-publish upload", workflows => {
+      delete workflows.get("post-publish-release-smoke.yml").jobs.smoke.steps
+        .find(({ name }) => name === "Upload authenticated post-publish release cells").if;
+    }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const workflows = loadWorkflows();
+    mutate(workflows);
+    assert.notDeepEqual(validateWorkflows(workflows), [], label);
+  }
+});

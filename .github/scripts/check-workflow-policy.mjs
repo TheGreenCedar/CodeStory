@@ -1275,6 +1275,19 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     requireUniqueCacheSaveLast(violations, sourceFile, full, "source cache", "proof step");
     requireStepRun(violations, sourceFile, full, "Test the complete workspace once", ["cargo test --workspace --locked"]);
     requireStepRun(violations, sourceFile, full, "Lint every workspace target and feature once", ["cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"]);
+    requireStepRun(violations, sourceFile, full, "Emit authenticated source release cell", [
+      "codestory-release-cell-manifest.mjs produce",
+      "--cell-id source_behavior",
+      "--producer-job full-source-gate",
+    ]);
+    const sourceCellUpload = namedStep(full, "Upload authenticated source release cell");
+    add(
+      violations,
+      sourceCellUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && String(sourceCellUpload?.if ?? "").includes("success()")
+        && String(sourceCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+      `${sourceFile} source release cell must be a success-only retained artifact`,
+    );
   }
 }
 
@@ -1307,6 +1320,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
     "scripts/tests/codestory-release-claims.test.mjs",
+    "scripts/tests/codestory-release-cell-manifest.test.mjs",
     "scripts/tests/codestory-release-closeout.test.mjs",
     "scripts/tests/codestory-release-evidence-gate.test.mjs",
   ]);
@@ -1326,14 +1340,23 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     proof_key: "release-${{ needs.preflight.outputs.version }}",
     profile: releaseChain.evidence_profile,
     drill_manifest: releaseChain.drill_manifest,
+    version: "${{ needs.preflight.outputs.version }}",
+    emit_release_cells: true,
   })) {
     add(violations, object(evidence.with)[key] === value, `${releaseFile} release-evidence with.${key} must equal ${value}`);
   }
+
+  const source = requireJob(violations, releaseFile, release, "source-proof");
+  add(violations, source.uses === "./.github/workflows/source-proof.yml", `${releaseFile} must call exact source proof`);
+  add(violations, sameMembers(needs(source), releaseChain.dependencies["source-proof"]), `${releaseFile} source proof dependencies must match the release claim graph`);
+  add(violations, object(source.with).ref === "${{ github.sha }}", `${releaseFile} source proof must receive the exact release SHA`);
+  add(violations, object(source.with).version === "${{ needs.preflight.outputs.version }}" && object(source.with).emit_release_cells === true, `${releaseFile} source proof must emit its authenticated release cell`);
 
   const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${releaseFile} packaged-proof must call the package workflow`);
   add(violations, sameMembers(needs(packaged), releaseChain.dependencies["packaged-proof"]), `${releaseFile} packaged-proof dependencies must match the release claim graph`);
   add(violations, object(packaged.with).sign_macos === true, `${releaseFile} packaged-proof must sign Mac assets`);
+  add(violations, object(packaged.with).emit_release_cells === true, `${releaseFile} packaged-proof must emit all package release cells`);
   add(
     violations,
     object(packaged.with).candidate_installed_proof === undefined,
@@ -1362,6 +1385,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, metal.uses === "./.github/workflows/macos-metal-proof.yml", `${releaseFile} must call protected Metal proof`);
   add(violations, sameMembers(needs(metal), releaseChain.dependencies["macos-metal-proof"]), `${releaseFile} Metal proof dependencies must match the release claim graph`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${releaseFile} Metal proof must use the packaged CLI`);
+  add(violations, object(metal.with).emit_release_cells === true, `${releaseFile} Metal proof must emit its authenticated release cell`);
   add(
     violations,
     object(metal.with).candidate_installed_proof === undefined
@@ -1373,6 +1397,17 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
   add(violations, sameMembers(needs(vulkan), releaseChain.dependencies["windows-vulkan-proof"]), `${releaseFile} Vulkan proof dependencies must match the release claim graph`);
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${releaseFile} Vulkan proof must use the packaged CLI`);
+  add(violations, object(vulkan.with).emit_release_cells === true, `${releaseFile} Vulkan proof must emit its authenticated release cell`);
+
+  const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
+  add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
+  requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
+    "producer-map",
+    "--phase pre_publish",
+    "--trusted-producers",
+    "codestory-release-closeout.mjs evaluate",
+  ]);
+  requireStepUses(violations, releaseFile, preCloseout, "Upload accepted pre-publish closeout", "actions/upload-artifact@v7.0.1");
 
   const publish = requireJob(violations, releaseFile, release, "publish");
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
@@ -1389,6 +1424,22 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
   add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
+  add(
+    violations,
+    object(post.with).emit_release_cells === true
+      && String(object(post.with).pre_publish_closeout_artifact ?? "").startsWith("release-closeout-pre-publish-"),
+    `${releaseFile} post-publish smoke must consume the accepted pre-publish ledger and emit authenticated cells`,
+  );
+  const postCloseout = requireJob(violations, releaseFile, release, "post-publish-closeout");
+  add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
+  requireStepRun(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", [
+    "producer-map",
+    "--phase post_publish",
+    "--trusted-producers",
+    "--pre-publish-ledger",
+    "codestory-release-closeout.mjs evaluate",
+  ]);
+  requireStepUses(violations, releaseFile, postCloseout, "Upload accepted post-publish closeout", "actions/upload-artifact@v7.0.1");
   for (const [jobName, job] of [
     ["Metal proof", metal],
     ["Vulkan proof", vulkan],
@@ -1722,6 +1773,20 @@ function validatePackagedProof(workflows, violations, graph) {
   ).map(message => `${file} ${message}`));
   requireStepUses(violations, file, job, "Upload release asset", "actions/upload-artifact@v7.0.1");
   requireStepUses(violations, file, job, "Upload macOS notarization proof", "actions/upload-artifact@v7.0.1");
+  requireStepRun(violations, file, job, "Emit authenticated package release cell", [
+    "codestory-release-cell-manifest.mjs produce",
+    "package_identity:${{ matrix.asset_target }}",
+    "--producer-job build",
+    "--archive",
+  ]);
+  const packageCellUpload = namedStep(job, "Upload authenticated package release cell");
+  add(
+    violations,
+    packageCellUpload?.uses === "actions/upload-artifact@v7.0.1"
+      && String(packageCellUpload?.if ?? "").includes("success()")
+      && String(packageCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+    `${file} package release cell must be a success-only retained artifact`,
+  );
 }
 
 function validatePostPublish(workflows, violations, graph) {
@@ -1742,6 +1807,8 @@ function validatePostPublish(workflows, violations, graph) {
         `${file} ${event} ${key} must be a required string`,
       );
     }
+    const closeoutInput = object(at(workflow, "on", event, "inputs", "pre_publish_closeout_artifact"));
+    add(violations, closeoutInput.type === "string", `${file} ${event} pre_publish_closeout_artifact must be a string`);
   }
   const job = requireJob(violations, file, workflow, "smoke");
   const expected = expectedPackageRows(graph).map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
@@ -1804,6 +1871,34 @@ function validatePostPublish(workflows, violations, graph) {
     job,
     "Download frozen calibration bundle",
     "actions/download-artifact@v8.0.1",
+  );
+  requireStepUses(
+    violations,
+    file,
+    job,
+    "Download accepted pre-publish closeout",
+    "actions/download-artifact@v8.0.1",
+  );
+  requireStepRun(violations, file, job, "Emit authenticated post-publish release cells", [
+    "platform_support:${{ matrix.asset_target }}",
+    "installed_runtime_behavior:${{ matrix.asset_target }}",
+    "post_publish_bytes:${{ matrix.asset_target }}",
+    "--pre-publish-ledger",
+    "release-cell-postpublish-${{ matrix.asset_target }}",
+  ]);
+  requireStepUses(
+    violations,
+    file,
+    job,
+    "Upload authenticated post-publish release cells",
+    "actions/upload-artifact@v7.0.1",
+  );
+  const postCellUpload = namedStep(job, "Upload authenticated post-publish release cells");
+  add(
+    violations,
+    String(postCellUpload?.if ?? "").includes("success()")
+      && String(postCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+    `${file} post-publish release cells must be success-only artifacts`,
   );
   const calibrationDownload = namedStep(job, "Download frozen calibration bundle");
   add(
@@ -2072,6 +2167,7 @@ function validateRemainingWorkflows(workflows, violations) {
     ]);
     requireStepRun(violations, autoFile, policy, "Check release claim and evidence contracts", [
       "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-cell-manifest.test.mjs",
       "scripts/tests/codestory-release-closeout.test.mjs",
       "scripts/tests/codestory-release-evidence-gate.test.mjs",
     ]);
@@ -2102,6 +2198,18 @@ function validateRemainingWorkflows(workflows, violations) {
     ));
     requireStepRun(violations, evidenceFile, job, "Produce full-retrieval repo evidence", ["--test-threads=1"]);
     requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
+    requireStepRun(violations, evidenceFile, job, "Emit authenticated release-evidence cells", [
+      "codestory-release-cell-manifest.mjs release-evidence",
+      "--producer-job measure",
+    ]);
+    const evidenceCellUpload = namedStep(job, "Upload authenticated release-evidence cells");
+    add(
+      violations,
+      evidenceCellUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && String(evidenceCellUpload?.if ?? "").includes("success()")
+        && String(evidenceCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+      `${evidenceFile} release-evidence cells must be success-only retained artifacts`,
+    );
   }
 
   const metalFile = "macos-metal-proof.yml";
@@ -2193,6 +2301,19 @@ function validateRemainingWorkflows(workflows, violations) {
       "$CODESTORY_CANDIDATE_MACOS_ROOT/data",
       'test -f "$quality_path"',
     ]);
+    requireStepRun(violations, metalFile, job, "Emit authenticated Metal release cell", [
+      "codestory-release-cell-manifest.mjs produce",
+      "accelerator_execution:macos-arm64-metal",
+      "--producer-job packaged-metal",
+    ]);
+    const metalCellUpload = namedStep(job, "Upload authenticated Metal release cell");
+    add(
+      violations,
+      metalCellUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && String(metalCellUpload?.if ?? "").includes("success()")
+        && String(metalCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+      `${metalFile} Metal release cell must be a success-only retained artifact`,
+    );
   }
 
   const vulkanFile = "windows-vulkan-proof.yml";
@@ -2239,6 +2360,19 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-artifact",
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
+    requireStepRun(violations, vulkanFile, job, "Emit authenticated Vulkan release cell", [
+      "codestory-release-cell-manifest.mjs produce",
+      "accelerator_execution:windows-x64-vulkan",
+      "--producer-job packaged-vulkan",
+    ]);
+    const vulkanCellUpload = namedStep(job, "Upload authenticated Vulkan release cell");
+    add(
+      violations,
+      vulkanCellUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && String(vulkanCellUpload?.if ?? "").includes("success()")
+        && String(vulkanCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+      `${vulkanFile} Vulkan release cell must be a success-only retained artifact`,
+    );
   }
 
   const statsFile = "repo-scale-stats.yml";

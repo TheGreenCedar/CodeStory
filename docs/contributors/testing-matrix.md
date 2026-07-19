@@ -318,7 +318,11 @@ coordinator expands native cells from `workflow_policy.package_matrix`, keeps
 protected hardware cells explicit, invokes the claim evaluator for each cell
 and its graph dependencies, then retains canonical copies under `manifests/`
 and `evaluations/` beside `ledger.json` and `summary.json`. A pre-publish run
-records each archive name, byte count, and SHA-256. A post-publish run requires
+accepts 12 cells: exact source, six package targets, two protected-hardware
+targets, and the three release-evidence claims. A post-publish run accepts 30
+cells after adding platform, installed-runtime and downloaded-byte proof for
+all six targets. Package rows record each archive name, byte count, and SHA-256.
+A post-publish run requires
 that accepted pre-publish ledger, requires its current package manifests to
 match the retained rows, and rejects any downloaded archive whose bytes do not
 match the retained digest. Producer and installed-runtime versions must equal
@@ -327,6 +331,14 @@ hosts must match the OS and architecture derived from the package matrix's Rust
 target. Do not use `matrix`, `mixed`, or another
 aggregate placeholder for a host, runner, backend, installer, or native-engine
 identity.
+
+Production producers use `scripts/codestory-release-cell-manifest.mjs`. They
+emit cells only after their job succeeds and bind workflow, job, run, attempt
+and Actions artifact identity. The closeout job independently derives a
+`codestory.release-producer-map/v1` document from the current workflow context;
+an arbitrary manifest directory cannot attest its own producer. Both closeout
+jobs retain that map with the canonical manifests, individual evaluations,
+ledger and summary.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -338,6 +350,7 @@ node scripts/codestory-release-closeout.mjs evaluate \
   --version <version> \
   --phase pre_publish \
   --evaluated-at <canonical-ISO-timestamp> \
+  --trusted-producers <current-run-producer-map.json> \
   --manifest-dir <producer-manifests> \
   --out-dir <new-closeout-directory>
 ```
@@ -347,6 +360,12 @@ For `--phase post_publish`, pass every graph-owned cell plus
 tested and merged without final evidence; an accepted ledger still requires
 the frozen exact-head producer manifests and does not upgrade source or package
 proof into installed, protected-hardware, or live-behavior proof.
+
+Pre-publish authorization deliberately has no candidate-installed cell. A
+marketplace install cannot exist until publication, and candidate-managed proof
+does not replace it. The six installed-runtime cells remain post-publish and
+the real two-session/one-server installed-runtime qualification remains the
+separate #1221 evidence tier.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply

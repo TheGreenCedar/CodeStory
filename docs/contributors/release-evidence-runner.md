@@ -205,7 +205,10 @@ Release-evidence output is one input to the exact-head closeout ledger; it is
 not the ledger itself. Each producer supplies one
 `codestory.release-cell-manifest/v1` document for its graph-owned cell. The
 manifest carries the claim evidence row plus its workflow, run, attempt and
-artifact identity. Native cells also carry the applicable target, concrete
+artifact identity. Production cells are emitted only on producer success, and
+the closeout coordinator checks those fields against a separately derived map
+for the current Actions run; manifests cannot authenticate themselves. Native
+cells also carry the applicable target, concrete
 host, runtime/native engine and calibration identities. The coordinator
 derives the required inventory from `release-claims.json`, so operators must
 not maintain a separate target checklist or combine multiple hosts into one
@@ -220,3 +223,9 @@ version, and platform hosts bind to the package matrix target. Keep the per-cell
 manifests and evaluations with both ledgers. A missing, duplicate, expired, failed,
 cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
 an operator override.
+
+The production pre-publish inventory is 12 cells and intentionally excludes a
+candidate-installed runtime. Publication is the prerequisite for the
+marketplace-managed tier. The six installed-runtime cells appear only in the
+30-cell post-publish ledger, while #1221 continues to own the real
+two-session/one-server installed-runtime qualification.

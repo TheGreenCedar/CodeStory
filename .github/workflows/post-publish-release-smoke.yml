@@ -20,6 +20,16 @@ on:
         description: Workflow run that produced the frozen calibration bundle artifact.
         required: true
         type: string
+      pre_publish_closeout_artifact:
+        description: Accepted pre-publish closeout artifact from this release run.
+        required: false
+        default: ""
+        type: string
+      emit_release_cells:
+        description: Emit authenticated post-publish cells for production release closeout.
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -38,6 +48,16 @@ on:
         description: Workflow run that produced the frozen calibration bundle artifact.
         required: true
         type: string
+      pre_publish_closeout_artifact:
+        description: Accepted pre-publish closeout artifact from this release run.
+        required: false
+        default: ""
+        type: string
+      emit_release_cells:
+        description: Emit authenticated post-publish cells.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -94,6 +114,13 @@ jobs:
         with:
           ref: ${{ steps.release.outputs.tag }}
           fetch-depth: 0
+
+      - name: Download accepted pre-publish closeout
+        if: inputs.emit_release_cells
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.pre_publish_closeout_artifact }}
+          path: target/pre-publish-closeout
 
       - name: Download exact-head publishable packet quality evidence
         if: inputs.quality_evidence_artifact != ''
@@ -363,6 +390,64 @@ jobs:
             "${quality_args[@]}" \
             --timeout-secs 3600 \
             --out-dir target/post-publish-installed-proof
+
+      - name: Emit authenticated post-publish release cells
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          archive="${{ steps.asset.outputs.archive }}"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          ledger="$(find target/pre-publish-closeout -type f -name ledger.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          mkdir -p target/release-cells
+          jq -n \
+            --arg installer marketplace_managed_plugin \
+            --arg native_engine coderank_q8_embedded \
+            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
+            '{installer: $installer, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            > target/release-cells/installed-identity.json
+          common=(
+            --repo "$GITHUB_WORKSPACE"
+            --expected-sha "$GITHUB_SHA"
+            --version "$version"
+            --producer-workflow .github/workflows/post-publish-release-smoke.yml
+            --producer-job smoke
+            --producer-run-id "$GITHUB_RUN_ID"
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT"
+            --producer-artifact "release-cell-postpublish-${{ matrix.asset_target }}"
+          )
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            "${common[@]}" \
+            --cell-id "platform_support:${{ matrix.asset_target }}" \
+            --archive "$archive" \
+            --out "target/release-cells/platform_support-${{ matrix.asset_target }}.json"
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            "${common[@]}" \
+            --cell-id "installed_runtime_behavior:${{ matrix.asset_target }}" \
+            --identity target/release-cells/installed-identity.json \
+            --archive "$archive" \
+            --out "target/release-cells/installed_runtime_behavior-${{ matrix.asset_target }}.json"
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            "${common[@]}" \
+            --cell-id "post_publish_bytes:${{ matrix.asset_target }}" \
+            --archive "$archive" \
+            --pre-publish-ledger "$ledger" \
+            --out "target/release-cells/post_publish_bytes-${{ matrix.asset_target }}.json"
+
+      - name: Upload authenticated post-publish release cells
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-postpublish-${{ matrix.asset_target }}
+          path: |
+            target/release-cells/platform_support-${{ matrix.asset_target }}.json
+            target/release-cells/installed_runtime_behavior-${{ matrix.asset_target }}.json
+            target/release-cells/post_publish_bytes-${{ matrix.asset_target }}.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload post-publish proof artifacts
         if: always()

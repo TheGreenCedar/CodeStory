@@ -21,6 +21,7 @@ import {
 } from "./codestory-release-claims.mjs";
 
 const MANIFEST_EVALUATION_SCHEMA = "codestory.release-cell-evaluation/v1";
+const PRODUCER_MAP_SCHEMA = "codestory.release-producer-map/v1";
 const SHA256 = /^[0-9a-f]{64}$/u;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
 const AGGREGATE_IDENTITY = /^(?:aggregate|all|matrix|mixed|multiple|various)$/iu;
@@ -90,6 +91,17 @@ export function deriveReleaseCells(graph, phase) {
     if (phaseIndex(closeout, group.phase) > selectedIndex) continue;
     const add = (suffix, constraints = {}) => {
       const id = suffix === null ? group.id : `${group.id}:${suffix}`;
+      const expandedConstraints = Object.fromEntries(
+        Object.entries({
+          ...(group.identity_constraints ?? {}),
+          ...constraints,
+        }).map(([key, value]) => [
+          key,
+          typeof value === "string" && suffix !== null
+            ? value.replaceAll("{target}", suffix)
+            : value,
+        ]),
+      );
       cells.push({
         id,
         group_id: group.id,
@@ -98,10 +110,7 @@ export function deriveReleaseCells(graph, phase) {
         evidence_type: group.evidence_type,
         required_identity: [...group.required_identity],
         singleton_identity: [...(group.singleton_identity ?? [])],
-        identity_constraints: {
-          ...(group.identity_constraints ?? {}),
-          ...constraints,
-        },
+        identity_constraints: expandedConstraints,
         archive_role: group.archive_role,
       });
     };
@@ -195,9 +204,6 @@ function manifestProblems({ manifest, cell, graph, graphSha256, version }) {
       if (archive.sha256 !== identity.artifact_sha256) {
         problems.push("archive sha256 must match evidence artifact_sha256");
       }
-      if (archive.name !== identity.producer_artifact) {
-        problems.push("archive name must match evidence producer_artifact");
-      }
     }
     if (manifest.comparison !== undefined) problems.push("pre-publish package manifest must not contain a byte comparison");
   } else if (cell.archive_role === "post_publish_compare") {
@@ -221,9 +227,103 @@ function manifestProblems({ manifest, cell, graph, graphSha256, version }) {
       if (comparison.published_artifact_sha256 !== identity.artifact_sha256) {
         problems.push("comparison published digest must match evidence artifact_sha256");
       }
+      if (typeof comparison.published_artifact_name !== "string"
+          || comparison.published_artifact_name === ""
+          || path.basename(comparison.published_artifact_name) !== comparison.published_artifact_name) {
+        problems.push("comparison published_artifact_name must be one plain file name");
+      }
     }
   } else if (manifest.archive !== undefined || manifest.comparison !== undefined) {
     problems.push("non-archive closeout cells must not contain archive attestations");
+  }
+  return problems;
+}
+
+export function validateReleaseCellManifest({ manifest, cell, graph, version }) {
+  return manifestProblems({
+    manifest,
+    cell,
+    graph,
+    graphSha256: releaseClaimGraphDigest(graph),
+    version,
+  });
+}
+
+function trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, phase }) {
+  const errors = [];
+  if (trustedProducers === null || typeof trustedProducers !== "object" || Array.isArray(trustedProducers)) {
+    return { byCell: new Map(), errors: ["closeout requires a separately trusted producer map"] };
+  }
+  if (trustedProducers.schema !== PRODUCER_MAP_SCHEMA) {
+    errors.push(`trusted producer map schema must be ${PRODUCER_MAP_SCHEMA}`);
+  }
+  if (trustedProducers.phase !== phase) errors.push(`trusted producer map phase must be ${phase}`);
+  for (const key of ["repository", "commit", "source_tree"]) {
+    if (trustedProducers.identity?.[key] !== gitIdentity[key]) {
+      errors.push(`trusted producer map ${key} identity changed`);
+    }
+  }
+  const rows = Array.isArray(trustedProducers.producers) ? trustedProducers.producers : [];
+  if (!Array.isArray(trustedProducers.producers)) errors.push("trusted producer map producers must be an array");
+  const byCell = new Map();
+  for (const [index, row] of rows.entries()) {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) {
+      errors.push(`trusted producer map producer[${index}] must be an object`);
+      continue;
+    }
+    if (typeof row.cell_id !== "string" || row.cell_id === "") {
+      errors.push(`trusted producer map producer[${index}].cell_id must be non-empty`);
+      continue;
+    }
+    if (byCell.has(row.cell_id)) {
+      errors.push(`trusted producer map duplicates ${row.cell_id}`);
+    } else {
+      byCell.set(row.cell_id, row);
+    }
+  }
+  const required = new Set(cells.map(({ id }) => id));
+  for (const cellId of byCell.keys()) {
+    if (!required.has(cellId)) errors.push(`trusted producer map contains undeclared cell ${cellId}`);
+  }
+  for (const cell of cells) {
+    const row = byCell.get(cell.id);
+    if (!row) {
+      errors.push(`trusted producer map is missing ${cell.id}`);
+      continue;
+    }
+    for (const key of [
+      "producer_workflow",
+      "producer_job",
+      "producer_run_id",
+      "producer_run_attempt",
+      "producer_artifact",
+    ]) {
+      if (!releaseClaimIdentityMatchesFormat(row[key], graph.evidence_policy.identity_formats[key])) {
+        errors.push(`trusted producer map ${cell.id} ${key} is invalid`);
+      }
+      const constrained = cell.identity_constraints[key];
+      if (constrained !== undefined && row[key] !== constrained) {
+        errors.push(`trusted producer map ${cell.id} ${key} must equal ${constrained}`);
+      }
+    }
+  }
+  return { byCell, errors };
+}
+
+function producerAuthenticationProblems(manifest, trustedProducer) {
+  if (!trustedProducer) return ["manifest producer is absent from the trusted producer map"];
+  const identity = manifest.evidence?.identity ?? {};
+  const problems = [];
+  for (const key of [
+    "producer_workflow",
+    "producer_job",
+    "producer_run_id",
+    "producer_run_attempt",
+    "producer_artifact",
+  ]) {
+    if (identity[key] !== trustedProducer[key]) {
+      problems.push(`manifest ${key} does not match the trusted producer map`);
+    }
   }
   return problems;
 }
@@ -393,7 +493,7 @@ function comparePublishedArchive({ manifest, cell, prePublishLedger, graphSha256
       || comparison.published_artifact_sha256 !== packageRow.archive?.sha256) {
     problems.push("published archive bytes are not identical to the retained pre-publish archive");
   }
-  if (manifest.evidence.identity.producer_artifact !== packageRow.archive?.name) {
+  if (comparison.published_artifact_name !== packageRow.archive?.name) {
     problems.push("published archive name does not match the retained pre-publish archive");
   }
   return problems;
@@ -429,6 +529,7 @@ export function evaluateReleaseCloseout({
   gitIdentity,
   manifests: inputManifests,
   prePublishLedger = null,
+  trustedProducers = null,
 }) {
   if (!SEMVER.test(version)) fail("version must be semantic version text without a leading v");
   const evaluatedEpoch = Date.parse(evaluatedAt);
@@ -437,9 +538,10 @@ export function evaluateReleaseCloseout({
   }
   const graphSha256 = releaseClaimGraphDigest(graph);
   const cells = deriveReleaseCells(graph, phase);
+  const trusted = trustedProducerIndex({ trustedProducers, cells, gitIdentity, graph, phase });
   const cellIds = new Set(cells.map(({ id }) => id));
   const indexed = indexManifests(inputManifests);
-  const inputErrors = [...indexed.errors];
+  const inputErrors = [...indexed.errors, ...trusted.errors];
   for (const cellId of indexed.byCell.keys()) {
     if (!cellIds.has(cellId)) inputErrors.push(`closeout contains undeclared cell ${cellId}`);
   }
@@ -451,6 +553,7 @@ export function evaluateReleaseCloseout({
     if (rows.length !== 1) continue;
     const manifest = rows[0];
     const problems = manifestProblems({ manifest, cell, graph, graphSha256, version });
+    problems.push(...producerAuthenticationProblems(manifest, trusted.byCell.get(cell.id)));
     const evidenceId = manifest.evidence?.id;
     if (typeof evidenceId !== "string" || evidenceId === "") {
       problems.push("manifest evidence id must be a non-empty string");
@@ -657,6 +760,10 @@ function main() {
   const prePublishLedger = values["pre-publish-ledger"]
     ? JSON.parse(readFileSync(values["pre-publish-ledger"], "utf8"))
     : null;
+  const trustedProducers = JSON.parse(readFileSync(
+    text(values["trusted-producers"], "--trusted-producers"),
+    "utf8",
+  ));
   const result = evaluateReleaseCloseout({
     graph,
     phase,
@@ -665,6 +772,7 @@ function main() {
     gitIdentity,
     manifests: readManifestDirectory(text(values["manifest-dir"], "--manifest-dir")),
     prePublishLedger,
+    trustedProducers,
   });
   writeReleaseCloseout(text(values["out-dir"], "--out-dir"), result);
   console.log(JSON.stringify(result.summary, null, 2));

@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "d73d2e85c2618b56982b696f1900508e1b6406c454a03465368d2b41a94301cd",
+  "candidate_sha256": "698fbc2b5236a3a12eb9f13e4133f8ab8add3e03769819741d9786a26f22a0a2",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -20,11 +20,74 @@
       "bytes": 5515
     }
   ],
+  "release_cell_evidence": [
+    {
+      "id": "retrieval_readiness-222222222222",
+      "type": "retrieval_readiness",
+      "tier": "live_behavior",
+      "status": "pass",
+      "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+      "observed_at": "2026-07-16T11:00:00.000Z",
+      "expires_at": "2026-07-17T11:00:00.000Z",
+      "identity": {
+        "repository": "TheGreenCedar/CodeStory",
+        "commit": "2222222222222222222222222222222222222222",
+        "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
+        "profile": "ci-contract-v1",
+        "corpus_id": "ci-contract-corpus-v1",
+        "cache_id": "cold-full-retrieval-v1",
+        "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
+        "release_key": "ci-contract-v1"
+      }
+    },
+    {
+      "id": "performance-222222222222",
+      "type": "performance",
+      "tier": "live_behavior",
+      "status": "pass",
+      "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+      "observed_at": "2026-07-16T11:00:00.000Z",
+      "expires_at": "2026-07-17T11:00:00.000Z",
+      "identity": {
+        "repository": "TheGreenCedar/CodeStory",
+        "commit": "2222222222222222222222222222222222222222",
+        "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
+        "profile": "ci-contract-v1",
+        "corpus_id": "ci-contract-corpus-v1",
+        "cache_id": "cold-full-retrieval-v1",
+        "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
+        "release_key": "ci-contract-v1",
+        "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
+        "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1"
+      }
+    },
+    {
+      "id": "answer_quality-222222222222",
+      "type": "answer_quality",
+      "tier": "answer_quality",
+      "status": "pass",
+      "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+      "observed_at": "2026-07-16T11:00:00.000Z",
+      "expires_at": "2026-07-17T11:00:00.000Z",
+      "identity": {
+        "repository": "TheGreenCedar/CodeStory",
+        "commit": "2222222222222222222222222222222222222222",
+        "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
+        "profile": "ci-contract-v1",
+        "corpus_id": "ci-contract-corpus-v1",
+        "cache_id": "cold-full-retrieval-v1",
+        "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
+        "release_key": "ci-contract-v1",
+        "artifact_sha256": "7f519e5d3c2d69aca7d29872ccff103d12cccd863e81f3ddad6615f94a1fe031",
+        "evaluation_contract": "publishable-three-repeat-packet/v1"
+      }
+    }
+  ],
   "release_claim_evaluation": {
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "4c451514d150ab91aaa1a199d5713267266c641d247df182fa8bd336fff5e538",
+    "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
     "evaluated_at": "2026-07-16T11:00:00.000Z",

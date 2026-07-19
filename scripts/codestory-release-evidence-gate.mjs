@@ -772,7 +772,10 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
   const report = { schema_version: 3, status: reportStatus, decision,
     commit, profile: candidate.profile, baseline_id: profile.baseline_id, baseline_sha256: baselineHash,
     candidate_path: path.relative(repoRoot, path.resolve(candidatePath)).replaceAll(path.sep, "/"), candidate_sha256: candidateHash,
-    artifact_paths: Object.values(candidate.artifacts), release_claim_evaluation: claimEvaluation, metrics: rows };
+    artifact_paths: Object.values(candidate.artifacts),
+    release_cell_evidence: claimDocument.evidence,
+    release_claim_evaluation: claimEvaluation,
+    metrics: rows };
   mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
   writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`);
   return report;

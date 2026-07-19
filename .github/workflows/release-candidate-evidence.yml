@@ -20,6 +20,14 @@ on:
         required: false
         type: string
         default: ""
+      version:
+        required: false
+        type: string
+        default: ""
+      emit_release_cells:
+        required: false
+        type: boolean
+        default: false
     secrets:
       CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
         required: false
@@ -190,6 +198,32 @@ jobs:
             --mode release \
             --repo "$GITHUB_WORKSPACE" \
             "${approval_args[@]}"
+
+      - name: Emit authenticated release-evidence cells
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/codestory-release-cell-manifest.mjs release-evidence \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "${{ inputs.version }}" \
+            --report target/release-evidence/report.json \
+            --producer-workflow .github/workflows/release-candidate-evidence.yml \
+            --producer-job measure \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact release-cell-prepublish-release-evidence \
+            --out-dir target/release-cells
+
+      - name: Upload authenticated release-evidence cells
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-release-evidence
+          path: target/release-cells/*.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload release evidence
         if: always()
