@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "issue": 1202,
+  "purpose": "evidence-only comparison; this harness cannot select or adopt a production backend",
+  "approved_profile": {
+    "os": "macOS arm64",
+    "machine": "local Apple Silicon evidence host",
+    "corpus": "torvalds/linux at 37e2f878a7a660a216cc7a60459995fefd150f25"
+  },
+  "candidates": {
+    "sqlite-vec": "0.1.9, vec0 float[768], cosine",
+    "usearch": "2.26.0, HNSW F32, cosine, default features disabled"
+  },
+  "shared_workload": {
+    "vector_counts": [1000, 10000, 25000, 100000],
+    "dimensions": 768,
+    "query_count": 30,
+    "top_k": 20,
+    "warmups": 5,
+    "latency_scope": "first_query_after_load_ms is measured after opening the candidate generation in its fresh candidate process; it is not a cold-cache claim because build and source-truth work may already have touched filesystem pages",
+    "paired_counterbalanced_blocks_per_workload": 6,
+    "clean_evidence_roots": 2,
+    "selection": "seeded nested real anchors; all catalog targets are force-included before the seeded fill",
+    "input_contract": "one complete immutable CodeStory retrieval publication admitted through a pinned product query session; its vectors.sqlite3, vector-generation-manifest.json, core publication identity, live query-embedder identity, independently reviewable vector-free source-truth query catalog bound to the clean exact Git checkout it names, and frozen query vectors generated before candidate timing; the measurement binary must re-resolve every catalog document hash and reproduce every product query vector before admitting the fixture",
+    "execution_contract": "the orchestrator snapshots source, generation manifest, reviewed catalog, fixture, and binary-produced fixture verification into one immutable fsynced evidence bundle; every child verifies that bundle, the exact binary digest, and macOS-arm64 host evidence before and after work; completed journals replay the full counterbalanced matrix and validate every artifact digest, input binding, and required publication/cancellation fault result before completion markers are written"
+  },
+  "required_measurements": [
+    "build_ms",
+    "load_ms",
+    "first_query_after_load_ms",
+    "warm_query_p50_ms",
+    "warm_query_p95_ms",
+    "rss_baseline_after_input_verification_bytes",
+    "rss_bytes_after_load",
+    "rss_bytes_after_warm_queries",
+    "rss_bytes_after_warm_queries_delta",
+    "disk_bytes",
+    "incremental_reuse_ms",
+    "ann_recall_at_20_against_embedded_scan",
+    "source_truth_hit_at_20",
+    "barrier_controlled_reader_publish_overlap",
+    "corrupt_and_incomplete_generation_publish_rejection",
+    "mid_build_cancellation_after_observed_backend_work",
+    "rollback_and_live_pointer_preservation"
+  ],
+  "decision_rules": {
+    "allowed_dispositions": ["recommend sqlite-vec", "recommend USearch", "retain embedded scan", "inconclusive"],
+    "minimum_ann_recall_at_20": 0.99,
+    "minimum_source_truth_hit_at_20": 1.0,
+    "selection_requires": [
+      "both clean evidence roots pass every declared workload and paired block",
+      "the source-truth catalog receives independent review",
+      "the immutable-generation, pre-publication validation, rollback, corruption, incomplete-generation, attributable mid-build cancellation, and concurrent-reader rows all pass",
+      "offline, license, native-dependency, archive-size, and later adoption integration evidence are complete",
+      "the candidate has a reversible fallback to the embedded scan"
+    ]
+  },
+  "non_goals": [
+    "shipping either candidate",
+    "changing production retrieval routing",
+    "using synthetic vectors as decision evidence",
+    "using a cache, hook, or workflow change to manufacture proof"
+  ]
+}

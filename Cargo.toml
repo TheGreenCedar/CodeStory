@@ -22,6 +22,7 @@ codestory-store = { path = "crates/codestory-store" }
 codestory-indexer = { path = "crates/codestory-indexer" }
 codestory-retrieval = { path = "crates/codestory-retrieval" }
 codestory-runtime = { path = "crates/codestory-runtime" }
+codestory-cli = { path = "crates/codestory-cli" }
 codestory-bench = { path = "crates/codestory-bench" }
 
 # Parsing (tree-sitter)

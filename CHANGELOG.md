@@ -4,6 +4,11 @@
 
 ### Performance
 
+- The sqlite-vec versus USearch evidence harness now freezes and independently
+  revalidates its reviewed catalog, source publication, query embeddings, and
+  exact corpus identity before measurement. Candidate publication validates
+  staged generations first and proves corrupt, incomplete, and mid-build
+  cancellation failures preserve the previous pointer.
 - Staged full refresh now bulk-builds grounding summary indexes around
   materialization instead of maintaining them row by row. The node file-rank
   index is created between node and file materialization for the file join;
