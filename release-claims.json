@@ -34,6 +34,7 @@
       "evaluation_contract": "versioned_contract",
       "producer_workflow": "workflow_path",
       "producer_job": "identifier",
+      "producer_job_name": "non_empty_text",
       "producer_run_id": "positive_integer",
       "producer_run_attempt": "positive_integer",
       "producer_artifact": "non_empty_text",
@@ -511,6 +512,7 @@
           "source_tree",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -518,7 +520,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/source-proof.yml",
           "producer_job": "full-source-gate",
-          "producer_artifact": "release-cell-prepublish-source"
+          "producer_job_name": "full-source-gate",
+          "producer_artifact": "release-cell-prepublish-source-attempt-{attempt}"
         },
         "archive_role": "none"
       },
@@ -537,6 +540,7 @@
           "target",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -544,7 +548,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/packaged-platform-proof.yml",
           "producer_job": "build",
-          "producer_artifact": "release-cell-prepublish-package-{target}"
+          "producer_job_name": "Build {target}",
+          "producer_artifact": "release-cell-prepublish-package-{target}-attempt-{attempt}"
         },
         "archive_role": "pre_publish"
       },
@@ -569,6 +574,7 @@
           "calibration_sha256",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -591,7 +597,8 @@
               "backend": "Metal",
               "producer_workflow": ".github/workflows/macos-metal-proof.yml",
               "producer_job": "packaged-metal",
-              "producer_artifact": "release-cell-prepublish-macos-arm64-metal"
+              "producer_job_name": "Packaged Apple Silicon Metal engine",
+              "producer_artifact": "release-cell-prepublish-macos-arm64-metal-attempt-{attempt}"
             }
           },
           {
@@ -604,7 +611,8 @@
               "backend": "Vulkan",
               "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
               "producer_job": "packaged-vulkan",
-              "producer_artifact": "release-cell-prepublish-windows-x64-vulkan"
+              "producer_job_name": "Packaged Windows Vulkan engine",
+              "producer_artifact": "release-cell-prepublish-windows-x64-vulkan-attempt-{attempt}"
             }
           }
         ],
@@ -627,6 +635,7 @@
           "release_key",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -634,7 +643,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/release-candidate-evidence.yml",
           "producer_job": "measure",
-          "producer_artifact": "release-cell-prepublish-release-evidence"
+          "producer_job_name": "Measure release candidate",
+          "producer_artifact": "release-cell-prepublish-release-evidence-attempt-{attempt}"
         },
         "archive_role": "none"
       },
@@ -657,6 +667,7 @@
           "release_key",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -664,7 +675,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/release-candidate-evidence.yml",
           "producer_job": "measure",
-          "producer_artifact": "release-cell-prepublish-release-evidence"
+          "producer_job_name": "Measure release candidate",
+          "producer_artifact": "release-cell-prepublish-release-evidence-attempt-{attempt}"
         },
         "archive_role": "none"
       },
@@ -687,6 +699,7 @@
           "evaluation_contract",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -694,7 +707,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/release-candidate-evidence.yml",
           "producer_job": "measure",
-          "producer_artifact": "release-cell-prepublish-release-evidence"
+          "producer_job_name": "Measure release candidate",
+          "producer_artifact": "release-cell-prepublish-release-evidence-attempt-{attempt}"
         },
         "archive_role": "none"
       },
@@ -715,6 +729,7 @@
           "host_arch",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -726,7 +741,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/post-publish-release-smoke.yml",
           "producer_job": "smoke",
-          "producer_artifact": "release-cell-postpublish-{target}"
+          "producer_job_name": "Published {target} smoke",
+          "producer_artifact": "release-cell-postpublish-{target}-attempt-{attempt}"
         },
         "archive_role": "none"
       },
@@ -751,6 +767,7 @@
           "calibration_sha256",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -764,7 +781,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/post-publish-release-smoke.yml",
           "producer_job": "smoke",
-          "producer_artifact": "release-cell-postpublish-{target}"
+          "producer_job_name": "Published {target} smoke",
+          "producer_artifact": "release-cell-postpublish-{target}-attempt-{attempt}"
         },
         "archive_role": "none"
       },
@@ -784,6 +802,7 @@
           "target",
           "producer_workflow",
           "producer_job",
+          "producer_job_name",
           "producer_run_id",
           "producer_run_attempt",
           "producer_artifact"
@@ -791,7 +810,8 @@
         "identity_constraints": {
           "producer_workflow": ".github/workflows/post-publish-release-smoke.yml",
           "producer_job": "smoke",
-          "producer_artifact": "release-cell-postpublish-{target}"
+          "producer_job_name": "Published {target} smoke",
+          "producer_artifact": "release-cell-postpublish-{target}-attempt-{attempt}"
         },
         "archive_role": "post_publish_compare"
       }

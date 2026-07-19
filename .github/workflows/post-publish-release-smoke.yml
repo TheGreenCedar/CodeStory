@@ -417,7 +417,7 @@ jobs:
             --producer-job smoke
             --producer-run-id "$GITHUB_RUN_ID"
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT"
-            --producer-artifact "release-cell-postpublish-${{ matrix.asset_target }}"
+            --producer-artifact "release-cell-postpublish-${{ matrix.asset_target }}-attempt-$GITHUB_RUN_ATTEMPT"
           )
           node scripts/codestory-release-cell-manifest.mjs produce \
             "${common[@]}" \
@@ -441,7 +441,7 @@ jobs:
         if: success() && inputs.emit_release_cells
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-cell-postpublish-${{ matrix.asset_target }}
+          name: release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: |
             target/release-cells/platform_support-${{ matrix.asset_target }}.json
             target/release-cells/installed_runtime_behavior-${{ matrix.asset_target }}.json

@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "698fbc2b5236a3a12eb9f13e4133f8ab8add3e03769819741d9786a26f22a0a2",
+  "candidate_sha256": "89a62d4bb007d2f8968e7370bfbdc95025d0f416c4d98393fb104529fd1debb1",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -26,7 +26,7 @@
       "type": "retrieval_readiness",
       "tier": "live_behavior",
       "status": "pass",
-      "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+      "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
       "observed_at": "2026-07-16T11:00:00.000Z",
       "expires_at": "2026-07-17T11:00:00.000Z",
       "identity": {
@@ -45,7 +45,7 @@
       "type": "performance",
       "tier": "live_behavior",
       "status": "pass",
-      "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+      "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
       "observed_at": "2026-07-16T11:00:00.000Z",
       "expires_at": "2026-07-17T11:00:00.000Z",
       "identity": {
@@ -66,7 +66,7 @@
       "type": "answer_quality",
       "tier": "answer_quality",
       "status": "pass",
-      "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+      "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
       "observed_at": "2026-07-16T11:00:00.000Z",
       "expires_at": "2026-07-17T11:00:00.000Z",
       "identity": {
@@ -83,11 +83,12 @@
       }
     }
   ],
+  "release_cell_exceptions": {},
   "release_claim_evaluation": {
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "3ef186d84ca65c41ac9d0089cc5864d73cb2012a76e2e852c2f6361400ab8e3f",
+    "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
     "evaluated_at": "2026-07-16T11:00:00.000Z",

@@ -12,10 +12,13 @@ import {
 } from "./codestory-release-claims.mjs";
 import {
   deriveReleaseCells,
+  resolveReleaseCellConstraints,
   validateReleaseCellManifest,
 } from "./codestory-release-closeout.mjs";
 
-const PRODUCER_MAP_SCHEMA = "codestory.release-producer-map/v1";
+const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
+const TRUSTED_EXCEPTIONS_SCHEMA = "codestory.release-closeout-exceptions/v1";
+const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
 function fail(message) {
   throw new Error(message);
@@ -144,7 +147,7 @@ export function produceReleaseCellManifest({
     ...(evidence?.identity ?? {}),
     ...(suppliedIdentity ?? {}),
     ...gitIdentity,
-    ...cell.identity_constraints,
+    ...resolveReleaseCellConstraints(cell, producer.producer_run_attempt),
     ...producer,
   };
   if (cell.required_identity.includes("producer_version")) identity.producer_version = version;
@@ -255,43 +258,230 @@ function produceReleaseEvidence(values) {
     });
     writeJson(path.join(outDir, `${cellId}.json`), manifest);
   }
-}
-
-function produceMap(values) {
-  const { graph, gitIdentity } = common(values);
-  const phase = text(values.phase, "--phase");
-  const runId = text(values["producer-run-id"], "--producer-run-id");
-  const runAttempt = text(values["producer-run-attempt"], "--producer-run-attempt");
-  if (process.env.GITHUB_ACTIONS === "true") {
-    if (process.env.GITHUB_REPOSITORY !== gitIdentity.repository
-        || process.env.GITHUB_SHA !== gitIdentity.commit
-        || process.env.GITHUB_RUN_ID !== runId
-        || process.env.GITHUB_RUN_ATTEMPT !== runAttempt) {
-      fail("current workflow context does not authenticate the trusted producer map");
-    }
-  }
-  const producers = deriveReleaseCells(graph, phase).map((cell) => ({
-    cell_id: cell.id,
-    producer_workflow: cell.identity_constraints.producer_workflow,
-    producer_job: cell.identity_constraints.producer_job,
-    producer_run_id: runId,
-    producer_run_attempt: runAttempt,
-    producer_artifact: cell.identity_constraints.producer_artifact,
-  }));
-  writeJson(text(values.out, "--out"), {
-    schema: PRODUCER_MAP_SCHEMA,
-    phase,
+  const performanceCell = selectedCell(graph, "performance");
+  const constraints = resolveReleaseCellConstraints(performanceCell, producer.producer_run_attempt);
+  const answerQuality = rows.find(({ type }) => type === "answer_quality");
+  writeJson(path.join(outDir, "trusted-exceptions.json"), {
+    schema: TRUSTED_EXCEPTIONS_SCHEMA,
+    graph_sha256: releaseClaimGraphDigest(graph),
+    version,
     identity: gitIdentity,
-    producers,
+    producer: {
+      ...producer,
+      producer_job_name: constraints.producer_job_name,
+    },
+    trusted_identity: {
+      candidate_sha256: report.candidate_sha256,
+      artifact_sha256: answerQuality?.identity?.artifact_sha256,
+    },
+    exceptions: report.release_cell_exceptions ?? {},
   });
 }
 
-function main() {
+function positiveInteger(value, label) {
+  const selected = text(String(value ?? ""), label);
+  if (!/^[1-9]\d*$/u.test(selected)) fail(`${label} must be a positive integer`);
+  return selected;
+}
+
+function actionsTimestamp(value, label) {
+  const selected = text(value, label);
+  if (!Number.isFinite(Date.parse(selected))) fail(`${label} must be an Actions timestamp`);
+  return selected;
+}
+
+function leafJobName(value) {
+  return text(value, "Actions job name").split(" / ").at(-1);
+}
+
+function flattenJobs(jobsByAttempt) {
+  if (Array.isArray(jobsByAttempt)) return jobsByAttempt;
+  if (jobsByAttempt === null || typeof jobsByAttempt !== "object") {
+    fail("Actions jobs must be grouped by run attempt");
+  }
+  return Object.entries(jobsByAttempt).flatMap(([attempt, jobs]) => {
+    if (!Array.isArray(jobs)) fail(`Actions jobs attempt ${attempt} must be an array`);
+    return jobs.map((job) => ({ ...job, run_attempt: String(job.run_attempt ?? attempt) }));
+  });
+}
+
+export function buildTrustedProducerMap({
+  graph,
+  gitIdentity,
+  phase,
+  runId,
+  currentRunAttempt,
+  artifacts,
+  jobsByAttempt,
+}) {
+  const selectedRunId = positiveInteger(runId, "Actions run id");
+  const selectedCurrentAttempt = positiveInteger(currentRunAttempt, "Actions current run attempt");
+  if (!Array.isArray(artifacts)) fail("Actions artifacts must be an array");
+  const jobs = flattenJobs(jobsByAttempt);
+  const selectionCache = new Map();
+  const producers = deriveReleaseCells(graph, phase).map((cell) => {
+    const jobName = text(cell.identity_constraints.producer_job_name, `${cell.id} producer job name`);
+    const cacheKey = `${jobName}\0${cell.identity_constraints.producer_artifact}`;
+    let selected = selectionCache.get(cacheKey);
+    if (!selected) {
+      const occurrences = jobs.filter((job) =>
+        leafJobName(job.name) === jobName
+        && Number(positiveInteger(job.run_attempt, `${jobName} run attempt`))
+          <= Number(selectedCurrentAttempt));
+      if (occurrences.length === 0) fail(`Actions run has no execution of ${jobName}`);
+      const latestAttempt = Math.max(...occurrences.map(({ run_attempt: attempt }) => Number(attempt)));
+      const latestJobs = occurrences.filter(({ run_attempt: attempt }) => Number(attempt) === latestAttempt);
+      if (latestJobs.length !== 1) {
+        fail(`Actions run attempt ${latestAttempt} has multiple executions of ${jobName}`);
+      }
+      const job = latestJobs[0];
+      if (job.status !== "completed" || job.conclusion !== "success") {
+        fail(`latest execution of ${jobName} in attempt ${latestAttempt} did not succeed`);
+      }
+      if (String(job.run_id) !== selectedRunId || job.head_sha !== gitIdentity.commit) {
+        fail(`Actions job ${jobName} is not bound to the selected run and commit`);
+      }
+      const constraints = resolveReleaseCellConstraints(cell, String(latestAttempt));
+      const matchingArtifacts = artifacts.filter(({ name }) => name === constraints.producer_artifact);
+      if (matchingArtifacts.length !== 1) {
+        fail(`Actions run must retain one ${constraints.producer_artifact} artifact`);
+      }
+      const artifact = matchingArtifacts[0];
+      if (artifact.expired !== false
+          || String(artifact.workflow_run?.id) !== selectedRunId
+          || artifact.workflow_run?.head_sha !== gitIdentity.commit) {
+        fail(`Actions artifact ${constraints.producer_artifact} has stale run provenance`);
+      }
+      if (!ACTIONS_DIGEST.test(String(artifact.digest ?? ""))) {
+        fail(`Actions artifact ${constraints.producer_artifact} has no SHA-256 container digest`);
+      }
+      if (!Number.isSafeInteger(artifact.size_in_bytes) || artifact.size_in_bytes <= 0) {
+        fail(`Actions artifact ${constraints.producer_artifact} has invalid size`);
+      }
+      const createdAt = actionsTimestamp(artifact.created_at, "Actions artifact created_at");
+      const startedAt = actionsTimestamp(job.started_at, "Actions job started_at");
+      const completedAt = actionsTimestamp(job.completed_at, "Actions job completed_at");
+      if (Date.parse(createdAt) < Date.parse(startedAt)
+          || Date.parse(createdAt) > Date.parse(completedAt)) {
+        fail(`Actions artifact ${constraints.producer_artifact} was not created by the selected job window`);
+      }
+      selected = {
+        constraints,
+        artifact: {
+          id: positiveInteger(artifact.id, "Actions artifact id"),
+          name: artifact.name,
+          digest: artifact.digest,
+          size_in_bytes: artifact.size_in_bytes,
+          expired: false,
+          created_at: createdAt,
+          expires_at: actionsTimestamp(artifact.expires_at, "Actions artifact expires_at"),
+          workflow_run_id: selectedRunId,
+          head_sha: gitIdentity.commit,
+        },
+        job: {
+          id: positiveInteger(job.id, "Actions job id"),
+          run_id: selectedRunId,
+          head_sha: gitIdentity.commit,
+          name: job.name,
+          status: job.status,
+          conclusion: job.conclusion,
+          run_attempt: String(latestAttempt),
+          started_at: startedAt,
+          completed_at: completedAt,
+        },
+      };
+      selectionCache.set(cacheKey, selected);
+    }
+    return {
+      cell_id: cell.id,
+      producer_workflow: selected.constraints.producer_workflow,
+      producer_job: selected.constraints.producer_job,
+      producer_job_name: selected.constraints.producer_job_name,
+      producer_run_id: selectedRunId,
+      producer_run_attempt: selected.job.run_attempt,
+      producer_artifact: selected.constraints.producer_artifact,
+      artifact: selected.artifact,
+      job: selected.job,
+    };
+  });
+  return {
+    schema: PRODUCER_MAP_SCHEMA,
+    phase,
+    manifest_schema: graph.closeout.manifest_schema,
+    graph_sha256: releaseClaimGraphDigest(graph),
+    identity: gitIdentity,
+    run_id: selectedRunId,
+    current_run_attempt: selectedCurrentAttempt,
+    producers,
+    artifacts: [...new Map(producers.map((row) => [row.artifact.id, row.artifact])).values()],
+  };
+}
+
+async function githubPages(url, token, field) {
+  const values = [];
+  for (let page = 1; ; page += 1) {
+    const separator = url.includes("?") ? "&" : "?";
+    const response = await fetch(`${url}${separator}per_page=100&page=${page}`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (!response.ok) fail(`GitHub Actions API ${response.status} for ${url}`);
+    const document = await response.json();
+    const rows = document[field];
+    if (!Array.isArray(rows)) fail(`GitHub Actions API omitted ${field}`);
+    values.push(...rows);
+    if (rows.length < 100) return values;
+  }
+}
+
+async function produceMap(values) {
+  const { graph, gitIdentity } = common(values);
+  const phase = text(values.phase, "--phase");
+  const runId = positiveInteger(values["producer-run-id"], "--producer-run-id");
+  const runAttempt = positiveInteger(values["producer-run-attempt"], "--producer-run-attempt");
+  if (process.env.GITHUB_ACTIONS !== "true"
+      || process.env.GITHUB_REPOSITORY !== gitIdentity.repository
+      || process.env.GITHUB_SHA !== gitIdentity.commit
+      || process.env.GITHUB_RUN_ID !== runId
+      || process.env.GITHUB_RUN_ATTEMPT !== runAttempt) {
+    fail("current workflow context does not authenticate the Actions provenance query");
+  }
+  const token = text(process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN, "GitHub Actions token");
+  const apiRoot = text(process.env.GITHUB_API_URL ?? "https://api.github.com", "GitHub API URL");
+  const repositoryPath = gitIdentity.repository.split("/").map(encodeURIComponent).join("/");
+  const runUrl = `${apiRoot}/repos/${repositoryPath}/actions/runs/${runId}`;
+  const artifacts = await githubPages(`${runUrl}/artifacts`, token, "artifacts");
+  const jobsByAttempt = {};
+  for (let attempt = 1; attempt <= Number(runAttempt); attempt += 1) {
+    jobsByAttempt[String(attempt)] = (await githubPages(
+      `${runUrl}/attempts/${attempt}/jobs`,
+      token,
+      "jobs",
+    )).map((job) => ({ ...job, run_attempt: String(attempt) }));
+  }
+  const map = buildTrustedProducerMap({
+    graph,
+    gitIdentity,
+    phase,
+    runId,
+    currentRunAttempt: runAttempt,
+    artifacts,
+    jobsByAttempt,
+  });
+  writeJson(text(values.out, "--out"), map);
+}
+
+async function main() {
   const { command, values } = parseArgs(process.argv.slice(2));
   if (command === "produce") produceOne(values);
   else if (command === "release-evidence") produceReleaseEvidence(values);
-  else if (command === "producer-map") produceMap(values);
+  else if (command === "producer-map") await produceMap(values);
   else fail("command must be produce, release-evidence, or producer-map");
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  await main();
+}

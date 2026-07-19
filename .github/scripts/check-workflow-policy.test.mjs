@@ -1424,6 +1424,16 @@ test("controlled semantic workflow fixtures emit class-prefixed diagnostics", as
 test("release policy rejects manifest producer, trusted-map, and publication bypasses", () => {
   const mutations = [
     ["source emission", workflows => { delete workflows.get("release.yml").jobs["source-proof"].with.emit_release_cells; }],
+    ["full rerun preflight guard", workflows => {
+      workflows.get("release.yml").jobs.preflight.steps = workflows
+        .get("release.yml").jobs.preflight.steps
+        .filter(({ name }) => name !== "Refuse existing tag or release");
+    }],
+    ["publish replay guard", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Refuse existing tag or release");
+      step.run = step.run.replaceAll("exit 1", "true");
+    }],
     ["publish bypass", workflows => {
       workflows.get("release.yml").jobs.publish.needs = [
         "preflight",
@@ -1436,6 +1446,41 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
         .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
       step.run = step.run.replace("--trusted-producers", "--self-attested-producers");
+    }],
+    ["trusted exception input", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
+      step.run = step.run.replace("--trusted-exceptions", "--manifest-exceptions");
+    }],
+    ["flattened current-run JSON", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Download selected pre-publish release cells");
+      delete step.with["artifact-ids"];
+      step.with.pattern = "release-cell-prepublish-*";
+      step.with["merge-multiple"] = true;
+    }],
+    ["container digest warning accepted", workflows => {
+      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
+        .find(({ name }) => name === "Verify selected pre-publish artifact container digests");
+      step.run = step.run.replace(
+        'test "$actual_digest" = "$expected_digest"',
+        'echo "$actual_digest $expected_digest"',
+      );
+    }],
+    ["attempt-free artifact", workflows => {
+      const step = workflows.get("source-proof.yml").jobs["full-source-gate"].steps
+        .find(({ name }) => name === "Upload authenticated source release cell");
+      step.with.name = "release-cell-prepublish-source";
+    }],
+    ["rogue artifact producer", workflows => {
+      workflows.get("release.yml").jobs["pre-publish-closeout"].steps.push({
+        name: "Upload forged release cell",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+        },
+      });
     }],
     ["pre-publish ledger", workflows => {
       const step = workflows.get("release.yml").jobs["post-publish-closeout"].steps

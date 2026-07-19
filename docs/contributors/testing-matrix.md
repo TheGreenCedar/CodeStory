@@ -266,7 +266,7 @@ Workflow edits run:
 ```sh
 npm ci --ignore-scripts
 node scripts/codestory-release-claims.mjs validate --repo .
-node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-closeout.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
+node --test scripts/tests/codestory-release-claims.test.mjs scripts/tests/codestory-release-cell-manifest.test.mjs scripts/tests/codestory-release-closeout.test.mjs scripts/tests/codestory-release-evidence-gate.test.mjs
 node --test .github/scripts/run-actionlint.test.mjs
 node .github/scripts/run-actionlint.mjs
 node .github/scripts/check-workflow-policy.mjs
@@ -334,11 +334,26 @@ identity.
 
 Production producers use `scripts/codestory-release-cell-manifest.mjs`. They
 emit cells only after their job succeeds and bind workflow, job, run, attempt
-and Actions artifact identity. The closeout job independently derives a
-`codestory.release-producer-map/v1` document from the current workflow context;
-an arbitrary manifest directory cannot attest its own producer. Both closeout
-jobs retain that map with the canonical manifests, individual evaluations,
-ledger and summary.
+and Actions artifact identity. Artifact names are immutable and attempt
+qualified. The closeout job queries the current run's Actions artifact and job
+APIs, selects the highest attempt in which each graph-owned job actually ran,
+requires that latest execution to have succeeded, and binds the selected
+container id, digest, creation window and unflattened directory to its cells in
+`codestory.release-actions-provenance/v1`. Loose JSON, expired or duplicate
+containers, a failed newer execution, and artifacts outside the selected job's
+time window are rejected. This permits **Re-run failed jobs** after a partial
+post-publish failure: cells from jobs that did not rerun retain their earlier
+attempt, while rerun cells use the newer successful attempt. Do not use
+**Re-run all jobs** as post-publish recovery; publication is intentionally not
+repeatable after the tag and release exist.
+
+An accepted model-microbenchmark exception is a separate authenticated input,
+not a manifest assertion. The release-evidence container retains
+`codestory.release-closeout-exceptions/v1`; closeout verifies its producer,
+includes same-run `answer_quality` in the performance-cell evaluation, and
+passes the trusted exception map to the claim evaluator. Both closeout jobs
+retain the provenance map and exception input with canonical manifests,
+individual evaluations, ledger and summary.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -350,8 +365,9 @@ node scripts/codestory-release-closeout.mjs evaluate \
   --version <version> \
   --phase pre_publish \
   --evaluated-at <canonical-ISO-timestamp> \
-  --trusted-producers <current-run-producer-map.json> \
-  --manifest-dir <producer-manifests> \
+  --trusted-producers <actions-provenance-map.json> \
+  --trusted-exceptions <selected-release-evidence-container/trusted-exceptions.json> \
+  --manifest-dir <unflattened-selected-artifact-directories> \
   --out-dir <new-closeout-directory>
 ```
 

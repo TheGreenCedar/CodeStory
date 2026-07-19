@@ -235,7 +235,7 @@ jobs:
             --producer-job packaged-vulkan \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --producer-artifact release-cell-prepublish-windows-x64-vulkan \
+            --producer-artifact "release-cell-prepublish-windows-x64-vulkan-attempt-$GITHUB_RUN_ATTEMPT" \
             --identity target/windows-vulkan-proof/release-cell-identity.json \
             --archive "target/release-dist/codestory-cli-v${version}-windows-x64.zip" \
             --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
@@ -244,7 +244,7 @@ jobs:
         if: success() && inputs.emit_release_cells
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-cell-prepublish-windows-x64-vulkan
+          name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
           path: target/release-cells/accelerator_execution-windows-x64-vulkan.json
           if-no-files-found: error
           retention-days: 30

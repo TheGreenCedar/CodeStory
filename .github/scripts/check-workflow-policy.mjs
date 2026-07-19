@@ -1332,6 +1332,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "node .github/scripts/extract-codestory-release-notes.mjs",
     '--version "$VERSION"',
   ]);
+  requireStepRun(violations, releaseFile, preflight, "Refuse existing tag or release", [
+    'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
+    'gh release view "$TAG"',
+    "exit 1",
+  ]);
 
   const evidence = requireJob(violations, releaseFile, release, "release-evidence");
   add(violations, sameMembers(needs(evidence), releaseChain.dependencies["release-evidence"]), `${releaseFile} release-evidence dependencies must match the release claim graph`);
@@ -1401,10 +1406,27 @@ function validateReleaseCoordinator(workflows, violations, graph) {
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
-  requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
+  requireStepRun(violations, releaseFile, preCloseout, "Authenticate pre-publish Actions provenance", [
     "producer-map",
     "--phase pre_publish",
+    "artifact_ids",
+  ]);
+  const preDownload = namedStep(preCloseout, "Download selected pre-publish release cells");
+  add(
+    violations,
+    preDownload?.uses === "actions/download-artifact@v8.0.1"
+      && object(preDownload.with)["artifact-ids"] === "${{ steps.pre-publish-provenance.outputs.artifact_ids }}"
+      && object(preDownload.with)["merge-multiple"] === false,
+    `${releaseFile} pre-publish closeout must download selected Actions artifact ids without flattening`,
+  );
+  requireStepRun(violations, releaseFile, preCloseout, "Verify selected pre-publish artifact container digests", [
+    "/actions/artifacts/$artifact_id/zip",
+    "sha256sum",
+    "test \"$actual_digest\" = \"$expected_digest\"",
+  ]);
+  requireStepRun(violations, releaseFile, preCloseout, "Evaluate authenticated pre-publish closeout", [
     "--trusted-producers",
+    "--trusted-exceptions",
     "codestory-release-closeout.mjs evaluate",
   ]);
   requireStepUses(violations, releaseFile, preCloseout, "Upload accepted pre-publish closeout", "actions/upload-artifact@v7.0.1");
@@ -1414,6 +1436,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
+  ]);
+  requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
+    'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
+    'gh release view "$TAG"',
+    "exit 1",
   ]);
   requireStepRun(violations, releaseFile, publish, "Create GitHub release", [
     "--notes-file target/release-assets/release-notes.md",
@@ -1432,10 +1459,27 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   );
   const postCloseout = requireJob(violations, releaseFile, release, "post-publish-closeout");
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
-  requireStepRun(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", [
+  requireStepRun(violations, releaseFile, postCloseout, "Authenticate post-publish Actions provenance", [
     "producer-map",
     "--phase post_publish",
+    "artifact_ids",
+  ]);
+  const postDownload = namedStep(postCloseout, "Download selected release cells without flattening");
+  add(
+    violations,
+    postDownload?.uses === "actions/download-artifact@v8.0.1"
+      && object(postDownload.with)["artifact-ids"] === "${{ steps.post-publish-provenance.outputs.artifact_ids }}"
+      && object(postDownload.with)["merge-multiple"] === false,
+    `${releaseFile} post-publish closeout must download selected Actions artifact ids without flattening`,
+  );
+  requireStepRun(violations, releaseFile, postCloseout, "Verify selected post-publish artifact container digests", [
+    "/actions/artifacts/$artifact_id/zip",
+    "sha256sum",
+    "test \"$actual_digest\" = \"$expected_digest\"",
+  ]);
+  requireStepRun(violations, releaseFile, postCloseout, "Evaluate authenticated post-publish closeout", [
     "--trusted-producers",
+    "--trusted-exceptions",
     "--pre-publish-ledger",
     "codestory-release-closeout.mjs evaluate",
   ]);
@@ -2569,6 +2613,34 @@ export function releaseWorkflowContractViolations(
   return violations;
 }
 
+function validateReleaseCellUploadOwnership(workflows, violations) {
+  const actual = [];
+  for (const [file, workflow] of workflows) {
+    for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
+      for (const step of Array.isArray(jobValue.steps) ? jobValue.steps : []) {
+        if (step?.uses !== "actions/upload-artifact@v7.0.1") continue;
+        const artifactName = String(object(step.with).name ?? "");
+        if (artifactName.startsWith("release-cell-")) {
+          actual.push(`${file}/${jobId}/${artifactName}`);
+        }
+      }
+    }
+  }
+  const expected = [
+    "source-proof.yml/full-source-gate/release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
+    "release-candidate-evidence.yml/measure/release-cell-prepublish-release-evidence-attempt-${{ github.run_attempt }}",
+    "packaged-platform-proof.yml/build/release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
+    "macos-metal-proof.yml/packaged-metal/release-cell-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "windows-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "post-publish-release-smoke.yml/smoke/release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
+  ];
+  add(
+    violations,
+    JSON.stringify(actual.sort()) === JSON.stringify(expected.sort()),
+    "release-cell Actions artifact names must have one graph-owned producer job and attempt suffix",
+  );
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
@@ -2582,6 +2654,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validatePostPublish(workflows, violations, graph);
   validatePackagedCoordinator(workflows, violations, graph);
   validateRemainingWorkflows(workflows, violations);
+  validateReleaseCellUploadOwnership(workflows, violations);
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }

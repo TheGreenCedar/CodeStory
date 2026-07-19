@@ -164,14 +164,14 @@ jobs:
             --producer-job full-source-gate \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --producer-artifact release-cell-prepublish-source \
+            --producer-artifact "release-cell-prepublish-source-attempt-$GITHUB_RUN_ATTEMPT" \
             --out target/release-cells/source_behavior.json
 
       - name: Upload authenticated source release cell
         if: success() && inputs.emit_release_cells
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-cell-prepublish-source
+          name: release-cell-prepublish-source-attempt-${{ github.run_attempt }}
           path: target/release-cells/source_behavior.json
           if-no-files-found: error
           retention-days: 30

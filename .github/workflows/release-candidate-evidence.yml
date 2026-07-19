@@ -213,14 +213,14 @@ jobs:
             --producer-job measure \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --producer-artifact release-cell-prepublish-release-evidence \
+            --producer-artifact "release-cell-prepublish-release-evidence-attempt-$GITHUB_RUN_ATTEMPT" \
             --out-dir target/release-cells
 
       - name: Upload authenticated release-evidence cells
         if: success() && inputs.emit_release_cells
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-cell-prepublish-release-evidence
+          name: release-cell-prepublish-release-evidence-attempt-${{ github.run_attempt }}
           path: target/release-cells/*.json
           if-no-files-found: error
           retention-days: 30

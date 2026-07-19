@@ -830,7 +830,7 @@ jobs:
             --producer-job build \
             --producer-run-id "$GITHUB_RUN_ID" \
             --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --producer-artifact "release-cell-prepublish-package-${{ matrix.asset_target }}" \
+            --producer-artifact "release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-$GITHUB_RUN_ATTEMPT" \
             --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}" \
             --out "target/release-cells/package_identity-${{ matrix.asset_target }}.json"
 
@@ -838,7 +838,7 @@ jobs:
         if: success() && inputs.emit_release_cells
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-cell-prepublish-package-${{ matrix.asset_target }}
+          name: release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
           path: target/release-cells/package_identity-${{ matrix.asset_target }}.json
           if-no-files-found: error
           retention-days: 30

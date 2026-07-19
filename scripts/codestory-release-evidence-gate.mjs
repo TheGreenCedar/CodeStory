@@ -774,6 +774,7 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
     candidate_path: path.relative(repoRoot, path.resolve(candidatePath)).replaceAll(path.sep, "/"), candidate_sha256: candidateHash,
     artifact_paths: Object.values(candidate.artifacts),
     release_cell_evidence: claimDocument.evidence,
+    release_cell_exceptions: expectedExceptions,
     release_claim_evaluation: claimEvaluation,
     metrics: rows };
   mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
