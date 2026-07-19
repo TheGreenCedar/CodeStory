@@ -670,11 +670,12 @@ struct FullRefreshChunkPlan {
     projected_nodes: usize,
 }
 
-#[derive(Debug)]
 struct AdaptiveFullRefreshChunkPlanner {
     budget: FullRefreshChunkBudget,
     last_source_bytes: u64,
     last_nodes: usize,
+    #[cfg(test)]
+    before_plan_file: Option<FullRefreshChunkTestHook>,
 }
 
 impl AdaptiveFullRefreshChunkPlanner {
@@ -687,6 +688,8 @@ impl AdaptiveFullRefreshChunkPlanner {
             },
             last_source_bytes: 0,
             last_nodes: 0,
+            #[cfg(test)]
+            before_plan_file: None,
         }
     }
 
@@ -695,6 +698,7 @@ impl AdaptiveFullRefreshChunkPlanner {
         files: &[PathBuf],
         root: &Path,
         start: usize,
+        cancel_token: Option<&CancellationToken>,
     ) -> Option<FullRefreshChunkPlan> {
         if start >= files.len() {
             return None;
@@ -704,6 +708,13 @@ impl AdaptiveFullRefreshChunkPlanner {
         let mut projected_nodes = 0usize;
         let mut end = start;
         while end < files.len() && end - start < self.budget.file_ceiling {
+            #[cfg(test)]
+            if let Some(hook) = &self.before_plan_file {
+                hook(end);
+            }
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
             let file_bytes =
                 std::fs::metadata(WorkspaceIndexer::normalize_index_path(root, &files[end]))
                     .map(|metadata| metadata.len())
@@ -722,12 +733,21 @@ impl AdaptiveFullRefreshChunkPlanner {
             end += 1;
         }
 
+        if end == start {
+            return None;
+        }
+
         Some(FullRefreshChunkPlan {
             start,
-            end: end.max(start + 1),
+            end,
             source_bytes,
             projected_nodes,
         })
+    }
+
+    #[cfg(test)]
+    fn set_before_plan_file_hook(&mut self, hook: Option<FullRefreshChunkTestHook>) {
+        self.before_plan_file = hook;
     }
 
     fn observe(&mut self, source_bytes: u64, nodes: usize) {
@@ -954,6 +974,7 @@ impl IndexProgress<'_> {
 #[cfg(test)]
 #[derive(Clone, Default)]
 struct FullRefreshPipelineTestHooks {
+    before_plan_file: Option<FullRefreshChunkTestHook>,
     before_prepare_chunk: Option<FullRefreshChunkTestHook>,
     before_parse_job: Option<FullRefreshChunkTestHook>,
     before_writer_chunk: Option<FullRefreshChunkTestHook>,
@@ -1316,6 +1337,9 @@ impl WorkspaceIndexer {
             });
         }
         let mut stats = IncrementalIndexingStats::default();
+        if plan.mode == codestory_workspace::BuildMode::FullRefresh {
+            Self::record_full_refresh_chunk_config(&mut stats, self.full_refresh_chunk_budget);
+        }
         if Self::is_cancelled(cancel_token) {
             return Ok(stats);
         }
@@ -1735,13 +1759,20 @@ impl WorkspaceIndexer {
         );
         if plan.mode == codestory_workspace::BuildMode::FullRefresh {
             let mut planner = AdaptiveFullRefreshChunkPlanner::new(self.full_refresh_chunk_budget);
+            #[cfg(test)]
+            planner.set_before_plan_file_hook(self.pipeline_test_hooks.before_plan_file.clone());
             let mut start = 0usize;
             let mut chunk_index = 0usize;
             let mut planning_duration = Duration::ZERO;
             loop {
                 let planning_started = Instant::now();
-                let next_chunk = planner.next_chunk(&plan.files_to_index, root, start);
+                let next_chunk =
+                    planner.next_chunk(&plan.files_to_index, root, start, cancel_token);
                 planning_duration = planning_duration.saturating_add(planning_started.elapsed());
+                if Self::is_cancelled(cancel_token) {
+                    cancelled.store(true, Ordering::Relaxed);
+                    break;
+                }
                 let Some(chunk_plan) = next_chunk else {
                     break;
                 };
@@ -1844,21 +1875,24 @@ impl WorkspaceIndexer {
             let producer_result = (|| -> Result<()> {
                 let mut planner =
                     AdaptiveFullRefreshChunkPlanner::new(self.full_refresh_chunk_budget);
+                #[cfg(test)]
+                planner
+                    .set_before_plan_file_hook(self.pipeline_test_hooks.before_plan_file.clone());
                 let mut start = 0usize;
                 let mut chunk_index = 0usize;
                 let mut planning_duration = Duration::ZERO;
                 loop {
                     let planning_started = Instant::now();
-                    let next_chunk = planner.next_chunk(files_to_index, root, start);
+                    let next_chunk = planner.next_chunk(files_to_index, root, start, cancel_token);
                     planning_duration =
                         planning_duration.saturating_add(planning_started.elapsed());
-                    let Some(chunk_plan) = next_chunk else {
-                        break;
-                    };
                     if Self::is_cancelled(cancel_token) {
                         cancelled.store(true, Ordering::Relaxed);
                         break;
                     }
+                    let Some(chunk_plan) = next_chunk else {
+                        break;
+                    };
                     let chunk = {
                         let mut cache_access = ArtifactCacheAccess::Reader(cache_reader);
                         self.prepare_index_chunk(
@@ -2001,9 +2035,7 @@ impl WorkspaceIndexer {
         plan: FullRefreshChunkPlan,
         node_count: usize,
     ) {
-        stats.full_refresh_chunk_target_bytes = budget.source_bytes;
-        stats.full_refresh_chunk_target_nodes = budget.projected_nodes;
-        stats.full_refresh_chunk_file_ceiling = budget.file_ceiling;
+        Self::record_full_refresh_chunk_config(stats, budget);
         stats.full_refresh_chunk_max_files = stats
             .full_refresh_chunk_max_files
             .max(plan.end.saturating_sub(plan.start));
@@ -2018,6 +2050,15 @@ impl WorkspaceIndexer {
             stats.full_refresh_chunk_budget_overruns =
                 stats.full_refresh_chunk_budget_overruns.saturating_add(1);
         }
+    }
+
+    fn record_full_refresh_chunk_config(
+        stats: &mut IncrementalIndexingStats,
+        budget: FullRefreshChunkBudget,
+    ) {
+        stats.full_refresh_chunk_target_bytes = budget.source_bytes;
+        stats.full_refresh_chunk_target_nodes = budget.projected_nodes;
+        stats.full_refresh_chunk_file_ceiling = budget.file_ceiling;
     }
 
     fn is_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
@@ -21492,21 +21533,21 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         });
 
         let initial = planner
-            .next_chunk(&files, dir.path(), 0)
+            .next_chunk(&files, dir.path(), 0, None)
             .expect("initial chunk");
         assert_eq!((initial.start, initial.end), (0, 4));
         assert_eq!(initial.source_bytes, 100);
 
         planner.observe(initial.source_bytes, 400);
         let dense = planner
-            .next_chunk(&files, dir.path(), initial.end)
+            .next_chunk(&files, dir.path(), initial.end, None)
             .expect("dense projection chunk");
         assert_eq!((dense.start, dense.end), (4, 5));
         assert_eq!(dense.projected_nodes, 100);
 
         planner.observe(dense.source_bytes, 1);
         let sparse = planner
-            .next_chunk(&files, dir.path(), dense.end)
+            .next_chunk(&files, dir.path(), dense.end, None)
             .expect("sparse projection chunk");
         assert_eq!((sparse.start, sparse.end), (5, 8));
         assert_eq!(sparse.source_bytes, 75);
@@ -21550,6 +21591,37 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert!(stats.full_refresh_chunk_max_files > 24);
         assert!(stats.full_refresh_chunk_max_planned_bytes < 8 * 1024 * 1024);
         assert!(stats.full_refresh_chunk_max_nodes < 120_000);
+        assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_full_refresh_reports_adaptive_chunk_config() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert_eq!(stats.full_refresh_chunk_target_bytes, 8 * 1024 * 1024);
+        assert_eq!(stats.full_refresh_chunk_target_nodes, 120_000);
+        assert_eq!(stats.full_refresh_chunk_file_ceiling, 512);
+        assert_eq!(stats.full_refresh_chunk_max_files, 0);
+        assert_eq!(stats.full_refresh_chunk_max_planned_bytes, 0);
+        assert_eq!(stats.full_refresh_chunk_max_nodes, 0);
         assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
         Ok(())
     }
@@ -21743,6 +21815,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let writer_writer_has_chunk = writer_has_chunk.clone();
         let writer_release_writer = release_writer.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: Some(Arc::new(move |chunk_index| {
                 if chunk_index == 1 && !parse_barrier_entered_hook.swap(true, Ordering::SeqCst) {
@@ -21812,6 +21885,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let cancel_token = CancellationToken::new();
         let timeout_cancel_token = cancel_token.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: Some(Arc::new(move |chunk_index| {
                 if chunk_index == 1 {
                     prepare_writer_has_chunk.wait();
@@ -21903,6 +21977,55 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
+    fn test_full_refresh_cancellation_during_planning_drops_partial_chunk() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut paths = Vec::new();
+        for index in 0..40 {
+            let path = dir.path().join(format!("plan_cancel_{index}.rs"));
+            std::fs::write(&path, format!("fn plan_cancel_{index}() {{}}\n"))?;
+            paths.push(path);
+        }
+        let cancel_token = CancellationToken::new();
+        let planning_cancel_token = cancel_token.clone();
+        let planned_files = Arc::new(AtomicUsize::new(0));
+        let planned_files_from_hook = planned_files.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: Some(Arc::new(move |file_index| {
+                planned_files_from_hook.store(file_index.saturating_add(1), Ordering::SeqCst);
+                if file_index == 5 {
+                    planning_cancel_token.cancel();
+                }
+            })),
+            before_prepare_chunk: None,
+            before_parse_job: None,
+            before_writer_chunk: None,
+            after_send_chunk: None,
+            on_send_timeout: None,
+        };
+        let indexer =
+            WorkspaceIndexer::new(dir.path().to_path_buf()).with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(planned_files.load(Ordering::SeqCst), 6);
+        assert_eq!(stats.full_refresh_chunks_produced, 0);
+        assert_eq!(stats.full_refresh_chunks_persisted, 0);
+        assert!(storage.get_nodes()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_full_refresh_cancellation_during_parse_drops_unaccepted_chunk() -> Result<()> {
         use codestory_store::Store as Storage;
         use tempfile::tempdir;
@@ -21917,6 +22040,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let cancel_token = CancellationToken::new();
         let parse_cancel_token = cancel_token.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: Some(Arc::new(move |_| parse_cancel_token.cancel())),
             before_writer_chunk: None,
@@ -21965,6 +22089,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let cancel_token = CancellationToken::new();
         let writer_cancel_token = cancel_token.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: None,
             before_writer_chunk: Some(Arc::new(move |chunk_index| {
@@ -22402,6 +22527,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let parse_hook_ran = Arc::new(AtomicBool::new(false));
         let parse_hook_ran_from_hook = parse_hook_ran.clone();
         let hooks = FullRefreshPipelineTestHooks {
+            before_plan_file: None,
             before_prepare_chunk: None,
             before_parse_job: Some(Arc::new(move |_| {
                 let (current, total) = loop {

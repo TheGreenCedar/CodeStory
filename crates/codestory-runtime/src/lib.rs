@@ -25279,6 +25279,32 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn empty_full_refresh_reports_adaptive_chunk_config() {
+        let workspace = tempdir().expect("workspace dir");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("empty full publication");
+
+        assert_eq!(
+            timings.full_refresh_chunk_target_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(timings.full_refresh_chunk_target_nodes, Some(120_000));
+        assert_eq!(timings.full_refresh_chunk_file_ceiling, Some(512));
+        assert_eq!(timings.full_refresh_chunk_max_files, Some(0));
+        assert_eq!(timings.full_refresh_chunk_max_planned_bytes, Some(0));
+        assert_eq!(timings.full_refresh_chunk_max_nodes, Some(0));
+        assert_eq!(timings.full_refresh_chunk_budget_overruns, Some(0));
+        assert!(timings.full_refresh_chunk_planning_ms.is_some());
+    }
+
+    #[test]
     fn full_and_incremental_publications_advance_one_durable_generation() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
