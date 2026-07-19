@@ -453,7 +453,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: post-publish-proof-${{ matrix.asset_target }}-${{ steps.release.outputs.version }}
+          name: post-publish-proof-${{ matrix.asset_target }}-${{ steps.release.outputs.version }}-attempt-${{ github.run_attempt }}
           path: |
             target/post-publish-version-proof/${{ matrix.asset_target }}
             target/post-publish-installed-proof

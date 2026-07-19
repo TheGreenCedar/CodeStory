@@ -347,6 +347,12 @@ attempt, while rerun cells use the newer successful attempt. Do not use
 **Re-run all jobs** as post-publish recovery; publication is intentionally not
 repeatable after the tag and release exist.
 
+Every other release-chain upload is rerun-safe as well. Retained diagnostics
+use attempt-qualified names. Stable intermediate artifacts that a later job
+downloads by name use explicit replacement from a policy-owned allowlist, so a
+retried producer cannot fail on an immutable same-name artifact before it emits
+its authenticated cell. Terminal evidence is never overwriteable.
+
 An accepted model-microbenchmark exception is a separate authenticated input,
 not a manifest assertion. The release-evidence container retains
 `codestory.release-closeout-exceptions/v1`; closeout verifies its producer,

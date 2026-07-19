@@ -2641,6 +2641,76 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
   );
 }
 
+function validateReleaseArtifactRerunSafety(workflows, violations) {
+  const releaseChainWorkflows = new Set([
+    "source-proof.yml",
+    "release-candidate-evidence.yml",
+    "packaged-platform-proof.yml",
+    "macos-metal-proof.yml",
+    "windows-vulkan-proof.yml",
+    "post-publish-release-smoke.yml",
+    "release.yml",
+  ]);
+  const replaceableStableIntermediates = new Map([
+    ["release-candidate-evidence.yml/measure/Upload release evidence", {
+      name: "release-evidence-${{ inputs.ref }}",
+      path: "target/release-evidence",
+    }],
+    ["packaged-platform-proof.yml/build/Upload hosted Linux calibration runs", {
+      name: "embedding-calibration-linux-${{ inputs.version }}",
+      path: "target/calibration-runs/linux",
+    }],
+    ["packaged-platform-proof.yml/build/Upload release asset", {
+      name: "codestory-cli-${{ matrix.asset_target }}",
+      path: "target/release-dist/*.tar.gz\ntarget/release-dist/*.zip\ntarget/release-dist/*.sha256\ntarget/release-dist/SHA256SUMS.txt\n",
+    }],
+    ["macos-metal-proof.yml/packaged-metal/Upload Metal calibration runs", {
+      name: "embedding-calibration-macos-${{ inputs.version }}",
+      path: "target/calibration-runs/macos",
+    }],
+    ["release.yml/pre-publish-closeout/Upload accepted pre-publish closeout", {
+      name: "release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}",
+      path: "target/release-closeout/trusted-pre-publish-producers.json\ntarget/release-closeout/pre_publish\n",
+    }],
+  ]);
+  const observedStableIntermediates = new Set();
+  for (const [file, workflow] of workflows) {
+    if (!releaseChainWorkflows.has(file)) continue;
+    for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
+      for (const step of list(jobValue?.steps)) {
+        if (step?.uses !== "actions/upload-artifact@v7.0.1") continue;
+        const upload = object(step.with);
+        const artifactName = String(upload.name ?? "");
+        const uploadKey = `${file}/${jobId}/${step.name ?? ""}`;
+        const attemptQualified = artifactName.includes("${{ github.run_attempt }}");
+        const expectedStable = replaceableStableIntermediates.get(uploadKey);
+        const stableIntermediateMatches = expectedStable !== undefined
+          && !observedStableIntermediates.has(uploadKey)
+          && artifactName === expectedStable.name
+          && String(upload.path ?? "") === expectedStable.path
+          && upload.overwrite === true;
+        if (expectedStable !== undefined) {
+          observedStableIntermediates.add(uploadKey);
+        }
+        add(
+          violations,
+          expectedStable !== undefined
+            ? stableIntermediateMatches
+            : attemptQualified && upload.overwrite !== true,
+          `${file} job ${jobId} upload ${step.name ?? artifactName} must be immutable and attempt-qualified unless it is an explicitly allowlisted stable intermediate`,
+        );
+      }
+    }
+  }
+  for (const uploadKey of replaceableStableIntermediates.keys()) {
+    add(
+      violations,
+      observedStableIntermediates.has(uploadKey),
+      `${uploadKey} stable intermediate upload must exist exactly once with its policy-owned artifact name and path`,
+    );
+  }
+}
+
 export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
@@ -2655,6 +2725,7 @@ export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repos
   validatePackagedCoordinator(workflows, violations, graph);
   validateRemainingWorkflows(workflows, violations);
   validateReleaseCellUploadOwnership(workflows, violations);
+  validateReleaseArtifactRerunSafety(workflows, violations);
   violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }

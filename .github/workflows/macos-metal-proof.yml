@@ -398,12 +398,13 @@ jobs:
           path: target/calibration-runs/macos
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
       - name: Upload candidate-installed macOS proof
         if: always() && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '')
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: candidate-installed-macos-${{ inputs.version }}
+          name: candidate-installed-macos-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           path: target/candidate-installed-macos
           if-no-files-found: error
           retention-days: 30
@@ -450,7 +451,7 @@ jobs:
         if: always() && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: macos-arm64-metal-proof-${{ inputs.version }}
+          name: macos-arm64-metal-proof-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           path: target/macos-metal-proof
           if-no-files-found: error
           retention-days: 30

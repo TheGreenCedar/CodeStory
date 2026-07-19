@@ -1472,6 +1472,37 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
         .find(({ name }) => name === "Upload authenticated source release cell");
       step.with.name = "release-cell-prepublish-source";
     }],
+    ["rerun-unsafe diagnostic artifact", workflows => {
+      const step = workflows.get("post-publish-release-smoke.yml").jobs.smoke.steps
+        .find(({ name }) => name === "Upload post-publish proof artifacts");
+      step.with.name = "post-publish-proof-fixed";
+    }],
+    ["rerun-unsafe stable artifact", workflows => {
+      const step = workflows.get("packaged-platform-proof.yml").jobs.build.steps
+        .find(({ name }) => name === "Upload release asset");
+      delete step.with.overwrite;
+    }],
+    ["overwriteable terminal evidence", workflows => {
+      const step = workflows.get("packaged-platform-proof.yml").jobs.build.steps
+        .find(({ name }) => name === "Upload candidate-installed Linux proof");
+      step.name = "Upload hosted Linux calibration runs";
+      step.with.name = "embedding-calibration-linux-${{ inputs.version }}";
+      step.with.path = "target/calibration-runs/linux";
+      step.with.overwrite = true;
+    }],
+    ["attempt-qualified duplicate stable key", workflows => {
+      const steps = workflows.get("packaged-platform-proof.yml").jobs.build.steps;
+      const index = steps.findIndex(({ name }) => name === "Upload hosted Linux calibration runs");
+      steps.splice(index + 1, 0, {
+        name: "Upload hosted Linux calibration runs",
+        uses: "actions/upload-artifact@v7.0.1",
+        with: {
+          name: "diagnostic-attempt-${{ github.run_attempt }}",
+          path: "forged.json",
+          "retention-days": 30,
+        },
+      });
+    }],
     ["rogue artifact producer", workflows => {
       workflows.get("release.yml").jobs["pre-publish-closeout"].steps.push({
         name: "Upload forged release cell",

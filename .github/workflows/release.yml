@@ -304,6 +304,7 @@ jobs:
             target/release-closeout/pre_publish
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
   publish:
     name: Publish GitHub release
@@ -505,7 +506,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-closeout-post-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
+          name: release-closeout-post-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: |
             target/release-closeout/trusted-post-publish-producers.json
             target/release-closeout/post_publish

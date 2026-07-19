@@ -253,7 +253,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: windows-x64-vulkan-proof-${{ inputs.version }}
+          name: windows-x64-vulkan-proof-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           path: target/windows-vulkan-proof
           if-no-files-found: error
           retention-days: 30
