@@ -217,6 +217,20 @@ is observed at the next chunk boundary: an in-flight cache transaction either
 commits completely or rolls back, and a staged full refresh still cannot
 become live before the runtime publication fence.
 
+File-backed full refreshes use a query-only artifact-cache connection while a
+single writer connection remains on a dedicated scoped thread. The producer
+prepares and parses the next chunk, then sends it through a capacity-one
+channel. This overlaps parser work with persistence while preserving one
+SQLite writer and applying backpressure instead of growing an unbounded result
+queue. Incremental indexing and in-memory fixtures retain the serial path.
+
+At most three prepared chunks can be materialized at once: one owned by the
+writer, one queued, and one being prepared. A cancellation drops work that has
+not crossed the channel boundary; already accepted chunks finish their
+artifact-cache transaction and projection flush before the writer joins. The
+runtime still owns the later atomic publication decision, so cancellation
+cannot expose the staged database.
+
 ### 7. The indexer flushes projection batches
 
 As file results are merged, `WorkspaceIndexer::run` flushes batches once file, node, edge, or occurrence counts cross the configured thresholds.
@@ -236,6 +250,10 @@ when a refreshed row has no verified parser content identity. Modification time
 is captured only after the verification read matches. The same flush invalidates
 grounding snapshots as part of persistence. Projection flush is both a write
 boundary and a derived-state invalidation boundary.
+
+Full-refresh timing output includes produced and persisted chunk counts, queue
+capacity and high-water mark, producer backpressure time, and writer idle time.
+Those fields are omitted for the serial incremental path.
 
 ### 8. Resolution happens after flushes
 

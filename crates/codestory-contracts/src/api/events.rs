@@ -14,6 +14,18 @@ pub struct IndexingPhaseTimings {
     pub artifact_cache_writes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_cache_write_transactions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunks_produced: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_chunks_persisted: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_queue_capacity: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_queue_high_water: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_producer_blocked_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_refresh_writer_idle_ms: Option<u32>,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_projection_rebuild_ms: Option<u32>,
@@ -210,6 +222,12 @@ mod tests {
             artifact_cache_write_ms: None,
             artifact_cache_writes: None,
             artifact_cache_write_transactions: None,
+            full_refresh_chunks_produced: None,
+            full_refresh_chunks_persisted: None,
+            full_refresh_queue_capacity: None,
+            full_refresh_queue_high_water: None,
+            full_refresh_producer_blocked_ms: None,
+            full_refresh_writer_idle_ms: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -293,6 +311,12 @@ mod tests {
         assert!(value.get("artifact_cache_write_ms").is_none());
         assert!(value.get("artifact_cache_writes").is_none());
         assert!(value.get("artifact_cache_write_transactions").is_none());
+        assert!(value.get("full_refresh_chunks_produced").is_none());
+        assert!(value.get("full_refresh_chunks_persisted").is_none());
+        assert!(value.get("full_refresh_queue_capacity").is_none());
+        assert!(value.get("full_refresh_queue_high_water").is_none());
+        assert!(value.get("full_refresh_producer_blocked_ms").is_none());
+        assert!(value.get("full_refresh_writer_idle_ms").is_none());
         assert!(value.get("resolution_unresolved_counts_ms").is_none());
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());

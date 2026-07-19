@@ -11,6 +11,10 @@
   document checkpoints and commit/reload once, instead of reopening and
   committing the writer for every 8,192 symbols. Index telemetry reports
   symbol documents, writers, commits, and reloads.
+- File-backed full refreshes now overlap preparation and Rayon parsing with a
+  dedicated staged SQLite writer through a capacity-one queue. Cancellation
+  drains only accepted chunks, incremental indexing keeps its serial path, and
+  telemetry reports queue pressure plus producer/writer wait time.
 
 ## 0.16.0
 

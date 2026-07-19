@@ -5318,6 +5318,8 @@ const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 
 #[cfg(test)]
 type ActivationSearchRevalidateHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+type FullRefreshStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
 
 #[cfg(test)]
 thread_local! {
@@ -6229,6 +6231,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static SOURCE_POLICY_AFTER_PLAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static FULL_REFRESH_STAGED_STORE_HOOK: std::cell::RefCell<Option<FullRefreshStagedStoreHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -6280,6 +6284,22 @@ fn run_source_policy_after_plan_hook() {
     SOURCE_POLICY_AFTER_PLAN_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_full_refresh_staged_store_hook(hook: impl FnOnce(&mut Storage) + 'static) {
+    FULL_REFRESH_STAGED_STORE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_full_refresh_staged_store_hook(storage: &mut Storage) {
+    FULL_REFRESH_STAGED_STORE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage);
         }
     });
 }
@@ -14354,6 +14374,8 @@ fn index_full_for_runtime(
 
     let mut staged = SnapshotStore::open_staged(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
+    #[cfg(test)]
+    run_full_refresh_staged_store_hook(staged.store_mut());
     let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
 
     let bus = EventBus::new();
@@ -14650,6 +14672,7 @@ fn index_full_for_runtime(
     }
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
+    let full_refresh_pipeline_enabled = index_stats.full_refresh_queue_capacity > 0;
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
@@ -14662,6 +14685,21 @@ fn index_full_for_runtime(
             artifact_cache_write_transactions: Some(clamp_usize_to_u32(
                 index_stats.artifact_cache_write_transactions,
             )),
+            full_refresh_chunks_produced: full_refresh_pipeline_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunks_produced)),
+            full_refresh_chunks_persisted: full_refresh_pipeline_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunks_persisted),
+            ),
+            full_refresh_queue_capacity: full_refresh_pipeline_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_queue_capacity)),
+            full_refresh_queue_high_water: full_refresh_pipeline_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_queue_high_water),
+            ),
+            full_refresh_producer_blocked_ms: full_refresh_pipeline_enabled.then_some(
+                clamp_u64_to_u32(index_stats.full_refresh_producer_blocked_ms),
+            ),
+            full_refresh_writer_idle_ms: full_refresh_pipeline_enabled
+                .then_some(clamp_u64_to_u32(index_stats.full_refresh_writer_idle_ms)),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -15287,6 +15325,12 @@ fn run_incremental_indexing_common(
             artifact_cache_write_transactions: Some(clamp_usize_to_u32(
                 index_stats.artifact_cache_write_transactions,
             )),
+            full_refresh_chunks_produced: None,
+            full_refresh_chunks_persisted: None,
+            full_refresh_queue_capacity: None,
+            full_refresh_queue_high_water: None,
+            full_refresh_producer_blocked_ms: None,
+            full_refresh_writer_idle_ms: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -25223,9 +25267,15 @@ fn build_llm_symbol_doc_text() -> String {
             )
             .expect("open project");
 
-        controller
+        let full_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("first full publication");
+        assert_eq!(full_timings.full_refresh_queue_capacity, Some(1));
+        assert_eq!(full_timings.full_refresh_queue_high_water, Some(1));
+        assert_eq!(full_timings.full_refresh_chunks_produced, Some(1));
+        assert_eq!(full_timings.full_refresh_chunks_persisted, Some(1));
+        assert!(full_timings.full_refresh_producer_blocked_ms.is_some());
+        assert!(full_timings.full_refresh_writer_idle_ms.is_some());
         let first = controller
             .index_publication()
             .expect("read first publication")
@@ -25238,9 +25288,11 @@ fn build_llm_symbol_doc_text() -> String {
             "pub fn second_value() -> i32 { 2 }\n",
         )
         .expect("write incremental source");
-        controller
+        let incremental_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incremental publication");
+        assert!(incremental_timings.full_refresh_queue_capacity.is_none());
+        assert!(incremental_timings.full_refresh_chunks_produced.is_none());
         let second = controller
             .index_publication()
             .expect("read second publication")
@@ -25262,6 +25314,68 @@ fn build_llm_symbol_doc_text() -> String {
         assert_ne!(third.generation_id, second.generation_id);
         assert_ne!(third.run_id, second.run_id);
         assert!(third.published_at_epoch_ms >= second.published_at_epoch_ms);
+    }
+
+    #[test]
+    fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn retained_value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TRIGGER reject_pipeline_cache_write
+                     BEFORE INSERT ON index_artifact_cache
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced runtime pipeline cache failure');
+                     END;",
+                )
+                .expect("install staged writer failure");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("injected pipeline writer failure must reject the candidate");
+        assert!(
+            error
+                .message
+                .contains("forced runtime pipeline cache failure"),
+            "{error:?}"
+        );
+
+        let live = Storage::open(&storage_path).expect("reopen retained live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retained publication"),
+            Some(baseline)
+        );
+        assert!(
+            live.get_nodes()
+                .expect("read retained graph")
+                .iter()
+                .any(|node| node.serialized_name == "retained_value")
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]

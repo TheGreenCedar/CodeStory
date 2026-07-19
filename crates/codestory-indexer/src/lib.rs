@@ -17,7 +17,10 @@ use codestory_contracts::graph::{
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
 use codestory_contracts::workspace::process_source_index_policy;
-use codestory_store::{IndexArtifactCacheWrite, Store as Storage};
+use codestory_store::{
+    IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
+};
+use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -27,7 +30,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node as TsNode, Parser, Point, Query, QueryCursor, Tree};
 use tree_sitter_graph::ast::File as GraphFile;
@@ -682,6 +685,12 @@ pub struct IncrementalIndexingStats {
     pub artifact_cache_invalid_entries: usize,
     pub artifact_cache_writes: usize,
     pub artifact_cache_write_transactions: usize,
+    pub full_refresh_chunks_produced: usize,
+    pub full_refresh_chunks_persisted: usize,
+    pub full_refresh_queue_capacity: usize,
+    pub full_refresh_queue_high_water: usize,
+    pub full_refresh_producer_blocked_ms: u64,
+    pub full_refresh_writer_idle_ms: u64,
     pub parse_index_ms: u64,
     pub projection_flush_ms: u64,
     pub flush_files_ms: u64,
@@ -766,6 +775,281 @@ struct ArtifactCacheWrite {
     artifact_blob: Vec<u8>,
 }
 
+#[cfg(test)]
+type FullRefreshChunkTestHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+enum ArtifactCacheAccess<'a> {
+    Storage(&'a mut Storage),
+    Reader(&'a IndexArtifactCacheReader),
+}
+
+impl ArtifactCacheAccess<'_> {
+    fn get(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, StorageError> {
+        match self {
+            Self::Storage(storage) => storage.get_index_artifact_cache(path, cache_key),
+            Self::Reader(reader) => reader.get(path, cache_key),
+        }
+    }
+
+    fn storage_mut(&mut self) -> Option<&mut Storage> {
+        match self {
+            Self::Storage(storage) => Some(*storage),
+            Self::Reader(_) => None,
+        }
+    }
+}
+
+struct PreparedIndexChunk {
+    cache_writes: Vec<ArtifactCacheWrite>,
+    storages: Vec<IntermediateStorage>,
+    #[cfg(test)]
+    before_persist: Option<(usize, FullRefreshChunkTestHook)>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct FullRefreshPipelineTestHooks {
+    before_prepare_chunk: Option<FullRefreshChunkTestHook>,
+    before_parse_job: Option<FullRefreshChunkTestHook>,
+    before_writer_chunk: Option<FullRefreshChunkTestHook>,
+    on_send_timeout: Option<FullRefreshChunkTestHook>,
+}
+
+struct ProjectionWriterOutput {
+    stats: IncrementalIndexingStats,
+    all_errors: Vec<codestory_contracts::graph::ErrorInfo>,
+    had_edges: bool,
+}
+
+struct ProjectionWriter<'a> {
+    storage: &'a mut Storage,
+    mode: codestory_workspace::BuildMode,
+    batch_config: IncrementalIndexingConfig,
+    existing_projection_file_ids: &'a HashSet<i64>,
+    replaced_projection_ids: HashSet<i64>,
+    batched_storage: IntermediateStorage,
+    all_errors: Vec<codestory_contracts::graph::ErrorInfo>,
+    pending_error_file_ids: HashSet<i64>,
+    pending_file_errors: Vec<codestory_contracts::graph::ErrorInfo>,
+    had_edges: bool,
+    pipeline_telemetry: bool,
+    stats: IncrementalIndexingStats,
+}
+
+impl<'a> ProjectionWriter<'a> {
+    fn new(
+        storage: &'a mut Storage,
+        mode: codestory_workspace::BuildMode,
+        batch_config: IncrementalIndexingConfig,
+        existing_projection_file_ids: &'a HashSet<i64>,
+        pipeline_telemetry: bool,
+    ) -> Self {
+        Self {
+            storage,
+            mode,
+            batch_config,
+            existing_projection_file_ids,
+            replaced_projection_ids: HashSet::new(),
+            batched_storage: IntermediateStorage::default(),
+            all_errors: Vec::new(),
+            pending_error_file_ids: HashSet::new(),
+            pending_file_errors: Vec::new(),
+            had_edges: false,
+            pipeline_telemetry,
+            stats: IncrementalIndexingStats::default(),
+        }
+    }
+
+    fn storage_mut(&mut self) -> &mut Storage {
+        self.storage
+    }
+
+    fn accept_chunk(
+        &mut self,
+        chunk: PreparedIndexChunk,
+        processed_count: &AtomicUsize,
+        total_files: usize,
+        event_bus: &EventBus,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if let Some((chunk_index, hook)) = &chunk.before_persist {
+            hook(*chunk_index);
+        }
+        if !chunk.cache_writes.is_empty() {
+            let cache_write_started = Instant::now();
+            let batch = chunk
+                .cache_writes
+                .iter()
+                .map(|write| IndexArtifactCacheWrite {
+                    path: &write.path,
+                    cache_key: &write.cache_key,
+                    artifact_blob: &write.artifact_blob,
+                })
+                .collect::<Vec<_>>();
+            let written = self
+                .storage
+                .upsert_index_artifact_cache_batch(&batch)
+                .map_err(|error| {
+                    anyhow!(
+                        "Storage cache batch write error for {} entries: {error}",
+                        batch.len()
+                    )
+                })?;
+            self.stats.artifact_cache_write_ms = self
+                .stats
+                .artifact_cache_write_ms
+                .saturating_add(duration_ms_u64(cache_write_started.elapsed()));
+            self.stats.artifact_cache_writes =
+                self.stats.artifact_cache_writes.saturating_add(written);
+            self.stats.artifact_cache_write_transactions = self
+                .stats
+                .artifact_cache_write_transactions
+                .saturating_add(1);
+        }
+
+        for local_storage in chunk.storages {
+            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+            event_bus.publish(Event::IndexingProgress {
+                current,
+                total: total_files,
+            });
+            self.accept_storage(local_storage)?;
+        }
+        if self.pipeline_telemetry {
+            self.stats.full_refresh_chunks_persisted =
+                self.stats.full_refresh_chunks_persisted.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
+        if let Some((file_id, file_complete)) = local_storage
+            .files
+            .first()
+            .map(|file_info| (file_info.id, file_info.complete))
+            && self.mode == codestory_workspace::BuildMode::Incremental
+            && self.existing_projection_file_ids.contains(&file_id)
+            && self.replaced_projection_ids.insert(file_id)
+        {
+            if !file_complete {
+                // An unreadable, drifting, oversized, or parser-partial source is retry
+                // evidence, not proof that its previous symbols disappeared. Preserve the
+                // last verified projection and update only the file/error rows below.
+                local_storage
+                    .nodes
+                    .retain(|node| node.id != NodeId(file_id));
+            } else {
+                let existing_states = self
+                    .storage
+                    .get_callable_projection_states_for_file(file_id)
+                    .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
+                let cleanup_started = Instant::now();
+                let update_mode = classify_projection_update(
+                    &existing_states,
+                    &local_storage.callable_projection_states,
+                );
+                match update_mode {
+                    ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
+                    ProjectionUpdateMode::Delta { changed_callers } => {
+                        self.storage
+                            .delete_projection_for_callers(file_id, &changed_callers)
+                            .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
+                    }
+                    ProjectionUpdateMode::FullReplace => {
+                        self.storage
+                            .delete_file_projection(file_id)
+                            .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
+                    }
+                }
+                self.stats.cleanup_ms = self
+                    .stats
+                    .cleanup_ms
+                    .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
+            }
+        }
+        self.pending_error_file_ids
+            .extend(local_storage.files.iter().map(|file| file.id));
+        for error in local_storage.errors.drain(..) {
+            if let Some(file_id) = error.file_id {
+                self.pending_error_file_ids.insert(file_id.0);
+                self.pending_file_errors.push(error);
+            } else {
+                self.all_errors.push(error);
+            }
+        }
+        self.batched_storage.merge(local_storage);
+
+        let should_flush = !self.batched_storage.files.is_empty()
+            || !self.batched_storage.nodes.is_empty()
+            || !self.batched_storage.edges.is_empty()
+            || !self.batched_storage.occurrences.is_empty();
+        let pipeline_flush = std::env::var("CODESTORY_PIPELINE_FLUSH")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        if should_flush
+            && (pipeline_flush
+                || self.batched_storage.nodes.len() >= self.batch_config.node_batch_size
+                || self.batched_storage.edges.len() >= self.batch_config.edge_batch_size
+                || self.batched_storage.occurrences.len()
+                    >= self.batch_config.occurrence_batch_size)
+        {
+            let breakdown = WorkspaceIndexer::flush_projection_batch(
+                self.storage,
+                &mut self.batched_storage,
+                &mut self.had_edges,
+            )?;
+            accumulate_flush_breakdown(&mut self.stats, breakdown);
+            WorkspaceIndexer::flush_file_errors(
+                self.storage,
+                &mut self.pending_error_file_ids,
+                &mut self.pending_file_errors,
+            )?;
+        }
+
+        if self.all_errors.len() >= self.batch_config.error_batch_size {
+            let error_flush_started = Instant::now();
+            WorkspaceIndexer::flush_errors(
+                self.storage,
+                &mut self.all_errors,
+                self.batch_config.error_batch_size,
+            )?;
+            self.stats.error_flush_ms = self
+                .stats
+                .error_flush_ms
+                .saturating_add(duration_ms_u64(error_flush_started.elapsed()));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<ProjectionWriterOutput> {
+        let breakdown = WorkspaceIndexer::flush_projection_batch(
+            self.storage,
+            &mut self.batched_storage,
+            &mut self.had_edges,
+        )?;
+        accumulate_flush_breakdown(&mut self.stats, breakdown);
+        WorkspaceIndexer::flush_file_errors(
+            self.storage,
+            &mut self.pending_error_file_ids,
+            &mut self.pending_file_errors,
+        )?;
+        Ok(ProjectionWriterOutput {
+            stats: self.stats,
+            all_errors: self.all_errors,
+            had_edges: self.had_edges,
+        })
+    }
+}
+
 /// Workspace-level indexer that executes refresh plans into a `Store`.
 ///
 /// The indexer does not discover stale files; it consumes a
@@ -778,6 +1062,8 @@ pub struct WorkspaceIndexer {
     compilation_db_warning: Option<String>,
     batch_config: IncrementalIndexingConfig,
     source_file_byte_cap: u64,
+    #[cfg(test)]
+    pipeline_test_hooks: FullRefreshPipelineTestHooks,
 }
 
 impl WorkspaceIndexer {
@@ -810,6 +1096,8 @@ impl WorkspaceIndexer {
             compilation_db_warning,
             batch_config: IncrementalIndexingConfig::default(),
             source_file_byte_cap: process_source_index_policy().byte_cap,
+            #[cfg(test)]
+            pipeline_test_hooks: FullRefreshPipelineTestHooks::default(),
         }
     }
 
@@ -822,6 +1110,12 @@ impl WorkspaceIndexer {
     /// Override the parser-backed source file byte cap.
     pub fn with_source_file_byte_cap(mut self, source_file_byte_cap: u64) -> Self {
         self.source_file_byte_cap = source_file_byte_cap.max(1);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_pipeline_test_hooks(mut self, hooks: FullRefreshPipelineTestHooks) -> Self {
+        self.pipeline_test_hooks = hooks;
         self
     }
 
@@ -893,7 +1187,6 @@ impl WorkspaceIndexer {
             return Ok(stats);
         }
 
-        let mut replaced_projection_ids = HashSet::new();
         let symbol_seed_started = Instant::now();
         let symbol_table = Arc::new(SymbolTable::new());
         Self::seed_symbol_table(
@@ -904,18 +1197,11 @@ impl WorkspaceIndexer {
         )?;
         stats.setup_seed_symbol_table_ms = duration_ms_u64(symbol_seed_started.elapsed());
 
-        // Clone for parallel closure
-        let cancelled_clone = cancelled.clone();
         if Self::is_cancelled(cancel_token) {
             return Ok(stats);
         }
 
         // 1. Parallel Indexing (chunked and flushed)
-        let mut batched_storage = IntermediateStorage::default();
-        let mut all_errors = Vec::new();
-        let mut pending_error_file_ids = HashSet::new();
-        let mut pending_file_errors = Vec::new();
-        let mut had_edges = false;
         let full_refresh_defaults =
             IncrementalIndexingConfig::for_mode(codestory_workspace::BuildMode::FullRefresh);
         let batch_config = match plan.mode {
@@ -943,259 +1229,65 @@ impl WorkspaceIndexer {
                     .min(full_refresh_defaults.error_batch_size),
             },
         };
-        let file_batch_size = batch_config.file_batch_size.max(1);
-
-        for file_chunk in plan.files_to_index.chunks(file_batch_size) {
-            let lookup_started = Instant::now();
-            let mut chunk_results = Vec::with_capacity(file_chunk.len());
-            let mut parse_jobs = Vec::new();
-            for path in file_chunk {
-                if let Some(token) = cancel_token
-                    && token.is_cancelled()
-                {
-                    cancelled_clone.store(true, Ordering::Relaxed);
-                    break;
-                }
-
-                let normalized_path = Self::normalize_index_path(&root, path);
-                let file_id = Self::canonical_file_node_id_for_path(&normalized_path);
-                let existing_projection_id = (plan.mode
-                    == codestory_workspace::BuildMode::Incremental)
-                    .then_some(file_id)
-                    .filter(|file_id| existing_projection_file_ids.contains(file_id));
-                match self.prepare_index_work(
+        let writer_output = if plan.mode == codestory_workspace::BuildMode::FullRefresh
+            && Self::full_refresh_pipeline_paths_are_unique(&root, &plan.files_to_index)
+        {
+            if let Some(cache_reader) = storage.index_artifact_cache_reader()? {
+                self.run_full_refresh_pipeline(
                     storage,
-                    path,
+                    &cache_reader,
+                    &plan.files_to_index,
                     &root,
-                    existing_projection_id,
+                    batch_config,
+                    &existing_projection_file_ids,
                     &symbol_table,
+                    &processed_count,
+                    total_files,
+                    event_bus,
+                    &cancelled,
+                    cancel_token,
                     &mut stats,
-                ) {
-                    Ok(PreparedIndexWork::Immediate(local_storage)) => {
-                        let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        event_bus.publish(Event::IndexingProgress {
-                            current,
-                            total: total_files,
-                        });
-                        chunk_results.push(local_storage);
-                    }
-                    Ok(PreparedIndexWork::Parse(prepared_input)) => {
-                        parse_jobs.push(prepared_input);
-                    }
-                    Err(err_storage) => {
-                        let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        event_bus.publish(Event::IndexingProgress {
-                            current,
-                            total: total_files,
-                        });
-                        chunk_results.push(err_storage);
-                    }
-                }
-            }
-            stats.artifact_cache_lookup_ms = stats
-                .artifact_cache_lookup_ms
-                .saturating_add(duration_ms_u64(lookup_started.elapsed()));
-
-            let parse_started = Instant::now();
-            let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
-                .par_iter()
-                .map(|prepared_input| {
-                    if let Some(token) = cancel_token
-                        && token.is_cancelled()
-                    {
-                        cancelled_clone.store(true, Ordering::Relaxed);
-                        return PreparedIndexJobResult {
-                            local_storage: IntermediateStorage::default(),
-                            cache_write: None,
-                        };
-                    }
-                    self.execute_prepared_index(prepared_input, &symbol_table)
-                })
-                .collect();
-            stats.parse_index_ms = stats
-                .parse_index_ms
-                .saturating_add(duration_ms_u64(parse_started.elapsed()));
-
-            let mut cache_writes = Vec::with_capacity(parse_results.len());
-            let mut parsed_storages = Vec::with_capacity(parse_results.len());
-            for parsed in parse_results {
-                if let Some(cache_write) = parsed.cache_write {
-                    cache_writes.push(cache_write);
-                }
-                parsed_storages.push(parsed.local_storage);
-            }
-
-            if !cache_writes.is_empty() {
-                let cache_write_started = Instant::now();
-                let batch = cache_writes
-                    .iter()
-                    .map(|write| IndexArtifactCacheWrite {
-                        path: &write.path,
-                        cache_key: &write.cache_key,
-                        artifact_blob: &write.artifact_blob,
-                    })
-                    .collect::<Vec<_>>();
-                let written =
-                    storage
-                        .upsert_index_artifact_cache_batch(&batch)
-                        .map_err(|error| {
-                            anyhow!(
-                                "Storage cache batch write error for {} entries: {error}",
-                                batch.len()
-                            )
-                        })?;
-                stats.artifact_cache_write_ms = stats
-                    .artifact_cache_write_ms
-                    .saturating_add(duration_ms_u64(cache_write_started.elapsed()));
-                stats.artifact_cache_writes = stats.artifact_cache_writes.saturating_add(written);
-                stats.artifact_cache_write_transactions =
-                    stats.artifact_cache_write_transactions.saturating_add(1);
-            }
-
-            // Cancellation observed during this chunk is handled after the complete
-            // ordered cache transaction and projection flush boundary. The staged
-            // full-refresh database still cannot become live until runtime publish.
-            for local_storage in parsed_storages {
-                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                event_bus.publish(Event::IndexingProgress {
-                    current,
-                    total: total_files,
-                });
-                chunk_results.push(local_storage);
-            }
-
-            for mut local_storage in chunk_results {
-                if let Some((file_id, file_complete)) = local_storage
-                    .files
-                    .first()
-                    .map(|file_info| (file_info.id, file_info.complete))
-                    && plan.mode == codestory_workspace::BuildMode::Incremental
-                    && existing_projection_file_ids.contains(&file_id)
-                    && replaced_projection_ids.insert(file_id)
-                {
-                    if !file_complete {
-                        // An unreadable, drifting, oversized, or parser-partial source is retry
-                        // evidence, not proof that its previous symbols disappeared. Preserve the
-                        // last verified projection and update only the file/error rows below.
-                        local_storage
-                            .nodes
-                            .retain(|node| node.id != NodeId(file_id));
-                    } else {
-                        let existing_states = storage
-                            .get_callable_projection_states_for_file(file_id)
-                            .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
-                        let cleanup_started = Instant::now();
-                        let update_mode = classify_projection_update(
-                            &existing_states,
-                            &local_storage.callable_projection_states,
-                        );
-                        match update_mode {
-                            ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {
-                            }
-                            ProjectionUpdateMode::Delta { changed_callers } => {
-                                storage
-                                    .delete_projection_for_callers(file_id, &changed_callers)
-                                    .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
-                            }
-                            ProjectionUpdateMode::FullReplace => {
-                                storage
-                                    .delete_file_projection(file_id)
-                                    .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
-                            }
-                        }
-                        stats.cleanup_ms = stats
-                            .cleanup_ms
-                            .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
-                    }
-                }
-                pending_error_file_ids.extend(local_storage.files.iter().map(|file| file.id));
-                for error in local_storage.errors.drain(..) {
-                    if let Some(file_id) = error.file_id {
-                        pending_error_file_ids.insert(file_id.0);
-                        pending_file_errors.push(error);
-                    } else {
-                        all_errors.push(error);
-                    }
-                }
-                batched_storage.merge(local_storage);
-
-                let should_flush = !batched_storage.files.is_empty()
-                    || !batched_storage.nodes.is_empty()
-                    || !batched_storage.edges.is_empty()
-                    || !batched_storage.occurrences.is_empty();
-                let pipeline_flush =
-                    std::env::var("CODESTORY_PIPELINE_FLUSH")
-                        .ok()
-                        .is_some_and(|value| {
-                            matches!(
-                                value.trim().to_ascii_lowercase().as_str(),
-                                "1" | "true" | "yes" | "on"
-                            )
-                        });
-                if should_flush
-                    && (pipeline_flush
-                        || batched_storage.nodes.len() >= batch_config.node_batch_size
-                        || batched_storage.edges.len() >= batch_config.edge_batch_size
-                        || batched_storage.occurrences.len() >= batch_config.occurrence_batch_size)
-                {
-                    let breakdown = Self::flush_projection_batch(
-                        storage,
-                        &mut batched_storage,
-                        &mut had_edges,
-                    )?;
-                    accumulate_flush_breakdown(&mut stats, breakdown);
-                    Self::flush_file_errors(
-                        storage,
-                        &mut pending_error_file_ids,
-                        &mut pending_file_errors,
-                    )?;
-                }
-
-                if all_errors.len() >= batch_config.error_batch_size {
-                    let error_flush_started = Instant::now();
-                    Self::flush_errors(storage, &mut all_errors, batch_config.error_batch_size)?;
-                    stats.error_flush_ms = stats
-                        .error_flush_ms
-                        .saturating_add(duration_ms_u64(error_flush_started.elapsed()));
-                }
-            }
-
-            if cancelled.load(Ordering::Relaxed) {
-                let breakdown =
-                    Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
-                accumulate_flush_breakdown(&mut stats, breakdown);
-                Self::flush_file_errors(
+                )?
+            } else {
+                self.run_serial_index_chunks(
                     storage,
-                    &mut pending_error_file_ids,
-                    &mut pending_file_errors,
-                )?;
-                event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-                return Ok(stats);
+                    &plan,
+                    &root,
+                    batch_config,
+                    &existing_projection_file_ids,
+                    &symbol_table,
+                    &processed_count,
+                    total_files,
+                    event_bus,
+                    &cancelled,
+                    cancel_token,
+                    &mut stats,
+                )?
             }
-        }
-
-        // Check if cancelled during indexing
-        if cancelled.load(Ordering::Relaxed) {
-            let breakdown =
-                Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
-            accumulate_flush_breakdown(&mut stats, breakdown);
-            Self::flush_file_errors(
+        } else {
+            self.run_serial_index_chunks(
                 storage,
-                &mut pending_error_file_ids,
-                &mut pending_file_errors,
-            )?;
+                &plan,
+                &root,
+                batch_config,
+                &existing_projection_file_ids,
+                &symbol_table,
+                &processed_count,
+                total_files,
+                event_bus,
+                &cancelled,
+                cancel_token,
+                &mut stats,
+            )?
+        };
+        accumulate_projection_writer_stats(&mut stats, &writer_output.stats);
+        let mut all_errors = writer_output.all_errors;
+        let had_edges = writer_output.had_edges;
+
+        if cancelled.load(Ordering::Relaxed) {
             event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
             return Ok(stats);
         }
-
-        let breakdown =
-            Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
-        accumulate_flush_breakdown(&mut stats, breakdown);
-        Self::flush_file_errors(
-            storage,
-            &mut pending_error_file_ids,
-            &mut pending_file_errors,
-        )?;
 
         if plan.mode == codestory_workspace::BuildMode::Incremental
             && !plan.files_to_remove.is_empty()
@@ -1356,10 +1448,322 @@ impl WorkspaceIndexer {
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_index_chunk(
+        &self,
+        cache_access: &mut ArtifactCacheAccess<'_>,
+        _chunk_index: usize,
+        file_chunk: &[PathBuf],
+        root: &Path,
+        mode: codestory_workspace::BuildMode,
+        existing_projection_file_ids: &HashSet<i64>,
+        symbol_table: &Arc<SymbolTable>,
+        cancelled: &AtomicBool,
+        cancel_token: Option<&CancellationToken>,
+        stats: &mut IncrementalIndexingStats,
+    ) -> PreparedIndexChunk {
+        #[cfg(test)]
+        if let Some(hook) = &self.pipeline_test_hooks.before_prepare_chunk {
+            hook(_chunk_index);
+        }
+        let lookup_started = Instant::now();
+        let mut storages = Vec::with_capacity(file_chunk.len());
+        let mut parse_jobs = Vec::new();
+        for path in file_chunk {
+            if let Some(token) = cancel_token
+                && token.is_cancelled()
+            {
+                cancelled.store(true, Ordering::Relaxed);
+                break;
+            }
+
+            let normalized_path = Self::normalize_index_path(root, path);
+            let file_id = Self::canonical_file_node_id_for_path(&normalized_path);
+            let existing_projection_id = (mode == codestory_workspace::BuildMode::Incremental)
+                .then_some(file_id)
+                .filter(|file_id| existing_projection_file_ids.contains(file_id));
+            match self.prepare_index_work(
+                cache_access,
+                path,
+                root,
+                existing_projection_id,
+                symbol_table,
+                stats,
+            ) {
+                Ok(PreparedIndexWork::Immediate(local_storage)) => storages.push(local_storage),
+                Ok(PreparedIndexWork::Parse(prepared_input)) => parse_jobs.push(prepared_input),
+                Err(err_storage) => storages.push(err_storage),
+            }
+        }
+        stats.artifact_cache_lookup_ms = stats
+            .artifact_cache_lookup_ms
+            .saturating_add(duration_ms_u64(lookup_started.elapsed()));
+
+        let parse_started = Instant::now();
+        let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
+            .par_iter()
+            .map(|prepared_input| {
+                #[cfg(test)]
+                if let Some(hook) = &self.pipeline_test_hooks.before_parse_job {
+                    hook(_chunk_index);
+                }
+                if let Some(token) = cancel_token
+                    && token.is_cancelled()
+                {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return PreparedIndexJobResult {
+                        local_storage: IntermediateStorage::default(),
+                        cache_write: None,
+                    };
+                }
+                self.execute_prepared_index(prepared_input, symbol_table)
+            })
+            .collect();
+        stats.parse_index_ms = stats
+            .parse_index_ms
+            .saturating_add(duration_ms_u64(parse_started.elapsed()));
+        // Parsed projections and serialized cache artifacts own everything the
+        // writer needs. Release source strings before a capacity wait.
+        drop(parse_jobs);
+
+        let mut cache_writes = Vec::with_capacity(parse_results.len());
+        for parsed in parse_results {
+            if let Some(cache_write) = parsed.cache_write {
+                cache_writes.push(cache_write);
+            }
+            storages.push(parsed.local_storage);
+        }
+        PreparedIndexChunk {
+            cache_writes,
+            storages,
+            #[cfg(test)]
+            before_persist: self
+                .pipeline_test_hooks
+                .before_writer_chunk
+                .as_ref()
+                .map(|hook| (_chunk_index, hook.clone())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_serial_index_chunks(
+        &self,
+        storage: &mut Storage,
+        plan: &codestory_workspace::RefreshExecutionPlan,
+        root: &Path,
+        batch_config: IncrementalIndexingConfig,
+        existing_projection_file_ids: &HashSet<i64>,
+        symbol_table: &Arc<SymbolTable>,
+        processed_count: &AtomicUsize,
+        total_files: usize,
+        event_bus: &EventBus,
+        cancelled: &AtomicBool,
+        cancel_token: Option<&CancellationToken>,
+        stats: &mut IncrementalIndexingStats,
+    ) -> Result<ProjectionWriterOutput> {
+        let mut writer = ProjectionWriter::new(
+            storage,
+            plan.mode,
+            batch_config,
+            existing_projection_file_ids,
+            false,
+        );
+        for (chunk_index, file_chunk) in plan
+            .files_to_index
+            .chunks(batch_config.file_batch_size.max(1))
+            .enumerate()
+        {
+            let chunk = {
+                let mut cache_access = ArtifactCacheAccess::Storage(writer.storage_mut());
+                self.prepare_index_chunk(
+                    &mut cache_access,
+                    chunk_index,
+                    file_chunk,
+                    root,
+                    plan.mode,
+                    existing_projection_file_ids,
+                    symbol_table,
+                    cancelled,
+                    cancel_token,
+                    stats,
+                )
+            };
+            writer.accept_chunk(chunk, processed_count, total_files, event_bus)?;
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        writer.finish()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_full_refresh_pipeline(
+        &self,
+        storage: &mut Storage,
+        cache_reader: &IndexArtifactCacheReader,
+        files_to_index: &[PathBuf],
+        root: &Path,
+        batch_config: IncrementalIndexingConfig,
+        existing_projection_file_ids: &HashSet<i64>,
+        symbol_table: &Arc<SymbolTable>,
+        processed_count: &AtomicUsize,
+        total_files: usize,
+        event_bus: &EventBus,
+        cancelled: &AtomicBool,
+        cancel_token: Option<&CancellationToken>,
+        stats: &mut IncrementalIndexingStats,
+    ) -> Result<ProjectionWriterOutput> {
+        const QUEUE_CAPACITY: usize = 1;
+        const SEND_RETRY: Duration = Duration::from_millis(25);
+
+        let (sender, receiver) = bounded(QUEUE_CAPACITY);
+        stats.full_refresh_queue_capacity = QUEUE_CAPACITY;
+
+        std::thread::scope(|scope| {
+            let writer_handle = scope.spawn(|| {
+                Self::consume_full_refresh_chunks(
+                    storage,
+                    receiver,
+                    batch_config,
+                    existing_projection_file_ids,
+                    processed_count,
+                    total_files,
+                    event_bus,
+                )
+            });
+
+            let producer_result = (|| -> Result<()> {
+                for (chunk_index, file_chunk) in files_to_index
+                    .chunks(batch_config.file_batch_size.max(1))
+                    .enumerate()
+                {
+                    if Self::is_cancelled(cancel_token) {
+                        cancelled.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let chunk = {
+                        let mut cache_access = ArtifactCacheAccess::Reader(cache_reader);
+                        self.prepare_index_chunk(
+                            &mut cache_access,
+                            chunk_index,
+                            file_chunk,
+                            root,
+                            codestory_workspace::BuildMode::FullRefresh,
+                            existing_projection_file_ids,
+                            symbol_table,
+                            cancelled,
+                            cancel_token,
+                            stats,
+                        )
+                    };
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let blocked_started = Instant::now();
+                    let mut pending_chunk = chunk;
+                    loop {
+                        match sender.send_timeout(pending_chunk, SEND_RETRY) {
+                            Ok(()) => {
+                                stats.full_refresh_chunks_produced =
+                                    stats.full_refresh_chunks_produced.saturating_add(1);
+                                // A successful bounded send has one linearization
+                                // point at which the capacity-1 queue is occupied,
+                                // even if the receiver immediately dequeues it.
+                                stats.full_refresh_queue_high_water = 1;
+                                break;
+                            }
+                            Err(SendTimeoutError::Timeout(chunk)) => {
+                                #[cfg(test)]
+                                if let Some(hook) = &self.pipeline_test_hooks.on_send_timeout {
+                                    hook(chunk_index);
+                                }
+                                if Self::is_cancelled(cancel_token) {
+                                    cancelled.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                pending_chunk = chunk;
+                            }
+                            Err(SendTimeoutError::Disconnected(_)) => {
+                                return Err(anyhow!("Full-refresh projection writer disconnected"));
+                            }
+                        }
+                    }
+                    stats.full_refresh_producer_blocked_ms = stats
+                        .full_refresh_producer_blocked_ms
+                        .saturating_add(duration_ms_u64(blocked_started.elapsed()));
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            drop(sender);
+
+            let writer_result = writer_handle
+                .join()
+                .map_err(|_| anyhow!("Full-refresh projection writer panicked"))?;
+            match (producer_result, writer_result) {
+                (_, Err(writer_error)) => Err(writer_error),
+                (Err(producer_error), _) => Err(producer_error),
+                (Ok(()), Ok(output)) => Ok(output),
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consume_full_refresh_chunks(
+        storage: &mut Storage,
+        receiver: Receiver<PreparedIndexChunk>,
+        batch_config: IncrementalIndexingConfig,
+        existing_projection_file_ids: &HashSet<i64>,
+        processed_count: &AtomicUsize,
+        total_files: usize,
+        event_bus: &EventBus,
+    ) -> Result<ProjectionWriterOutput> {
+        let mut writer = ProjectionWriter::new(
+            storage,
+            codestory_workspace::BuildMode::FullRefresh,
+            batch_config,
+            existing_projection_file_ids,
+            true,
+        );
+        loop {
+            let idle_started = Instant::now();
+            match receiver.recv() {
+                Ok(chunk) => {
+                    writer.stats.full_refresh_writer_idle_ms = writer
+                        .stats
+                        .full_refresh_writer_idle_ms
+                        .saturating_add(duration_ms_u64(idle_started.elapsed()));
+                    writer.accept_chunk(chunk, processed_count, total_files, event_bus)?;
+                }
+                Err(_) => {
+                    writer.stats.full_refresh_writer_idle_ms = writer
+                        .stats
+                        .full_refresh_writer_idle_ms
+                        .saturating_add(duration_ms_u64(idle_started.elapsed()));
+                    break;
+                }
+            }
+        }
+        writer.finish()
+    }
+
     fn is_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
         cancel_token
             .map(CancellationToken::is_cancelled)
             .unwrap_or(false)
+    }
+
+    fn full_refresh_pipeline_paths_are_unique(root: &Path, files: &[PathBuf]) -> bool {
+        let mut identities = HashSet::with_capacity(files.len());
+        files.iter().all(|path| {
+            // Refresh planning already resolves native filesystem identity. Keep
+            // this defensive check lexical so enabling the pipeline does not add
+            // one filesystem canonicalization syscall per corpus file.
+            identities.insert(Self::normalize_index_path(root, path))
+        })
     }
 
     fn seed_symbol_table(
@@ -1640,7 +2044,7 @@ impl WorkspaceIndexer {
     #[allow(clippy::result_large_err)]
     fn prepare_index_work(
         &self,
-        storage: &mut Storage,
+        cache_access: &mut ArtifactCacheAccess<'_>,
         path: &PathBuf,
         root: &Path,
         existing_projection_id: Option<i64>,
@@ -1866,7 +2270,7 @@ impl WorkspaceIndexer {
             }));
         };
 
-        match storage.get_index_artifact_cache(cache_path, cache_key) {
+        match cache_access.get(cache_path, cache_key) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
                 Ok(artifact) => {
                     let mut artifact = rebase_cached_index_artifact(
@@ -1884,6 +2288,22 @@ impl WorkspaceIndexer {
                     )?;
                     stats.artifact_cache_hits += 1;
                     if existing_projection_id.is_some() {
+                        let Some(storage) = cache_access.storage_mut() else {
+                            let mut local_storage = IntermediateStorage::default();
+                            local_storage.add_error(codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Artifact-cache reader cannot refresh an existing projection for {:?}",
+                                    full_path
+                                ),
+                                file_id: artifact.files.first().map(|file| NodeId(file.id)),
+                                line: None,
+                                column: None,
+                                is_fatal: true,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                            });
+                            return Err(local_storage);
+                        };
                         if let Some(file_info) = artifact.files.first()
                             && let Err(error) =
                                 storage.update_file_metadata(file_info, Some(&content_hash))
@@ -2231,6 +2651,52 @@ fn file_modification_time(path: &Path) -> i64 {
 
 fn duration_ms_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn accumulate_projection_writer_stats(
+    stats: &mut IncrementalIndexingStats,
+    writer_stats: &IncrementalIndexingStats,
+) {
+    stats.artifact_cache_write_ms = stats
+        .artifact_cache_write_ms
+        .saturating_add(writer_stats.artifact_cache_write_ms);
+    stats.artifact_cache_writes = stats
+        .artifact_cache_writes
+        .saturating_add(writer_stats.artifact_cache_writes);
+    stats.artifact_cache_write_transactions = stats
+        .artifact_cache_write_transactions
+        .saturating_add(writer_stats.artifact_cache_write_transactions);
+    stats.full_refresh_chunks_persisted = stats
+        .full_refresh_chunks_persisted
+        .saturating_add(writer_stats.full_refresh_chunks_persisted);
+    stats.full_refresh_writer_idle_ms = stats
+        .full_refresh_writer_idle_ms
+        .saturating_add(writer_stats.full_refresh_writer_idle_ms);
+    stats.projection_flush_ms = stats
+        .projection_flush_ms
+        .saturating_add(writer_stats.projection_flush_ms);
+    stats.flush_files_ms = stats
+        .flush_files_ms
+        .saturating_add(writer_stats.flush_files_ms);
+    stats.flush_nodes_ms = stats
+        .flush_nodes_ms
+        .saturating_add(writer_stats.flush_nodes_ms);
+    stats.flush_edges_ms = stats
+        .flush_edges_ms
+        .saturating_add(writer_stats.flush_edges_ms);
+    stats.flush_occurrences_ms = stats
+        .flush_occurrences_ms
+        .saturating_add(writer_stats.flush_occurrences_ms);
+    stats.flush_component_access_ms = stats
+        .flush_component_access_ms
+        .saturating_add(writer_stats.flush_component_access_ms);
+    stats.flush_callable_projection_ms = stats
+        .flush_callable_projection_ms
+        .saturating_add(writer_stats.flush_callable_projection_ms);
+    stats.error_flush_ms = stats
+        .error_flush_ms
+        .saturating_add(writer_stats.error_flush_ms);
+    stats.cleanup_ms = stats.cleanup_ms.saturating_add(writer_stats.cleanup_ms);
 }
 
 fn accumulate_flush_breakdown(
@@ -19597,8 +20063,67 @@ fn generate_edge_id_for_edge(edge: &Edge, flags: IndexFeatureFlags) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::types::Value;
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    fn projection_snapshot(storage: &Storage) -> Result<Vec<(String, Vec<Vec<Value>>)>> {
+        const QUERIES: [(&str, &str); 8] = [
+            ("file", "SELECT * FROM file ORDER BY id"),
+            ("node", "SELECT * FROM node ORDER BY id"),
+            ("edge", "SELECT * FROM edge ORDER BY id"),
+            (
+                "occurrence",
+                "SELECT * FROM occurrence ORDER BY element_id, kind, file_node_id, start_line, start_col, end_line, end_col",
+            ),
+            (
+                "component_access",
+                "SELECT * FROM component_access ORDER BY node_id, type",
+            ),
+            ("error", "SELECT * FROM error ORDER BY id"),
+            (
+                "callable_projection_state",
+                "SELECT * FROM callable_projection_state ORDER BY file_id, symbol_key",
+            ),
+            (
+                "index_artifact_cache",
+                "SELECT file_path, cache_key FROM index_artifact_cache ORDER BY file_path",
+            ),
+        ];
+        let mut snapshot = Vec::with_capacity(QUERIES.len());
+        for (name, query) in QUERIES {
+            let mut statement = storage.get_connection().prepare(query)?;
+            let column_count = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..column_count)
+                        .map(|column| row.get::<_, Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            snapshot.push((name.to_string(), rows));
+        }
+        Ok(snapshot)
+    }
+
+    fn assert_projection_snapshots_equal(
+        expected: &Storage,
+        actual: &Storage,
+        actual_label: &str,
+    ) -> Result<()> {
+        for ((expected_table, expected_rows), (actual_table, actual_rows)) in
+            projection_snapshot(expected)?
+                .into_iter()
+                .zip(projection_snapshot(actual)?)
+        {
+            assert_eq!(expected_table, actual_table);
+            assert_eq!(
+                expected_rows, actual_rows,
+                "serial and {actual_label} {expected_table} projections differ"
+            );
+        }
+        Ok(())
+    }
 
     fn overwrite_preserving_mtime(path: &Path, source: &str) -> Result<()> {
         let modified = std::fs::metadata(path)?.modified()?;
@@ -20581,6 +21106,563 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let nodes = storage.get_nodes()?;
         assert!(nodes.len() >= 24);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_backed_full_refresh_uses_bounded_projection_pipeline() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..12 {
+            let path = dir.path().join(format!("pipeline_{index}.rs"));
+            fs::write(&path, format!("struct Pipeline_{index} {{}}\n"))?;
+            files.push(path);
+        }
+
+        let database_path = dir.path().join("staged.sqlite");
+        let mut storage = Storage::open_build(&database_path)?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 3,
+                node_batch_size: 4,
+                edge_batch_size: 4,
+                occurrence_batch_size: 8,
+                error_batch_size: 128,
+            },
+        );
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
+        };
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(stats.full_refresh_chunks_produced, 4);
+        assert_eq!(stats.full_refresh_chunks_persisted, 4);
+        assert_eq!(stats.full_refresh_queue_capacity, 1);
+        assert_eq!(stats.full_refresh_queue_high_water, 1);
+        assert_eq!(stats.artifact_cache_writes, 12);
+        assert_eq!(stats.artifact_cache_write_transactions, 4);
+        assert!(storage.get_nodes()?.len() >= 24);
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_backed_full_refresh_pipeline_reuses_copied_artifact_cache() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..6 {
+            let path = dir.path().join(format!("cached_pipeline_{index}.rs"));
+            fs::write(&path, format!("fn cached_pipeline_{index}() {{}}\n"))?;
+            files.push(path);
+        }
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 2,
+                node_batch_size: 8,
+                edge_batch_size: 8,
+                occurrence_batch_size: 8,
+                error_batch_size: 128,
+            },
+        );
+
+        let source_path = dir.path().join("cache-source.sqlite");
+        let mut source = Storage::open_build(&source_path)?;
+        let source_stats = indexer.run(&mut source, &plan, &EventBus::new(), None)?;
+        assert_eq!(source_stats.artifact_cache_misses, 6);
+        assert_eq!(source_stats.artifact_cache_writes, 6);
+        drop(source);
+
+        let mut target = Storage::open_build(dir.path().join("cache-target.sqlite"))?;
+        assert_eq!(target.copy_index_artifact_cache_from(&source_path)?, 6);
+        let cached_stats = indexer.run(&mut target, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(cached_stats.artifact_cache_hits, 6);
+        assert_eq!(cached_stats.artifact_cache_misses, 0);
+        assert_eq!(cached_stats.artifact_cache_writes, 0);
+        assert_eq!(cached_stats.artifact_cache_write_transactions, 0);
+        assert_eq!(cached_stats.full_refresh_chunks_produced, 3);
+        assert_eq!(cached_stats.full_refresh_chunks_persisted, 3);
+        assert!(target.get_nodes()?.len() >= 12);
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_backed_full_refresh_duplicate_paths_keep_serial_cache_semantics() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("duplicate.rs");
+        std::fs::write(&path, "fn duplicate() {}\n")?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![path.clone(), path],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 1,
+                ..IncrementalIndexingConfig::default()
+            },
+        );
+        let mut storage = Storage::open_build(dir.path().join("duplicate.sqlite"))?;
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(stats.full_refresh_queue_capacity, 0);
+        assert_eq!(stats.full_refresh_chunks_produced, 0);
+        assert_eq!(stats.artifact_cache_misses, 1);
+        assert_eq!(stats.artifact_cache_hits, 1);
+        assert_eq!(stats.artifact_cache_write_transactions, 1);
+        assert_eq!(
+            storage
+                .get_nodes()?
+                .into_iter()
+                .filter(|node| node.serialized_name == "duplicate")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_pipeline_matches_serial_projection_snapshot() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workflow_dir = dir.path().join(".github/workflows");
+        fs::create_dir_all(&workflow_dir)?;
+        let files = vec![
+            (
+                dir.path().join("first.rs"),
+                "fn first() { second(); }\n".to_string(),
+            ),
+            (
+                dir.path().join("package.json"),
+                "{\"scripts\":{\"build\":\"vite build\"}}\n".to_string(),
+            ),
+            (
+                dir.path().join("second.ts"),
+                "export function second(): number { return 2; }\n".to_string(),
+            ),
+            (
+                workflow_dir.join("build.yml"),
+                "name: build\non:\n  push:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n".to_string(),
+            ),
+            (
+                dir.path().join("oversized.rs"),
+                format!("{}\nfn too_large() {{}}\n", "// padding".repeat(40)),
+            ),
+        ];
+        let mut paths = Vec::new();
+        for (path, source) in &files {
+            fs::write(path, source)?;
+            paths.push(path.clone());
+        }
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let config = IncrementalIndexingConfig {
+            file_batch_size: 2,
+            node_batch_size: 5,
+            edge_batch_size: 5,
+            occurrence_batch_size: 5,
+            error_batch_size: 2,
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(256)
+            .with_batch_config(config);
+
+        let mut serial = Storage::new_in_memory()?;
+        let serial_stats = indexer.run(&mut serial, &plan, &EventBus::new(), None)?;
+        let pipeline_path = dir.path().join("pipeline.sqlite");
+        let mut pipelined = Storage::open_build(&pipeline_path)?;
+        let pipeline_stats = indexer.run(&mut pipelined, &plan, &EventBus::new(), None)?;
+
+        assert_projection_snapshots_equal(&serial, &pipelined, "pipelined")?;
+
+        let mut replay = Storage::open_build(dir.path().join("cache-replay.sqlite"))?;
+        assert!(replay.copy_index_artifact_cache_from(&pipeline_path)? > 0);
+        let replay_stats = indexer.run(&mut replay, &plan, &EventBus::new(), None)?;
+        assert!(replay_stats.artifact_cache_hits > 0);
+        assert_projection_snapshots_equal(&serial, &replay, "cache-replayed")?;
+        assert_eq!(serial_stats.full_refresh_queue_capacity, 0);
+        assert_eq!(pipeline_stats.full_refresh_queue_capacity, 1);
+        assert_eq!(
+            serial_stats.artifact_cache_write_transactions,
+            pipeline_stats.artifact_cache_write_transactions
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_parses_next_chunk_while_writer_owns_previous_chunk() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use std::sync::Barrier;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..4 {
+            let path = dir.path().join(format!("overlap_{index}.rs"));
+            fs::write(&path, format!("fn overlap_{index}() {{}}\n"))?;
+            files.push(path);
+        }
+
+        let writer_has_chunk = Arc::new(Barrier::new(2));
+        let release_writer = Arc::new(Barrier::new(2));
+        let next_parse_started = Arc::new(AtomicBool::new(false));
+        let parse_barrier_entered = Arc::new(AtomicBool::new(false));
+        let parse_writer_has_chunk = writer_has_chunk.clone();
+        let parse_release_writer = release_writer.clone();
+        let parse_next_parse_started = next_parse_started.clone();
+        let parse_barrier_entered_hook = parse_barrier_entered.clone();
+        let writer_writer_has_chunk = writer_has_chunk.clone();
+        let writer_release_writer = release_writer.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_prepare_chunk: None,
+            before_parse_job: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 1 && !parse_barrier_entered_hook.swap(true, Ordering::SeqCst) {
+                    parse_writer_has_chunk.wait();
+                    parse_next_parse_started.store(true, Ordering::SeqCst);
+                    parse_release_writer.wait();
+                }
+            })),
+            before_writer_chunk: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 0 {
+                    writer_writer_has_chunk.wait();
+                    writer_release_writer.wait();
+                }
+            })),
+            on_send_timeout: None,
+        };
+
+        let database_path = dir.path().join("staged.sqlite");
+        let mut storage = Storage::open_build(&database_path)?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 2,
+                node_batch_size: usize::MAX,
+                edge_batch_size: usize::MAX,
+                occurrence_batch_size: usize::MAX,
+                error_batch_size: usize::MAX,
+            })
+            .with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert!(next_parse_started.load(Ordering::SeqCst));
+        assert_eq!(stats.full_refresh_chunks_produced, 2);
+        assert_eq!(stats.full_refresh_chunks_persisted, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_cancellation_while_queue_is_full_drains_only_accepted_chunks() -> Result<()>
+    {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use std::sync::Barrier;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..6 {
+            let path = dir.path().join(format!("cancel_{index}.rs"));
+            fs::write(&path, format!("fn cancel_{index}() {{}}\n"))?;
+            files.push(path);
+        }
+
+        let writer_has_chunk = Arc::new(Barrier::new(2));
+        let release_writer = Arc::new(Barrier::new(2));
+        let prepare_writer_has_chunk = writer_has_chunk.clone();
+        let writer_writer_has_chunk = writer_has_chunk.clone();
+        let writer_release_writer = release_writer.clone();
+        let timeout_release_writer = release_writer.clone();
+        let cancel_token = CancellationToken::new();
+        let timeout_cancel_token = cancel_token.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_prepare_chunk: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 1 {
+                    prepare_writer_has_chunk.wait();
+                }
+            })),
+            before_parse_job: None,
+            before_writer_chunk: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 0 {
+                    writer_writer_has_chunk.wait();
+                    writer_release_writer.wait();
+                }
+            })),
+            on_send_timeout: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 2 {
+                    timeout_cancel_token.cancel();
+                    timeout_release_writer.wait();
+                }
+            })),
+        };
+
+        let database_path = dir.path().join("staged.sqlite");
+        let mut storage = Storage::open_build(&database_path)?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 2,
+                node_batch_size: usize::MAX,
+                edge_batch_size: usize::MAX,
+                occurrence_batch_size: usize::MAX,
+                error_batch_size: usize::MAX,
+            })
+            .with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(stats.full_refresh_chunks_produced, 2);
+        assert_eq!(stats.full_refresh_chunks_persisted, 2);
+        assert!(
+            stats.full_refresh_producer_blocked_ms >= 20,
+            "queue saturation should record bounded producer backpressure"
+        );
+        let names = storage
+            .get_nodes()?
+            .into_iter()
+            .map(|node| node.serialized_name)
+            .collect::<HashSet<_>>();
+        assert!(names.contains("cancel_0"));
+        assert!(names.contains("cancel_3"));
+        assert!(!names.contains("cancel_4"));
+        assert!(!names.contains("cancel_5"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_cancellation_before_dispatch_writes_nothing() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("cancelled.rs");
+        std::fs::write(&path, "fn cancelled() {}\n")?;
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![path],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            Some(&cancel_token),
+        )?;
+
+        assert_eq!(stats.full_refresh_chunks_produced, 0);
+        assert!(storage.get_nodes()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_cancellation_during_parse_drops_unaccepted_chunk() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut paths = Vec::new();
+        for index in 0..4 {
+            let path = dir.path().join(format!("parse_cancel_{index}.rs"));
+            std::fs::write(&path, format!("fn parse_cancel_{index}() {{}}\n"))?;
+            paths.push(path);
+        }
+        let cancel_token = CancellationToken::new();
+        let parse_cancel_token = cancel_token.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_prepare_chunk: None,
+            before_parse_job: Some(Arc::new(move |_| parse_cancel_token.cancel())),
+            before_writer_chunk: None,
+            on_send_timeout: None,
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 2,
+                ..IncrementalIndexingConfig::default()
+            })
+            .with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(stats.full_refresh_chunks_produced, 0);
+        assert_eq!(stats.full_refresh_chunks_persisted, 0);
+        assert!(storage.get_nodes()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_cancellation_after_writer_acceptance_drains_that_chunk() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::sync::Barrier;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut paths = Vec::new();
+        for index in 0..4 {
+            let path = dir.path().join(format!("accepted_{index}.rs"));
+            std::fs::write(&path, format!("fn accepted_{index}() {{}}\n"))?;
+            paths.push(path);
+        }
+        let accepted = Arc::new(Barrier::new(2));
+        let producer_accepted = accepted.clone();
+        let writer_accepted = accepted.clone();
+        let cancel_token = CancellationToken::new();
+        let writer_cancel_token = cancel_token.clone();
+        let hooks = FullRefreshPipelineTestHooks {
+            before_prepare_chunk: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 1 {
+                    producer_accepted.wait();
+                }
+            })),
+            before_parse_job: None,
+            before_writer_chunk: Some(Arc::new(move |chunk_index| {
+                if chunk_index == 0 {
+                    writer_cancel_token.cancel();
+                    writer_accepted.wait();
+                }
+            })),
+            on_send_timeout: None,
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 2,
+                ..IncrementalIndexingConfig::default()
+            })
+            .with_pipeline_test_hooks(hooks);
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::open_build(dir.path().join("staged.sqlite"))?;
+
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), Some(&cancel_token))?;
+
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(stats.full_refresh_chunks_produced, 1);
+        assert_eq!(stats.full_refresh_chunks_persisted, 1);
+        let names = storage
+            .get_nodes()?
+            .into_iter()
+            .map(|node| node.serialized_name)
+            .collect::<HashSet<_>>();
+        assert!(names.contains("accepted_0"));
+        assert!(names.contains("accepted_1"));
+        assert!(!names.contains("accepted_2"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_refresh_writer_failure_disconnects_producer_without_deadlock() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use std::fs;
+        use std::sync::mpsc;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..8 {
+            let path = dir.path().join(format!("failure_{index}.rs"));
+            fs::write(&path, format!("fn failure_{index}() {{}}\n"))?;
+            files.push(path);
+        }
+
+        let database_path = dir.path().join("staged.sqlite");
+        let mut storage = Storage::open_build(&database_path)?;
+        storage.get_connection().execute_batch(
+            "CREATE TRIGGER reject_pipeline_cache_write
+             BEFORE INSERT ON index_artifact_cache
+             BEGIN
+               SELECT RAISE(ABORT, 'forced pipeline cache failure');
+             END;",
+        )?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 2,
+                node_batch_size: usize::MAX,
+                edge_batch_size: usize::MAX,
+                occurrence_batch_size: usize::MAX,
+                error_batch_size: usize::MAX,
+            },
+        );
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = indexer
+                .run(&mut storage, &plan, &EventBus::new(), None)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            result_tx
+                .send(result)
+                .expect("result receiver must remain open");
+        });
+
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pipeline failure must not deadlock")
+            .expect_err("injected writer failure must propagate");
+        handle.join().expect("indexing thread must not panic");
+        assert!(error.contains("forced pipeline cache failure"), "{error}");
         Ok(())
     }
 

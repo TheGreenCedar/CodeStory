@@ -1415,6 +1415,47 @@ fn test_index_artifact_cache_batch_rolls_back_every_row_on_failure() -> Result<(
 }
 
 #[test]
+fn test_index_artifact_cache_reader_observes_committed_batches_without_write_access()
+-> Result<(), StorageError> {
+    let dir = tempfile::tempdir().map_err(|error| StorageError::Other(error.to_string()))?;
+    let database_path = dir.path().join("staged.sqlite");
+    let storage = Storage::open_build(&database_path)?;
+    let reader = storage
+        .index_artifact_cache_reader()?
+        .expect("file-backed storage must provide a cache reader");
+    let path = Path::new("src/lib.rs");
+
+    assert_eq!(reader.get(path, "first-key")?, None);
+    storage.upsert_index_artifact_cache_batch(&[IndexArtifactCacheWrite {
+        path,
+        cache_key: "first-key",
+        artifact_blob: b"first",
+    }])?;
+    assert_eq!(reader.get(path, "first-key")?, Some(b"first".to_vec()));
+
+    storage.upsert_index_artifact_cache_batch(&[IndexArtifactCacheWrite {
+        path,
+        cache_key: "second-key",
+        artifact_blob: b"second",
+    }])?;
+    assert_eq!(reader.get(path, "first-key")?, None);
+    assert_eq!(reader.get(path, "second-key")?, Some(b"second".to_vec()));
+
+    let query_only: i64 = reader
+        .conn
+        .query_row("PRAGMA query_only", [], |row| row.get(0))?;
+    assert_eq!(query_only, 1);
+    assert!(
+        reader
+            .conn
+            .execute("DELETE FROM index_artifact_cache", [])
+            .is_err(),
+        "query-only reader must reject writes"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_resolution_support_snapshot_round_trip_and_invalidation() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let payload = br#"{"support":1}"#;

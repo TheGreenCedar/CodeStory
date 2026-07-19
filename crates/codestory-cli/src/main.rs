@@ -8933,6 +8933,12 @@ mod tests {
             artifact_cache_write_ms: Some(6),
             artifact_cache_writes: Some(24),
             artifact_cache_write_transactions: Some(1),
+            full_refresh_chunks_produced: Some(2),
+            full_refresh_chunks_persisted: Some(2),
+            full_refresh_queue_capacity: Some(1),
+            full_refresh_queue_high_water: Some(1),
+            full_refresh_producer_blocked_ms: Some(3),
+            full_refresh_writer_idle_ms: Some(4),
             cache_refresh_ms: Some(6),
             search_projection_rebuild_ms: Some(61),
             search_symbol_index_ms: Some(62),
@@ -9169,6 +9175,9 @@ mod tests {
             "cache_ms: artifact_write=6 search_projection=61 search_index=62 runtime_publish=63"
         ));
         assert!(markdown.contains("artifact_cache: writes=24 transactions=1"));
+        assert!(markdown.contains(
+            "full_refresh_pipeline: produced=2 persisted=2 queue_capacity=1 queue_high_water=1 producer_blocked_ms=3 writer_idle_ms=4"
+        ));
         assert!(markdown.contains("symbol_index: docs=8192 writers=1 commits=1 reloads=1"));
         assert!(
             markdown

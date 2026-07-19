@@ -68,6 +68,10 @@ const INDEX_ARTIFACT_CACHE_UPSERT_SQL: &str = "INSERT INTO index_artifact_cache 
     cache_key = excluded.cache_key,
     artifact_blob = excluded.artifact_blob,
     updated_at_epoch_ms = excluded.updated_at_epoch_ms";
+const INDEX_ARTIFACT_CACHE_SELECT_SQL: &str = "SELECT artifact_blob
+     FROM index_artifact_cache
+     WHERE file_path = ?1
+       AND cache_key = ?2";
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
 #[cfg(test)]
@@ -936,6 +940,20 @@ fn outside_file_node_predicate(file_param: &str) -> String {
     format!("(file_node_id IS NULL OR file_node_id != {file_param})")
 }
 
+fn get_index_artifact_cache_from_connection(
+    connection: &Connection,
+    path: &Path,
+    cache_key: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    Ok(connection
+        .query_row(
+            INDEX_ARTIFACT_CACHE_SELECT_SQL,
+            params![path.to_string_lossy().to_string(), cache_key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn upsert_index_artifact_cache_row(
     statement: &mut rusqlite::Statement<'_>,
     write: IndexArtifactCacheWrite<'_>,
@@ -979,6 +997,22 @@ pub struct Storage {
     conn: Connection,
     cache: StorageCache,
     deferred_secondary_indexes: bool,
+}
+
+/// Narrow query-only view used while a staged store has one active writer.
+///
+/// Unlike the published-store openers, this reader never runs promotion
+/// recovery, migrations, initialization, or immutable-file checks. Each cache
+/// lookup owns only its statement transaction so it cannot pin the staged WAL
+/// across parse chunks.
+pub struct IndexArtifactCacheReader {
+    conn: Connection,
+}
+
+impl IndexArtifactCacheReader {
+    pub fn get(&self, path: &Path, cache_key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
 }
 
 /// One coherent read view of a live SQLite store.
@@ -2238,22 +2272,41 @@ impl Storage {
         &self.conn
     }
 
+    /// Open a query-only artifact-cache reader for this file-backed store.
+    ///
+    /// The reader is intentionally narrower than `open_read_only`: it does not
+    /// recover promotion state or retain a read snapshot between lookups. An
+    /// in-memory store has no second connection and returns `None` so callers
+    /// can keep their existing serial path.
+    pub fn index_artifact_cache_reader(
+        &self,
+    ) -> Result<Option<IndexArtifactCacheReader>, StorageError> {
+        let Some(path) = self
+            .conn
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+        else {
+            return Ok(None);
+        };
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(2_500))?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Artifact-cache reader requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Some(IndexArtifactCacheReader { conn }))
+    }
+
     pub fn get_index_artifact_cache(
         &self,
         path: &Path,
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT artifact_blob
-             FROM index_artifact_cache
-             WHERE file_path = ?1
-               AND cache_key = ?2",
-        )?;
-        let mut rows = stmt.query(params![path.to_string_lossy().to_string(), cache_key])?;
-        if let Some(row) = rows.next()? {
-            return Ok(Some(row.get(0)?));
-        }
-        Ok(None)
+        get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
     }
 
     pub fn upsert_index_artifact_cache(
