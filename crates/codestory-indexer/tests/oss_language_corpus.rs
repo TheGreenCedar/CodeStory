@@ -859,9 +859,11 @@ fn report_json(report: &CorpusReport) -> serde_json::Value {
         "indexing_stats": {
             "parse_index_ms": report.stats.parse_index_ms,
             "edge_resolution_ms": report.stats.edge_resolution_ms,
+            "artifact_cache_write_ms": report.stats.artifact_cache_write_ms,
             "artifact_cache_hits": report.stats.artifact_cache_hits,
             "artifact_cache_misses": report.stats.artifact_cache_misses,
             "artifact_cache_writes": report.stats.artifact_cache_writes,
+            "artifact_cache_write_transactions": report.stats.artifact_cache_write_transactions,
             "resolved_calls": report.stats.resolved_calls,
             "resolved_imports": report.stats.resolved_imports,
             "unresolved_calls_end": report.stats.unresolved_calls_end,

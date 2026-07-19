@@ -17,7 +17,7 @@ use codestory_contracts::graph::{
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
 use codestory_contracts::workspace::process_source_index_policy;
-use codestory_store::Store as Storage;
+use codestory_store::{IndexArtifactCacheWrite, Store as Storage};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -681,6 +681,7 @@ pub struct IncrementalIndexingStats {
     pub artifact_cache_misses: usize,
     pub artifact_cache_invalid_entries: usize,
     pub artifact_cache_writes: usize,
+    pub artifact_cache_write_transactions: usize,
     pub parse_index_ms: u64,
     pub projection_flush_ms: u64,
     pub flush_files_ms: u64,
@@ -1015,28 +1016,52 @@ impl WorkspaceIndexer {
                 .parse_index_ms
                 .saturating_add(duration_ms_u64(parse_started.elapsed()));
 
+            let mut cache_writes = Vec::with_capacity(parse_results.len());
+            let mut parsed_storages = Vec::with_capacity(parse_results.len());
             for parsed in parse_results {
                 if let Some(cache_write) = parsed.cache_write {
-                    let cache_write_started = Instant::now();
-                    storage
-                        .upsert_index_artifact_cache(
-                            &cache_write.path,
-                            &cache_write.cache_key,
-                            &cache_write.artifact_blob,
-                        )
-                        .map_err(|e| anyhow!("Storage cache write error: {:?}", e))?;
-                    stats.artifact_cache_write_ms = stats
-                        .artifact_cache_write_ms
-                        .saturating_add(duration_ms_u64(cache_write_started.elapsed()));
-                    stats.artifact_cache_writes += 1;
+                    cache_writes.push(cache_write);
                 }
+                parsed_storages.push(parsed.local_storage);
+            }
 
+            if !cache_writes.is_empty() {
+                let cache_write_started = Instant::now();
+                let batch = cache_writes
+                    .iter()
+                    .map(|write| IndexArtifactCacheWrite {
+                        path: &write.path,
+                        cache_key: &write.cache_key,
+                        artifact_blob: &write.artifact_blob,
+                    })
+                    .collect::<Vec<_>>();
+                let written =
+                    storage
+                        .upsert_index_artifact_cache_batch(&batch)
+                        .map_err(|error| {
+                            anyhow!(
+                                "Storage cache batch write error for {} entries: {error}",
+                                batch.len()
+                            )
+                        })?;
+                stats.artifact_cache_write_ms = stats
+                    .artifact_cache_write_ms
+                    .saturating_add(duration_ms_u64(cache_write_started.elapsed()));
+                stats.artifact_cache_writes = stats.artifact_cache_writes.saturating_add(written);
+                stats.artifact_cache_write_transactions =
+                    stats.artifact_cache_write_transactions.saturating_add(1);
+            }
+
+            // Cancellation observed during this chunk is handled after the complete
+            // ordered cache transaction and projection flush boundary. The staged
+            // full-refresh database still cannot become live until runtime publish.
+            for local_storage in parsed_storages {
                 let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
                 event_bus.publish(Event::IndexingProgress {
                     current,
                     total: total_files,
                 });
-                chunk_results.push(parsed.local_storage);
+                chunk_results.push(local_storage);
             }
 
             for mut local_storage in chunk_results {
@@ -20515,9 +20540,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
-    fn test_incremental_indexing_batch_flush() -> Result<()> {
+    fn test_full_refresh_batches_artifact_cache_writes_per_file_chunk() -> Result<()> {
         use codestory_store::Store as Storage;
-        use codestory_workspace::RefreshInfo;
         use std::fs;
         use tempfile::tempdir;
 
@@ -20541,14 +20565,17 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             },
         );
 
-        let refresh_info = RefreshInfo {
-            mode: codestory_workspace::BuildMode::Incremental,
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
             files_to_index: files,
             files_to_remove: vec![],
             existing_file_ids: std::collections::HashMap::new(),
         };
 
-        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+        let stats = indexer.run(&mut storage, &plan, &bus, None)?;
+
+        assert_eq!(stats.artifact_cache_writes, 12);
+        assert_eq!(stats.artifact_cache_write_transactions, 4);
 
         // Each file should contribute at least one file node and one symbol node.
         let nodes = storage.get_nodes()?;
@@ -20856,6 +20883,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             !stats.resolution_ran,
             "cancellation after indexing flush should skip resolution"
         );
+        assert_eq!(stats.artifact_cache_writes, 64);
+        assert_eq!(stats.artifact_cache_write_transactions, 1);
         assert!(
             !storage.get_edges()?.is_empty(),
             "indexing should flush edges"

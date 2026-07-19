@@ -1330,6 +1330,91 @@ fn test_index_artifact_cache_round_trip() -> Result<(), StorageError> {
 }
 
 #[test]
+fn test_index_artifact_cache_batch_is_ordered_and_empty_is_noop() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let path = Path::new("src/lib.rs");
+    let empty: [IndexArtifactCacheWrite<'_>; 0] = [];
+
+    assert_eq!(storage.upsert_index_artifact_cache_batch(&empty)?, 0);
+    assert_eq!(
+        storage.upsert_index_artifact_cache_batch(&[
+            IndexArtifactCacheWrite {
+                path,
+                cache_key: "first-key",
+                artifact_blob: b"first",
+            },
+            IndexArtifactCacheWrite {
+                path,
+                cache_key: "last-key",
+                artifact_blob: b"last",
+            },
+        ])?,
+        2
+    );
+
+    assert_eq!(storage.get_index_artifact_cache(path, "first-key")?, None);
+    assert_eq!(
+        storage.get_index_artifact_cache(path, "last-key")?,
+        Some(b"last".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
+fn test_index_artifact_cache_batch_rolls_back_every_row_on_failure() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    let stable_path = Path::new("stable.rs");
+    storage.upsert_index_artifact_cache(stable_path, "stable-key", b"stable")?;
+    storage.get_connection().execute_batch(
+        "CREATE TRIGGER reject_failed_artifact_cache_write
+         BEFORE INSERT ON index_artifact_cache
+         WHEN NEW.file_path = 'fail.rs'
+         BEGIN
+           SELECT RAISE(ABORT, 'forced artifact-cache batch failure');
+         END;",
+    )?;
+
+    let error = storage
+        .upsert_index_artifact_cache_batch(&[
+            IndexArtifactCacheWrite {
+                path: stable_path,
+                cache_key: "replacement-key",
+                artifact_blob: b"replacement",
+            },
+            IndexArtifactCacheWrite {
+                path: Path::new("new.rs"),
+                cache_key: "new-key",
+                artifact_blob: b"new",
+            },
+            IndexArtifactCacheWrite {
+                path: Path::new("fail.rs"),
+                cache_key: "fail-key",
+                artifact_blob: b"fail",
+            },
+        ])
+        .expect_err("trigger must abort the artifact-cache batch");
+    assert!(
+        error
+            .to_string()
+            .contains("forced artifact-cache batch failure")
+    );
+
+    assert_eq!(
+        storage.get_index_artifact_cache(stable_path, "stable-key")?,
+        Some(b"stable".to_vec())
+    );
+    assert_eq!(
+        storage.get_index_artifact_cache(stable_path, "replacement-key")?,
+        None
+    );
+    assert_eq!(
+        storage.get_index_artifact_cache(Path::new("new.rs"), "new-key")?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
 fn test_resolution_support_snapshot_round_trip_and_invalidation() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let payload = br#"{"support":1}"#;

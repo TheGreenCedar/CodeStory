@@ -57,6 +57,17 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
+const INDEX_ARTIFACT_CACHE_UPSERT_SQL: &str = "INSERT INTO index_artifact_cache (
+    file_path,
+    cache_key,
+    artifact_blob,
+    updated_at_epoch_ms
+ )
+ VALUES (?1, ?2, ?3, ?4)
+ ON CONFLICT(file_path) DO UPDATE SET
+    cache_key = excluded.cache_key,
+    artifact_blob = excluded.artifact_blob,
+    updated_at_epoch_ms = excluded.updated_at_epoch_ms";
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
 #[cfg(test)]
@@ -925,6 +936,18 @@ fn outside_file_node_predicate(file_param: &str) -> String {
     format!("(file_node_id IS NULL OR file_node_id != {file_param})")
 }
 
+fn upsert_index_artifact_cache_row(
+    statement: &mut rusqlite::Statement<'_>,
+    write: IndexArtifactCacheWrite<'_>,
+) -> Result<usize, StorageError> {
+    Ok(statement.execute(params![
+        write.path.to_string_lossy().to_string(),
+        write.cache_key,
+        write.artifact_blob,
+        current_epoch_ms()
+    ])?)
+}
+
 /// Errors returned by storage facade operations.
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -936,6 +959,14 @@ pub enum StorageError {
     EnumConversion(#[from] EnumConversionError),
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// One reusable parser artifact to persist in the index artifact cache.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexArtifactCacheWrite<'a> {
+    pub path: &'a Path,
+    pub cache_key: &'a str,
+    pub artifact_blob: &'a [u8],
 }
 
 /// SQLite-backed graph, search, file, and snapshot store.
@@ -2232,17 +2263,7 @@ impl Storage {
         artifact_blob: &[u8],
     ) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO index_artifact_cache (
-                file_path,
-                cache_key,
-                artifact_blob,
-                updated_at_epoch_ms
-             )
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(file_path) DO UPDATE SET
-                cache_key = excluded.cache_key,
-                artifact_blob = excluded.artifact_blob,
-                updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            INDEX_ARTIFACT_CACHE_UPSERT_SQL,
             params![
                 path.to_string_lossy().to_string(),
                 cache_key,
@@ -2251,6 +2272,30 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist one ordered artifact-cache chunk in a single transaction.
+    ///
+    /// Duplicate paths retain ordered single-row semantics: the last entry wins.
+    /// An empty chunk does not open a transaction, and any row failure rolls the
+    /// complete chunk back.
+    pub fn upsert_index_artifact_cache_batch(
+        &self,
+        writes: &[IndexArtifactCacheWrite<'_>],
+    ) -> Result<usize, StorageError> {
+        if writes.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.conn.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(INDEX_ARTIFACT_CACHE_UPSERT_SQL)?;
+            for write in writes {
+                upsert_index_artifact_cache_row(&mut statement, *write)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(writes.len())
     }
 
     pub fn copy_index_artifact_cache_from(

@@ -14609,6 +14609,11 @@ fn index_full_for_runtime(
             edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
+            artifact_cache_write_ms: Some(clamp_u64_to_u32(index_stats.artifact_cache_write_ms)),
+            artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
+            artifact_cache_write_transactions: Some(clamp_usize_to_u32(
+                index_stats.artifact_cache_write_transactions,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -15225,6 +15230,11 @@ fn run_incremental_indexing_common(
             edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
+            artifact_cache_write_ms: Some(clamp_u64_to_u32(index_stats.artifact_cache_write_ms)),
+            artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
+            artifact_cache_write_transactions: Some(clamp_usize_to_u32(
+                index_stats.artifact_cache_write_transactions,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,

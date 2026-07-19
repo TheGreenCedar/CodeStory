@@ -325,9 +325,18 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
         markdown,
         "cache_ms",
         &[
+            ("artifact_write", timings.artifact_cache_write_ms),
             ("search_projection", timings.search_projection_rebuild_ms),
             ("search_index", timings.search_symbol_index_ms),
             ("runtime_publish", timings.runtime_cache_publish_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "artifact_cache",
+        &[
+            ("writes", timings.artifact_cache_writes),
+            ("transactions", timings.artifact_cache_write_transactions),
         ],
     );
     append_optional_timings_line(
