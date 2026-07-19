@@ -2614,6 +2614,9 @@ export function releaseWorkflowContractViolations(
 }
 
 function validateReleaseCellUploadOwnership(workflows, violations) {
+  const evidenceFile = releaseEvidenceWorkflowRef.slice(
+    releaseEvidenceWorkflowRef.lastIndexOf("/") + 1,
+  );
   const actual = [];
   for (const [file, workflow] of workflows) {
     for (const [jobId, jobValue] of Object.entries(object(workflow.jobs))) {
@@ -2628,7 +2631,8 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
   }
   const expected = [
     "source-proof.yml/full-source-gate/release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
-    "release-candidate-evidence.yml/measure/release-cell-prepublish-release-evidence-attempt-${{ github.run_attempt }}",
+    evidenceFile
+      + "/measure/release-cell-prepublish-release-evidence-attempt-${{ github.run_attempt }}",
     "packaged-platform-proof.yml/build/release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
     "macos-metal-proof.yml/packaged-metal/release-cell-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
     "windows-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
@@ -2642,9 +2646,12 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
 }
 
 function validateReleaseArtifactRerunSafety(workflows, violations) {
+  const evidenceFile = releaseEvidenceWorkflowRef.slice(
+    releaseEvidenceWorkflowRef.lastIndexOf("/") + 1,
+  );
   const releaseChainWorkflows = new Set([
     "source-proof.yml",
-    "release-candidate-evidence.yml",
+    evidenceFile,
     "packaged-platform-proof.yml",
     "macos-metal-proof.yml",
     "windows-vulkan-proof.yml",
@@ -2652,7 +2659,7 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     "release.yml",
   ]);
   const replaceableStableIntermediates = new Map([
-    ["release-candidate-evidence.yml/measure/Upload release evidence", {
+    [`${evidenceFile}/measure/Upload release evidence`, {
       name: "release-evidence-${{ inputs.ref }}",
       path: "target/release-evidence",
     }],
