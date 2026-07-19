@@ -810,10 +810,7 @@ impl AppController {
                 let file_id = record.node.file_node_id?;
                 let path = record.file_path.as_deref()?;
                 let path_key = path.to_string_lossy();
-                let role = stored_file_roles
-                    .get(path_key.as_ref())
-                    .copied()
-                    .unwrap_or_else(|| FileRole::classify_path(path));
+                let role = stored_file_roles.get(path_key.as_ref()).copied()?;
                 Some((file_id.0, role))
             })
             .collect::<HashMap<_, _>>();
@@ -2071,6 +2068,32 @@ mod tests {
                 .expect("insert production root");
             }
 
+            let node_only_path = temp.path().join("src/compatibility_only.rs");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(400),
+                        kind: NodeKind::FILE,
+                        serialized_name: node_only_path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(4_000),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "CompatibilityRoot".to_string(),
+                        file_node_id: Some(CoreNodeId(400)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert node-only compatibility root");
+            assert!(
+                storage
+                    .get_file_roles_by_paths(&[node_only_path.to_string_lossy().to_string()])
+                    .expect("load node-only role")
+                    .is_empty()
+            );
+
             let previous_balanced = storage
                 .get_grounding_root_symbol_candidates(16, 0)
                 .expect("load unranked root candidates");
@@ -2132,6 +2155,17 @@ mod tests {
                 .label
                 .contains("crates/codestory-runtime/src/production_")
         }));
+        assert!(max.root_symbols.iter().take(20).all(|symbol| {
+            symbol
+                .label
+                .contains("crates/codestory-runtime/src/production_")
+        }));
+        assert!(
+            max.root_symbols
+                .iter()
+                .position(|symbol| symbol.label.starts_with("CompatibilityRoot @ "))
+                .is_some_and(|index| index >= 20)
+        );
         assert_eq!(
             strict
                 .root_symbols
@@ -2182,8 +2216,14 @@ mod tests {
                     .then_some(index)
             })
             .collect::<Vec<_>>();
-        assert_eq!(notifier_positions.first(), Some(&20));
-        assert!(notifier_positions.iter().skip(1).all(|index| *index >= 24));
+        let first_notifier = *notifier_positions.first().expect("retained notifier root");
+        assert!(first_notifier >= 20);
+        assert!(
+            notifier_positions
+                .iter()
+                .skip(1)
+                .all(|index| *index >= first_notifier + 4)
+        );
     }
 
     #[test]
