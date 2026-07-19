@@ -4,6 +4,10 @@
 
 ### Performance
 
+- Staged full refresh now bulk-builds grounding summary indexes around
+  materialization instead of maintaining them row by row. The node file-rank
+  index is created between node and file materialization for the file join;
+  deferred-index telemetry includes the pre-, mid-, and post-summary builds.
 - Full-refresh telemetry now reconciles exclusive outer wall stages and exposes
   previously hidden source preparation, complete projection transactions,
   semantic node/context loading, and final Tantivy commit/reload time. The

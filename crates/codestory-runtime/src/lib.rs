@@ -25840,6 +25840,61 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn full_refresh_post_summary_index_failure_preserves_live_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn retained_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+
+        fs::write(&source_path, "pub fn rejected_generation() -> i32 { 2 }\n")
+            .expect("write replacement source");
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TABLE idx_grounding_file_snapshot_path (
+                         collision INTEGER
+                     );",
+                )
+                .expect("install post-summary index collision");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("post-summary destination index failure must reject the candidate");
+        assert!(
+            error.message.contains("idx_grounding_file_snapshot_path"),
+            "{error:?}"
+        );
+
+        let live = Storage::open(&storage_path).expect("reopen retained live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retained publication"),
+            Some(baseline)
+        );
+        assert!(storage_has_symbol(&live, "retained_generation"));
+        assert!(!storage_has_symbol(&live, "rejected_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
     fn incremental_publication_ignores_changed_files_without_graph_collectors() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(

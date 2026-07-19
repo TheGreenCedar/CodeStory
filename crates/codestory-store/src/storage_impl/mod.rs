@@ -938,6 +938,50 @@ fn grounding_node_rank_sql(alias: &str) -> String {
     )
 }
 
+fn grounding_file_snapshot_cte_sql() -> String {
+    format!(
+        "WITH all_files AS (
+            SELECT id, path, language, modification_time, indexed, complete, line_count
+            FROM file
+            UNION ALL
+            SELECT
+                n.id,
+                n.serialized_name,
+                '',
+                0,
+                1,
+                1,
+                0
+            FROM node n
+            WHERE n.kind = {file_kind}
+              AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
+        )",
+        file_kind = NodeKind::FILE as i32,
+    )
+}
+
+const GROUNDING_FILE_SNAPSHOT_SELECT_SQL: &str = "SELECT
+    f.id,
+    f.path,
+    f.language,
+    f.modification_time,
+    f.indexed,
+    f.complete,
+    f.line_count,
+    COUNT(gs.node_id) AS symbol_count,
+    MIN(CASE WHEN gs.node_id IS NULL THEN 255 ELSE gs.node_rank END) AS best_node_rank
+FROM all_files f
+LEFT JOIN grounding_node_snapshot gs
+  ON gs.file_node_id = f.id
+GROUP BY
+    f.id,
+    f.path,
+    f.language,
+    f.modification_time,
+    f.indexed,
+    f.complete,
+    f.line_count";
+
 fn outside_related_file_edge_predicate(file_param: &str) -> String {
     format!(
         "source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
@@ -2825,6 +2869,20 @@ impl Storage {
     }
 
     pub fn refresh_grounding_summary_snapshots(&self) -> Result<(), StorageError> {
+        self.refresh_grounding_summary_snapshots_impl(false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn refresh_grounding_summary_snapshots_for_staged_finalize(
+        &self,
+    ) -> Result<Duration, StorageError> {
+        self.refresh_grounding_summary_snapshots_impl(self.deferred_secondary_indexes)
+    }
+
+    fn refresh_grounding_summary_snapshots_impl(
+        &self,
+        build_node_file_rank_index: bool,
+    ) -> Result<Duration, StorageError> {
         let rank_sql = grounding_node_rank_sql("n");
         let display_name = grounding_display_name_expr("n");
         let indexable = grounding_indexable_predicate("n");
@@ -2940,23 +2998,16 @@ impl Storage {
         );
         tx.execute(&node_snapshot_sql, [])?;
 
+        let node_file_rank_index_duration = if build_node_file_rank_index {
+            let started = Instant::now();
+            schema::create_grounding_node_file_rank_index(&tx)?;
+            started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+
         let file_snapshot_sql = format!(
-            "WITH all_files AS (
-                SELECT id, path, language, modification_time, indexed, complete, line_count
-                FROM file
-                UNION ALL
-                SELECT
-                    n.id,
-                    n.serialized_name,
-                    '',
-                    0,
-                    1,
-                    1,
-                    0
-                FROM node n
-                WHERE n.kind = {file_kind}
-                  AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
-            )
+            "{}
             INSERT INTO grounding_file_snapshot (
                 file_id,
                 path,
@@ -2968,28 +3019,9 @@ impl Storage {
                 symbol_count,
                 best_node_rank
             )
-            SELECT
-                f.id,
-                f.path,
-                f.language,
-                f.modification_time,
-                f.indexed,
-                f.complete,
-                f.line_count,
-                COUNT(gs.node_id) AS symbol_count,
-                MIN(CASE WHEN gs.node_id IS NULL THEN 255 ELSE gs.node_rank END) AS best_node_rank
-            FROM all_files f
-            LEFT JOIN grounding_node_snapshot gs
-              ON gs.file_node_id = f.id
-            GROUP BY
-                f.id,
-                f.path,
-                f.language,
-                f.modification_time,
-                f.indexed,
-                f.complete,
-                f.line_count",
-            file_kind = NodeKind::FILE as i32,
+            {}",
+            grounding_file_snapshot_cte_sql(),
+            GROUNDING_FILE_SNAPSHOT_SELECT_SQL,
         );
         tx.execute(&file_snapshot_sql, [])?;
 
@@ -3009,7 +3041,7 @@ impl Storage {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(node_file_rank_index_duration)
     }
 
     pub fn hydrate_grounding_detail_snapshots(&self) -> Result<(), StorageError> {
@@ -3421,9 +3453,12 @@ impl Storage {
     }
 
     pub fn finalize_staged_snapshot(&self) -> Result<(), StorageError> {
-        self.refresh_grounding_summary_snapshots()?;
         if self.deferred_secondary_indexes {
-            schema::create_deferred_indexes(&self.conn)?;
+            self.prepare_deferred_secondary_indexes_for_summary()?;
+            self.refresh_grounding_summary_snapshots_for_staged_finalize()?;
+            self.complete_deferred_secondary_indexes_after_summary()?;
+        } else {
+            self.refresh_grounding_summary_snapshots()?;
         }
         Ok(())
     }
@@ -3475,6 +3510,25 @@ impl Storage {
     pub fn create_deferred_secondary_indexes(&self) -> Result<(), StorageError> {
         if self.deferred_secondary_indexes {
             schema::create_deferred_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_deferred_secondary_indexes_for_summary(
+        &self,
+    ) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::drop_grounding_summary_destination_indexes(&self.conn)?;
+            schema::create_pre_summary_secondary_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_deferred_secondary_indexes_after_summary(
+        &self,
+    ) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::create_post_summary_destination_indexes(&self.conn)?;
         }
         Ok(())
     }
