@@ -341,6 +341,21 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
     );
     append_optional_timings_line(
         markdown,
+        "full_refresh_pipeline",
+        &[
+            ("produced", timings.full_refresh_chunks_produced),
+            ("persisted", timings.full_refresh_chunks_persisted),
+            ("queue_capacity", timings.full_refresh_queue_capacity),
+            ("queue_high_water", timings.full_refresh_queue_high_water),
+            (
+                "producer_blocked_ms",
+                timings.full_refresh_producer_blocked_ms,
+            ),
+            ("writer_idle_ms", timings.full_refresh_writer_idle_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
         "symbol_index",
         &[
             ("docs", timings.search_symbol_index_docs_written),
