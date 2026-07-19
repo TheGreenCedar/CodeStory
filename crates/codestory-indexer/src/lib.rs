@@ -1627,9 +1627,65 @@ impl WorkspaceIndexer {
             .compilation_db
             .as_ref()
             .and_then(|db| db.get_parsed_info(&full_path));
-        let Some(mut language_config) =
-            get_language_config_for_path(&full_path, compilation_info.as_ref())
-        else {
+        let language_config = get_language_config_for_path(&full_path, compilation_info.as_ref());
+        let source_language = language_config
+            .as_ref()
+            .map(|config| config.language_name)
+            .or_else(|| template_pipeline::template_surface_language(&full_path))
+            .or_else(|| {
+                structural::is_structural_candidate_path(&full_path)
+                    .then(|| structural::structural_language_name(&full_path))
+            })
+            .or_else(|| {
+                is_text_only_candidate_path(&full_path).then(|| text_only_language_name(&full_path))
+            })
+            .or_else(|| is_openapi_candidate_path(&full_path).then_some("openapi"));
+        let Some(source_language) = source_language else {
+            return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
+        };
+
+        let file_size = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata.len(),
+            Err(e) => {
+                let local_storage = incomplete_file_storage(
+                    &full_path,
+                    None,
+                    source_language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to inspect {:?}: {}", path, e),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: true,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
+                    },
+                );
+                return Err(local_storage);
+            }
+        };
+        if file_size > self.source_file_byte_cap {
+            let local_storage = incomplete_file_storage(
+                &full_path,
+                None,
+                source_language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Skipped oversized source file {:?}: {} bytes exceeds {} byte cap",
+                        path, file_size, self.source_file_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            );
+            return Err(local_storage);
+        }
+
+        let Some(mut language_config) = language_config else {
             match self.prepare_openapi_schema_work(&full_path) {
                 Ok(Some(local_storage)) => return Ok(PreparedIndexWork::Immediate(local_storage)),
                 Ok(None) => {}
@@ -1713,47 +1769,6 @@ impl WorkspaceIndexer {
             }
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
-
-        let file_size = match std::fs::metadata(&full_path) {
-            Ok(metadata) => metadata.len(),
-            Err(e) => {
-                let local_storage = incomplete_file_storage(
-                    &full_path,
-                    None,
-                    language_config.language_name,
-                    codestory_contracts::graph::ErrorInfo {
-                        message: format!("Failed to inspect {:?}: {}", path, e),
-                        file_id: None,
-                        line: None,
-                        column: None,
-                        is_fatal: true,
-                        index_step: codestory_contracts::graph::IndexStep::Collection,
-                        coverage_reason: Some(FileCoverageReason::Unreadable),
-                    },
-                );
-                return Err(local_storage);
-            }
-        };
-        if file_size > self.source_file_byte_cap {
-            let local_storage = incomplete_file_storage(
-                &full_path,
-                None,
-                language_config.language_name,
-                codestory_contracts::graph::ErrorInfo {
-                    message: format!(
-                        "Skipped oversized source file {:?}: {} bytes exceeds {} byte cap",
-                        path, file_size, self.source_file_byte_cap
-                    ),
-                    file_id: None,
-                    line: None,
-                    column: None,
-                    is_fatal: false,
-                    index_step: codestory_contracts::graph::IndexStep::Indexing,
-                    coverage_reason: Some(FileCoverageReason::Oversized),
-                },
-            );
-            return Err(local_storage);
-        }
 
         let bytes = match std::fs::read(&full_path) {
             Ok(bytes) => bytes,
@@ -20615,6 +20630,164 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert!(
             !nodes.iter().any(|node| node.serialized_name == "too_large"),
             "oversized parser-backed source should not be read and parsed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_source_byte_cap_precedes_special_collector_reads() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use codestory_workspace::RefreshInfo;
+        use std::fs;
+        use tempfile::tempdir;
+
+        const CAP: usize = 512;
+        let dir = tempdir()?;
+        let cases = [
+            (
+                "openapi",
+                "oversized-openapi.json",
+                "small-openapi.json",
+                r#"{
+  "openapi": "3.1.0",
+  "paths": {
+    "/small": {
+      "get": { "operationId": "getSmall" }
+    }
+  }
+}"#,
+            ),
+            (
+                "svelte",
+                "Oversized.svelte",
+                "Small.svelte",
+                r#"<script>
+  export function smallTemplate() { return 1; }
+</script>
+<h1>Small</h1>"#,
+            ),
+            (
+                "docker_compose",
+                "docker-compose.override.yml",
+                "compose.yaml",
+                "services:\n  web:\n    image: example/web:latest\n",
+            ),
+            (
+                "csharp",
+                "oversized.cshtml",
+                "small.cshtml",
+                "[HttpGet(\"/small\")]\n",
+            ),
+        ];
+
+        let mut files_to_index = Vec::new();
+        let mut oversized_paths = Vec::new();
+        let mut control_paths = Vec::new();
+        for (_, oversized_name, control_name, source) in cases {
+            assert!(source.len() <= CAP, "control fixture must remain below cap");
+            let oversized_path = dir.path().join(oversized_name);
+            let mut oversized_source = source.as_bytes().to_vec();
+            oversized_source.resize(CAP + 1, b' ');
+            fs::write(&oversized_path, oversized_source)?;
+            files_to_index.push(oversized_path.clone());
+            oversized_paths.push(oversized_path);
+
+            let control_path = dir.path().join(control_name);
+            fs::write(&control_path, source)?;
+            files_to_index.push(control_path.clone());
+            control_paths.push(control_path);
+        }
+        let unsupported_path = dir.path().join("oversized.bin");
+        fs::write(&unsupported_path, vec![b'x'; CAP + 1])?;
+        files_to_index.push(unsupported_path.clone());
+
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(CAP as u64)
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: files_to_index.len(),
+                node_batch_size: 256,
+                edge_batch_size: 256,
+                occurrence_batch_size: 256,
+                error_batch_size: 256,
+            });
+        indexer.run_incremental(
+            &mut storage,
+            &RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index,
+                files_to_remove: Vec::new(),
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+
+        let files = storage.get_files()?;
+        let nodes = storage.get_nodes()?;
+        let edges = storage.get_edges()?;
+        let errors = storage.get_errors(None)?;
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.coverage_reason == Some(FileCoverageReason::Oversized))
+                .count(),
+            oversized_paths.len()
+        );
+
+        for ((expected_language, _, _, _), path) in cases.iter().zip(&oversized_paths) {
+            let file = files
+                .iter()
+                .find(|file| file.path == *path)
+                .expect("oversized collector candidate must retain a diagnostic file row");
+            assert!(!file.complete);
+            assert_eq!(&file.language, expected_language);
+            assert!(errors.iter().any(|error| {
+                error.file_id == Some(NodeId(file.id))
+                    && error.coverage_reason == Some(FileCoverageReason::Oversized)
+            }));
+            assert_eq!(storage.get_file_content_hash(file.id)?, None);
+            assert!(
+                storage
+                    .get_callable_projection_states_for_file(file.id)?
+                    .is_empty(),
+                "oversized collector candidate cannot retain callable projection state"
+            );
+            assert!(
+                nodes
+                    .iter()
+                    .filter(|node| node.id != NodeId(file.id))
+                    .all(|node| node.file_node_id != Some(NodeId(file.id))),
+                "oversized collector candidate cannot emit non-file graph nodes"
+            );
+            assert!(
+                edges
+                    .iter()
+                    .all(|edge| edge.file_node_id != Some(NodeId(file.id))),
+                "oversized collector candidate cannot emit graph edges"
+            );
+        }
+
+        for path in control_paths {
+            let file = files
+                .iter()
+                .find(|file| file.path == path)
+                .expect("below-cap collector control must retain a file row");
+            assert!(
+                file.complete,
+                "below-cap collector control must remain usable"
+            );
+            assert!(
+                nodes.iter().any(|node| {
+                    node.kind != NodeKind::FILE && node.file_node_id == Some(NodeId(file.id))
+                }),
+                "below-cap collector control must still emit collector evidence"
+            );
+        }
+        assert!(
+            files.iter().all(|file| file.path != unsupported_path),
+            "ordinary unsupported paths must remain ignored"
         );
 
         Ok(())
