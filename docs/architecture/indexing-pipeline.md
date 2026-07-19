@@ -317,6 +317,17 @@ The last step belongs to runtime plus store:
 
 Full and incremental snapshot behavior are intentionally not symmetric.
 
+Staged finalization splits deferred indexes around summary materialization. It
+first creates source/core indexes used by the snapshot query, including the
+edge indexes needed for root membership checks. It fills the grounding node
+table with both destination indexes absent, then bulk-builds the node file-rank
+index needed by the file-summary join. After file materialization it bulk-builds
+the node root-rank index and both file-summary indexes before the stage can
+publish. All three index-build segments belong to `deferred_indexes_ms`;
+`summary_snapshot_ms` covers only materialization. Any failure in a build
+segment leaves the candidate unpublished and the previous live generation
+usable.
+
 ### 11. Runtime synchronizes core search inputs
 
 After graph and snapshot work, runtime streams canonical search symbols

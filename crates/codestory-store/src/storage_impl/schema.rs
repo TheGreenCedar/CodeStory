@@ -330,7 +330,7 @@ const LOAD_TIME_INDEX_STATEMENTS: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_component_access_node ON component_access(node_id)",
 ];
 
-const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
+const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element ON occurrence(element_id)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element_start_line ON occurrence(element_id, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_file ON occurrence(file_node_id)",
@@ -372,17 +372,42 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
      ON search_symbol_projection(display_name)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_rank
-     ON grounding_file_snapshot(best_node_rank, symbol_count DESC, path)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_file_rank
-     ON grounding_node_snapshot(file_node_id, file_symbol_rank, node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_root_rank
-     ON grounding_node_snapshot(is_root, node_rank, sort_start_line, display_name, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
     "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
      ON retrieval_index_manifest(built_at_epoch_ms)",
+];
+
+const GROUNDING_FILE_SNAPSHOT_PATH_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)";
+const GROUNDING_FILE_SNAPSHOT_RANK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_rank
+     ON grounding_file_snapshot(best_node_rank, symbol_count DESC, path)";
+const GROUNDING_NODE_SNAPSHOT_FILE_RANK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_file_rank
+     ON grounding_node_snapshot(file_node_id, file_symbol_rank, node_id)";
+const GROUNDING_NODE_SNAPSHOT_ROOT_RANK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_root_rank
+     ON grounding_node_snapshot(is_root, node_rank, sort_start_line, display_name, node_id)";
+
+const GROUNDING_SUMMARY_DESTINATION_INDEX_STATEMENTS: &[&str] = &[
+    GROUNDING_FILE_SNAPSHOT_PATH_INDEX,
+    GROUNDING_FILE_SNAPSHOT_RANK_INDEX,
+    GROUNDING_NODE_SNAPSHOT_FILE_RANK_INDEX,
+    GROUNDING_NODE_SNAPSHOT_ROOT_RANK_INDEX,
+];
+
+const POST_SUMMARY_DESTINATION_INDEX_STATEMENTS: &[&str] = &[
+    GROUNDING_FILE_SNAPSHOT_PATH_INDEX,
+    GROUNDING_FILE_SNAPSHOT_RANK_INDEX,
+    GROUNDING_NODE_SNAPSHOT_ROOT_RANK_INDEX,
+];
+
+const GROUNDING_SUMMARY_DESTINATION_INDEX_NAMES: &[&str] = &[
+    "idx_grounding_file_snapshot_path",
+    "idx_grounding_file_snapshot_rank",
+    "idx_grounding_node_snapshot_file_rank",
+    "idx_grounding_node_snapshot_root_rank",
 ];
 
 pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
@@ -400,7 +425,38 @@ pub(super) fn create_load_indexes(conn: &Connection) -> Result<(), StorageError>
 }
 
 pub(super) fn create_secondary_indexes(conn: &Connection) -> Result<(), StorageError> {
-    for statement in SECONDARY_INDEX_STATEMENTS {
+    create_pre_summary_secondary_indexes(conn)?;
+    for statement in GROUNDING_SUMMARY_DESTINATION_INDEX_STATEMENTS {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn create_pre_summary_secondary_indexes(conn: &Connection) -> Result<(), StorageError> {
+    for statement in PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn drop_grounding_summary_destination_indexes(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    for index_name in GROUNDING_SUMMARY_DESTINATION_INDEX_NAMES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {index_name}"), [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn create_grounding_node_file_rank_index(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(GROUNDING_NODE_SNAPSHOT_FILE_RANK_INDEX, [])?;
+    Ok(())
+}
+
+pub(super) fn create_post_summary_destination_indexes(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    for statement in POST_SUMMARY_DESTINATION_INDEX_STATEMENTS {
         conn.execute(statement, [])?;
     }
     Ok(())

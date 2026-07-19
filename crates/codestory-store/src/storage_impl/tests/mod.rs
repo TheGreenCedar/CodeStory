@@ -38,6 +38,19 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
     ))
 }
 
+fn sqlite_index_exists(storage: &Storage, index_name: &str) -> Result<bool, StorageError> {
+    storage
+        .conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+             )",
+            [index_name],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
+}
+
 fn create_versioned_observation_fixture(path: &Path, version: u32) {
     let connection = Connection::open(path).expect("create observation fixture");
     connection
@@ -4268,6 +4281,131 @@ fn test_resolution_query_plan_prefers_new_indexes() -> Result<(), StorageError> 
             .any(|line| line.contains("idx_edge_kind_resolved_target"))
     );
 
+    Ok(())
+}
+
+#[test]
+fn staged_summary_build_uses_bulk_node_file_rank_index_for_file_aggregation()
+-> Result<(), StorageError> {
+    const DESTINATION_INDEXES: &[&str] = &[
+        "idx_grounding_file_snapshot_path",
+        "idx_grounding_file_snapshot_rank",
+        "idx_grounding_node_snapshot_file_rank",
+        "idx_grounding_node_snapshot_root_rank",
+    ];
+
+    let db_path = unique_temp_db_path("summary-index-phases");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let mut storage = Storage::open_build(&db_path)?;
+    storage.insert_files_batch(&[FileInfo {
+        id: 1,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 5,
+        file_role: FileRole::Source,
+    }])?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".to_string(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(1),
+            ..Default::default()
+        },
+    ])?;
+
+    storage.prepare_deferred_secondary_indexes_for_summary()?;
+    assert!(sqlite_index_exists(&storage, "idx_node_file")?);
+    for index_name in DESTINATION_INDEXES {
+        assert!(!sqlite_index_exists(&storage, index_name)?);
+    }
+
+    storage.refresh_grounding_summary_snapshots_for_staged_finalize()?;
+    assert!(sqlite_index_exists(
+        &storage,
+        "idx_grounding_node_snapshot_file_rank"
+    )?);
+    for index_name in [
+        "idx_grounding_file_snapshot_path",
+        "idx_grounding_file_snapshot_rank",
+        "idx_grounding_node_snapshot_root_rank",
+    ] {
+        assert!(!sqlite_index_exists(&storage, index_name)?);
+    }
+    assert!(storage.has_ready_grounding_summary_snapshots()?);
+    assert_eq!(storage.get_grounding_file_summary_count()?, 1);
+
+    let file_snapshot_plan_sql = format!(
+        "EXPLAIN QUERY PLAN\n{}\n{}",
+        grounding_file_snapshot_cte_sql(),
+        GROUNDING_FILE_SNAPSHOT_SELECT_SQL,
+    );
+    let mut plan_stmt = storage.conn.prepare(&file_snapshot_plan_sql)?;
+    let plan = plan_stmt
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("idx_grounding_node_snapshot_file_rank")),
+        "file-summary join did not use the persistent file-rank index: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|line| !line.contains("AUTOMATIC")),
+        "file-summary join built an automatic index: {plan:?}"
+    );
+    drop(plan_stmt);
+
+    storage.complete_deferred_secondary_indexes_after_summary()?;
+    for index_name in DESTINATION_INDEXES {
+        assert!(sqlite_index_exists(&storage, index_name)?);
+    }
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+    Ok(())
+}
+
+#[test]
+fn legacy_staged_finalize_builds_complete_secondary_index_set() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("legacy-summary-finalize");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let mut storage = Storage::open_build(&db_path)?;
+    storage.insert_files_batch(&[FileInfo {
+        id: 1,
+        path: PathBuf::from("legacy.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    }])?;
+
+    storage.finalize_staged_snapshot()?;
+
+    assert!(storage.has_ready_grounding_summary_snapshots()?);
+    for index_name in [
+        "idx_node_file",
+        "idx_grounding_file_snapshot_path",
+        "idx_grounding_file_snapshot_rank",
+        "idx_grounding_node_snapshot_file_rank",
+        "idx_grounding_node_snapshot_root_rank",
+    ] {
+        assert!(sqlite_index_exists(&storage, index_name)?);
+    }
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
     Ok(())
 }
 

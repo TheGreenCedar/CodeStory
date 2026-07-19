@@ -103,20 +103,30 @@ impl<'a> SnapshotStore<'a> {
         self.storage.create_deferred_secondary_indexes()
     }
 
-    /// Create deferred indexes and refresh the summary snapshot for publish.
+    /// Create deferred indexes around the summary snapshot build for publish.
     pub fn finalize_staged(&self) -> Result<StagedSnapshotFinalizeStats, StorageError> {
-        let deferred_started = Instant::now();
-        self.create_deferred_indexes()?;
-        let deferred_indexes_ms = clamp_u128_to_u32(deferred_started.elapsed().as_millis());
+        let pre_summary_indexes_started = Instant::now();
+        self.storage
+            .prepare_deferred_secondary_indexes_for_summary()?;
+        let pre_summary_indexes_duration = pre_summary_indexes_started.elapsed();
 
         let summary_started = Instant::now();
-        self.refresh_summary()?;
-        let summary_snapshot_ms = clamp_u128_to_u32(summary_started.elapsed().as_millis());
+        let node_file_rank_index_duration = self
+            .storage
+            .refresh_grounding_summary_snapshots_for_staged_finalize()?;
+        let summary_with_mid_index_duration = summary_started.elapsed();
 
-        Ok(StagedSnapshotFinalizeStats {
-            deferred_indexes_ms,
-            summary_snapshot_ms,
-        })
+        let post_summary_indexes_started = Instant::now();
+        self.storage
+            .complete_deferred_secondary_indexes_after_summary()?;
+        let post_summary_indexes_duration = post_summary_indexes_started.elapsed();
+
+        Ok(staged_snapshot_finalize_stats(
+            pre_summary_indexes_duration,
+            summary_with_mid_index_duration,
+            node_file_rank_index_duration,
+            post_summary_indexes_duration,
+        ))
     }
 
     /// Return whether the summary snapshot is ready for reads.
@@ -245,6 +255,23 @@ fn clamp_u128_to_u32(value: u128) -> u32 {
     value.min(u32::MAX as u128) as u32
 }
 
+fn staged_snapshot_finalize_stats(
+    pre_summary_indexes_duration: std::time::Duration,
+    summary_with_mid_index_duration: std::time::Duration,
+    node_file_rank_index_duration: std::time::Duration,
+    post_summary_indexes_duration: std::time::Duration,
+) -> StagedSnapshotFinalizeStats {
+    let deferred_indexes_duration = pre_summary_indexes_duration
+        .saturating_add(node_file_rank_index_duration)
+        .saturating_add(post_summary_indexes_duration);
+    let summary_snapshot_duration =
+        summary_with_mid_index_duration.saturating_sub(node_file_rank_index_duration);
+    StagedSnapshotFinalizeStats {
+        deferred_indexes_ms: clamp_u128_to_u32(deferred_indexes_duration.as_millis()),
+        summary_snapshot_ms: clamp_u128_to_u32(summary_snapshot_duration.as_millis()),
+    }
+}
+
 fn unique_staged_suffix() -> String {
     let epoch_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -360,6 +387,106 @@ mod tests {
         assert_eq!(metadata.detail_state, GroundingSnapshotState::Dirty);
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn staged_finalize_builds_summary_destination_indexes_in_required_order() {
+        const DESTINATION_INDEXES: &[&str] = &[
+            "idx_grounding_file_snapshot_path",
+            "idx_grounding_file_snapshot_rank",
+            "idx_grounding_node_snapshot_file_rank",
+            "idx_grounding_node_snapshot_root_rank",
+        ];
+
+        let temp = fresh_temp_root("summary-index-order");
+        let live_path = temp.join("live.sqlite");
+        let mut staged = SnapshotStore::open_staged(&live_path).expect("open staged");
+        staged
+            .store_mut()
+            .insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("ordered.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed staged file");
+        staged
+            .store_mut()
+            .get_connection()
+            .execute_batch(
+                "CREATE TRIGGER assert_summary_index_order
+                 BEFORE INSERT ON grounding_file_snapshot
+                 BEGIN
+                   SELECT CASE WHEN NOT EXISTS (
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name = 'idx_grounding_node_snapshot_file_rank'
+                   ) THEN RAISE(ABORT, 'node file-rank index missing before file aggregation') END;
+                   SELECT CASE WHEN EXISTS (
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name IN (
+                         'idx_grounding_file_snapshot_path',
+                         'idx_grounding_file_snapshot_rank',
+                         'idx_grounding_node_snapshot_root_rank'
+                       )
+                   ) THEN RAISE(ABORT, 'post-summary index built before file aggregation') END;
+                 END;",
+            )
+            .expect("install summary ordering assertion");
+
+        staged
+            .snapshots()
+            .finalize_staged()
+            .expect("finalize staged summary");
+
+        for index_name in DESTINATION_INDEXES {
+            let count: i64 = staged
+                .store_mut()
+                .get_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index_name],
+                    |row| row.get(0),
+                )
+                .expect("inspect destination index");
+            assert_eq!(count, 1, "missing destination index {index_name}");
+        }
+        assert!(
+            staged
+                .snapshots()
+                .has_ready_summary()
+                .expect("summary readiness")
+        );
+
+        staged.discard().expect("discard staged database");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn staged_finalize_timing_excludes_mid_summary_index_build() {
+        let stats = staged_snapshot_finalize_stats(
+            std::time::Duration::from_millis(11),
+            std::time::Duration::from_millis(42),
+            std::time::Duration::from_millis(13),
+            std::time::Duration::from_millis(17),
+        );
+
+        assert_eq!(stats.deferred_indexes_ms, 41);
+        assert_eq!(stats.summary_snapshot_ms, 29);
+
+        let sub_millisecond_segments = staged_snapshot_finalize_stats(
+            std::time::Duration::from_micros(400),
+            std::time::Duration::from_micros(900),
+            std::time::Duration::from_micros(400),
+            std::time::Duration::from_micros(400),
+        );
+        assert_eq!(sub_millisecond_segments.deferred_indexes_ms, 1);
+        assert_eq!(sub_millisecond_segments.summary_snapshot_ms, 0);
     }
 
     #[test]
