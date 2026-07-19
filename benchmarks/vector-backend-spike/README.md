@@ -20,22 +20,32 @@ an exact current source publication and both clean paired evidence roots exist,
 The runner uses six counterbalanced paired blocks for each declared nested
 real-anchor workload in two fresh evidence roots. It snapshots the admitted
 `vectors.sqlite3`, its `vector-generation-manifest.json`, and the fixture into
-the evidence root before any child starts. Every oracle, candidate, and fresh
-memory-reader child checks that frozen input manifest, the binary digest, and
-the recorded host evidence before and after its work. Its journal is fsynced
+the evidence root together with the reviewed catalog. Before any candidate
+starts, the same digest-bound binary re-resolves every catalog file/symbol and
+document hash against the frozen source, re-embeds every query through the
+product transport, and rechecks the exact clean corpus and publication
+identities. That verification is frozen into the input manifest. Every oracle,
+candidate, and fresh memory-reader child checks the manifest, binary, host, and
+fixture-verification evidence before and after its work. Its journal is fsynced
 after each child result. Before either completion marker is written, the runner
 replays the declared counterbalanced matrix and validates every result artifact,
-digest, and frozen-input binding. Each candidate publishes staged immutable
-generations with a digest-bound manifest and atomic current/rollback pointer;
-barrier-held readers open the old generation before publication and query only
-after it, while a new reader must match exact incremental source truth. The
-bundle accepts ordinary files only; symlinked input paths fail closed.
+digest, frozen-input binding, and required fault result. Each candidate
+validates a staged generation before atomically replacing the current/rollback
+pointer. It attempts corrupt, incomplete, and mid-build-cancelled publications;
+all must fail after real backend work while the previous pointer remains
+readable. Barrier-held readers open the old generation before publication and
+query only after it, while a new reader must match exact incremental source
+truth. The bundle accepts ordinary files only; symlinked input paths fail
+closed.
 
 Create a fixture only after retrieval indexing produced an immutable
 publication. Keep query embedding outside candidate timing:
 
 ```sh
-CODESTORY_CACHE_ROOT=/Volumes/CodeStoryVectorEvidence/runs/fixture-cache \
+mkdir -m 700 /Volumes/CodeStoryVectorEvidence/runs/fixture-embedding-authority
+CODESTORY_CACHE_ROOT=/path/to/cache-that-owns-the-publication \
+CODESTORY_EMBED_QUALIFICATION_DIR=/Volumes/CodeStoryVectorEvidence/runs/fixture-embedding-authority \
+CODESTORY_EMBED_QUALIFICATION_NONCE=vector-spike-fixture-<sha> \
 target/release/vector_backend_spike prepare \
   --project-root /path/to/linux \
   --storage /path/to/codestory.db \
@@ -48,9 +58,18 @@ Run two clean evidence roots:
 ```sh
 CODESTORY_VECTOR_SPIKE_SOURCE_SQLITE=/path/to/vectors.sqlite3 \
 CODESTORY_VECTOR_SPIKE_FIXTURE_JSON=/Volumes/CodeStoryVectorEvidence/runs/linux-fixture.json \
+CODESTORY_VECTOR_SPIKE_PROJECT_ROOT=/path/to/linux \
+CODESTORY_VECTOR_SPIKE_STORAGE=/path/to/codestory.db \
+CODESTORY_VECTOR_SPIKE_CATALOG_JSON=benchmarks/vector-backend-spike/query-catalog-linux-37e2f878.json \
 CODESTORY_VECTOR_SPIKE_OUTPUT_ROOT=/Volumes/CodeStoryVectorEvidence/runs/measurement-<sha> \
+CODESTORY_CACHE_ROOT=/path/to/cache-that-owns-the-publication \
 node scripts/run-vector-backend-spike.mjs
 ```
+
+Keep `CODESTORY_CACHE_ROOT` on the cache that owns the admitted publication.
+The runner creates a private qualification namespace for its verifier's native
+embedding server. Preparation requires an explicit private namespace as shown,
+so the evidence binary cannot share or replace the ordinary per-user authority.
 
 Raw observations stay in the external evidence root. A completed run is still
 not a selection: the criteria require review of the source-truth catalog and

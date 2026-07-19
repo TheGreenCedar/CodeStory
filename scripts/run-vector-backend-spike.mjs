@@ -29,6 +29,18 @@ const source = realpathSync(sourceInput);
 const fixtureInput = resolve(required("CODESTORY_VECTOR_SPIKE_FIXTURE_JSON"));
 assertRegularFileWithoutSymlinks(fixtureInput, "fixture");
 const fixture = realpathSync(fixtureInput);
+const catalogInput = resolve(
+  process.env.CODESTORY_VECTOR_SPIKE_CATALOG_JSON
+    ?? join(root, "benchmarks", "vector-backend-spike", "query-catalog-linux-37e2f878.json"),
+);
+assertRegularFileWithoutSymlinks(catalogInput, "reviewed source-truth catalog");
+const catalog = realpathSync(catalogInput);
+const projectRootInput = resolve(required("CODESTORY_VECTOR_SPIKE_PROJECT_ROOT"));
+assertDirectoryWithoutSymlinks(projectRootInput, "catalog source project root");
+const projectRoot = realpathSync(projectRootInput);
+const storageInput = resolve(required("CODESTORY_VECTOR_SPIKE_STORAGE"));
+assertRegularFileWithoutSymlinks(storageInput, "core storage");
+const storage = realpathSync(storageInput);
 const sourceManifestInput = join(dirname(source), "vector-generation-manifest.json");
 assertRegularFileWithoutSymlinks(sourceManifestInput, "source generation manifest");
 const sourceManifest = realpathSync(sourceManifestInput);
@@ -45,6 +57,10 @@ rejectSqliteSidecars(source);
 const hostEvidence = approvedHostEvidence(binary);
 mkdirSync(output, { recursive: true });
 assertDirectoryWithoutSymlinks(output, "evidence root");
+const embeddingAuthority = join(output, "embedding-authority");
+mkdirSync(embeddingAuthority, { mode: 0o700 });
+chmodSync(embeddingAuthority, 0o700);
+const embeddingAuthorityNonce = `vector-spike-${hostEvidence.binary.sha256.slice(0, 24)}-${process.pid}`;
 atomicJson(join(output, "host-evidence.json"), hostEvidence);
 sealFrozenArtifact(join(output, "host-evidence.json"));
 
@@ -55,12 +71,40 @@ mkdirSync(frozenPublicationRoot, { recursive: true });
 const sourceArtifact = freezeArtifact(source, join(frozenPublicationRoot, "vectors.sqlite3"));
 const sourceManifestArtifact = freezeArtifact(sourceManifest, join(frozenPublicationRoot, "vector-generation-manifest.json"));
 const fixtureArtifact = freezeArtifact(fixture, join(frozenRoot, "fixture.json"));
+const catalogArtifact = freezeArtifact(catalog, join(frozenRoot, "catalog.json"));
 const hostEvidencePath = join(output, "host-evidence.json");
+const fixtureVerificationPath = join(output, "fixture-verification.json");
+const verificationInputDigests = new Map([
+  [sourceArtifact, sha256(readFileSync(sourceArtifact))],
+  [sourceManifestArtifact, sha256(readFileSync(sourceManifestArtifact))],
+  [fixtureArtifact, sha256(readFileSync(fixtureArtifact))],
+  [catalogArtifact, sha256(readFileSync(catalogArtifact))],
+]);
+const fixtureVerification = await invokeBinary([
+  "verify-fixture",
+  "--project-root", projectRoot,
+  "--storage", storage,
+  "--source", sourceArtifact,
+  "--source-generation-manifest", sourceManifestArtifact,
+  "--fixture", fixtureArtifact,
+  "--catalog", catalogArtifact,
+], () => {
+  for (const [path, digest] of verificationInputDigests) {
+    assertArtifactDigest(path, "fixture-verification input", digest);
+  }
+}, {
+  CODESTORY_EMBED_QUALIFICATION_DIR: embeddingAuthority,
+  CODESTORY_EMBED_QUALIFICATION_NONCE: embeddingAuthorityNonce,
+});
+atomicJson(fixtureVerificationPath, fixtureVerification);
+sealFrozenArtifact(fixtureVerificationPath);
 const input = {
-  schema_version: 1,
+  schema_version: 2,
   source: relativeArtifact(output, sourceArtifact),
   source_generation_manifest: relativeArtifact(output, sourceManifestArtifact),
   fixture: relativeArtifact(output, fixtureArtifact),
+  catalog: relativeArtifact(output, catalogArtifact),
+  fixture_verification: relativeArtifact(output, fixtureVerificationPath),
   binary_sha256: hostEvidence.binary.sha256,
   host_evidence: relativeArtifact(output, hostEvidencePath),
 };
@@ -141,6 +185,7 @@ for (const cleanRoot of cleanRoots) {
     clean_root: cleanRoot,
     completed_at: new Date().toISOString(),
     input_manifest_sha256: inputSha256,
+    fixture_verification_sha256: sha256(readFileSync(fixtureVerificationPath)),
     journal_sha256: sha256(readFileSync(journal)),
     replay,
   });
@@ -151,6 +196,7 @@ const completedCleanRoots = cleanRoots.map(cleanRoot => validateCompletedCleanEv
 atomicJson(join(output, "complete.json"), {
   completed_at: new Date().toISOString(),
   input_manifest_sha256: inputSha256,
+  fixture_verification_sha256: sha256(readFileSync(fixtureVerificationPath)),
   host_evidence_sha256: sha256(readFileSync(hostEvidencePath)),
   clean_roots: completedCleanRoots,
   disposition: "measurements complete; backend selection remains prohibited until all #1202 acceptance evidence is independently reviewed",
@@ -279,12 +325,15 @@ function relativeArtifact(rootPath, artifactPath) {
 }
 
 function assertFrozenInputs(inputManifest, manifestPath, expectedManifestSha256) {
+  if (inputManifest.schema_version !== 2) throw new Error("unsupported frozen input manifest schema");
   assertRegularFileWithoutSymlinks(manifestPath, "frozen input manifest");
   if (sha256(readFileSync(manifestPath)) !== expectedManifestSha256) throw new Error("frozen input manifest changed during the run");
   for (const [label, artifact] of Object.entries({
     source: inputManifest.source,
     source_generation_manifest: inputManifest.source_generation_manifest,
     fixture: inputManifest.fixture,
+    catalog: inputManifest.catalog,
+    fixture_verification: inputManifest.fixture_verification,
     host_evidence: inputManifest.host_evidence,
   })) {
     const resolved = resolve(dirname(manifestPath), artifact.path);
@@ -298,6 +347,25 @@ function assertFrozenInputs(inputManifest, manifestPath, expectedManifestSha256)
   if (host.os !== "darwin" || host.arch !== "arm64" || host.binary?.sha256 !== inputManifest.binary_sha256) {
     throw new Error("host evidence no longer matches the approved binary/profile");
   }
+  const verification = JSON.parse(
+    readFileSync(resolve(dirname(manifestPath), inputManifest.fixture_verification.path), "utf8"),
+  );
+  if (verification.schema_version !== 1
+    || verification.source_database_sha256 !== inputManifest.source.sha256
+    || verification.source_generation_manifest_sha256 !== inputManifest.source_generation_manifest.sha256
+    || verification.fixture_sha256 !== inputManifest.fixture.sha256
+    || verification.catalog_sha256 !== inputManifest.catalog.sha256
+    || verification.binary_sha256 !== inputManifest.binary_sha256
+    || verification.selection_seed !== "codestory-1202-vector-spike-v1"
+    || typeof verification.query_vector_digest !== "string"
+    || typeof verification.expected_document_digest !== "string") {
+    throw new Error("fixture verification does not bind the reviewed frozen inputs");
+  }
+}
+
+function assertArtifactDigest(path, label, expectedSha256) {
+  assertRegularFileWithoutSymlinks(path, label);
+  if (sha256(readFileSync(path)) !== expectedSha256) throw new Error(`${label} changed: ${path}`);
 }
 
 function sha256(bytes) {
@@ -432,7 +500,10 @@ function validateJournalArtifact(clean, event, expectedEvent, inputManifestSha25
   } catch (error) {
     throw new Error(`journal ${journalKey(event)} artifact is not JSON: ${error}`);
   }
-  if (result.schema_version !== 2 || result.input_manifest_sha256 !== inputManifestSha256 || result.count !== expectedEvent.count) {
+  const expectedSchemaVersion = expectedEvent.kind === "candidate" ? 3 : 2;
+  if (result.schema_version !== expectedSchemaVersion
+    || result.input_manifest_sha256 !== inputManifestSha256
+    || result.count !== expectedEvent.count) {
     throw new Error(`journal ${journalKey(event)} artifact does not bind the frozen input/count`);
   }
   if (expectedEvent.kind === "candidate") {
@@ -441,6 +512,25 @@ function validateJournalArtifact(clean, event, expectedEvent, inputManifestSha25
       || result.block !== expectedEvent.block
       || result.order_position !== expectedEvent.order_position) {
       throw new Error(`journal ${journalKey(event)} candidate artifact does not match its matrix row`);
+    }
+    const requiredFaultProof = [
+      "reader_publish_barrier_old_readers_pinned",
+      "reader_publish_barrier_post_publish_reader_matches_truth",
+      "pinned_old_reader_after_publication",
+      "old_generation_unchanged",
+      "corrupt_candidate_publish_rejected",
+      "incomplete_candidate_publish_rejected",
+      "failed_candidate_preserved_current_pointer",
+      "cancelled_candidate_publish_rejected",
+      "cancelled_candidate_preserved_current_pointer",
+      "rollback_pointer_readable",
+      "referenced_generation_tamper_rejected",
+      "pinned_reader_after_referenced_tamper",
+    ];
+    if (requiredFaultProof.some(field => result[field] !== true)
+      || result.cancellation_signal !== "candidate_build_cancelled_after_vectors"
+      || result.cancellation_observed_after_vectors !== 8) {
+      throw new Error(`journal ${journalKey(event)} candidate artifact lacks required publication/cancellation proof`);
     }
   }
 }
@@ -459,6 +549,7 @@ function validateCompletedCleanEvidence(cleanRoot, inputManifestSha256) {
   }
   if (marker.clean_root !== cleanRoot
     || marker.input_manifest_sha256 !== inputManifestSha256
+    || marker.fixture_verification_sha256 !== sha256(readFileSync(fixtureVerificationPath))
     || marker.journal_sha256 !== replay.journal_sha256
     || marker.replay?.schema_version !== replay.schema_version
     || marker.replay?.expected_rows !== replay.expected_rows
@@ -488,24 +579,41 @@ function fsyncDirectory(path) {
 function invoke(args) {
   assertFrozenInputs(input, inputPath, inputSha256);
   const childArgs = [...args, "--inputs", inputPath, "--expected-input-sha256", inputSha256];
+  return invokeBinary(childArgs, () => assertFrozenInputs(input, inputPath, inputSha256));
+}
+
+function invokeBinary(args, verifyAfter, childEnv = {}) {
+  verifyAfter?.();
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(binary, childArgs, { cwd: root, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(binary, args, {
+      cwd: root,
+      detached: true,
+      env: { ...process.env, ...childEnv },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     child.stdout.on("data", chunk => { stdout += chunk; });
     child.stderr.on("data", chunk => { stderr += chunk; });
     const timer = setTimeout(() => {
+      timedOut = true;
       try { process.kill(-child.pid, "SIGKILL"); } catch {}
     }, timeoutMs);
     child.on("error", error => {
       clearTimeout(timer);
       reject(error);
     });
-    child.on("close", code => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`${args[0]} exited ${code}: ${stderr.trim()}`));
+      if (code !== 0) {
+        const outcome = timedOut
+          ? `timed_out_after_ms=${timeoutMs} signal=${signal ?? "unknown"}`
+          : `exit_code=${code ?? "null"} signal=${signal ?? "none"}`;
+        return reject(new Error(`${args[0]} failed ${outcome}: ${stderr.trim()}`));
+      }
       try {
-        assertFrozenInputs(input, inputPath, inputSha256);
+        verifyAfter?.();
         resolvePromise(JSON.parse(stdout));
       } catch (error) {
         reject(new Error(`${args[0]} emitted invalid JSON or changed frozen input: ${error}; stderr: ${stderr.trim()}`));

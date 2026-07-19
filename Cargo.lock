@@ -497,6 +497,7 @@ version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
+ "codestory-cli",
  "codestory-contracts",
  "codestory-indexer",
  "codestory-retrieval",

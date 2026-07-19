@@ -21,8 +21,8 @@
     "paired_counterbalanced_blocks_per_workload": 6,
     "clean_evidence_roots": 2,
     "selection": "seeded nested real anchors; all catalog targets are force-included before the seeded fill",
-    "input_contract": "one complete immutable CodeStory retrieval publication admitted through a pinned product query session; its vectors.sqlite3, vector-generation-manifest.json, core publication identity, live query-embedder identity, independently reviewable vector-free source-truth query catalog bound to the clean exact Git checkout it names, and frozen query vectors generated before candidate timing",
-    "execution_contract": "the orchestrator snapshots source, generation manifest, and fixture into one immutable fsynced evidence bundle; every child verifies that bundle, the exact binary digest, and macOS-arm64 host evidence before and after work; completed journals replay the full counterbalanced matrix and validate every artifact digest and input binding before completion markers are written"
+    "input_contract": "one complete immutable CodeStory retrieval publication admitted through a pinned product query session; its vectors.sqlite3, vector-generation-manifest.json, core publication identity, live query-embedder identity, independently reviewable vector-free source-truth query catalog bound to the clean exact Git checkout it names, and frozen query vectors generated before candidate timing; the measurement binary must re-resolve every catalog document hash and reproduce every product query vector before admitting the fixture",
+    "execution_contract": "the orchestrator snapshots source, generation manifest, reviewed catalog, fixture, and binary-produced fixture verification into one immutable fsynced evidence bundle; every child verifies that bundle, the exact binary digest, and macOS-arm64 host evidence before and after work; completed journals replay the full counterbalanced matrix and validate every artifact digest, input binding, and required publication/cancellation fault result before completion markers are written"
   },
   "required_measurements": [
     "build_ms",
@@ -39,7 +39,9 @@
     "ann_recall_at_20_against_embedded_scan",
     "source_truth_hit_at_20",
     "barrier_controlled_reader_publish_overlap",
-    "rollback_and_corrupt_generation_rejection"
+    "corrupt_and_incomplete_generation_publish_rejection",
+    "mid_build_cancellation_after_observed_backend_work",
+    "rollback_and_live_pointer_preservation"
   ],
   "decision_rules": {
     "allowed_dispositions": ["recommend sqlite-vec", "recommend USearch", "retain embedded scan", "inconclusive"],
@@ -48,7 +50,7 @@
     "selection_requires": [
       "both clean evidence roots pass every declared workload and paired block",
       "the source-truth catalog receives independent review",
-      "the immutable-generation, publication, rollback, corruption, cancellation, and concurrent-reader rows all pass",
+      "the immutable-generation, pre-publication validation, rollback, corruption, incomplete-generation, attributable mid-build cancellation, and concurrent-reader rows all pass",
       "offline, license, native-dependency, archive-size, and later adoption integration evidence are complete",
       "the candidate has a reversible fallback to the embedded scan"
     ]

@@ -17,7 +17,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -26,6 +29,8 @@ const TOP_K: usize = 20;
 const INCREMENTAL_COUNT: usize = 100;
 const SELECTION_SEED: &str = "codestory-1202-vector-spike-v1";
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
+const EMBEDDING_AUTHORITY_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
+const EMBEDDING_AUTHORITY_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 
 #[derive(Parser)]
 #[command(about = "Evidence-only sqlite-vec vs USearch runner for CodeStory issue #1202")]
@@ -36,6 +41,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Internal native embedding-server entrypoint used by the shared CLI transport.
+    #[command(name = "internal-embedding-server", hide = true)]
+    InternalEmbeddingServer,
     /// Bind a vector-free source-truth catalog to one immutable production publication.
     Prepare {
         #[arg(long)]
@@ -46,6 +54,22 @@ enum Command {
         catalog: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Re-prove a frozen fixture against its catalog, source publication, and live embedder.
+    #[command(hide = true)]
+    VerifyFixture {
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        storage: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        source_generation_manifest: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
     },
     /// Run the production embedded cosine scan over the exact frozen subset.
     Oracle {
@@ -169,6 +193,8 @@ struct FrozenInputManifest {
     source: FrozenArtifact,
     source_generation_manifest: FrozenArtifact,
     fixture: FrozenArtifact,
+    catalog: FrozenArtifact,
+    fixture_verification: FrozenArtifact,
     binary_sha256: String,
     host_evidence: FrozenArtifact,
 }
@@ -191,7 +217,10 @@ struct FrozenInputPaths {
     source: PathBuf,
     source_generation_manifest: PathBuf,
     fixture: PathBuf,
+    catalog: PathBuf,
+    fixture_verification: PathBuf,
     host_evidence: PathBuf,
+    binary_sha256: String,
     input_manifest_sha256: String,
 }
 
@@ -201,14 +230,14 @@ struct VerifiedInputs {
     fixture_sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Catalog {
     schema_version: u32,
     corpus_commit: String,
     queries: Vec<CatalogQuery>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct CatalogQuery {
     id: String,
     kind: String,
@@ -230,7 +259,7 @@ struct VerifiedCorpusIdentity {
     worktree_clean: bool,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 struct FrozenQuery {
     id: String,
     kind: String,
@@ -254,6 +283,22 @@ struct Fixture {
     selected_node_ids: Vec<String>,
     incremental_node_ids: Vec<String>,
     queries: Vec<FrozenQuery>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+struct FixtureVerification {
+    schema_version: u32,
+    source_database_sha256: String,
+    source_generation_manifest_sha256: String,
+    fixture_sha256: String,
+    catalog_sha256: String,
+    binary_sha256: String,
+    corpus: VerifiedCorpusIdentity,
+    publication: ProductPublicationBinding,
+    query_embedder: QueryEmbedderIdentity,
+    selection_seed: String,
+    query_vector_digest: String,
+    expected_document_digest: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -302,8 +347,13 @@ struct CandidateResult {
     reader_publish_barrier_post_publish_reader_matches_truth: bool,
     pinned_old_reader_after_publication: bool,
     old_generation_unchanged: bool,
-    corrupt_candidate_rejected: bool,
+    corrupt_candidate_publish_rejected: bool,
+    incomplete_candidate_publish_rejected: bool,
     failed_candidate_preserved_current_pointer: bool,
+    cancellation_signal: &'static str,
+    cancellation_observed_after_vectors: usize,
+    cancelled_candidate_publish_rejected: bool,
+    cancelled_candidate_preserved_current_pointer: bool,
     rollback_pointer_readable: bool,
     referenced_generation_tamper_rejected: bool,
     pinned_reader_after_referenced_tamper: bool,
@@ -356,14 +406,68 @@ struct FixtureBinding<'a> {
     query_embedder: &'a QueryEmbedderIdentity,
 }
 
+#[derive(Clone, Copy)]
+struct BuildControl<'a> {
+    processed: &'a AtomicUsize,
+    cancel_after: Option<usize>,
+}
+
+impl BuildControl<'_> {
+    fn before_next(self) -> Result<()> {
+        let processed = self.processed.load(Ordering::Acquire);
+        if self.cancel_after.is_some_and(|limit| processed >= limit) {
+            anyhow::bail!("candidate_build_cancelled_after_vectors:{processed}");
+        }
+        Ok(())
+    }
+
+    fn record_processed(self) {
+        self.processed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    match command {
+        Command::InternalEmbeddingServer => {
+            require_isolated_embedding_authority()?;
+            codestory_cli::run_native_embedding_server()
+        }
         Command::Prepare {
             project_root,
             storage,
             catalog,
             output,
-        } => prepare(&project_root, &storage, &catalog, &output),
+        } => {
+            require_isolated_embedding_authority()?;
+            codestory_cli::install_native_embedding_client_transport()
+                .context("install native embedding server transport")?;
+            prepare(&project_root, &storage, &catalog, &output)
+        }
+        Command::VerifyFixture {
+            project_root,
+            storage,
+            source,
+            source_generation_manifest,
+            fixture,
+            catalog,
+        } => {
+            require_isolated_embedding_authority()?;
+            codestory_cli::install_native_embedding_client_transport()
+                .context("install native embedding server transport")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&verify_fixture_for_measurement(
+                    &project_root,
+                    &storage,
+                    &source,
+                    &source_generation_manifest,
+                    &fixture,
+                    &catalog,
+                )?)?
+            );
+            Ok(())
+        }
         Command::Oracle {
             inputs,
             expected_input_sha256,
@@ -537,12 +641,12 @@ fn prepare(
         "catalog source checkout changed while freezing the fixture"
     );
     let fixture = Fixture {
-        schema_version: 3,
+        schema_version: 4,
         source: attestation,
         publication,
         query_embedder,
         source_database_path: source.display().to_string(),
-        corpus_commit: catalog.corpus_commit,
+        corpus_commit: catalog.corpus_commit.clone(),
         verified_corpus,
         catalog_sha256: sha256_bytes(&catalog_bytes),
         selection_seed: SELECTION_SEED.into(),
@@ -550,7 +654,123 @@ fn prepare(
         incremental_node_ids,
         queries,
     };
+    verify_fixture_contract(&fixture, &catalog, &sha256_bytes(&catalog_bytes), &source)?;
     atomic_write_json(output, &fixture)
+}
+
+fn verify_fixture_for_measurement(
+    project_root: &Path,
+    storage: &Path,
+    source: &Path,
+    source_generation_manifest: &Path,
+    fixture_path: &Path,
+    catalog_path: &Path,
+) -> Result<FixtureVerification> {
+    require_approved_execution_target()?;
+    reject_symlinked_path(project_root, "fixture-verification project root")?;
+    let project_root = project_root
+        .canonicalize()
+        .context("canonicalize fixture-verification project root")?;
+    let storage = frozen_regular_path(storage, "fixture-verification core storage")?;
+    let source = frozen_regular_path(source, "fixture-verification source database")?;
+    let source_generation_manifest = frozen_regular_path(
+        source_generation_manifest,
+        "fixture-verification source generation manifest",
+    )?;
+    let fixture_path = frozen_regular_path(fixture_path, "fixture-verification fixture")?;
+    let catalog_path = frozen_regular_path(catalog_path, "fixture-verification catalog")?;
+    let expected_manifest = source
+        .parent()
+        .context("fixture-verification source has no parent")?
+        .join("vector-generation-manifest.json")
+        .canonicalize()
+        .context("canonicalize fixture-verification source generation manifest sibling")?;
+    ensure!(
+        source_generation_manifest == expected_manifest,
+        "fixture-verification source generation manifest is not the source sibling"
+    );
+
+    let fixture_bytes = fs::read(&fixture_path)?;
+    let fixture: Fixture =
+        serde_json::from_slice(&fixture_bytes).context("parse frozen fixture")?;
+    let catalog_bytes = fs::read(&catalog_path)?;
+    let catalog: Catalog =
+        serde_json::from_slice(&catalog_bytes).context("parse reviewed source-truth catalog")?;
+    let catalog_sha256 = sha256_bytes(&catalog_bytes);
+    let fixture_sha256 = sha256_bytes(&fixture_bytes);
+    verify_fixture_contract(&fixture, &catalog, &catalog_sha256, &source)?;
+
+    let attestation = attest_source(&source)?;
+    ensure!(
+        attestation == fixture.source,
+        "fixture-verification source does not match fixture attestation"
+    );
+    ensure!(
+        attestation.generation_manifest_sha256 == sha256_file(&source_generation_manifest)?,
+        "fixture-verification generation manifest does not match source attestation"
+    );
+    verify_source_matches_pinned_publication(&source, &attestation, &fixture.publication)?;
+    let corpus = verify_catalog_corpus_identity(&project_root, &catalog.corpus_commit)?;
+    ensure!(
+        corpus == fixture.verified_corpus,
+        "fixture-verification checkout identity does not match the prepared fixture"
+    );
+
+    let runtime = SidecarRuntimeConfig::for_project_auto(&project_root);
+    let session = PinnedQuerySession::begin(&project_root, &storage, &runtime)
+        .context("re-admit the prepared product publication for measurement")?;
+    ensure!(
+        session.manifest() == &fixture.publication.retrieval_manifest
+            && session.publication_identity() == &fixture.publication.publication,
+        "fixture-verification product publication identity changed"
+    );
+    let live_source = source_for_pinned_publication(&runtime, &fixture.publication)?;
+    ensure!(
+        attest_source(&live_source)? == attestation,
+        "fixture-verification live source publication differs from the frozen source"
+    );
+    let embedder = ProductEmbeddingClient::new(&runtime);
+    let recomputed = fixture
+        .queries
+        .iter()
+        .map(|query| embedder.embed_query(&query.text))
+        .collect::<Result<Vec<_>>>()?;
+    verify_query_vectors(&fixture.queries, &recomputed)?;
+    let query_embedder = current_query_embedder_identity(&runtime)?;
+    ensure!(
+        query_embedder == fixture.query_embedder,
+        "fixture-verification live query embedder identity changed"
+    );
+    ensure!(
+        verify_catalog_corpus_identity(&project_root, &catalog.corpus_commit)? == corpus,
+        "fixture-verification source checkout changed during query reproduction"
+    );
+    ensure!(
+        attest_source(&source)? == attestation,
+        "fixture-verification source publication changed during query reproduction"
+    );
+    ensure!(
+        attest_source(&live_source)? == attestation,
+        "fixture-verification live source publication changed during query reproduction"
+    );
+    session
+        .revalidate()
+        .context("fixture-verification product publication changed during query reproduction")?;
+
+    Ok(FixtureVerification {
+        schema_version: 1,
+        source_database_sha256: attestation.database_sha256,
+        source_generation_manifest_sha256: sha256_file(&source_generation_manifest)?,
+        fixture_sha256,
+        catalog_sha256,
+        binary_sha256: sha256_file(&std::env::current_exe()?)?,
+        corpus,
+        publication: fixture.publication.clone(),
+        query_embedder,
+        selection_seed: fixture.selection_seed.clone(),
+        query_vector_digest: query_vector_digest(&fixture.queries),
+        expected_document_digest: expected_document_digest(&fixture.queries),
+    })
 }
 
 fn run_oracle(inputs: &Path, expected_input_sha256: &str, count: usize) -> Result<Oracle> {
@@ -629,7 +849,7 @@ fn run_candidate(
         &generation_one,
         binding,
     )?;
-    publish_pointer(workdir, "generation-1", None)?;
+    publish_generation(workdir, "generation-1", None, backend, binding)?;
     let build_ms = elapsed_ms(started);
     let old_hash = directory_hash(&generation_one)?;
     let disk_bytes = directory_size(&generation_one)?;
@@ -691,10 +911,16 @@ fn run_candidate(
         &verified.fixture.incremental_node_ids,
         binding,
     )?;
-    publish_pointer(workdir, "generation-2", Some("generation-1"))?;
+    publish_generation(
+        workdir,
+        "generation-2",
+        Some("generation-1"),
+        backend,
+        binding,
+    )?;
     let incremental_reuse_ms = elapsed_ms(started);
     let current = open_current_generation(backend, workdir, binding)?;
-    let reader_publish_barrier_post_publish_reader_matches_truth = current.count()
+    let reader_publish_barrier_post_publish_reader_matches_truth = current.count()?
         == count + INCREMENTAL_COUNT
         && current.search(&verified.fixture.queries[0].vector)? == post_publish_expected;
     let reader_publish_barrier_old_readers_pinned =
@@ -703,15 +929,95 @@ fn run_candidate(
         pinned_old.search(&verified.fixture.queries[0].vector)? == cold;
     let old_generation_unchanged = directory_hash(&generation_one)? == old_hash;
     let pointer_before_corrupt = fs::read(workdir.join("publication.json"))?;
+
     let corrupt = workdir.join("generations").join("generation-corrupt");
     fs::create_dir_all(&corrupt)?;
-    fs::write(corrupt.join(backend.index_name()), b"not an index")?;
-    let corrupt_candidate_rejected = validate_generation(&corrupt, backend, binding).is_err();
+    fs::copy(
+        generation_two.join(backend.index_name()),
+        corrupt.join(backend.index_name()),
+    )?;
+    fs::copy(
+        generation_two.join("manifest.json"),
+        corrupt.join("manifest.json"),
+    )?;
+    tamper_file(&corrupt.join(backend.index_name()))?;
+    rebind_manifest_index_digest(&corrupt, backend)?;
+    let corrupt_candidate_publish_rejected = publish_generation(
+        workdir,
+        "generation-corrupt",
+        Some("generation-2"),
+        backend,
+        binding,
+    )
+    .is_err();
+
+    let incomplete = workdir.join("generations").join("generation-incomplete");
+    fs::create_dir_all(&incomplete)?;
+    fs::copy(
+        generation_two.join(backend.index_name()),
+        incomplete.join(backend.index_name()),
+    )?;
+    let incomplete_candidate_publish_rejected = publish_generation(
+        workdir,
+        "generation-incomplete",
+        Some("generation-2"),
+        backend,
+        binding,
+    )
+    .is_err();
     let failed_candidate_preserved_current_pointer =
         fs::read(workdir.join("publication.json"))? == pointer_before_corrupt;
-    publish_pointer(workdir, "generation-1", Some("generation-2"))?;
+
+    let cancellation_processed = AtomicUsize::new(0);
+    let cancelled = workdir.join("generations").join("generation-cancelled");
+    let cancellation_error = build_generation_with_control(
+        backend,
+        &verified.paths.source,
+        &selected,
+        &cancelled,
+        binding,
+        BuildControl {
+            processed: &cancellation_processed,
+            cancel_after: Some(8),
+        },
+    )
+    .expect_err("fault probe must cancel after backend work begins");
+    let cancellation_observed_after_vectors = cancellation_processed.load(Ordering::Acquire);
+    ensure!(
+        cancellation_observed_after_vectors == 8
+            && cancellation_error
+                .to_string()
+                .contains("candidate_build_cancelled_after_vectors:8"),
+        "candidate cancellation did not preserve its attributable progress signal"
+    );
+    let cancelled_candidate_publish_rejected = publish_generation(
+        workdir,
+        "generation-cancelled",
+        Some("generation-2"),
+        backend,
+        binding,
+    )
+    .is_err();
+    let cancelled_candidate_preserved_current_pointer =
+        fs::read(workdir.join("publication.json"))? == pointer_before_corrupt;
+    ensure!(
+        corrupt_candidate_publish_rejected
+            && incomplete_candidate_publish_rejected
+            && failed_candidate_preserved_current_pointer
+            && cancelled_candidate_publish_rejected
+            && cancelled_candidate_preserved_current_pointer,
+        "candidate fault probe did not reject publication while preserving the live pointer"
+    );
+
+    publish_generation(
+        workdir,
+        "generation-1",
+        Some("generation-2"),
+        backend,
+        binding,
+    )?;
     let rollback_pointer_readable =
-        open_current_generation(backend, workdir, binding)?.count() == count;
+        open_current_generation(backend, workdir, binding)?.count()? == count;
     tamper_file(&generation_one.join(backend.index_name()))?;
     let referenced_generation_tamper_rejected =
         open_current_generation(backend, workdir, binding).is_err();
@@ -719,7 +1025,7 @@ fn run_candidate(
         pinned_old.search(&verified.fixture.queries[0].vector)? == cold;
     verify_frozen_input_paths(&verified.paths)?;
     Ok(CandidateResult {
-        schema_version: 2,
+        schema_version: 3,
         generated_at_unix_seconds: now_unix_seconds(),
         backend: backend.label(),
         backend_version: backend.version(),
@@ -753,8 +1059,13 @@ fn run_candidate(
         reader_publish_barrier_post_publish_reader_matches_truth,
         pinned_old_reader_after_publication,
         old_generation_unchanged,
-        corrupt_candidate_rejected,
+        corrupt_candidate_publish_rejected,
+        incomplete_candidate_publish_rejected,
         failed_candidate_preserved_current_pointer,
+        cancellation_signal: "candidate_build_cancelled_after_vectors",
+        cancellation_observed_after_vectors,
+        cancelled_candidate_publish_rejected,
+        cancelled_candidate_preserved_current_pointer,
         rollback_pointer_readable,
         referenced_generation_tamper_rejected,
         pinned_reader_after_referenced_tamper,
@@ -769,15 +1080,14 @@ fn run_resident_rss(
     generation: &str,
     warmups: usize,
 ) -> Result<ResidentRss> {
-    let paths = load_frozen_input_paths(inputs, expected_input_sha256)?;
-    let (fixture, fixture_sha256) = frozen_fixture(&paths)?;
-    verify_fixture_contract(&fixture)?;
-    verify_source_matches_pinned_publication(&paths.source, &fixture.source, &fixture.publication)?;
+    let verified = verified_inputs(inputs, expected_input_sha256)?;
+    let paths = &verified.paths;
+    let fixture = &verified.fixture;
     let binding = FixtureBinding {
         input_manifest_sha256: &paths.input_manifest_sha256,
         source_database_sha256: &fixture.source.database_sha256,
         source_generation_manifest_sha256: &fixture.source.generation_manifest_sha256,
-        fixture_sha256: &fixture_sha256,
+        fixture_sha256: &verified.fixture_sha256,
         query_embedder: &fixture.query_embedder,
     };
     let rss_baseline_after_input_verification_bytes = current_resident_bytes()?;
@@ -789,16 +1099,16 @@ fn run_resident_rss(
         }
     }
     let rss_bytes_after_warm_queries = current_resident_bytes()?;
-    verify_frozen_input_paths(&paths)?;
+    verify_frozen_input_paths(paths)?;
     Ok(ResidentRss {
         schema_version: 1,
-        input_manifest_sha256: paths.input_manifest_sha256,
+        input_manifest_sha256: paths.input_manifest_sha256.clone(),
         backend: backend.label().into(),
         generation: generation.into(),
-        source_database_sha256: fixture.source.database_sha256,
-        source_generation_manifest_sha256: fixture.source.generation_manifest_sha256,
-        fixture_sha256,
-        query_embedder: fixture.query_embedder,
+        source_database_sha256: fixture.source.database_sha256.clone(),
+        source_generation_manifest_sha256: fixture.source.generation_manifest_sha256.clone(),
+        fixture_sha256: verified.fixture_sha256,
+        query_embedder: fixture.query_embedder.clone(),
         warmups,
         rss_baseline_after_input_verification_bytes,
         rss_bytes_after_load,
@@ -862,7 +1172,8 @@ fn measure_resident_rss(
 fn verified_inputs(inputs: &Path, expected_input_sha256: &str) -> Result<VerifiedInputs> {
     let paths = load_frozen_input_paths(inputs, expected_input_sha256)?;
     let (fixture, fixture_sha256) = frozen_fixture(&paths)?;
-    verify_fixture_contract(&fixture)?;
+    let (catalog, catalog_sha256) = frozen_catalog(&paths)?;
+    verify_fixture_contract(&fixture, &catalog, &catalog_sha256, &paths.source)?;
     let expected_generation_manifest = paths
         .source
         .parent()
@@ -884,6 +1195,7 @@ fn verified_inputs(inputs: &Path, expected_input_sha256: &str) -> Result<Verifie
         "frozen source generation manifest no longer matches fixture attestation"
     );
     verify_source_matches_pinned_publication(&paths.source, &attestation, &fixture.publication)?;
+    validate_fixture_verification(&paths, &fixture, &catalog_sha256)?;
     verify_frozen_input_paths(&paths)?;
     Ok(VerifiedInputs {
         paths,
@@ -910,16 +1222,48 @@ fn frozen_fixture(paths: &FrozenInputPaths) -> Result<(Fixture, String)> {
     Ok((fixture, sha256))
 }
 
-fn verify_fixture_contract(fixture: &Fixture) -> Result<()> {
-    ensure!(fixture.schema_version == 3, "unsupported fixture schema");
+fn frozen_catalog(paths: &FrozenInputPaths) -> Result<(Catalog, String)> {
+    let bytes = fs::read(&paths.catalog)
+        .with_context(|| format!("read frozen catalog {}", paths.catalog.display()))?;
+    let sha256 = sha256_bytes(&bytes);
+    let catalog: Catalog = serde_json::from_slice(&bytes).context("parse frozen catalog")?;
+    Ok((catalog, sha256))
+}
+
+fn verify_fixture_contract(
+    fixture: &Fixture,
+    catalog: &Catalog,
+    catalog_sha256: &str,
+    source: &Path,
+) -> Result<()> {
+    ensure!(fixture.schema_version == 4, "unsupported fixture schema");
+    ensure!(
+        catalog.schema_version == 1 && catalog.queries.len() == 30,
+        "reviewed catalog does not meet the declared profile"
+    );
     ensure!(
         fixture.source.embedding_dim == DIMENSIONS && fixture.queries.len() == 30,
         "fixture does not meet the declared profile"
     );
     ensure!(
+        fixture.catalog_sha256 == catalog_sha256
+            && fixture.selection_seed == SELECTION_SEED
+            && fixture.corpus_commit == catalog.corpus_commit,
+        "fixture is not bound to the reviewed catalog and selection contract"
+    );
+    ensure!(
         fixture.selected_node_ids.len() == 100_000
             && fixture.incremental_node_ids.len() == INCREMENTAL_COUNT,
         "fixture does not contain the declared nested real-anchor input"
+    );
+    let selected = fixture
+        .selected_node_ids
+        .iter()
+        .chain(fixture.incremental_node_ids.iter())
+        .collect::<HashSet<_>>();
+    ensure!(
+        selected.len() == 100_000 + INCREMENTAL_COUNT,
+        "fixture selection contains duplicate base or incremental node IDs"
     );
     ensure!(
         fixture.query_embedder.runtime_id == fixture.source.embedding_backend
@@ -928,7 +1272,10 @@ fn verify_fixture_contract(fixture: &Fixture) -> Result<()> {
             && !fixture.query_embedder.model_digest.is_empty()
             && !fixture.query_embedder.ggml_build_identity.is_empty()
             && !fixture.query_embedder.backend.is_empty()
-            && !fixture.query_embedder.policy.is_empty(),
+            && !fixture.query_embedder.policy.is_empty()
+            && !fixture.query_embedder.execution_device_names.is_empty()
+            && !fixture.query_embedder.execution_backend_names.is_empty()
+            && fixture.query_embedder.accelerator_execution_verified,
         "fixture query embedder identity is incomplete or incompatible with the source publication"
     );
     ensure!(
@@ -948,10 +1295,101 @@ fn verify_fixture_contract(fixture: &Fixture) -> Result<()> {
             && fixture.verified_corpus.worktree_clean,
         "fixture catalog source identity is incomplete or was not frozen from a clean checkout"
     );
-    for query in &fixture.queries {
-        validate_vector(&query.id, &query.vector)?;
+    verify_reviewed_query_bindings(&fixture.queries, catalog, source)?;
+    for fixture_query in &fixture.queries {
+        ensure!(
+            fixture
+                .selected_node_ids
+                .contains(&fixture_query.expected_node_id),
+            "fixture selection omits reviewed catalog target {}",
+            fixture_query.id
+        );
+        validate_vector(&fixture_query.id, &fixture_query.vector)?;
     }
     Ok(())
+}
+
+fn verify_reviewed_query_bindings(
+    fixture_queries: &[FrozenQuery],
+    catalog: &Catalog,
+    source: &Path,
+) -> Result<()> {
+    ensure!(
+        fixture_queries.len() == catalog.queries.len(),
+        "fixture and reviewed catalog query counts differ"
+    );
+    let unique_catalog_ids = catalog
+        .queries
+        .iter()
+        .map(|query| query.id.as_str())
+        .collect::<HashSet<_>>();
+    ensure!(
+        unique_catalog_ids.len() == catalog.queries.len(),
+        "reviewed catalog contains duplicate query IDs"
+    );
+    let resolved = resolve_catalog(source, catalog)?;
+    for ((catalog_query, resolved_query), fixture_query) in catalog
+        .queries
+        .iter()
+        .zip(resolved.iter())
+        .zip(fixture_queries.iter())
+    {
+        ensure!(
+            fixture_query.id == catalog_query.id
+                && fixture_query.kind == catalog_query.kind
+                && fixture_query.text == catalog_query.text
+                && fixture_query.expected_node_id == resolved_query.expected_node_id
+                && fixture_query.expected_document_hash == resolved_query.expected_document_hash
+                && !fixture_query.expected_document_hash.is_empty(),
+            "fixture query {} does not match reviewed catalog/source truth",
+            catalog_query.id
+        );
+    }
+    Ok(())
+}
+
+fn verify_query_vectors(queries: &[FrozenQuery], recomputed: &[Vec<f32>]) -> Result<()> {
+    ensure!(
+        queries.len() == recomputed.len(),
+        "fixture query-vector verification count mismatch"
+    );
+    for (query, observed) in queries.iter().zip(recomputed) {
+        validate_vector(&query.id, observed)?;
+        ensure!(
+            query.vector.len() == observed.len()
+                && query
+                    .vector
+                    .iter()
+                    .zip(observed)
+                    .all(|(expected, actual)| expected.to_bits() == actual.to_bits()),
+            "fixture query vector does not match live product embedding for {}",
+            query.id
+        );
+    }
+    Ok(())
+}
+
+fn query_vector_digest(queries: &[FrozenQuery]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"codestory-vector-spike-query-vectors-v1\0");
+    for query in queries {
+        hash_len(&mut digest, query.id.as_bytes());
+        for value in &query.vector {
+            digest.update(value.to_bits().to_le_bytes());
+        }
+    }
+    hex::encode(digest.finalize())
+}
+
+fn expected_document_digest(queries: &[FrozenQuery]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"codestory-vector-spike-source-truth-v1\0");
+    for query in queries {
+        hash_len(&mut digest, query.id.as_bytes());
+        hash_len(&mut digest, query.expected_node_id.as_bytes());
+        hash_len(&mut digest, query.expected_document_hash.as_bytes());
+    }
+    hex::encode(digest.finalize())
 }
 
 fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result<FrozenInputPaths> {
@@ -971,7 +1409,7 @@ fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result
     let input: FrozenInputManifest =
         serde_json::from_slice(&input_bytes).context("parse frozen input manifest")?;
     ensure!(
-        input.schema_version == 1,
+        input.schema_version == 2,
         "unsupported frozen input manifest schema"
     );
     let source = resolve_frozen_artifact(&input_path, &input.source, "source database")?;
@@ -982,6 +1420,12 @@ fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result
         "source generation manifest",
     )?;
     let fixture = resolve_frozen_artifact(&input_path, &input.fixture, "fixture")?;
+    let catalog = resolve_frozen_artifact(&input_path, &input.catalog, "catalog")?;
+    let fixture_verification = resolve_frozen_artifact(
+        &input_path,
+        &input.fixture_verification,
+        "fixture verification",
+    )?;
     let host_evidence =
         resolve_frozen_artifact(&input_path, &input.host_evidence, "host evidence")?;
     let executable = std::env::current_exe().context("locate vector spike executable")?;
@@ -1011,7 +1455,10 @@ fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result
         source,
         source_generation_manifest,
         fixture,
+        catalog,
+        fixture_verification,
         host_evidence,
+        binary_sha256: input.binary_sha256,
         input_manifest_sha256,
     })
 }
@@ -1101,12 +1548,53 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn frozen_regular_path(path: &Path, label: &str) -> Result<PathBuf> {
+    reject_symlinked_path(path, label)?;
+    require_regular_file(path, label)?;
+    path.canonicalize()
+        .with_context(|| format!("canonicalize {label} {}", path.display()))
+}
+
+fn validate_fixture_verification(
+    paths: &FrozenInputPaths,
+    fixture: &Fixture,
+    catalog_sha256: &str,
+) -> Result<()> {
+    let verification: FixtureVerification =
+        serde_json::from_slice(&fs::read(&paths.fixture_verification).with_context(|| {
+            format!(
+                "read frozen fixture verification {}",
+                paths.fixture_verification.display()
+            )
+        })?)
+        .context("parse frozen fixture verification")?;
+    ensure!(
+        verification.schema_version == 1
+            && verification.source_database_sha256 == fixture.source.database_sha256
+            && verification.source_generation_manifest_sha256
+                == fixture.source.generation_manifest_sha256
+            && verification.fixture_sha256 == sha256_file(&paths.fixture)?
+            && verification.catalog_sha256 == catalog_sha256
+            && verification.binary_sha256 == paths.binary_sha256
+            && verification.corpus == fixture.verified_corpus
+            && verification.publication == fixture.publication
+            && verification.query_embedder == fixture.query_embedder
+            && verification.selection_seed == fixture.selection_seed
+            && verification.query_vector_digest == query_vector_digest(&fixture.queries)
+            && verification.expected_document_digest == expected_document_digest(&fixture.queries),
+        "fixture verification does not bind the frozen reviewed preparation"
+    );
+    Ok(())
+}
+
 fn verify_frozen_input_paths(paths: &FrozenInputPaths) -> Result<()> {
     let reloaded = load_frozen_input_paths(&paths.input_path, &paths.input_manifest_sha256)?;
     ensure!(
         reloaded.source == paths.source
             && reloaded.source_generation_manifest == paths.source_generation_manifest
             && reloaded.fixture == paths.fixture
+            && reloaded.catalog == paths.catalog
+            && reloaded.fixture_verification == paths.fixture_verification
             && reloaded.host_evidence == paths.host_evidence,
         "frozen input manifest resolved to different evidence paths"
     );
@@ -1210,6 +1698,28 @@ fn require_approved_execution_target() -> Result<()> {
     ensure!(
         cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"),
         "vector backend spike is approved only on a native macOS arm64 executable"
+    );
+    Ok(())
+}
+
+fn require_isolated_embedding_authority() -> Result<()> {
+    let directory = std::env::var_os(EMBEDDING_AUTHORITY_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .context("vector evidence embedding authority directory is required")?;
+    let nonce = std::env::var(EMBEDDING_AUTHORITY_NONCE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .context("vector evidence embedding authority nonce is required")?;
+    ensure!(
+        Path::new(&directory).is_absolute(),
+        "vector evidence embedding authority directory must be absolute"
+    );
+    ensure!(
+        nonce.len() <= 64
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "vector evidence embedding authority nonce is invalid"
     );
     Ok(())
 }
@@ -1386,11 +1896,33 @@ fn build_generation(
     dir: &Path,
     binding: FixtureBinding<'_>,
 ) -> Result<()> {
+    let processed = AtomicUsize::new(0);
+    build_generation_with_control(
+        backend,
+        source,
+        selected,
+        dir,
+        binding,
+        BuildControl {
+            processed: &processed,
+            cancel_after: None,
+        },
+    )
+}
+
+fn build_generation_with_control(
+    backend: Backend,
+    source: &Path,
+    selected: &HashMap<String, u64>,
+    dir: &Path,
+    binding: FixtureBinding<'_>,
+    control: BuildControl<'_>,
+) -> Result<()> {
     fs::create_dir_all(dir)?;
     let index = dir.join(backend.index_name());
     match backend {
-        Backend::SqliteVec => build_sqlite_vec(&index, source, selected)?,
-        Backend::Usearch => build_usearch(&index, source, selected)?,
+        Backend::SqliteVec => build_sqlite_vec(&index, source, selected, control)?,
+        Backend::Usearch => build_usearch(&index, source, selected, control)?,
     }
     write_manifest(dir, backend, selected.len(), binding)
 }
@@ -1460,14 +1992,19 @@ fn build_incremental_generation(
     write_manifest(dir, backend, base_count + tail.len(), binding)
 }
 
-fn build_sqlite_vec(index: &Path, source: &Path, selected: &HashMap<String, u64>) -> Result<()> {
+fn build_sqlite_vec(
+    index: &Path,
+    source: &Path,
+    selected: &HashMap<String, u64>,
+    control: BuildControl<'_>,
+) -> Result<()> {
     register_sqlite_vec()?;
     let mut conn = Connection::open(index)?;
     conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE VIRTUAL TABLE vectors USING vec0(embedding float[768] distance_metric=cosine);")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut insert = tx.prepare("INSERT INTO vectors(rowid, embedding) VALUES (?1, ?2)")?;
     let mut added = 0usize;
-    stream_vectors(source, selected, |ordinal, vector| {
+    stream_vectors_with_control(source, selected, control, |ordinal, vector| {
         insert.execute(params![ordinal as i64, vector_bytes(&vector)])?;
         added += 1;
         Ok(())
@@ -1480,7 +2017,12 @@ fn build_sqlite_vec(index: &Path, source: &Path, selected: &HashMap<String, u64>
     sync_file(index)
 }
 
-fn build_usearch(index: &Path, source: &Path, selected: &HashMap<String, u64>) -> Result<()> {
+fn build_usearch(
+    index: &Path,
+    source: &Path,
+    selected: &HashMap<String, u64>,
+    control: BuildControl<'_>,
+) -> Result<()> {
     let options = IndexOptions {
         dimensions: DIMENSIONS,
         metric: MetricKind::Cos,
@@ -1490,7 +2032,7 @@ fn build_usearch(index: &Path, source: &Path, selected: &HashMap<String, u64>) -
     let index_handle = Index::new(&options)?;
     index_handle.reserve(selected.len())?;
     let mut added = 0usize;
-    stream_vectors(source, selected, |ordinal, vector| {
+    stream_vectors_with_control(source, selected, control, |ordinal, vector| {
         index_handle.add(ordinal, &vector)?;
         added += 1;
         Ok(())
@@ -1503,6 +2045,24 @@ fn build_usearch(index: &Path, source: &Path, selected: &HashMap<String, u64>) -
 fn stream_vectors(
     source: &Path,
     selection: &HashMap<String, u64>,
+    visit: impl FnMut(u64, Vec<f32>) -> Result<()>,
+) -> Result<()> {
+    let processed = AtomicUsize::new(0);
+    stream_vectors_with_control(
+        source,
+        selection,
+        BuildControl {
+            processed: &processed,
+            cancel_after: None,
+        },
+        visit,
+    )
+}
+
+fn stream_vectors_with_control(
+    source: &Path,
+    selection: &HashMap<String, u64>,
+    control: BuildControl<'_>,
     mut visit: impl FnMut(u64, Vec<f32>) -> Result<()>,
 ) -> Result<()> {
     let conn = open_read_only(source)?;
@@ -1511,7 +2071,9 @@ fn stream_vectors(
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
         if let Some(ordinal) = selection.get(&id).copied() {
+            control.before_next()?;
             visit(ordinal, decode_vector(&row.get::<_, Vec<u8>>(1)?)?)?;
+            control.record_processed();
         }
     }
     Ok(())
@@ -1538,28 +2100,20 @@ impl Handle {
             Self::Usearch(index) => Ok(index.search(query, TOP_K)?.keys),
         }
     }
-    fn count(&self) -> usize {
+    fn count(&self) -> Result<usize> {
         match self {
-            Self::Sqlite(conn) => conn
-                .query_row("SELECT count(*) FROM vectors", [], |row| {
+            Self::Sqlite(conn) => {
+                let count = conn.query_row("SELECT count(*) FROM vectors", [], |row| {
                     row.get::<_, i64>(0)
-                })
-                .unwrap_or_default()
-                .max(0) as usize,
-            Self::Usearch(index) => index.size(),
+                })?;
+                Ok(count.max(0) as usize)
+            }
+            Self::Usearch(index) => Ok(index.size()),
         }
     }
 }
 
-fn open_generation(
-    backend: Backend,
-    root: &Path,
-    generation: &str,
-    binding: FixtureBinding<'_>,
-) -> Result<Handle> {
-    let dir = root.join("generations").join(generation);
-    validate_generation(&dir, backend, binding)?;
-    let index = dir.join(backend.index_name());
+fn open_candidate_index(backend: Backend, index: &Path) -> Result<Handle> {
     match backend {
         Backend::SqliteVec => {
             register_sqlite_vec()?;
@@ -1570,6 +2124,19 @@ fn open_generation(
         }
         Backend::Usearch => Ok(Handle::Usearch(Index::restore(&index.to_string_lossy())?)),
     }
+}
+
+fn open_generation(
+    backend: Backend,
+    root: &Path,
+    generation: &str,
+    binding: FixtureBinding<'_>,
+) -> Result<Handle> {
+    validate_generation_name(generation)?;
+    let dir = root.join("generations").join(generation);
+    validate_generation(&dir, backend, binding)?;
+    let index = dir.join(backend.index_name());
+    open_candidate_index(backend, &index)
 }
 
 fn open_current_generation(
@@ -1617,6 +2184,7 @@ fn validate_generation(dir: &Path, backend: Backend, binding: FixtureBinding<'_>
     ensure!(
         manifest.schema_version == 1
             && manifest.backend == backend.label()
+            && manifest.backend_version == backend.version()
             && manifest.input_manifest_sha256 == binding.input_manifest_sha256
             && manifest.source_database_sha256 == binding.source_database_sha256
             && manifest.source_generation_manifest_sha256
@@ -1629,10 +2197,33 @@ fn validate_generation(dir: &Path, backend: Backend, binding: FixtureBinding<'_>
         sha256_file(&dir.join(backend.index_name()))? == manifest.index_sha256,
         "generation index digest mismatch"
     );
+    ensure!(
+        open_candidate_index(backend, &dir.join(backend.index_name()))?.count()? == manifest.count,
+        "generation index count does not match its manifest"
+    );
     Ok(())
 }
 
-fn publish_pointer(root: &Path, current: &str, rollback: Option<&str>) -> Result<()> {
+fn rebind_manifest_index_digest(dir: &Path, backend: Backend) -> Result<()> {
+    let manifest_path = dir.join("manifest.json");
+    let mut manifest: GenerationManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    manifest.index_sha256 = sha256_file(&dir.join(backend.index_name()))?;
+    atomic_write_json(&manifest_path, &manifest)
+}
+
+fn publish_generation(
+    root: &Path,
+    current: &str,
+    rollback: Option<&str>,
+    backend: Backend,
+    binding: FixtureBinding<'_>,
+) -> Result<()> {
+    validate_generation_name(current)?;
+    validate_generation(&root.join("generations").join(current), backend, binding)?;
+    if let Some(rollback) = rollback {
+        validate_generation_name(rollback)?;
+        validate_generation(&root.join("generations").join(rollback), backend, binding)?;
+    }
     atomic_write_json(
         &root.join("publication.json"),
         &Pointer {
@@ -1641,6 +2232,15 @@ fn publish_pointer(root: &Path, current: &str, rollback: Option<&str>) -> Result
             rollback: rollback.map(str::to_owned),
         },
     )
+}
+
+fn validate_generation_name(generation: &str) -> Result<()> {
+    let mut components = Path::new(generation).components();
+    ensure!(
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+        "candidate generation name must be one plain path component"
+    );
+    Ok(())
 }
 
 /// A two-phase reader/publish barrier.
@@ -2059,6 +2659,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedding_server_entrypoint_is_hidden_but_parsable() {
+        let parsed = Cli::try_parse_from(["vector_backend_spike", "internal-embedding-server"])
+            .expect("internal embedding server entrypoint should parse");
+        assert!(matches!(parsed.command, Command::InternalEmbeddingServer));
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("internal-embedding-server"));
+        assert!(!help.contains("verify-fixture"));
+    }
+
+    #[test]
+    fn reviewed_catalog_binding_rejects_fabricated_source_truth() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("vectors.sqlite3");
+        let conn = Connection::open(&source)?;
+        conn.execute_batch(
+            "CREATE TABLE vectors (
+                node_id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                document_hash TEXT NOT NULL
+            );",
+        )?;
+        conn.execute(
+            "INSERT INTO vectors VALUES ('node-real', 'kernel/example.c', 'real_symbol', 'doc-real')",
+            [],
+        )?;
+        drop(conn);
+        let catalog = Catalog {
+            schema_version: 1,
+            corpus_commit: "a".repeat(40),
+            queries: vec![CatalogQuery {
+                id: "query-real".into(),
+                kind: "symbol".into(),
+                text: "Where is the real symbol?".into(),
+                file_path: "kernel/example.c".into(),
+                symbol: "real_symbol".into(),
+            }],
+        };
+        let mut queries = vec![FrozenQuery {
+            id: "query-real".into(),
+            kind: "symbol".into(),
+            text: "Where is the real symbol?".into(),
+            expected_node_id: "node-real".into(),
+            expected_document_hash: "doc-real".into(),
+            vector: vec![0.0; DIMENSIONS],
+        }];
+        verify_reviewed_query_bindings(&queries, &catalog, &source)?;
+        queries[0].expected_document_hash = "caller-fabricated".into();
+        assert!(verify_reviewed_query_bindings(&queries, &catalog, &source).is_err());
+        queries[0].expected_document_hash = "doc-real".into();
+        queries[0].text = "caller changed reviewed text".into();
+        assert!(verify_reviewed_query_bindings(&queries, &catalog, &source).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn query_vector_verification_rejects_caller_fabrication() -> Result<()> {
+        let mut expected = vec![0.0; DIMENSIONS];
+        expected[0] = 1.0;
+        let queries = vec![FrozenQuery {
+            id: "query".into(),
+            kind: "symbol".into(),
+            text: "query text".into(),
+            expected_node_id: "node".into(),
+            expected_document_hash: "document".into(),
+            vector: expected.clone(),
+        }];
+        verify_query_vectors(&queries, std::slice::from_ref(&expected))?;
+        let mut fabricated = expected;
+        fabricated[0] = 0.5;
+        fabricated[1] = (0.75f32).sqrt();
+        assert!(verify_query_vectors(&queries, &[fabricated]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn catalog_corpus_identity_requires_the_clean_named_checkout() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
@@ -2140,10 +2818,10 @@ mod tests {
             let root = temp.path().join(backend.label());
             let generation_one = root.join("generations").join("generation-1");
             build_generation(backend, &source, &base_selection, &generation_one, binding)?;
-            publish_pointer(&root, "generation-1", None)?;
+            publish_generation(&root, "generation-1", None, backend, binding)?;
 
             let handle = open_current_generation(backend, &root, binding)?;
-            assert_eq!(handle.count(), base_selection.len());
+            assert_eq!(handle.count()?, base_selection.len());
             let expected = handle.search(&query)?;
             assert_eq!(expected.len(), TOP_K);
 
@@ -2158,13 +2836,95 @@ mod tests {
                 &incremental,
                 binding,
             )?;
-            publish_pointer(&root, "generation-2", Some("generation-1"))?;
+            publish_generation(
+                &root,
+                "generation-2",
+                Some("generation-1"),
+                backend,
+                binding,
+            )?;
             let post_publish = open_current_generation(backend, &root, binding)?;
-            assert_eq!(post_publish.count(), 32);
+            assert_eq!(post_publish.count()?, 32);
             assert_eq!(post_publish.search(&query)?, expected);
             assert!(readers.release_after_publish()?);
             assert_eq!(handle.search(&query)?, expected);
             drop(post_publish);
+
+            let pointer_before_fault = fs::read(root.join("publication.json"))?;
+            let corrupt = root.join("generations/generation-corrupt");
+            fs::create_dir_all(&corrupt)?;
+            fs::copy(
+                generation_two.join(backend.index_name()),
+                corrupt.join(backend.index_name()),
+            )?;
+            fs::copy(
+                generation_two.join("manifest.json"),
+                corrupt.join("manifest.json"),
+            )?;
+            tamper_file(&corrupt.join(backend.index_name()))?;
+            rebind_manifest_index_digest(&corrupt, backend)?;
+            assert!(
+                publish_generation(
+                    &root,
+                    "generation-corrupt",
+                    Some("generation-2"),
+                    backend,
+                    binding,
+                )
+                .is_err()
+            );
+
+            let incomplete = root.join("generations/generation-incomplete");
+            fs::create_dir_all(&incomplete)?;
+            fs::copy(
+                generation_two.join(backend.index_name()),
+                incomplete.join(backend.index_name()),
+            )?;
+            assert!(
+                publish_generation(
+                    &root,
+                    "generation-incomplete",
+                    Some("generation-2"),
+                    backend,
+                    binding,
+                )
+                .is_err()
+            );
+
+            let processed = AtomicUsize::new(0);
+            let cancelled = root.join("generations/generation-cancelled");
+            let cancellation = build_generation_with_control(
+                backend,
+                &source,
+                &base_selection,
+                &cancelled,
+                binding,
+                BuildControl {
+                    processed: &processed,
+                    cancel_after: Some(3),
+                },
+            )
+            .expect_err("candidate build should cancel after work begins");
+            assert_eq!(processed.load(Ordering::Acquire), 3);
+            assert!(
+                cancellation
+                    .to_string()
+                    .contains("candidate_build_cancelled_after_vectors:3")
+            );
+            assert!(
+                publish_generation(
+                    &root,
+                    "generation-cancelled",
+                    Some("generation-2"),
+                    backend,
+                    binding,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                fs::read(root.join("publication.json"))?,
+                pointer_before_fault
+            );
 
             tamper_file(&generation_two.join(backend.index_name()))?;
             assert!(open_current_generation(backend, &root, binding).is_err());
@@ -2212,10 +2972,14 @@ mod tests {
         let source = temp_root.join("source.sqlite3");
         let source_manifest = temp_root.join("vector-generation-manifest.json");
         let fixture = temp_root.join("fixture.json");
+        let catalog = temp_root.join("catalog.json");
+        let fixture_verification = temp_root.join("fixture-verification.json");
         let host_evidence = temp_root.join("host-evidence.json");
         fs::write(&source, b"source")?;
         fs::write(&source_manifest, b"manifest")?;
         fs::write(&fixture, b"fixture")?;
+        fs::write(&catalog, b"catalog")?;
+        fs::write(&fixture_verification, b"verification")?;
         let binary = std::env::current_exe()?.canonicalize()?;
         let binary_sha256 = sha256_file(&binary)?;
         atomic_write_json(
@@ -2228,13 +2992,18 @@ mod tests {
             }),
         )?;
         let input = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "source": { "path": "source.sqlite3", "sha256": sha256_file(&source)? },
             "source_generation_manifest": {
                 "path": "vector-generation-manifest.json",
                 "sha256": sha256_file(&source_manifest)?,
             },
             "fixture": { "path": "fixture.json", "sha256": sha256_file(&fixture)? },
+            "catalog": { "path": "catalog.json", "sha256": sha256_file(&catalog)? },
+            "fixture_verification": {
+                "path": "fixture-verification.json",
+                "sha256": sha256_file(&fixture_verification)?,
+            },
             "binary_sha256": binary_sha256,
             "host_evidence": {
                 "path": "host-evidence.json",
