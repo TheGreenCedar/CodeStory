@@ -3514,6 +3514,17 @@ impl Storage {
         Ok(())
     }
 
+    /// Create only the edge endpoint indexes needed by staged semantic context reads.
+    ///
+    /// Live stores already have the complete secondary schema. Build stores defer
+    /// these indexes until semantic projection to keep the ingestion write path lean.
+    pub fn create_semantic_context_endpoint_indexes_for_build(&self) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::create_semantic_context_endpoint_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_deferred_secondary_indexes_for_summary(
         &self,
     ) -> Result<(), StorageError> {

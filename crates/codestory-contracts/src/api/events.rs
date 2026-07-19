@@ -93,6 +93,8 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_cache_publish_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_context_index_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_node_load_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_node_load_rows: Option<u32>,
@@ -316,6 +318,7 @@ mod tests {
             search_symbol_index_commit_ms: None,
             search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
             semantic_context_ms: None,
@@ -419,6 +422,7 @@ mod tests {
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
         assert!(value.get("resolution_cleanup_ms").is_none());
+        assert!(value.get("semantic_context_index_ms").is_none());
         assert!(value.get("semantic_doc_build_ms").is_none());
         assert!(value.get("semantic_node_load_ms").is_none());
         assert!(value.get("semantic_node_load_rows").is_none());
@@ -531,6 +535,7 @@ mod tests {
         .expect("deserialize legacy timings");
 
         assert!(timings.full_refresh_wall.is_none());
+        assert!(timings.semantic_context_index_ms.is_none());
         assert!(timings.semantic_node_load_ms.is_none());
         assert!(timings.search_symbol_index_commit_ms.is_none());
     }

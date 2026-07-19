@@ -4763,6 +4763,7 @@ fn read_line_capped<R: BufRead>(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SemanticProjectionStats {
     reported: bool,
+    semantic_context_index_ms: u32,
     node_load_ms: u32,
     node_load_rows: u32,
     context_ms: u32,
@@ -4833,6 +4834,7 @@ fn apply_semantic_projection_stats(
     if !stats.reported {
         return;
     }
+    timings.semantic_context_index_ms = Some(stats.semantic_context_index_ms);
     timings.semantic_node_load_ms = Some(stats.node_load_ms);
     timings.semantic_node_load_rows = Some(stats.node_load_rows);
     timings.semantic_context_ms = Some(stats.context_ms);
@@ -6145,6 +6147,7 @@ struct SearchGenerationCatalogGuard {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationTestBoundary {
+    SemanticContextIndexes,
     Identity,
     SearchBuild,
     SearchSymbolPage,
@@ -8813,6 +8816,24 @@ fn finalize_staged_semantic_docs_for_runtime(
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
+    let semantic_context_index_started = Instant::now();
+    storage
+        .create_semantic_context_endpoint_indexes_for_build()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to create staged semantic context endpoint indexes: {error}"
+            ))
+        })?;
+    let semantic_context_index_ms =
+        clamp_u128_to_u32(semantic_context_index_started.elapsed().as_millis());
+    #[cfg(test)]
+    publication_test_checkpoint(
+        PublicationTestBoundary::SemanticContextIndexes,
+        cancel_token,
+    )?;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
     let node_load_started = Instant::now();
     let nodes = storage
         .get_nodes()
@@ -8839,6 +8860,7 @@ fn finalize_staged_semantic_docs_for_runtime(
         cancel_token,
         runtime,
     )?;
+    stats.semantic_context_index_ms = semantic_context_index_ms;
     stats.node_load_ms = node_load_ms;
     stats.node_load_rows = node_load_rows;
     Ok(stats)
@@ -14578,7 +14600,9 @@ fn index_full_for_runtime(
             )));
         }
     };
-    let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
+    let deferred_indexes_ms = staged_finalize_stats
+        .deferred_indexes_ms
+        .saturating_add(staged_semantic_stats.semantic_context_index_ms);
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let detail_started = Instant::now();
     if let Err(err) = staged.snapshots().refresh_detail() {
@@ -14818,6 +14842,7 @@ fn index_full_for_runtime(
             search_symbol_index_commit_ms: None,
             search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
             semantic_context_ms: None,
@@ -15280,7 +15305,9 @@ fn run_incremental_indexing_common(
             return Err(error);
         }
     };
-    let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
+    let deferred_indexes_ms = staged_finalize_stats
+        .deferred_indexes_ms
+        .saturating_add(staged_semantic_stats.semantic_context_index_ms);
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
 
@@ -15478,6 +15505,7 @@ fn run_incremental_indexing_common(
             search_symbol_index_commit_ms: None,
             search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
             semantic_context_ms: None,
@@ -25677,7 +25705,12 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(full_timings.search_symbol_index_reload_count, Some(1));
         assert!(full_timings.search_symbol_index_commit_ms.is_some());
         assert!(full_timings.search_symbol_index_reload_ms.is_some());
+        assert!(full_timings.semantic_context_index_ms.is_some());
         assert!(full_timings.semantic_node_load_ms.is_some());
+        assert!(
+            full_timings.deferred_indexes_ms.unwrap_or_default()
+                >= full_timings.semantic_context_index_ms.unwrap_or_default()
+        );
         assert!(
             full_timings
                 .semantic_node_load_rows
@@ -25836,6 +25869,58 @@ fn build_llm_symbol_doc_text() -> String {
                 .iter()
                 .any(|node| node.serialized_name == "retained_value")
         );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_semantic_endpoint_index_failure_preserves_live_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn retained_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+
+        fs::write(&source_path, "pub fn rejected_generation() -> i32 { 2 }\n")
+            .expect("write replacement source");
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TABLE idx_edge_source (
+                         collision INTEGER
+                     );",
+                )
+                .expect("install semantic endpoint index collision");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("semantic endpoint index failure must reject the candidate");
+        assert!(error.message.contains("idx_edge_source"), "{error:?}");
+
+        let live = Storage::open(&storage_path).expect("reopen retained live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retained publication"),
+            Some(baseline)
+        );
+        assert!(storage_has_symbol(&live, "retained_generation"));
+        assert!(!storage_has_symbol(&live, "rejected_generation"));
         assert_no_staged_publication_artifacts(&storage_path);
     }
 
@@ -26497,7 +26582,8 @@ fn build_llm_symbol_doc_text() -> String {
         }
     }
 
-    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 10] = [
+    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 11] = [
+        PublicationTestBoundary::SemanticContextIndexes,
         PublicationTestBoundary::Identity,
         PublicationTestBoundary::SearchBuild,
         PublicationTestBoundary::SearchSymbolPage,

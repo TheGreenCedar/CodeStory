@@ -4285,6 +4285,162 @@ fn test_resolution_query_plan_prefers_new_indexes() -> Result<(), StorageError> 
 }
 
 #[test]
+fn semantic_context_endpoint_indexes_replace_edge_scan_without_other_deferred_indexes()
+-> Result<(), StorageError> {
+    const ENDPOINT_INDEXES: &[&str] = &[
+        "idx_edge_source",
+        "idx_edge_target",
+        "idx_edge_resolved_source",
+        "idx_edge_resolved_target",
+    ];
+    const UNRELATED_DEFERRED_INDEXES: &[&str] = &[
+        "idx_edge_file",
+        "idx_edge_kind_source",
+        "idx_node_file",
+        "idx_occurrence_element",
+    ];
+    const REPRESENTATIVE_NODE_COUNT: i64 = 12_000;
+    const REPRESENTATIVE_EDGE_COUNT: i64 = 48_000;
+
+    let db_path = unique_temp_db_path("semantic-endpoint-indexes");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let storage = Storage::open_build(&db_path)?;
+    storage.conn.execute_batch(&format!(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_NODE_COUNT}
+         )
+         INSERT INTO node(id, kind, serialized_name)
+         SELECT value, 3, printf('node-%d', value) FROM sequence;
+         WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {REPRESENTATIVE_EDGE_COUNT}
+         )
+         INSERT INTO edge(
+             id,
+             source_node_id,
+             target_node_id,
+             kind,
+             resolved_source_node_id,
+             resolved_target_node_id
+         )
+         SELECT
+             value,
+             (value % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             ((value * 17) % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             2,
+             ((value * 19) % {REPRESENTATIVE_NODE_COUNT}) + 1,
+             ((value * 23) % {REPRESENTATIVE_NODE_COUNT}) + 1
+         FROM sequence;"
+    ))?;
+
+    for index_name in ENDPOINT_INDEXES
+        .iter()
+        .chain(UNRELATED_DEFERRED_INDEXES.iter())
+    {
+        assert!(!sqlite_index_exists(&storage, index_name)?);
+    }
+
+    let plan_sql = format!(
+        "EXPLAIN QUERY PLAN
+         {EDGE_SELECT_BASE}
+         WHERE e.source_node_id IN (?1)
+            OR e.target_node_id IN (?2)
+            OR e.resolved_source_node_id IN (?3)
+            OR e.resolved_target_node_id IN (?4)
+         ORDER BY e.id"
+    );
+    let plan = |storage: &Storage| -> Result<Vec<String>, StorageError> {
+        let mut statement = storage.conn.prepare(&plan_sql)?;
+        statement
+            .query_map(rusqlite::params![17_i64, 17_i64, 17_i64, 17_i64], |row| {
+                row.get(3)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(StorageError::from)
+    };
+    let scan_plan = plan(&storage)?;
+    assert!(
+        scan_plan.iter().any(|line| line.contains("SCAN e")),
+        "semantic endpoint lookup did not scan before early indexes: {scan_plan:?}"
+    );
+
+    let node_ids = [NodeId(17), NodeId(311), NodeId(1_021), NodeId(5_099)];
+    let scan_callbacks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let scan_counter = std::sync::Arc::clone(&scan_callbacks);
+    storage.conn.progress_handler(
+        100,
+        Some(move || {
+            scan_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    )?;
+    let scan_started = std::time::Instant::now();
+    let scan_edges = storage.get_edges_for_node_ids(&node_ids)?;
+    let scan_elapsed = scan_started.elapsed();
+    storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+
+    storage.create_semantic_context_endpoint_indexes_for_build()?;
+    for index_name in ENDPOINT_INDEXES {
+        assert!(sqlite_index_exists(&storage, index_name)?);
+    }
+    for index_name in UNRELATED_DEFERRED_INDEXES {
+        assert!(!sqlite_index_exists(&storage, index_name)?);
+    }
+
+    let indexed_plan = plan(&storage)?;
+    for index_name in ENDPOINT_INDEXES {
+        assert!(
+            indexed_plan.iter().any(|line| line.contains(index_name)),
+            "semantic endpoint lookup did not use {index_name}: {indexed_plan:?}"
+        );
+    }
+    assert!(
+        indexed_plan.iter().all(|line| !line.contains("SCAN e")),
+        "semantic endpoint lookup still scanned after early indexes: {indexed_plan:?}"
+    );
+
+    let indexed_callbacks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let indexed_counter = std::sync::Arc::clone(&indexed_callbacks);
+    storage.conn.progress_handler(
+        100,
+        Some(move || {
+            indexed_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    )?;
+    let indexed_started = std::time::Instant::now();
+    let indexed_edges = storage.get_edges_for_node_ids(&node_ids)?;
+    let indexed_elapsed = indexed_started.elapsed();
+    storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+
+    assert_eq!(indexed_edges, scan_edges);
+    for edges in indexed_edges.values() {
+        assert!(
+            edges.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "semantic endpoint results lost deterministic edge-id order"
+        );
+    }
+    let scan_callback_count = scan_callbacks.load(std::sync::atomic::Ordering::Relaxed);
+    let indexed_callback_count = indexed_callbacks.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        scan_callback_count > indexed_callback_count.saturating_mul(5),
+        "representative endpoint lookup VM work did not improve enough: scan={scan_callback_count}, indexed={indexed_callback_count}"
+    );
+    eprintln!(
+        "semantic endpoint representative proof: nodes={REPRESENTATIVE_NODE_COUNT} edges={REPRESENTATIVE_EDGE_COUNT} scan_callbacks={scan_callback_count} indexed_callbacks={indexed_callback_count} scan_ms={} indexed_ms={}",
+        scan_elapsed.as_millis(),
+        indexed_elapsed.as_millis(),
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+    Ok(())
+}
+
+#[test]
 fn staged_summary_build_uses_bulk_node_file_rank_index_for_file_aggregation()
 -> Result<(), StorageError> {
     const DESTINATION_INDEXES: &[&str] = &[
@@ -4396,6 +4552,10 @@ fn legacy_staged_finalize_builds_complete_secondary_index_set() -> Result<(), St
     assert!(storage.has_ready_grounding_summary_snapshots()?);
     for index_name in [
         "idx_node_file",
+        "idx_edge_source",
+        "idx_edge_target",
+        "idx_edge_resolved_source",
+        "idx_edge_resolved_target",
         "idx_grounding_file_snapshot_path",
         "idx_grounding_file_snapshot_rank",
         "idx_grounding_node_snapshot_file_rank",
