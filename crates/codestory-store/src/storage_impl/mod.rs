@@ -22,7 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod bookmarks;
@@ -78,6 +78,7 @@ const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTI
 const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const PROMOTION_JOURNAL_VERSION: u32 = 2;
+const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -997,6 +998,7 @@ pub struct Storage {
     conn: Connection,
     cache: StorageCache,
     deferred_secondary_indexes: bool,
+    durability_profile: SqliteDurabilityProfile,
 }
 
 /// Narrow query-only view used while a staged store has one active writer.
@@ -1081,6 +1083,18 @@ pub enum StorageOpenMode {
     Live,
     /// Build stores defer expensive secondary indexes until finalization.
     Build,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteDurabilityProfile {
+    Durable,
+    DisposableFullBuild,
+}
+
+pub(crate) struct DisposableFullBuildSealStats {
+    pub(crate) wal_autocheckpoint_bytes: u64,
+    pub(crate) checkpoint_ms: u32,
+    pub(crate) sync_ms: u32,
 }
 
 /// Per-table timing breakdown for a projection flush.
@@ -2031,6 +2045,7 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
         })
     }
 
@@ -2129,6 +2144,7 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
         })
     }
 
@@ -2155,10 +2171,35 @@ impl Storage {
         Self::open_with_mode(path, StorageOpenMode::Build)
     }
 
+    /// Open a fresh, repeatable full-refresh stage with relaxed write durability.
+    ///
+    /// The resulting database is never publishable until the consuming staged
+    /// snapshot path seals its WAL and syncs the standalone database. Generic
+    /// build stores and incremental clones retain the durable profile.
+    pub(crate) fn open_disposable_full_build<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        cleanup_sqlite_sidecars(path)?;
+        Self::open_with_mode_and_durability(
+            path,
+            StorageOpenMode::Build,
+            SqliteDurabilityProfile::DisposableFullBuild,
+        )
+    }
+
     /// Open a store with explicit live or build indexing behavior.
     pub fn open_with_mode<P: AsRef<Path>>(
         path: P,
         mode: StorageOpenMode,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_mode_and_durability(path, mode, SqliteDurabilityProfile::Durable)
+    }
+
+    fn open_with_mode_and_durability<P: AsRef<Path>>(
+        path: P,
+        mode: StorageOpenMode,
+        durability_profile: SqliteDurabilityProfile,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
         if matches!(mode, StorageOpenMode::Live) {
@@ -2170,7 +2211,20 @@ impl Storage {
         conn.busy_timeout(Duration::from_millis(2_500))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        match durability_profile {
+            SqliteDurabilityProfile::Durable => {
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+            }
+            SqliteDurabilityProfile::DisposableFullBuild => {
+                conn.pragma_update(None, "synchronous", "OFF")?;
+                let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+                let page_size = page_size.max(1);
+                let checkpoint_pages = (DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64)
+                    .saturating_add(page_size - 1)
+                    / page_size;
+                conn.pragma_update(None, "wal_autocheckpoint", checkpoint_pages)?;
+            }
+        }
         if matches!(mode, StorageOpenMode::Build) {
             // Favor fewer temp-file round trips and larger page caches while building
             // the staged full-refresh snapshot.
@@ -2182,6 +2236,7 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: matches!(mode, StorageOpenMode::Build),
+            durability_profile,
         };
         storage.init(mode)?;
         Ok(storage)
@@ -2259,6 +2314,7 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
         };
         storage.init(StorageOpenMode::Live)?;
         Ok(storage)
@@ -3360,6 +3416,50 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn seal_disposable_full_build(
+        &self,
+    ) -> Result<Option<DisposableFullBuildSealStats>, StorageError> {
+        if self.durability_profile != SqliteDurabilityProfile::DisposableFullBuild {
+            return Ok(None);
+        }
+
+        let checkpoint_started = Instant::now();
+        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 || log_frames != 0 || checkpointed_frames != 0 {
+            return Err(StorageError::Other(format!(
+                "Disposable full-refresh WAL seal did not complete: busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}"
+            )));
+        }
+        let checkpoint_ms = checkpoint_started
+            .elapsed()
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+
+        let path = self.conn.path().ok_or_else(|| {
+            StorageError::Other(
+                "Disposable full-refresh WAL seal requires file-backed storage".to_string(),
+            )
+        })?;
+        let sync_started = Instant::now();
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                promotion_path_error("sync staged database", Path::new(path), error)
+            })?;
+        sync_promotion_parent(Path::new(path))?;
+        let sync_ms = sync_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        Ok(Some(DisposableFullBuildSealStats {
+            wal_autocheckpoint_bytes: DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+            checkpoint_ms,
+            sync_ms,
+        }))
+    }
+
     pub fn create_deferred_secondary_indexes(&self) -> Result<(), StorageError> {
         if self.deferred_secondary_indexes {
             schema::create_deferred_indexes(&self.conn)?;
@@ -3442,6 +3542,7 @@ impl Storage {
 
         let mut live_conn = Connection::open(live_path)?;
         let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
+        live_conn.pragma_update(None, "synchronous", "FULL")?;
 
         #[cfg(test)]
         let restore_result = if let Some(sentinel_path) =

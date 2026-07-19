@@ -19,6 +19,13 @@
   8 MiB source and 120,000 projected-node target plus a 512-file safety
   ceiling. Completed output adjusts the next chunk's node-density estimate,
   and telemetry reports planning time, observed maxima, and target overruns.
+- Fresh full-refresh stages now use a store-owned disposable SQLite profile:
+  WAL remains available to the bounded cache reader, automatic checkpoint work
+  uses a 64 MiB window instead of SQLite's small default, and durability is
+  deferred to a verified NORMAL/TRUNCATE checkpoint plus filesystem sync before
+  promotion. Live, generic build, and incremental-clone profiles remain
+  WAL/NORMAL. Full-refresh telemetry reports the configured checkpoint window,
+  final checkpoint time, and explicit sync time.
 
 ## 0.16.0
 

@@ -8976,6 +8976,9 @@ mod tests {
             summary_snapshot_ms: Some(8),
             detail_snapshot_ms: Some(9),
             publish_ms: Some(10),
+            staged_sqlite_wal_autocheckpoint_bytes: Some(67_108_864),
+            staged_sqlite_checkpoint_ms: Some(11),
+            staged_sqlite_sync_ms: Some(12),
             setup_existing_projection_ids_ms: Some(11),
             setup_seed_symbol_table_ms: Some(12),
             flush_files_ms: Some(13),
@@ -9197,6 +9200,9 @@ mod tests {
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(
             "staged_publish_ms: deferred_indexes=7 summary_snapshot=8 detail_snapshot=9 publish=10"
+        ));
+        assert!(markdown.contains(
+            "staged_sqlite: wal_autocheckpoint_bytes=67108864 checkpoint_ms=11 sync_ms=12"
         ));
         assert!(markdown.contains("setup_ms: existing_projection_ids=11 seed_symbol_table=12"));
         assert!(

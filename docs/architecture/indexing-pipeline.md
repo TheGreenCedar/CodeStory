@@ -27,7 +27,7 @@ sequenceDiagram
     CLI->>Runtime: parse `index` command and open project
     Runtime->>Workspace: full refresh plan or diff-based refresh plan
     Workspace-->>Runtime: RefreshExecutionPlan + verified policy exclusions
-    Runtime->>Store: open staged store for full refresh or live store for incremental
+    Runtime->>Store: open disposable full stage or durable incremental clone
     Runtime->>Indexer: WorkspaceIndexer::run(plan, store)
     Indexer->>Store: flush files, nodes, edges, occurrences, component access, callable projection state
     Indexer->>Store: run post-flush resolution updates
@@ -115,8 +115,17 @@ flowchart TD
 
 `crates/codestory-runtime/src/lib.rs` owns the orchestration split:
 
-- `index_full` opens a staged store with `SnapshotStore::open_staged`, asks the workspace for a full refresh plan, runs the indexer against the staged store, finalizes the staged snapshot, and then publishes it to the live path
-- `index_incremental` opens the live store, collects refresh inputs from stored inventory, builds a diff-based execution plan, runs the same indexer against the live store, and then refreshes live summary and detail snapshots
+- `index_full` opens a fresh stage with `SnapshotStore::open_disposable_full_refresh`, asks the workspace for a full refresh plan, runs the indexer against the staged store, finalizes every core/search identity, and then seals and publishes it to the live path
+- `index_incremental` clones the current live database into a durable staged store, collects refresh inputs from stored inventory, builds a diff-based execution plan, runs the same indexer against the clone, and publishes the completed replacement
+
+Only the fresh full stage uses relaxed SQLite synchronization. It remains in
+WAL mode for the bounded parser-artifact reader and keeps a nonzero 64 MiB
+automatic-checkpoint budget. The consuming publish call restores NORMAL
+synchronization, completes a blocking TRUNCATE checkpoint, syncs the database
+and containing directory, and only then enters the store's old-or-new promotion
+journal. Its phase telemetry exposes the checkpoint budget, checkpoint time,
+and sync time. Generic build stores and incremental clones keep WAL/NORMAL
+throughout.
 
 The indexer does not know whether the store is staged or live.
 

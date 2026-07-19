@@ -396,6 +396,18 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             ("publish", timings.publish_ms),
         ],
     );
+    if timings.staged_sqlite_wal_autocheckpoint_bytes.is_some()
+        || timings.staged_sqlite_checkpoint_ms.is_some()
+        || timings.staged_sqlite_sync_ms.is_some()
+    {
+        let _ = writeln!(
+            markdown,
+            "staged_sqlite: wal_autocheckpoint_bytes={} checkpoint_ms={} sync_ms={}",
+            timings.staged_sqlite_wal_autocheckpoint_bytes.unwrap_or(0),
+            timings.staged_sqlite_checkpoint_ms.unwrap_or(0),
+            timings.staged_sqlite_sync_ms.unwrap_or(0),
+        );
+    }
     append_optional_timings_line(
         markdown,
         "setup_ms",
