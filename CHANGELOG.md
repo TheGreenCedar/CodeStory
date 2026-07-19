@@ -52,6 +52,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   blocking the staged core publication.
 - Safe refreshes preserve the last verified index. Incomplete reads, cancellation, or concurrent source changes cannot publish a partial generation or mix results from different generations.
 - Large full and incremental refreshes now batch file-identity lookups against SQLite's runtime bind-variable limit without changing duplicate or missing-ID semantics.
+- Large semantic-document builds now batch component-access metadata lookups
+  against SQLite's runtime bind-variable limit instead of constructing one
+  repository-wide statement.
 - Resolution now skips its optional support cache when the serialized snapshot exceeds SQLite's runtime value limit, while keeping the in-memory result and staged publication intact.
 - Existing semantic indexes rebuild once after upgrading. The last complete index remains available while the replacement is prepared.
 - Project switching now preserves isolated per-project state across A/B/A MCP routing. Requests require an explicit project, and status remains observational instead of activating or repairing a repository.

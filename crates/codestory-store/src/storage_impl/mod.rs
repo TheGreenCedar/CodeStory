@@ -4608,16 +4608,36 @@ impl Storage {
             return Ok(HashMap::new());
         }
 
-        let placeholders = question_placeholders(node_ids.len());
-        let sql =
-            format!("SELECT node_id, type FROM component_access WHERE node_id IN ({placeholders})");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(node_ids.iter().map(|id| id.0)))?;
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for component-access lookup"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support component-access lookup".to_string(),
+            ));
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|id| id.0);
+        unique_node_ids.dedup();
+
         let mut map = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let node_id: i64 = row.get(0)?;
-            let raw: i32 = row.get(1)?;
-            map.insert(NodeId(node_id), row_mapping::access_kind_from_db(raw));
+        for batch in unique_node_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            let sql = format!(
+                "SELECT node_id, type FROM component_access WHERE node_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let node_id: i64 = row.get(0)?;
+                let raw: i32 = row.get(1)?;
+                map.insert(NodeId(node_id), row_mapping::access_kind_from_db(raw));
+            }
         }
         Ok(map)
     }

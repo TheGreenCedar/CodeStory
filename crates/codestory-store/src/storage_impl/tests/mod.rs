@@ -1549,6 +1549,77 @@ fn test_component_access_round_trip() -> Result<(), StorageError> {
 }
 
 #[test]
+fn component_access_lookup_batches_at_runtime_bind_limit() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(41),
+            kind: NodeKind::METHOD,
+            serialized_name: "run".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(42),
+            kind: NodeKind::FIELD,
+            serialized_name: "state".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(43),
+            kind: NodeKind::METHOD,
+            serialized_name: "reset".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_component_access_batch(&[
+        (NodeId(41), AccessKind::Protected),
+        (NodeId(42), AccessKind::Private),
+        (NodeId(43), AccessKind::Public),
+    ])?;
+
+    let previous_limit = storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 2)?;
+    assert!(previous_limit >= 2);
+
+    let map = storage.get_component_access_map_for_nodes(&[
+        NodeId(99),
+        NodeId(43),
+        NodeId(41),
+        NodeId(42),
+        NodeId(41),
+        NodeId(100),
+    ])?;
+    assert_eq!(map.len(), 3);
+    assert_eq!(map.get(&NodeId(41)), Some(&AccessKind::Protected));
+    assert_eq!(map.get(&NodeId(42)), Some(&AccessKind::Private));
+    assert_eq!(map.get(&NodeId(43)), Some(&AccessKind::Public));
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)?;
+    Ok(())
+}
+
+#[test]
+fn component_access_lookup_rejects_zero_bind_limit() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+    storage
+        .get_connection()
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 0)?;
+
+    let error = storage
+        .get_component_access_map_for_nodes(&[NodeId(41)])
+        .expect_err("component-access lookup must reject a zero-variable runtime limit");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot support component-access lookup"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_symbol_search_doc_version_mismatch_detection() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[Node {
