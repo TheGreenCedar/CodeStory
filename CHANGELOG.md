@@ -7,6 +7,10 @@
 - Full refresh now persists each ordered parser-artifact chunk in one SQLite
   transaction instead of one autocommit per parsed file. Index telemetry
   reports artifact-cache rows, transactions, and write time separately.
+- Staged symbol search generations now retain one bounded Tantivy writer across
+  document checkpoints and commit/reload once, instead of reopening and
+  committing the writer for every 8,192 symbols. Index telemetry reports
+  symbol documents, writers, commits, and reloads.
 
 ## 0.16.0
 

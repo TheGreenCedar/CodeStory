@@ -341,6 +341,16 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
     );
     append_optional_timings_line(
         markdown,
+        "symbol_index",
+        &[
+            ("docs", timings.search_symbol_index_docs_written),
+            ("writers", timings.search_symbol_index_writer_count),
+            ("commits", timings.search_symbol_index_commit_count),
+            ("reloads", timings.search_symbol_index_reload_count),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
         "staged_publish_ms",
         &[
             ("deferred_indexes", timings.deferred_indexes_ms),

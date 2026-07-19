@@ -20,6 +20,14 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_symbol_index_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_docs_written: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_writer_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_commit_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol_index_reload_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_cache_publish_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_doc_build_ms: Option<u32>,
@@ -205,6 +213,10 @@ mod tests {
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
+            search_symbol_index_docs_written: None,
+            search_symbol_index_writer_count: None,
+            search_symbol_index_commit_count: None,
+            search_symbol_index_reload_count: None,
             runtime_cache_publish_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
@@ -292,6 +304,10 @@ mod tests {
         assert!(value.get("semantic_prune_ms").is_none());
         assert!(value.get("search_projection_rebuild_ms").is_none());
         assert!(value.get("search_symbol_index_ms").is_none());
+        assert!(value.get("search_symbol_index_docs_written").is_none());
+        assert!(value.get("search_symbol_index_writer_count").is_none());
+        assert!(value.get("search_symbol_index_commit_count").is_none());
+        assert!(value.get("search_symbol_index_reload_count").is_none());
         assert!(value.get("runtime_cache_publish_ms").is_none());
         assert!(value.get("semantic_docs_reused").is_none());
         assert!(value.get("semantic_docs_embedded").is_none());
