@@ -14372,7 +14372,7 @@ fn index_full_for_runtime(
     #[cfg(test)]
     run_source_policy_after_plan_hook();
 
-    let mut staged = SnapshotStore::open_staged(storage_path)
+    let mut staged = SnapshotStore::open_disposable_full_refresh(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
     #[cfg(test)]
     run_full_refresh_staged_store_hook(staged.store_mut());
@@ -14662,14 +14662,17 @@ fn index_full_for_runtime(
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
-    if let Err(err) = staged.publish(storage_path) {
-        drop(prepared_search_state);
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(ApiError::internal(format!(
-            "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
-            staged_path.display()
-        )));
-    }
+    let staged_publish_stats = match staged.publish_with_stats(storage_path) {
+        Ok(stats) => stats,
+        Err(err) => {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(ApiError::internal(format!(
+                "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
+                staged_path.display()
+            )));
+        }
+    };
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
     let full_refresh_pipeline_enabled = index_stats.full_refresh_queue_capacity > 0;
@@ -14749,6 +14752,10 @@ fn index_full_for_runtime(
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms,
             publish_ms: Some(publish_ms),
+            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
+                .sqlite_wal_autocheckpoint_bytes,
+            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
+            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -15323,14 +15330,17 @@ fn run_incremental_indexing_common(
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
-    if let Err(error) = staged.publish(storage_path) {
-        drop(prepared_search_state);
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(ApiError::internal(format!(
-            "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
-            staged_path.display()
-        )));
-    }
+    let staged_publish_stats = match staged.publish_with_stats(storage_path) {
+        Ok(stats) => stats,
+        Err(error) => {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(ApiError::internal(format!(
+                "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
+                staged_path.display()
+            )));
+        }
+    };
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
 
     Ok(IndexingRunSummary {
@@ -15388,6 +15398,10 @@ fn run_incremental_indexing_common(
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: Some(detail_snapshot_ms),
             publish_ms: Some(publish_ms),
+            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
+                .sqlite_wal_autocheckpoint_bytes,
+            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
+            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -25341,6 +25355,12 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(full_timings.full_refresh_chunk_max_nodes.is_some());
         assert_eq!(full_timings.full_refresh_chunk_budget_overruns, Some(0));
         assert!(full_timings.full_refresh_chunk_planning_ms.is_some());
+        assert_eq!(
+            full_timings.staged_sqlite_wal_autocheckpoint_bytes,
+            Some(64 * 1024 * 1024)
+        );
+        assert!(full_timings.staged_sqlite_checkpoint_ms.is_some());
+        assert!(full_timings.staged_sqlite_sync_ms.is_some());
         let first = controller
             .index_publication()
             .expect("read first publication")
@@ -25369,6 +25389,13 @@ fn build_llm_symbol_doc_text() -> String {
                 .is_none()
         );
         assert!(incremental_timings.full_refresh_chunk_planning_ms.is_none());
+        assert!(
+            incremental_timings
+                .staged_sqlite_wal_autocheckpoint_bytes
+                .is_none()
+        );
+        assert!(incremental_timings.staged_sqlite_checkpoint_ms.is_none());
+        assert!(incremental_timings.staged_sqlite_sync_ms.is_none());
         let second = controller
             .index_publication()
             .expect("read second publication")

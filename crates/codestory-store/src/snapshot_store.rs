@@ -16,6 +16,14 @@ pub struct StagedSnapshotFinalizeStats {
     pub summary_snapshot_ms: u32,
 }
 
+/// SQLite fence timings for a completed staged publication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StagedSnapshotPublishStats {
+    pub sqlite_wal_autocheckpoint_bytes: Option<u64>,
+    pub sqlite_checkpoint_ms: Option<u32>,
+    pub sqlite_sync_ms: Option<u32>,
+}
+
 /// Derived grounding snapshot facade.
 ///
 /// Summary and detail snapshots are cached read models over the graph tables.
@@ -55,6 +63,14 @@ impl<'a> SnapshotStore<'a> {
     /// Open a fresh staged database in build mode.
     pub fn open_staged(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
         StagedSnapshot::open(live_path)
+    }
+
+    /// Open a fresh, repeatable full-refresh stage with relaxed build writes.
+    ///
+    /// The consuming `publish` call installs the durable WAL checkpoint and
+    /// filesystem fence before promotion can inspect or mutate live state.
+    pub fn open_disposable_full_refresh(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
+        StagedSnapshot::open_disposable_full_refresh(live_path)
     }
 
     /// Clone the live database into a unique staged database in build mode.
@@ -157,6 +173,12 @@ impl StagedSnapshot {
         Ok(Self { path, store })
     }
 
+    fn open_disposable_full_refresh(live_path: &Path) -> Result<Self, StorageError> {
+        let path = SnapshotStore::staged_path(live_path);
+        let store = Store::open_disposable_full_build(&path)?;
+        Ok(Self { path, store })
+    }
+
     fn clone_live(live_path: &Path) -> Result<Self, StorageError> {
         let path = SnapshotStore::staged_path(live_path);
         Store::discard_staged_snapshot(&path)?;
@@ -195,11 +217,27 @@ impl StagedSnapshot {
         SnapshotStore::discard_staged(&path)
     }
 
-    /// Close and promote the staged database to `live_path`.
+    /// Seal, close, and promote the staged database to `live_path`.
     pub fn publish(self, live_path: &Path) -> Result<(), StorageError> {
+        self.publish_with_stats(live_path).map(|_| ())
+    }
+
+    /// Seal, close, and promote while returning full-refresh SQLite timings.
+    pub fn publish_with_stats(
+        self,
+        live_path: &Path,
+    ) -> Result<StagedSnapshotPublishStats, StorageError> {
+        let seal_stats = self.store.seal_disposable_full_build()?;
         let path = self.path;
         drop(self.store);
-        SnapshotStore::promote_staged(&path, live_path)
+        SnapshotStore::promote_staged(&path, live_path)?;
+        Ok(StagedSnapshotPublishStats {
+            sqlite_wal_autocheckpoint_bytes: seal_stats
+                .as_ref()
+                .map(|stats| stats.wal_autocheckpoint_bytes),
+            sqlite_checkpoint_ms: seal_stats.as_ref().map(|stats| stats.checkpoint_ms),
+            sqlite_sync_ms: seal_stats.as_ref().map(|stats| stats.sync_ms),
+        })
     }
 }
 
@@ -321,6 +359,140 @@ mod tests {
         assert_eq!(metadata.summary_state, GroundingSnapshotState::Ready);
         assert_eq!(metadata.detail_state, GroundingSnapshotState::Dirty);
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn disposable_full_refresh_seals_wal_before_promotion() {
+        let temp = fresh_temp_root("disposable-promote");
+        let live_path = temp.join("live.sqlite");
+        let mut staged = SnapshotStore::open_disposable_full_refresh(&live_path)
+            .expect("open disposable full-refresh stage");
+        let staged_path = staged.path().to_path_buf();
+        let synchronous: i64 = staged
+            .store_mut()
+            .get_connection()
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("read disposable synchronous profile");
+        assert_eq!(synchronous, 0);
+
+        staged
+            .store_mut()
+            .insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("disposable.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed disposable stage");
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "disposable-generation".to_string(),
+            run_id: "disposable-run".to_string(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        staged
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("identify disposable publication");
+        publish_empty_source_policy(staged.store_mut(), &publication);
+
+        let publish_stats = staged
+            .publish_with_stats(&live_path)
+            .expect("seal and promote disposable stage");
+        assert_eq!(
+            publish_stats.sqlite_wal_autocheckpoint_bytes,
+            Some(64 * 1024 * 1024)
+        );
+        assert!(publish_stats.sqlite_checkpoint_ms.is_some());
+        assert!(publish_stats.sqlite_sync_ms.is_some());
+
+        let live = Store::open(&live_path).expect("open promoted live store");
+        let quick_check: String = live
+            .get_connection()
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .expect("validate promoted database");
+        assert_eq!(quick_check, "ok");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read live publication"),
+            Some(publication)
+        );
+        assert_eq!(
+            live.get_files().expect("read promoted files")[0].path,
+            PathBuf::from("disposable.rs")
+        );
+        assert!(!staged_path.exists());
+        assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
+
+        drop(live);
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn disposable_full_refresh_busy_seal_never_starts_promotion() {
+        let temp = fresh_temp_root("disposable-busy");
+        let live_path = temp.join("live.sqlite");
+        let mut staged = SnapshotStore::open_disposable_full_refresh(&live_path)
+            .expect("open disposable full-refresh stage");
+        let staged_path = staged.path().to_path_buf();
+        let publication = crate::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "busy-generation".to_string(),
+            run_id: "busy-run".to_string(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        staged
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("identify busy candidate");
+        publish_empty_source_policy(staged.store_mut(), &publication);
+
+        let reader = rusqlite::Connection::open(&staged_path).expect("open staged reader");
+        reader
+            .execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM file;")
+            .expect("pin staged reader snapshot");
+        staged
+            .store_mut()
+            .insert_files_batch(&[crate::FileInfo {
+                id: 2,
+                path: PathBuf::from("newer.rs"),
+                language: "rust".to_string(),
+                modification_time: 2,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("write after pinned snapshot");
+
+        let error = staged
+            .publish(&live_path)
+            .expect_err("busy final checkpoint must block promotion");
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("seal") || message.contains("locked") || message.contains("busy"),
+            "unexpected seal error: {error}"
+        );
+        assert!(
+            !live_path.exists(),
+            "seal failure must not create live state"
+        );
+        assert!(staged_path.exists(), "failed stage must remain inspectable");
+        assert!(!live_path.with_extension("sqlite.backup").exists());
+        assert!(
+            !PathBuf::from(format!("{}.promotion.prepared.json", live_path.display())).exists()
+        );
+
+        drop(reader);
+        Store::discard_staged_snapshot(&staged_path).expect("discard failed stage");
         let _ = fs::remove_dir_all(&temp);
     }
 

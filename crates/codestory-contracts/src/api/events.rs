@@ -100,6 +100,12 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_sqlite_wal_autocheckpoint_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_sqlite_checkpoint_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_sqlite_sync_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_existing_projection_ids_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_seed_symbol_table_ms: Option<u32>,
@@ -281,6 +287,9 @@ mod tests {
             summary_snapshot_ms: None,
             detail_snapshot_ms: None,
             publish_ms: None,
+            staged_sqlite_wal_autocheckpoint_bytes: None,
+            staged_sqlite_checkpoint_ms: None,
+            staged_sqlite_sync_ms: None,
             setup_existing_projection_ids_ms: None,
             setup_seed_symbol_table_ms: None,
             flush_files_ms: None,
@@ -411,6 +420,13 @@ mod tests {
         assert!(value.get("summary_snapshot_ms").is_none());
         assert!(value.get("detail_snapshot_ms").is_none());
         assert!(value.get("publish_ms").is_none());
+        assert!(
+            value
+                .get("staged_sqlite_wal_autocheckpoint_bytes")
+                .is_none()
+        );
+        assert!(value.get("staged_sqlite_checkpoint_ms").is_none());
+        assert!(value.get("staged_sqlite_sync_ms").is_none());
         assert!(value.get("setup_existing_projection_ids_ms").is_none());
         assert!(value.get("setup_seed_symbol_table_ms").is_none());
         assert!(value.get("flush_files_ms").is_none());

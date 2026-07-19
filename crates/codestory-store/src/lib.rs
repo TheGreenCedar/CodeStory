@@ -15,6 +15,7 @@ pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
+    StagedSnapshotPublishStats,
 };
 pub use storage_impl::{
     CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,

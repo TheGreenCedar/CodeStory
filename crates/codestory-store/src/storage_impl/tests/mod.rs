@@ -1456,6 +1456,51 @@ fn test_index_artifact_cache_reader_observes_committed_batches_without_write_acc
 }
 
 #[test]
+fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), StorageError> {
+    fn profile(storage: &Storage) -> Result<(String, i64, i64, i64), StorageError> {
+        let connection = storage.get_connection();
+        Ok((
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
+            connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?,
+            connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?,
+            connection.query_row("PRAGMA page_size", [], |row| row.get(0))?,
+        ))
+    }
+
+    let dir = tempfile::tempdir().map_err(|error| StorageError::Other(error.to_string()))?;
+    let live_path = dir.path().join("live.sqlite");
+    let generic_build_path = dir.path().join("generic-build.sqlite");
+    let disposable_path = dir.path().join("disposable.sqlite");
+
+    let live = Storage::open(&live_path)?;
+    let generic_build = Storage::open_build(&generic_build_path)?;
+    let disposable = Storage::open_disposable_full_build(&disposable_path)?;
+    let mut incremental_clone = crate::SnapshotStore::clone_live_to_staged(&live_path)?;
+
+    for (name, storage) in [("live", &live), ("generic build", &generic_build)] {
+        let (journal_mode, synchronous, _, _) = profile(storage)?;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal", "{name}");
+        assert_eq!(synchronous, 1, "{name} must retain synchronous=NORMAL");
+    }
+    let (journal_mode, synchronous, _, _) = profile(incremental_clone.store_mut())?;
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(
+        synchronous, 1,
+        "incremental clone must retain synchronous=NORMAL"
+    );
+
+    let (journal_mode, synchronous, checkpoint_pages, page_size) = profile(&disposable)?;
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(synchronous, 0);
+    assert_eq!(
+        checkpoint_pages,
+        (DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64 + page_size - 1) / page_size
+    );
+    assert!(checkpoint_pages > 0);
+    Ok(())
+}
+
+#[test]
 fn test_resolution_support_snapshot_round_trip_and_invalidation() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
     let payload = br#"{"support":1}"#;
@@ -3426,8 +3471,85 @@ fn reader_open_during_healthy_promotion_does_not_recover_active_backup() -> Resu
     Ok(())
 }
 
+const DISPOSABLE_BUILD_ABORT_PATH_ENV: &str = "CODESTORY_TEST_DISPOSABLE_BUILD_ABORT_PATH";
+const DISPOSABLE_BUILD_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_DISPOSABLE_BUILD_ABORT_SENTINEL";
 const PROMOTION_ABORT_LIVE_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_LIVE";
 const PROMOTION_ABORT_STAGED_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_STAGED";
+
+#[test]
+fn disposable_full_build_abort_child() {
+    let Some(staged_path) = std::env::var_os(DISPOSABLE_BUILD_ABORT_PATH_ENV).map(PathBuf::from)
+    else {
+        return;
+    };
+    let sentinel_path = PathBuf::from(
+        std::env::var_os(DISPOSABLE_BUILD_ABORT_SENTINEL_ENV)
+            .expect("disposable abort sentinel path"),
+    );
+    let mut staged =
+        Storage::open_disposable_full_build(&staged_path).expect("open disposable child stage");
+    staged
+        .insert_files_batch(&[FileInfo {
+            id: 2,
+            path: PathBuf::from("unpublished.rs"),
+            language: "rust".to_string(),
+            modification_time: 2,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        }])
+        .expect("write disposable child stage");
+    fs::write(&sentinel_path, b"disposable-stage-written\n").expect("write abort sentinel");
+    File::open(&sentinel_path)
+        .and_then(|file| file.sync_all())
+        .expect("sync abort sentinel");
+    std::process::abort();
+}
+
+#[test]
+fn process_abort_during_disposable_build_never_mutates_live() {
+    let live_path = unique_temp_db_path("disposable-build-abort-live");
+    let staged_path = unique_temp_db_path("disposable-build-abort-staged");
+    let sentinel_path = unique_temp_db_path("disposable-build-abort-sentinel");
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))
+            .arg("--exact")
+            .arg("storage_impl::tests::disposable_full_build_abort_child")
+            .arg("--nocapture")
+            .env(DISPOSABLE_BUILD_ABORT_PATH_ENV, &staged_path)
+            .env(DISPOSABLE_BUILD_ABORT_SENTINEL_ENV, &sentinel_path)
+            .status()
+            .expect("run disposable build abort child");
+    assert!(!status.success(), "abort child exited successfully");
+    assert_eq!(
+        fs::read(&sentinel_path).expect("read disposable abort sentinel"),
+        b"disposable-stage-written\n"
+    );
+
+    let live = Storage::open(&live_path).expect("reopen live after staged abort");
+    assert_eq!(
+        live.get_files().expect("read preserved live")[0].path,
+        PathBuf::from("old.rs")
+    );
+    assert_eq!(
+        live.get_complete_index_publication()
+            .expect("read preserved publication")
+            .expect("complete preserved publication")
+            .generation,
+        1
+    );
+    drop(live);
+    assert!(!live_path.with_extension("sqlite.backup").exists());
+    assert!(!promotion_prepared_journal_path(&live_path).exists());
+    assert!(!promotion_committed_journal_path(&live_path).exists());
+
+    cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
+    cleanup_sqlite_sidecars(&staged_path).expect("clean aborted stage");
+    let _ = fs::remove_file(sentinel_path);
+}
 
 fn seed_promotion_file_with_identity(
     path: &Path,
@@ -3469,6 +3591,43 @@ fn seed_promotion_file_with_identity(
 
 fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
     seed_promotion_file_with_identity(path, id, name, true)
+}
+
+fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    let mut storage = Storage::open_disposable_full_build(path)?;
+    storage.insert_files_batch(&[FileInfo {
+        id,
+        path: PathBuf::from(name),
+        language: "rust".to_string(),
+        modification_time: id,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    }])?;
+    let publication = IndexPublicationRecord {
+        generation: id.max(0) as u64,
+        generation_id: format!("generation-{id}"),
+        run_id: format!("run-{id}"),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: id.max(0),
+    };
+    storage.put_index_publication(&publication)?;
+    storage.publish_source_policy_exclusion_generation(
+        &publication,
+        "test-project",
+        "test-workspace",
+        OVERSIZED_SOURCE_POLICY_VERSION,
+        DEFAULT_SOURCE_FILE_BYTE_CAP,
+        &[OversizedSourceExclusionCandidate {
+            normalized_path: format!("vendor/registers-{id}.h"),
+            content_hash: format!("{:064x}", id.max(0)),
+            observed_size: DEFAULT_SOURCE_FILE_BYTE_CAP + id.max(0) as u64,
+            policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+            byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+        }],
+    )?;
+    storage.seal_disposable_full_build().map(|_| ())
 }
 
 fn seed_unpublished_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
@@ -3697,10 +3856,9 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
     let prepared_path = promotion_prepared_journal_path(&live_path);
     let committed_path = promotion_committed_journal_path(&live_path);
     seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
-    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+    seed_disposable_promotion_file(&staged_path, 2, "new.rs")
+        .expect("seed sealed disposable staged generation");
     publish_nonempty_test_source_policy(&live_path, 1).expect("publish live exclusion identity");
-    publish_nonempty_test_source_policy(&staged_path, 2)
-        .expect("publish staged exclusion identity");
 
     let status =
         std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))

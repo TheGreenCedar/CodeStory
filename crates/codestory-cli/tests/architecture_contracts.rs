@@ -420,9 +420,9 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
 fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
     let runtime = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        runtime.contains("SnapshotStore::open_staged(storage_path)")
+        runtime.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
             && runtime.contains("finalize_staged()")
-            && runtime.contains("staged.publish(storage_path)"),
+            && runtime.contains("staged.publish_with_stats(storage_path)"),
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
