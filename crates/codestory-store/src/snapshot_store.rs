@@ -304,6 +304,9 @@ mod tests {
 
     fn publish_empty_source_policy(store: &mut Store, publication: &crate::IndexPublicationRecord) {
         store
+            .publish_structural_text_unit_generation(publication)
+            .expect("publish empty structural text unit identity");
+        store
             .publish_source_policy_exclusion_generation(
                 publication,
                 "test-project",

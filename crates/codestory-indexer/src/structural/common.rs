@@ -147,7 +147,7 @@ pub(crate) fn push_structural_node(
     line: u32,
     col: u32,
 ) -> NodeId {
-    let node_id = NodeId(crate::generate_id(canonical_id));
+    let node_id = structural_node_id(file_id, canonical_id, line, col);
     let label_len = name.len().max(1);
     let start_col = col.max(1);
     let end_col = start_col.saturating_add(label_len as u32).saturating_sub(1);
@@ -163,6 +163,7 @@ pub(crate) fn push_structural_node(
         end_line: Some(line),
         end_col: Some(end_col),
     });
+    storage.structural_unit_node_ids.push(node_id);
     storage.component_access.push((node_id, AccessKind::Public));
     storage.occurrences.push(Occurrence {
         element_id: node_id.0,
@@ -176,6 +177,13 @@ pub(crate) fn push_structural_node(
         },
     });
     node_id
+}
+
+fn structural_node_id(file_id: NodeId, canonical_id: &str, line: u32, col: u32) -> NodeId {
+    NodeId(crate::generate_id(&format!(
+        "structural:{}:{line}:{col}:{canonical_id}",
+        file_id.0,
+    )))
 }
 
 fn structural_edge_id(source: i64, target: i64, kind: EdgeKind) -> i64 {

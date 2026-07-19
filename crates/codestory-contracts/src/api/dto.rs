@@ -1641,6 +1641,12 @@ pub struct NodeDetailsDto {
     pub start_col: Option<u32>,
     pub end_line: Option<u32>,
     pub end_col: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
     #[serde(default)]
     pub member_access: Option<MemberAccess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

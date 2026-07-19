@@ -732,6 +732,9 @@ mod trail_story_tests {
             start_col: None,
             end_line: None,
             end_col: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
             member_access: None,
             route_endpoint: None,
         }
@@ -877,6 +880,9 @@ mod trail_story_tests {
             start_col: None,
             end_line: None,
             end_col: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
             member_access: None,
             route_endpoint: None,
         };
@@ -935,6 +941,9 @@ mod trail_story_tests {
             start_col: None,
             end_line: None,
             end_col: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
             member_access: None,
             route_endpoint: None,
         };

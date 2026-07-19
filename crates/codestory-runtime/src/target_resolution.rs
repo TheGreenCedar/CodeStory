@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
-use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{
     AppController, compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank,
 };
@@ -772,8 +772,6 @@ fn compare_resolution_candidates(
 }
 
 fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
-    let diagnostic_evidence =
-        diagnostic_source_evidence(node.file_path.as_deref(), node.canonical_id.as_deref());
     let mut hit = SearchHit {
         node_id: node.id.clone(),
         display_name: node.display_name.clone(),
@@ -785,19 +783,16 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         match_quality: None,
         resolvable: true,
         evidence_tier: Some(
-            diagnostic_evidence
-                .map(|evidence| evidence.tier)
+            node.evidence_tier
                 .unwrap_or(PacketEvidenceTierDto::ResolvedGraph),
         ),
         evidence_producer: Some(
-            diagnostic_evidence
-                .map(|evidence| evidence.producer)
-                .unwrap_or("node_details")
-                .to_string(),
+            node.evidence_producer
+                .clone()
+                .unwrap_or_else(|| "node_details".to_string()),
         ),
         resolution_status: Some(
-            diagnostic_evidence
-                .map(|evidence| evidence.resolution)
+            node.resolution_status
                 .unwrap_or(PacketEvidenceResolutionDto::Resolved),
         ),
         loss_reason: None,
@@ -1030,6 +1025,9 @@ mod tests {
             start_col: Some(1),
             end_line: Some(2),
             end_col: Some(8),
+            evidence_tier: Some(PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_cargo_manifest_collector".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
             member_access: None,
             route_endpoint: None,
         };
@@ -1082,6 +1080,9 @@ mod tests {
             start_col: Some(1),
             end_line: Some(8),
             end_col: Some(16),
+            evidence_tier: Some(PacketEvidenceTierDto::ExactSource),
+            evidence_producer: Some("openapi_endpoint_schema".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
             member_access: None,
             route_endpoint: None,
         };

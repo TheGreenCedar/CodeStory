@@ -12,6 +12,9 @@ recovery.
 - graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
 - verified source-policy exclusion rows and their project/workspace/core-bound
   count-and-digest manifest;
+- versioned structural text units, per-file complete projections, their
+  dedicated artifact cache, and a project/workspace/core-bound publication
+  manifest;
 - core `generation_id`/`run_id` and retrieval-manifest records;
 - schema migrations and a versioned promotion journal.
 
@@ -47,6 +50,20 @@ and manifest replace together in one SQLite transaction, and staged promotion
 records their candidate and rollback identities. A schema migration creates no
 synthetic manifest; runtime must republish from a complete verified inventory.
 
+The structural-unit manifest binds descriptor schema and producer version,
+complete unit count and digest, project/workspace identity, and exact core
+generation/run. Each structural file has a verified source hash and a
+count-and-digest projection, including zero-unit files. Replacing one file's
+hash, graph rows, units, projection, and dedicated cache entry is atomic and
+invalidates the complete manifest until runtime republishes it. Schema
+migration creates the tables but no synthetic completeness claim.
+
+Promotion journals record candidate and rollback structural identities.
+Prepared install, committed recovery, and rollback validate the recorded
+manifest and current row digest before accepting a database. Missing, legacy,
+or corrupt structural publication state therefore cannot become the current
+core generation.
+
 Schema v25 also stores the current retrieval manifest and its deeply verified
 rollback record in the same SQLite row. They change in one transaction. The
 filesystem retention marker is derived after commit and can only make cleanup
@@ -72,4 +89,6 @@ more conservative; it is not a publication authority.
 - backup existence alone authorizes rollback;
 - callers reopen current storage during a pinned publication read;
 - runtime or CLI manages SQLite files or writes SQL;
+- a structural cache row is copied through the generic parser cache or is
+  published without matching source and projection identities;
 - a partial promotion can be reported as successful.

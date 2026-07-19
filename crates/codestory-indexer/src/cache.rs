@@ -40,6 +40,10 @@ impl CachedIndexArtifact {
             files: self.files,
             file_content_hashes: Vec::new(),
             nodes: self.nodes,
+            structural_unit_node_ids: Vec::new(),
+            structural_text_units: Vec::new(),
+            structural_text_projections: Vec::new(),
+            structural_text_cache_writes: Vec::new(),
             edges: self.edges,
             occurrences: self.occurrences,
             component_access: self.component_access,
@@ -48,6 +52,76 @@ impl CachedIndexArtifact {
             errors: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CachedStructuralArtifact {
+    pub descriptor_version: u32,
+    pub files: Vec<FileInfo>,
+    pub file_content_hashes: Vec<codestory_store::FileContentHash>,
+    pub nodes: Vec<Node>,
+    pub structural_unit_node_ids: Vec<NodeId>,
+    pub structural_text_units: Vec<codestory_store::StructuralTextUnit>,
+    pub structural_text_projections: Vec<codestory_store::StructuralTextProjection>,
+    pub edges: Vec<Edge>,
+    pub occurrences: Vec<Occurrence>,
+    pub component_access: Vec<(NodeId, AccessKind)>,
+    pub callable_projection_states: Vec<CallableProjectionState>,
+}
+
+impl CachedStructuralArtifact {
+    pub(crate) fn from_storage(storage: IntermediateStorage) -> Self {
+        Self {
+            descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            files: storage.files,
+            file_content_hashes: storage.file_content_hashes,
+            nodes: storage.nodes,
+            structural_unit_node_ids: storage.structural_unit_node_ids,
+            structural_text_units: storage.structural_text_units,
+            structural_text_projections: storage.structural_text_projections,
+            edges: storage.edges,
+            occurrences: storage.occurrences,
+            component_access: storage.component_access,
+            callable_projection_states: storage.callable_projection_states,
+        }
+    }
+
+    pub(crate) fn into_intermediate_storage(self) -> IntermediateStorage {
+        IntermediateStorage {
+            files: self.files,
+            file_content_hashes: self.file_content_hashes,
+            nodes: self.nodes,
+            structural_unit_node_ids: self.structural_unit_node_ids,
+            structural_text_units: self.structural_text_units,
+            structural_text_projections: self.structural_text_projections,
+            structural_text_cache_writes: Vec::new(),
+            edges: self.edges,
+            occurrences: self.occurrences,
+            component_access: self.component_access,
+            callable_projection_states: self.callable_projection_states,
+            impl_anchor_node_ids: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+}
+
+pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 1;
+
+pub(crate) fn build_structural_artifact_cache_key(
+    cache_path: &Path,
+    source_bytes: &[u8],
+    producer: &str,
+) -> Option<String> {
+    let mut state = FNV_OFFSET_BASIS;
+    mix_str(&mut state, "structural-artifact");
+    mix_u32(
+        &mut state,
+        codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+    );
+    mix_path(&mut state, cache_path)?;
+    mix_bytes(&mut state, source_bytes);
+    mix_str(&mut state, producer);
+    Some(format!("v{STRUCTURAL_ARTIFACT_CACHE_VERSION}:{state:016x}"))
 }
 
 pub(crate) fn build_index_artifact_cache_key(

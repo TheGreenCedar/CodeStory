@@ -5177,6 +5177,21 @@ fn validate_source_policy_exclusions(
     Ok(())
 }
 
+fn validate_structural_text_units(
+    storage: &Store,
+    publication: &IndexPublicationRecord,
+) -> Result<(), ApiError> {
+    storage
+        .validate_structural_text_unit_publication(publication)
+        .map_err(|error| {
+            ApiError::new(
+                "source_verification_failed",
+                format!("Structural text unit publication is incomplete or stale: {error}"),
+            )
+        })?;
+    Ok(())
+}
+
 fn stored_file_coverage_diagnostics(
     root: &Path,
     storage: &Store,
@@ -5195,6 +5210,15 @@ fn stored_file_coverage_diagnostics(
         .into_iter()
         .filter_map(|file| file.content_hash.map(|_| file.id))
         .collect::<HashSet<_>>();
+    let structural_projection_file_ids = storage
+        .get_structural_text_projection_file_ids()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load staged structural projection identities: {error}"
+            ))
+        })?
+        .into_iter()
+        .collect::<HashSet<_>>();
     let mut errors_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
     for error in storage.get_errors(None).map_err(|error| {
         ApiError::internal(format!("Failed to load staged file errors: {error}"))
@@ -5211,14 +5235,22 @@ fn stored_file_coverage_diagnostics(
         .iter()
         .filter_map(|file| {
             let verified_source = verified_file_ids.contains(&file.id);
-            file_coverage_reason(file, &errors_by_file, verified_source).map(|reason| {
-                FileCoverageDiagnosticDto {
-                    path: runtime_relative_path(root, &file.path),
-                    reason,
-                    retryable: file_coverage_retryable(reason),
-                    verified_source,
-                    projection_available: file.indexed && verified_source,
-                }
+            let structural_projection_verified =
+                !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+                    || (verified_source && structural_projection_file_ids.contains(&file.id));
+            let reason = if file.complete && !structural_projection_verified {
+                Some(FileCoverageReason::CollectorFailure)
+            } else {
+                file_coverage_reason(file, &errors_by_file, verified_source)
+            };
+            reason.map(|reason| FileCoverageDiagnosticDto {
+                path: runtime_relative_path(root, &file.path),
+                reason,
+                retryable: file_coverage_retryable(reason),
+                verified_source,
+                projection_available: file.indexed
+                    && verified_source
+                    && structural_projection_verified,
             })
         })
         .collect())
@@ -5378,6 +5410,16 @@ where
     }
     match storage.get_complete_index_publication() {
         Ok(Some(publication)) => {
+            if let Err(error) = validate_structural_text_units(storage, &publication) {
+                return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                    format!(
+                        "structural text unit publication is incomplete: {}",
+                        error.message
+                    ),
+                    0,
+                    started_at,
+                ));
+            }
             if let Err(error) =
                 validate_source_policy_exclusions(storage, root, &publication, policy)
             {
@@ -10545,6 +10587,7 @@ impl AppController {
             .canonical_id
             .as_deref()
             .is_some_and(|value| value.starts_with("openapi:endpoint:"));
+        let structural_unit = storage.get_structural_text_unit(id).ok().flatten();
 
         let mut hit = SearchHit {
             node_id: NodeId::from(id),
@@ -10556,27 +10599,31 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
-            evidence_tier: Some(if openapi_endpoint {
+            evidence_tier: Some(if structural_unit.is_some() {
+                codestory_contracts::api::PacketEvidenceTierDto::StructuralText
+            } else if openapi_endpoint {
                 codestory_contracts::api::PacketEvidenceTierDto::ExactSource
             } else {
                 codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph
             }),
-            evidence_producer: Some(
+            evidence_producer: Some(if let Some(unit) = structural_unit.as_ref() {
+                unit.producer.clone()
+            } else {
                 if openapi_endpoint {
                     "openapi_endpoint_schema"
                 } else {
                     "route_endpoint"
                 }
-                .to_string(),
-            ),
-            resolution_status: Some(if openapi_endpoint {
+                .to_string()
+            }),
+            resolution_status: Some(if structural_unit.is_some() || openapi_endpoint {
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly
             } else {
                 codestory_contracts::api::PacketEvidenceResolutionDto::Resolved
             }),
             loss_reason: None,
             coverage_role: None,
-            eligible_for_sufficiency: Some(!openapi_endpoint),
+            eligible_for_sufficiency: Some(structural_unit.is_none() && !openapi_endpoint),
             score_breakdown: None,
         };
         decorate_search_hit_evidence(&mut hit);
@@ -11524,6 +11571,9 @@ impl AppController {
         if storage
             .validate_dense_anchor_publication(&publication)
             .is_err()
+            || storage
+                .validate_structural_text_unit_publication(&publication)
+                .is_err()
         {
             return Ok(true);
         }
@@ -12353,6 +12403,7 @@ impl AppController {
             &publication,
             &self.source_index_policy,
         )?;
+        validate_structural_text_units(&storage, &publication)?;
         let source_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
             ApiError::internal(format!("Failed to load source policy exclusions: {error}"))
         })?;
@@ -13933,6 +13984,15 @@ impl AppController {
 
         let route_endpoint =
             self.route_endpoint_metadata(&storage, &node, file_path.as_deref(), &display_name);
+        let structural_unit = storage.get_structural_text_unit(node.id).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to query structural evidence metadata: {error}"
+            ))
+        })?;
+        let openapi_endpoint = node
+            .canonical_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("openapi:endpoint:"));
 
         Ok(NodeDetailsDto {
             id: NodeId::from(node.id),
@@ -13946,6 +14006,19 @@ impl AppController {
             start_col: node.start_col,
             end_line: node.end_line,
             end_col: node.end_col,
+            evidence_tier: structural_unit
+                .as_ref()
+                .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+                .or_else(|| {
+                    openapi_endpoint
+                        .then_some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+                }),
+            evidence_producer: structural_unit
+                .as_ref()
+                .map(|unit| unit.producer.clone())
+                .or_else(|| openapi_endpoint.then(|| "openapi_endpoint_schema".to_string())),
+            resolution_status: (structural_unit.is_some() || openapi_endpoint)
+                .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             member_access: member_access_dto(storage.get_component_access(node.id).ok().flatten()),
             route_endpoint,
         })
@@ -14409,13 +14482,16 @@ fn index_full_for_runtime(
             match live.get_complete_index_publication() {
                 Ok(Some(publication)) if publication == *expected => {
                     match live.validate_dense_anchor_publication(&publication) {
-                        Ok(_) => validate_source_policy_exclusions(
-                            &live,
-                            root,
-                            &publication,
-                            source_index_policy,
-                        )
-                        .is_ok(),
+                        Ok(_) => {
+                            validate_structural_text_units(&live, &publication).is_ok()
+                                && validate_source_policy_exclusions(
+                                    &live,
+                                    root,
+                                    &publication,
+                                    source_index_policy,
+                                )
+                                .is_ok()
+                        }
                         Err(error) => {
                             tracing::debug!(
                                 path = %storage_path.display(),
@@ -14457,6 +14533,24 @@ fn index_full_for_runtime(
     #[cfg(test)]
     run_full_refresh_staged_store_hook(staged.store_mut());
     let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
+    if has_verified_live_publication {
+        match staged
+            .store_mut()
+            .copy_structural_text_artifact_cache_from(storage_path)
+        {
+            Ok(copied) => {
+                tracing::debug!(
+                    copied,
+                    "Copied verified structural artifacts into staged storage"
+                )
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to copy verified structural artifacts into staged storage; recollecting: {error}"
+                )
+            }
+        }
+    }
 
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
@@ -14661,6 +14755,15 @@ fn index_full_for_runtime(
     ) {
         let _ = staged.discard();
         return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_structural_text_unit_generation(&publication)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete structural text units: {error}"
+        )));
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -15031,6 +15134,36 @@ fn run_incremental_indexing_common(
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
+    if live_exists {
+        let structural_live_is_verified = Store::open_read_only(storage_path)
+            .ok()
+            .and_then(|storage| {
+                storage
+                    .get_complete_index_publication()
+                    .ok()
+                    .flatten()
+                    .map(|publication| {
+                        storage
+                            .validate_structural_text_unit_publication(&publication)
+                            .is_ok()
+                    })
+            })
+            .unwrap_or(false);
+        if !structural_live_is_verified {
+            let _ = events_tx.send(AppEventPayload::StatusUpdate {
+                message: "The live index predates verified structural unit publication; rebuilding through staged full recollection."
+                    .to_string(),
+            });
+            return index_full_for_runtime(
+                root,
+                storage_path,
+                events_tx,
+                cancel_token,
+                runtime,
+                source_index_policy,
+            );
+        }
+    }
 
     let mut staged = if live_exists {
         SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
@@ -15214,6 +15347,26 @@ fn run_incremental_indexing_common(
             }
             Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
         };
+        let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
+            .into_iter()
+            .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+            .collect::<Vec<_>>();
+        if !blocking_gaps.is_empty() {
+            let count = blocking_gaps.len();
+            let sample = blocking_gaps
+                .iter()
+                .take(3)
+                .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ApiError::source_coverage_failure(
+                source_coverage_failure_code(&blocking_gaps),
+                format!(
+                    "Incremental refresh could not verify {count} scheduled file(s): {sample}. The previous complete publication was preserved."
+                ),
+                blocking_gaps,
+            ));
+        }
         let mut semantic_refresh_seed_file_ids = HashSet::new();
         for path in &execution_plan.files_to_index {
             let normalized_path = if path.is_absolute() {
@@ -15354,6 +15507,15 @@ fn run_incremental_indexing_common(
     ) {
         let _ = staged.discard();
         return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_structural_text_unit_generation(&publication)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete structural text units: {error}"
+        )));
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -21561,24 +21723,81 @@ fn build_llm_symbol_doc_text() -> String {
     #[test]
     fn build_search_hit_marks_structural_collectors_as_structural_text() {
         let mut storage = Storage::new_in_memory().expect("storage");
+        let source_hash = "a".repeat(64);
+        let unit = codestory_store::StructuralTextUnit {
+            node_id: CoreNodeId(41),
+            file_id: 40,
+            placement_id: "b".repeat(64),
+            content_hash: "c".repeat(64),
+            source_content_hash: source_hash.clone(),
+            descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "structural_cargo_manifest_collector".to_string(),
+            evidence_tier: "structural_text".to_string(),
+            resolution: "source_range_only".to_string(),
+            language: "cargo_manifest".to_string(),
+            kind: NodeKind::PACKAGE,
+            start_line: 2,
+            start_col: 1,
+            end_line: 2,
+            end_col: 4,
+            file_role: codestory_store::FileRole::Source,
+        };
         storage
-            .insert_nodes_batch(&[
-                Node {
-                    id: CoreNodeId(40),
-                    kind: NodeKind::FILE,
-                    serialized_name: "crates/demo/Cargo.toml".to_string(),
-                    ..Default::default()
-                },
-                Node {
-                    id: CoreNodeId(41),
-                    kind: NodeKind::PACKAGE,
-                    serialized_name: "demo".to_string(),
-                    file_node_id: Some(CoreNodeId(40)),
-                    start_line: Some(2),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert nodes");
+            .projections()
+            .flush_projection_batch(codestory_store::ProjectionBatch {
+                files: &[codestory_store::FileInfo {
+                    id: 40,
+                    path: PathBuf::from("crates/demo/Cargo.toml"),
+                    language: "cargo_manifest".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: codestory_store::FileRole::Source,
+                }],
+                file_content_hashes: &[codestory_store::FileContentHash {
+                    file_id: 40,
+                    content_hash: source_hash.clone(),
+                }],
+                nodes: &[
+                    Node {
+                        id: CoreNodeId(40),
+                        kind: NodeKind::FILE,
+                        serialized_name: "crates/demo/Cargo.toml".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(41),
+                        kind: NodeKind::PACKAGE,
+                        serialized_name: "demo".to_string(),
+                        file_node_id: Some(CoreNodeId(40)),
+                        start_line: Some(2),
+                        start_col: Some(1),
+                        end_line: Some(2),
+                        end_col: Some(4),
+                        ..Default::default()
+                    },
+                ],
+                structural_text_units: std::slice::from_ref(&unit),
+                structural_text_projections: &[codestory_store::StructuralTextProjection {
+                    file_id: 40,
+                    source_content_hash: source_hash,
+                    descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+                    producer: "structural_cargo_manifest_collector".to_string(),
+                    language: "cargo_manifest".to_string(),
+                    file_role: codestory_store::FileRole::Source,
+                    unit_count: 1,
+                    unit_digest: codestory_store::structural_text_unit_digest(
+                        std::slice::from_ref(&unit),
+                    ),
+                }],
+                structural_text_cache_writes: &[],
+                edges: &[],
+                occurrences: &[],
+                component_access: &[],
+                callable_projection_states: &[],
+            })
+            .expect("insert verified structural projection");
         let node_names = HashMap::from([(CoreNodeId(41), "demo".to_string())]);
 
         let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(41), 1.0)
@@ -25808,6 +26027,188 @@ fn build_llm_symbol_doc_text() -> String {
         assert_ne!(third.generation_id, second.generation_id);
         assert_ne!(third.run_id, second.run_id);
         assert!(third.published_at_epoch_ms >= second.published_at_epoch_ms);
+    }
+
+    #[test]
+    fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
+        let workspace = tempdir().expect("workspace dir");
+        let css_path = workspace.path().join("styles.css");
+        let sql_path = workspace.path().join("schema.sql");
+        fs::write(&css_path, ".card { color: red; }\n").expect("write css");
+        fs::write(&sql_path, "CREATE TABLE users (id INTEGER);\n").expect("write sql");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish first structural generation");
+        let first = Store::database_index_publication(&storage_path)
+            .expect("read first publication")
+            .expect("first publication");
+        let first_store = Store::open_read_only(&storage_path).expect("open first publication");
+        let first_manifest = first_store
+            .validate_structural_text_unit_publication(&first)
+            .expect("validate first structural manifest");
+        assert_eq!(first_manifest.projection_count, 2);
+        assert!(first_manifest.unit_count >= 2);
+        let first_cache = {
+            let mut statement = first_store
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, cache_key
+                 FROM structural_text_artifact_cache
+                 ORDER BY file_path",
+                )
+                .expect("prepare first structural cache keys");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query first structural cache keys")
+                .map(|row| row.expect("read first structural cache key"))
+                .collect::<HashMap<String, String>>()
+        };
+        drop(first_store);
+        assert_eq!(first_cache.len(), 2);
+
+        fs::write(&css_path, ".card { color: blue; }\n").expect("change css");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish second structural generation");
+        let second = Store::database_index_publication(&storage_path)
+            .expect("read second publication")
+            .expect("second publication");
+        assert_eq!(second.generation, first.generation + 1);
+        let second_store = Store::open_read_only(&storage_path).expect("open second publication");
+        let second_manifest = second_store
+            .validate_structural_text_unit_publication(&second)
+            .expect("validate second structural manifest");
+        assert_eq!(second_manifest.projection_count, 2);
+        assert_ne!(second_manifest.unit_digest, first_manifest.unit_digest);
+        let second_cache = {
+            let mut statement = second_store
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, cache_key
+                 FROM structural_text_artifact_cache
+                 ORDER BY file_path",
+                )
+                .expect("prepare second structural cache keys");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query second structural cache keys")
+                .map(|row| row.expect("read second structural cache key"))
+                .collect::<HashMap<String, String>>()
+        };
+        drop(second_store);
+        assert_ne!(
+            first_cache.get("styles.css"),
+            second_cache.get("styles.css")
+        );
+        assert_eq!(
+            first_cache.get("schema.sql"),
+            second_cache.get("schema.sql")
+        );
+
+        fs::write(&sql_path, "CREATE TABLE accounts (id INTEGER);\n").expect("change sql");
+        std::fs::File::options()
+            .write(true)
+            .open(&sql_path)
+            .expect("open changed sql")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+            )
+            .expect("advance changed sql mtime");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish structural incremental");
+        let third = Store::database_index_publication(&storage_path)
+            .expect("read incremental publication")
+            .expect("incremental publication");
+        assert_eq!(third.generation, second.generation + 1);
+        assert_eq!(third.mode, IndexPublicationMode::Incremental);
+        let third_store = Store::open_read_only(&storage_path).expect("open incremental");
+        let third_manifest = third_store
+            .validate_structural_text_unit_publication(&third)
+            .expect("validate incremental structural manifest");
+        assert_eq!(third_manifest.projection_count, 2);
+        let third_names = third_store
+            .get_nodes()
+            .expect("read incremental nodes")
+            .into_iter()
+            .map(|node| node.serialized_name)
+            .collect::<HashSet<_>>();
+        assert!(
+            third_names.contains("public.accounts"),
+            "incremental structural nodes: {third_names:?}"
+        );
+        assert!(!third_names.contains("public.users"));
+        drop(third_store);
+
+        fs::write(&css_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("invalid structural input must fail closed");
+        assert_eq!(error.code, "source_collector_failure");
+        let preserved = Store::database_index_publication(&storage_path)
+            .expect("read preserved publication")
+            .expect("preserved publication");
+        assert_eq!(preserved, third);
+        Store::open_read_only(&storage_path)
+            .expect("open preserved publication")
+            .validate_structural_text_unit_publication(&preserved)
+            .expect("previous structural manifest remains valid");
+    }
+
+    #[test]
+    fn incremental_request_recollects_legacy_structural_graph_without_unit_manifest() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"legacy-demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let previous = Store::database_index_publication(&storage_path)
+            .expect("read baseline")
+            .expect("baseline publication");
+        let storage = Store::open(&storage_path).expect("open baseline");
+        storage
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove structural manifest");
+        drop(storage);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("repair legacy structural state");
+        let repaired = Store::database_index_publication(&storage_path)
+            .expect("read repaired publication")
+            .expect("repaired publication");
+        assert_eq!(repaired.generation, previous.generation + 1);
+        assert_eq!(repaired.mode, IndexPublicationMode::Full);
+        let repaired_store =
+            Store::open_read_only(&storage_path).expect("open repaired publication");
+        let manifest = repaired_store
+            .validate_structural_text_unit_publication(&repaired)
+            .expect("validate repaired structural manifest");
+        assert!(manifest.unit_count > 0);
+        assert_eq!(manifest.projection_count, 1);
     }
 
     #[test]

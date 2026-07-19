@@ -6,7 +6,9 @@
 
 - language detection and parser or query selection
 - file-level parse and extract work
-- artifact-cache lookup and reuse
+- parser artifact-cache lookup and reuse
+- versioned structural text-unit collection, source revalidation, and
+  structural-only cache reuse
 - batching and projection flush timing
 - post-flush call, import, and override resolution
 - incremental cleanup for touched and removed files
@@ -16,7 +18,10 @@
 
 - `crates/codestory-indexer/src/lib.rs`: `WorkspaceIndexer`, feature flags, indexing phases, flush timing, and incremental cleanup
 - `crates/codestory-indexer/src/intermediate_storage.rs`: in-memory batch shape before a store flush
-- `crates/codestory-indexer/src/cache.rs`: serialized artifact-cache format and cache-key construction
+- `crates/codestory-indexer/src/cache.rs`: serialized parser and structural
+  artifact-cache formats and cache-key construction
+- `crates/codestory-indexer/src/structural/`: workflow, Compose, Cargo
+  manifest, HTML, CSS, and SQL collectors plus structural unit finalization
 - `crates/codestory-indexer/src/compilation_database.rs`: `compile_commands.json` discovery and parsed compilation metadata
 - `crates/codestory-indexer/src/resolution/`: post-flush `ResolutionPass`, candidate selection, scoped resolution, and semantic fallback
 - `crates/codestory-indexer/src/semantic/`: language-aware semantic helpers used by resolution
@@ -35,7 +40,10 @@ The indexer does not choose staged versus live storage. It only consumes a refre
 `WorkspaceIndexer::run` handles both full and incremental work, but the plan changes the behavior:
 
 - full refresh indexes every discovered source file, does not remove file rows, and runs unscoped resolution
-- incremental refresh only touches files whose mtime changed, whose verified parser source hash no longer matches, or that were previously not indexed; it tracks removed file IDs, seeds the symbol table from existing rows, and scopes resolution to touched files
+- incremental refresh only touches files whose mtime changed, whose verified
+  parser or structural source hash no longer matches, or that were previously
+  not indexed; it tracks removed file IDs, seeds the symbol table from existing
+  rows, and scopes resolution to touched files
 
 Incremental work also does more cleanup:
 
@@ -60,9 +68,32 @@ Projection flushes are broader than just graph rows. `IntermediateStorage` carri
 - component access tuples
 - callable projection state
 - impl anchor node IDs
+- verified structural source hashes
+- collector-owned structural text units with separate content and placement
+  identities
+- one structural projection per admitted structural file, including zero-unit
+  files
+- dedicated structural artifact-cache writes
 - indexing errors
 
-`flush_projection_batch` writes the projection payload through `codestory-store`. Resolution changes happen later, after those rows already exist.
+`flush_projection_batch` writes the projection payload through
+`codestory-store`. For structural files, source identity, graph rows, units,
+projection, and cache write share one transaction. Resolution changes happen
+later, after those rows already exist.
+
+## Structural Unit Identity
+
+The six structural collector families emit source-range-only evidence without
+claiming parser-backed graph resolution. Finalization slices the exact UTF-8
+source span and records the collector producer, evidence tier, resolution
+status, language, kind, file role, descriptor version, source hash, and span.
+The content identity is stable for an equivalent descriptor and exact source
+slice; placement identity additionally includes file and node identity.
+
+Only collector-marked nodes become structural units. Delegated parser nodes,
+including HTML script or style descendants, remain parser-owned. Cache hits
+must reproduce the complete unit and projection digests after a fresh source
+read or the indexer recollects the file.
 
 ## Resolution and Semantic Fallback
 
@@ -89,6 +120,8 @@ This keeps parse and extract logic in the indexer while leaving persistence and 
 - unsupported files are treated as runtime concerns instead of being skipped by the indexer
 - resolution logic is applied before graph data is flushed
 - projection flushes change without matching updates to cleanup or snapshot invalidation expectations
+- a structural-looking path is used to infer evidence provenance instead of
+  reading the persisted unit descriptor
 - new indexing behavior lands without a fidelity or regression test in `crates/codestory-indexer/tests/`
 
 ## Read Next

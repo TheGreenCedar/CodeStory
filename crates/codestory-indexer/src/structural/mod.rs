@@ -30,6 +30,7 @@ use codestory_contracts::graph::NodeId;
 use codestory_contracts::language_support::{
     is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
 };
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Return whether `path` is routed to a structural collector.
@@ -53,8 +54,196 @@ pub fn is_structural_candidate_path(path: &Path) -> bool {
 
 /// Read and structurally index a file from disk.
 pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
-    let source = std::fs::read_to_string(path)?;
-    index_structural_source(path, &source)
+    let bytes = std::fs::read(path)?;
+    let source = String::from_utf8(bytes.clone())?;
+    let source_content_hash = format!("{:x}", Sha256::digest(&bytes));
+    let storage = index_structural_source(path, &source)?;
+    finalize_structural_storage(path, &source, &source_content_hash, storage)
+}
+
+pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {
+    let path_text = path.to_string_lossy();
+    if is_github_actions_workflow_path(path_text.as_ref()) {
+        return Some("structural_github_actions_workflow_collector");
+    }
+    if is_docker_compose_file_path(path_text.as_ref()) {
+        return Some("structural_docker_compose_collector");
+    }
+    if is_cargo_manifest_file_path(path_text.as_ref()) {
+        return Some("structural_cargo_manifest_collector");
+    }
+    match structural_extension(path).as_deref() {
+        Some("html" | "htm") => Some("structural_html_collector"),
+        Some("css") => Some("structural_css_collector"),
+        Some("sql") => Some("structural_sql_collector"),
+        _ => None,
+    }
+}
+
+pub(crate) fn finalize_structural_storage(
+    path: &Path,
+    source: &str,
+    source_content_hash: &str,
+    mut storage: IntermediateStorage,
+) -> Result<IntermediateStorage> {
+    let producer = structural_producer(path)
+        .ok_or_else(|| anyhow::anyhow!("unsupported structural collector path"))?;
+    let file = storage
+        .files
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("structural collector emitted no file projection"))?
+        .clone();
+    let structural_unit_ids = storage
+        .structural_unit_node_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    storage.file_content_hashes.clear();
+    storage.structural_text_units.clear();
+    storage.structural_text_projections.clear();
+    let mut units_by_node = std::collections::BTreeMap::new();
+    for node in storage.nodes.iter().filter(|node| {
+        node.kind != codestory_contracts::graph::NodeKind::FILE
+            && node
+                .file_node_id
+                .is_some_and(|file_id| file_id.0 == file.id)
+            && structural_unit_ids.contains(&node.id)
+    }) {
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            return Err(anyhow::anyhow!(
+                "structural evidence node {} has no exact source span",
+                node.id.0
+            ));
+        };
+        let exact_source = exact_source_range_bytes(
+            source, start_line, start_col, end_line, end_col,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "structural evidence node {} has an invalid source span",
+                node.id.0
+            )
+        })?;
+        let mut content_hasher = Sha256::new();
+        hash_part(
+            &mut content_hasher,
+            b"codestory-structural-text-unit-content-v1",
+        );
+        hash_part(
+            &mut content_hasher,
+            &codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION.to_le_bytes(),
+        );
+        hash_part(&mut content_hasher, producer.as_bytes());
+        hash_part(&mut content_hasher, b"structural_text");
+        hash_part(&mut content_hasher, b"source_range_only");
+        hash_part(&mut content_hasher, file.language.as_bytes());
+        hash_part(&mut content_hasher, &(node.kind as i32).to_le_bytes());
+        hash_part(&mut content_hasher, source_content_hash.as_bytes());
+        hash_part(&mut content_hasher, file.file_role.as_str().as_bytes());
+        for coordinate in [start_line, start_col, end_line, end_col] {
+            hash_part(&mut content_hasher, &coordinate.to_le_bytes());
+        }
+        hash_part(&mut content_hasher, node.serialized_name.as_bytes());
+        hash_part(
+            &mut content_hasher,
+            node.canonical_id.as_deref().unwrap_or("").as_bytes(),
+        );
+        hash_part(&mut content_hasher, exact_source);
+
+        let content_hash = format!("{:x}", content_hasher.finalize());
+        let mut placement_hasher = Sha256::new();
+        hash_part(
+            &mut placement_hasher,
+            b"codestory-structural-text-unit-placement-v1",
+        );
+        hash_part(&mut placement_hasher, &file.id.to_le_bytes());
+        hash_part(&mut placement_hasher, &node.id.0.to_le_bytes());
+        hash_part(&mut placement_hasher, content_hash.as_bytes());
+        for coordinate in [start_line, start_col, end_line, end_col] {
+            hash_part(&mut placement_hasher, &coordinate.to_le_bytes());
+        }
+        units_by_node.insert(
+            node.id,
+            codestory_store::StructuralTextUnit {
+                node_id: node.id,
+                file_id: file.id,
+                placement_id: format!("{:x}", placement_hasher.finalize()),
+                content_hash,
+                source_content_hash: source_content_hash.to_string(),
+                descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+                producer: producer.to_string(),
+                evidence_tier: "structural_text".to_string(),
+                resolution: "source_range_only".to_string(),
+                language: file.language.clone(),
+                kind: node.kind,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                file_role: file.file_role,
+            },
+        );
+    }
+    storage.structural_text_units = units_by_node.into_values().collect();
+    storage.structural_unit_node_ids.sort_unstable();
+    storage.structural_unit_node_ids.dedup();
+    storage.structural_text_projections = vec![codestory_store::StructuralTextProjection {
+        file_id: file.id,
+        source_content_hash: source_content_hash.to_string(),
+        descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: producer.to_string(),
+        language: file.language.clone(),
+        file_role: file.file_role,
+        unit_count: storage.structural_text_units.len() as u64,
+        unit_digest: codestory_store::structural_text_unit_digest(&storage.structural_text_units),
+    }];
+    storage
+        .file_content_hashes
+        .push(codestory_store::FileContentHash {
+            file_id: file.id,
+            content_hash: source_content_hash.to_string(),
+        });
+    Ok(storage)
+}
+
+fn hash_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn exact_source_range_bytes(
+    source: &str,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) -> Option<&[u8]> {
+    if start_line == 0
+        || start_col == 0
+        || end_line < start_line
+        || (end_line == start_line && end_col < start_col)
+    {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut line_starts = vec![0usize];
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            line_starts.push(index + 1);
+        }
+    }
+    let start_base = *line_starts.get(start_line as usize - 1)?;
+    let end_base = *line_starts.get(end_line as usize - 1)?;
+    let start = start_base.checked_add(start_col as usize - 1)?;
+    let end_exclusive = end_base.checked_add(end_col as usize)?;
+    if start >= end_exclusive || end_exclusive > bytes.len() {
+        return None;
+    }
+    source.is_char_boundary(start).then_some(())?;
+    source.is_char_boundary(end_exclusive).then_some(())?;
+    Some(&bytes[start..end_exclusive])
 }
 
 /// Add CSS entities extracted from an embedded template style block.
@@ -152,6 +341,128 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn existing_structural_families_emit_deterministic_verified_unit_descriptors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixtures = [
+            (
+                ".github/workflows/ci.yml",
+                "name: CI\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+                "structural_github_actions_workflow_collector",
+            ),
+            (
+                "docker-compose.yml",
+                "services:\n  web:\n    image: nginx:1.27\n",
+                "structural_docker_compose_collector",
+            ),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+                "structural_cargo_manifest_collector",
+            ),
+            (
+                "web/index.html",
+                "<main id=\"app\" class=\"shell\">Hello</main>\n",
+                "structural_html_collector",
+            ),
+            (
+                "web/styles.css",
+                ".shell { color: red; --accent: blue; }\n",
+                "structural_css_collector",
+            ),
+            (
+                "db/schema.sql",
+                "CREATE TABLE users (id INTEGER);\n",
+                "structural_sql_collector",
+            ),
+        ];
+
+        for (relative, source, producer) in fixtures {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture parent");
+            std::fs::write(&path, source).expect("write structural fixture");
+            let first = index_structural_file(&path).expect("index structural fixture");
+            let second = index_structural_file(&path).expect("repeat structural fixture");
+
+            assert!(!first.structural_text_units.is_empty(), "{relative}");
+            assert_eq!(first.structural_text_units, second.structural_text_units);
+            assert_eq!(
+                first.structural_text_projections,
+                second.structural_text_projections
+            );
+            assert_eq!(first.structural_text_projections.len(), 1);
+            let projection = &first.structural_text_projections[0];
+            assert_eq!(projection.producer, producer);
+            assert_eq!(
+                projection.descriptor_version,
+                codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+            );
+            assert_eq!(
+                projection.unit_count,
+                first.structural_text_units.len() as u64
+            );
+            assert_eq!(
+                projection.unit_digest,
+                codestory_store::structural_text_unit_digest(&first.structural_text_units)
+            );
+            for unit in &first.structural_text_units {
+                assert_eq!(unit.producer, producer);
+                assert_eq!(unit.evidence_tier, "structural_text");
+                assert_eq!(unit.resolution, "source_range_only");
+                assert_eq!(unit.source_content_hash, projection.source_content_hash);
+                assert_eq!(unit.content_hash.len(), 64);
+                assert_eq!(unit.placement_id.len(), 64);
+                assert_eq!(unit.file_role, first.files[0].file_role);
+                assert!(
+                    !exact_source_range_bytes(
+                        source,
+                        unit.start_line,
+                        unit.start_col,
+                        unit.end_line,
+                        unit.end_col,
+                    )
+                    .expect("unit exact source span")
+                    .is_empty(),
+                    "{relative}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identical_structural_content_keeps_content_identity_but_not_file_placement_or_node_identity()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = ".card { color: red; }\n";
+        let first_path = dir.path().join("first/styles.css");
+        let second_path = dir.path().join("second/styles.css");
+        for path in [&first_path, &second_path] {
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture parent");
+            std::fs::write(path, source).expect("write css");
+        }
+
+        let first = index_structural_file(&first_path).expect("index first css");
+        let second = index_structural_file(&second_path).expect("index second css");
+        let first_content = first
+            .structural_text_units
+            .iter()
+            .map(|unit| unit.content_hash.clone())
+            .collect::<HashSet<_>>();
+        let second_content = second
+            .structural_text_units
+            .iter()
+            .map(|unit| unit.content_hash.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(first_content, second_content);
+        assert!(first.structural_text_units.iter().all(|left| {
+            second.structural_text_units.iter().all(|right| {
+                left.node_id != right.node_id && left.placement_id != right.placement_id
+            })
+        }));
     }
 
     #[test]
@@ -603,6 +914,9 @@ jobs:
                 files: &projected.files,
                 file_content_hashes: &[],
                 nodes: &projected.nodes,
+                structural_text_units: &projected.structural_text_units,
+                structural_text_projections: &projected.structural_text_projections,
+                structural_text_cache_writes: &[],
                 edges: &projected.edges,
                 occurrences: &projected.occurrences,
                 component_access: &projected.component_access,

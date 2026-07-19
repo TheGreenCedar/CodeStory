@@ -1268,6 +1268,9 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
         files: &[],
         file_content_hashes: &[],
         nodes: &[definition],
+        structural_text_units: &[],
+        structural_text_projections: &[],
+        structural_text_cache_writes: &[],
         edges: &[],
         occurrences: &[],
         component_access: &[],
@@ -1469,6 +1472,110 @@ fn test_index_artifact_cache_reader_observes_committed_batches_without_write_acc
 }
 
 #[test]
+fn structural_projection_cache_write_is_atomic_with_file_and_unit_rows() -> Result<(), StorageError>
+{
+    let mut storage = Storage::new_in_memory()?;
+    storage.get_connection().execute_batch(
+        "CREATE TRIGGER reject_structural_cache_write
+         BEFORE INSERT ON structural_text_artifact_cache
+         BEGIN
+           SELECT RAISE(ABORT, 'forced structural cache failure');
+         END;",
+    )?;
+    let source_hash = "a".repeat(64);
+    let file = FileInfo {
+        id: 70,
+        path: PathBuf::from(".github/workflows/ci.yml"),
+        language: "github_actions_workflow".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    };
+    let nodes = [
+        file_node(file.id, ".github/workflows/ci.yml"),
+        Node {
+            id: NodeId(71),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "build".to_string(),
+            canonical_id: Some("github-actions:job:build".to_string()),
+            file_node_id: Some(NodeId(file.id)),
+            start_line: Some(2),
+            start_col: Some(3),
+            end_line: Some(2),
+            end_col: Some(7),
+            ..Default::default()
+        },
+    ];
+    let unit = StructuralTextUnit {
+        node_id: NodeId(71),
+        file_id: file.id,
+        placement_id: "b".repeat(64),
+        content_hash: "c".repeat(64),
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "github_actions_workflow".to_string(),
+        evidence_tier: "structural_text".to_string(),
+        resolution: "source_range_only".to_string(),
+        language: file.language.clone(),
+        kind: NodeKind::FUNCTION,
+        start_line: 2,
+        start_col: 3,
+        end_line: 2,
+        end_col: 7,
+        file_role: FileRole::Source,
+    };
+    let projection = StructuralTextProjection {
+        file_id: file.id,
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "github_actions_workflow".to_string(),
+        language: file.language.clone(),
+        file_role: FileRole::Source,
+        unit_count: 1,
+        unit_digest: structural_text_unit_digest(std::slice::from_ref(&unit)),
+    };
+    let error = storage
+        .flush_projection_batch(ProjectionBatch {
+            files: std::slice::from_ref(&file),
+            file_content_hashes: &[FileContentHash {
+                file_id: file.id,
+                content_hash: source_hash,
+            }],
+            nodes: &nodes,
+            structural_text_units: std::slice::from_ref(&unit),
+            structural_text_projections: std::slice::from_ref(&projection),
+            structural_text_cache_writes: &[StructuralTextArtifactCacheWrite {
+                path: Path::new(".github/workflows/ci.yml"),
+                cache_key: "v1:cache",
+                artifact_blob: b"artifact",
+            }],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+        })
+        .expect_err("trigger must abort the complete structural projection batch");
+    assert!(
+        error
+            .to_string()
+            .contains("forced structural cache failure")
+    );
+    assert!(storage.get_files()?.is_empty());
+    assert!(storage.get_nodes()?.is_empty());
+    assert_eq!(storage.get_structural_text_unit(NodeId(71))?, None);
+    assert_eq!(
+        storage.get_structural_text_artifact_cache(
+            Path::new(".github/workflows/ci.yml"),
+            "v1:cache"
+        )?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
 fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), StorageError> {
     fn profile(storage: &Storage) -> Result<(String, i64, i64, i64), StorageError> {
         let connection = storage.get_connection();
@@ -1635,6 +1742,9 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
         files: &files,
         file_content_hashes: &hashes,
         nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: &[],
+        structural_text_cache_writes: &[],
         edges: &[],
         occurrences: &[],
         component_access: &[],
@@ -1649,6 +1759,9 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
         files: &files,
         file_content_hashes: &[],
         nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: &[],
+        structural_text_cache_writes: &[],
         edges: &[],
         occurrences: &[],
         component_access: &[],
@@ -3334,6 +3447,45 @@ fn schema_27_adds_source_policy_tables_without_synthesizing_publication() -> Res
 }
 
 #[test]
+fn schema_28_adds_structural_unit_tables_without_synthesizing_publication()
+-> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v28-structural-unit-migration");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let storage = Storage::open(&db_path)?;
+        for table in [
+            "structural_text_unit_publication",
+            "structural_text_projection",
+            "structural_text_unit",
+            "structural_text_artifact_cache",
+        ] {
+            storage.conn.execute(&format!("DROP TABLE {table}"), [])?;
+        }
+        storage.set_schema_version(27)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert!(
+        storage
+            .get_structural_text_unit_publication_manifest()?
+            .is_none(),
+        "migration cannot manufacture verified structural evidence"
+    );
+    assert!(
+        storage
+            .get_structural_text_projection_file_ids()?
+            .is_empty()
+    );
+    schema::migrate_v28_structural_text_units(&storage.conn)?;
+    schema::migrate_v28_structural_text_units(&storage.conn)?;
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    Ok(())
+}
+
+#[test]
 fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_column()
 -> Result<(), StorageError> {
     for source_version in [19, 20] {
@@ -3488,6 +3640,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 1,
         };
+        seed.publish_structural_text_unit_generation(&live_publication)?;
         seed.put_index_publication(&live_publication)?;
         seed.publish_source_policy_exclusion_generation(
             &live_publication,
@@ -3519,6 +3672,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
                 mode: IndexPublicationMode::Full,
                 published_at_epoch_ms: 2,
             };
+            staged.publish_structural_text_unit_generation(&staged_publication)?;
             staged.put_index_publication(&staged_publication)?;
             staged.publish_source_policy_exclusion_generation(
                 &staged_publication,
@@ -3704,6 +3858,7 @@ fn seed_promotion_file_with_identity(
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: id.max(0),
         };
+        storage.publish_structural_text_unit_generation(&publication)?;
         storage.put_index_publication(&publication)?;
         storage.publish_source_policy_exclusion_generation(
             &publication,
@@ -3740,6 +3895,7 @@ fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<()
         mode: IndexPublicationMode::Full,
         published_at_epoch_ms: id.max(0),
     };
+    storage.publish_structural_text_unit_generation(&publication)?;
     storage.put_index_publication(&publication)?;
     storage.publish_source_policy_exclusion_generation(
         &publication,
@@ -3800,6 +3956,17 @@ fn promotion_journal(
             .transpose()?
             .flatten(),
         candidate_source_policy: read_source_policy_exclusion_rollback_identity(
+            candidate_path,
+            &candidate,
+        )?,
+        previous_structural_text: previous
+            .as_ref()
+            .map(|publication| {
+                read_structural_text_unit_rollback_identity(previous_path, publication)
+            })
+            .transpose()?
+            .flatten(),
+        candidate_structural_text: read_structural_text_unit_rollback_identity(
             candidate_path,
             &candidate,
         )?,
@@ -3919,6 +4086,71 @@ fn staged_promotion_rejects_missing_corrupt_or_timestamp_drifted_candidate_manif
 }
 
 #[test]
+fn staged_promotion_rejects_missing_corrupt_or_drifted_structural_manifest() {
+    for corruption in ["missing", "digest", "timestamp"] {
+        let live_path = unique_temp_db_path(&format!("promotion-structural-live-{corruption}"));
+        let staged_path = unique_temp_db_path(&format!("promotion-structural-staged-{corruption}"));
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed live publication");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged publication");
+        let staged = Storage::open(&staged_path).expect("open staged publication");
+        match corruption {
+            "missing" => {
+                staged
+                    .get_connection()
+                    .execute("DELETE FROM structural_text_unit_publication", [])
+                    .expect("remove structural manifest");
+            }
+            "digest" => {
+                staged
+                    .get_connection()
+                    .execute(
+                        "UPDATE structural_text_unit_publication SET unit_digest = ?1",
+                        params!["0".repeat(64)],
+                    )
+                    .expect("corrupt structural digest");
+            }
+            "timestamp" => {
+                staged
+                    .get_connection()
+                    .execute(
+                        "UPDATE structural_text_unit_publication
+                         SET published_at_epoch_ms = published_at_epoch_ms + 1",
+                        [],
+                    )
+                    .expect("drift structural timestamp");
+            }
+            _ => unreachable!(),
+        }
+        drop(staged);
+
+        let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+            .expect_err("invalid structural manifest must block promotion");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("structural text unit"),
+            "unexpected promotion error: {error}"
+        );
+        let live = Storage::open(&live_path).expect("reopen preserved live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("live publication")
+                .expect("complete live publication")
+                .generation_id,
+            "generation-1"
+        );
+        assert_eq!(
+            live.get_files().expect("live files")[0].path,
+            PathBuf::from("old.rs")
+        );
+
+        cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
+    }
+}
+
+#[test]
 fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_repair() {
     let live_path = unique_temp_db_path("legacy-committed-policy-live");
     seed_promotion_file(&live_path, 1, "legacy.rs").expect("seed legacy live publication");
@@ -3941,6 +4173,8 @@ fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_
             candidate: candidate.clone(),
             previous_source_policy: None,
             candidate_source_policy: None,
+            previous_structural_text: None,
+            candidate_structural_text: None,
         },
     )
     .expect("write legacy committed journal");

@@ -4,6 +4,13 @@
 
 ### Release
 
+- Structural workflow, Compose, Cargo manifest, HTML, CSS, and SQL collectors
+  now persist versioned exact-source units with separate content and placement
+  identity. Verified source hashes, per-file projections, and a dedicated
+  structural cache advance atomically; a complete manifest binds them to the
+  core generation and is checked across full, incremental, promotion, and
+  rollback boundaries. Grounding, search, details, and packets consume the
+  persisted provenance instead of inferring it from paths.
 - The production release chain now emits graph-owned, success-only proof-cell
   manifests for exact source, release evidence, all six packages, protected
   Metal and Vulkan execution, and all six post-publish hosts. Publication

@@ -48,7 +48,10 @@ pub mod semantic;
 pub mod structural;
 pub mod symbol_table;
 pub mod template_pipeline;
-use cache::{CachedIndexArtifact, build_index_artifact_cache_key, index_artifact_cache_path};
+use cache::{
+    CachedIndexArtifact, CachedStructuralArtifact, build_index_artifact_cache_key,
+    build_structural_artifact_cache_key, index_artifact_cache_path,
+};
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
@@ -835,6 +838,7 @@ pub struct IncrementalIndexingStats {
     pub projection_batch_transactions: usize,
     pub flush_files_ms: u64,
     pub flush_nodes_ms: u64,
+    pub flush_structural_text_units_ms: u64,
     pub flush_edges_ms: u64,
     pub flush_occurrences_ms: u64,
     pub flush_component_access_ms: u64,
@@ -899,9 +903,24 @@ struct PreparedIndexInput {
     content_hash: String,
 }
 
+#[derive(Debug)]
+struct PreparedStructuralInput {
+    full_path: PathBuf,
+    artifact_cache_path: Option<PathBuf>,
+    artifact_cache_key: Option<String>,
+    source: String,
+    content_hash: String,
+}
+
 enum PreparedIndexWork {
     Immediate(IntermediateStorage),
     Parse(PreparedIndexInput),
+    Structural(PreparedStructuralInput),
+}
+
+enum PreparedIndexJob {
+    Parse(Box<PreparedIndexInput>),
+    Structural(PreparedStructuralInput),
 }
 
 struct PreparedIndexJobResult {
@@ -932,6 +951,17 @@ impl ArtifactCacheAccess<'_> {
         match self {
             Self::Storage(storage) => storage.get_index_artifact_cache(path, cache_key),
             Self::Reader(reader) => reader.get(path, cache_key),
+        }
+    }
+
+    fn get_structural(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, StorageError> {
+        match self {
+            Self::Storage(storage) => storage.get_structural_text_artifact_cache(path, cache_key),
+            Self::Reader(reader) => reader.get_structural(path, cache_key),
         }
     }
 
@@ -1112,10 +1142,14 @@ impl<'a> ProjectionWriter<'a> {
                     .get_callable_projection_states_for_file(file_id)
                     .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
                 let cleanup_started = Instant::now();
-                let update_mode = classify_projection_update(
-                    &existing_states,
-                    &local_storage.callable_projection_states,
-                );
+                let update_mode = if !local_storage.structural_text_projections.is_empty() {
+                    ProjectionUpdateMode::FullReplace
+                } else {
+                    classify_projection_update(
+                        &existing_states,
+                        &local_storage.callable_projection_states,
+                    )
+                };
                 match update_mode {
                     ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
                     ProjectionUpdateMode::Delta { changed_callers } => {
@@ -1675,7 +1709,12 @@ impl WorkspaceIndexer {
                     }
                     storages.push(local_storage);
                 }
-                Ok(PreparedIndexWork::Parse(prepared_input)) => parse_jobs.push(prepared_input),
+                Ok(PreparedIndexWork::Parse(prepared_input)) => {
+                    parse_jobs.push(PreparedIndexJob::Parse(Box::new(prepared_input)))
+                }
+                Ok(PreparedIndexWork::Structural(prepared_input)) => {
+                    parse_jobs.push(PreparedIndexJob::Structural(prepared_input))
+                }
                 Err(err_storage) => {
                     if let Some(progress) = serial_progress {
                         progress.emit();
@@ -1708,7 +1747,14 @@ impl WorkspaceIndexer {
                         cache_write: None,
                     };
                 }
-                self.execute_prepared_index(prepared_input, symbol_table)
+                match prepared_input {
+                    PreparedIndexJob::Parse(prepared_input) => {
+                        self.execute_prepared_index(prepared_input, symbol_table)
+                    }
+                    PreparedIndexJob::Structural(prepared_input) => {
+                        self.execute_prepared_structural_index(prepared_input)
+                    }
+                }
             })
             .collect();
         stats.parse_index_ms = stats
@@ -2344,12 +2390,24 @@ impl WorkspaceIndexer {
         reconcile_rust_impl_anchors(storage, batched_storage)?;
         let has_rows = projection_batch_has_rows(batched_storage);
         let flush_started = has_rows.then(Instant::now);
+        let structural_cache_writes = batched_storage
+            .structural_text_cache_writes
+            .iter()
+            .map(|write| codestory_store::StructuralTextArtifactCacheWrite {
+                path: &write.path,
+                cache_key: &write.cache_key,
+                artifact_blob: &write.artifact_blob,
+            })
+            .collect::<Vec<_>>();
         let breakdown = storage
             .projections()
             .flush_projection_batch(codestory_store::ProjectionBatch {
                 files: &batched_storage.files,
                 file_content_hashes: &batched_storage.file_content_hashes,
                 nodes: &batched_storage.nodes,
+                structural_text_units: &batched_storage.structural_text_units,
+                structural_text_projections: &batched_storage.structural_text_projections,
+                structural_text_cache_writes: &structural_cache_writes,
                 edges: &batched_storage.edges,
                 occurrences: &batched_storage.occurrences,
                 component_access: &batched_storage.component_access,
@@ -2478,29 +2536,13 @@ impl WorkspaceIndexer {
                 };
             }
             if structural::is_structural_candidate_path(&full_path) {
-                return match structural::index_structural_file(&full_path) {
-                    Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
-                    Err(error) => {
-                        let local_storage = incomplete_file_storage(
-                            &full_path,
-                            None,
-                            structural::structural_language_name(&full_path),
-                            codestory_contracts::graph::ErrorInfo {
-                                message: format!(
-                                    "Failed to index structural file {:?}: {}",
-                                    path, error
-                                ),
-                                file_id: None,
-                                line: None,
-                                column: None,
-                                is_fatal: false,
-                                index_step: codestory_contracts::graph::IndexStep::Indexing,
-                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
-                            },
-                        );
-                        Err(local_storage)
-                    }
-                };
+                return self.prepare_structural_index_work(
+                    cache_access,
+                    path,
+                    root,
+                    existing_projection_id,
+                    stats,
+                );
             }
             if is_text_only_candidate_path(&full_path) {
                 return match index_text_only_file(&full_path) {
@@ -2730,6 +2772,202 @@ impl WorkspaceIndexer {
     }
 
     #[allow(clippy::result_large_err)]
+    fn prepare_structural_index_work(
+        &self,
+        cache_access: &mut ArtifactCacheAccess<'_>,
+        path: &Path,
+        root: &Path,
+        existing_projection_id: Option<i64>,
+        stats: &mut IncrementalIndexingStats,
+    ) -> std::result::Result<PreparedIndexWork, IntermediateStorage> {
+        let full_path = Self::normalize_index_path(root, path);
+        let language = structural::structural_language_name(&full_path);
+        let producer = structural::structural_producer(&full_path)
+            .expect("admitted structural paths have one producer");
+        let bytes = std::fs::read(&full_path).map_err(|error| {
+            incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!("Failed to read {:?}: {}", path, error),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: true,
+                    index_step: codestory_contracts::graph::IndexStep::Collection,
+                    coverage_reason: Some(FileCoverageReason::Unreadable),
+                },
+            )
+        })?;
+        let content_hash = source_content_hash(&bytes);
+        let source = String::from_utf8(bytes).map_err(|error| {
+            incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!("Failed to index structural file {:?}: {}", path, error),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                },
+            )
+        })?;
+        let artifact_cache_path = index_artifact_cache_path(root, &full_path);
+        let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
+            build_structural_artifact_cache_key(cache_path, source.as_bytes(), producer)
+        });
+        let prepared_input = || PreparedStructuralInput {
+            full_path: full_path.clone(),
+            artifact_cache_path: artifact_cache_path.clone(),
+            artifact_cache_key: artifact_cache_key.clone(),
+            source: source.clone(),
+            content_hash: content_hash.clone(),
+        };
+        let Some(cache_path) = artifact_cache_path.as_ref() else {
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Structural(prepared_input()));
+        };
+        let Some(cache_key) = artifact_cache_key.as_ref() else {
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Structural(prepared_input()));
+        };
+
+        let cached = cache_access.get_structural(cache_path, cache_key);
+        let Ok(Some(blob)) = cached else {
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Structural(prepared_input()));
+        };
+        let Ok(mut artifact) = serde_json::from_slice::<CachedStructuralArtifact>(&blob) else {
+            stats.artifact_cache_invalid_entries += 1;
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Structural(prepared_input()));
+        };
+        if artifact.descriptor_version != codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+            || artifact.files.first().map(|file| file.id)
+                != Some(Self::canonical_file_node_id_for_path(&full_path))
+        {
+            stats.artifact_cache_invalid_entries += 1;
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Structural(prepared_input()));
+        }
+        let modification_time = verify_source_snapshot(&full_path, &content_hash)
+            .map_err(|error| changed_source_storage(&full_path, language, error))?;
+        if let Some(file_info) = artifact.files.first_mut() {
+            file_info.modification_time = modification_time;
+            file_info.path = full_path.clone();
+            file_info.language = language.to_string();
+            file_info.line_count = source.lines().count() as u32;
+        }
+        let expected_storage = structural::finalize_structural_storage(
+            &full_path,
+            &source,
+            &content_hash,
+            artifact.clone().into_intermediate_storage(),
+        )
+        .map_err(|error| {
+            incomplete_file_storage(
+                &full_path,
+                Some(&source),
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Failed to validate cached structural file {:?}: {}",
+                        path, error
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                },
+            )
+        })?;
+        if expected_storage.file_content_hashes != artifact.file_content_hashes
+            || expected_storage.structural_text_units != artifact.structural_text_units
+            || expected_storage.structural_text_projections != artifact.structural_text_projections
+            || expected_storage.structural_unit_node_ids != artifact.structural_unit_node_ids
+        {
+            stats.artifact_cache_invalid_entries += 1;
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Structural(prepared_input()));
+        }
+        stats.artifact_cache_hits += 1;
+        if existing_projection_id.is_some() {
+            let Some(storage) = cache_access.storage_mut() else {
+                return Err(incomplete_file_storage(
+                    &full_path,
+                    Some(&source),
+                    language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!(
+                            "Artifact-cache reader cannot refresh an existing structural projection for {:?}",
+                            full_path
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: true,
+                        index_step: codestory_contracts::graph::IndexStep::Indexing,
+                        coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                    },
+                ));
+            };
+            if let Some(file_info) = expected_storage.files.first() {
+                storage
+                    .update_file_metadata(file_info, Some(&content_hash))
+                    .map_err(|error| {
+                        incomplete_file_storage(
+                            &full_path,
+                            Some(&source),
+                            language,
+                            codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Failed to refresh cached structural metadata for {:?}: {:?}",
+                                    full_path, error
+                                ),
+                                file_id: None,
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                            },
+                        )
+                    })?;
+                storage
+                    .replace_errors_for_files_batch(&[file_info.id], &[])
+                    .map_err(|error| {
+                        incomplete_file_storage(
+                            &full_path,
+                            Some(&source),
+                            language,
+                            codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Failed to clear cached structural errors for {:?}: {:?}",
+                                    full_path, error
+                                ),
+                                file_id: None,
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                            },
+                        )
+                    })?;
+            }
+            return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
+        }
+        Ok(PreparedIndexWork::Immediate(expected_storage))
+    }
+
+    #[allow(clippy::result_large_err)]
     fn prepare_openapi_schema_work(
         &self,
         full_path: &Path,
@@ -2870,6 +3108,92 @@ impl WorkspaceIndexer {
         }
     }
 
+    fn execute_prepared_structural_index(
+        &self,
+        prepared_input: &PreparedStructuralInput,
+    ) -> PreparedIndexJobResult {
+        let language = structural::structural_language_name(&prepared_input.full_path);
+        let collected =
+            structural::index_structural_source(&prepared_input.full_path, &prepared_input.source);
+        let modification_time =
+            match verify_source_snapshot(&prepared_input.full_path, &prepared_input.content_hash) {
+                Ok(modification_time) => modification_time,
+                Err(error) => {
+                    return PreparedIndexJobResult {
+                        local_storage: changed_source_storage(
+                            &prepared_input.full_path,
+                            language,
+                            error,
+                        ),
+                        cache_write: None,
+                    };
+                }
+            };
+        let mut local_storage = match collected.and_then(|storage| {
+            structural::finalize_structural_storage(
+                &prepared_input.full_path,
+                &prepared_input.source,
+                &prepared_input.content_hash,
+                storage,
+            )
+        }) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return PreparedIndexJobResult {
+                    local_storage: incomplete_file_storage(
+                        &prepared_input.full_path,
+                        Some(&prepared_input.source),
+                        language,
+                        codestory_contracts::graph::ErrorInfo {
+                            message: format!(
+                                "Failed to index structural file {:?}: {}",
+                                prepared_input.full_path, error
+                            ),
+                            file_id: None,
+                            line: None,
+                            column: None,
+                            is_fatal: false,
+                            index_step: codestory_contracts::graph::IndexStep::Indexing,
+                            coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                        },
+                    ),
+                    cache_write: None,
+                };
+            }
+        };
+        if let Some(file_info) = local_storage.files.first_mut() {
+            file_info.modification_time = modification_time;
+        }
+        let artifact = CachedStructuralArtifact::from_storage(local_storage);
+        let structural_cache_write = prepared_input
+            .artifact_cache_path
+            .as_ref()
+            .zip(prepared_input.artifact_cache_key.as_ref())
+            .and_then(|(path, cache_key)| {
+                serde_json::to_vec(&artifact)
+                    .ok()
+                    .map(|artifact_blob| ArtifactCacheWrite {
+                        path: path.clone(),
+                        cache_key: cache_key.clone(),
+                        artifact_blob,
+                    })
+            });
+        local_storage = artifact.into_intermediate_storage();
+        if let Some(write) = structural_cache_write {
+            local_storage.structural_text_cache_writes.push(
+                intermediate_storage::StructuralTextArtifactCacheWrite {
+                    path: write.path,
+                    cache_key: write.cache_key,
+                    artifact_blob: write.artifact_blob,
+                },
+            );
+        }
+        PreparedIndexJobResult {
+            local_storage,
+            cache_write: None,
+        }
+    }
+
     fn seed_symbol_table_from_nodes(symbol_table: &SymbolTable, nodes: &[Node]) {
         for node in nodes {
             symbol_table.insert(node.id.0, node.kind);
@@ -2988,6 +3312,9 @@ fn projection_batch_has_rows(storage: &IntermediateStorage) -> bool {
     !storage.files.is_empty()
         || !storage.file_content_hashes.is_empty()
         || !storage.nodes.is_empty()
+        || !storage.structural_text_units.is_empty()
+        || !storage.structural_text_projections.is_empty()
+        || !storage.structural_text_cache_writes.is_empty()
         || !storage.edges.is_empty()
         || !storage.occurrences.is_empty()
         || !storage.component_access.is_empty()
@@ -2997,6 +3324,7 @@ fn projection_batch_has_rows(storage: &IntermediateStorage) -> bool {
 fn projection_flush_breakdown_ms(breakdown: &codestory_store::ProjectionFlushBreakdown) -> u64 {
     u64::from(breakdown.files_ms)
         .saturating_add(u64::from(breakdown.nodes_ms))
+        .saturating_add(u64::from(breakdown.structural_text_units_ms))
         .saturating_add(u64::from(breakdown.edges_ms))
         .saturating_add(u64::from(breakdown.occurrences_ms))
         .saturating_add(u64::from(breakdown.component_access_ms))
@@ -3037,6 +3365,9 @@ fn accumulate_projection_writer_stats(
     stats.flush_nodes_ms = stats
         .flush_nodes_ms
         .saturating_add(writer_stats.flush_nodes_ms);
+    stats.flush_structural_text_units_ms = stats
+        .flush_structural_text_units_ms
+        .saturating_add(writer_stats.flush_structural_text_units_ms);
     stats.flush_edges_ms = stats
         .flush_edges_ms
         .saturating_add(writer_stats.flush_edges_ms);
@@ -3067,6 +3398,9 @@ fn accumulate_flush_breakdown(
     stats.flush_nodes_ms = stats
         .flush_nodes_ms
         .saturating_add(u64::from(breakdown.nodes_ms));
+    stats.flush_structural_text_units_ms = stats
+        .flush_structural_text_units_ms
+        .saturating_add(u64::from(breakdown.structural_text_units_ms));
     stats.flush_edges_ms = stats
         .flush_edges_ms
         .saturating_add(u64::from(breakdown.edges_ms));
@@ -21555,6 +21889,179 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
+    fn structural_full_refresh_reuses_only_the_verified_structural_cache() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workflow_dir = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflow_dir)?;
+        let workflow = workflow_dir.join("ci.yml");
+        std::fs::write(
+            &workflow,
+            "name: CI\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        )?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![workflow],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+
+        let source_path = dir.path().join("structural-cache-source.sqlite");
+        let mut source = Storage::open_build(&source_path)?;
+        let source_stats = indexer.run(&mut source, &plan, &EventBus::new(), None)?;
+        assert_eq!(source_stats.artifact_cache_misses, 1);
+        assert!(
+            !source
+                .get_structural_text_units_for_nodes(
+                    &source
+                        .get_nodes()?
+                        .into_iter()
+                        .map(|node| node.id)
+                        .collect::<Vec<_>>()
+                )?
+                .is_empty()
+        );
+        drop(source);
+
+        let mut target = Storage::open_build(dir.path().join("structural-cache-target.sqlite"))?;
+        assert_eq!(target.copy_index_artifact_cache_from(&source_path)?, 0);
+        assert_eq!(
+            target.copy_structural_text_artifact_cache_from(&source_path)?,
+            1
+        );
+        let cached_stats = indexer.run(&mut target, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(cached_stats.artifact_cache_hits, 1);
+        assert_eq!(cached_stats.artifact_cache_misses, 0);
+        assert!(
+            !target
+                .get_structural_text_units_for_nodes(
+                    &target
+                        .get_nodes()?
+                        .into_iter()
+                        .map(|node| node.id)
+                        .collect::<Vec<_>>()
+                )?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_or_incompatible_structural_cache_recollects_and_changed_bytes_replace_only_that_path()
+    -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let workflow_dir = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflow_dir)?;
+        let workflow = workflow_dir.join("ci.yml");
+        std::fs::write(
+            &workflow,
+            "name: CI\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        )?;
+        let mut plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![workflow.clone()],
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let mut storage = Storage::open_build(dir.path().join("structural-cache.sqlite"))?;
+        indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+        plan.mode = codestory_workspace::BuildMode::Incremental;
+
+        storage.get_connection().execute(
+            "UPDATE structural_text_artifact_cache
+             SET artifact_blob = ?1
+             WHERE file_path = ?2",
+            (b"not-json".as_slice(), ".github/workflows/ci.yml"),
+        )?;
+        let corrupt_stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+        assert_eq!(corrupt_stats.artifact_cache_invalid_entries, 1);
+        assert_eq!(corrupt_stats.artifact_cache_misses, 1);
+
+        let (cache_key, blob): (String, Vec<u8>) = storage.get_connection().query_row(
+            "SELECT cache_key, artifact_blob
+             FROM structural_text_artifact_cache
+             WHERE file_path = ?1",
+            [".github/workflows/ci.yml"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut incompatible: serde_json::Value = serde_json::from_slice(&blob)?;
+        incompatible["descriptor_version"] = serde_json::json!(999);
+        storage.get_connection().execute(
+            "UPDATE structural_text_artifact_cache
+             SET artifact_blob = ?1
+             WHERE file_path = ?2 AND cache_key = ?3",
+            (
+                serde_json::to_vec(&incompatible)?,
+                ".github/workflows/ci.yml",
+                cache_key,
+            ),
+        )?;
+        let incompatible_stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+        assert_eq!(incompatible_stats.artifact_cache_invalid_entries, 1);
+        assert_eq!(incompatible_stats.artifact_cache_misses, 1);
+
+        overwrite_preserving_mtime(
+            &workflow,
+            "name: CI\non:\n  push:\njobs:\n  verify:\n    runs-on: ubuntu-latest\n",
+        )?;
+        let changed_stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+        assert_eq!(changed_stats.artifact_cache_hits, 0);
+        assert_eq!(changed_stats.artifact_cache_misses, 1);
+        assert!(
+            storage
+                .get_nodes()?
+                .iter()
+                .any(|node| node.serialized_name == "verify")
+        );
+        assert!(
+            storage
+                .get_nodes()?
+                .iter()
+                .all(|node| node.serialized_name != "build")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structural_source_drift_discards_units_and_cache_write_even_with_restored_mtime()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("schema.sql");
+        let original = "CREATE TABLE original (id INTEGER);\n";
+        std::fs::write(&path, original)?;
+        let content_hash = source_content_hash(original.as_bytes());
+        let prepared = PreparedStructuralInput {
+            full_path: path.clone(),
+            artifact_cache_path: Some(PathBuf::from("schema.sql")),
+            artifact_cache_key: Some("v1:original".to_string()),
+            source: original.to_string(),
+            content_hash,
+        };
+        overwrite_preserving_mtime(&path, "CREATE TABLE changed (id INTEGER);\n")?;
+
+        let result = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .execute_prepared_structural_index(&prepared);
+
+        assert!(result.local_storage.structural_text_units.is_empty());
+        assert!(result.local_storage.structural_text_projections.is_empty());
+        assert!(result.local_storage.structural_text_cache_writes.is_empty());
+        assert!(!result.local_storage.files[0].complete);
+        assert_eq!(
+            result.local_storage.errors[0].coverage_reason,
+            Some(FileCoverageReason::SourceChanged)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_adaptive_full_refresh_planner_tracks_dense_and_sparse_node_output() -> Result<()> {
         use std::fs;
         use tempfile::tempdir;
@@ -24487,6 +24994,9 @@ jobs:
                 files: &local.files,
                 file_content_hashes: &local.file_content_hashes,
                 nodes: &local.nodes,
+                structural_text_units: &local.structural_text_units,
+                structural_text_projections: &local.structural_text_projections,
+                structural_text_cache_writes: &[],
                 edges: &local.edges,
                 occurrences: &local.occurrences,
                 component_access: &local.component_access,

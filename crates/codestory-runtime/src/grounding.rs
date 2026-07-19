@@ -1,8 +1,10 @@
 use super::*;
 use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
 use crate::trail_story::build_trail_story;
-use codestory_contracts::api::SearchHitOrigin;
-use codestory_store::FileRole;
+use codestory_contracts::api::{
+    PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
+};
+use codestory_store::{FileRole, StructuralTextUnit};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -219,24 +221,29 @@ fn build_coverage_buckets(
     buckets
 }
 
+struct SymbolDigestContext<'a> {
+    member_counts: &'a HashMap<codestory_contracts::graph::NodeId, u32>,
+    fallback_lines: &'a HashMap<codestory_contracts::graph::NodeId, u32>,
+    edge_digests: &'a HashMap<codestory_contracts::graph::NodeId, Vec<String>>,
+    summaries: &'a HashMap<codestory_contracts::graph::NodeId, SymbolSummaryRecord>,
+    structural_units: &'a HashMap<codestory_contracts::graph::NodeId, StructuralTextUnit>,
+}
+
 fn symbol_digest(
     node: &codestory_contracts::graph::Node,
     display_name: &str,
     relative_file_path: Option<&str>,
-    member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
-    fallback_lines: &HashMap<codestory_contracts::graph::NodeId, u32>,
-    edge_digests: &HashMap<codestory_contracts::graph::NodeId, Vec<String>>,
-    summaries: &HashMap<codestory_contracts::graph::NodeId, SymbolSummaryRecord>,
+    context: &SymbolDigestContext<'_>,
 ) -> GroundingSymbolDigestDto {
     let member_count = if is_structural_kind(node.kind) {
-        Some(*member_counts.get(&node.id).unwrap_or(&0))
+        Some(*context.member_counts.get(&node.id).unwrap_or(&0))
     } else {
         None
     };
 
     let line = node
         .start_line
-        .or_else(|| fallback_lines.get(&node.id).copied());
+        .or_else(|| context.fallback_lines.get(&node.id).copied());
 
     let label = if let Some(file_path) = relative_file_path {
         format!("{display_name} @ {file_path}")
@@ -245,6 +252,7 @@ fn symbol_digest(
     };
     let diagnostic_evidence =
         diagnostic_source_evidence(relative_file_path, node.canonical_id.as_deref());
+    let structural_unit = context.structural_units.get(&node.id);
 
     GroundingSymbolDigestDto {
         id: NodeId::from(node.id),
@@ -255,11 +263,24 @@ fn symbol_digest(
         kind: NodeKind::from(node.kind),
         line,
         member_count,
-        summary: summaries.get(&node.id).map(|record| record.summary.clone()),
-        edge_digest: edge_digests.get(&node.id).cloned().unwrap_or_default(),
-        evidence_tier: diagnostic_evidence.map(|evidence| evidence.tier),
-        evidence_producer: diagnostic_evidence.map(|evidence| evidence.producer.to_string()),
-        resolution_status: diagnostic_evidence.map(|evidence| evidence.resolution),
+        summary: context
+            .summaries
+            .get(&node.id)
+            .map(|record| record.summary.clone()),
+        edge_digest: context
+            .edge_digests
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_default(),
+        evidence_tier: structural_unit
+            .map(|_| PacketEvidenceTierDto::StructuralText)
+            .or_else(|| diagnostic_evidence.map(|evidence| evidence.tier)),
+        evidence_producer: structural_unit
+            .map(|unit| unit.producer.clone())
+            .or_else(|| diagnostic_evidence.map(|evidence| evidence.producer.to_string())),
+        resolution_status: structural_unit
+            .map(|_| PacketEvidenceResolutionDto::SourceRangeOnly)
+            .or_else(|| diagnostic_evidence.map(|evidence| evidence.resolution)),
     }
 }
 
@@ -861,6 +882,23 @@ impl AppController {
         let summaries = storage
             .get_current_symbol_summaries_by_node_ids(&displayed_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
+        let structural_units = storage
+            .get_structural_text_units_for_nodes(&displayed_node_ids)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to load structural grounding provenance: {e}"
+                ))
+            })?
+            .into_iter()
+            .map(|unit| (unit.node_id, unit))
+            .collect::<HashMap<_, _>>();
+        let symbol_digest_context = SymbolDigestContext {
+            member_counts: &member_counts,
+            fallback_lines: &fallback_lines,
+            edge_digests: &edge_digests,
+            summaries: &summaries,
+            structural_units: &structural_units,
+        };
 
         for coverage in selected_coverages {
             let mut symbols = Vec::with_capacity(coverage.represented_symbol_count as usize);
@@ -874,10 +912,7 @@ impl AppController {
                         &record.node,
                         &record.display_name,
                         relative_file_path.as_deref(),
-                        &member_counts,
-                        &fallback_lines,
-                        &edge_digests,
-                        &summaries,
+                        &symbol_digest_context,
                     ));
                 }
             }
@@ -912,10 +947,7 @@ impl AppController {
                 &record.node,
                 &record.display_name,
                 relative_file_path.as_deref(),
-                &member_counts,
-                &fallback_lines,
-                &edge_digests,
-                &summaries,
+                &symbol_digest_context,
             ));
         }
 
@@ -1571,20 +1603,23 @@ mod tests {
 
         {
             let mut storage = Storage::open(&db_path).expect("open storage");
-            insert_file_node(
-                &mut storage,
-                11,
-                &manifest,
-                Node {
-                    id: CoreNodeId(101),
-                    kind: NodeKind::PACKAGE,
-                    serialized_name: "demo".to_string(),
-                    file_node_id: Some(CoreNodeId(11)),
-                    start_line: Some(2),
-                    ..Default::default()
-                },
-            )
-            .expect("insert manifest node");
+            let projected = codestory_indexer::structural::index_structural_file(&manifest)
+                .expect("collect manifest");
+            storage
+                .projections()
+                .flush_projection_batch(codestory_store::ProjectionBatch {
+                    files: &projected.files,
+                    file_content_hashes: &projected.file_content_hashes,
+                    nodes: &projected.nodes,
+                    structural_text_units: &projected.structural_text_units,
+                    structural_text_projections: &projected.structural_text_projections,
+                    structural_text_cache_writes: &[],
+                    edges: &projected.edges,
+                    occurrences: &projected.occurrences,
+                    component_access: &projected.component_access,
+                    callable_projection_states: &projected.callable_projection_states,
+                })
+                .expect("insert verified manifest projection");
         }
 
         let controller = AppController::new();

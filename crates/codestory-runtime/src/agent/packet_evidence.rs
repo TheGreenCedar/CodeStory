@@ -4,11 +4,6 @@ use codestory_contracts::api::{
     AgentCitationDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHit,
     SearchHitOrigin,
 };
-use codestory_contracts::language_support::{
-    is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
-    structural_language_name_for_path,
-};
-
 const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
@@ -22,7 +17,7 @@ pub(crate) struct DiagnosticSourceEvidence {
 }
 
 pub(crate) fn diagnostic_source_evidence(
-    path: Option<&str>,
+    _path: Option<&str>,
     canonical_id: Option<&str>,
 ) -> Option<DiagnosticSourceEvidence> {
     if canonical_id.is_some_and(|value| value.starts_with("openapi:endpoint:")) {
@@ -32,11 +27,7 @@ pub(crate) fn diagnostic_source_evidence(
             resolution: PacketEvidenceResolution::SourceRangeOnly,
         });
     }
-    structural_text_producer_for_path(path).map(|producer| DiagnosticSourceEvidence {
-        tier: PacketEvidenceTier::StructuralText,
-        producer,
-        resolution: PacketEvidenceResolution::SourceRangeOnly,
-    })
+    None
 }
 
 pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
@@ -72,13 +63,6 @@ pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &
             PacketEvidenceTier::ExactSource
         });
         citation.resolution_status = Some(evidence_resolution_for_citation(citation));
-        if structural_text {
-            citation.evidence_producer = citation
-                .file_path
-                .as_deref()
-                .and_then(|path| structural_text_producer_for_path(Some(path)))
-                .map(str::to_string);
-        }
         citation.eligible_for_sufficiency = Some(false);
         return;
     }
@@ -185,13 +169,11 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
     if hit_is_openapi_endpoint_schema(hit) {
         return OPENAPI_ENDPOINT_SCHEMA_PRODUCER.to_string();
     }
-    if hit_is_structural_source_proof(hit) {
-        return structural_text_producer_for_path(hit.file_path.as_deref())
-            .unwrap_or("structural_source_proof_collector")
-            .to_string();
-    }
     if let Some(producer) = hit.evidence_producer.as_ref() {
         return producer.clone();
+    }
+    if hit_is_structural_source_proof(hit) {
+        return "structural_source_proof_collector".to_string();
     }
     if let Some(breakdown) = hit.score_breakdown.as_ref()
         && let Some(provenance) = breakdown.provenance.first()
@@ -262,7 +244,9 @@ pub(crate) fn evidence_resolution_for_citation(
 }
 
 fn hit_is_structural_source_proof(hit: &SearchHit) -> bool {
-    structural_text_producer_for_path(hit.file_path.as_deref()).is_some()
+    hit.evidence_tier == Some(PacketEvidenceTier::StructuralText)
+        && hit.resolution_status == Some(PacketEvidenceResolution::SourceRangeOnly)
+        && hit.evidence_producer.is_some()
 }
 
 fn hit_is_diagnostic_source_proof(hit: &SearchHit) -> bool {
@@ -274,7 +258,9 @@ fn hit_is_openapi_endpoint_schema(hit: &SearchHit) -> bool {
 }
 
 fn citation_is_structural_source_proof(citation: &AgentCitationDto) -> bool {
-    structural_text_producer_for_path(citation.file_path.as_deref()).is_some()
+    citation.evidence_tier == Some(PacketEvidenceTier::StructuralText)
+        && citation.resolution_status == Some(PacketEvidenceResolution::SourceRangeOnly)
+        && citation.evidence_producer.is_some()
 }
 
 fn citation_is_diagnostic_source_proof(citation: &AgentCitationDto) -> bool {
@@ -283,29 +269,6 @@ fn citation_is_diagnostic_source_proof(citation: &AgentCitationDto) -> bool {
 
 fn citation_is_openapi_endpoint_schema(citation: &AgentCitationDto) -> bool {
     citation.evidence_producer.as_deref() == Some(OPENAPI_ENDPOINT_SCHEMA_PRODUCER)
-}
-
-/// Return the stable producer label for an already-indexed structural collector
-/// path. This intentionally does not admit generic text formats: expansion of
-/// the collector inventory belongs to the structural indexing work, not result
-/// publication.
-pub(crate) fn structural_text_producer_for_path(path: Option<&str>) -> Option<&'static str> {
-    let path = path?;
-    if is_github_actions_workflow_path(path) {
-        return Some("structural_github_actions_workflow_collector");
-    }
-    if is_docker_compose_file_path(path) {
-        return Some("structural_docker_compose_collector");
-    }
-    if is_cargo_manifest_file_path(path) {
-        return Some("structural_cargo_manifest_collector");
-    }
-    match structural_language_name_for_path(Some(path)) {
-        Some("html") => Some("structural_html_collector"),
-        Some("css") => Some("structural_css_collector"),
-        Some("sql") => Some("structural_sql_collector"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -326,9 +289,9 @@ mod tests {
             origin: SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
-            evidence_tier: None,
-            evidence_producer: None,
-            resolution_status: None,
+            evidence_tier: Some(PacketEvidenceTier::StructuralText),
+            evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
+            resolution_status: Some(PacketEvidenceResolution::SourceRangeOnly),
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
@@ -371,6 +334,7 @@ mod tests {
         hit.display_name = "web".to_string();
         hit.file_path = Some("docker/retrieval-compose.yml".to_string());
         hit.line = Some(9);
+        hit.evidence_producer = Some("structural_docker_compose_collector".to_string());
 
         decorate_search_hit_evidence(&mut hit);
 
@@ -392,7 +356,9 @@ mod tests {
         hit.node_id = NodeId("openapi-endpoint".to_string());
         hit.display_name = "GET /api/users".to_string();
         hit.file_path = Some("openapi.json".to_string());
+        hit.evidence_tier = None;
         hit.evidence_producer = Some("openapi_endpoint_schema".to_string());
+        hit.resolution_status = None;
 
         decorate_search_hit_evidence(&mut hit);
 
@@ -415,6 +381,7 @@ mod tests {
         hit.display_name = "serde".to_string();
         hit.file_path = Some("crates/app/Cargo.toml".to_string());
         hit.line = Some(8);
+        hit.evidence_producer = Some("structural_cargo_manifest_collector".to_string());
 
         decorate_search_hit_evidence(&mut hit);
 
@@ -431,44 +398,21 @@ mod tests {
     }
 
     #[test]
-    fn structural_text_producers_cover_existing_collectors_without_admitting_generic_text() {
-        let cases = [
-            (
-                ".github/workflows/ci.yml",
-                "structural_github_actions_workflow_collector",
-            ),
-            (
-                "docker/stack-compose.yaml",
-                "structural_docker_compose_collector",
-            ),
-            (
-                "crates/runtime/Cargo.toml",
-                "structural_cargo_manifest_collector",
-            ),
-            ("web/index.html", "structural_html_collector"),
-            ("web/styles.css", "structural_css_collector"),
-            ("db/schema.sql", "structural_sql_collector"),
-        ];
+    fn structural_path_without_persisted_provenance_is_not_relabelled() {
+        let mut hit = workflow_hit();
+        hit.evidence_tier = None;
+        hit.evidence_producer = None;
+        hit.resolution_status = None;
 
-        for (path, expected_producer) in cases {
-            assert_eq!(
-                structural_text_producer_for_path(Some(path)),
-                Some(expected_producer),
-                "expected existing structural collector for {path}"
-            );
-        }
+        decorate_search_hit_evidence(&mut hit);
 
-        for path in [
-            "docs/design.md",
-            "config/service.yaml",
-            "config/service.toml",
-        ] {
-            assert_eq!(
-                structural_text_producer_for_path(Some(path)),
-                None,
-                "generic text remains outside this publication-only slice: {path}"
-            );
-        }
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ResolvedGraph));
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolution::Resolved)
+        );
+        assert_eq!(hit.evidence_producer.as_deref(), Some("indexed_symbol"));
+        assert_eq!(hit.eligible_for_sufficiency, Some(true));
     }
 
     #[test]
@@ -525,7 +469,9 @@ mod tests {
         hit.node_id = NodeId("openapi-endpoint".to_string());
         hit.display_name = "GET /api/users".to_string();
         hit.file_path = Some("openapi.json".to_string());
+        hit.evidence_tier = None;
         hit.evidence_producer = Some("openapi_endpoint_schema".to_string());
+        hit.resolution_status = None;
         decorate_search_hit_evidence(&mut hit);
 
         let mut citation = AgentCitationDto {

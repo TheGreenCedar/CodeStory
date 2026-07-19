@@ -4072,6 +4072,9 @@ mod tests {
             end_col: None,
             member_access: None,
             route_endpoint: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
         }
     }
 
