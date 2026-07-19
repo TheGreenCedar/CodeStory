@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
-codestory-runtime = { workspace = true, features = ["test-support"] }
+codestory-runtime = { workspace = true, features = ["benchmark-support"] }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 criterion = { workspace = true }

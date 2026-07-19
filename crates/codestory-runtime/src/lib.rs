@@ -97,7 +97,7 @@ mod query_language;
 mod repository_identity;
 mod search;
 mod search_runtime;
-#[cfg(feature = "test-support")]
+#[cfg(feature = "benchmark-support")]
 pub mod benchmark_support {
     pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
 }

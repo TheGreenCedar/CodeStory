@@ -4,6 +4,7 @@ version = "0.16.0"
 edition = "2024"
 
 [features]
+benchmark-support = []
 test-support = []
 
 [dependencies]

@@ -849,7 +849,7 @@ impl SearchEngine {
         self.reader.searcher().num_docs() as usize
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(feature = "benchmark-support")]
     pub fn tantivy_segment_count(&self) -> usize {
         self.reader.searcher().segment_readers().len()
     }
