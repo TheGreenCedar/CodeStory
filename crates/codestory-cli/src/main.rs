@@ -8979,6 +8979,7 @@ mod tests {
             search_symbol_index_reload_count: Some(1),
             search_symbol_index_reload_ms: Some(65),
             runtime_cache_publish_ms: Some(63),
+            semantic_context_index_ms: Some(59),
             semantic_node_load_ms: Some(66),
             semantic_node_load_rows: Some(8_192),
             semantic_context_ms: Some(67),
@@ -9229,7 +9230,7 @@ mod tests {
         assert!(markdown.contains("projection_batches: transactions=2"));
         assert!(
             markdown
-                .contains("semantic_ms: node_load=66 node_rows=8192 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
+                .contains("semantic_ms: context_index=59 node_load=66 node_rows=8192 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
         );
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(

@@ -330,12 +330,17 @@ const LOAD_TIME_INDEX_STATEMENTS: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_component_access_node ON component_access(node_id)",
 ];
 
+const SEMANTIC_CONTEXT_ENDPOINT_INDEX_STATEMENTS: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_edge_source ON edge(source_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_target ON edge(target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
+];
+
 const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element ON occurrence(element_id)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element_start_line ON occurrence(element_id, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_file ON occurrence(file_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_source ON edge(source_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_target ON edge(target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_file ON edge(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_scope_unresolved
      ON edge(kind, resolved_target_node_id, source_node_id, file_node_id)",
@@ -346,8 +351,6 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_node ON bookmark_node(node_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_kind_serialized_name ON node(kind, serialized_name)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_source ON edge(kind, source_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_target ON edge(kind, target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_resolved_target ON edge(kind, resolved_target_node_id)",
@@ -433,7 +436,17 @@ pub(super) fn create_secondary_indexes(conn: &Connection) -> Result<(), StorageE
 }
 
 pub(super) fn create_pre_summary_secondary_indexes(conn: &Connection) -> Result<(), StorageError> {
+    create_semantic_context_endpoint_indexes(conn)?;
     for statement in PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn create_semantic_context_endpoint_indexes(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    for statement in SEMANTIC_CONTEXT_ENDPOINT_INDEX_STATEMENTS {
         conn.execute(statement, [])?;
     }
     Ok(())

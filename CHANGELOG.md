@@ -21,6 +21,11 @@
 
 ### Performance
 
+- Staged builds now create the four edge endpoint indexes immediately before
+  semantic context reads instead of issuing thousands of bounded endpoint
+  queries against an unindexed edge table. The normal deferred schema still
+  owns the indexes, and telemetry reports their wall time separately while
+  retaining it in the deferred-index total.
 - The sqlite-vec versus USearch evidence harness now freezes and independently
   revalidates its reviewed catalog, source publication, query embeddings, and
   exact corpus identity before measurement. Candidate publication validates

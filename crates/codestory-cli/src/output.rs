@@ -463,6 +463,7 @@ fn append_index_semantic_timings(markdown: &mut String, timings: &IndexingPhaseT
         markdown,
         "semantic_ms",
         &[
+            ("context_index", timings.semantic_context_index_ms),
             ("node_load", timings.semantic_node_load_ms),
             ("node_rows", timings.semantic_node_load_rows),
             ("context", timings.semantic_context_ms),

@@ -318,12 +318,15 @@ The last step belongs to runtime plus store:
 Full and incremental snapshot behavior are intentionally not symmetric.
 
 Staged finalization splits deferred indexes around summary materialization. It
-first creates source/core indexes used by the snapshot query, including the
-edge indexes needed for root membership checks. It fills the grounding node
+creates the four source, target, resolved-source, and resolved-target edge
+indexes immediately before semantic context reads. The normal deferred schema
+also retains those statements. Snapshot finalization then creates the remaining
+source/core indexes used by the snapshot query. It fills the grounding node
 table with both destination indexes absent, then bulk-builds the node file-rank
 index needed by the file-summary join. After file materialization it bulk-builds
 the node root-rank index and both file-summary indexes before the stage can
-publish. All three index-build segments belong to `deferred_indexes_ms`;
+publish. All index-build segments belong to `deferred_indexes_ms`;
+`semantic_ms.context_index` isolates the early endpoint-index work and
 `summary_snapshot_ms` covers only materialization. Any failure in a build
 segment leaves the candidate unpublished and the previous live generation
 usable.
@@ -432,6 +435,7 @@ The index summary reports graph and semantic work separately:
 - `symbol_index.stream_ms`, `stream_rows`, and `stream_batches`: nested canonical-node read telemetry; stream time is part of `cache_ms.search_index`, not an additive phase
 - `symbol_index`: documents written plus Tantivy writer, commit, and reader-reload counts and final commit/reload durations; all are nested inside `cache_ms.search_index`, and completed-generation reuse reports zero
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
+- `semantic_ms.context_index`: creating the four staged edge endpoint indexes before semantic context reads; this is nested in `timings_ms.deferred_indexes`
 - `semantic_ms.node_load` and `node_rows`: loading the complete staged node set before semantic selection
 - `semantic_ms.context`: loading the graph context used by generated semantic documents
 - `semantic_ms.doc_build`: generated semantic text and hashes
