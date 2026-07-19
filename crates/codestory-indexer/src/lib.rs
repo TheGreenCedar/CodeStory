@@ -805,6 +805,9 @@ pub enum IndexingEvent {
 pub struct IncrementalIndexingStats {
     pub setup_existing_projection_ids_ms: u64,
     pub setup_seed_symbol_table_ms: u64,
+    /// Full source preparation wall time, including artifact-cache lookups.
+    pub source_prepare_ms: u64,
+    /// Backward-compatible alias for `source_prepare_ms`.
     pub artifact_cache_lookup_ms: u64,
     pub artifact_cache_write_ms: u64,
     pub artifact_cache_hits: usize,
@@ -828,6 +831,8 @@ pub struct IncrementalIndexingStats {
     pub full_refresh_chunk_planning_ms: u64,
     pub parse_index_ms: u64,
     pub projection_flush_ms: u64,
+    pub projection_batch_wall_ms: u64,
+    pub projection_batch_transactions: usize,
     pub flush_files_ms: u64,
     pub flush_nodes_ms: u64,
     pub flush_edges_ms: u64,
@@ -1165,6 +1170,7 @@ impl<'a> ProjectionWriter<'a> {
                 self.storage,
                 &mut self.batched_storage,
                 &mut self.had_edges,
+                &mut self.stats,
             )?;
             accumulate_flush_breakdown(&mut self.stats, breakdown);
             WorkspaceIndexer::flush_file_errors(
@@ -1194,6 +1200,7 @@ impl<'a> ProjectionWriter<'a> {
             self.storage,
             &mut self.batched_storage,
             &mut self.had_edges,
+            &mut self.stats,
         )?;
         accumulate_flush_breakdown(&mut self.stats, breakdown);
         WorkspaceIndexer::flush_file_errors(
@@ -1678,9 +1685,11 @@ impl WorkspaceIndexer {
             }
         }
         let progress_already_emitted = serial_progress.map_or(0, |_| storages.len());
+        let source_prepare_ms = duration_ms_u64(lookup_started.elapsed());
+        stats.source_prepare_ms = stats.source_prepare_ms.saturating_add(source_prepare_ms);
         stats.artifact_cache_lookup_ms = stats
             .artifact_cache_lookup_ms
-            .saturating_add(duration_ms_u64(lookup_started.elapsed()));
+            .saturating_add(source_prepare_ms);
 
         let parse_started = Instant::now();
         let parse_results: Vec<PreparedIndexJobResult> = parse_jobs
@@ -2330,8 +2339,11 @@ impl WorkspaceIndexer {
         storage: &mut Storage,
         batched_storage: &mut IntermediateStorage,
         had_edges: &mut bool,
+        stats: &mut IncrementalIndexingStats,
     ) -> Result<codestory_store::ProjectionFlushBreakdown> {
         reconcile_rust_impl_anchors(storage, batched_storage)?;
+        let has_rows = projection_batch_has_rows(batched_storage);
+        let flush_started = has_rows.then(Instant::now);
         let breakdown = storage
             .projections()
             .flush_projection_batch(codestory_store::ProjectionBatch {
@@ -2344,6 +2356,14 @@ impl WorkspaceIndexer {
                 callable_projection_states: &batched_storage.callable_projection_states,
             })
             .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        if let Some(flush_started) = flush_started {
+            let batch_wall_ms = duration_ms_u64(flush_started.elapsed());
+            debug_assert!(batch_wall_ms >= projection_flush_breakdown_ms(&breakdown));
+            stats.projection_batch_wall_ms =
+                stats.projection_batch_wall_ms.saturating_add(batch_wall_ms);
+            stats.projection_batch_transactions =
+                stats.projection_batch_transactions.saturating_add(1);
+        }
         if !batched_storage.edges.is_empty() {
             *had_edges = true;
         }
@@ -2964,6 +2984,25 @@ fn duration_ms_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+fn projection_batch_has_rows(storage: &IntermediateStorage) -> bool {
+    !storage.files.is_empty()
+        || !storage.file_content_hashes.is_empty()
+        || !storage.nodes.is_empty()
+        || !storage.edges.is_empty()
+        || !storage.occurrences.is_empty()
+        || !storage.component_access.is_empty()
+        || !storage.callable_projection_states.is_empty()
+}
+
+fn projection_flush_breakdown_ms(breakdown: &codestory_store::ProjectionFlushBreakdown) -> u64 {
+    u64::from(breakdown.files_ms)
+        .saturating_add(u64::from(breakdown.nodes_ms))
+        .saturating_add(u64::from(breakdown.edges_ms))
+        .saturating_add(u64::from(breakdown.occurrences_ms))
+        .saturating_add(u64::from(breakdown.component_access_ms))
+        .saturating_add(u64::from(breakdown.callable_projection_ms))
+}
+
 fn accumulate_projection_writer_stats(
     stats: &mut IncrementalIndexingStats,
     writer_stats: &IncrementalIndexingStats,
@@ -2986,6 +3025,12 @@ fn accumulate_projection_writer_stats(
     stats.projection_flush_ms = stats
         .projection_flush_ms
         .saturating_add(writer_stats.projection_flush_ms);
+    stats.projection_batch_wall_ms = stats
+        .projection_batch_wall_ms
+        .saturating_add(writer_stats.projection_batch_wall_ms);
+    stats.projection_batch_transactions = stats
+        .projection_batch_transactions
+        .saturating_add(writer_stats.projection_batch_transactions);
     stats.flush_files_ms = stats
         .flush_files_ms
         .saturating_add(writer_stats.flush_files_ms);
@@ -3014,12 +3059,7 @@ fn accumulate_flush_breakdown(
     stats: &mut IncrementalIndexingStats,
     breakdown: codestory_store::ProjectionFlushBreakdown,
 ) {
-    let total = u64::from(breakdown.files_ms)
-        .saturating_add(u64::from(breakdown.nodes_ms))
-        .saturating_add(u64::from(breakdown.edges_ms))
-        .saturating_add(u64::from(breakdown.occurrences_ms))
-        .saturating_add(u64::from(breakdown.component_access_ms))
-        .saturating_add(u64::from(breakdown.callable_projection_ms));
+    let total = projection_flush_breakdown_ms(&breakdown);
     stats.projection_flush_ms = stats.projection_flush_ms.saturating_add(total);
     stats.flush_files_ms = stats
         .flush_files_ms
@@ -21623,6 +21663,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(stats.full_refresh_chunk_max_planned_bytes, 0);
         assert_eq!(stats.full_refresh_chunk_max_nodes, 0);
         assert_eq!(stats.full_refresh_chunk_budget_overruns, 0);
+        assert_eq!(stats.projection_batch_transactions, 0);
+        assert_eq!(stats.projection_batch_wall_ms, 0);
         Ok(())
     }
 
@@ -21703,6 +21745,9 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(stats.artifact_cache_misses, 1);
         assert_eq!(stats.artifact_cache_hits, 1);
         assert_eq!(stats.artifact_cache_write_transactions, 1);
+        assert_eq!(stats.source_prepare_ms, stats.artifact_cache_lookup_ms);
+        assert_eq!(stats.projection_batch_transactions, 1);
+        assert!(stats.projection_batch_wall_ms >= stats.projection_flush_ms);
         assert_eq!(
             storage
                 .get_nodes()?
@@ -21783,9 +21828,24 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(serial_stats.full_refresh_queue_capacity, 0);
         assert_eq!(pipeline_stats.full_refresh_queue_capacity, 1);
         assert_eq!(
+            serial_stats.source_prepare_ms,
+            serial_stats.artifact_cache_lookup_ms
+        );
+        assert_eq!(
+            pipeline_stats.source_prepare_ms,
+            pipeline_stats.artifact_cache_lookup_ms
+        );
+        assert_eq!(
             serial_stats.artifact_cache_write_transactions,
             pipeline_stats.artifact_cache_write_transactions
         );
+        assert_eq!(
+            serial_stats.projection_batch_transactions,
+            pipeline_stats.projection_batch_transactions
+        );
+        assert!(serial_stats.projection_batch_transactions > 0);
+        assert!(serial_stats.projection_batch_wall_ms >= serial_stats.projection_flush_ms);
+        assert!(pipeline_stats.projection_batch_wall_ms >= pipeline_stats.projection_flush_ms);
         Ok(())
     }
 

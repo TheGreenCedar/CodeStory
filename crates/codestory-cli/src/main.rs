@@ -8063,13 +8063,14 @@ mod tests {
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
-        AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse,
-        IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto,
-        IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId,
-        PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto,
-        PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
-        ProjectSummary, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-        SemanticModeDto, SourcePolicyExclusionDto, StorageStatsDto, TrailContextDto,
+        AgentRetrievalTraceDto, EdgeId, EdgeKind, FullRefreshWallTimings, GraphEdgeDto,
+        GraphNodeDto, GraphResponse, IndexMode, IndexedFileDto,
+        IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto, IndexedFilesDto,
+        IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId, PacketBudgetDto,
+        PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanDto,
+        PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, ProjectSummary,
+        RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin, SemanticModeDto,
+        SourcePolicyExclusionDto, StorageStatsDto, TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8930,6 +8931,24 @@ mod tests {
             edge_resolution_ms: 30,
             error_flush_ms: 4,
             cleanup_ms: 5,
+            full_refresh_wall: Some(FullRefreshWallTimings {
+                core_refresh_ms: 1_000,
+                live_inspection_ms: 10,
+                source_discovery_ms: 20,
+                stage_open_ms: 30,
+                indexer_execution_ms: 400,
+                coverage_validation_ms: 40,
+                copy_forward_ms: 50,
+                semantic_stage_ms: 150,
+                snapshot_stage_ms: 100,
+                publication_prepare_ms: 50,
+                search_generation_ms: 100,
+                catalog_publication_ms: 30,
+                unattributed_ms: 20,
+            }),
+            source_prepare_ms: Some(41),
+            projection_batch_wall_ms: Some(50),
+            projection_batch_transactions: Some(2),
             artifact_cache_write_ms: Some(6),
             artifact_cache_writes: Some(24),
             artifact_cache_write_transactions: Some(1),
@@ -8956,8 +8975,13 @@ mod tests {
             search_symbol_index_docs_written: Some(8192),
             search_symbol_index_writer_count: Some(1),
             search_symbol_index_commit_count: Some(1),
+            search_symbol_index_commit_ms: Some(64),
             search_symbol_index_reload_count: Some(1),
+            search_symbol_index_reload_ms: Some(65),
             runtime_cache_publish_ms: Some(63),
+            semantic_node_load_ms: Some(66),
+            semantic_node_load_rows: Some(8_192),
+            semantic_context_ms: Some(67),
             semantic_doc_build_ms: Some(7),
             semantic_embedding_ms: Some(8),
             semantic_db_upsert_ms: Some(9),
@@ -9196,11 +9220,16 @@ mod tests {
             "full_refresh_chunking: target_bytes=8388608 target_nodes=120000 file_ceiling=512 max_files=384 max_planned_bytes=7500000 max_nodes=98000 overruns=0 planning_ms=5"
         ));
         assert!(markdown.contains(
-            "symbol_index: stream_ms=60 stream_rows=8192 stream_batches=2 docs=8192 writers=1 commits=1 reloads=1"
+            "symbol_index: stream_ms=60 stream_rows=8192 stream_batches=2 docs=8192 writers=1 commits=1 commit_ms=64 reloads=1 reload_ms=65"
         ));
+        assert!(markdown.contains(
+            "full_refresh_wall_ms: core_refresh=1000 live_inspection=10 source_discovery=20 stage_open=30 indexer_execution=400 coverage_validation=40 copy_forward=50 semantic_stage=150 snapshot_stage=100 publication_prepare=50 search_generation=100 catalog_publication=30 unattributed=20"
+        ));
+        assert!(markdown.contains("indexer_io_ms: source_prepare=41 projection_batch_wall=50"));
+        assert!(markdown.contains("projection_batches: transactions=2"));
         assert!(
             markdown
-                .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
+                .contains("semantic_ms: node_load=66 node_rows=8192 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
         );
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(

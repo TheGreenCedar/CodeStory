@@ -306,6 +306,25 @@ fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimi
         timings.cleanup_ms,
         timings.cache_refresh_ms.unwrap_or(0)
     );
+    if let Some(wall) = timings.full_refresh_wall.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "full_refresh_wall_ms: core_refresh={} live_inspection={} source_discovery={} stage_open={} indexer_execution={} coverage_validation={} copy_forward={} semantic_stage={} snapshot_stage={} publication_prepare={} search_generation={} catalog_publication={} unattributed={}",
+            wall.core_refresh_ms,
+            wall.live_inspection_ms,
+            wall.source_discovery_ms,
+            wall.stage_open_ms,
+            wall.indexer_execution_ms,
+            wall.coverage_validation_ms,
+            wall.copy_forward_ms,
+            wall.semantic_stage_ms,
+            wall.snapshot_stage_ms,
+            wall.publication_prepare_ms,
+            wall.search_generation_ms,
+            wall.catalog_publication_ms,
+            wall.unattributed_ms,
+        );
+    }
     append_index_cache_timings(markdown, timings);
     let _ = writeln!(
         markdown,
@@ -330,6 +349,19 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             ("search_index", timings.search_symbol_index_ms),
             ("runtime_publish", timings.runtime_cache_publish_ms),
         ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "indexer_io_ms",
+        &[
+            ("source_prepare", timings.source_prepare_ms),
+            ("projection_batch_wall", timings.projection_batch_wall_ms),
+        ],
+    );
+    append_optional_timings_line(
+        markdown,
+        "projection_batches",
+        &[("transactions", timings.projection_batch_transactions)],
     );
     append_optional_timings_line(
         markdown,
@@ -386,7 +418,9 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             ("docs", timings.search_symbol_index_docs_written),
             ("writers", timings.search_symbol_index_writer_count),
             ("commits", timings.search_symbol_index_commit_count),
+            ("commit_ms", timings.search_symbol_index_commit_ms),
             ("reloads", timings.search_symbol_index_reload_count),
+            ("reload_ms", timings.search_symbol_index_reload_ms),
         ],
     );
     append_optional_timings_line(
@@ -429,6 +463,9 @@ fn append_index_semantic_timings(markdown: &mut String, timings: &IndexingPhaseT
         markdown,
         "semantic_ms",
         &[
+            ("node_load", timings.semantic_node_load_ms),
+            ("node_rows", timings.semantic_node_load_rows),
+            ("context", timings.semantic_context_ms),
             ("doc_build", timings.semantic_doc_build_ms),
             ("embedding", timings.semantic_embedding_ms),
             ("db_upsert", timings.semantic_db_upsert_ms),

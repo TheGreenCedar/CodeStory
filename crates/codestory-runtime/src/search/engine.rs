@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
@@ -387,6 +388,8 @@ pub struct SymbolIndexWriteStats {
     pub writer_count: usize,
     pub commit_count: usize,
     pub reload_count: usize,
+    pub commit_duration: Duration,
+    pub reload_duration: Duration,
 }
 
 pub struct SymbolIndexSession<'a> {
@@ -1110,14 +1113,20 @@ impl SymbolIndexSession<'_> {
         let writer_count = usize::from(self.writer.is_some());
         let mut commit_count = 0;
         let mut reload_count = 0;
+        let mut commit_duration = Duration::ZERO;
+        let mut reload_duration = Duration::ZERO;
         if let Some(mut writer) = self.writer.take() {
             #[cfg(test)]
             if take_symbol_index_test_fault(SymbolIndexTestFault::Commit) {
                 bail!("injected symbol index commit failure");
             }
+            let commit_started = Instant::now();
             writer.commit()?;
+            commit_duration = commit_started.elapsed();
             commit_count = 1;
+            let reload_started = Instant::now();
             self.engine.reader.reload()?;
+            reload_duration = reload_started.elapsed();
             reload_count = 1;
         }
         self.finished = true;
@@ -1126,6 +1135,8 @@ impl SymbolIndexSession<'_> {
             writer_count,
             commit_count,
             reload_count,
+            commit_duration,
+            reload_duration,
         })
     }
 }
