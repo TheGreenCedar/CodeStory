@@ -14673,6 +14673,7 @@ fn index_full_for_runtime(
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
     let full_refresh_pipeline_enabled = index_stats.full_refresh_queue_capacity > 0;
+    let full_refresh_chunking_enabled = index_stats.full_refresh_chunk_target_bytes > 0;
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
@@ -14700,6 +14701,25 @@ fn index_full_for_runtime(
             ),
             full_refresh_writer_idle_ms: full_refresh_pipeline_enabled
                 .then_some(clamp_u64_to_u32(index_stats.full_refresh_writer_idle_ms)),
+            full_refresh_chunk_target_bytes: full_refresh_chunking_enabled
+                .then_some(index_stats.full_refresh_chunk_target_bytes),
+            full_refresh_chunk_target_nodes: full_refresh_chunking_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunk_target_nodes),
+            ),
+            full_refresh_chunk_file_ceiling: full_refresh_chunking_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunk_file_ceiling),
+            ),
+            full_refresh_chunk_max_files: full_refresh_chunking_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunk_max_files)),
+            full_refresh_chunk_max_planned_bytes: full_refresh_chunking_enabled
+                .then_some(index_stats.full_refresh_chunk_max_planned_bytes),
+            full_refresh_chunk_max_nodes: full_refresh_chunking_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunk_max_nodes)),
+            full_refresh_chunk_budget_overruns: full_refresh_chunking_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunk_budget_overruns),
+            ),
+            full_refresh_chunk_planning_ms: full_refresh_chunking_enabled
+                .then_some(clamp_u64_to_u32(index_stats.full_refresh_chunk_planning_ms)),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -15331,6 +15351,14 @@ fn run_incremental_indexing_common(
             full_refresh_queue_high_water: None,
             full_refresh_producer_blocked_ms: None,
             full_refresh_writer_idle_ms: None,
+            full_refresh_chunk_target_bytes: None,
+            full_refresh_chunk_target_nodes: None,
+            full_refresh_chunk_file_ceiling: None,
+            full_refresh_chunk_max_files: None,
+            full_refresh_chunk_max_planned_bytes: None,
+            full_refresh_chunk_max_nodes: None,
+            full_refresh_chunk_budget_overruns: None,
+            full_refresh_chunk_planning_ms: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_index_ms: None,
@@ -25276,6 +25304,17 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(full_timings.full_refresh_chunks_persisted, Some(1));
         assert!(full_timings.full_refresh_producer_blocked_ms.is_some());
         assert!(full_timings.full_refresh_writer_idle_ms.is_some());
+        assert_eq!(
+            full_timings.full_refresh_chunk_target_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(full_timings.full_refresh_chunk_target_nodes, Some(120_000));
+        assert_eq!(full_timings.full_refresh_chunk_file_ceiling, Some(512));
+        assert_eq!(full_timings.full_refresh_chunk_max_files, Some(1));
+        assert!(full_timings.full_refresh_chunk_max_planned_bytes.is_some());
+        assert!(full_timings.full_refresh_chunk_max_nodes.is_some());
+        assert_eq!(full_timings.full_refresh_chunk_budget_overruns, Some(0));
+        assert!(full_timings.full_refresh_chunk_planning_ms.is_some());
         let first = controller
             .index_publication()
             .expect("read first publication")
@@ -25293,6 +25332,17 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("incremental publication");
         assert!(incremental_timings.full_refresh_queue_capacity.is_none());
         assert!(incremental_timings.full_refresh_chunks_produced.is_none());
+        assert!(
+            incremental_timings
+                .full_refresh_chunk_target_bytes
+                .is_none()
+        );
+        assert!(
+            incremental_timings
+                .full_refresh_chunk_target_nodes
+                .is_none()
+        );
+        assert!(incremental_timings.full_refresh_chunk_planning_ms.is_none());
         let second = controller
             .index_publication()
             .expect("read second publication")

@@ -8939,6 +8939,14 @@ mod tests {
             full_refresh_queue_high_water: Some(1),
             full_refresh_producer_blocked_ms: Some(3),
             full_refresh_writer_idle_ms: Some(4),
+            full_refresh_chunk_target_bytes: Some(8_388_608),
+            full_refresh_chunk_target_nodes: Some(120_000),
+            full_refresh_chunk_file_ceiling: Some(512),
+            full_refresh_chunk_max_files: Some(384),
+            full_refresh_chunk_max_planned_bytes: Some(7_500_000),
+            full_refresh_chunk_max_nodes: Some(98_000),
+            full_refresh_chunk_budget_overruns: Some(0),
+            full_refresh_chunk_planning_ms: Some(5),
             cache_refresh_ms: Some(6),
             search_projection_rebuild_ms: Some(61),
             search_symbol_index_ms: Some(62),
@@ -9177,6 +9185,9 @@ mod tests {
         assert!(markdown.contains("artifact_cache: writes=24 transactions=1"));
         assert!(markdown.contains(
             "full_refresh_pipeline: produced=2 persisted=2 queue_capacity=1 queue_high_water=1 producer_blocked_ms=3 writer_idle_ms=4"
+        ));
+        assert!(markdown.contains(
+            "full_refresh_chunking: target_bytes=8388608 target_nodes=120000 file_ceiling=512 max_files=384 max_planned_bytes=7500000 max_nodes=98000 overruns=0 planning_ms=5"
         ));
         assert!(markdown.contains("symbol_index: docs=8192 writers=1 commits=1 reloads=1"));
         assert!(
