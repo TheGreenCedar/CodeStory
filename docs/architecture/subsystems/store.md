@@ -7,7 +7,8 @@ recovery.
 ## Durable state
 
 - file, node, edge, occurrence, component, callable, bookmark, and trail rows;
-- grounding snapshots and search projections;
+- grounding snapshots and canonical paged search-symbol reads from the node
+  table; the legacy materialized search projection remains compatibility-only;
 - graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
 - verified source-policy exclusion rows and their project/workspace/core-bound
   count-and-digest manifest;

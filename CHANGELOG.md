@@ -11,6 +11,11 @@
   document checkpoints and commit/reload once, instead of reopening and
   committing the writer for every 8,192 symbols. Index telemetry reports
   symbol documents, writers, commits, and reloads.
+- Runtime and retrieval now stream canonical search symbols directly from the
+  node table in 4,096-row keyset pages. Fresh full and incremental builds no
+  longer rewrite the legacy SQLite search projection or materialize every
+  complete graph node before search construction; telemetry reports stream
+  time, rows, and batches alongside the single Tantivy commit.
 - File-backed full refreshes now overlap preparation and Rayon parsing with a
   dedicated staged SQLite writer through a capacity-one queue. Cancellation
   drains only accepted chunks, incremental indexing keeps its serial path, and

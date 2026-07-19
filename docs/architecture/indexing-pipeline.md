@@ -101,7 +101,7 @@ flowchart TD
     resolve --> errors["Flush indexing errors"]
     errors --> cleanup["Incremental cleanup for removed files"]
     cleanup --> snapshots["Runtime refreshes or publishes snapshots"]
-    snapshots --> semantic["Runtime syncs lexical search projection, symbol docs, component reports, and dense anchors"]
+    snapshots --> semantic["Runtime streams canonical symbols and syncs symbol docs, component reports, and dense anchors"]
     semantic --> summary["CLI receives retrieval state and phase timings"]
 ```
 
@@ -312,16 +312,24 @@ Full and incremental snapshot behavior are intentionally not symmetric.
 
 ### 11. Runtime synchronizes core search inputs
 
-After graph and snapshot work, runtime rebuilds the search-symbol projection, opens or refreshes the persisted Tantivy search directory, writes graph-native symbol docs, writes deterministic component reports, and synchronizes selected dense-anchor docs. This is part of the default `index` contract.
+After graph and snapshot work, runtime streams canonical search symbols
+directly from the node table, opens or refreshes the persisted Tantivy search
+directory, writes graph-native symbol docs, writes deterministic component
+reports, and synchronizes selected dense-anchor docs. The legacy
+`search_symbol_projection` table remains a compatibility surface; product
+indexing does not rebuild or read it. This is part of the default `index`
+contract.
 
-A new persisted symbol generation uses one 20 MB Tantivy writer across the
-existing 8,192-document checkpoints. Runtime checks cancellation after each
-checkpoint and immediately before the single commit/reload. Dropping an
-unfinished writer restores its in-memory fuzzy projection; the generation is
-not admitted until document-count validation and the completion marker both
-succeed. This protects process failure and cancellation. The completion-marker
-rename does not claim power-loss durability before its parent directory is
-synced.
+A new persisted symbol generation reads the canonical count and then advances
+through 4,096-row node-id keyset pages. It retains only the resident name map
+and search structures, rather than loading every complete graph node or a
+second derived SQLite table into memory. One 20 MB Tantivy writer spans all
+pages and commits/reloads once. Runtime checks cancellation after each page and
+immediately before the commit. Dropping an unfinished writer restores its
+in-memory fuzzy projection; the generation is not admitted until the streamed,
+indexed, and stored document counts agree and the completion marker succeeds.
+This protects process failure and cancellation. The completion-marker rename
+does not claim power-loss durability before its parent directory is synced.
 
 Semantic sync does these pieces of work:
 
@@ -399,9 +407,10 @@ and publishes the attested generation. Core indexing never loads the model.
 
 The index summary reports graph and semantic work separately:
 
-- `timings_ms.cache_refresh`: wrapper time for search projection, search indexing, semantic sync, and runtime publication
-- `cache_ms.search_projection`: SQLite search-symbol projection rebuild from persisted nodes
+- `timings_ms.cache_refresh`: wrapper time for canonical symbol streaming, search indexing, semantic sync, and runtime publication
+- `cache_ms.search_projection`: compatibility timing for the retired SQLite search-symbol projection rebuild; fresh product builds report zero
 - `cache_ms.search_index`: runtime search index construction for symbol names
+- `symbol_index.stream_ms`, `stream_rows`, and `stream_batches`: nested canonical-node read telemetry; stream time is part of `cache_ms.search_index`, not an additive phase
 - `symbol_index`: documents written plus Tantivy writer, commit, and reader-reload counts; completed-generation reuse reports zero for each count
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
 - `semantic_ms.doc_build`: generated semantic text and hashes

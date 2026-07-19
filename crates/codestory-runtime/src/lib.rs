@@ -4760,14 +4760,6 @@ fn read_line_capped<R: BufRead>(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticProjectionMode {
-    PersistBackedDocs,
-    LoadPersistedDocs,
-    SkipPersistence,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SemanticProjectionStats {
     reported: bool,
@@ -4804,6 +4796,9 @@ struct SemanticRefreshScope<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SearchStateBuildStats {
     search_projection_rebuild_ms: u32,
+    search_symbol_stream_ms: u32,
+    search_symbol_stream_rows: u32,
+    search_symbol_stream_batches: u32,
     search_symbol_index_ms: u32,
     search_symbol_index_docs_written: u32,
     search_symbol_index_writer_count: u32,
@@ -4854,6 +4849,9 @@ fn apply_semantic_projection_stats(
 
 fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRefreshStats) {
     timings.search_projection_rebuild_ms = Some(stats.search_stats.search_projection_rebuild_ms);
+    timings.search_symbol_stream_ms = Some(stats.search_stats.search_symbol_stream_ms);
+    timings.search_symbol_stream_rows = Some(stats.search_stats.search_symbol_stream_rows);
+    timings.search_symbol_stream_batches = Some(stats.search_stats.search_symbol_stream_batches);
     timings.search_symbol_index_ms = Some(stats.search_stats.search_symbol_index_ms);
     timings.search_symbol_index_docs_written =
         Some(stats.search_stats.search_symbol_index_docs_written);
@@ -4869,56 +4867,20 @@ fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRef
 
 #[cfg(test)]
 fn build_search_state(
-    storage: &mut Storage,
     search_storage_path: Option<&Path>,
     nodes: Vec<codestory_contracts::graph::Node>,
-    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-    semantic_projection_mode: SemanticProjectionMode,
-    hydrate_semantic_docs: bool,
 ) -> Result<SearchStateBuildResult, ApiError> {
-    build_search_state_for_runtime(
-        storage,
-        search_storage_path,
-        nodes,
-        llm_refresh_file_scope,
-        semantic_projection_mode,
-        SearchStateBuildContext {
-            hydrate_semantic_docs,
-            runtime: &test_sidecar_runtime_from_env(),
-            cancel_token: None,
-        },
-    )
+    build_search_state_for_nodes(search_storage_path, nodes, None)
 }
 
-struct SearchStateBuildContext<'a> {
-    hydrate_semantic_docs: bool,
-    runtime: &'a codestory_retrieval::SidecarRuntimeConfig,
-    cancel_token: Option<&'a CancellationToken>,
-}
-
-fn build_search_state_for_runtime(
-    storage: &mut Storage,
+#[cfg(test)]
+fn build_search_state_for_nodes(
     search_storage_path: Option<&Path>,
     nodes: Vec<codestory_contracts::graph::Node>,
-    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-    semantic_projection_mode: SemanticProjectionMode,
-    context: SearchStateBuildContext<'_>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<SearchStateBuildResult, ApiError> {
-    let SearchStateBuildContext {
-        hydrate_semantic_docs,
-        runtime,
-        cancel_token,
-    } = context;
-    let projection_started = Instant::now();
-    match llm_refresh_file_scope {
-        Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
-        None => storage.rebuild_search_symbol_projection_from_node_table(),
-    }
-    .map_err(|e| ApiError::internal(format!("Failed to rebuild search symbol projection: {e}")))?;
-    let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
-
     let search_index_started = Instant::now();
-    let mut node_names = HashMap::new();
+    let mut node_names = HashMap::with_capacity(nodes.len());
     let mut engine = SearchEngine::new(search_storage_path).map_err(|error| {
         if search::engine::is_persisted_search_index_busy(&error) {
             ApiError::new(
@@ -4968,46 +4930,25 @@ fn build_search_state_for_runtime(
     }
     let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
     let search_stats = SearchStateBuildStats {
-        search_projection_rebuild_ms,
+        search_projection_rebuild_ms: 0,
+        search_symbol_stream_ms: 0,
+        search_symbol_stream_rows: clamp_usize_to_u32(nodes.len()),
+        search_symbol_stream_batches: clamp_usize_to_u32(
+            nodes.len().div_ceil(SEARCH_NODE_BATCH_SIZE),
+        ),
         search_symbol_index_ms,
         search_symbol_index_docs_written: clamp_usize_to_u32(symbol_write_stats.docs_written),
         search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
         search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
         search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
     };
-    let semantic_stats = match semantic_projection_mode {
-        SemanticProjectionMode::PersistBackedDocs => sync_llm_symbol_projection_for_runtime(
-            storage,
-            &nodes,
-            &node_names,
-            &mut engine,
-            SemanticRefreshScope {
-                file_ids: llm_refresh_file_scope,
-                component_reports: None,
-            },
-            hydrate_semantic_docs,
-            &dense_anchor_source_identity(storage)?,
-            None,
-            runtime,
-        )?,
-        SemanticProjectionMode::LoadPersistedDocs => load_persisted_semantic_docs_for_runtime(
-            storage,
-            &mut engine,
-            hydrate_semantic_docs,
-            runtime,
-        )?,
-        SemanticProjectionMode::SkipPersistence => {
-            tracing::debug!("Skipping semantic docs for transient search-state build");
-            engine.index_llm_symbol_docs(Vec::new());
-            SemanticProjectionStats::default()
-        }
-    };
+    engine.index_llm_symbol_docs(Vec::new());
     Ok(SearchStateBuildResult {
         publication: None,
         node_names,
         engine,
         search_stats,
-        semantic_stats,
+        semantic_stats: SemanticProjectionStats::default(),
     })
 }
 
@@ -5016,22 +4957,6 @@ fn current_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
-}
-
-fn dense_anchor_source_identity(storage: &Storage) -> Result<String, ApiError> {
-    storage
-        .get_index_publication()
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to read core publication identity for dense anchors: {error}"
-            ))
-        })
-        .map(|publication| {
-            publication.map_or_else(
-                || "core:unpublished".to_string(),
-                |publication| format!("core:{}:{}", publication.generation_id, publication.run_id),
-            )
-        })
 }
 
 fn runtime_relative_path(root: &Path, path: &Path) -> String {
@@ -5925,8 +5850,9 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
 
 const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 6;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
+#[cfg(test)]
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
-const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
+const SEARCH_SYMBOL_STREAM_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 512;
 #[cfg(test)]
 const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
@@ -6205,6 +6131,7 @@ struct SearchGenerationCatalogGuard {
 enum PublicationTestBoundary {
     Identity,
     SearchBuild,
+    SearchSymbolPage,
     SearchIndexWrite,
     SearchValidation,
     SearchCompletion,
@@ -6548,36 +6475,67 @@ fn discard_unpublished_search_generation(
     }
 }
 
-fn load_search_symbol_projection(
+fn load_canonical_search_symbols(
     storage: &Storage,
     batch_size: usize,
+    cancel_token: Option<&CancellationToken>,
+    mut consume_batch: impl FnMut(Vec<SearchSymbolProjection>) -> Result<(), ApiError>,
 ) -> Result<
     (
         HashMap<codestory_contracts::graph::NodeId, String>,
-        Vec<SearchSymbolProjection>,
+        SearchStateBuildStats,
     ),
     ApiError,
 > {
-    let mut node_names = HashMap::new();
-    let mut entries = Vec::new();
+    let count_started = Instant::now();
+    let expected_rows = storage
+        .get_canonical_search_symbol_count()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+        })?;
+    let mut node_names = HashMap::with_capacity(expected_rows as usize);
     let mut after_node_id = None;
     let batch_size = batch_size.max(1);
+    let mut stream_duration = count_started.elapsed();
+    let mut stream_rows = 0_usize;
+    let mut stream_batches = 0_usize;
     loop {
+        let batch_started = Instant::now();
         let batch = storage
-            .get_search_symbol_projection_batch_after(after_node_id, batch_size)
+            .get_canonical_search_symbol_batch_after(after_node_id, batch_size)
             .map_err(|e| {
-                ApiError::internal(format!("Failed to load search symbol projection: {e}"))
+                ApiError::internal(format!("Failed to stream canonical search symbols: {e}"))
             })?;
+        stream_duration = stream_duration.saturating_add(batch_started.elapsed());
         if batch.is_empty() {
             break;
         }
         after_node_id = batch.last().map(|entry| entry.node_id);
-        for entry in batch {
+        stream_rows = stream_rows.saturating_add(batch.len());
+        stream_batches = stream_batches.saturating_add(1);
+        for entry in &batch {
             node_names.insert(entry.node_id, entry.display_name.clone());
-            entries.push(entry);
+        }
+        consume_batch(batch)?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
         }
     }
-    Ok((node_names, entries))
+    if stream_rows != expected_rows as usize {
+        return Err(ApiError::internal(format!(
+            "Canonical search symbol stream count changed: expected {expected_rows}, loaded {stream_rows}"
+        )));
+    }
+    Ok((
+        node_names,
+        SearchStateBuildStats {
+            search_projection_rebuild_ms: 0,
+            search_symbol_stream_ms: clamp_u128_to_u32(stream_duration.as_millis()),
+            search_symbol_stream_rows: clamp_usize_to_u32(stream_rows),
+            search_symbol_stream_batches: clamp_usize_to_u32(stream_batches),
+            ..SearchStateBuildStats::default()
+        },
+    ))
 }
 
 struct LoadedSearchState {
@@ -6607,23 +6565,28 @@ fn load_persisted_search_state_for_runtime(
         ))
     })?;
     if publication.is_none() {
-        let nodes = storage.get_nodes().map_err(|error| {
-            ApiError::internal(format!("Failed to load legacy search nodes: {error}"))
-        })?;
-        let mut node_names = HashMap::with_capacity(nodes.len());
         let mut engine = SearchEngine::new(None).map_err(|error| {
             ApiError::internal(format!("Failed to init search engine: {error}"))
         })?;
-        let search_nodes = nodes
-            .iter()
-            .map(|node| {
-                let display_name = node_display_name(node);
-                node_names.insert(node.id, display_name.clone());
-                (node.id, display_name)
-            })
-            .collect();
-        engine.index_nodes(search_nodes).map_err(|error| {
-            ApiError::internal(format!("Failed to index legacy search nodes: {error}"))
+        let mut symbol_session = engine.begin_symbol_index().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to start legacy symbol index writer: {error}"
+            ))
+        })?;
+        let (node_names, _) = load_canonical_search_symbols(storage, 10_000, None, |batch| {
+            symbol_session
+                .add_nodes(
+                    batch
+                        .into_iter()
+                        .map(|entry| (entry.node_id, entry.display_name)),
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to index legacy search nodes: {error}"))
+                })
+        })?;
+        symbol_session.finish().map_err(|error| {
+            ApiError::internal(format!("Failed to finish legacy symbol index: {error}"))
         })?;
         load_persisted_semantic_docs_for_runtime(storage, &mut engine, false, runtime)?;
         return Ok(LoadedSearchState {
@@ -6632,8 +6595,6 @@ fn load_persisted_search_state_for_runtime(
             engine,
         });
     }
-    let (node_names, projection) =
-        load_search_symbol_projection(storage, SEARCH_SYMBOL_PROJECTION_BATCH_SIZE)?;
     let search_storage_path =
         search_index_path_for_publication(storage_path, publication.as_ref())?;
     let completion = publication.as_ref().and_then(|publication| {
@@ -6641,7 +6602,6 @@ fn load_persisted_search_state_for_runtime(
             .ok()?
             .to_string();
         read_search_generation_completion(&search_storage_path, &generation_id)
-            .filter(|marker| marker.symbol_count == projection.len() as u64)
     });
     if publication.is_some() && completion.is_none() {
         return Err(ApiError::new(
@@ -6659,20 +6619,35 @@ fn load_persisted_search_state_for_runtime(
                 ),
             )
         })?;
-    engine.load_symbol_projection(
-        projection
-            .iter()
-            .map(|entry| (entry.node_id, entry.display_name.clone())),
-    );
-    let completion_count_mismatch = completion
-        .as_ref()
-        .is_some_and(|marker| marker.tantivy_doc_count != engine.tantivy_doc_count() as u64);
-    if engine.full_text_doc_count() != projection.len() || completion_count_mismatch {
+    engine.load_symbol_projection(std::iter::empty());
+    let (node_names, stream_stats) =
+        load_canonical_search_symbols(storage, SEARCH_SYMBOL_STREAM_BATCH_SIZE, None, |batch| {
+            engine.extend_symbol_projection(
+                batch
+                    .into_iter()
+                    .map(|entry| (entry.node_id, entry.display_name)),
+            );
+            Ok(())
+        })?;
+    let completion_count_mismatch = completion.as_ref().is_some_and(|marker| {
+        marker.symbol_count != stream_stats.search_symbol_stream_rows as u64
+            || marker.tantivy_doc_count != engine.tantivy_doc_count() as u64
+    });
+    if engine.full_text_doc_count() != stream_stats.search_symbol_stream_rows as usize
+        || completion_count_mismatch
+    {
         return Err(ApiError::new(
             "cache_busy",
             format!(
-                "Completed search generation {} does not match its core projection.",
-                search_storage_path.display()
+                "Completed search generation {} does not match its core symbols: streamed={}, searchable={}, marker_symbols={}, stored_docs={}, marker_docs={}.",
+                search_storage_path.display(),
+                stream_stats.search_symbol_stream_rows,
+                engine.full_text_doc_count(),
+                completion.as_ref().map_or(0, |marker| marker.symbol_count),
+                engine.tantivy_doc_count(),
+                completion
+                    .as_ref()
+                    .map_or(0, |marker| marker.tantivy_doc_count),
             ),
         ));
     }
@@ -14725,6 +14700,9 @@ fn index_full_for_runtime(
                 .then_some(clamp_u64_to_u32(index_stats.full_refresh_chunk_planning_ms)),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
+            search_symbol_stream_ms: None,
+            search_symbol_stream_rows: None,
+            search_symbol_stream_batches: None,
             search_symbol_index_ms: None,
             search_symbol_index_docs_written: None,
             search_symbol_index_writer_count: None,
@@ -15371,6 +15349,9 @@ fn run_incremental_indexing_common(
             full_refresh_chunk_planning_ms: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
+            search_symbol_stream_ms: None,
+            search_symbol_stream_rows: None,
+            search_symbol_stream_batches: None,
             search_symbol_index_ms: None,
             search_symbol_index_docs_written: None,
             search_symbol_index_writer_count: None,
@@ -15499,10 +15480,9 @@ fn reuse_completed_search_state(
     storage: &mut Storage,
     search_storage_path: &Path,
     publication: &IndexPublicationRecord,
-    nodes: &[codestory_contracts::graph::Node],
-    llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     hydrate_semantic_docs: bool,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<Option<SearchStateBuildResult>, ApiError> {
     let generation_id = Uuid::parse_str(&publication.generation_id)
         .map_err(|error| {
@@ -15513,22 +15493,9 @@ fn reuse_completed_search_state(
         })?
         .to_string();
     let Some(marker) = read_search_generation_completion(search_storage_path, &generation_id)
-        .filter(|marker| marker.symbol_count == nodes.len() as u64)
     else {
         return Ok(None);
     };
-
-    let projection_started = Instant::now();
-    match llm_refresh_scope {
-        Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
-        None => storage.rebuild_search_symbol_projection_from_node_table(),
-    }
-    .map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to rebuild search symbol projection before generation reuse: {error}"
-        ))
-    })?;
-    let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
 
     let search_index_started = Instant::now();
     let mut engine = match SearchEngine::open_existing(search_storage_path) {
@@ -15541,26 +15508,36 @@ fn reuse_completed_search_state(
             return Ok(None);
         }
     };
-    let mut node_names = HashMap::with_capacity(nodes.len());
-    engine.load_symbol_projection(nodes.iter().map(|node| {
-        let display_name = node_display_name(node);
-        node_names.insert(node.id, display_name.clone());
-        (node.id, display_name)
-    }));
-    if engine.full_text_doc_count() != nodes.len()
+    engine.load_symbol_projection(std::iter::empty());
+    let (node_names, mut search_stats) = load_canonical_search_symbols(
+        storage,
+        SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+        cancel_token,
+        |batch| {
+            engine.extend_symbol_projection(
+                batch
+                    .into_iter()
+                    .map(|entry| (entry.node_id, entry.display_name)),
+            );
+            Ok(())
+        },
+    )?;
+    if marker.symbol_count != search_stats.search_symbol_stream_rows as u64
+        || engine.full_text_doc_count() != search_stats.search_symbol_stream_rows as usize
         || engine.tantivy_doc_count() as u64 != marker.tantivy_doc_count
     {
         tracing::warn!(
             path = %search_storage_path.display(),
             searchable_docs = engine.full_text_doc_count(),
             stored_docs = engine.tantivy_doc_count(),
-            expected_symbols = nodes.len(),
+            expected_symbols = search_stats.search_symbol_stream_rows,
             expected_stored_docs = marker.tantivy_doc_count,
             "Completed persisted search generation count validation failed and will be rebuilt"
         );
         return Ok(None);
     }
-    let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
+    search_stats.search_symbol_index_ms =
+        clamp_u128_to_u32(search_index_started.elapsed().as_millis());
     let semantic_stats = load_persisted_semantic_docs_for_runtime(
         storage,
         &mut engine,
@@ -15571,13 +15548,118 @@ fn reuse_completed_search_state(
         publication: Some(publication.clone()),
         node_names,
         engine,
-        search_stats: SearchStateBuildStats {
-            search_projection_rebuild_ms,
-            search_symbol_index_ms,
-            ..SearchStateBuildStats::default()
-        },
+        search_stats,
         semantic_stats,
     }))
+}
+
+fn build_persisted_search_state_from_canonical_symbols(
+    storage: &mut Storage,
+    search_storage_path: &Path,
+    hydrate_semantic_docs: bool,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<SearchStateBuildResult, ApiError> {
+    let search_index_started = Instant::now();
+    let count_started = Instant::now();
+    let expected_rows = storage
+        .get_canonical_search_symbol_count()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+        })?;
+    let mut stream_duration = count_started.elapsed();
+    let mut engine = SearchEngine::new(Some(search_storage_path)).map_err(|error| {
+        if search::engine::is_persisted_search_index_busy(&error) {
+            ApiError::new(
+                "cache_busy",
+                format!("Failed to init search engine: {error}"),
+            )
+        } else {
+            ApiError::internal(format!("Failed to init search engine: {error}"))
+        }
+    })?;
+    let mut node_names = HashMap::with_capacity(expected_rows as usize);
+    let mut symbol_session = engine.begin_symbol_index().map_err(|error| {
+        ApiError::internal(format!("Failed to start symbol index writer: {error}"))
+    })?;
+    let mut after_node_id = None;
+    let mut stream_rows = 0_usize;
+    let mut stream_batches = 0_usize;
+    loop {
+        let batch_started = Instant::now();
+        let batch = storage
+            .get_canonical_search_symbol_batch_after(after_node_id, SEARCH_SYMBOL_STREAM_BATCH_SIZE)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to stream canonical search symbols: {error}"
+                ))
+            })?;
+        stream_duration = stream_duration.saturating_add(batch_started.elapsed());
+        if batch.is_empty() {
+            break;
+        }
+        after_node_id = batch.last().map(|entry| entry.node_id);
+        stream_rows = stream_rows.saturating_add(batch.len());
+        stream_batches = stream_batches.saturating_add(1);
+        let symbols = batch
+            .into_iter()
+            .map(|entry| {
+                node_names.insert(entry.node_id, entry.display_name.clone());
+                (entry.node_id, entry.display_name)
+            })
+            .collect::<Vec<_>>();
+        symbol_session.add_nodes(symbols).map_err(|error| {
+            ApiError::internal(format!("Failed to index search nodes: {error}"))
+        })?;
+        #[cfg(test)]
+        publication_test_checkpoint(PublicationTestBoundary::SearchSymbolPage, cancel_token)?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+    }
+    if stream_rows != expected_rows as usize {
+        return Err(ApiError::internal(format!(
+            "Canonical search symbol stream count changed: expected {expected_rows}, loaded {stream_rows}"
+        )));
+    }
+    #[cfg(test)]
+    publication_test_checkpoint(PublicationTestBoundary::SearchIndexWrite, cancel_token)?;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let symbol_write_stats = symbol_session
+        .finish()
+        .map_err(|error| ApiError::internal(format!("Failed to commit symbol index: {error}")))?;
+    if engine.full_text_doc_count() != stream_rows {
+        return Err(ApiError::internal(format!(
+            "Persisted search generation validation failed: indexed {} docs for {stream_rows} canonical symbols",
+            engine.full_text_doc_count()
+        )));
+    }
+    let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
+    let semantic_stats = load_persisted_semantic_docs_for_runtime(
+        storage,
+        &mut engine,
+        hydrate_semantic_docs,
+        runtime,
+    )?;
+    Ok(SearchStateBuildResult {
+        publication: None,
+        node_names,
+        engine,
+        search_stats: SearchStateBuildStats {
+            search_projection_rebuild_ms: 0,
+            search_symbol_stream_ms: clamp_u128_to_u32(stream_duration.as_millis()),
+            search_symbol_stream_rows: clamp_usize_to_u32(stream_rows),
+            search_symbol_stream_batches: clamp_usize_to_u32(stream_batches),
+            search_symbol_index_ms,
+            search_symbol_index_docs_written: clamp_usize_to_u32(symbol_write_stats.docs_written),
+            search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
+            search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
+            search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
+        },
+        semantic_stats,
+    })
 }
 
 #[cfg(test)]
@@ -15604,7 +15686,7 @@ type SearchCompletionValidator<'a> =
 fn rebuild_search_state_from_storage_for_runtime(
     storage: &mut Storage,
     storage_path: &Path,
-    llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+    _llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     hydrate_semantic_docs: bool,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     cancel_token: Option<&CancellationToken>,
@@ -15621,18 +15703,14 @@ fn rebuild_search_state_from_storage_for_runtime(
         .transpose()?;
     let search_storage_path =
         search_index_path_for_publication(storage_path, publication.as_ref())?;
-    let nodes = storage
-        .get_nodes()
-        .map_err(|e| ApiError::internal(format!("Failed to load nodes for search rebuild: {e}")))?;
     let reused = match publication.as_ref() {
         Some(publication) => reuse_completed_search_state(
             storage,
             &search_storage_path,
             publication,
-            &nodes,
-            llm_refresh_scope,
             hydrate_semantic_docs,
             runtime,
+            cancel_token,
         )?,
         None => None,
     };
@@ -15644,17 +15722,12 @@ fn rebuild_search_state_from_storage_for_runtime(
     let built_new = reused.is_none();
     let mut result = match reused {
         Some(result) => result,
-        None => build_search_state_for_runtime(
+        None => build_persisted_search_state_from_canonical_symbols(
             storage,
-            Some(search_storage_path.as_path()),
-            nodes,
-            llm_refresh_scope,
-            SemanticProjectionMode::LoadPersistedDocs,
-            SearchStateBuildContext {
-                hydrate_semantic_docs,
-                runtime,
-                cancel_token,
-            },
+            search_storage_path.as_path(),
+            hydrate_semantic_docs,
+            runtime,
+            cancel_token,
         )
         .map_err(|mut error| {
             error.message = format!("Failed to rebuild search state: {}", error.message);
@@ -21441,7 +21514,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn build_search_state_scopes_projection_rebuild_to_touched_files() {
+    fn build_search_state_ignores_stale_legacy_projection_rows() {
         let mut storage = Storage::new_in_memory().expect("storage");
         storage
             .insert_nodes_batch(&[
@@ -21476,10 +21549,6 @@ fn build_llm_symbol_doc_text() -> String {
             ])
             .expect("insert nodes");
         storage
-            .rebuild_search_symbol_projection_from_node_table()
-            .expect("full projection");
-
-        storage
             .insert_nodes_batch(&[Node {
                 id: CoreNodeId(901),
                 kind: NodeKind::FUNCTION,
@@ -21497,16 +21566,16 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("seed untouched stale projection");
 
         let nodes = storage.get_nodes().expect("nodes");
-        let touched = HashSet::from([CoreNodeId(900)]);
-        build_search_state(
-            &mut storage,
-            None,
-            nodes,
-            Some(&touched),
-            SemanticProjectionMode::SkipPersistence,
-            false,
-        )
-        .expect("scoped search state");
+        let result =
+            build_search_state(None, nodes).expect("build search state from canonical nodes");
+        assert_eq!(
+            result.node_names.get(&CoreNodeId(901)).map(String::as_str),
+            Some("pkg::renamed")
+        );
+        assert_eq!(
+            result.node_names.get(&CoreNodeId(911)).map(String::as_str),
+            Some("pkg::untouched")
+        );
 
         let projection = storage
             .get_search_symbol_projection_batch_after(None, 10)
@@ -21516,16 +21585,85 @@ fn build_llm_symbol_doc_text() -> String {
             .map(|entry| (entry.node_id, entry.display_name))
             .collect();
         assert_eq!(
-            names_by_id.get(&CoreNodeId(900)).map(String::as_str),
-            Some("src/changed.rs")
-        );
-        assert_eq!(
-            names_by_id.get(&CoreNodeId(901)).map(String::as_str),
-            Some("pkg::renamed")
-        );
-        assert_eq!(
             names_by_id.get(&CoreNodeId(911)).map(String::as_str),
             Some("stale_other_file")
+        );
+    }
+
+    #[test]
+    fn persisted_search_build_streams_multiple_pages_through_one_writer() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("search stream tempdir");
+        let storage_path = temp.path().join("codestory.db");
+        let search_path = temp.path().join("search-generation");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        let nodes = (1..=4_100_i64)
+            .map(|id| Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("symbol_{id}"),
+                qualified_name: (id % 2 == 0).then(|| format!("pkg::symbol_{id}")),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert streamed search nodes");
+
+        let cancelled_search_path = temp.path().join("cancelled-search-generation");
+        let cancel_token = CancellationToken::new();
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchSymbolPage,
+            PublicationTestAction::Cancel,
+        );
+        let cancelled = match build_persisted_search_state_from_canonical_symbols(
+            &mut storage,
+            &cancelled_search_path,
+            false,
+            &test_sidecar_runtime_from_env(),
+            Some(&cancel_token),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("cancel after the first non-final page"),
+        };
+        assert_eq!(cancelled.code, "cancelled");
+        assert!(cancel_token.is_cancelled());
+        assert!(
+            !search_generation_completion_path(&cancelled_search_path).exists(),
+            "cancelled page stream must not publish a completion marker"
+        );
+        let cancelled_engine = SearchEngine::open_existing(&cancelled_search_path)
+            .expect("open uncommitted cancelled generation");
+        assert_eq!(
+            cancelled_engine.tantivy_doc_count(),
+            0,
+            "cancelled non-final page must not commit Tantivy documents"
+        );
+        drop(cancelled_engine);
+
+        let result = build_persisted_search_state_from_canonical_symbols(
+            &mut storage,
+            &search_path,
+            false,
+            &test_sidecar_runtime_from_env(),
+            None,
+        )
+        .expect("build persisted search from canonical stream");
+
+        assert_eq!(result.search_stats.search_projection_rebuild_ms, 0);
+        assert_eq!(result.search_stats.search_symbol_stream_rows, 4_100);
+        assert_eq!(result.search_stats.search_symbol_stream_batches, 2);
+        assert_eq!(result.search_stats.search_symbol_index_docs_written, 4_100);
+        assert_eq!(result.search_stats.search_symbol_index_writer_count, 1);
+        assert_eq!(result.search_stats.search_symbol_index_commit_count, 1);
+        assert_eq!(result.search_stats.search_symbol_index_reload_count, 1);
+        assert_eq!(result.node_names.len(), 4_100);
+        assert_eq!(result.engine.full_text_doc_count(), 4_100);
+        assert_eq!(
+            storage
+                .get_search_symbol_projection_count()
+                .expect("count legacy projection"),
+            0
         );
     }
 
@@ -21778,7 +21916,6 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn build_search_state_prefers_qualified_name() {
-        let mut storage = Storage::new_in_memory().expect("storage");
         let nodes = vec![Node {
             id: CoreNodeId(1),
             kind: NodeKind::FUNCTION,
@@ -21787,15 +21924,7 @@ fn build_llm_symbol_doc_text() -> String {
             ..Default::default()
         }];
 
-        let result = build_search_state(
-            &mut storage,
-            None,
-            nodes,
-            None,
-            SemanticProjectionMode::SkipPersistence,
-            true,
-        )
-        .expect("build search state");
+        let result = build_search_state(None, nodes).expect("build search state");
         let node_names = result.node_names;
         let engine = result.engine;
         assert_eq!(
@@ -24253,6 +24382,16 @@ fn build_llm_symbol_doc_text() -> String {
         storage
             .put_index_publication(&old_publication)
             .expect("publish old identity");
+        storage
+            .publish_source_policy_exclusion_generation(
+                &old_publication,
+                "test-project",
+                "test-workspace",
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+                &[],
+            )
+            .expect("publish old source policy identity");
         drop(
             rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
                 .expect("build old generation"),
@@ -24284,34 +24423,35 @@ fn build_llm_symbol_doc_text() -> String {
                 [],
             )
             .expect("rename symbol in staged core");
-        staged
-            .store_mut()
-            .clear_search_symbol_projection()
-            .expect("clear staged projection");
-        staged
-            .store_mut()
-            .rebuild_search_symbol_projection_from_node_table()
-            .expect("rebuild staged projection");
         let new_publication = test_index_publication(2, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
         staged
             .store_mut()
             .put_index_publication(&new_publication)
             .expect("publish staged identity");
         staged
+            .store_mut()
+            .publish_source_policy_exclusion_generation(
+                &new_publication,
+                "test-project",
+                "test-workspace",
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+                &[],
+            )
+            .expect("publish staged source policy identity");
+        staged
             .publish(&storage_path)
             .expect("publish replacement core");
 
         let mut live = Storage::open(&storage_path).expect("open replacement core");
-        let nodes = live.get_nodes().expect("load replacement nodes");
         let search_path = search_index_path_for_publication(&storage_path, Some(&new_publication))
             .expect("replacement search path");
-        let mut built = build_search_state(
+        let mut built = build_persisted_search_state_from_canonical_symbols(
             &mut live,
-            Some(&search_path),
-            nodes,
-            None,
-            SemanticProjectionMode::PersistBackedDocs,
+            &search_path,
             false,
+            &test_sidecar_runtime_from_env(),
+            None,
         )
         .expect("build replacement search generation");
         write_search_generation_completion(
@@ -24376,7 +24516,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn missing_or_corrupt_expected_search_generation_is_not_rebuilt_by_a_reader() {
+    fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_reader() {
         let _env = hybrid_test_env();
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
@@ -24401,6 +24541,25 @@ fn build_llm_symbol_doc_text() -> String {
             rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
                 .expect("writer builds expected generation"),
         );
+        let completion_path = search_generation_completion_path(&expected_path);
+        let correct_completion = fs::read(&completion_path).expect("read completion marker");
+        let mut mismatched_completion: SearchGenerationCompletion =
+            serde_json::from_slice(&correct_completion).expect("decode completion marker");
+        mismatched_completion.symbol_count = mismatched_completion.symbol_count.saturating_add(1);
+        fs::write(
+            &completion_path,
+            serde_json::to_vec(&mismatched_completion).expect("encode mismatched completion"),
+        )
+        .expect("write mismatched completion marker");
+
+        let mismatch_error = match load_persisted_search_state(&mut storage, &storage_path) {
+            Err(error) => error,
+            Ok(_) => panic!("reader must reject a count-mismatched search generation"),
+        };
+        assert_eq!(mismatch_error.code, "cache_busy");
+        assert!(expected_path.is_dir());
+
+        fs::write(&completion_path, correct_completion).expect("restore completion marker");
         fs::remove_dir_all(&expected_path).expect("remove built generation");
         fs::write(&expected_path, b"corrupt search generation")
             .expect("write corrupt generation artifact");
@@ -25361,6 +25520,25 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(full_timings.staged_sqlite_checkpoint_ms.is_some());
         assert!(full_timings.staged_sqlite_sync_ms.is_some());
+        assert_eq!(full_timings.search_projection_rebuild_ms, Some(0));
+        assert!(full_timings.search_symbol_stream_ms.is_some());
+        assert!(
+            full_timings
+                .search_symbol_stream_rows
+                .is_some_and(|rows| rows > 0)
+        );
+        assert_eq!(full_timings.search_symbol_stream_batches, Some(1));
+        assert_eq!(full_timings.search_symbol_index_writer_count, Some(1));
+        assert_eq!(full_timings.search_symbol_index_commit_count, Some(1));
+        assert_eq!(full_timings.search_symbol_index_reload_count, Some(1));
+        assert_eq!(
+            Storage::open(&storage_path)
+                .expect("open full publication")
+                .get_search_symbol_projection_count()
+                .expect("count legacy search projection"),
+            0,
+            "fresh full publication must not materialize the legacy projection table"
+        );
         let first = controller
             .index_publication()
             .expect("read first publication")
@@ -25396,6 +25574,14 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(incremental_timings.staged_sqlite_checkpoint_ms.is_none());
         assert!(incremental_timings.staged_sqlite_sync_ms.is_none());
+        assert_eq!(incremental_timings.search_projection_rebuild_ms, Some(0));
+        assert!(incremental_timings.search_symbol_stream_ms.is_some());
+        assert!(
+            incremental_timings
+                .search_symbol_stream_rows
+                .is_some_and(|rows| rows > full_timings.search_symbol_stream_rows.unwrap_or(0))
+        );
+        assert_eq!(incremental_timings.search_symbol_stream_batches, Some(1));
         let second = controller
             .index_publication()
             .expect("read second publication")
@@ -26084,9 +26270,10 @@ fn build_llm_symbol_doc_text() -> String {
         }
     }
 
-    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 9] = [
+    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 10] = [
         PublicationTestBoundary::Identity,
         PublicationTestBoundary::SearchBuild,
+        PublicationTestBoundary::SearchSymbolPage,
         PublicationTestBoundary::SearchIndexWrite,
         PublicationTestBoundary::SearchValidation,
         PublicationTestBoundary::SearchCompletion,

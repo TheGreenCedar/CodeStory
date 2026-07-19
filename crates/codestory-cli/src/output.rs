@@ -380,6 +380,9 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
         markdown,
         "symbol_index",
         &[
+            ("stream_ms", timings.search_symbol_stream_ms),
+            ("stream_rows", timings.search_symbol_stream_rows),
+            ("stream_batches", timings.search_symbol_stream_batches),
             ("docs", timings.search_symbol_index_docs_written),
             ("writers", timings.search_symbol_index_writer_count),
             ("commits", timings.search_symbol_index_commit_count),

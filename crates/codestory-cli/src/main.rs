@@ -8949,6 +8949,9 @@ mod tests {
             full_refresh_chunk_planning_ms: Some(5),
             cache_refresh_ms: Some(6),
             search_projection_rebuild_ms: Some(61),
+            search_symbol_stream_ms: Some(60),
+            search_symbol_stream_rows: Some(8192),
+            search_symbol_stream_batches: Some(2),
             search_symbol_index_ms: Some(62),
             search_symbol_index_docs_written: Some(8192),
             search_symbol_index_writer_count: Some(1),
@@ -9192,7 +9195,9 @@ mod tests {
         assert!(markdown.contains(
             "full_refresh_chunking: target_bytes=8388608 target_nodes=120000 file_ceiling=512 max_files=384 max_planned_bytes=7500000 max_nodes=98000 overruns=0 planning_ms=5"
         ));
-        assert!(markdown.contains("symbol_index: docs=8192 writers=1 commits=1 reloads=1"));
+        assert!(markdown.contains(
+            "symbol_index: stream_ms=60 stream_rows=8192 stream_batches=2 docs=8192 writers=1 commits=1 reloads=1"
+        ));
         assert!(
             markdown
                 .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")

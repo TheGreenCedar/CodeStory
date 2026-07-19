@@ -554,9 +554,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         u32::try_from(embedding_dim).context("negative embedding dimension")?,
     )?;
 
-    let mut storage =
-        Store::open(storage_path).context("open storage for retrieval sidecar input")?;
-    ensure_search_symbol_projection(&mut storage)?;
+    let storage = Store::open(storage_path).context("open storage for retrieval sidecar input")?;
     let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
     let input_snapshot = storage
         .read_snapshot()
@@ -1154,15 +1152,6 @@ fn update_precise_semantic_import_status(
 pub fn query_fingerprint(query: &str) -> String {
     let digest = Sha256::digest(query.as_bytes());
     format!("{:x}", digest)[..16].to_string()
-}
-
-fn ensure_search_symbol_projection(storage: &mut Store) -> Result<()> {
-    if storage.get_search_symbol_projection_count().unwrap_or(0) == 0 {
-        storage
-            .rebuild_search_symbol_projection_from_node_table()
-            .context("rebuild search_symbol_projection")?;
-    }
-    Ok(())
 }
 
 fn manifest_matches_sidecar_input(
@@ -2111,7 +2100,7 @@ mod tests {
     use super::*;
     use crate::retention::read_retention_marker;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
-    use codestory_store::SearchSymbolProjectionDetail;
+    use codestory_store::{SearchSymbolProjection, SearchSymbolProjectionDetail};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -2856,6 +2845,49 @@ mod tests {
         assert!(!semantic_projection_row(&row(NodeKind::VARIABLE)));
         assert!(!semantic_projection_row(&row(NodeKind::FIELD)));
         assert!(!semantic_projection_row(&row(NodeKind::UNKNOWN)));
+    }
+
+    #[test]
+    fn sidecar_input_preparation_ignores_empty_and_stale_legacy_symbol_projection() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
+            .expect("write source");
+        let mut storage = Store::new_in_memory().expect("storage");
+        insert_matching_semantic_doc(&mut storage, project.path());
+
+        assert_eq!(
+            storage
+                .get_search_symbol_projection_count()
+                .expect("empty legacy projection count"),
+            0
+        );
+        let empty_projection = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            "project",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+        )
+        .expect("prepare sidecar input without legacy projection");
+
+        storage
+            .upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+                node_id: NodeId(1),
+                display_name: "stale_wrong_name".into(),
+            }])
+            .expect("seed stale legacy projection");
+        let stale_projection = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            "project",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+        )
+        .expect("prepare sidecar input with stale legacy projection");
+
+        assert_eq!(empty_projection, stale_projection);
     }
 
     #[test]

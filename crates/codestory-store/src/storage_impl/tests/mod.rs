@@ -2357,6 +2357,121 @@ fn test_search_symbol_projection_round_trip_and_backfill() -> Result<(), Storage
 }
 
 #[test]
+fn canonical_search_symbols_page_node_table_independently_of_projection() -> Result<(), StorageError>
+{
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::METHOD,
+            serialized_name: "whitespace_fallback".to_string(),
+            qualified_name: Some("   ".to_string()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "qualified_fallback".to_string(),
+            qualified_name: Some("pkg::qualified".to_string()),
+            file_node_id: Some(NodeId(100)),
+            start_line: Some(7),
+            end_line: Some(11),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::CLASS,
+            serialized_name: "empty_fallback".to_string(),
+            qualified_name: Some(String::new()),
+            file_node_id: Some(NodeId(100)),
+            ..Default::default()
+        },
+    ])?;
+    storage.upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
+        node_id: NodeId(10),
+        display_name: "stale_projection_name".to_string(),
+    }])?;
+
+    assert_eq!(storage.get_canonical_search_symbol_count()?, 4);
+    let first_page = storage.get_canonical_search_symbol_batch_after(None, 2)?;
+    assert_eq!(
+        first_page,
+        vec![
+            SearchSymbolProjection {
+                node_id: NodeId(10),
+                display_name: "pkg::qualified".to_string(),
+            },
+            SearchSymbolProjection {
+                node_id: NodeId(20),
+                display_name: "empty_fallback".to_string(),
+            },
+        ]
+    );
+    let second_page = storage.get_canonical_search_symbol_batch_after(Some(NodeId(20)), 2)?;
+    assert_eq!(
+        second_page,
+        vec![
+            SearchSymbolProjection {
+                node_id: NodeId(30),
+                display_name: "whitespace_fallback".to_string(),
+            },
+            SearchSymbolProjection {
+                node_id: NodeId(100),
+                display_name: "src/lib.rs".to_string(),
+            },
+        ]
+    );
+    assert!(
+        storage
+            .get_canonical_search_symbol_batch_after(Some(NodeId(100)), 2)?
+            .is_empty()
+    );
+
+    let details = storage.get_canonical_search_symbol_detail_batch_after(None, usize::MAX)?;
+    assert_eq!(details.len(), 4);
+    assert_eq!(details[0].node_id, NodeId(10));
+    assert_eq!(details[0].display_name, "pkg::qualified");
+    assert_eq!(details[0].node_kind, Some(NodeKind::FUNCTION as i64));
+    assert_eq!(details[0].file_path.as_deref(), Some("src/lib.rs"));
+    assert_eq!(details[0].start_line, Some(7));
+    assert_eq!(details[0].end_line, Some(11));
+
+    storage.clear_search_symbol_projection()?;
+    assert_eq!(storage.get_search_symbol_projection_count()?, 0);
+    assert_eq!(
+        storage.get_canonical_search_symbol_batch_after(None, usize::MAX)?,
+        [first_page, second_page].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_search_symbol_batches_reject_zero_limit() -> Result<(), StorageError> {
+    let storage = Storage::new_in_memory()?;
+
+    assert!(matches!(
+        storage.get_canonical_search_symbol_batch_after(None, 0),
+        Err(StorageError::InvalidBatchLimit(
+            "get_canonical_search_symbol_batch_after"
+        ))
+    ));
+    assert!(matches!(
+        storage.get_canonical_search_symbol_detail_batch_after(None, 0),
+        Err(StorageError::InvalidBatchLimit(
+            "get_canonical_search_symbol_detail_batch_after"
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_scoped_search_symbol_projection_rebuild() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[
