@@ -636,6 +636,8 @@ pub fn structural_source_path_exclusion(path: &str) -> Option<&'static str> {
     }
     if file_name.contains(".min.")
         || file_name.ends_with(".min")
+        || file_name.starts_with("generated-")
+        || file_name.starts_with("generated_")
         || file_name.contains(".generated.")
         || file_name.contains("_generated.")
         || file_name.ends_with(".map")
@@ -1031,6 +1033,8 @@ mod tests {
             "build/settings.yaml",
             r"secrets\deploy.ps1",
             "web/app.min.json",
+            "plugins/codestory/generated-mcp-catalog.json",
+            "config/generated_service.yaml",
             "config/package-lock.json",
             "skills-lock.json",
         ] {
@@ -1053,6 +1057,7 @@ mod tests {
         }
         for root_relative in [
             "config.json",
+            "generatedly-config.json",
             "lock.json",
             "docs/guide.md",
             "scripts/deploy.ps1",
