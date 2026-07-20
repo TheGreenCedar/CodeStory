@@ -5601,10 +5601,11 @@ impl Storage {
         let resolved_target_placeholders = numbered_placeholders(1 + seed_count * 3, seed_count);
         let after_placeholder = seed_count * 4 + 1;
         let limit_placeholder = after_placeholder + usize::from(after_edge_id.is_some());
-        let after_clause = after_edge_id
-            .is_some()
-            .then(|| format!("AND e.id > ?{after_placeholder}"))
-            .unwrap_or_default();
+        let after_clause = if after_edge_id.is_some() {
+            format!("AND e.id > ?{after_placeholder}")
+        } else {
+            String::new()
+        };
         let query = format!(
             "{EDGE_SELECT_BASE}
              WHERE (
