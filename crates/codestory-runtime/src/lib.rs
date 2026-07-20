@@ -6120,10 +6120,12 @@ fn runtime_workspace_manifest(
     storage_path: &Path,
 ) -> anyhow::Result<WorkspaceManifest> {
     let mut workspace = WorkspaceManifest::open(root.to_path_buf())?;
-    workspace.exclude_discovery_roots([
+    workspace.exclude_discovery_files([
         storage_path.to_path_buf(),
         storage_path.with_extension("db-wal"),
         storage_path.with_extension("db-shm"),
+    ]);
+    workspace.exclude_discovery_directory_roots([
         search_index_storage_path(storage_path),
         search_index_generation_root(storage_path),
     ]);
