@@ -86,6 +86,12 @@ pub struct StoredFileState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshInputs {
     pub stored_files: Vec<StoredFileState>,
+    /// Complete verified exclusions from the currently published core.
+    ///
+    /// Structurally over-bound sources intentionally have no parser-backed
+    /// file row, so refresh planning must carry their exact content identity
+    /// separately to avoid rediscovering unchanged exclusions as new files.
+    pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     pub inventory: WorkspaceInventory,
 }
 

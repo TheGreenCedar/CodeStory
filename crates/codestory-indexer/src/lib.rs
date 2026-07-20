@@ -23155,6 +23155,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let manifest = codestory_workspace::WorkspaceManifest::open(dir.path().to_path_buf())?;
         let outcome = manifest.build_execution_outcome(&codestory_workspace::RefreshInputs {
             stored_files: storage.files().inventory()?,
+            policy_exclusions: Vec::new(),
             inventory: codestory_workspace::WorkspaceInventory::default(),
         })?;
         assert_eq!(outcome.plan.files_to_remove, vec![projected.files[0].id]);

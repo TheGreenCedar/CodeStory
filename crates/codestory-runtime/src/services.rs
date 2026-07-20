@@ -701,6 +701,15 @@ impl ActivationService {
                 .as_ref()
                 .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Fresh);
         if !local_ready {
+            if summary.stats.node_count > 0
+                && summary.stats.fatal_error_count == 0
+                && !self
+                    .controller
+                    .complete_core_requires_publication_repair(&storage_path)?
+                && let Some(publication) = summary.publication.clone()
+            {
+                operation.set_retained_local_publication(publication);
+            }
             return Err(ApiError::new(
                 "project_unavailable",
                 "activation did not produce a fresh complete core publication",
@@ -1267,6 +1276,25 @@ impl ActivationOperation {
         {
             snapshot.retained_core_publication = Some(publication);
             snapshot.capabilities.local_navigation = ActivationCapabilityState::Ready;
+            snapshot.revision += 1;
+        }
+        self.service.coordinator.changed.notify_all();
+    }
+
+    fn set_retained_local_publication(&self, publication: IndexPublicationDto) {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if let Some(snapshot) = state
+            .current
+            .as_mut()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+        {
+            snapshot.retained_core_publication = Some(publication);
+            snapshot.capabilities.local_navigation = ActivationCapabilityState::Retained;
             snapshot.revision += 1;
         }
         self.service.coordinator.changed.notify_all();
@@ -2008,7 +2036,7 @@ mod activation_tests {
         );
         assert_eq!(
             snapshot.retained_core_publication.as_ref(),
-            Some(&crate::index_publication_dto(retained))
+            Some(&crate::index_publication_dto(retained.clone()))
         );
         assert_eq!(
             snapshot.capabilities.broad_search,
@@ -2042,6 +2070,52 @@ mod activation_tests {
             .expect_err("broad search must remain fail-closed on a retained core");
         assert_eq!(broad.code, "project_unavailable");
         assert!(!entered_broad_response);
+
+        fs::remove_file(project.path().join("codestory_workspace.json"))
+            .expect("remove incomplete workspace");
+        fs::write(
+            project.path().join("src/lib.rs"),
+            "pub fn retained_fixture_after_publication() {}\n",
+        )
+        .expect("change source for replacement publication");
+        seeding_runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("advance complete core publication");
+        let advanced = Store::database_complete_index_publication(&storage_path)
+            .expect("read advanced publication")
+            .expect("complete advanced publication");
+        assert_ne!(advanced, retained);
+        fs::write(
+            project.path().join("codestory_workspace.json"),
+            r#"{"members":["src","missing"]}"#,
+        )
+        .expect("restore incomplete workspace");
+
+        let stale_identity = runtime
+            .public_operation_service()
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect_err("the old retained identity must not admit a newer live core");
+        assert_eq!(stale_identity.code, "project_unavailable");
+
+        ActivationOperation {
+            service: runtime.activation_service(),
+            operation_id: snapshot.operation_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+        .set_retained_local_publication(crate::index_publication_dto(advanced.clone()));
+        let rebound = runtime
+            .activation_service()
+            .snapshot()
+            .expect("rebound retained snapshot");
+        assert_eq!(
+            rebound.retained_core_publication.as_ref(),
+            Some(&crate::index_publication_dto(advanced))
+        );
+        runtime
+            .public_operation_service()
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("ground admits the exact post-publication retained core");
     }
 
     #[test]
