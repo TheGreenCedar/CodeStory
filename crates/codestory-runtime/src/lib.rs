@@ -21886,7 +21886,7 @@ fn build_llm_symbol_doc_text() -> String {
         std::fs::write(&error_path, "fn broken( {\n").expect("write error");
 
         {
-            let storage = Storage::open(&storage_path).expect("open storage");
+            let mut storage = Storage::open(&storage_path).expect("open storage");
             for (id, path) in [(11, unknown_path), (12, error_path)] {
                 let file = FileInfo {
                     id,
@@ -21916,11 +21916,29 @@ fn build_llm_symbol_doc_text() -> String {
                     coverage_reason: Some(FileCoverageReason::CollectorFailure),
                 })
                 .expect("insert error");
+            let publication = test_index_publication(1, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+            let identity = project_identity_v3(temp.path());
+            storage
+                .publish_source_policy_exclusion_generation(
+                    &publication,
+                    &identity.project_id,
+                    &identity.workspace_id,
+                    OVERSIZED_SOURCE_POLICY_VERSION,
+                    DEFAULT_SOURCE_FILE_BYTE_CAP,
+                    &[],
+                )
+                .expect("publish source policy identity");
+            storage
+                .publish_structural_text_unit_generation(&publication)
+                .expect("publish structural text identity");
+            storage
+                .put_index_publication(&publication)
+                .expect("publish complete core identity");
         }
 
         let controller = AppController::new();
         controller
-            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
         let output = controller
             .indexed_files(IndexedFilesRequest {
@@ -22232,10 +22250,9 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
         controller
-            .open_project(OpenProjectRequest {
-                path: workspace.path().to_string_lossy().to_string(),
-            })
+            .open_project_with_storage_path(workspace.path().to_path_buf(), storage_path)
             .expect("open workspace");
         controller
             .run_indexing_blocking(IndexMode::Full)
@@ -22262,10 +22279,9 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
         controller
-            .open_project(OpenProjectRequest {
-                path: workspace.path().to_string_lossy().to_string(),
-            })
+            .open_project_with_storage_path(workspace.path().to_path_buf(), storage_path)
             .expect("open workspace");
         controller
             .run_indexing_blocking(IndexMode::Full)
@@ -24827,6 +24843,9 @@ fn build_llm_symbol_doc_text() -> String {
         insert_semantic_fixture_nodes(&mut storage, &file_path);
         let old_publication = test_index_publication(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
         storage
+            .publish_structural_text_unit_generation(&old_publication)
+            .expect("publish old structural text identity");
+        storage
             .put_index_publication(&old_publication)
             .expect("publish old identity");
         storage
@@ -24871,6 +24890,10 @@ fn build_llm_symbol_doc_text() -> String {
             )
             .expect("rename symbol in staged core");
         let new_publication = test_index_publication(2, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        staged
+            .store_mut()
+            .publish_structural_text_unit_generation(&new_publication)
+            .expect("publish staged structural text identity");
         staged
             .store_mut()
             .put_index_publication(&new_publication)
