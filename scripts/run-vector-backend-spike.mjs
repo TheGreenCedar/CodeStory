@@ -20,6 +20,11 @@ import {
 import { basename, dirname, join, relative, resolve } from "node:path";
 
 const root = resolve(process.cwd());
+const criteriaInput = resolve(
+  process.env.CODESTORY_VECTOR_SPIKE_CRITERIA_JSON
+    ?? join(root, "benchmarks", "vector-backend-spike", "criteria.json"),
+);
+assertRegularFileWithoutSymlinks(criteriaInput, "declared comparison criteria");
 const binaryInput = resolve(process.env.CODESTORY_VECTOR_SPIKE_BINARY ?? join(root, "target", "release", "vector_backend_spike"));
 assertRegularFileWithoutSymlinks(binaryInput, "vector spike binary");
 const binary = realpathSync(binaryInput);
@@ -45,7 +50,6 @@ const sourceManifestInput = join(dirname(source), "vector-generation-manifest.js
 assertRegularFileWithoutSymlinks(sourceManifestInput, "source generation manifest");
 const sourceManifest = realpathSync(sourceManifestInput);
 const output = resolve(required("CODESTORY_VECTOR_SPIKE_OUTPUT_ROOT"));
-const counts = [1000, 10000, 25000, 100000];
 const blocks = 6;
 const cleanRoots = ["clean-a", "clean-b"];
 const timeoutMs = Number(process.env.CODESTORY_VECTOR_SPIKE_TIMEOUT_MS ?? 20 * 60_000);
@@ -72,6 +76,9 @@ const sourceArtifact = freezeArtifact(source, join(frozenPublicationRoot, "vecto
 const sourceManifestArtifact = freezeArtifact(sourceManifest, join(frozenPublicationRoot, "vector-generation-manifest.json"));
 const fixtureArtifact = freezeArtifact(fixture, join(frozenRoot, "fixture.json"));
 const catalogArtifact = freezeArtifact(catalog, join(frozenRoot, "catalog.json"));
+const criteriaArtifact = freezeArtifact(criteriaInput, join(frozenRoot, "criteria.json"));
+const criteria = JSON.parse(readFileSync(criteriaArtifact, "utf8"));
+const counts = declaredVectorCounts(criteria);
 const hostEvidencePath = join(output, "host-evidence.json");
 const fixtureVerificationPath = join(output, "fixture-verification.json");
 const verificationInputDigests = new Map([
@@ -79,6 +86,7 @@ const verificationInputDigests = new Map([
   [sourceManifestArtifact, sha256(readFileSync(sourceManifestArtifact))],
   [fixtureArtifact, sha256(readFileSync(fixtureArtifact))],
   [catalogArtifact, sha256(readFileSync(catalogArtifact))],
+  [criteriaArtifact, sha256(readFileSync(criteriaArtifact))],
 ]);
 const fixtureVerification = await invokeBinary([
   "verify-fixture",
@@ -99,11 +107,12 @@ const fixtureVerification = await invokeBinary([
 atomicJson(fixtureVerificationPath, fixtureVerification);
 sealFrozenArtifact(fixtureVerificationPath);
 const input = {
-  schema_version: 2,
+  schema_version: 3,
   source: relativeArtifact(output, sourceArtifact),
   source_generation_manifest: relativeArtifact(output, sourceManifestArtifact),
   fixture: relativeArtifact(output, fixtureArtifact),
   catalog: relativeArtifact(output, catalogArtifact),
+  criteria: relativeArtifact(output, criteriaArtifact),
   fixture_verification: relativeArtifact(output, fixtureVerificationPath),
   binary_sha256: hostEvidence.binary.sha256,
   host_evidence: relativeArtifact(output, hostEvidencePath),
@@ -206,6 +215,18 @@ function required(name) {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required`);
   return value;
+}
+
+function declaredVectorCounts(criteria) {
+  const values = criteria?.shared_workload?.vector_counts;
+  if (!Array.isArray(values)
+    || values.length !== 4
+    || values.some((value, index) => !Number.isInteger(value)
+      || value <= 0
+      || (index > 0 && value <= values[index - 1]))) {
+    throw new Error("comparison criteria need four strictly increasing positive integer vector counts");
+  }
+  return values;
 }
 
 function approvedHostEvidence(binaryPath) {
@@ -325,7 +346,7 @@ function relativeArtifact(rootPath, artifactPath) {
 }
 
 function assertFrozenInputs(inputManifest, manifestPath, expectedManifestSha256) {
-  if (inputManifest.schema_version !== 2) throw new Error("unsupported frozen input manifest schema");
+  if (inputManifest.schema_version !== 3) throw new Error("unsupported frozen input manifest schema");
   assertRegularFileWithoutSymlinks(manifestPath, "frozen input manifest");
   if (sha256(readFileSync(manifestPath)) !== expectedManifestSha256) throw new Error("frozen input manifest changed during the run");
   for (const [label, artifact] of Object.entries({
@@ -333,6 +354,7 @@ function assertFrozenInputs(inputManifest, manifestPath, expectedManifestSha256)
     source_generation_manifest: inputManifest.source_generation_manifest,
     fixture: inputManifest.fixture,
     catalog: inputManifest.catalog,
+    criteria: inputManifest.criteria,
     fixture_verification: inputManifest.fixture_verification,
     host_evidence: inputManifest.host_evidence,
   })) {
@@ -356,7 +378,7 @@ function assertFrozenInputs(inputManifest, manifestPath, expectedManifestSha256)
     || verification.fixture_sha256 !== inputManifest.fixture.sha256
     || verification.catalog_sha256 !== inputManifest.catalog.sha256
     || verification.binary_sha256 !== inputManifest.binary_sha256
-    || verification.selection_seed !== "codestory-1202-vector-spike-v1"
+    || verification.selection_seed !== "codestory-1202-vector-spike-v2"
     || typeof verification.query_vector_digest !== "string"
     || typeof verification.expected_document_digest !== "string") {
     throw new Error("fixture verification does not bind the reviewed frozen inputs");

@@ -18,9 +18,16 @@ an exact current source publication and both clean paired evidence roots exist,
 #1202 is **inconclusive** and #1196 must not choose a backend from this work.
 
 The runner uses six counterbalanced paired blocks for each declared nested
-real-anchor workload in two fresh evidence roots. It snapshots the admitted
+real-anchor workload in two fresh evidence roots. The declared workloads are
+1,000, 10,000, 25,000, and 75,000 vectors. Fixture preparation therefore
+requires at least 75,100 distinct anchors: the 75,000-vector largest workload
+plus the unchanged 100-anchor incremental generation. Clearing that size floor
+does not prove publication completeness; the retained 84,025-anchor core-only
+publication still lacks the retrieval manifest and vectors required by this
+harness. The runner snapshots the admitted
 `vectors.sqlite3`, its `vector-generation-manifest.json`, and the fixture into
-the evidence root together with the reviewed catalog. Before any candidate
+the evidence root together with the reviewed catalog and declared criteria.
+Before any candidate
 starts, the same digest-bound binary re-resolves every catalog file/symbol and
 document hash against the frozen source, re-embeds every query through the
 product transport, and rechecks the exact clean corpus and publication

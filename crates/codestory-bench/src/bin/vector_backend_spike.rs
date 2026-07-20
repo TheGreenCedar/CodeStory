@@ -27,7 +27,11 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 const DIMENSIONS: usize = 768;
 const TOP_K: usize = 20;
 const INCREMENTAL_COUNT: usize = 100;
-const SELECTION_SEED: &str = "codestory-1202-vector-spike-v1";
+const WORKLOAD_COUNTS: [usize; 4] = [1_000, 10_000, 25_000, 75_000];
+const LARGEST_WORKLOAD_COUNT: usize = 75_000;
+const FIXTURE_ANCHOR_COUNT: usize = LARGEST_WORKLOAD_COUNT + INCREMENTAL_COUNT;
+const FIXTURE_SCHEMA_VERSION: u32 = 5;
+const SELECTION_SEED: &str = "codestory-1202-vector-spike-v2";
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
 const EMBEDDING_AUTHORITY_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const EMBEDDING_AUTHORITY_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
@@ -194,6 +198,7 @@ struct FrozenInputManifest {
     source_generation_manifest: FrozenArtifact,
     fixture: FrozenArtifact,
     catalog: FrozenArtifact,
+    criteria: FrozenArtifact,
     fixture_verification: FrozenArtifact,
     binary_sha256: String,
     host_evidence: FrozenArtifact,
@@ -218,6 +223,7 @@ struct FrozenInputPaths {
     source_generation_manifest: PathBuf,
     fixture: PathBuf,
     catalog: PathBuf,
+    criteria: PathBuf,
     fixture_verification: PathBuf,
     host_evidence: PathBuf,
     binary_sha256: String,
@@ -574,8 +580,8 @@ fn prepare(
     let attestation = attest_source(&source)?;
     verify_source_matches_pinned_publication(&source, &attestation, &publication)?;
     ensure!(
-        attestation.point_count > 100_000 + INCREMENTAL_COUNT,
-        "production publication needs more than 100100 dense anchors"
+        attestation.point_count >= FIXTURE_ANCHOR_COUNT,
+        "production publication needs at least {FIXTURE_ANCHOR_COUNT} dense anchors"
     );
     let identities = resolve_catalog(&source, &catalog)?;
     let all_ids = list_node_ids(&source)?;
@@ -590,13 +596,13 @@ fn prepare(
         .filter(|id| !selected.contains(id))
         .collect::<Vec<_>>();
     ranked.sort_by_key(|id| selection_key(id));
-    let remaining = 100_000 + INCREMENTAL_COUNT - selected.len();
+    let remaining = FIXTURE_ANCHOR_COUNT - selected.len();
     selected.extend(ranked.into_iter().take(remaining));
     ensure!(
-        selected.len() == 100_000 + INCREMENTAL_COUNT,
+        selected.len() == FIXTURE_ANCHOR_COUNT,
         "not enough real anchors for nested fixture"
     );
-    let incremental_node_ids = selected.split_off(100_000);
+    let incremental_node_ids = selected.split_off(LARGEST_WORKLOAD_COUNT);
     let embedder = ProductEmbeddingClient::new(&runtime);
     let queries = identities
         .into_iter()
@@ -641,7 +647,7 @@ fn prepare(
         "catalog source checkout changed while freezing the fixture"
     );
     let fixture = Fixture {
-        schema_version: 4,
+        schema_version: FIXTURE_SCHEMA_VERSION,
         source: attestation,
         publication,
         query_embedder,
@@ -1236,7 +1242,10 @@ fn verify_fixture_contract(
     catalog_sha256: &str,
     source: &Path,
 ) -> Result<()> {
-    ensure!(fixture.schema_version == 4, "unsupported fixture schema");
+    ensure!(
+        fixture.schema_version == FIXTURE_SCHEMA_VERSION,
+        "unsupported fixture schema"
+    );
     ensure!(
         catalog.schema_version == 1 && catalog.queries.len() == 30,
         "reviewed catalog does not meet the declared profile"
@@ -1251,20 +1260,7 @@ fn verify_fixture_contract(
             && fixture.corpus_commit == catalog.corpus_commit,
         "fixture is not bound to the reviewed catalog and selection contract"
     );
-    ensure!(
-        fixture.selected_node_ids.len() == 100_000
-            && fixture.incremental_node_ids.len() == INCREMENTAL_COUNT,
-        "fixture does not contain the declared nested real-anchor input"
-    );
-    let selected = fixture
-        .selected_node_ids
-        .iter()
-        .chain(fixture.incremental_node_ids.iter())
-        .collect::<HashSet<_>>();
-    ensure!(
-        selected.len() == 100_000 + INCREMENTAL_COUNT,
-        "fixture selection contains duplicate base or incremental node IDs"
-    );
+    verify_fixture_selection(&fixture.selected_node_ids, &fixture.incremental_node_ids)?;
     ensure!(
         fixture.query_embedder.runtime_id == fixture.source.embedding_backend
             && fixture.query_embedder.embedding_dim == fixture.source.embedding_dim
@@ -1409,7 +1405,7 @@ fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result
     let input: FrozenInputManifest =
         serde_json::from_slice(&input_bytes).context("parse frozen input manifest")?;
     ensure!(
-        input.schema_version == 2,
+        input.schema_version == 3,
         "unsupported frozen input manifest schema"
     );
     let source = resolve_frozen_artifact(&input_path, &input.source, "source database")?;
@@ -1421,6 +1417,8 @@ fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result
     )?;
     let fixture = resolve_frozen_artifact(&input_path, &input.fixture, "fixture")?;
     let catalog = resolve_frozen_artifact(&input_path, &input.catalog, "catalog")?;
+    let criteria = resolve_frozen_artifact(&input_path, &input.criteria, "comparison criteria")?;
+    verify_criteria_contract(&criteria)?;
     let fixture_verification = resolve_frozen_artifact(
         &input_path,
         &input.fixture_verification,
@@ -1456,6 +1454,7 @@ fn load_frozen_input_paths(inputs: &Path, expected_input_sha256: &str) -> Result
         source_generation_manifest,
         fixture,
         catalog,
+        criteria,
         fixture_verification,
         host_evidence,
         binary_sha256: input.binary_sha256,
@@ -1594,9 +1593,34 @@ fn verify_frozen_input_paths(paths: &FrozenInputPaths) -> Result<()> {
             && reloaded.source_generation_manifest == paths.source_generation_manifest
             && reloaded.fixture == paths.fixture
             && reloaded.catalog == paths.catalog
+            && reloaded.criteria == paths.criteria
             && reloaded.fixture_verification == paths.fixture_verification
             && reloaded.host_evidence == paths.host_evidence,
         "frozen input manifest resolved to different evidence paths"
+    );
+    Ok(())
+}
+
+fn verify_criteria_contract(path: &Path) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read comparison criteria {}", path.display()))?,
+    )
+    .context("parse comparison criteria")?;
+    let counts = value
+        .pointer("/shared_workload/vector_counts")
+        .and_then(serde_json::Value::as_array)
+        .context("comparison criteria have no vector_counts array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .context("comparison criteria contain a non-integer vector count")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        counts == WORKLOAD_COUNTS,
+        "comparison criteria vector counts do not match the executable workload contract"
     );
     Ok(())
 }
@@ -1829,15 +1853,23 @@ fn list_node_ids(source: &Path) -> Result<Vec<String>> {
 }
 
 fn selected_ordinals(fixture: &Fixture, count: usize) -> Result<HashMap<String, u64>> {
+    selected_ordinals_for_queries(&fixture.selected_node_ids, &fixture.queries, count)
+}
+
+fn selected_ordinals_for_queries(
+    selected_node_ids: &[String],
+    queries: &[FrozenQuery],
+    count: usize,
+) -> Result<HashMap<String, u64>> {
     ensure!(
-        [1_000, 10_000, 25_000, 100_000].contains(&count),
+        WORKLOAD_COUNTS.contains(&count),
         "undeclared vector count {count}"
     );
     let mut output = HashMap::with_capacity(count);
-    for (index, id) in fixture.selected_node_ids.iter().take(count).enumerate() {
+    for (index, id) in selected_node_ids.iter().take(count).enumerate() {
         output.insert(id.clone(), index as u64 + 1);
     }
-    for query in &fixture.queries {
+    for query in queries {
         ensure!(
             output.contains_key(&query.expected_node_id),
             "selected {} workload omits catalog target {}",
@@ -1846,6 +1878,26 @@ fn selected_ordinals(fixture: &Fixture, count: usize) -> Result<HashMap<String, 
         );
     }
     Ok(output)
+}
+
+fn verify_fixture_selection(
+    selected_node_ids: &[String],
+    incremental_node_ids: &[String],
+) -> Result<()> {
+    ensure!(
+        selected_node_ids.len() == LARGEST_WORKLOAD_COUNT
+            && incremental_node_ids.len() == INCREMENTAL_COUNT,
+        "fixture does not contain the declared nested real-anchor input"
+    );
+    let selected = selected_node_ids
+        .iter()
+        .chain(incremental_node_ids.iter())
+        .collect::<HashSet<_>>();
+    ensure!(
+        selected.len() == FIXTURE_ANCHOR_COUNT,
+        "fixture selection contains duplicate base or incremental node IDs"
+    );
+    Ok(())
 }
 
 fn selected_ordinals_after_incremental(
@@ -2671,6 +2723,55 @@ mod tests {
     }
 
     #[test]
+    fn declared_criteria_match_the_executable_workloads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let criteria = temp.path().join("criteria.json");
+        fs::write(
+            &criteria,
+            include_bytes!("../../../../benchmarks/vector-backend-spike/criteria.json"),
+        )?;
+        verify_criteria_contract(&criteria)
+    }
+
+    #[test]
+    fn fixture_selection_requires_75k_plus_100_unique_anchors() -> Result<()> {
+        let selected = (0..LARGEST_WORKLOAD_COUNT)
+            .map(|index| format!("node-{index}"))
+            .collect::<Vec<_>>();
+        let incremental = (LARGEST_WORKLOAD_COUNT..FIXTURE_ANCHOR_COUNT)
+            .map(|index| format!("node-{index}"))
+            .collect::<Vec<_>>();
+        verify_fixture_selection(&selected, &incremental)?;
+
+        let query = FrozenQuery {
+            id: "catalog-target".into(),
+            kind: "symbol".into(),
+            text: "Where is the catalog target?".into(),
+            expected_node_id: selected[0].clone(),
+            expected_document_hash: "document-hash".into(),
+            vector: vec![0.0; DIMENSIONS],
+        };
+        assert!(
+            selected_ordinals_for_queries(
+                &selected,
+                std::slice::from_ref(&query),
+                LARGEST_WORKLOAD_COUNT,
+            )
+            .is_ok()
+        );
+        assert!(
+            selected_ordinals_for_queries(&selected, &[query], 100_000).is_err(),
+            "the superseded 100k workload must fail closed"
+        );
+
+        let mut duplicate_incremental = incremental.clone();
+        duplicate_incremental[0] = selected[0].clone();
+        assert!(verify_fixture_selection(&selected, &duplicate_incremental).is_err());
+        assert!(verify_fixture_selection(&selected[..selected.len() - 1], &incremental).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn reviewed_catalog_binding_rejects_fabricated_source_truth() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("vectors.sqlite3");
@@ -2973,12 +3074,17 @@ mod tests {
         let source_manifest = temp_root.join("vector-generation-manifest.json");
         let fixture = temp_root.join("fixture.json");
         let catalog = temp_root.join("catalog.json");
+        let criteria = temp_root.join("criteria.json");
         let fixture_verification = temp_root.join("fixture-verification.json");
         let host_evidence = temp_root.join("host-evidence.json");
         fs::write(&source, b"source")?;
         fs::write(&source_manifest, b"manifest")?;
         fs::write(&fixture, b"fixture")?;
         fs::write(&catalog, b"catalog")?;
+        fs::write(
+            &criteria,
+            include_bytes!("../../../../benchmarks/vector-backend-spike/criteria.json"),
+        )?;
         fs::write(&fixture_verification, b"verification")?;
         let binary = std::env::current_exe()?.canonicalize()?;
         let binary_sha256 = sha256_file(&binary)?;
@@ -2992,7 +3098,7 @@ mod tests {
             }),
         )?;
         let input = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "source": { "path": "source.sqlite3", "sha256": sha256_file(&source)? },
             "source_generation_manifest": {
                 "path": "vector-generation-manifest.json",
@@ -3000,6 +3106,7 @@ mod tests {
             },
             "fixture": { "path": "fixture.json", "sha256": sha256_file(&fixture)? },
             "catalog": { "path": "catalog.json", "sha256": sha256_file(&catalog)? },
+            "criteria": { "path": "criteria.json", "sha256": sha256_file(&criteria)? },
             "fixture_verification": {
                 "path": "fixture-verification.json",
                 "sha256": sha256_file(&fixture_verification)?,
