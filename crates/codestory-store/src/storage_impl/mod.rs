@@ -1558,6 +1558,78 @@ fn grounding_node_rank_sql(alias: &str) -> String {
     )
 }
 
+fn grounding_node_snapshot_insert_sql() -> String {
+    let rank_sql = grounding_node_rank_sql("n");
+    let display_name = grounding_display_name_expr("n");
+    let indexable = grounding_indexable_predicate("n");
+    format!(
+        "WITH ranked_nodes AS (
+            SELECT
+                n.id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY n.file_node_id
+                    ORDER BY
+                        {rank_sql},
+                        COALESCE(n.start_line, 2147483647),
+                        {display_name},
+                        n.id
+                ) AS file_symbol_rank
+            FROM node n
+            WHERE {indexable}
+        )
+        INSERT INTO grounding_node_snapshot (
+            node_id,
+            kind,
+            serialized_name,
+            qualified_name,
+            canonical_id,
+            file_node_id,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            display_name,
+            file_path,
+            node_rank,
+            sort_start_line,
+            is_root,
+            file_symbol_rank
+        )
+        SELECT
+            n.id,
+            n.kind,
+            n.serialized_name,
+            n.qualified_name,
+            n.canonical_id,
+            n.file_node_id,
+            n.start_line,
+            n.start_col,
+            n.end_line,
+            n.end_col,
+            {display_name},
+            COALESCE(f.path, file_node.serialized_name),
+            {rank_sql},
+            COALESCE(n.start_line, 2147483647),
+            CASE
+                WHEN n.id IN (
+                    SELECT e.target_node_id
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                ) THEN 0
+                ELSE 1
+            END,
+            ranked_nodes.file_symbol_rank
+        FROM ranked_nodes
+        JOIN node n ON n.id = ranked_nodes.id
+        LEFT JOIN file f ON f.id = n.file_node_id
+        LEFT JOIN node file_node
+            ON file_node.id = n.file_node_id
+           AND file_node.kind = {file_kind}",
+        member_kind = EdgeKind::MEMBER as i32,
+        file_kind = NodeKind::FILE as i32,
+    )
+}
+
 fn grounding_file_snapshot_cte_sql() -> String {
     format!(
         "WITH all_files AS (
@@ -4304,9 +4376,6 @@ impl Storage {
         &self,
         build_node_file_rank_index: bool,
     ) -> Result<Duration, StorageError> {
-        let rank_sql = grounding_node_rank_sql("n");
-        let display_name = grounding_display_name_expr("n");
-        let indexable = grounding_indexable_predicate("n");
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
@@ -4337,86 +4406,7 @@ impl Storage {
         tx.execute("DELETE FROM grounding_node_summary_snapshot", [])?;
         tx.execute("DELETE FROM grounding_node_edge_digest_snapshot", [])?;
 
-        let node_snapshot_sql = format!(
-            "WITH indexable_nodes AS (
-                SELECT
-                    n.id,
-                    n.kind,
-                    n.serialized_name,
-                    n.qualified_name,
-                    n.canonical_id,
-                    n.file_node_id,
-                    n.start_line,
-                    n.start_col,
-                    n.end_line,
-                    n.end_col,
-                    {display_name} AS display_name,
-                    COALESCE(f.path, file_node.serialized_name) AS file_path,
-                    {rank_sql} AS node_rank,
-                    COALESCE(n.start_line, 2147483647) AS sort_start_line,
-                    CASE
-                        WHEN EXISTS (
-                            SELECT 1
-                            FROM edge e
-                            WHERE e.kind = {member_kind}
-                              AND e.target_node_id = n.id
-                        ) THEN 0
-                        ELSE 1
-                    END AS is_root,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY n.file_node_id
-                        ORDER BY
-                            {rank_sql},
-                            COALESCE(n.start_line, 2147483647),
-                            {display_name},
-                            n.id
-                    ) AS file_symbol_rank
-                FROM node n
-                LEFT JOIN file f ON f.id = n.file_node_id
-                LEFT JOIN node file_node
-                    ON file_node.id = n.file_node_id
-                   AND file_node.kind = {file_kind}
-                WHERE {indexable}
-            )
-            INSERT INTO grounding_node_snapshot (
-                node_id,
-                kind,
-                serialized_name,
-                qualified_name,
-                canonical_id,
-                file_node_id,
-                start_line,
-                start_col,
-                end_line,
-                end_col,
-                display_name,
-                file_path,
-                node_rank,
-                sort_start_line,
-                is_root,
-                file_symbol_rank
-            )
-            SELECT
-                id,
-                kind,
-                serialized_name,
-                qualified_name,
-                canonical_id,
-                file_node_id,
-                start_line,
-                start_col,
-                end_line,
-                end_col,
-                display_name,
-                file_path,
-                node_rank,
-                sort_start_line,
-                is_root,
-                file_symbol_rank
-            FROM indexable_nodes",
-            member_kind = EdgeKind::MEMBER as i32,
-            file_kind = NodeKind::FILE as i32,
-        );
+        let node_snapshot_sql = grounding_node_snapshot_insert_sql();
         tx.execute(&node_snapshot_sql, [])?;
 
         let node_file_rank_index_duration = if build_node_file_rank_index {
