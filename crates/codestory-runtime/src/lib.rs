@@ -4179,18 +4179,26 @@ pub struct Runtime {
 impl Runtime {
     pub fn new() -> Self {
         let controller = AppController::new();
+        let activation = ActivationService::new(controller.clone());
         Self {
-            activation: ActivationService::new(controller.clone()),
-            public_operation: PublicOperationService::new(controller.clone()),
+            activation: activation.clone(),
+            public_operation: PublicOperationService::new_with_activation(
+                controller.clone(),
+                activation,
+            ),
             controller,
         }
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
         let controller = AppController::new_with_config(config);
+        let activation = ActivationService::new(controller.clone());
         Self {
-            activation: ActivationService::new(controller.clone()),
-            public_operation: PublicOperationService::new(controller.clone()),
+            activation: activation.clone(),
+            public_operation: PublicOperationService::new_with_activation(
+                controller.clone(),
+                activation,
+            ),
             controller,
         }
     }

@@ -5318,3 +5318,186 @@ fn packet_preserves_typed_source_failure_diagnostics() {
         Some(&json!(true))
     );
 }
+
+#[test]
+fn failed_replacement_retries_keep_identity_and_offer_retained_local_analysis() {
+    let fixture = indexed_fixture();
+    fs::write(
+        fixture.workspace.path().join("codestory_workspace.json"),
+        r#"{"members":["src","missing"]}"#,
+    )
+    .expect("write incomplete replacement fixture");
+    let mut server = spawn_stdio_server(&fixture);
+    let packet_request = |id: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "packet",
+                "arguments": {"question": "How does AppController open a project?"}
+            }
+        })
+    };
+
+    let first = send_json(&mut server, packet_request("retained-packet-first"));
+    let first_error = assert_tool_error(&first, json!("retained-packet-first"));
+    assert_eq!(first_error["code"], json!("codestory_unavailable"));
+    assert_eq!(
+        first_error["cause_code"],
+        json!("source_discovery_incomplete")
+    );
+    assert_eq!(first_error["retry_tool"], Value::Null);
+    assert!(first_error["retry_after_ms"].is_null());
+    assert_eq!(
+        first_error["operation"]["capabilities"]["local_navigation"],
+        json!("retained")
+    );
+    assert_eq!(
+        first_error["operation"]["capabilities"]["broad_search"],
+        json!("unavailable")
+    );
+    assert!(
+        first_error["operation"]["retained_core_publication"]["generation_id"]
+            .as_str()
+            .is_some()
+    );
+    assert!(
+        first_error["operation"]["revision"].as_u64().is_some()
+            && first_error["operation"]["progress"].as_u64().is_some()
+    );
+    assert_eq!(
+        first_error["next_action"],
+        json!("continue_with_retained_local_navigation")
+    );
+    assert!(
+        first_error["recommended_next_calls"]
+            .as_array()
+            .is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call["method"] == "tools/call"
+                        && call["tool"] == "affected"
+                        && call["arguments"]["paths"] == json!(["<changed-project-path>"])
+                }) && calls.iter().any(|call| {
+                    call["method"] == "resources/read"
+                        && call["uri"]
+                            .as_str()
+                            .is_some_and(|uri| uri.starts_with("codestory://status?project="))
+                })
+            }),
+        "terminal MCP response must provide useful native follow-ups: {first_error}"
+    );
+
+    let first_operation = first_error["operation"].clone();
+    let second = send_json(&mut server, packet_request("retained-packet-second"));
+    let second_error = assert_tool_error(&second, json!("retained-packet-second"));
+    assert_eq!(
+        second_error["operation"]["operation_id"],
+        first_operation["operation_id"]
+    );
+    assert!(
+        second_error["operation"]["revision"]
+            .as_u64()
+            .zip(first_operation["revision"].as_u64())
+            .is_some_and(|(second, first)| second > first)
+    );
+    assert!(
+        second_error["operation"]["attempt"]
+            .as_u64()
+            .zip(first_operation["attempt"].as_u64())
+            .is_some_and(|(second, first)| second == first + 1)
+    );
+    assert!(
+        second_error["operation"]["progress"]
+            .as_u64()
+            .zip(first_operation["progress"].as_u64())
+            .is_some_and(|(second, first)| second >= first)
+    );
+    assert_eq!(second_error["operation"]["stage"], first_operation["stage"]);
+
+    let affected = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "retained-affected",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"paths": ["src/runtime.rs"]}
+            }
+        }),
+    );
+    assert_tool_success(&affected, json!("retained-affected"));
+    let affected_result = assert_success_envelope(&affected, json!("retained-affected"));
+    assert!(
+        affected_result["_meta"]["codestory_publication"]["core_publication"]["generation"]
+            .as_u64()
+            .is_some(),
+        "affected must pin the retained core publication: {affected_result}"
+    );
+
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "retained-ground",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let ground = assert_tool_success(&ground, json!("retained-ground"));
+    assert!(
+        ground["stats"]["node_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "ground must remain usable from the retained core: {ground}"
+    );
+
+    let status = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "retained-status",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let status = assert_tool_success(&status, json!("retained-status"));
+    assert_eq!(status["state"], json!("working_locally"));
+    assert_eq!(
+        status["capabilities"]["local_navigation"],
+        json!("retained")
+    );
+    assert_eq!(status["capabilities"]["broad_search"], json!("unavailable"));
+    assert_eq!(
+        status["current_operation"]["operation_id"],
+        first_operation["operation_id"]
+    );
+
+    let diagnostics_uri = first_error["diagnostics_uri"]
+        .as_str()
+        .expect("project-bound status URI");
+    let resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "retained-status-resource",
+            "method": "resources/read",
+            "params": {"uri": diagnostics_uri}
+        }),
+    );
+    let resource = assert_success_envelope(&resource, json!("retained-status-resource"));
+    let full_status = json_resource_content(resource, "codestory://status");
+    assert_allowed_surface(&full_status, "affected", true, "local_navigation", "ready");
+    assert_allowed_surface(&full_status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(
+        &full_status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "unavailable",
+    );
+}

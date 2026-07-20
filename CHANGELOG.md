@@ -4,6 +4,13 @@
 
 ### Release
 
+- Project activation retries now retain one operation ID with monotonic
+  revision, stage, attempt, and progress fields. Request cancellation no longer
+  replaces shared preparation, and failed replacements bind any still-complete
+  core publication as `retained` local evidence while broad search remains
+  unavailable without a matching retrieval/runtime proof. Native MCP failures
+  return the same-tool retry when applicable plus project-bound status and
+  retained `affected` follow-ups.
 - Structural JSON, YAML, TOML, Markdown, and other tooling sources that exceed
   the 2,048-unit collector bound without exceeding the source-byte cap now
   publish as verified source-policy exclusions instead of blocking the entire

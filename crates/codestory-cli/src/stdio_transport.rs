@@ -1001,6 +1001,13 @@ fn handle_stdio_message(
                 if let Err(error) = activation {
                     state.status_cache = None;
                     let operation = runtime.activation.snapshot();
+                    let retained_local = operation.as_ref().is_some_and(|snapshot| {
+                        matches!(
+                            snapshot.capabilities.local_navigation,
+                            codestory_runtime::ActivationCapabilityState::Ready
+                                | codestory_runtime::ActivationCapabilityState::Retained
+                        )
+                    });
                     let allowed = !observes_complete_core
                         && operation
                             .as_ref()
@@ -1019,6 +1026,42 @@ fn handle_stdio_message(
                             .and_then(|details| details.cause_code.clone())
                             .unwrap_or_else(|| error.code.clone());
                         let details = error.details.clone();
+                        let diagnostics_uri = stdio_resource_uri_for_project(
+                            &StdioResource::Status,
+                            &runtime.project_root,
+                        );
+                        let mut recommended_next_calls = Vec::new();
+                        if preparing {
+                            recommended_next_calls.push(serde_json::json!({
+                                "method": "tools/call",
+                                "tool": name,
+                                "arguments": request
+                                    .pointer("/params/arguments")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({})),
+                                "after_ms": operation
+                                    .as_ref()
+                                    .and_then(|snapshot| snapshot.retry_after_ms)
+                                    .unwrap_or(250),
+                            }));
+                        }
+                        if retained_local {
+                            recommended_next_calls.push(serde_json::json!({
+                                "method": "tools/call",
+                                "tool": "affected",
+                                "arguments": {
+                                    "project": crate::display::clean_path_string(
+                                        &runtime.project_root.to_string_lossy()
+                                    ),
+                                    "paths": ["<changed-project-path>"]
+                                },
+                                "evidence_scope": "retained_core_publication",
+                            }));
+                        }
+                        recommended_next_calls.push(serde_json::json!({
+                            "method": "resources/read",
+                            "uri": diagnostics_uri.clone(),
+                        }));
                         let error = serde_json::json!({
                             "code": if error.code == "cancelled" {
                                 "cancelled"
@@ -1043,10 +1086,15 @@ fn handle_stdio_message(
                                 .as_ref()
                                 .and_then(|snapshot| snapshot.retry_after_ms),
                             "operation": operation,
-                            "diagnostics_uri": stdio_resource_uri_for_project(
-                                &StdioResource::Status,
-                                &runtime.project_root,
-                            ),
+                            "next_action": if preparing {
+                                "retry_intended_tool"
+                            } else if retained_local {
+                                "continue_with_retained_local_navigation"
+                            } else {
+                                "use_focused_source_inspection"
+                            },
+                            "recommended_next_calls": recommended_next_calls,
+                            "diagnostics_uri": diagnostics_uri,
                         });
                         return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
                     }
@@ -3738,10 +3786,12 @@ fn stdio_status_with_activation(
         .as_ref()
         .filter(|snapshot| snapshot.state != codestory_runtime::ActivationState::Ready);
     let working_locally = active.is_some_and(|snapshot| {
-        snapshot.capabilities.local_navigation
-            == codestory_runtime::ActivationCapabilityState::Ready
-            && snapshot.capabilities.broad_search
-                != codestory_runtime::ActivationCapabilityState::Ready
+        matches!(
+            snapshot.capabilities.local_navigation,
+            codestory_runtime::ActivationCapabilityState::Ready
+                | codestory_runtime::ActivationCapabilityState::Retained
+        ) && snapshot.capabilities.broad_search
+            != codestory_runtime::ActivationCapabilityState::Ready
     });
     let (state, next_action) = match active.map(|snapshot| snapshot.state) {
         Some(_) if working_locally => ("working_locally", "continue_with_local_navigation"),
@@ -3760,6 +3810,7 @@ fn stdio_status_with_activation(
     };
     let capability_label = |capability| match capability {
         codestory_runtime::ActivationCapabilityState::Ready => "ready",
+        codestory_runtime::ActivationCapabilityState::Retained => "retained",
         codestory_runtime::ActivationCapabilityState::Retryable => "retryable",
         codestory_runtime::ActivationCapabilityState::Unavailable => "unavailable",
         codestory_runtime::ActivationCapabilityState::Cancelled => "cancelled",
@@ -4513,15 +4564,26 @@ fn build_stdio_status_readiness(
         effective_freshness.as_ref(),
         retrieval_status,
     );
-    if local_refresh.as_ref().is_some_and(|refresh| {
+    let serves_retained_core = runtime.activation.snapshot().is_some_and(|snapshot| {
+        snapshot.capabilities.local_navigation
+            == codestory_runtime::ActivationCapabilityState::Retained
+            && snapshot.retained_core_publication.as_ref() == summary.publication.as_ref()
+    });
+    let serves_refreshing_core = local_refresh.as_ref().is_some_and(|refresh| {
         refresh.state == crate::readiness::LocalRefreshState::Refreshing
             && refresh.serving_publication.is_some()
-    }) && let Some(local) = readiness
-        .iter_mut()
-        .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
+    });
+    if (serves_refreshing_core || serves_retained_core)
+        && let Some(local) = readiness
+            .iter_mut()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
     {
         local.status = ReadinessStatusDto::Ready;
-        local.summary = "Serving the last complete publication while a single refresh writer builds the next generation.".to_string();
+        local.summary = if serves_retained_core {
+            "Serving the retained complete core publication while replacement activation remains unavailable.".to_string()
+        } else {
+            "Serving the last complete publication while a single refresh writer builds the next generation.".to_string()
+        };
         local.minimum_next.clear();
         local.full_repair.clear();
     }
@@ -7218,8 +7280,10 @@ version = "0.11.20"
             active.runtime.activation.set_snapshot_for_test(Some(
                 codestory_runtime::ActivationSnapshot {
                     operation_id: format!("activation-{index}"),
+                    revision: 1,
                     state: codestory_runtime::ActivationState::Unavailable,
                     stage: codestory_runtime::ActivationStage::Validation,
+                    progress: 90,
                     attempt: 1,
                     retry_after_ms: None,
                     failure_code: Some("project_unavailable".to_string()),
@@ -7227,6 +7291,7 @@ version = "0.11.20"
                     failure_details: None,
                     embedding_capacity: None,
                     embedding_retry: None,
+                    retained_core_publication: None,
                     capabilities: codestory_runtime::ActivationCapabilities {
                         local_navigation: codestory_runtime::ActivationCapabilityState::Unavailable,
                         broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,
@@ -7738,8 +7803,10 @@ version = "0.11.20"
             .activation
             .set_snapshot_for_test(Some(codestory_runtime::ActivationSnapshot {
                 operation_id: "activation-live".to_string(),
+                revision: 4,
                 state: codestory_runtime::ActivationState::Preparing,
                 stage: codestory_runtime::ActivationStage::DensePreparation,
+                progress: 60,
                 attempt: 1,
                 retry_after_ms: Some(375),
                 failure_code: None,
@@ -7747,6 +7814,7 @@ version = "0.11.20"
                 failure_details: None,
                 embedding_capacity: None,
                 embedding_retry: None,
+                retained_core_publication: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
@@ -7781,8 +7849,10 @@ version = "0.11.20"
             .activation
             .set_snapshot_for_test(Some(codestory_runtime::ActivationSnapshot {
                 operation_id: "activation-live".to_string(),
+                revision: 8,
                 state: codestory_runtime::ActivationState::Retryable,
                 stage: codestory_runtime::ActivationStage::Validation,
+                progress: 90,
                 attempt: 2,
                 retry_after_ms: Some(250),
                 failure_code: Some("activation_retryable".to_string()),
@@ -7796,6 +7866,7 @@ version = "0.11.20"
                     retry_condition: "the incompatible owner exits while fully idle".into(),
                     capacity: None,
                 }),
+                retained_core_publication: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
@@ -7833,8 +7904,10 @@ version = "0.11.20"
             .activation
             .set_snapshot_for_test(Some(codestory_runtime::ActivationSnapshot {
                 operation_id: "activation-live".to_string(),
+                revision: 10,
                 state: codestory_runtime::ActivationState::Unavailable,
                 stage: codestory_runtime::ActivationStage::Validation,
+                progress: 90,
                 attempt: 3,
                 retry_after_ms: None,
                 failure_code: Some("project_unavailable".to_string()),
@@ -7842,6 +7915,7 @@ version = "0.11.20"
                 failure_details: None,
                 embedding_capacity: None,
                 embedding_retry: None,
+                retained_core_publication: None,
                 capabilities: codestory_runtime::ActivationCapabilities {
                     local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
                     broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,

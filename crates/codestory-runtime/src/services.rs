@@ -80,16 +80,28 @@ pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> 
     ACTIVE_PUBLIC_OPERATION_CANCELLATION.with(|active| active.borrow().clone())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationStage {
     Discovery,
     CoreFreshness,
     SearchPreparation,
     DensePreparation,
-    Validation,
     Publication,
+    Validation,
     Ready,
+}
+
+fn activation_stage_progress(stage: ActivationStage) -> u8 {
+    match stage {
+        ActivationStage::Discovery => 0,
+        ActivationStage::CoreFreshness => 20,
+        ActivationStage::SearchPreparation => 40,
+        ActivationStage::DensePreparation => 60,
+        ActivationStage::Publication => 75,
+        ActivationStage::Validation => 90,
+        ActivationStage::Ready => 100,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -107,6 +119,7 @@ pub enum ActivationState {
 #[serde(rename_all = "snake_case")]
 pub enum ActivationCapabilityState {
     Ready,
+    Retained,
     Retryable,
     Unavailable,
     Cancelled,
@@ -121,8 +134,10 @@ pub struct ActivationCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActivationSnapshot {
     pub operation_id: String,
+    pub revision: u64,
     pub state: ActivationState,
     pub stage: ActivationStage,
+    pub progress: u8,
     pub attempt: u32,
     pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +149,8 @@ pub struct ActivationSnapshot {
     pub failure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_details: Option<Box<ApiErrorDetails>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_core_publication: Option<IndexPublicationDto>,
     pub capabilities: ActivationCapabilities,
 }
 
@@ -142,7 +159,10 @@ impl ActivationSnapshot {
         if operation_requires_retrieval(operation) {
             self.capabilities.broad_search == ActivationCapabilityState::Ready
         } else {
-            self.capabilities.local_navigation == ActivationCapabilityState::Ready
+            matches!(
+                self.capabilities.local_navigation,
+                ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
+            )
         }
     }
 }
@@ -229,6 +249,25 @@ impl ActivationService {
             .expect("activation coordinator poisoned")
             .current
             .clone()
+    }
+
+    fn snapshot_for_target(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Option<ActivationSnapshot> {
+        let target = ActivationTarget::new(project_root, storage_path);
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        state
+            .target
+            .as_ref()
+            .is_some_and(|current| current.matches(&target))
+            .then(|| state.current.clone())
+            .flatten()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -330,6 +369,51 @@ impl ActivationService {
         }
     }
 
+    fn retained_core_publication(
+        &self,
+        storage_path: &Path,
+    ) -> Result<Option<IndexPublicationDto>, ApiError> {
+        if !storage_path.is_file() {
+            return Ok(None);
+        }
+        let storage = Store::open_read_only(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open retained core publication observationally: {error}"
+            ))
+        })?;
+        let snapshot = storage.read_snapshot().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to pin retained core publication observation: {error}"
+            ))
+        })?;
+        let retained = if snapshot
+            .storage()
+            .has_incomplete_incremental_run()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to inspect retained core publication fence: {error}"
+                ))
+            })? {
+            None
+        } else {
+            snapshot
+                .storage()
+                .get_complete_index_publication()
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to inspect retained core publication: {error}"
+                    ))
+                })?
+                .map(crate::index_publication_dto)
+        };
+        snapshot.finish().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finish retained core publication observation: {error}"
+            ))
+        })?;
+        Ok(retained)
+    }
+
     pub fn activate_project_with_foreground_budget(
         &self,
         project_root: &Path,
@@ -344,6 +428,8 @@ impl ActivationService {
             ));
         }
         let target = ActivationTarget::new(project_root, storage_path);
+        let retained_core_publication =
+            self.retained_core_publication(storage_path).unwrap_or(None);
         let mut state = self
             .coordinator
             .state
@@ -382,9 +468,10 @@ impl ActivationService {
             let operation_id = if let Some(snapshot) = state
                 .current
                 .as_mut()
-                .filter(|snapshot| snapshot.state == ActivationState::Retryable)
+                .filter(|snapshot| snapshot.state != ActivationState::Ready)
             {
                 snapshot.attempt += 1;
+                snapshot.revision += 1;
                 snapshot.failure = None;
                 snapshot.failure_code = None;
                 snapshot.failure_details = None;
@@ -392,7 +479,18 @@ impl ActivationService {
                 snapshot.embedding_retry = None;
                 snapshot.retry_after_ms = Some(250);
                 snapshot.state = ActivationState::Preparing;
-                snapshot.stage = ActivationStage::Discovery;
+                let retained_was_ready = snapshot.capabilities.local_navigation
+                    == ActivationCapabilityState::Ready
+                    && snapshot.retained_core_publication == retained_core_publication;
+                snapshot.retained_core_publication = retained_core_publication.clone();
+                snapshot.capabilities.local_navigation = if retained_was_ready {
+                    ActivationCapabilityState::Ready
+                } else if snapshot.retained_core_publication.is_some() {
+                    ActivationCapabilityState::Retained
+                } else {
+                    ActivationCapabilityState::Unavailable
+                };
+                snapshot.capabilities.broad_search = ActivationCapabilityState::Unavailable;
                 snapshot.operation_id.clone()
             } else {
                 let project_scope = target
@@ -407,8 +505,10 @@ impl ActivationService {
                 );
                 state.current = Some(ActivationSnapshot {
                     operation_id: operation_id.clone(),
+                    revision: 1,
                     state: ActivationState::Preparing,
                     stage: ActivationStage::Discovery,
+                    progress: activation_stage_progress(ActivationStage::Discovery),
                     attempt: 1,
                     retry_after_ms: Some(250),
                     embedding_capacity: None,
@@ -416,8 +516,13 @@ impl ActivationService {
                     failure_code: None,
                     failure: None,
                     failure_details: None,
+                    retained_core_publication: retained_core_publication.clone(),
                     capabilities: ActivationCapabilities {
-                        local_navigation: ActivationCapabilityState::Unavailable,
+                        local_navigation: if retained_core_publication.is_some() {
+                            ActivationCapabilityState::Retained
+                        } else {
+                            ActivationCapabilityState::Unavailable
+                        },
                         broad_search: ActivationCapabilityState::Unavailable,
                     },
                 });
@@ -601,7 +706,12 @@ impl ActivationService {
                 "activation did not produce a fresh complete core publication",
             ));
         }
-        operation.set_capability(false, ActivationCapabilityState::Ready);
+        operation.set_local_publication(
+            summary
+                .publication
+                .clone()
+                .expect("fresh complete core has a publication identity"),
+        );
 
         operation.ensure_not_cancelled("search preparation")?;
         operation.set_stage(ActivationStage::SearchPreparation);
@@ -861,6 +971,7 @@ pub struct ActivePublicOperationPublication {
 #[derive(Clone)]
 pub struct PublicOperationService {
     controller: AppController,
+    activation: Option<ActivationService>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -868,8 +979,41 @@ impl PublicOperationService {
     pub(crate) fn new(controller: AppController) -> Self {
         Self {
             controller,
+            activation: None,
             next_id: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn new_with_activation(
+        controller: AppController,
+        activation: ActivationService,
+    ) -> Self {
+        Self {
+            controller,
+            activation: Some(activation),
+            next_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn retained_core_allows(&self, operation: &str, publication: &IndexPublicationRecord) -> bool {
+        !operation_requires_retrieval(operation)
+            && self.activation.as_ref().is_some_and(|activation| {
+                let Some(project_root) = self.controller.require_project_root().ok() else {
+                    return false;
+                };
+                let Some(storage_path) = self.controller.require_storage_path().ok() else {
+                    return false;
+                };
+                activation
+                    .snapshot_for_target(&project_root, &storage_path)
+                    .is_some_and(|snapshot| {
+                        matches!(
+                            snapshot.capabilities.local_navigation,
+                            ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
+                        ) && snapshot.retained_core_publication.as_ref()
+                            == Some(&crate::index_publication_dto(publication.clone()))
+                    })
+            })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -923,7 +1067,9 @@ impl PublicOperationService {
         for attempt in 1..=2 {
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let freshness = self.controller.index_freshness_uncached()?;
-                if freshness.status != IndexFreshnessStatusDto::Fresh {
+                if freshness.status != IndexFreshnessStatusDto::Fresh
+                    && !self.retained_core_allows(operation, publication)
+                {
                     return Err(ApiError::new(
                         "project_unavailable",
                         format!("{operation} requires a fresh complete core publication"),
@@ -945,7 +1091,9 @@ impl PublicOperationService {
                         ));
                     }
                     let after = self.controller.index_freshness_uncached()?;
-                    if after.status != IndexFreshnessStatusDto::Fresh {
+                    if after.status != IndexFreshnessStatusDto::Fresh
+                        && !self.retained_core_allows(operation, publication)
+                    {
                         return Err(ApiError::new(
                             "publication_changed",
                             format!("source inputs changed while running {operation}"),
@@ -1097,8 +1245,29 @@ impl ActivationOperation {
             .as_mut()
             .filter(|snapshot| snapshot.operation_id == self.operation_id)
         {
-            snapshot.stage = stage;
+            snapshot.stage = snapshot.stage.max(stage);
+            snapshot.progress = snapshot.progress.max(activation_stage_progress(stage));
             snapshot.state = ActivationState::Updating;
+            snapshot.revision += 1;
+        }
+        self.service.coordinator.changed.notify_all();
+    }
+
+    fn set_local_publication(&self, publication: IndexPublicationDto) {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if let Some(snapshot) = state
+            .current
+            .as_mut()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+        {
+            snapshot.retained_core_publication = Some(publication);
+            snapshot.capabilities.local_navigation = ActivationCapabilityState::Ready;
+            snapshot.revision += 1;
         }
         self.service.coordinator.changed.notify_all();
     }
@@ -1120,6 +1289,7 @@ impl ActivationOperation {
             } else {
                 snapshot.capabilities.local_navigation = capability;
             }
+            snapshot.revision += 1;
         }
         self.service.coordinator.changed.notify_all();
     }
@@ -1145,7 +1315,10 @@ impl ActivationOperation {
                 | "publication_changed" => ActivationCapabilityState::Retryable,
                 _ => ActivationCapabilityState::Unavailable,
             };
-            if snapshot.capabilities.local_navigation != ActivationCapabilityState::Ready {
+            if !matches!(
+                snapshot.capabilities.local_navigation,
+                ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
+            ) {
                 snapshot.capabilities.local_navigation = capability;
             }
             if snapshot.capabilities.broad_search != ActivationCapabilityState::Ready {
@@ -1156,6 +1329,7 @@ impl ActivationOperation {
                 ActivationCapabilityState::Unavailable => ActivationState::Unavailable,
                 ActivationCapabilityState::Cancelled => ActivationState::Cancelled,
                 ActivationCapabilityState::Ready => ActivationState::Ready,
+                ActivationCapabilityState::Retained => ActivationState::Updating,
             };
             snapshot.embedding_capacity = error
                 .details
@@ -1183,10 +1357,15 @@ impl ActivationOperation {
         } else {
             snapshot.state = ActivationState::Ready;
             snapshot.stage = ActivationStage::Ready;
+            snapshot.progress = activation_stage_progress(ActivationStage::Ready);
             snapshot.retry_after_ms = None;
             snapshot.embedding_capacity = None;
+            snapshot.embedding_retry = None;
+            snapshot.failure_code = None;
+            snapshot.failure_details = None;
             snapshot.failure = None;
         }
+        snapshot.revision += 1;
         let snapshot = snapshot.clone();
         state.running = false;
         state.current_cancel = None;
@@ -1694,6 +1873,175 @@ mod activation_tests {
         service.cancel_and_wait();
         let terminal = service.snapshot().expect("terminal snapshot");
         assert_ne!(terminal.state, ActivationState::Ready);
+    }
+
+    #[test]
+    fn serial_retries_keep_one_activation_identity_after_terminal_failure() {
+        let project = tempfile::tempdir().expect("project");
+        let missing = project.path().join("missing");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let service = Runtime::new().activation_service();
+
+        let first = service
+            .activate_project(&missing, &storage_path, Arc::new(AtomicBool::new(false)))
+            .expect_err("missing project must fail activation");
+        assert_eq!(first.code, "project_unavailable");
+        let first_snapshot = service.snapshot().expect("first terminal snapshot");
+
+        let second = service
+            .activate_project(&missing, &storage_path, Arc::new(AtomicBool::new(false)))
+            .expect_err("same missing project must fail activation again");
+        assert_eq!(second.code, "project_unavailable");
+        let second_snapshot = service.snapshot().expect("second terminal snapshot");
+
+        assert_eq!(
+            second_snapshot.operation_id, first_snapshot.operation_id,
+            "serial retries for one project must retain one activation identity"
+        );
+        assert_eq!(second_snapshot.attempt, first_snapshot.attempt + 1);
+        assert!(second_snapshot.revision > first_snapshot.revision);
+        assert!(second_snapshot.stage >= first_snapshot.stage);
+        assert!(second_snapshot.progress >= first_snapshot.progress);
+    }
+
+    #[test]
+    fn cancelling_a_waiter_does_not_cancel_or_replace_shared_activation() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn shared_activation_fixture() {}\n",
+        )
+        .expect("write fixture");
+        let service = Runtime::new().activation_service();
+
+        let first = service
+            .activate_project_with_foreground_budget(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+            )
+            .expect_err("zero foreground budget must return shared progress");
+        assert_eq!(first.code, "activation_preparing");
+        let before = service.snapshot().expect("shared activation snapshot");
+
+        let target = ActivationTarget::new(project.path(), &storage_path);
+        let cancelled = service
+            .wait_for_activation(
+                &target,
+                &before.operation_id,
+                true,
+                &AtomicBool::new(true),
+                Duration::ZERO,
+            )
+            .expect_err("the cancelled waiter must return without joining");
+        assert_eq!(cancelled.code, "cancelled");
+        let after = service
+            .snapshot()
+            .expect("shared activation survives waiter");
+
+        assert_eq!(after.operation_id, before.operation_id);
+        assert_ne!(after.state, ActivationState::Cancelled);
+        service.cancel_and_wait();
+    }
+
+    #[test]
+    fn failed_replacement_retains_exact_local_core_without_broad_capability() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::create_dir_all(project.path().join("src")).expect("create source directory");
+        fs::write(
+            project.path().join("src/lib.rs"),
+            "pub fn retained_fixture() {}\n",
+        )
+        .expect("write fixture");
+
+        let seeding_runtime = Runtime::new();
+        seeding_runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open seed project");
+        seeding_runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish retained core");
+        let retained = Store::database_complete_index_publication(&storage_path)
+            .expect("read retained publication")
+            .expect("complete retained publication");
+
+        fs::write(
+            project.path().join("codestory_workspace.json"),
+            r#"{"members":["src","missing"]}"#,
+        )
+        .expect("write incomplete synthetic workspace");
+        let runtime = Runtime::new();
+        assert_eq!(
+            runtime
+                .activation_service()
+                .retained_core_publication(&storage_path)
+                .expect("inspect retained core before activation")
+                .as_ref(),
+            Some(&crate::index_publication_dto(retained.clone()))
+        );
+        let error = runtime
+            .activation_service()
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("incomplete replacement inventory must fail closed");
+        assert_eq!(error.code, "source_discovery_incomplete");
+
+        let snapshot = runtime
+            .activation_service()
+            .snapshot()
+            .expect("failed replacement snapshot");
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Retained
+        );
+        assert_eq!(
+            snapshot.retained_core_publication.as_ref(),
+            Some(&crate::index_publication_dto(retained))
+        );
+        assert_eq!(
+            snapshot.capabilities.broad_search,
+            ActivationCapabilityState::Unavailable
+        );
+        assert!(!snapshot.allows_operation("packet"));
+
+        runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("retained complete core remains admissible for affected analysis");
+        runtime
+            .public_operation_service()
+            .run_observational_with_cancel("affected", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("affected analysis can pin the exact retained core");
+        runtime
+            .public_operation_service()
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("local grounding can pin the exact retained core");
+        let mut entered_broad_response = false;
+        let broad = runtime
+            .public_operation_service()
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                entered_broad_response = true;
+                Ok(())
+            })
+            .expect_err("broad search must remain fail-closed on a retained core");
+        assert_eq!(broad.code, "project_unavailable");
+        assert!(!entered_broad_response);
     }
 
     #[test]
@@ -2277,8 +2625,10 @@ mod activation_tests {
         };
         let snapshot = ActivationSnapshot {
             operation_id: "activation-source-failure".to_string(),
+            revision: 3,
             state: ActivationState::Unavailable,
             stage: ActivationStage::CoreFreshness,
+            progress: activation_stage_progress(ActivationStage::CoreFreshness),
             attempt: 1,
             retry_after_ms: None,
             embedding_capacity: None,
@@ -2288,6 +2638,7 @@ mod activation_tests {
             failure_details: Some(Box::new(ApiErrorDetails::source_coverage(vec![
                 diagnostic.clone(),
             ]))),
+            retained_core_publication: None,
             capabilities: ActivationCapabilities {
                 local_navigation: ActivationCapabilityState::Unavailable,
                 broad_search: ActivationCapabilityState::Unavailable,
@@ -2408,8 +2759,10 @@ mod activation_tests {
     fn failed_broad_activation_never_becomes_ready_but_can_preserve_local_capability() {
         let snapshot = ActivationSnapshot {
             operation_id: "activation-1".into(),
+            revision: 7,
             state: ActivationState::Unavailable,
             stage: ActivationStage::Validation,
+            progress: activation_stage_progress(ActivationStage::Validation),
             attempt: 1,
             retry_after_ms: None,
             embedding_capacity: None,
@@ -2417,6 +2770,7 @@ mod activation_tests {
             failure_code: Some("project_unavailable".into()),
             failure: Some("embedding backend unavailable".into()),
             failure_details: None,
+            retained_core_publication: None,
             capabilities: ActivationCapabilities {
                 local_navigation: ActivationCapabilityState::Ready,
                 broad_search: ActivationCapabilityState::Unavailable,
