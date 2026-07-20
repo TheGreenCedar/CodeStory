@@ -1241,6 +1241,11 @@ enum AffectedPathMetadataObservation {
     },
 }
 
+struct AffectedUnmatchedPathObservation<'a> {
+    workspace_root: Option<&'a Path>,
+    metadata: AffectedPathMetadataObservation,
+}
+
 fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
@@ -1267,30 +1272,31 @@ fn classify_unmatched_affected_input(
     previous_identity_error: Option<&str>,
 ) -> (AffectedInputClassificationDto, String, Vec<String>) {
     classify_unmatched_affected_input_with_metadata(
-        workspace_root,
         record,
         resolved,
         freshness,
         current_identity,
         current_identity_error,
         previous_identity_error,
-        affected_path_metadata(&resolved.current),
+        AffectedUnmatchedPathObservation {
+            workspace_root,
+            metadata: affected_path_metadata(&resolved.current),
+        },
     )
 }
 
 fn classify_unmatched_affected_input_with_metadata(
-    workspace_root: Option<&Path>,
     record: &AffectedChangeRecordDto,
     resolved: &AffectedResolvedInput,
     freshness: &IndexFreshnessObservation,
     current_identity: Option<&WorkspacePathIdentity>,
     current_identity_error: Option<&str>,
     previous_identity_error: Option<&str>,
-    metadata: AffectedPathMetadataObservation,
+    observation: AffectedUnmatchedPathObservation<'_>,
 ) -> (AffectedInputClassificationDto, String, Vec<String>) {
     let mut evidence = Vec::new();
     let path = &resolved.current;
-    let regular_file = match metadata {
+    let regular_file = match observation.metadata {
         AffectedPathMetadataObservation::RegularFile => {
             evidence.push(format!(
                 "resolved existing regular project file: {}",
@@ -1328,7 +1334,7 @@ fn classify_unmatched_affected_input_with_metadata(
     };
 
     if regular_file {
-        if !indexable_source_path_with_root(workspace_root, path) {
+        if !indexable_source_path_with_root(observation.workspace_root, path) {
             return (
                 AffectedInputClassificationDto::ValidUncovered,
                 "regular file exists inside the project but is outside current graph/index coverage"
@@ -17200,16 +17206,18 @@ mod tests {
             affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
 
         let (classification, reason, evidence) = classify_unmatched_affected_input_with_metadata(
-            None,
             &affected_test_record(AffectedChangeKindDto::Modified, "unreadable.rs"),
             &resolved,
             &freshness,
             None,
             None,
             None,
-            AffectedPathMetadataObservation::Unavailable {
-                kind: io::ErrorKind::PermissionDenied,
-                message: "injected metadata denial".to_string(),
+            AffectedUnmatchedPathObservation {
+                workspace_root: None,
+                metadata: AffectedPathMetadataObservation::Unavailable {
+                    kind: io::ErrorKind::PermissionDenied,
+                    message: "injected metadata denial".to_string(),
+                },
             },
         );
 

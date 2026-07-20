@@ -389,6 +389,19 @@ fn strict_readiness_unavailable_reason_for_runtime(
     )))
 }
 
+fn graph_indexed_source_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(language_support_profile_for_ext)
+        .is_some_and(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
+}
+
+fn manifest_contract_drift_should_win(reason: &str) -> bool {
+    reason.contains("sidecar_embedding_backend_changed")
+        || reason.contains("sidecar_embedding_dim_changed")
+        || reason == SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,17 +471,4 @@ mod tests {
         assert!(!reason.contains("indexable_file_added_or_changed"));
         assert!(!reason.contains("meta.json"));
     }
-}
-
-fn graph_indexed_source_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .and_then(language_support_profile_for_ext)
-        .is_some_and(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
-}
-
-fn manifest_contract_drift_should_win(reason: &str) -> bool {
-    reason.contains("sidecar_embedding_backend_changed")
-        || reason.contains("sidecar_embedding_dim_changed")
-        || reason == SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED
 }

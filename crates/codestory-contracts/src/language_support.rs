@@ -572,7 +572,7 @@ pub fn structural_source_path_exclusion(path: &str) -> Option<&'static str> {
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
         .collect::<Vec<_>>();
-    if components.iter().any(|component| *component == "..") {
+    if components.contains(&"..") {
         return None;
     }
     let file_name = components.last().copied().unwrap_or_default();

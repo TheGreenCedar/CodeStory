@@ -259,6 +259,15 @@ struct ObservedDiscoveryExclusions {
     directory_roots: Vec<ObservedDiscoveryDirectoryRoot>,
 }
 
+struct DiscoveryPathFilter<'a> {
+    workspace_root: &'a Path,
+    source_root: &'a Path,
+    filter_by_language: bool,
+    language: &'a Language,
+    exclude_patterns: &'a [CompiledExcludePattern],
+    discovery_exclusions: &'a ObservedDiscoveryExclusions,
+}
+
 #[derive(Debug)]
 struct DiscoveryExclusionObservationError {
     path: PathBuf,
@@ -901,16 +910,15 @@ impl WorkspaceDiscovery {
                 inspected_source_roots += 1;
 
                 if metadata.is_file() {
-                    if !should_include_discovered_path(
-                        &full_path,
-                        false,
-                        &workspace_root,
-                        &source_root,
+                    let path_filter = DiscoveryPathFilter {
+                        workspace_root: &workspace_root,
+                        source_root: &source_root,
                         filter_by_language,
-                        &group.language,
-                        &exclude_patterns,
-                        &discovery_exclusions,
-                    ) {
+                        language: &group.language,
+                        exclude_patterns: &exclude_patterns,
+                        discovery_exclusions: &discovery_exclusions,
+                    };
+                    if !should_include_discovered_path(&full_path, false, &path_filter) {
                         continue;
                     }
                     if !push_discovered_file_within_limit(
@@ -940,16 +948,15 @@ impl WorkspaceDiscovery {
                     let language = group.language.clone();
                     builder.filter_entry(move |entry| {
                         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                        should_include_discovered_path(
-                            entry.path(),
-                            is_dir,
-                            &workspace_root_for_filter,
-                            &source_root_for_filter,
+                        let path_filter = DiscoveryPathFilter {
+                            workspace_root: &workspace_root_for_filter,
+                            source_root: &source_root_for_filter,
                             filter_by_language,
-                            &language,
-                            &exclude_patterns,
-                            &filter_discovery_exclusions,
-                        )
+                            language: &language,
+                            exclude_patterns: &exclude_patterns,
+                            discovery_exclusions: &filter_discovery_exclusions,
+                        };
+                        should_include_discovered_path(entry.path(), is_dir, &path_filter)
                     });
                     for entry in builder.build() {
                         let entry = match entry {
@@ -1476,12 +1483,7 @@ impl ObservedDiscoveryExclusions {
 fn should_include_discovered_path(
     path: &Path,
     is_dir: bool,
-    workspace_root: &Path,
-    source_root: &Path,
-    filter_by_language: bool,
-    language: &Language,
-    exclude_patterns: &[CompiledExcludePattern],
-    discovery_exclusions: &ObservedDiscoveryExclusions,
+    filter: &DiscoveryPathFilter<'_>,
 ) -> bool {
     let normalized = normalize_lexical_path(path);
     let canonical = normalized.canonicalize().ok();
@@ -1491,24 +1493,32 @@ fn should_include_discovered_path(
     let exclusion_canonical = canonical
         .as_deref()
         .and_then(|path| workspace_path_lexical_identity(path).ok());
-    if discovery_exclusions
+    if filter
+        .discovery_exclusions
         .directory_contains_observed(&exclusion_lexical, exclusion_canonical.as_ref())
     {
         return false;
     }
-    if !is_dir && workspace_structural_source_exclusion(workspace_root, &normalized).is_some() {
+    if !is_dir
+        && workspace_structural_source_exclusion(filter.workspace_root, &normalized).is_some()
+    {
         return false;
     }
-    if canonical.is_some_and(|canonical| !canonical.starts_with(source_root)) {
+    if canonical.is_some_and(|canonical| !canonical.starts_with(filter.source_root)) {
         return false;
     }
-    if is_excluded_path(&normalized, workspace_root, source_root, exclude_patterns) {
+    if is_excluded_path(
+        &normalized,
+        filter.workspace_root,
+        filter.source_root,
+        filter.exclude_patterns,
+    ) {
         return false;
     }
     if is_dir {
         return true;
     }
-    !filter_by_language || matches_source_group_language(&normalized, language)
+    !filter.filter_by_language || matches_source_group_language(&normalized, filter.language)
 }
 
 fn workspace_structural_source_exclusion(

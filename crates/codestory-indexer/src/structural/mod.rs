@@ -80,7 +80,7 @@ pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
 pub(crate) fn decode_structural_source(
     bytes: Vec<u8>,
 ) -> std::result::Result<String, StructuralCollectionError> {
-    if bytes.iter().any(|byte| *byte == 0)
+    if bytes.contains(&0)
         || bytes
             .iter()
             .any(|byte| *byte < 0x09 || (*byte > 0x0d && *byte < 0x20))
