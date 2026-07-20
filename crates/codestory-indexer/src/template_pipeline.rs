@@ -27,6 +27,7 @@ pub struct StyleBlockRange {
     pub range: ByteRange,
     pub content: String,
     pub start_line: u32,
+    pub start_col: u32,
 }
 
 /// Output of preparing a template file for JS/TS graph indexing.
@@ -102,6 +103,7 @@ pub fn delegate_template_style_blocks(
             file_id,
             storage,
             block.start_line,
+            block.start_col,
         );
     }
 }
@@ -153,11 +155,12 @@ fn collect_style_blocks(source: &str, style_blocks: &mut Vec<StyleBlockRange>) {
         let close_start = open_end + close_rel;
         let close_end = close_start + "</style>".len();
         let end = close_end.min(source.len());
-        let start_line = 1 + source[..open_end].bytes().filter(|b| *b == b'\n').count() as u32;
+        let (start_line, start_col) = crate::structural::byte_offset_line_col(source, open_end);
         style_blocks.push(StyleBlockRange {
             range: ByteRange { start, end },
             content: source[open_end..close_start].to_string(),
             start_line,
+            start_col,
         });
         search_from = close_end;
     }

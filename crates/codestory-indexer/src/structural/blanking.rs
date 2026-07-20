@@ -9,9 +9,11 @@ pub enum EmbeddedRegionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedRegion {
     pub kind: EmbeddedRegionKind,
+    pub open_start_byte: usize,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: u32,
+    pub start_col: u32,
 }
 
 /// Regions between paired tags (`<script>...</script>`, `<style>...</style>`), case-insensitive.
@@ -34,13 +36,14 @@ pub fn extract_embedded_regions(source: &str) -> Vec<EmbeddedRegion> {
                 break;
             };
             let content_end = content_start + close_rel;
-            let start_line =
-                1 + source[..open_start].bytes().filter(|b| *b == b'\n').count() as u32;
+            let (start_line, start_col) = byte_offset_line_col(source, content_start);
             regions.push(EmbeddedRegion {
                 kind,
+                open_start_byte: open_start,
                 start_byte: content_start,
                 end_byte: content_end,
                 start_line,
+                start_col,
             });
             search_from = content_end + close_tag.len();
         }
@@ -81,7 +84,7 @@ pub fn blank_non_script_regions(source: &str) -> String {
 }
 
 /// Extract inner text for each `<style>` block.
-pub fn extract_style_block_sources(source: &str) -> Vec<(u32, String)> {
+pub fn extract_style_block_sources(source: &str) -> Vec<(u32, u32, String)> {
     extract_embedded_regions(source)
         .into_iter()
         .filter(|region| region.kind == EmbeddedRegionKind::Style)
@@ -89,9 +92,31 @@ pub fn extract_style_block_sources(source: &str) -> Vec<(u32, String)> {
             let slice = source
                 .get(region.start_byte..region.end_byte)
                 .unwrap_or_default();
-            (region.start_line, slice.to_string())
+            (region.start_line, region.start_col, slice.to_string())
         })
         .collect()
+}
+
+pub(crate) fn byte_offset_line_col(source: &str, offset: usize) -> (u32, u32) {
+    let offset = offset.min(source.len());
+    let prefix = &source.as_bytes()[..offset];
+    let line = prefix
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_add(1)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let line_start = prefix
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index.saturating_add(1));
+    let col = offset
+        .saturating_sub(line_start)
+        .saturating_add(1)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    (line, col)
 }
 
 fn blank_range(out: &mut str, start: usize, end: usize) {

@@ -3,7 +3,9 @@ use codestory_contracts::graph::{NodeId, NodeKind};
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::common::{push_member_edge, push_structural_node, push_usage_edge};
+use super::common::{
+    StructuralSourceSpan, push_member_edge, push_structural_node, push_usage_edge,
+};
 
 pub(crate) fn collect_css_entities(
     path: &Path,
@@ -11,6 +13,7 @@ pub(crate) fn collect_css_entities(
     file_id: NodeId,
     storage: &mut IntermediateStorage,
     line_offset: u32,
+    first_line_byte_offset: usize,
 ) {
     let path_key = path.to_string_lossy();
     let mut seen_classes = HashSet::new();
@@ -19,12 +22,18 @@ pub(crate) fn collect_css_entities(
 
     for (line_idx, line_text) in source.lines().enumerate() {
         let line_number = line_idx as u32 + line_offset;
+        let line_byte_offset = if line_idx == 0 {
+            first_line_byte_offset
+        } else {
+            0
+        };
         collect_css_tokens_on_line(
             &path_key,
             file_id,
             storage,
             line_number,
             line_text,
+            line_byte_offset,
             &mut seen_classes,
             &mut seen_ids,
             &mut seen_vars,
@@ -40,6 +49,7 @@ fn collect_css_tokens_on_line(
     storage: &mut IntermediateStorage,
     line: u32,
     text: &str,
+    line_byte_offset: usize,
     seen_classes: &mut HashSet<String>,
     seen_ids: &mut HashSet<String>,
     seen_vars: &mut HashSet<String>,
@@ -60,8 +70,7 @@ fn collect_css_tokens_on_line(
                 NodeKind::CONSTANT,
                 name,
                 &canonical,
-                line,
-                start as u32,
+                StructuralSourceSpan::token(line, line_byte_offset + start, name.len()),
             );
             push_member_edge(storage, file_id, file_id, node_id, line);
         }
@@ -84,8 +93,7 @@ fn collect_css_tokens_on_line(
                 NodeKind::CONSTANT,
                 name,
                 &canonical,
-                line,
-                start as u32,
+                StructuralSourceSpan::token(line, line_byte_offset + start, name.len()),
             );
             push_member_edge(storage, file_id, file_id, node_id, line);
         }
@@ -108,8 +116,7 @@ fn collect_css_tokens_on_line(
                 NodeKind::VARIABLE,
                 name,
                 &canonical,
-                line,
-                start as u32,
+                StructuralSourceSpan::token(line, line_byte_offset + start, name.len()),
             );
             push_member_edge(storage, file_id, file_id, node_id, line);
         }
@@ -202,6 +209,7 @@ mod tests {
             file_id,
             &mut storage,
             1,
+            0,
         );
         let kinds: Vec<_> = storage.nodes.iter().map(|n| n.kind).collect();
         assert!(kinds.contains(&NodeKind::CONSTANT));

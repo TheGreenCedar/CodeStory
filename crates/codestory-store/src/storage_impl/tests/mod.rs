@@ -1268,6 +1268,9 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
         files: &[],
         file_content_hashes: &[],
         nodes: &[definition],
+        structural_text_units: &[],
+        structural_text_projections: &[],
+        structural_text_cache_writes: &[],
         edges: &[],
         occurrences: &[],
         component_access: &[],
@@ -1469,6 +1472,261 @@ fn test_index_artifact_cache_reader_observes_committed_batches_without_write_acc
 }
 
 #[test]
+fn structural_projection_cache_write_is_atomic_with_file_and_unit_rows() -> Result<(), StorageError>
+{
+    let mut storage = Storage::new_in_memory()?;
+    storage.get_connection().execute_batch(
+        "CREATE TRIGGER reject_structural_cache_write
+         BEFORE INSERT ON structural_text_artifact_cache
+         BEGIN
+           SELECT RAISE(ABORT, 'forced structural cache failure');
+         END;",
+    )?;
+    let source_hash = "a".repeat(64);
+    let file = FileInfo {
+        id: 70,
+        path: PathBuf::from(".github/workflows/ci.yml"),
+        language: "github_actions_workflow".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    };
+    let nodes = [
+        file_node(file.id, ".github/workflows/ci.yml"),
+        Node {
+            id: NodeId(71),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "build".to_string(),
+            canonical_id: Some("github-actions:job:build".to_string()),
+            file_node_id: Some(NodeId(file.id)),
+            start_line: Some(2),
+            start_col: Some(3),
+            end_line: Some(2),
+            end_col: Some(7),
+            ..Default::default()
+        },
+    ];
+    let unit = StructuralTextUnit {
+        node_id: NodeId(71),
+        file_id: file.id,
+        placement_id: "b".repeat(64),
+        content_hash: "c".repeat(64),
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "github_actions_workflow".to_string(),
+        evidence_tier: "structural_text".to_string(),
+        resolution: "source_range_only".to_string(),
+        language: file.language.clone(),
+        kind: NodeKind::FUNCTION,
+        start_line: 2,
+        start_col: 3,
+        end_line: 2,
+        end_col: 7,
+        file_role: FileRole::Source,
+    };
+    let projection = StructuralTextProjection {
+        file_id: file.id,
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "github_actions_workflow".to_string(),
+        language: file.language.clone(),
+        file_role: FileRole::Source,
+        unit_count: 1,
+        unit_digest: structural_text_unit_digest(std::slice::from_ref(&unit)),
+    };
+    let error = storage
+        .flush_projection_batch(ProjectionBatch {
+            files: std::slice::from_ref(&file),
+            file_content_hashes: &[FileContentHash {
+                file_id: file.id,
+                content_hash: source_hash,
+            }],
+            nodes: &nodes,
+            structural_text_units: std::slice::from_ref(&unit),
+            structural_text_projections: std::slice::from_ref(&projection),
+            structural_text_cache_writes: &[StructuralTextArtifactCacheWrite {
+                path: Path::new(".github/workflows/ci.yml"),
+                file_id: file.id,
+                cache_key: "v1:cache",
+                artifact_blob: b"artifact",
+            }],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+        })
+        .expect_err("trigger must abort the complete structural projection batch");
+    assert!(
+        error
+            .to_string()
+            .contains("forced structural cache failure")
+    );
+    assert!(storage.get_files()?.is_empty());
+    assert!(storage.get_nodes()?.is_empty());
+    assert_eq!(storage.get_structural_text_unit(NodeId(71))?, None);
+    assert_eq!(
+        storage.get_structural_text_artifact_cache(
+            Path::new(".github/workflows/ci.yml"),
+            "v1:cache"
+        )?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let current_hash = "a".repeat(64);
+    let changed_hash = "b".repeat(64);
+    let files = [
+        FileInfo {
+            id: 80,
+            path: PathBuf::from("styles.css"),
+            language: "css".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        },
+        FileInfo {
+            id: 81,
+            path: PathBuf::from("changed.sql"),
+            language: "sql".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        },
+    ];
+    let empty_digest = structural_text_unit_digest(&[]);
+    let projections = [
+        StructuralTextProjection {
+            file_id: files[0].id,
+            source_content_hash: current_hash.clone(),
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "css".to_string(),
+            language: files[0].language.clone(),
+            file_role: FileRole::Source,
+            unit_count: 0,
+            unit_digest: empty_digest.clone(),
+        },
+        StructuralTextProjection {
+            file_id: files[1].id,
+            source_content_hash: changed_hash.clone(),
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "sql".to_string(),
+            language: files[1].language.clone(),
+            file_role: FileRole::Source,
+            unit_count: 0,
+            unit_digest: empty_digest,
+        },
+    ];
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &[
+            FileContentHash {
+                file_id: files[0].id,
+                content_hash: current_hash.clone(),
+            },
+            FileContentHash {
+                file_id: files[1].id,
+                content_hash: changed_hash,
+            },
+        ],
+        nodes: &[
+            file_node(files[0].id, "styles.css"),
+            file_node(files[1].id, "changed.sql"),
+        ],
+        structural_text_units: &[],
+        structural_text_projections: &projections,
+        structural_text_cache_writes: &[StructuralTextArtifactCacheWrite {
+            path: Path::new("styles.css"),
+            file_id: files[0].id,
+            cache_key: "v1:current",
+            artifact_blob: b"current",
+        }],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+
+    for (path, file_id, source_hash, producer, blob) in [
+        (
+            "changed.sql",
+            81_i64,
+            "c".repeat(64),
+            "sql",
+            b"changed".as_slice(),
+        ),
+        (
+            "deleted.sql",
+            82_i64,
+            "d".repeat(64),
+            "sql",
+            b"deleted".as_slice(),
+        ),
+        (
+            "newly-excluded.sql",
+            83_i64,
+            "e".repeat(64),
+            "sql",
+            b"excluded".as_slice(),
+        ),
+    ] {
+        storage.get_connection().execute(
+            "INSERT INTO structural_text_artifact_cache (
+                file_path, file_id, cache_key, source_content_hash,
+                descriptor_version, producer, artifact_digest, artifact_blob,
+                updated_at_epoch_ms
+             ) VALUES (?1, ?2, 'v1:stale', ?3, ?4, ?5, ?6, ?7, 1)",
+            params![
+                path,
+                file_id,
+                source_hash,
+                STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64,
+                producer,
+                format!("{:x}", Sha256::digest(blob)),
+                blob,
+            ],
+        )?;
+    }
+
+    storage.publish_structural_text_unit_generation(&IndexPublicationRecord {
+        generation: 1,
+        generation_id: "generation-cache-membership".to_string(),
+        run_id: "run-cache-membership".to_string(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    })?;
+
+    let remaining = storage.get_connection().query_row(
+        "SELECT COUNT(*) FROM structural_text_artifact_cache",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    assert_eq!(remaining, 1);
+    assert_eq!(
+        storage.get_structural_text_artifact_cache(Path::new("styles.css"), "v1:current")?,
+        Some(b"current".to_vec())
+    );
+    for stale_path in ["changed.sql", "deleted.sql", "newly-excluded.sql"] {
+        assert_eq!(
+            storage.get_structural_text_artifact_cache(Path::new(stale_path), "v1:stale")?,
+            None,
+            "{stale_path} retained stale structural cache membership"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn disposable_full_build_is_the_only_relaxed_sqlite_profile() -> Result<(), StorageError> {
     fn profile(storage: &Storage) -> Result<(String, i64, i64, i64), StorageError> {
         let connection = storage.get_connection();
@@ -1635,6 +1893,9 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
         files: &files,
         file_content_hashes: &hashes,
         nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: &[],
+        structural_text_cache_writes: &[],
         edges: &[],
         occurrences: &[],
         component_access: &[],
@@ -1649,6 +1910,9 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
         files: &files,
         file_content_hashes: &[],
         nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: &[],
+        structural_text_cache_writes: &[],
         edges: &[],
         occurrences: &[],
         component_access: &[],
@@ -3334,6 +3598,45 @@ fn schema_27_adds_source_policy_tables_without_synthesizing_publication() -> Res
 }
 
 #[test]
+fn schema_28_adds_structural_unit_tables_without_synthesizing_publication()
+-> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v28-structural-unit-migration");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let storage = Storage::open(&db_path)?;
+        for table in [
+            "structural_text_unit_publication",
+            "structural_text_projection",
+            "structural_text_unit",
+            "structural_text_artifact_cache",
+        ] {
+            storage.conn.execute(&format!("DROP TABLE {table}"), [])?;
+        }
+        storage.set_schema_version(27)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert!(
+        storage
+            .get_structural_text_unit_publication_manifest()?
+            .is_none(),
+        "migration cannot manufacture verified structural evidence"
+    );
+    assert!(
+        storage
+            .get_structural_text_projection_file_ids()?
+            .is_empty()
+    );
+    schema::migrate_v28_structural_text_units(&storage.conn)?;
+    schema::migrate_v28_structural_text_units(&storage.conn)?;
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    Ok(())
+}
+
+#[test]
 fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_column()
 -> Result<(), StorageError> {
     for source_version in [19, 20] {
@@ -3488,6 +3791,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 1,
         };
+        seed.publish_structural_text_unit_generation(&live_publication)?;
         seed.put_index_publication(&live_publication)?;
         seed.publish_source_policy_exclusion_generation(
             &live_publication,
@@ -3519,6 +3823,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
                 mode: IndexPublicationMode::Full,
                 published_at_epoch_ms: 2,
             };
+            staged.publish_structural_text_unit_generation(&staged_publication)?;
             staged.put_index_publication(&staged_publication)?;
             staged.publish_source_policy_exclusion_generation(
                 &staged_publication,
@@ -3704,6 +4009,7 @@ fn seed_promotion_file_with_identity(
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: id.max(0),
         };
+        storage.publish_structural_text_unit_generation(&publication)?;
         storage.put_index_publication(&publication)?;
         storage.publish_source_policy_exclusion_generation(
             &publication,
@@ -3719,6 +4025,92 @@ fn seed_promotion_file_with_identity(
 
 fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
     seed_promotion_file_with_identity(path, id, name, true)
+}
+
+fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> {
+    let mut storage = Storage::open(path)?;
+    let file = storage
+        .get_files()?
+        .into_iter()
+        .next()
+        .expect("promotion fixture file");
+    let source_hash = format!("{:064x}", file.id);
+    let producer = "test_structural_collector".to_string();
+    let projection = StructuralTextProjection {
+        file_id: file.id,
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer,
+        language: file.language.clone(),
+        file_role: file.file_role,
+        unit_count: 0,
+        unit_digest: structural_text_unit_digest(&[]),
+    };
+    storage.flush_projection_batch(ProjectionBatch {
+        files: std::slice::from_ref(&file),
+        file_content_hashes: &[FileContentHash {
+            file_id: file.id,
+            content_hash: source_hash,
+        }],
+        nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: std::slice::from_ref(&projection),
+        structural_text_cache_writes: &[StructuralTextArtifactCacheWrite {
+            path: &file.path,
+            file_id: file.id,
+            cache_key: "v1:test",
+            artifact_blob: b"verified structural cache",
+        }],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+    let publication = storage
+        .get_complete_index_publication()?
+        .expect("promotion fixture publication");
+    storage.publish_structural_text_unit_generation(&publication)?;
+    storage.finalize_staged_snapshot()
+}
+
+fn corrupt_test_structural_cache(path: &Path, corruption: &str) -> Result<(), StorageError> {
+    let connection = Connection::open(path)?;
+    match corruption {
+        "blob" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET artifact_blob = ?1",
+            [b"corrupt blob".as_slice()],
+        )?,
+        "digest" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET artifact_digest = ?1",
+            ["0".repeat(64)],
+        )?,
+        "key" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET cache_key = 'unversioned'",
+            [],
+        )?,
+        "source" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET source_content_hash = ?1",
+            ["f".repeat(64)],
+        )?,
+        "producer" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET producer = 'wrong-producer'",
+            [],
+        )?,
+        "file" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET file_id = file_id + 1000",
+            [],
+        )?,
+        _ => panic!("unknown structural cache corruption {corruption}"),
+    };
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+fn copy_promotion_database_fixture(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    cleanup_sqlite_sidecars(destination)?;
+    let source = Connection::open(source)?;
+    source.backup(MAIN_DB, destination, None::<fn(rusqlite::backup::Progress)>)?;
+    Ok(())
 }
 
 fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
@@ -3740,6 +4132,7 @@ fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<()
         mode: IndexPublicationMode::Full,
         published_at_epoch_ms: id.max(0),
     };
+    storage.publish_structural_text_unit_generation(&publication)?;
     storage.put_index_publication(&publication)?;
     storage.publish_source_policy_exclusion_generation(
         &publication,
@@ -3788,7 +4181,8 @@ fn promotion_journal(
     previous_path: &Path,
     candidate_path: &Path,
 ) -> Result<PromotionJournal, StorageError> {
-    let previous = read_recovery_database_identity(previous_path)?;
+    let previous =
+        read_recovery_database_identity(previous_path, RecoveryDatabaseContract::CurrentPromotion)?;
     let candidate = require_complete_promotion_database_identity(candidate_path, "Test candidate")?;
     Ok(PromotionJournal {
         version: PROMOTION_JOURNAL_VERSION,
@@ -3803,9 +4197,552 @@ fn promotion_journal(
             candidate_path,
             &candidate,
         )?,
+        previous_structural_text: previous
+            .as_ref()
+            .map(|publication| {
+                read_structural_text_unit_rollback_identity(previous_path, publication)
+            })
+            .transpose()?
+            .flatten(),
+        candidate_structural_text: read_structural_text_unit_rollback_identity(
+            candidate_path,
+            &candidate,
+        )?,
         previous,
         candidate,
     })
+}
+
+fn promotion_journal_for_version(
+    previous_path: &Path,
+    candidate_path: &Path,
+    version: u32,
+) -> Result<PromotionJournal, StorageError> {
+    let mut journal = promotion_journal(previous_path, candidate_path)?;
+    journal.version = version;
+    if version < SOURCE_POLICY_PROMOTION_JOURNAL_VERSION {
+        journal.previous_source_policy = None;
+        journal.candidate_source_policy = None;
+    }
+    if version < PROMOTION_JOURNAL_VERSION {
+        journal.previous_structural_text = None;
+        journal.candidate_structural_text = None;
+    }
+    Ok(journal)
+}
+
+fn restamp_complete_promotion_fixture(
+    path: &Path,
+    schema_version: u32,
+) -> Result<(), StorageError> {
+    let conn = Connection::open(path)?;
+    if schema_version < STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS structural_text_unit;
+             DROP TABLE IF EXISTS structural_text_projection;
+             DROP TABLE IF EXISTS structural_text_artifact_cache;
+             DROP TABLE IF EXISTS structural_text_unit_publication;",
+        )?;
+    }
+    if schema_version < SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS source_policy_exclusion;
+             DROP TABLE IF EXISTS source_policy_exclusion_publication;",
+        )?;
+    }
+    conn.execute("DELETE FROM incomplete_index_run", [])?;
+    conn.pragma_update(None, "user_version", schema_version.to_string())?;
+    Ok(())
+}
+
+#[test]
+fn recovery_schema_contracts_match_their_durable_journal_generations() {
+    let current = RecoveryDatabaseContract::CurrentPromotion;
+    let legacy_journal = RecoveryDatabaseContract::Journal(LEGACY_PROMOTION_JOURNAL_VERSION);
+    let source_policy_journal =
+        RecoveryDatabaseContract::Journal(SOURCE_POLICY_PROMOTION_JOURNAL_VERSION);
+    let structural_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
+    let legacy_backup = RecoveryDatabaseContract::LegacyBackup;
+
+    for schema_version in
+        LEGACY_PROMOTION_MIN_SCHEMA_VERSION..=SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+    {
+        assert!(legacy_journal.supports_complete_schema(schema_version));
+    }
+    for schema_version in LEGACY_PROMOTION_MIN_SCHEMA_VERSION..=SCHEMA_VERSION {
+        assert!(legacy_backup.supports_complete_schema(schema_version));
+    }
+    assert!(
+        source_policy_journal.supports_complete_schema(SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(structural_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(current.supports_complete_schema(SCHEMA_VERSION));
+    assert!(legacy_journal.supports_complete_schema(SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
+    assert!(!legacy_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(!source_policy_journal.supports_complete_schema(SCHEMA_VERSION));
+
+    for (contract, rejected) in [
+        (legacy_journal, LEGACY_PROMOTION_MIN_SCHEMA_VERSION - 1),
+        (
+            source_policy_journal,
+            SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
+        (
+            structural_journal,
+            STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
+        (legacy_backup, LEGACY_PROMOTION_MIN_SCHEMA_VERSION - 1),
+        (current, SCHEMA_VERSION - 1),
+    ] {
+        assert!(!contract.supports_complete_schema(rejected));
+        assert!(!contract.supports_complete_schema(SCHEMA_VERSION + 1));
+    }
+    assert!(
+        !RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION + 1)
+            .supports_complete_schema(SCHEMA_VERSION)
+    );
+}
+
+#[test]
+fn legacy_journal_recovery_runs_before_supported_schema_migration() {
+    for (label, journal_version, schema_version, committed, expected_generation) in [
+        (
+            "v1-schema21-prepared",
+            LEGACY_PROMOTION_JOURNAL_VERSION,
+            LEGACY_PROMOTION_MIN_SCHEMA_VERSION,
+            false,
+            1,
+        ),
+        (
+            "v1-schema21-committed",
+            LEGACY_PROMOTION_JOURNAL_VERSION,
+            LEGACY_PROMOTION_MIN_SCHEMA_VERSION,
+            true,
+            2,
+        ),
+        (
+            "v1-schema27-prepared",
+            LEGACY_PROMOTION_JOURNAL_VERSION,
+            SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
+            false,
+            1,
+        ),
+        (
+            "v2-schema27-prepared",
+            SOURCE_POLICY_PROMOTION_JOURNAL_VERSION,
+            SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
+            false,
+            1,
+        ),
+        (
+            "v2-schema27-committed",
+            SOURCE_POLICY_PROMOTION_JOURNAL_VERSION,
+            SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
+            true,
+            2,
+        ),
+    ] {
+        let live_path = unique_temp_db_path(label);
+        let backup_path = live_path.with_extension("sqlite.backup");
+        seed_promotion_file(&live_path, 2, "new.rs").expect("seed legacy live");
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed legacy backup");
+        let journal = promotion_journal_for_version(&backup_path, &live_path, journal_version)
+            .expect("build legacy journal");
+        restamp_complete_promotion_fixture(&backup_path, schema_version)
+            .expect("restamp legacy backup");
+        restamp_complete_promotion_fixture(&live_path, schema_version)
+            .expect("restamp legacy live");
+        let journal_path = if committed {
+            promotion_committed_journal_path(&live_path)
+        } else {
+            promotion_prepared_journal_path(&live_path)
+        };
+        write_promotion_journal(&journal_path, &journal).expect("write legacy journal");
+
+        let raw = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open legacy database before recovery");
+        let raw_schema: i64 = raw
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read legacy schema");
+        assert_eq!(raw_schema as u32, schema_version);
+        drop(raw);
+
+        let recovered = Storage::open(&live_path).expect("recover then migrate legacy database");
+        assert_eq!(
+            recovered
+                .get_complete_index_publication()
+                .expect("read recovered publication")
+                .expect("complete recovered publication")
+                .generation,
+            expected_generation
+        );
+        assert_eq!(
+            recovered.get_files().expect("read recovered files")[0].path,
+            PathBuf::from(if committed { "new.rs" } else { "old.rs" })
+        );
+        assert_eq!(
+            recovered.schema_version().expect("read migrated schema"),
+            SCHEMA_VERSION
+        );
+        drop(recovered);
+
+        assert!(!journal_path.exists(), "recovery must consume its journal");
+        assert!(!backup_path.exists(), "recovery must consume its backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean recovered live fixture");
+    }
+}
+
+#[test]
+fn schema_21_legacy_backup_recovers_before_migration() {
+    let live_path = unique_temp_db_path("schema21-legacy-backup-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 21 backup");
+    restamp_complete_promotion_fixture(&backup_path, LEGACY_PROMOTION_MIN_SCHEMA_VERSION)
+        .expect("restamp schema 21 backup");
+
+    let recovered = Storage::open(&live_path).expect("recover schema 21 legacy backup");
+    assert_eq!(
+        recovered
+            .get_complete_index_publication()
+            .expect("read recovered publication")
+            .expect("complete recovered publication")
+            .generation,
+        1
+    );
+    assert_eq!(
+        recovered.schema_version().expect("read migrated schema"),
+        SCHEMA_VERSION
+    );
+    drop(recovered);
+
+    assert!(
+        !backup_path.exists(),
+        "legacy recovery must consume its backup"
+    );
+    cleanup_sqlite_sidecars(&live_path).expect("clean recovered legacy fixture");
+}
+
+#[test]
+fn schema_28_journal_less_backup_requires_complete_auxiliary_publications() {
+    let live_path = unique_temp_db_path("schema28-journal-less-valid-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
+    publish_bound_test_structural_cache(&backup_path).expect("bind schema 28 structural cache");
+
+    let recovered = Storage::open(&live_path).expect("recover valid schema 28 backup");
+    let publication = recovered
+        .get_complete_index_publication()
+        .expect("read recovered publication")
+        .expect("complete recovered publication");
+    recovered
+        .validate_source_policy_exclusion_publication(
+            &publication,
+            "test-project",
+            "test-workspace",
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+        )
+        .expect("validate recovered source policy publication");
+    recovered
+        .validate_structural_text_unit_publication(&publication)
+        .expect("validate recovered structural publication");
+    assert_eq!(
+        recovered
+            .get_structural_text_artifact_cache(Path::new("old.rs"), "v1:test")
+            .expect("read recovered structural cache"),
+        Some(b"verified structural cache".to_vec())
+    );
+    drop(recovered);
+    assert!(
+        !backup_path.exists(),
+        "valid recovery must consume its backup"
+    );
+    cleanup_sqlite_sidecars(&live_path).expect("clean recovered schema 28 fixture");
+}
+
+#[test]
+fn schema_28_journal_less_backup_protects_against_invalid_live_auxiliary_state() {
+    for live_state in ["same-corrupt", "newer-corrupt"] {
+        let live_path = unique_temp_db_path(&format!("schema28-journal-less-{live_state}-live"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        if live_state == "newer-corrupt" {
+            seed_promotion_file(&live_path, 2, "new.rs").expect("seed newer live publication");
+            publish_bound_test_structural_cache(&live_path)
+                .expect("bind newer live structural cache");
+        }
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed valid schema 28 backup");
+        publish_bound_test_structural_cache(&backup_path)
+            .expect("bind valid backup structural cache");
+        if live_state == "same-corrupt" {
+            copy_promotion_database_fixture(&backup_path, &live_path)
+                .expect("copy same-identity live fixture");
+        }
+        corrupt_test_structural_cache(&live_path, "blob").expect("corrupt live structural cache");
+
+        if live_state == "same-corrupt" {
+            let recovered = Storage::open(&live_path).expect("restore valid same-identity backup");
+            let publication = recovered
+                .get_complete_index_publication()
+                .expect("read restored publication")
+                .expect("complete restored publication");
+            recovered
+                .validate_structural_text_unit_publication(&publication)
+                .expect("restored structural publication");
+            assert_eq!(
+                recovered
+                    .get_structural_text_artifact_cache(Path::new("old.rs"), "v1:test")
+                    .expect("read restored cache"),
+                Some(b"verified structural cache".to_vec())
+            );
+            drop(recovered);
+            assert!(
+                !backup_path.exists(),
+                "successful same-identity restore retained its backup"
+            );
+        } else {
+            let error = match Storage::open(&live_path) {
+                Ok(_) => panic!("newer corrupt live publication passed journal-less recovery"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("structural artifact cache"),
+                "unexpected newer-live recovery error: {error}"
+            );
+            assert!(
+                backup_path.exists(),
+                "invalid newer live publication destroyed the valid backup"
+            );
+            let live = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open retained newer live fixture");
+            let generation: String = live
+                .query_row(
+                    "SELECT generation_id FROM index_publication WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read retained newer live generation");
+            assert_eq!(generation, "generation-2");
+        }
+
+        cleanup_sqlite_sidecars(&backup_path).expect("clean protected backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean protected live");
+    }
+}
+
+#[test]
+fn schema_28_journal_less_backup_rejects_missing_or_corrupt_auxiliary_state() {
+    for corruption in [
+        "source-policy-missing",
+        "source-policy-corrupt",
+        "structural-missing",
+        "structural-corrupt",
+        "cache-missing",
+        "cache-corrupt",
+    ] {
+        let live_path = unique_temp_db_path(&format!("schema28-journal-less-{corruption}-live"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
+        publish_bound_test_structural_cache(&backup_path).expect("bind schema 28 structural cache");
+        let connection = Connection::open(&backup_path).expect("open schema 28 backup");
+        match corruption {
+            "source-policy-missing" => connection
+                .execute("DELETE FROM source_policy_exclusion_publication", [])
+                .expect("remove source policy manifest"),
+            "source-policy-corrupt" => connection
+                .execute(
+                    "UPDATE source_policy_exclusion_publication
+                     SET exclusion_digest = ?1",
+                    ["0".repeat(64)],
+                )
+                .expect("corrupt source policy manifest"),
+            "structural-missing" => connection
+                .execute("DELETE FROM structural_text_unit_publication", [])
+                .expect("remove structural manifest"),
+            "structural-corrupt" => connection
+                .execute(
+                    "UPDATE structural_text_unit_publication SET unit_digest = ?1",
+                    ["0".repeat(64)],
+                )
+                .expect("corrupt structural manifest"),
+            "cache-missing" => connection
+                .execute("DROP TABLE structural_text_artifact_cache", [])
+                .expect("remove structural cache table"),
+            "cache-corrupt" => connection
+                .execute(
+                    "UPDATE structural_text_artifact_cache SET artifact_blob = ?1",
+                    [b"corrupt cache".as_slice()],
+                )
+                .expect("corrupt structural cache"),
+            _ => unreachable!(),
+        };
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint corrupt schema 28 backup");
+        drop(connection);
+
+        let error = match Storage::open(&live_path) {
+            Ok(_) => panic!("schema 28 recovery accepted {corruption}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().to_ascii_lowercase().contains(
+                if corruption.starts_with("source-policy") {
+                    "source policy"
+                } else if corruption.starts_with("cache") {
+                    "structural artifact cache"
+                } else {
+                    "structural text unit"
+                }
+            ),
+            "unexpected {corruption} recovery error: {error}"
+        );
+        assert!(
+            backup_path.exists(),
+            "{corruption} recovery consumed its backup"
+        );
+        assert!(
+            !live_path.exists(),
+            "{corruption} recovery installed an invalid backup"
+        );
+
+        cleanup_sqlite_sidecars(&backup_path).expect("clean rejected schema 28 backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean rejected schema 28 live");
+    }
+}
+
+#[test]
+fn schema_27_journal_less_backup_allows_absent_policy_but_rejects_corrupt_present_policy() {
+    for policy_state in ["absent", "corrupt"] {
+        let live_path = unique_temp_db_path(&format!("schema27-journal-less-{policy_state}-live"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 27 backup");
+        let connection = Connection::open(&backup_path).expect("open schema 27 backup");
+        if policy_state == "absent" {
+            connection
+                .execute("DELETE FROM source_policy_exclusion_publication", [])
+                .expect("remove optional schema 27 policy manifest");
+        } else {
+            connection
+                .execute(
+                    "UPDATE source_policy_exclusion_publication
+                     SET exclusion_digest = ?1",
+                    ["0".repeat(64)],
+                )
+                .expect("corrupt schema 27 policy manifest");
+        }
+        drop(connection);
+        restamp_complete_promotion_fixture(
+            &backup_path,
+            SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
+        )
+        .expect("restamp schema 27 backup");
+
+        if policy_state == "absent" {
+            let recovered =
+                Storage::open(&live_path).expect("recover schema 27 backup without policy");
+            assert_eq!(
+                recovered
+                    .get_complete_index_publication()
+                    .expect("read schema 27 publication")
+                    .expect("complete schema 27 publication")
+                    .generation,
+                1
+            );
+            assert!(
+                recovered
+                    .get_source_policy_exclusion_manifest()
+                    .expect("read optional schema 27 policy")
+                    .is_none()
+            );
+            drop(recovered);
+            assert!(!backup_path.exists());
+        } else {
+            let error = match Storage::open(&live_path) {
+                Ok(_) => panic!("schema 27 recovery accepted corrupt present policy"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("source policy"),
+                "unexpected schema 27 policy error: {error}"
+            );
+            assert!(backup_path.exists());
+            assert!(!live_path.exists());
+        }
+
+        cleanup_sqlite_sidecars(&backup_path).expect("clean schema 27 backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean schema 27 live");
+    }
+}
+
+#[test]
+fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
+    for (label, journal_version, schema_version, expected_error) in [
+        (
+            "unsupported-old-v1",
+            LEGACY_PROMOTION_JOURNAL_VERSION,
+            LEGACY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+            "unsupported schema version",
+        ),
+        (
+            "invalid-v1-schema28",
+            LEGACY_PROMOTION_JOURNAL_VERSION,
+            SCHEMA_VERSION,
+            "unsupported schema version",
+        ),
+        (
+            "invalid-v2-schema28",
+            SOURCE_POLICY_PROMOTION_JOURNAL_VERSION,
+            SCHEMA_VERSION,
+            "unsupported schema version",
+        ),
+        (
+            "unsupported-future-v3",
+            PROMOTION_JOURNAL_VERSION,
+            SCHEMA_VERSION + 1,
+            "unsupported schema version",
+        ),
+        (
+            "unmarked-incomplete-v2",
+            SOURCE_POLICY_PROMOTION_JOURNAL_VERSION,
+            INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+            "without its marker",
+        ),
+    ] {
+        let live_path = unique_temp_db_path(label);
+        let backup_path = live_path.with_extension("sqlite.backup");
+        let prepared_path = promotion_prepared_journal_path(&live_path);
+        seed_promotion_file(&live_path, 2, "new.rs").expect("seed recovery live");
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed recovery backup");
+        let journal = promotion_journal_for_version(&backup_path, &live_path, journal_version)
+            .expect("build recovery journal");
+        restamp_complete_promotion_fixture(&live_path, schema_version)
+            .expect("stamp rejected recovery schema");
+        write_promotion_journal(&prepared_path, &journal).expect("write recovery journal");
+
+        let error = match Storage::open(&live_path) {
+            Ok(_) => panic!("unsupported recovery schema must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected recovery error for {label}: {error}"
+        );
+        assert!(
+            prepared_path.exists(),
+            "failed recovery must retain journal"
+        );
+        assert!(backup_path.exists(), "failed recovery must retain backup");
+
+        std::fs::remove_file(&prepared_path).expect("remove rejected journal");
+        cleanup_sqlite_sidecars(&backup_path).expect("clean rejected backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean rejected live");
+    }
 }
 
 #[test]
@@ -3919,6 +4856,249 @@ fn staged_promotion_rejects_missing_corrupt_or_timestamp_drifted_candidate_manif
 }
 
 #[test]
+fn staged_promotion_rejects_missing_corrupt_or_drifted_structural_manifest() {
+    for corruption in ["missing", "digest", "timestamp"] {
+        let live_path = unique_temp_db_path(&format!("promotion-structural-live-{corruption}"));
+        let staged_path = unique_temp_db_path(&format!("promotion-structural-staged-{corruption}"));
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed live publication");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged publication");
+        let staged = Storage::open(&staged_path).expect("open staged publication");
+        match corruption {
+            "missing" => {
+                staged
+                    .get_connection()
+                    .execute("DELETE FROM structural_text_unit_publication", [])
+                    .expect("remove structural manifest");
+            }
+            "digest" => {
+                staged
+                    .get_connection()
+                    .execute(
+                        "UPDATE structural_text_unit_publication SET unit_digest = ?1",
+                        params!["0".repeat(64)],
+                    )
+                    .expect("corrupt structural digest");
+            }
+            "timestamp" => {
+                staged
+                    .get_connection()
+                    .execute(
+                        "UPDATE structural_text_unit_publication
+                         SET published_at_epoch_ms = published_at_epoch_ms + 1",
+                        [],
+                    )
+                    .expect("drift structural timestamp");
+            }
+            _ => unreachable!(),
+        }
+        drop(staged);
+
+        let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+            .expect_err("invalid structural manifest must block promotion");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("structural text unit"),
+            "unexpected promotion error: {error}"
+        );
+        let live = Storage::open(&live_path).expect("reopen preserved live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("live publication")
+                .expect("complete live publication")
+                .generation_id,
+            "generation-1"
+        );
+        assert_eq!(
+            live.get_files().expect("live files")[0].path,
+            PathBuf::from("old.rs")
+        );
+
+        cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
+    }
+}
+
+#[test]
+fn staged_promotion_rejects_every_corrupt_structural_cache_binding() {
+    for corruption in ["blob", "digest", "key", "source", "producer", "file"] {
+        let live_path =
+            unique_temp_db_path(&format!("promotion-structural-cache-live-{corruption}"));
+        let staged_path =
+            unique_temp_db_path(&format!("promotion-structural-cache-staged-{corruption}"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        let prepared_path = promotion_prepared_journal_path(&live_path);
+        let committed_path = promotion_committed_journal_path(&live_path);
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed live publication");
+        publish_bound_test_structural_cache(&live_path).expect("bind live structural cache");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged publication");
+        publish_bound_test_structural_cache(&staged_path).expect("bind staged structural cache");
+        corrupt_test_structural_cache(&staged_path, corruption)
+            .expect("corrupt staged structural cache");
+
+        let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+            .expect_err("corrupt structural cache must block promotion");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("structural artifact cache"),
+            "unexpected {corruption} promotion error: {error}"
+        );
+        let live = Storage::open(&live_path).expect("reopen preserved live publication");
+        let publication = live
+            .get_complete_index_publication()
+            .expect("read live publication")
+            .expect("complete live publication");
+        assert_eq!(publication.generation_id, "generation-1");
+        live.validate_structural_text_unit_publication(&publication)
+            .expect("preserved live structural publication");
+        assert_eq!(
+            live.get_files().expect("live files")[0].path,
+            PathBuf::from("old.rs")
+        );
+        assert!(staged_path.exists(), "rejected candidate remains retryable");
+        assert!(
+            !backup_path.exists(),
+            "candidate rejection created a backup"
+        );
+        assert!(
+            !prepared_path.exists(),
+            "candidate rejection created a prepared journal"
+        );
+        assert!(
+            !committed_path.exists(),
+            "candidate rejection created a committed journal"
+        );
+        drop(live);
+
+        cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
+    }
+}
+
+#[test]
+fn prepared_recovery_rejects_corrupt_previous_and_backup_structural_caches() {
+    for corruption_role in ["previous-live", "backup"] {
+        let live_path = unique_temp_db_path(&format!("prepared-cache-{corruption_role}-live"));
+        let staged_path = unique_temp_db_path(&format!("prepared-cache-{corruption_role}-staged"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        let prepared_path = promotion_prepared_journal_path(&live_path);
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed previous publication");
+        publish_bound_test_structural_cache(&live_path).expect("bind previous structural cache");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed candidate publication");
+        publish_bound_test_structural_cache(&staged_path).expect("bind candidate structural cache");
+        copy_promotion_database_fixture(&live_path, &backup_path).expect("copy previous backup");
+        let journal =
+            promotion_journal(&backup_path, &staged_path).expect("build prepared journal");
+
+        if corruption_role == "previous-live" {
+            corrupt_test_structural_cache(&live_path, "blob").expect("corrupt previous live cache");
+        } else {
+            corrupt_test_structural_cache(&backup_path, "blob")
+                .expect("corrupt previous backup cache");
+            copy_promotion_database_fixture(&staged_path, &live_path)
+                .expect("install candidate before prepared recovery");
+        }
+        write_promotion_journal(&prepared_path, &journal).expect("write prepared journal");
+
+        let error = match Storage::open(&live_path) {
+            Ok(_) => panic!("prepared recovery accepted corrupt structural cache"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("structural artifact cache"),
+            "unexpected {corruption_role} recovery error: {error}"
+        );
+        assert!(
+            prepared_path.exists(),
+            "failed prepared recovery consumed its journal"
+        );
+        assert!(
+            backup_path.exists(),
+            "failed prepared recovery consumed its backup"
+        );
+        let live = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open failed-recovery live database");
+        let live_file: String = live
+            .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read failed-recovery live file");
+        assert_eq!(
+            live_file,
+            if corruption_role == "previous-live" {
+                "old.rs"
+            } else {
+                "new.rs"
+            }
+        );
+        drop(live);
+
+        std::fs::remove_file(&prepared_path).expect("remove prepared journal");
+        cleanup_sqlite_sidecars(&backup_path).expect("clean prepared backup");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean prepared candidate");
+        cleanup_sqlite_sidecars(&live_path).expect("clean prepared live");
+    }
+}
+
+#[test]
+fn committed_recovery_rejects_corrupt_candidate_structural_cache() {
+    let live_path = unique_temp_db_path("committed-cache-live");
+    let staged_path = unique_temp_db_path("committed-cache-staged");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let committed_path = promotion_committed_journal_path(&live_path);
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed previous publication");
+    publish_bound_test_structural_cache(&live_path).expect("bind previous structural cache");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed candidate publication");
+    publish_bound_test_structural_cache(&staged_path).expect("bind candidate structural cache");
+    copy_promotion_database_fixture(&live_path, &backup_path).expect("copy previous backup");
+    let journal = promotion_journal(&backup_path, &staged_path).expect("build committed journal");
+    copy_promotion_database_fixture(&staged_path, &live_path)
+        .expect("install committed candidate fixture");
+    corrupt_test_structural_cache(&live_path, "blob").expect("corrupt committed candidate cache");
+    write_promotion_journal(&committed_path, &journal).expect("write committed journal");
+
+    let error = match Storage::open(&live_path) {
+        Ok(_) => panic!("committed recovery accepted corrupt structural cache"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("structural artifact cache"),
+        "unexpected committed recovery error: {error}"
+    );
+    assert!(
+        committed_path.exists(),
+        "failed committed recovery consumed its journal"
+    );
+    assert!(
+        backup_path.exists(),
+        "failed committed recovery consumed its backup"
+    );
+    let live = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open corrupt committed live database");
+    let live_file: String = live
+        .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read corrupt committed live file");
+    assert_eq!(live_file, "new.rs");
+    drop(live);
+
+    std::fs::remove_file(&committed_path).expect("remove committed journal");
+    cleanup_sqlite_sidecars(&backup_path).expect("clean committed backup");
+    cleanup_sqlite_sidecars(&staged_path).expect("clean committed candidate");
+    cleanup_sqlite_sidecars(&live_path).expect("clean committed live");
+}
+
+#[test]
 fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_repair() {
     let live_path = unique_temp_db_path("legacy-committed-policy-live");
     seed_promotion_file(&live_path, 1, "legacy.rs").expect("seed legacy live publication");
@@ -3931,6 +5111,8 @@ fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_
         .execute("DELETE FROM source_policy_exclusion_publication", [])
         .expect("remove post-v27 policy identity from legacy fixture");
     drop(live);
+    restamp_complete_promotion_fixture(&live_path, SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+        .expect("restore the schema 27 journal-v1 producer shape");
 
     let committed_path = promotion_committed_journal_path(&live_path);
     write_promotion_journal(
@@ -3941,6 +5123,8 @@ fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_
             candidate: candidate.clone(),
             previous_source_policy: None,
             candidate_source_policy: None,
+            previous_structural_text: None,
+            candidate_structural_text: None,
         },
     )
     .expect("write legacy committed journal");

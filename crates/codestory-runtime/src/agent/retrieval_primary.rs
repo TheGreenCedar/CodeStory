@@ -1828,7 +1828,7 @@ fn resolve_sidecar_candidates_in_storage(
             continue;
         }
         let Some(mut hit) =
-            AppController::build_search_hit(storage, node_names, node_id, candidate.score)
+            AppController::build_search_hit(storage, node_names, node_id, candidate.score)?
         else {
             unresolved_candidates.push((candidate, "hit_build_failed"));
             continue;

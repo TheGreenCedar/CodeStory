@@ -65,6 +65,62 @@ const TABLE_STATEMENTS: &[&str] = &[
         mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
         published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
     )",
+    "CREATE TABLE IF NOT EXISTS structural_text_unit (
+        node_id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL,
+        placement_id TEXT NOT NULL UNIQUE CHECK(length(placement_id) = 64),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        evidence_tier TEXT NOT NULL CHECK(evidence_tier = 'structural_text'),
+        resolution TEXT NOT NULL CHECK(resolution = 'source_range_only'),
+        language TEXT NOT NULL CHECK(length(language) > 0),
+        kind INTEGER NOT NULL,
+        start_line INTEGER NOT NULL CHECK(start_line > 0),
+        start_col INTEGER NOT NULL CHECK(start_col > 0),
+        end_line INTEGER NOT NULL CHECK(end_line > 0),
+        end_col INTEGER NOT NULL CHECK(end_col > 0),
+        file_role TEXT NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id),
+        FOREIGN KEY(file_id) REFERENCES file(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_projection (
+        file_id INTEGER PRIMARY KEY,
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        language TEXT NOT NULL CHECK(length(language) > 0),
+        file_role TEXT NOT NULL,
+        unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+        unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+        FOREIGN KEY(file_id) REFERENCES file(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_artifact_cache (
+        file_path TEXT PRIMARY KEY,
+        file_id INTEGER NOT NULL UNIQUE,
+        cache_key TEXT NOT NULL,
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        artifact_digest TEXT NOT NULL CHECK(length(artifact_digest) = 64),
+        artifact_blob BLOB NOT NULL,
+        updated_at_epoch_ms INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_unit_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+        unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+        projection_count INTEGER NOT NULL CHECK(projection_count >= 0),
+        projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS local_symbol (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -377,6 +433,14 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_file
+     ON structural_text_unit(file_id)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_content
+     ON structural_text_unit(content_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_artifact_cache_key
+     ON structural_text_artifact_cache(cache_key)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_artifact_cache_file
+     ON structural_text_artifact_cache(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
      ON retrieval_index_manifest(built_at_epoch_ms)",
 ];
@@ -619,6 +683,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v27_source_policy_exclusions(&storage.conn)?;
     if stored_version < 27 {
         storage.set_schema_version(27)?;
+    }
+    migrate_v28_structural_text_units(&storage.conn)?;
+    if stored_version < 28 {
+        storage.set_schema_version(28)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -985,6 +1053,98 @@ pub(super) fn migrate_v27_source_policy_exclusions(conn: &Connection) -> Result<
             policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
             byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
             published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v28_structural_text_units(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_unit (
+            node_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            placement_id TEXT NOT NULL UNIQUE CHECK(length(placement_id) = 64),
+            content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            evidence_tier TEXT NOT NULL CHECK(evidence_tier = 'structural_text'),
+            resolution TEXT NOT NULL CHECK(resolution = 'source_range_only'),
+            language TEXT NOT NULL CHECK(length(language) > 0),
+            kind INTEGER NOT NULL,
+            start_line INTEGER NOT NULL CHECK(start_line > 0),
+            start_col INTEGER NOT NULL CHECK(start_col > 0),
+            end_line INTEGER NOT NULL CHECK(end_line > 0),
+            end_col INTEGER NOT NULL CHECK(end_col > 0),
+            file_role TEXT NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id),
+            FOREIGN KEY(file_id) REFERENCES file(id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_unit_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+            unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+            projection_count INTEGER NOT NULL CHECK(projection_count >= 0),
+            projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_projection (
+            file_id INTEGER PRIMARY KEY,
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            language TEXT NOT NULL CHECK(length(language) > 0),
+            file_role TEXT NOT NULL,
+            unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+            unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+            FOREIGN KEY(file_id) REFERENCES file(id)
+        )",
+        [],
+    )?;
+    let structural_cache_columns = table_columns(conn, "structural_text_artifact_cache")?;
+    if !structural_cache_columns.is_empty()
+        && ![
+            "file_id",
+            "source_content_hash",
+            "descriptor_version",
+            "producer",
+            "artifact_digest",
+        ]
+        .iter()
+        .all(|required| {
+            structural_cache_columns
+                .iter()
+                .any(|column| column == required)
+        })
+    {
+        // This cache is disposable. Rebuild the pre-binding v28 shape rather
+        // than preserving rows that cannot be tied to a verified projection.
+        conn.execute("DROP TABLE structural_text_artifact_cache", [])?;
+    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_artifact_cache (
+            file_path TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL UNIQUE,
+            cache_key TEXT NOT NULL,
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            artifact_digest TEXT NOT NULL CHECK(length(artifact_digest) = 64),
+            artifact_blob BLOB NOT NULL,
+            updated_at_epoch_ms INTEGER NOT NULL
         )",
         [],
     )?;

@@ -163,15 +163,47 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
     generation_id: &str,
     run_id: &str,
 ) -> Result<RetrievalIndexManifest> {
-    let storage = Store::open(storage_path).context("open replacement core fixture storage")?;
+    let mut storage = Store::open(storage_path).context("open replacement core fixture storage")?;
+    let source_policy = storage
+        .get_source_policy_exclusion_manifest()
+        .context("load replacement core source policy manifest")?
+        .context("replacement core fixture requires a source policy manifest")?;
+    let source_policy_candidates = storage
+        .get_source_policy_exclusions()
+        .context("load replacement core source policy exclusions")?
+        .into_iter()
+        .map(
+            |record| codestory_workspace::OversizedSourceExclusionCandidate {
+                normalized_path: record.normalized_path,
+                content_hash: record.content_hash,
+                observed_size: record.observed_size,
+                policy_version: record.policy_version,
+                byte_cap: record.byte_cap,
+            },
+        )
+        .collect::<Vec<_>>();
+    let publication = codestory_store::IndexPublicationRecord {
+        generation,
+        generation_id: generation_id.into(),
+        run_id: run_id.into(),
+        mode: codestory_store::IndexPublicationMode::Full,
+        published_at_epoch_ms: 2,
+    };
     storage
-        .put_index_publication(&codestory_store::IndexPublicationRecord {
-            generation,
-            generation_id: generation_id.into(),
-            run_id: run_id.into(),
-            mode: codestory_store::IndexPublicationMode::Full,
-            published_at_epoch_ms: 2,
-        })
+        .publish_structural_text_unit_generation(&publication)
+        .context("publish replacement core structural text unit manifest")?;
+    storage
+        .publish_source_policy_exclusion_generation(
+            &publication,
+            &source_policy.project_id,
+            &source_policy.workspace_id,
+            &source_policy.policy_version,
+            source_policy.byte_cap,
+            &source_policy_candidates,
+        )
+        .context("publish replacement core source policy manifest")?;
+    storage
+        .put_index_publication(&publication)
         .context("publish replacement core fixture identity")?;
     drop(storage);
     publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)

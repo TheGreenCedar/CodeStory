@@ -37,7 +37,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 27;
+const SCHEMA_VERSION: u32 = 28;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -77,7 +77,15 @@ const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTI
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
-const PROMOTION_JOURNAL_VERSION: u32 = 2;
+const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
+const PROMOTION_JOURNAL_VERSION: u32 = 3;
+// Snapshot promotion first shipped with schema 21. Journal v2 added the
+// source-policy identity at schema 27, and journal v3 added structural-text
+// identity at schema 28. Recovery runs before schema migration, so these
+// boundaries are part of the durable journal contract.
+const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
+const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
+const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
@@ -211,6 +219,34 @@ struct PromotionLock {
     file: File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDatabaseContract {
+    CurrentPromotion,
+    Journal(u32),
+    LegacyBackup,
+}
+
+impl RecoveryDatabaseContract {
+    fn supports_complete_schema(self, schema_version: u32) -> bool {
+        match self {
+            Self::CurrentPromotion => schema_version == SCHEMA_VERSION,
+            Self::Journal(LEGACY_PROMOTION_JOURNAL_VERSION) => (LEGACY_PROMOTION_MIN_SCHEMA_VERSION
+                ..=SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+                .contains(&schema_version),
+            Self::Journal(SOURCE_POLICY_PROMOTION_JOURNAL_VERSION) => {
+                schema_version == SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                schema_version == STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(_) => false,
+            Self::LegacyBackup => {
+                (LEGACY_PROMOTION_MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema_version)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PromotionJournal {
     version: u32,
@@ -220,6 +256,10 @@ struct PromotionJournal {
     previous_source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
     #[serde(default)]
     candidate_source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+    #[serde(default)]
+    previous_structural_text: Option<StructuralTextUnitRollbackIdentity>,
+    #[serde(default)]
+    candidate_structural_text: Option<StructuralTextUnitRollbackIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +273,19 @@ struct SourcePolicyExclusionRollbackIdentity {
     exclusion_digest: String,
     policy_version: String,
     byte_cap: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StructuralTextUnitRollbackIdentity {
+    core_generation_id: String,
+    core_run_id: String,
+    core_published_at_epoch_ms: i64,
+    unit_count: u64,
+    unit_digest: String,
+    projection_count: u64,
+    projection_digest: String,
+    descriptor_version: u32,
+    migration_state: String,
 }
 
 fn read_source_policy_exclusion_rollback_identity(
@@ -360,6 +413,140 @@ fn require_candidate_source_policy_identity(
     require_recorded_source_policy_identity(path, publication, expected, role)
 }
 
+fn read_structural_text_unit_rollback_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<Option<StructuralTextUnitRollbackIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'structural_text_unit_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(None);
+    }
+    let identity = conn
+        .query_row(
+            "SELECT core_generation_id, core_run_id, published_at_epoch_ms,
+                    unit_count, unit_digest, projection_count, projection_digest,
+                    descriptor_version, migration_state
+             FROM structural_text_unit_publication
+             WHERE id = 1 AND complete = 1 AND schema_version = ?1",
+            params![STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION as i64],
+            |row| {
+                Ok(StructuralTextUnitRollbackIdentity {
+                    core_generation_id: row.get(0)?,
+                    core_run_id: row.get(1)?,
+                    core_published_at_epoch_ms: row.get(2)?,
+                    unit_count: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                    unit_digest: row.get(4)?,
+                    projection_count: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                    projection_digest: row.get(6)?,
+                    descriptor_version: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    migration_state: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(&conn)?;
+    let (projection_count, projection_digest, projection_versions) =
+        structural_text_projection_content_summary(&conn)?;
+    validate_structural_text_projection_rows(&conn)?;
+    validate_structural_text_artifact_cache_rows(&conn).map_err(|error| {
+        promotion_error(format!(
+            "Structural artifact cache rollback identity does not match {}: {error}",
+            path.display()
+        ))
+    })?;
+    let invalid_rows: i64 = conn.query_row(
+        "SELECT
+            (SELECT COUNT(*)
+             FROM structural_text_projection p
+             LEFT JOIN file f ON f.id = p.file_id
+             WHERE f.id IS NULL
+                OR f.complete <> 1
+                OR f.content_hash IS NULL
+                OR length(f.content_hash) <> 64
+                OR f.content_hash <> p.source_content_hash
+                OR f.language <> p.language
+                OR f.file_role <> p.file_role
+                OR p.descriptor_version <> ?1)
+          + (SELECT COUNT(*)
+             FROM structural_text_unit u
+             LEFT JOIN file f ON f.id = u.file_id
+             WHERE f.id IS NULL
+                OR f.content_hash IS NULL
+                OR f.content_hash <> u.source_content_hash
+                OR u.descriptor_version <> ?1)",
+        params![STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+        |row| row.get(0),
+    )?;
+    if identity.core_generation_id != publication.generation_id
+        || identity.core_run_id != publication.run_id
+        || identity.core_published_at_epoch_ms != publication.published_at_epoch_ms
+        || identity.unit_count != unit_count
+        || identity.unit_digest != unit_digest
+        || identity.projection_count != projection_count
+        || identity.projection_digest != projection_digest
+        || identity.descriptor_version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+        || identity.migration_state != STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+        || invalid_rows != 0
+        || unit_versions
+            .iter()
+            .chain(projection_versions.iter())
+            .any(|version| *version != identity.descriptor_version)
+    {
+        return Err(promotion_error(format!(
+            "Structural text unit rollback identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(Some(identity))
+}
+
+fn require_recorded_structural_text_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<StructuralTextUnitRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Ok(());
+    }
+    if &read_structural_text_unit_rollback_identity(path, publication)? != expected {
+        return Err(promotion_error(format!(
+            "{role} structural text unit identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_candidate_structural_text_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<StructuralTextUnitRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Err(promotion_error(format!(
+            "{role} structural text unit manifest is missing for {}",
+            path.display()
+        )));
+    }
+    require_recorded_structural_text_identity(path, publication, expected, role)
+}
+
 fn promotion_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.promotion.lock", path.display()))
 }
@@ -448,13 +635,13 @@ fn read_complete_promotion_database_identity(
 
 fn read_recovery_database_identity(
     path: &Path,
+    contract: RecoveryDatabaseContract,
 ) -> Result<Option<IndexPublicationRecord>, StorageError> {
     let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
         return Ok(None);
     };
     match schema_version {
         0 => Ok(None),
-        SCHEMA_VERSION => read_complete_index_publication(&conn),
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
             read_index_publication(&conn)
         }
@@ -462,9 +649,12 @@ fn read_recovery_database_identity(
             "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
             path.display()
         ))),
+        version if contract.supports_complete_schema(version) => {
+            read_complete_index_publication(&conn)
+        }
         _ => Err(promotion_error(format!(
-            "SQLite recovery artifact {} has unsupported schema version {schema_version}",
-            path.display()
+            "SQLite recovery artifact {} has unsupported schema version {schema_version} for {contract:?}",
+            path.display(),
         ))),
     }
 }
@@ -484,8 +674,9 @@ fn require_complete_promotion_database_identity(
 fn require_recovery_database_identity(
     path: &Path,
     role: &str,
+    contract: RecoveryDatabaseContract,
 ) -> Result<IndexPublicationRecord, StorageError> {
-    read_recovery_database_identity(path)?.ok_or_else(|| {
+    read_recovery_database_identity(path, contract)?.ok_or_else(|| {
         promotion_error(format!(
             "{role} {} has no complete publication identity",
             path.display()
@@ -499,7 +690,9 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
         .map_err(|error| promotion_path_error("parse", path, error))?;
     if !matches!(
         journal.version,
-        LEGACY_PROMOTION_JOURNAL_VERSION | PROMOTION_JOURNAL_VERSION
+        LEGACY_PROMOTION_JOURNAL_VERSION
+            | SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
+            | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
             "Unsupported promotion journal {}: version={}",
@@ -649,15 +842,16 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
 
     if committed_path.exists() {
         let committed = read_promotion_journal(&committed_path)?;
+        let recovery_contract = RecoveryDatabaseContract::Journal(committed.version);
         let live_identity =
-            require_complete_promotion_database_identity(path, "Committed live database")?;
+            require_recovery_database_identity(path, "Committed live database", recovery_contract)?;
         if live_identity != committed.candidate {
             return Err(promotion_error(format!(
                 "Committed promotion identity does not match live database {}",
                 path.display()
             )));
         }
-        if committed.version >= PROMOTION_JOURNAL_VERSION {
+        if committed.version >= SOURCE_POLICY_PROMOTION_JOURNAL_VERSION {
             require_candidate_source_policy_identity(
                 path,
                 &live_identity,
@@ -669,6 +863,21 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
                 path,
                 &live_identity,
                 &committed.candidate_source_policy,
+                "Legacy committed live database",
+            )?;
+        }
+        if committed.version >= PROMOTION_JOURNAL_VERSION {
+            require_candidate_structural_text_identity(
+                path,
+                &live_identity,
+                &committed.candidate_structural_text,
+                "Committed live database",
+            )?;
+        } else {
+            require_recorded_structural_text_identity(
+                path,
+                &live_identity,
+                &committed.candidate_structural_text,
                 "Legacy committed live database",
             )?;
         }
@@ -704,15 +913,25 @@ fn rollback_prepared_promotion(
     live_path: &Path,
     prepared: &PromotionJournal,
 ) -> Result<(), StorageError> {
-    if prepared.version >= PROMOTION_JOURNAL_VERSION && prepared.candidate_source_policy.is_none() {
+    if prepared.version >= SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
+        && prepared.candidate_source_policy.is_none()
+    {
         return Err(promotion_error(format!(
             "Prepared promotion candidate source policy identity is missing for {}",
             live_path.display()
         )));
     }
+    if prepared.version >= PROMOTION_JOURNAL_VERSION && prepared.candidate_structural_text.is_none()
+    {
+        return Err(promotion_error(format!(
+            "Prepared promotion candidate structural text identity is missing for {}",
+            live_path.display()
+        )));
+    }
     let backup_path = live_path.with_extension("sqlite.backup");
     let prepared_path = promotion_prepared_journal_path(live_path);
-    let live_identity = read_recovery_database_identity(live_path)?;
+    let recovery_contract = RecoveryDatabaseContract::Journal(prepared.version);
+    let live_identity = read_recovery_database_identity(live_path, recovery_contract)?;
     if live_identity
         .as_ref()
         .is_some_and(|live| live != &prepared.candidate && Some(live) != prepared.previous.as_ref())
@@ -732,6 +951,14 @@ fn rollback_prepared_promotion(
                     "Prepared candidate",
                 )?;
             }
+            if prepared.candidate_structural_text.is_some() {
+                require_candidate_structural_text_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.candidate_structural_text,
+                    "Prepared candidate",
+                )?;
+            }
         } else if prepared.previous.as_ref() == Some(live_identity) {
             require_recorded_source_policy_identity(
                 live_path,
@@ -739,13 +966,22 @@ fn rollback_prepared_promotion(
                 &prepared.previous_source_policy,
                 "Prepared previous live database",
             )?;
+            require_recorded_structural_text_identity(
+                live_path,
+                live_identity,
+                &prepared.previous_structural_text,
+                "Prepared previous live database",
+            )?;
         }
     }
 
     match prepared.previous.as_ref() {
         Some(expected_previous) => {
-            let backup_identity =
-                require_recovery_database_identity(&backup_path, "Prepared recovery backup")?;
+            let backup_identity = require_recovery_database_identity(
+                &backup_path,
+                "Prepared recovery backup",
+                recovery_contract,
+            )?;
             if &backup_identity != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion backup identity does not match {}",
@@ -758,10 +994,20 @@ fn rollback_prepared_promotion(
                 &prepared.previous_source_policy,
                 "Prepared recovery backup",
             )?;
+            require_recorded_structural_text_identity(
+                &backup_path,
+                &backup_identity,
+                &prepared.previous_structural_text,
+                "Prepared recovery backup",
+            )?;
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
-            let restored = require_recovery_database_identity(live_path, "Restored live database")?;
+            let restored = require_recovery_database_identity(
+                live_path,
+                "Restored live database",
+                recovery_contract,
+            )?;
             if &restored != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion rollback did not restore the recorded identity for {}",
@@ -772,6 +1018,12 @@ fn rollback_prepared_promotion(
                 live_path,
                 &restored,
                 &prepared.previous_source_policy,
+                "Restored live database",
+            )?;
+            require_recorded_structural_text_identity(
+                live_path,
+                &restored,
+                &prepared.previous_structural_text,
                 "Restored live database",
             )?;
             remove_promotion_file(&prepared_path)?;
@@ -792,13 +1044,70 @@ fn rollback_prepared_promotion(
     }
 }
 
+fn read_journal_less_recovery_auxiliary_identities(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    schema_version: u32,
+    role: &str,
+) -> Result<
+    (
+        Option<SourcePolicyExclusionRollbackIdentity>,
+        Option<StructuralTextUnitRollbackIdentity>,
+    ),
+    StorageError,
+> {
+    let source_policy = if schema_version >= SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION {
+        read_source_policy_exclusion_rollback_identity(path, publication)?
+    } else {
+        None
+    };
+    if schema_version == SCHEMA_VERSION && source_policy.is_none() {
+        return Err(promotion_error(format!(
+            "Current-schema {role} {} has no complete source policy exclusion manifest",
+            path.display()
+        )));
+    }
+    let structural_text = if schema_version == SCHEMA_VERSION {
+        let identity = read_structural_text_unit_rollback_identity(path, publication)?;
+        if identity.is_none() {
+            return Err(promotion_error(format!(
+                "Current-schema {role} {} has no complete structural text unit manifest",
+                path.display()
+            )));
+        }
+        identity
+    } else {
+        None
+    };
+    Ok((source_policy, structural_text))
+}
+
 fn recover_legacy_promotion_backup(
     live_path: &Path,
     backup_path: &Path,
 ) -> Result<(), StorageError> {
-    let backup_identity =
-        require_recovery_database_identity(backup_path, "Legacy promotion backup")?;
-    let live_identity = read_recovery_database_identity(live_path);
+    let recovery_contract = RecoveryDatabaseContract::LegacyBackup;
+    let backup_schema_version = inspect_promotion_database(backup_path)?
+        .map(|(_, schema_version)| schema_version)
+        .ok_or_else(|| {
+            promotion_error(format!(
+                "Legacy promotion backup {} is missing",
+                backup_path.display()
+            ))
+        })?;
+    let backup_identity = require_recovery_database_identity(
+        backup_path,
+        "Legacy promotion backup",
+        recovery_contract,
+    )?;
+    let (backup_source_policy, backup_structural_text) =
+        read_journal_less_recovery_auxiliary_identities(
+            backup_path,
+            &backup_identity,
+            backup_schema_version,
+            "legacy promotion backup",
+        )?;
+    let live_identity = read_recovery_database_identity(live_path, recovery_contract);
     let restore_backup = match live_identity {
         Ok(None) => true,
         Err(error) => {
@@ -807,8 +1116,47 @@ fn recover_legacy_promotion_backup(
                 live_path.display()
             )));
         }
-        Ok(Some(ref live)) if live == &backup_identity => false,
-        Ok(Some(ref live)) if live.generation > backup_identity.generation => false,
+        Ok(Some(ref live)) if live == &backup_identity => {
+            let live_schema_version = inspect_promotion_database(live_path)?
+                .map(|(_, schema_version)| schema_version)
+                .ok_or_else(|| {
+                    promotion_error(format!("Live database {} is missing", live_path.display()))
+                })?;
+            match read_journal_less_recovery_auxiliary_identities(
+                live_path,
+                live,
+                live_schema_version,
+                "live database",
+            ) {
+                Ok((live_source_policy, live_structural_text))
+                    if live_source_policy == backup_source_policy
+                        && live_structural_text == backup_structural_text =>
+                {
+                    false
+                }
+                Ok(_) | Err(_) => true,
+            }
+        }
+        Ok(Some(ref live)) if live.generation > backup_identity.generation => {
+            let live_schema_version = inspect_promotion_database(live_path)?
+                .map(|(_, schema_version)| schema_version)
+                .ok_or_else(|| {
+                    promotion_error(format!("Live database {} is missing", live_path.display()))
+                })?;
+            read_journal_less_recovery_auxiliary_identities(
+                live_path,
+                live,
+                live_schema_version,
+                "newer live database",
+            )
+            .map_err(|error| {
+                promotion_error(format!(
+                    "Cannot validate newer live database {} while a legacy promotion backup exists: {error}",
+                    live_path.display()
+                ))
+            })?;
+            false
+        }
         Ok(Some(_)) => {
             return Err(promotion_error(format!(
                 "Ambiguous legacy promotion backup for {}; refusing to overwrite the live database",
@@ -818,13 +1166,29 @@ fn recover_legacy_promotion_backup(
     };
     if restore_backup {
         restore_promotion_database(backup_path, live_path)?;
-        let restored = require_recovery_database_identity(live_path, "Recovered live database")?;
+        let restored = require_recovery_database_identity(
+            live_path,
+            "Recovered live database",
+            recovery_contract,
+        )?;
         if restored != backup_identity {
             return Err(promotion_error(format!(
                 "Legacy promotion recovery produced an unexpected identity for {}",
                 live_path.display()
             )));
         }
+        require_recorded_source_policy_identity(
+            live_path,
+            &restored,
+            &backup_source_policy,
+            "Recovered live database",
+        )?;
+        require_recorded_structural_text_identity(
+            live_path,
+            &restored,
+            &backup_structural_text,
+            "Recovered live database",
+        )?;
     }
     cleanup_sqlite_sidecars(backup_path)
 }
@@ -1009,6 +1373,25 @@ fn get_index_artifact_cache_from_connection(
         .optional()?)
 }
 
+fn get_structural_text_artifact_cache_from_connection(
+    connection: &Connection,
+    path: &Path,
+    cache_key: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let cached = connection
+        .query_row(
+            "SELECT artifact_blob, artifact_digest
+             FROM structural_text_artifact_cache
+             WHERE file_path = ?1 AND cache_key = ?2",
+            params![path.to_string_lossy().to_string(), cache_key],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(cached.and_then(|(blob, digest)| {
+        (format!("{:x}", Sha256::digest(&blob)) == digest).then_some(blob)
+    }))
+}
+
 fn upsert_index_artifact_cache_row(
     statement: &mut rusqlite::Statement<'_>,
     write: IndexArtifactCacheWrite<'_>,
@@ -1019,6 +1402,30 @@ fn upsert_index_artifact_cache_row(
         write.artifact_blob,
         current_epoch_ms()
     ])?)
+}
+
+fn structural_text_unit_from_row(row: &Row<'_>) -> Result<StructuralTextUnit> {
+    let descriptor_version = u32::try_from(row.get::<_, i64>(5)?)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, i64::MAX))?;
+    Ok(StructuralTextUnit {
+        node_id: NodeId(row.get(0)?),
+        file_id: row.get(1)?,
+        placement_id: row.get(2)?,
+        content_hash: row.get(3)?,
+        source_content_hash: row.get(4)?,
+        descriptor_version,
+        producer: row.get(6)?,
+        evidence_tier: row.get(7)?,
+        resolution: row.get(8)?,
+        language: row.get(9)?,
+        kind: NodeKind::try_from(row.get::<_, i32>(10)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, i64::MAX))?,
+        start_line: row.get(11)?,
+        start_col: row.get(12)?,
+        end_line: row.get(13)?,
+        end_col: row.get(14)?,
+        file_role: FileRole::from_db_value(&row.get::<_, String>(15)?),
+    })
 }
 
 /// Errors returned by storage facade operations.
@@ -1070,6 +1477,14 @@ pub struct IndexArtifactCacheReader {
 impl IndexArtifactCacheReader {
     pub fn get(&self, path: &Path, cache_key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn get_structural(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        get_structural_text_artifact_cache_from_connection(&self.conn, path, cache_key)
     }
 }
 
@@ -1158,6 +1573,7 @@ pub(crate) struct DisposableFullBuildSealStats {
 pub struct ProjectionFlushBreakdown {
     pub files_ms: u32,
     pub nodes_ms: u32,
+    pub structural_text_units_ms: u32,
     pub edges_ms: u32,
     pub occurrences_ms: u32,
     pub component_access_ms: u32,
@@ -1168,6 +1584,9 @@ pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub file_content_hashes: &'a [FileContentHash],
     pub nodes: &'a [Node],
+    pub structural_text_units: &'a [StructuralTextUnit],
+    pub structural_text_projections: &'a [StructuralTextProjection],
+    pub structural_text_cache_writes: &'a [StructuralTextArtifactCacheWrite<'a>],
     pub edges: &'a [Edge],
     pub occurrences: &'a [Occurrence],
     pub component_access: &'a [(NodeId, AccessKind)],
@@ -1198,11 +1617,323 @@ pub struct FileInfo {
     pub file_role: FileRole,
 }
 
-/// Verified content identity for one parser-backed file projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Verified content identity for one parser-backed or structural file projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileContentHash {
     pub file_id: i64,
     pub content_hash: String,
+}
+
+pub const STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION: u32 = 1;
+pub const STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+pub const STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE: &str = "native_v1";
+const STRUCTURAL_TEXT_UNIT_DIGEST_DOMAIN: &[u8] =
+    b"codestory-structural-text-unit-publication-v1\0";
+
+/// Verified structural source evidence attached to one file-scoped graph node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralTextUnit {
+    pub node_id: NodeId,
+    pub file_id: i64,
+    pub placement_id: String,
+    pub content_hash: String,
+    pub source_content_hash: String,
+    pub descriptor_version: u32,
+    pub producer: String,
+    pub evidence_tier: String,
+    pub resolution: String,
+    pub language: String,
+    pub kind: NodeKind,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub file_role: FileRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralTextProjection {
+    pub file_id: i64,
+    pub source_content_hash: String,
+    pub descriptor_version: u32,
+    pub producer: String,
+    pub language: String,
+    pub file_role: FileRole,
+    pub unit_count: u64,
+    pub unit_digest: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructuralTextArtifactCacheWrite<'a> {
+    pub path: &'a Path,
+    pub file_id: i64,
+    pub cache_key: &'a str,
+    pub artifact_blob: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralTextUnitPublicationManifest {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub unit_count: u64,
+    pub unit_digest: String,
+    pub projection_count: u64,
+    pub projection_digest: String,
+    pub descriptor_version: u32,
+    pub migration_state: String,
+    pub published_at_epoch_ms: i64,
+}
+
+fn hash_structural_text_unit_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn structural_text_unit_content_summary(
+    conn: &Connection,
+) -> Result<(u64, String, HashSet<u32>), StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                descriptor_version, producer, evidence_tier, resolution, language,
+                kind, start_line, start_col, end_line, end_col, file_role
+         FROM structural_text_unit ORDER BY node_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    hasher.update(STRUCTURAL_TEXT_UNIT_DIGEST_DOMAIN);
+    let mut count = 0_u64;
+    let mut descriptor_versions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+            StorageError::Other("structural text unit descriptor version is invalid".into())
+        })?;
+        descriptor_versions.insert(descriptor_version);
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            row.get::<_, i64>(1)?.to_string(),
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?.to_string(),
+            row.get::<_, i64>(11)?.to_string(),
+            row.get::<_, i64>(12)?.to_string(),
+            row.get::<_, i64>(13)?.to_string(),
+            row.get::<_, i64>(14)?.to_string(),
+            row.get::<_, String>(15)?,
+        ];
+        for value in values {
+            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((
+        count,
+        format!("{:x}", hasher.finalize()),
+        descriptor_versions,
+    ))
+}
+
+pub fn structural_text_unit_digest(units: &[StructuralTextUnit]) -> String {
+    let mut units = units.to_vec();
+    units.sort_by_key(|unit| unit.node_id.0);
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-structural-text-file-units-v1\0");
+    for unit in units {
+        for value in [
+            unit.node_id.0.to_string(),
+            unit.file_id.to_string(),
+            unit.placement_id,
+            unit.content_hash,
+            unit.source_content_hash,
+            unit.descriptor_version.to_string(),
+            unit.producer,
+            unit.evidence_tier,
+            unit.resolution,
+            unit.language,
+            (unit.kind as i32).to_string(),
+            unit.start_line.to_string(),
+            unit.start_col.to_string(),
+            unit.end_line.to_string(),
+            unit.end_col.to_string(),
+            unit.file_role.as_str().to_string(),
+        ] {
+            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn read_all_structural_text_units(
+    conn: &Connection,
+) -> Result<Vec<StructuralTextUnit>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                descriptor_version, producer, evidence_tier, resolution, language,
+                kind, start_line, start_col, end_line, end_col, file_role
+         FROM structural_text_unit ORDER BY node_id ASC",
+    )?;
+    let rows = stmt.query_map([], structural_text_unit_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn read_structural_text_projections(
+    conn: &Connection,
+) -> Result<Vec<StructuralTextProjection>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT file_id, source_content_hash, descriptor_version, producer,
+                language, file_role, unit_count, unit_digest
+         FROM structural_text_projection ORDER BY file_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(StructuralTextProjection {
+            file_id: row.get(0)?,
+            source_content_hash: row.get(1)?,
+            descriptor_version: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+            producer: row.get(3)?,
+            language: row.get(4)?,
+            file_role: FileRole::from_db_value(&row.get::<_, String>(5)?),
+            unit_count: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+            unit_digest: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn structural_text_artifact_cache_key_is_valid(cache_key: &str) -> bool {
+    let Some((version, identity)) = cache_key
+        .strip_prefix('v')
+        .and_then(|key| key.split_once(':'))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+        && version.parse::<u32>().is_ok_and(|version| version > 0)
+        && !identity.is_empty()
+}
+
+fn validate_structural_text_artifact_cache_rows(conn: &Connection) -> Result<(), StorageError> {
+    let orphaned_rows = conn.query_row(
+        "SELECT COUNT(*)
+         FROM structural_text_artifact_cache c
+         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
+         WHERE p.file_id IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if orphaned_rows != 0 {
+        return Err(StorageError::Other(
+            "structural artifact cache contains rows without verified projections".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT c.file_id, c.cache_key, c.source_content_hash,
+                c.descriptor_version, c.producer, c.artifact_digest, c.artifact_blob,
+                p.source_content_hash, p.descriptor_version, p.producer
+         FROM structural_text_artifact_cache c
+         INNER JOIN structural_text_projection p ON p.file_id = c.file_id
+         ORDER BY c.file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let file_id = row.get::<_, i64>(0)?;
+        let cache_key = row.get::<_, String>(1)?;
+        let source_content_hash = row.get::<_, String>(2)?;
+        let descriptor_version = row.get::<_, i64>(3)?;
+        let producer = row.get::<_, String>(4)?;
+        let artifact_digest = row.get::<_, String>(5)?;
+        let artifact_blob = row.get::<_, Vec<u8>>(6)?;
+        let projection_source_content_hash = row.get::<_, String>(7)?;
+        let projection_descriptor_version = row.get::<_, i64>(8)?;
+        let projection_producer = row.get::<_, String>(9)?;
+        let expected_digest = format!("{:x}", Sha256::digest(&artifact_blob));
+        if source_content_hash != projection_source_content_hash
+            || descriptor_version != projection_descriptor_version
+            || producer != projection_producer
+            || !structural_text_artifact_cache_key_is_valid(&cache_key)
+            || artifact_digest != expected_digest
+        {
+            return Err(StorageError::Other(format!(
+                "structural artifact cache row {file_id} does not match its verified projection"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_structural_text_projection_rows(conn: &Connection) -> Result<(), StorageError> {
+    let units = read_all_structural_text_units(conn)?;
+    let projections = read_structural_text_projections(conn)?;
+    let mut units_by_file = HashMap::<i64, Vec<StructuralTextUnit>>::new();
+    for unit in units {
+        units_by_file.entry(unit.file_id).or_default().push(unit);
+    }
+    for projection in projections {
+        let units = units_by_file
+            .remove(&projection.file_id)
+            .unwrap_or_default();
+        if projection.unit_count != units.len() as u64
+            || projection.unit_digest != structural_text_unit_digest(&units)
+        {
+            return Err(StorageError::Other(format!(
+                "structural text projection {} does not match its unit set",
+                projection.file_id
+            )));
+        }
+    }
+    if !units_by_file.is_empty() {
+        return Err(StorageError::Other(
+            "structural text units exist without owning projections".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn structural_text_projection_content_summary(
+    conn: &Connection,
+) -> Result<(u64, String, HashSet<u32>), StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT file_id, source_content_hash, descriptor_version, producer,
+                language, file_role, unit_count, unit_digest
+         FROM structural_text_projection ORDER BY file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-structural-text-projection-publication-v1\0");
+    let mut count = 0_u64;
+    let mut descriptor_versions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+            StorageError::Other("structural text projection descriptor version is invalid".into())
+        })?;
+        descriptor_versions.insert(descriptor_version);
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            row.get::<_, String>(1)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?.to_string(),
+            row.get::<_, String>(7)?,
+        ];
+        for value in values {
+            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((
+        count,
+        format!("{:x}", hasher.finalize()),
+        descriptor_versions,
+    ))
 }
 
 /// Heuristic role assigned to a file for ranking and summaries.
@@ -2421,6 +3152,14 @@ impl Storage {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
     }
 
+    pub fn get_structural_text_artifact_cache(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        get_structural_text_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
     pub fn upsert_index_artifact_cache(
         &self,
         path: &Path,
@@ -2521,6 +3260,40 @@ impl Storage {
             )?;
         }
         let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
+        detach_result?;
+        Ok(copied)
+    }
+
+    /// Copy only versioned structural artifacts into a disposable full stage.
+    pub fn copy_structural_text_artifact_cache_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        drop(Storage::open(source_path)?);
+        let source = source_path.to_string_lossy().to_string();
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS structural_cache_source",
+            params![source],
+        )?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO structural_text_artifact_cache (
+                file_path, file_id, cache_key, source_content_hash,
+                descriptor_version, producer, artifact_digest, artifact_blob,
+                updated_at_epoch_ms
+             )
+             SELECT file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
+             FROM structural_cache_source.structural_text_artifact_cache",
+            [],
+        );
+        let detach_result = self
+            .conn
+            .execute("DETACH DATABASE structural_cache_source", []);
+        let copied = copy_result?;
         detach_result?;
         Ok(copied)
     }
@@ -3227,6 +4000,10 @@ impl Storage {
     pub fn clear(&self) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM callable_projection_state", [])?;
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        tx.execute("DELETE FROM structural_text_unit", [])?;
+        tx.execute("DELETE FROM structural_text_projection", [])?;
+        tx.execute("DELETE FROM structural_text_artifact_cache", [])?;
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
@@ -3389,6 +4166,12 @@ impl Storage {
         // available as incremental inputs, but require core indexing to publish a new,
         // internally consistent manifest before retrieval can consume them.
         tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        // Structural placement identity is file-scoped. A rehydrated project must
+        // recollect verified units rather than relabel path-bound rows.
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        tx.execute("DELETE FROM structural_text_unit", [])?;
+        tx.execute("DELETE FROM structural_text_projection", [])?;
+        tx.execute("DELETE FROM structural_text_artifact_cache", [])?;
         tx.commit()?;
         Ok(updated)
     }
@@ -3571,9 +4354,22 @@ impl Storage {
                 staged_path.display()
             )));
         }
-        let previous = read_recovery_database_identity(live_path)?;
+        let candidate_structural_text =
+            read_structural_text_unit_rollback_identity(staged_path, &candidate)?;
+        if candidate_structural_text.is_none() {
+            return Err(promotion_error(format!(
+                "Staged promotion candidate {} has no complete structural text unit manifest",
+                staged_path.display()
+            )));
+        }
+        let recovery_contract = RecoveryDatabaseContract::CurrentPromotion;
+        let previous = read_recovery_database_identity(live_path, recovery_contract)?;
         let previous_source_policy = match previous.as_ref() {
             Some(previous) => read_source_policy_exclusion_rollback_identity(live_path, previous)?,
+            None => None,
+        };
+        let previous_structural_text = match previous.as_ref() {
+            Some(previous) => read_structural_text_unit_rollback_identity(live_path, previous)?,
             None => None,
         };
         cleanup_sqlite_sidecars(&backup_path)?;
@@ -3587,8 +4383,11 @@ impl Storage {
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
             drop(live_conn);
-            let backup_identity =
-                require_recovery_database_identity(&backup_path, "Promotion backup")?;
+            let backup_identity = require_recovery_database_identity(
+                &backup_path,
+                "Promotion backup",
+                recovery_contract,
+            )?;
             if Some(&backup_identity) != previous.as_ref() {
                 return Err(promotion_error(format!(
                     "Promotion backup identity does not match live database {}",
@@ -3601,6 +4400,12 @@ impl Storage {
                 &previous_source_policy,
                 "Promotion backup",
             )?;
+            require_recorded_structural_text_identity(
+                &backup_path,
+                &backup_identity,
+                &previous_structural_text,
+                "Promotion backup",
+            )?;
         }
 
         let prepared = PromotionJournal {
@@ -3609,6 +4414,8 @@ impl Storage {
             candidate: candidate.clone(),
             previous_source_policy,
             candidate_source_policy: candidate_source_policy.clone(),
+            previous_structural_text,
+            candidate_structural_text: candidate_structural_text.clone(),
         };
         if let Err(error) = write_promotion_journal(&prepared_path, &prepared) {
             if !prepared_path.exists() {
@@ -3669,6 +4476,15 @@ impl Storage {
             live_path,
             &published,
             &candidate_source_policy,
+            "Promoted live database",
+        ) {
+            let _ = rollback_prepared_promotion(live_path, &prepared);
+            return Err(error);
+        }
+        if let Err(error) = require_candidate_structural_text_identity(
+            live_path,
+            &published,
+            &candidate_structural_text,
             "Promoted live database",
         ) {
             let _ = rollback_prepared_promotion(live_path, &prepared);
@@ -4516,6 +5332,9 @@ impl Storage {
         if batch.files.is_empty()
             && batch.file_content_hashes.is_empty()
             && batch.nodes.is_empty()
+            && batch.structural_text_units.is_empty()
+            && batch.structural_text_projections.is_empty()
+            && batch.structural_text_cache_writes.is_empty()
             && batch.edges.is_empty()
             && batch.occurrences.is_empty()
             && batch.component_access.is_empty()
@@ -4614,6 +5433,152 @@ impl Storage {
                 nodes_insert_started.elapsed().as_millis() as i64,
             ));
         }
+
+        if !batch.files.is_empty() {
+            let placeholders = question_placeholders(batch.files.len());
+            tx.execute(
+                &format!("DELETE FROM structural_text_unit WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM structural_text_projection WHERE file_id IN ({placeholders})"
+                ),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+        }
+        if !batch.structural_text_units.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_text_unit (
+                    node_id, file_id, placement_id, content_hash, source_content_hash,
+                    descriptor_version, producer, evidence_tier, resolution, language,
+                    kind, start_line, start_col, end_line, end_col, file_role
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                 )",
+            )?;
+            for unit in batch.structural_text_units {
+                let Some(expected_source_hash) = file_content_hashes.get(&unit.file_id) else {
+                    return Err(StorageError::Other(format!(
+                        "structural text unit {} has no verified file hash in its projection batch",
+                        unit.node_id.0
+                    )));
+                };
+                if *expected_source_hash != unit.source_content_hash {
+                    return Err(StorageError::Other(format!(
+                        "structural text unit {} does not match its verified file hash",
+                        unit.node_id.0
+                    )));
+                }
+                stmt.execute(params![
+                    unit.node_id.0,
+                    unit.file_id,
+                    &unit.placement_id,
+                    &unit.content_hash,
+                    &unit.source_content_hash,
+                    unit.descriptor_version as i64,
+                    &unit.producer,
+                    &unit.evidence_tier,
+                    &unit.resolution,
+                    &unit.language,
+                    unit.kind as i32,
+                    unit.start_line,
+                    unit.start_col,
+                    unit.end_line,
+                    unit.end_col,
+                    unit.file_role.as_str(),
+                ])?;
+            }
+            breakdown.structural_text_units_ms =
+                clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+        if !batch.structural_text_projections.is_empty() {
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_text_projection (
+                    file_id, source_content_hash, descriptor_version, producer,
+                    language, file_role, unit_count, unit_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for projection in batch.structural_text_projections {
+                let units = batch
+                    .structural_text_units
+                    .iter()
+                    .filter(|unit| unit.file_id == projection.file_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if projection.unit_count != units.len() as u64
+                    || projection.unit_digest != structural_text_unit_digest(&units)
+                    || file_content_hashes
+                        .get(&projection.file_id)
+                        .is_none_or(|hash| *hash != projection.source_content_hash.as_str())
+                {
+                    return Err(StorageError::Other(format!(
+                        "structural text projection {} is inconsistent with its batch",
+                        projection.file_id
+                    )));
+                }
+                stmt.execute(params![
+                    projection.file_id,
+                    &projection.source_content_hash,
+                    projection.descriptor_version as i64,
+                    &projection.producer,
+                    &projection.language,
+                    projection.file_role.as_str(),
+                    projection.unit_count.min(i64::MAX as u64) as i64,
+                    &projection.unit_digest,
+                ])?;
+            }
+        }
+        if !batch.structural_text_cache_writes.is_empty() {
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_text_artifact_cache (
+                    file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(file_path) DO UPDATE SET
+                    file_id = excluded.file_id,
+                    cache_key = excluded.cache_key,
+                    source_content_hash = excluded.source_content_hash,
+                    descriptor_version = excluded.descriptor_version,
+                    producer = excluded.producer,
+                    artifact_digest = excluded.artifact_digest,
+                    artifact_blob = excluded.artifact_blob,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+            for write in batch.structural_text_cache_writes {
+                let projection = batch
+                    .structural_text_projections
+                    .iter()
+                    .find(|projection| projection.file_id == write.file_id)
+                    .ok_or_else(|| {
+                        StorageError::Other(format!(
+                            "structural cache write {} has no matching projection",
+                            write.file_id
+                        ))
+                    })?;
+                if !structural_text_artifact_cache_key_is_valid(write.cache_key) {
+                    return Err(StorageError::Other(format!(
+                        "structural cache write {} has an invalid cache key",
+                        write.file_id
+                    )));
+                }
+                let artifact_digest = format!("{:x}", Sha256::digest(write.artifact_blob));
+                stmt.execute(params![
+                    write.path.to_string_lossy().to_string(),
+                    write.file_id,
+                    write.cache_key,
+                    &projection.source_content_hash,
+                    projection.descriptor_version as i64,
+                    &projection.producer,
+                    artifact_digest,
+                    write.artifact_blob,
+                    current_epoch_ms(),
+                ])?;
+            }
+        }
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
 
         if !batch.edges.is_empty() {
             let started = std::time::Instant::now();
@@ -5266,6 +6231,282 @@ impl Storage {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn get_structural_text_unit(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<StructuralTextUnit>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                        descriptor_version, producer, evidence_tier, resolution, language,
+                        kind, start_line, start_col, end_line, end_col, file_role
+                 FROM structural_text_unit WHERE node_id = ?1",
+                params![node_id.0],
+                structural_text_unit_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_structural_text_units_for_nodes(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<StructuralTextUnit>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut units = Vec::new();
+        for chunk in node_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            let placeholders = question_placeholders(chunk.len());
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                        descriptor_version, producer, evidence_tier, resolution, language,
+                        kind, start_line, start_col, end_line, end_col, file_role
+                 FROM structural_text_unit
+                 WHERE node_id IN ({placeholders})
+                 ORDER BY node_id ASC"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(|node_id| node_id.0)),
+                structural_text_unit_from_row,
+            )?;
+            units.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        Ok(units)
+    }
+
+    pub fn get_structural_text_projection_file_ids(&self) -> Result<Vec<i64>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id
+             FROM structural_text_projection
+             WHERE descriptor_version = ?1
+             ORDER BY file_id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+            |row| row.get(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_structural_text_unit_publication_manifest(
+        &self,
+    ) -> Result<Option<StructuralTextUnitPublicationManifest>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT schema_version, complete, core_generation_id, core_run_id,
+                        unit_count, unit_digest, projection_count, projection_digest,
+                        descriptor_version, migration_state, published_at_epoch_ms
+                 FROM structural_text_unit_publication WHERE id = 1",
+                [],
+                |row| {
+                    Ok(StructuralTextUnitPublicationManifest {
+                        schema_version: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                        complete: row.get::<_, i64>(1)? == 1,
+                        core_generation_id: row.get(2)?,
+                        core_run_id: row.get(3)?,
+                        unit_count: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        unit_digest: row.get(5)?,
+                        projection_count: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                        projection_digest: row.get(7)?,
+                        descriptor_version: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+                        migration_state: row.get(9)?,
+                        published_at_epoch_ms: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn publish_structural_text_unit_generation(
+        &mut self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextUnitPublicationManifest, StorageError> {
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || publication.published_at_epoch_ms < 0
+        {
+            return Err(StorageError::Other(
+                "structural text unit publication identity is invalid".into(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM structural_text_artifact_cache
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM structural_text_projection p
+                WHERE p.file_id = structural_text_artifact_cache.file_id
+                  AND p.source_content_hash =
+                      structural_text_artifact_cache.source_content_hash
+                  AND p.descriptor_version =
+                      structural_text_artifact_cache.descriptor_version
+                  AND p.producer = structural_text_artifact_cache.producer
+             )",
+            [],
+        )?;
+        validate_structural_text_artifact_cache_rows(&tx)?;
+        let invalid_structural_files = tx.query_row(
+            "SELECT COUNT(*)
+             FROM structural_text_projection p
+             LEFT JOIN file f ON f.id = p.file_id
+             WHERE f.id IS NULL
+                OR f.complete <> 1
+                OR f.content_hash IS NULL
+                OR length(f.content_hash) <> 64
+                OR f.content_hash <> p.source_content_hash
+                OR f.language <> p.language
+                OR f.file_role <> p.file_role",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if invalid_structural_files != 0 {
+            return Err(StorageError::Other(
+                "complete structural projections contain unverified source identity".into(),
+            ));
+        }
+        validate_structural_text_projection_rows(&tx)?;
+        let mismatched_sources = tx.query_row(
+            "SELECT COUNT(*)
+             FROM structural_text_unit u
+             LEFT JOIN file f ON f.id = u.file_id
+             WHERE f.id IS NULL
+                OR f.content_hash IS NULL
+                OR f.content_hash <> u.source_content_hash
+                OR u.descriptor_version <> ?1",
+            params![STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if mismatched_sources != 0 {
+            return Err(StorageError::Other(
+                "structural text units do not match their verified sources".into(),
+            ));
+        }
+        let (unit_count, unit_digest, descriptor_versions) =
+            structural_text_unit_content_summary(&tx)?;
+        let (projection_count, projection_digest, projection_versions) =
+            structural_text_projection_content_summary(&tx)?;
+        if descriptor_versions
+            .iter()
+            .any(|version| *version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION)
+            || projection_versions
+                .iter()
+                .any(|version| *version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION)
+        {
+            return Err(StorageError::Other(
+                "structural text unit descriptor versions are incompatible".into(),
+            ));
+        }
+        let manifest = StructuralTextUnitPublicationManifest {
+            schema_version: STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            unit_count,
+            unit_digest,
+            projection_count,
+            projection_digest,
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            migration_state: STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE.to_string(),
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        tx.execute(
+            "INSERT INTO structural_text_unit_publication (
+                id, schema_version, complete, core_generation_id, core_run_id,
+                unit_count, unit_digest, projection_count, projection_digest,
+                descriptor_version, migration_state, published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                complete = excluded.complete,
+                core_generation_id = excluded.core_generation_id,
+                core_run_id = excluded.core_run_id,
+                unit_count = excluded.unit_count,
+                unit_digest = excluded.unit_digest,
+                projection_count = excluded.projection_count,
+                projection_digest = excluded.projection_digest,
+                descriptor_version = excluded.descriptor_version,
+                migration_state = excluded.migration_state,
+                published_at_epoch_ms = excluded.published_at_epoch_ms",
+            params![
+                manifest.schema_version as i64,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.unit_count.min(i64::MAX as u64) as i64,
+                &manifest.unit_digest,
+                manifest.projection_count.min(i64::MAX as u64) as i64,
+                &manifest.projection_digest,
+                manifest.descriptor_version as i64,
+                &manifest.migration_state,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(manifest)
+    }
+
+    pub fn validate_structural_text_unit_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextUnitPublicationManifest, StorageError> {
+        let manifest = self
+            .get_structural_text_unit_publication_manifest()?
+            .ok_or_else(|| {
+                StorageError::Other("structural text unit publication is missing".into())
+            })?;
+        if manifest.schema_version != STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION
+            || !manifest.complete
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.descriptor_version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+            || manifest.migration_state != STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+        {
+            return Err(StorageError::Other(
+                "structural text unit publication does not match the complete core publication"
+                    .into(),
+            ));
+        }
+        let (unit_count, unit_digest, descriptor_versions) =
+            structural_text_unit_content_summary(&self.conn)?;
+        let (projection_count, projection_digest, projection_versions) =
+            structural_text_projection_content_summary(&self.conn)?;
+        if unit_count != manifest.unit_count
+            || unit_digest != manifest.unit_digest
+            || projection_count != manifest.projection_count
+            || projection_digest != manifest.projection_digest
+            || descriptor_versions
+                .iter()
+                .any(|version| *version != manifest.descriptor_version)
+            || projection_versions
+                .iter()
+                .any(|version| *version != manifest.descriptor_version)
+        {
+            return Err(StorageError::Other(
+                "structural text unit rows do not match their complete manifest".into(),
+            ));
+        }
+        let mismatched_sources = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM structural_text_unit u
+             LEFT JOIN file f ON f.id = u.file_id
+             WHERE f.id IS NULL
+                OR f.content_hash IS NULL
+                OR f.content_hash <> u.source_content_hash",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if mismatched_sources != 0 {
+            return Err(StorageError::Other(
+                "structural text unit rows do not match their verified file projections".into(),
+            ));
+        }
+        validate_structural_text_projection_rows(&self.conn)?;
+        validate_structural_text_artifact_cache_rows(&self.conn)?;
+        Ok(manifest)
     }
 
     pub fn get_source_policy_exclusions(
@@ -8072,6 +9313,25 @@ impl Storage {
             ),
             params![file_node_id],
         )?;
+
+        tx.execute(
+            &format!(
+                "DELETE FROM structural_text_unit
+                 WHERE file_id = ?1
+                    OR node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
+            params![file_node_id],
+        )?;
+        tx.execute(
+            "DELETE FROM structural_text_projection WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+        tx.execute(
+            "DELETE FROM structural_text_artifact_cache
+             WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
 
         let removed_local_symbols = tx.execute(
             "DELETE FROM local_symbol WHERE file_id = ?1",

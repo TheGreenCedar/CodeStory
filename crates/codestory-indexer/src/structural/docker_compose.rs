@@ -2,7 +2,7 @@ use crate::intermediate_storage::IntermediateStorage;
 use codestory_contracts::graph::{NodeId, NodeKind};
 use std::path::Path;
 
-use super::common::{push_member_edge, push_structural_node};
+use super::common::{StructuralSourceSpan, push_member_edge, push_structural_node};
 
 pub(crate) fn collect_docker_compose_entities(
     path: &Path,
@@ -23,8 +23,11 @@ pub(crate) fn collect_docker_compose_entities(
         NodeKind::MODULE,
         &stack_name,
         &format!("docker-compose:stack:{path_key}"),
-        stack_line,
-        stack_col,
+        StructuralSourceSpan::token(
+            stack_line,
+            stack_col.saturating_sub(1) as usize,
+            stack_name.len(),
+        ),
     );
     push_member_edge(storage, file_id, file_id, stack_id, stack_line);
     collect_services(&path_key, source, file_id, storage, stack_id);
@@ -176,8 +179,7 @@ fn push_service(
         NodeKind::FUNCTION,
         service_name,
         &format!("docker-compose:service:{path_key}:{service_name}"),
-        line,
-        indent.saturating_add(1).try_into().unwrap_or(u32::MAX),
+        StructuralSourceSpan::token(line, indent, service_name.len()),
     );
     push_member_edge(storage, file_id, stack_id, service_id, line);
     service_id
@@ -201,8 +203,7 @@ fn push_anchor(
         NodeKind::ANNOTATION,
         anchor,
         &format!("docker-compose:anchor:{path_key}:{service_name}:{anchor_index}"),
-        line,
-        col,
+        StructuralSourceSpan::token(line, col.saturating_sub(1) as usize, anchor.len()),
     );
     push_member_edge(storage, file_id, service_id, anchor_id, line);
 }

@@ -206,6 +206,13 @@ named fault and race cases for:
 - prepared versus committed journal recovery;
 - cleanup failure after a committed publication;
 - stale/invalid backup ambiguity;
+- structural-unit descriptor determinism across all six collectors, exact
+  source spans, cross-file content-versus-placement identity, and zero-unit
+  projection completeness;
+- structural cache compatibility, corruption, restored-mtime source changes,
+  per-file incremental replacement, and structural-only copy-forward;
+- missing, legacy, corrupt, or source-drifted structural manifests at full,
+  incremental, promotion, and rollback fences;
 - source drift at the publication fence;
 - core, retrieval, vector-evidence, and engine changes during a query;
 - exact dense-anchor ID/hash coverage and corrupt/non-finite/unnormalized vector rejection;
@@ -217,6 +224,10 @@ Evidence must show that failure leaves the previous complete publication usable
 and never deletes an outside sentinel. Query drift must return typed
 `publication_changed`; runtime may retry the complete query-and-resolution
 operation once, never an internal fragment against a newly current generation.
+Structural evidence tests must also show that grounding, search, details, and
+packet paths read persisted producer/tier/resolution metadata in batches where
+the surface is batched, never infer provenance from a filename, and retain
+structural evidence as diagnostic and non-sufficient.
 
 ## CLI and plugin
 

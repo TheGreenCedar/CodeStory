@@ -29,12 +29,12 @@ sequenceDiagram
     Workspace-->>Runtime: RefreshExecutionPlan + verified policy exclusions
     Runtime->>Store: open disposable full stage or durable incremental clone
     Runtime->>Indexer: WorkspaceIndexer::run(plan, store)
-    Indexer->>Store: flush files, nodes, edges, occurrences, component access, callable projection state
+    Indexer->>Store: flush graph rows, structural text units, source identities, and cache writes
     Indexer->>Store: run post-flush resolution updates
     Runtime->>Store: finalize staged snapshot or refresh live snapshots
     Runtime->>Search: rebuild lexical projection, symbol docs, component reports, and dense anchors
     Search->>Store: reuse unchanged anchor metadata or upsert selected embedding-free inputs
-    Runtime->>Store: revalidate and publish the bound exclusion manifest at the identity fence
+    Runtime->>Store: publish structural-unit and exclusion manifests bound to the candidate core identity
     Runtime-->>CLI: indexing summary and phase timings
 ```
 
@@ -85,13 +85,13 @@ flowchart TD
     plan["Refresh plan from codestory-workspace"] --> prep["Normalize paths and load compile_commands metadata"]
     prep --> supported{"Parser-backed or structural support path?"}
     supported -->|"No"| skip["Skip file with no parse work"]
-    supported -->|"Yes"| cache{"Artifact cache hit?"}
-    cache -->|"Yes"| reuse["Reuse cached intermediate artifacts or refresh file metadata"]
-    cache -->|"No"| parse["Parse and extract file in parallel"]
+    supported -->|"Yes"| cache{"Compatible parser or structural cache hit?"}
+    cache -->|"Yes"| reuse["Revalidate source bytes and reuse cached intermediate artifacts"]
+    cache -->|"No"| parse["Parse or collect exact source units in parallel"]
     reuse --> merge["Merge into IntermediateStorage batch"]
     parse --> merge
     merge --> flush{"Batch threshold reached?"}
-    flush -->|"Yes"| write["Flush files, nodes, edges, occurrences, component access, callable projection state"]
+    flush -->|"Yes"| write["Flush graph rows, source hashes, structural units, projections, and cache writes"]
     flush -->|"No"| more["Continue collecting file results"]
     more --> prep
     write --> prep
@@ -147,10 +147,11 @@ For incremental work, a file is reindexed when:
 - its modification time matches but its verified parser content hash differs
 - it exists in the store but is marked as not indexed
 
-Legacy rows and collectors without a verified parser hash retain the metadata
-fallback. Content comparison reads only rows that already carry a verified
-source hash; it does not add hashing for structural, text-only, or oversized
-files that did not produce one.
+Legacy rows and text-only collectors without a verified source hash retain the
+metadata fallback. Parser-backed and structural collector rows carry a
+verified SHA-256 identity; structural files therefore cannot hide changed
+content behind a restored timestamp. Oversized candidates use the separate
+source-policy identity described below.
 
 Verified oversized candidates are removed from parser scheduling and published
 as a complete exclusion manifest bound to the project, workspace, candidate
@@ -176,11 +177,14 @@ coverage blockers and preserves the previous complete publication.
 
 Compilation metadata matters mostly for native-language parsing and is part of the artifact-cache key, so changes to compiler flags or include paths can invalidate cached artifacts. Artifact-cache identity uses the root-relative file path so compatible clean worktrees can reuse copied artifact rows.
 
-### 5. Artifact cache decides parse versus reuse
+### 5. Compatible caches decide parse or collection versus reuse
 
-`prepare_index_work` checks the index artifact cache before reparsing a file.
+`prepare_index_work` checks the parser artifact cache before reparsing a file.
+Structural collectors use a separate, versioned cache whose payload contains
+only collector-owned source units and their graph projection. Copy-forward
+never relabels parser artifacts as structural units.
 
-The cache key includes:
+The parser cache key includes:
 
 - the root-relative file path
 - file bytes
@@ -196,6 +200,14 @@ input. A mismatch, including one hidden by a restored timestamp, becomes an
 incomplete file-level retry error; stale graph output and artifact-cache writes
 are discarded.
 
+The structural cache key includes the root-relative path, exact source bytes,
+collector producer, and structural descriptor version. A hit is accepted only
+after the current source hash, file identity, unit descriptors, placement
+identities, and per-file projection digest all revalidate. Corrupt,
+incompatible, or source-drifted rows are recollected. A verified full refresh
+may copy this cache alone from the prior publication; incremental refresh
+retains unchanged file projections and fully replaces a changed file's units.
+
 File diagnostics retain a typed coverage reason: `parser_partial`,
 `source_changed`, `unreadable`, `oversized`, `discovery_incomplete`, or
 `collector_failure`. Each entry reports whether the condition is retryable and
@@ -208,23 +220,31 @@ gaps and preserve the previous complete publication.
 Cache misses become `PreparedIndexInput` values and are parsed in parallel. Each file produces `IntermediateStorage`, which is the in-memory shape of a future store flush:
 
 - file metadata
-- verified parser source hashes
+- verified parser or structural source hashes
 - nodes
 - edges
 - occurrences
 - component access
 - callable projection state
 - impl anchors
+- structural text units, including evidence producer, tier, resolution status,
+  exact source span, file role, descriptor version, content identity, and
+  placement identity
+- one structural projection per admitted structural file, including files that
+  legitimately produce zero units
+- structural cache writes
 - errors
 
 This phase is where the indexer builds unresolved edges and other graph artifacts. Resolution does not happen yet.
 
 Parsed artifact-cache writes retain Rayon result order and commit once per
-existing file chunk. Duplicate paths therefore keep ordered last-write
-semantics, while a row failure rolls back the whole cache chunk. Cancellation
-is observed at the next chunk boundary: an in-flight cache transaction either
-commits completely or rolls back, and a staged full refresh still cannot
-become live before the runtime publication fence.
+existing file chunk. Structural cache writes instead commit in the projection
+transaction with the file identity, graph nodes, source units, and per-file
+projection. A row failure therefore rolls back the entire structural file
+replacement. Duplicate paths retain ordered last-write semantics.
+Cancellation is observed at the next chunk boundary: an in-flight transaction
+either commits completely or rolls back, and a staged full refresh still
+cannot become live before the runtime publication fence.
 
 File-backed full refreshes use a query-only artifact-cache connection while a
 single writer connection remains on a dedicated scoped thread. The producer
@@ -257,18 +277,23 @@ As file results are merged, `WorkspaceIndexer::run` flushes batches once file, n
 Projection flushes write more than the core graph:
 
 - files
-- nullable verified parser source hashes
+- nullable verified parser or structural source hashes
 - nodes
 - edges
 - occurrences
 - component access tuples
 - callable projection state
+- structural text units and per-file projections
+- structural artifact-cache writes
 
 The store flush path writes the verified hash beside the file row and clears it
-when a refreshed row has no verified parser content identity. Modification time
-is captured only after the verification read matches. The same flush invalidates
-grounding snapshots as part of persistence. Projection flush is both a write
-boundary and a derived-state invalidation boundary.
+when a refreshed row has no verified content identity. For a structural file,
+the source hash, graph rows, units, projection, and dedicated cache entry
+advance in the same SQLite transaction. Modification time is captured only
+after the verification read matches. The same flush invalidates grounding
+snapshots and the prior complete structural-unit manifest as part of
+persistence. Projection flush is both a write boundary and a derived-state
+invalidation boundary.
 
 Full-refresh timing output includes produced and persisted chunk counts, queue
 capacity and high-water mark, producer backpressure time, and writer idle time.
@@ -402,7 +427,10 @@ Artifact caching sits inside the indexer before parsing. Cache hits can reuse a 
 
 ### What gets written before resolution
 
-Files, nodes, edges, occurrences, component access, and callable projection state are flushed before `ResolutionPass` runs. Resolution then updates unresolved edges using the stored graph state.
+Files, source hashes, nodes, edges, occurrences, component access, callable
+projection state, structural text units, structural file projections, and
+structural cache writes are flushed before `ResolutionPass` runs. Resolution
+then updates unresolved edges using the stored graph state.
 
 ### What full refresh publishes that incremental refresh does not
 
@@ -411,6 +439,15 @@ Full refresh builds a staged database and publishes it only after staged finaliz
 Neither core path alone publishes the immutable retrieval generation.
 Retrieval finalization binds its candidate to the resulting core generation and
 leaves the prior retrieval publication active if source or core identity drifts.
+
+Both core paths publish a complete structural-unit manifest immediately before
+the core publication record. It binds descriptor schema, migration state, unit
+and projection counts and digests, and the exact candidate generation/run.
+Per-file projections bind verified source identity and producer. Missing,
+legacy, corrupt, or source-incomplete structural state fails closed. Full
+refresh discards the stage; incremental refresh discards its clone; promotion
+and rollback validate the recorded structural identity before installing either
+database.
 
 ### How symbol docs and dense anchors are kept fast
 
