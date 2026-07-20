@@ -8952,6 +8952,8 @@ mod tests {
             artifact_cache_write_ms: Some(6),
             artifact_cache_writes: Some(24),
             artifact_cache_write_transactions: Some(1),
+            parser_artifact_cache: None,
+            structural_artifact_cache: None,
             full_refresh_chunks_produced: Some(2),
             full_refresh_chunks_persisted: Some(2),
             full_refresh_queue_capacity: Some(1),

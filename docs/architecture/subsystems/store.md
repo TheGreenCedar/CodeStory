@@ -26,12 +26,14 @@ may restore only a valid recorded prepared backup; a committed publication is
 never rolled back merely because a backup remains.
 
 The fresh full-refresh stage is explicitly disposable until publication. It
-keeps WAL for the bounded artifact-cache reader, uses relaxed synchronous writes
-with a bounded nonzero checkpoint window, and is never served or resumed. Its
-consuming publish path restores NORMAL synchronization, completes a TRUNCATE
-checkpoint, syncs the standalone database and directory, and permits no later
-stage writes before entering the promotion journal. Live stores, generic build
-callers, and staged incremental clones remain WAL/NORMAL.
+keeps WAL so a bounded artifact-cache reader can be opened when verified
+structural rows were copied forward, uses relaxed synchronous writes with a
+bounded nonzero checkpoint window, and is never served or resumed. Parser rows
+are not copied, and a stage with no copied structural rows opens no cache
+reader. Its consuming publish path restores NORMAL synchronization, completes a
+TRUNCATE checkpoint, syncs the standalone database and directory, and permits
+no later stage writes before entering the promotion journal. Live stores,
+generic build callers, and staged incremental clones remain WAL/NORMAL.
 
 Incremental refresh writes a durable clone and promotes the completed
 replacement through the same journal. Readers that need publication coherence

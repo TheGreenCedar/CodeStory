@@ -654,6 +654,7 @@ dependencies = [
  "nucleo-matcher",
  "parking_lot",
  "rayon",
+ "rusqlite",
  "serde",
  "serde_json",
  "tantivy",

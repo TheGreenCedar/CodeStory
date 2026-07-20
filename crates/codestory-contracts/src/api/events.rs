@@ -18,6 +18,25 @@ pub struct FullRefreshWallTimings {
     pub unattributed_ms: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactCachePolicyDto {
+    KnownEmpty,
+    #[default]
+    ReadThrough,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ArtifactCacheAccessTimings {
+    pub policy: ArtifactCachePolicyDto,
+    pub logical_lookups: u32,
+    pub physical_queries: u32,
+    pub hits: u32,
+    pub misses: u32,
+    pub reader_opens: u32,
+    pub lookup_wall_ms: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +52,10 @@ pub struct IndexingPhaseTimings {
     pub artifact_cache_writes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_cache_write_transactions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_artifact_cache: Option<ArtifactCacheAccessTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_artifact_cache: Option<ArtifactCacheAccessTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_refresh_chunks_produced: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,6 +311,8 @@ mod tests {
             artifact_cache_write_ms: None,
             artifact_cache_writes: None,
             artifact_cache_write_transactions: None,
+            parser_artifact_cache: None,
+            structural_artifact_cache: None,
             full_refresh_chunks_produced: None,
             full_refresh_chunks_persisted: None,
             full_refresh_queue_capacity: None,
@@ -538,6 +563,44 @@ mod tests {
         assert!(timings.semantic_context_index_ms.is_none());
         assert!(timings.semantic_node_load_ms.is_none());
         assert!(timings.search_symbol_index_commit_ms.is_none());
+        assert!(timings.parser_artifact_cache.is_none());
+        assert!(timings.structural_artifact_cache.is_none());
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_round_trips_separate_artifact_cache_families() {
+        let timings = IndexingPhaseTimings {
+            parser_artifact_cache: Some(ArtifactCacheAccessTimings {
+                policy: ArtifactCachePolicyDto::KnownEmpty,
+                logical_lookups: 3,
+                physical_queries: 0,
+                hits: 0,
+                misses: 3,
+                reader_opens: 0,
+                lookup_wall_ms: 0,
+            }),
+            structural_artifact_cache: Some(ArtifactCacheAccessTimings {
+                policy: ArtifactCachePolicyDto::ReadThrough,
+                logical_lookups: 2,
+                physical_queries: 2,
+                hits: 1,
+                misses: 1,
+                reader_opens: 1,
+                lookup_wall_ms: 4,
+            }),
+            ..IndexingPhaseTimings::default()
+        };
+
+        let value = serde_json::to_value(&timings).expect("serialize timings");
+        assert_eq!(value["parser_artifact_cache"]["policy"], "known_empty");
+        assert_eq!(value["structural_artifact_cache"]["policy"], "read_through");
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize timings");
+        assert_eq!(decoded.parser_artifact_cache, timings.parser_artifact_cache);
+        assert_eq!(
+            decoded.structural_artifact_cache,
+            timings.structural_artifact_cache
+        );
     }
 
     #[test]
