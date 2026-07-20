@@ -5,7 +5,7 @@ use codestory_contracts::api::{
     PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
 };
 use codestory_store::{FileRole, StructuralTextUnit};
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
@@ -428,65 +428,50 @@ fn build_grounding_edge_degree_map(
     degrees
 }
 
-fn compare_grounding_root_records(
-    left: &GroundingNodeRecord,
-    right: &GroundingNodeRecord,
-    root: &Path,
-    file_roles: &HashMap<i64, FileRole>,
-    edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
-    member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
-) -> Ordering {
-    let role = |record: &GroundingNodeRecord| {
-        record
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GroundingRootSortKey {
+    import_like: bool,
+    entrypoint: Reverse<bool>,
+    file_role_rank: u8,
+    path_rank: u8,
+    edge_degree: Reverse<u32>,
+    member_count: Reverse<u32>,
+    node_rank: u8,
+    start_line: u32,
+    relative_path: Option<String>,
+    display_name: String,
+    node_id: i64,
+}
+
+impl GroundingRootSortKey {
+    fn new(
+        record: &GroundingNodeRecord,
+        root: &Path,
+        file_roles: &HashMap<i64, FileRole>,
+        edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
+        member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
+    ) -> Self {
+        let role = record
             .node
             .file_node_id
-            .and_then(|file_id| file_roles.get(&file_id.0).copied())
-    };
-    is_import_like_symbol(&left.node)
-        .cmp(&is_import_like_symbol(&right.node))
-        .then(
-            is_grounding_entrypoint_root(root, right, file_roles)
-                .cmp(&is_grounding_entrypoint_root(root, left, file_roles)),
-        )
-        .then(
-            grounding_root_file_role_rank(role(left))
-                .cmp(&grounding_root_file_role_rank(role(right))),
-        )
-        .then(grounding_root_path_rank(root, left).cmp(&grounding_root_path_rank(root, right)))
-        .then(
-            edge_degrees
-                .get(&right.node.id)
-                .copied()
-                .unwrap_or(0)
-                .cmp(&edge_degrees.get(&left.node.id).copied().unwrap_or(0)),
-        )
-        .then(
-            member_counts
-                .get(&right.node.id)
-                .copied()
-                .unwrap_or(0)
-                .cmp(&member_counts.get(&left.node.id).copied().unwrap_or(0)),
-        )
-        .then(node_rank(&left.node).cmp(&node_rank(&right.node)))
-        .then(
-            left.node
-                .start_line
-                .unwrap_or(u32::MAX)
-                .cmp(&right.node.start_line.unwrap_or(u32::MAX)),
-        )
-        .then_with(|| {
-            left.file_path
+            .and_then(|file_id| file_roles.get(&file_id.0).copied());
+        Self {
+            import_like: is_import_like_symbol(&record.node),
+            entrypoint: Reverse(is_grounding_entrypoint_root(root, record, file_roles)),
+            file_role_rank: grounding_root_file_role_rank(role),
+            path_rank: grounding_root_path_rank(root, record),
+            edge_degree: Reverse(edge_degrees.get(&record.node.id).copied().unwrap_or(0)),
+            member_count: Reverse(member_counts.get(&record.node.id).copied().unwrap_or(0)),
+            node_rank: node_rank(&record.node),
+            start_line: record.node.start_line.unwrap_or(u32::MAX),
+            relative_path: record
+                .file_path
                 .as_deref()
-                .map(|path| relative_path(root, path))
-                .cmp(
-                    &right
-                        .file_path
-                        .as_deref()
-                        .map(|path| relative_path(root, path)),
-                )
-        })
-        .then_with(|| left.display_name.cmp(&right.display_name))
-        .then(left.node.id.0.cmp(&right.node.id.0))
+                .map(|path| relative_path(root, path)),
+            display_name: record.display_name.clone(),
+            node_id: record.node.id.0,
+        }
+    }
 }
 
 fn append_diversified_grounding_root_tier(
@@ -529,8 +514,8 @@ fn diversify_grounding_root_records(
     edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
     member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
 ) -> Vec<GroundingNodeRecord> {
-    records.sort_by(|left, right| {
-        compare_grounding_root_records(left, right, root, file_roles, edge_degrees, member_counts)
+    records.sort_by_cached_key(|record| {
+        GroundingRootSortKey::new(record, root, file_roles, edge_degrees, member_counts)
     });
     let (production, secondary): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| {
         is_production_file_role(
