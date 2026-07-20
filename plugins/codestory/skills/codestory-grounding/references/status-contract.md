@@ -16,9 +16,13 @@ across repositories.
 | `unavailable` | CodeStory could not converge within the managed path. | Use focused source inspection and state the evidence gap. |
 
 `current_operation` is the runtime-owned activation snapshot. When present it
-contains one stable `operation_id`, `state`, `stage`, `attempt`, retry delay,
-and failure. Concurrent calls for the same native project/configuration key
-join that operation; they do not start another refresh or repair flow.
+contains one stable `operation_id`, monotonic `revision`, `stage`, `attempt`,
+and `progress`, plus retry delay and failure. Concurrent and serial retries for
+the same native project/configuration key join that operation; they do not
+start another refresh or repair flow. A `retained` local-navigation capability
+names the exact complete core publication still usable for observational local
+analysis after a replacement fails. It never upgrades broad search without the
+matching retrieval publication and runtime proof.
 
 When no complete publication exists yet, `ground`, `packet`, `search`, and
 `context` return `codestory_preparing` with `retry_tool` and
