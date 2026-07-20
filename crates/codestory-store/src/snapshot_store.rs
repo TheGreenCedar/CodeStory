@@ -357,6 +357,7 @@ mod tests {
                 "test-workspace",
                 codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION,
                 codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                 &[],
             )
             .expect("publish empty source policy identity");

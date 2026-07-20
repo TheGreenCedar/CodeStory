@@ -3241,17 +3241,20 @@ impl WorkspaceIndexer {
             stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         };
+        let structural_unit_cap = self
+            .source_index_policy
+            .as_ref()
+            .map(|policy| policy.structural_unit_cap)
+            .unwrap_or(codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP);
         if artifact.descriptor_version != codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
             || artifact.files.first().map(|file| file.id)
                 != Some(Self::canonical_file_node_id_for_path(&full_path))
-            || artifact.structural_unit_node_ids.len() > structural::MAX_STRUCTURAL_UNITS_PER_FILE
-            || artifact.structural_text_units.len() > structural::MAX_STRUCTURAL_UNITS_PER_FILE
+            || artifact.structural_unit_node_ids.len() as u64 > structural_unit_cap
+            || artifact.structural_text_units.len() as u64 > structural_unit_cap
             || artifact
                 .structural_text_projections
                 .iter()
-                .any(|projection| {
-                    projection.unit_count > structural::MAX_STRUCTURAL_UNITS_PER_FILE as u64
-                })
+                .any(|projection| projection.unit_count > structural_unit_cap)
         {
             stats.artifact_cache_invalid_entries += 1;
             stats.artifact_cache_misses += 1;
@@ -3561,18 +3564,26 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedStructuralInput,
     ) -> PreparedIndexJobResult {
         let language = structural::structural_language_name(&prepared_input.full_path);
-        let collected = match structural::index_structural_source(
+        let structural_unit_cap = self
+            .source_index_policy
+            .as_ref()
+            .map(|policy| policy.structural_unit_cap)
+            .unwrap_or(codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP);
+        let collected = match structural::index_structural_source_with_unit_cap(
             &prepared_input.full_path,
             &prepared_input.source,
+            structural_unit_cap,
         ) {
             Ok(collected) => collected,
-            Err(structural::StructuralCollectionError::UnitLimit(observed_unit_count))
-                if self.source_index_policy.is_some() =>
-            {
+            Err(structural::StructuralCollectionError::UnitLimit {
+                observed_unit_count,
+                structural_unit_cap: observed_cap,
+            }) if self.source_index_policy.is_some() => {
                 let policy = self
                     .source_index_policy
                     .as_ref()
                     .expect("guarded source policy");
+                debug_assert_eq!(observed_cap, policy.structural_unit_cap);
                 let verified =
                     verify_source_snapshot(&prepared_input.full_path, &prepared_input.content_hash);
                 if let Err(error) = verified {
@@ -3619,7 +3630,7 @@ impl WorkspaceIndexer {
                             normalized_path,
                             content_hash: prepared_input.content_hash.clone(),
                             observed_size: prepared_input.source.len() as u64,
-                            observed_unit_count: observed_unit_count as u64,
+                            observed_unit_count,
                             policy_version: policy.policy_version.clone(),
                             byte_cap: policy.byte_cap,
                             structural_unit_cap: policy.structural_unit_cap,
@@ -3634,7 +3645,7 @@ impl WorkspaceIndexer {
                     }
                     structural::StructuralCollectionError::Binary => FileCoverageReason::Binary,
                     structural::StructuralCollectionError::SourceByteLimit(_)
-                    | structural::StructuralCollectionError::UnitLimit(_) => {
+                    | structural::StructuralCollectionError::UnitLimit { .. } => {
                         FileCoverageReason::Oversized
                     }
                 };
@@ -23400,6 +23411,35 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         );
         assert_eq!(exclusion.policy_version, policy.policy_version);
         assert_eq!(exclusion.structural_unit_cap, policy.structural_unit_cap);
+        Ok(())
+    }
+
+    #[test]
+    fn structural_unit_exclusion_uses_the_caller_owned_policy_cap() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("evidence.json");
+        std::fs::write(&path, "{\"one\":1,\"two\":2,\"three\":3}")?;
+        let policy = SourceIndexPolicy {
+            policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+                .to_string(),
+            byte_cap: codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+            structural_unit_cap: 2,
+        };
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![path],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let outcome = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_index_policy(policy.clone())
+            .run_with_policy_exclusions(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(outcome.policy_exclusions.len(), 1);
+        assert_eq!(outcome.policy_exclusions[0].observed_unit_count, 3);
+        assert_eq!(outcome.policy_exclusions[0].structural_unit_cap, 2);
+        assert!(storage.get_files()?.is_empty());
         Ok(())
     }
 

@@ -5241,6 +5241,7 @@ fn publish_source_policy_exclusions(
             &identity.workspace_id,
             &policy.policy_version,
             policy.byte_cap,
+            policy.structural_unit_cap,
             exclusions,
         )
         .map_err(|error| {
@@ -5282,6 +5283,7 @@ fn validate_source_policy_exclusions(
             &identity.workspace_id,
             &policy.policy_version,
             policy.byte_cap,
+            policy.structural_unit_cap,
         )
         .map_err(|error| {
             ApiError::new(
@@ -23363,6 +23365,7 @@ fn build_llm_symbol_doc_text() -> String {
                     &identity.workspace_id,
                     OVERSIZED_SOURCE_POLICY_VERSION,
                     DEFAULT_SOURCE_FILE_BYTE_CAP,
+                    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                     &[],
                 )
                 .expect("publish source policy identity");
@@ -24146,6 +24149,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &project_identity_v3(workspace.path()).workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("verified exclusion manifest");
         assert_eq!(manifest.exclusion_count, 1);
@@ -24367,6 +24371,111 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn structural_unit_policy_change_invalidates_exclusion_and_forces_reevaluation() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let evidence_path = workspace.path().join("evidence.json");
+        fs::write(&evidence_path, "{\"one\":1,\"two\":2,\"three\":3}").expect("structural source");
+        fs::write(workspace.path().join("control.rs"), "pub fn control() {}\n")
+            .expect("control source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let excluding_policy = SourceIndexPolicy {
+            policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+            byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+            structural_unit_cap: 2,
+        };
+        let excluding_controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            excluding_policy.clone(),
+        );
+        excluding_controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open excluding controller");
+        excluding_controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish custom-cap exclusion");
+
+        let excluded_storage = Storage::open(&storage_path).expect("excluded storage");
+        let publication = excluded_storage
+            .get_complete_index_publication()
+            .expect("excluded publication")
+            .expect("complete excluded publication");
+        let excluded_manifest = excluded_storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                &excluding_policy.policy_version,
+                excluding_policy.byte_cap,
+                excluding_policy.structural_unit_cap,
+            )
+            .expect("custom unit cap manifest");
+        assert_eq!(excluded_manifest.structural_unit_cap, 2);
+        assert_eq!(excluded_manifest.exclusion_count, 1);
+        drop(excluded_storage);
+
+        let admitting_policy = SourceIndexPolicy {
+            structural_unit_cap: 3,
+            ..excluding_policy
+        };
+        let admitting_controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            admitting_policy.clone(),
+        );
+        admitting_controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open admitting controller");
+        assert!(
+            admitting_controller
+                .complete_core_requires_publication_repair(&storage_path)
+                .expect("policy change freshness"),
+            "a changed unit cap must invalidate the prior publication identity"
+        );
+        let error = admitting_controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: None,
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect_err("mismatched unit-cap reader must fail closed");
+        assert_eq!(error.code, "source_verification_failed");
+
+        admitting_controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("reevaluate source under changed unit cap");
+        let admitted_storage = Storage::open(&storage_path).expect("admitted storage");
+        let admitted_publication = admitted_storage
+            .get_complete_index_publication()
+            .expect("admitted publication")
+            .expect("complete admitted publication");
+        let admitted_manifest = admitted_storage
+            .validate_source_policy_exclusion_publication(
+                &admitted_publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                &admitting_policy.policy_version,
+                admitting_policy.byte_cap,
+                admitting_policy.structural_unit_cap,
+            )
+            .expect("changed-cap manifest");
+        assert_eq!(admitted_manifest.structural_unit_cap, 3);
+        assert_eq!(admitted_manifest.exclusion_count, 0);
+        assert!(
+            admitted_storage
+                .get_file_by_path(&evidence_path)
+                .expect("reevaluated file")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_coverage() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -24410,6 +24519,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &project_identity_v3(workspace.path()).workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("verified exclusion manifest");
         assert_eq!(manifest.exclusion_count, 3);
@@ -24547,6 +24657,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &project_identity_v3(workspace.path()).workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("baseline exclusion manifest remains valid");
         assert_eq!(manifest.exclusion_count, 0);
@@ -24607,6 +24718,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &project_identity_v3(workspace.path()).workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("baseline exclusion manifest remains valid");
         assert_eq!(manifest.exclusion_count, 0);
@@ -24685,6 +24797,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &project_identity_v3(workspace.path()).workspace_id,
                 &policy.policy_version,
                 policy.byte_cap,
+                policy.structural_unit_cap,
             )
             .expect("manifest uses the injected policy");
         assert_eq!(published.byte_cap, 64);
@@ -24904,6 +25017,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &identity.workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("complete exclusion publication");
         let first_exclusion = storage
@@ -25014,6 +25128,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &identity.workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("replacement exclusion manifest");
         assert_eq!(manifest.exclusion_count, 1);
@@ -25083,6 +25198,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &identity.workspace_id,
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .expect("recovered exclusion manifest");
         assert_eq!(manifest.exclusion_count, 1);
@@ -27087,6 +27203,7 @@ fn build_llm_symbol_doc_text() -> String {
                 "test-workspace",
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                 &[],
             )
             .expect("publish old source policy identity");
@@ -27138,6 +27255,7 @@ fn build_llm_symbol_doc_text() -> String {
                 "test-workspace",
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                 &[],
             )
             .expect("publish staged source policy identity");

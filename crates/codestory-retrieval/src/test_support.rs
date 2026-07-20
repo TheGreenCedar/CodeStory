@@ -202,6 +202,7 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
             &source_policy.workspace_id,
             &source_policy.policy_version,
             source_policy.byte_cap,
+            source_policy.structural_unit_cap,
             &source_policy_candidates,
         )
         .context("publish replacement core source policy manifest")?;

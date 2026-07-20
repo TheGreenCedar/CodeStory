@@ -7645,9 +7645,9 @@ impl Storage {
         workspace_id: &str,
         policy_version: &str,
         byte_cap: u64,
+        structural_unit_cap: u64,
         candidates: &[OversizedSourceExclusionCandidate],
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
-        let structural_unit_cap = codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP;
         if publication.generation_id.trim().is_empty()
             || publication.run_id.trim().is_empty()
             || project_id.trim().is_empty()
@@ -7782,8 +7782,8 @@ impl Storage {
         workspace_id: &str,
         policy_version: &str,
         byte_cap: u64,
+        structural_unit_cap: u64,
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
-        let structural_unit_cap = codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP;
         let manifest = self
             .get_source_policy_exclusion_manifest()?
             .ok_or_else(|| {

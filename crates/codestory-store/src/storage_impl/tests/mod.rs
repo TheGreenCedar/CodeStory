@@ -795,6 +795,7 @@ fn source_policy_exclusion_publication_binds_complete_rows_to_core_identity()
         "workspace-4",
         "oversized-source-v1",
         1_000_000,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         &candidates,
     )?;
     assert_eq!(manifest.exclusion_count, 3);
@@ -807,6 +808,7 @@ fn source_policy_exclusion_publication_binds_complete_rows_to_core_identity()
             "workspace-4",
             "oversized-source-v1",
             1_000_000,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         )?,
         manifest
     );
@@ -823,6 +825,7 @@ fn source_policy_exclusion_publication_binds_complete_rows_to_core_identity()
                 "workspace-4",
                 "oversized-source-v1",
                 1_000_000,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             )
             .is_err()
     );
@@ -855,6 +858,7 @@ fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
         "workspace",
         "oversized-source-v1",
         1_000_000,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         &first,
     )?;
     storage.conn.execute_batch(
@@ -889,6 +893,7 @@ fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
                 "workspace",
                 "oversized-source-v1",
                 1_000_000,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                 &second,
             )
             .is_err()
@@ -904,6 +909,7 @@ fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
         "workspace",
         "oversized-source-v1",
         1_000_000,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
     )?;
     Ok(())
 }
@@ -4607,6 +4613,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             "test-workspace",
             OVERSIZED_SOURCE_POLICY_VERSION,
             DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             &[],
         )?;
         drop(seed);
@@ -4639,6 +4646,7 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
                 "test-workspace",
                 OVERSIZED_SOURCE_POLICY_VERSION,
                 DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                 &[],
             )?;
             staged.finalize_staged_snapshot()?;
@@ -4825,6 +4833,7 @@ fn seed_promotion_file_with_identity(
             "test-workspace",
             OVERSIZED_SOURCE_POLICY_VERSION,
             DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             &[],
         )?;
     }
@@ -4949,6 +4958,7 @@ fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<()
         "test-workspace",
         OVERSIZED_SOURCE_POLICY_VERSION,
         DEFAULT_SOURCE_FILE_BYTE_CAP,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         &[OversizedSourceExclusionCandidate {
             normalized_path: format!("vendor/registers-{id}.h"),
             content_hash: format!("{:064x}", id.max(0)),
@@ -4977,6 +4987,7 @@ fn publish_nonempty_test_source_policy(path: &Path, generation: u64) -> Result<(
         "test-workspace",
         OVERSIZED_SOURCE_POLICY_VERSION,
         DEFAULT_SOURCE_FILE_BYTE_CAP,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         &[OversizedSourceExclusionCandidate {
             normalized_path: format!("vendor/registers-{generation}.h"),
             content_hash: format!("{generation:064x}"),
@@ -5379,6 +5390,7 @@ fn schema_28_journal_less_backup_requires_complete_auxiliary_publications() {
             "test-workspace",
             OVERSIZED_SOURCE_POLICY_VERSION,
             DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         )
         .expect("validate recovered source policy publication");
     recovered
@@ -5701,6 +5713,7 @@ fn promotion_journal_binds_source_policy_exclusion_count_and_digest() -> Result<
             "workspace",
             "oversized-source-v1",
             1_000_000,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             &[OversizedSourceExclusionCandidate {
                 normalized_path: format!("vendor/registers-{generation}.h"),
                 content_hash: format!("{generation:x}").repeat(64),
