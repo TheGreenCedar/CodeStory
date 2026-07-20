@@ -291,16 +291,35 @@ pub(crate) fn search_hit_matches_exact_file(
     } else {
         project_root.join(file_path)
     };
+    if !candidate.is_file() || !codestory_workspace::same_workspace_path(&candidate, exact_path) {
+        return false;
+    }
     #[cfg(unix)]
     {
-        let candidate_relative =
-            codestory_workspace::workspace_relative_path(project_root, &candidate);
-        let exact_relative = codestory_workspace::workspace_relative_path(project_root, exact_path);
-        if candidate_relative != exact_relative {
+        let Some(candidate_relative) =
+            codestory_workspace::workspace_relative_path(project_root, &candidate)
+        else {
+            return false;
+        };
+        let Some(exact_relative) =
+            codestory_workspace::workspace_relative_path(project_root, exact_path)
+        else {
+            return false;
+        };
+        if unix_path_spelling_is_case_only_substitution(&candidate_relative, &exact_relative) {
             return false;
         }
     }
-    candidate.is_file() && codestory_workspace::same_workspace_path(&candidate, exact_path)
+    true
+}
+
+#[cfg(unix)]
+fn unix_path_spelling_is_case_only_substitution(left: &Path, right: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let left = left.as_os_str().as_bytes();
+    let right = right.as_os_str().as_bytes();
+    left != right && left.eq_ignore_ascii_case(right)
 }
 
 pub(crate) fn file_filter_match_bucket(project_root: &Path, hit: &SearchHit, fragment: &str) -> u8 {
@@ -1033,11 +1052,19 @@ mod tests {
         let exact = project.path().join("src").join("lib.rs");
         std::fs::write(&exact, "fn target() {}\n").expect("source");
         let matching = hit("1", "target", NodeKind::FUNCTION, 1.0, "src/lib.rs");
+        let wrong_case_path = project.path().join("src").join("LIB.rs");
+        if !wrong_case_path.is_file() {
+            std::fs::hard_link(&exact, &wrong_case_path).expect("case-only hard-link spelling");
+        }
         let wrong_case = hit("2", "target", NodeKind::FUNCTION, 1.0, "src/LIB.rs");
 
         assert!(search_hit_matches_exact_file(
             project.path(),
             &matching,
+            &exact
+        ));
+        assert!(codestory_workspace::same_workspace_path(
+            &wrong_case_path,
             &exact
         ));
         assert!(!search_hit_matches_exact_file(
@@ -1049,6 +1076,37 @@ mod tests {
             file_filter_match_bucket(project.path(), &wrong_case, &exact.to_string_lossy()),
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_file_matching_accepts_in_project_symlink_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let exact = project.path().join("src").join("lib.rs");
+        let symlink_alias = project.path().join("src").join("linked.rs");
+        let hard_link_alias = project.path().join("src").join("hard-linked.rs");
+        std::fs::write(&exact, "fn target() {}\n").expect("source");
+        symlink(&exact, &symlink_alias).expect("symlink alias");
+        std::fs::hard_link(&exact, &hard_link_alias).expect("hard-link alias");
+
+        for (id, path) in [
+            ("symlink", "src/linked.rs"),
+            ("hard-link", "src/hard-linked.rs"),
+        ] {
+            let alias = hit(id, "target", NodeKind::FUNCTION, 1.0, path);
+            assert!(search_hit_matches_exact_file(
+                project.path(),
+                &alias,
+                &exact
+            ));
+            assert_eq!(
+                file_filter_match_bucket(project.path(), &alias, &exact.to_string_lossy()),
+                4
+            );
+        }
     }
 
     #[cfg(windows)]
