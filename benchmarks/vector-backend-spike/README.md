@@ -26,8 +26,11 @@ does not prove publication completeness; the retained 84,025-anchor core-only
 publication still lacks the retrieval manifest and vectors required by this
 harness. The runner snapshots the admitted
 `vectors.sqlite3`, its `vector-generation-manifest.json`, and the fixture into
-the evidence root together with the reviewed catalog and declared criteria.
-Before any candidate
+the evidence root together with the reviewed catalog and exact digest-pinned
+declared criteria. Any change to the workload, dimensions, query count, top-k,
+warmups, root/block matrix, candidate versions, decision rules, or required
+measurements requires an explicit executable-contract update and otherwise
+fails closed. Before any candidate
 starts, the same digest-bound binary re-resolves every catalog file/symbol and
 document hash against the frozen source, re-embeds every query through the
 product transport, and rechecks the exact clean corpus and publication

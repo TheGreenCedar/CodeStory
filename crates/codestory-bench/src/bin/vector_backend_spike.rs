@@ -32,6 +32,7 @@ const LARGEST_WORKLOAD_COUNT: usize = 75_000;
 const FIXTURE_ANCHOR_COUNT: usize = LARGEST_WORKLOAD_COUNT + INCREMENTAL_COUNT;
 const FIXTURE_SCHEMA_VERSION: u32 = 5;
 const SELECTION_SEED: &str = "codestory-1202-vector-spike-v2";
+const CRITERIA_SHA256: &str = "4dd32441ae3d8754f7a1cec6c1e1e150ce5a6b4f78a7d94d1eb2d94859f96460";
 const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
 const EMBEDDING_AUTHORITY_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const EMBEDDING_AUTHORITY_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
@@ -1602,6 +1603,10 @@ fn verify_frozen_input_paths(paths: &FrozenInputPaths) -> Result<()> {
 }
 
 fn verify_criteria_contract(path: &Path) -> Result<()> {
+    ensure!(
+        sha256_file(path)? == CRITERIA_SHA256,
+        "comparison criteria digest does not match the executable evidence contract"
+    );
     let value: serde_json::Value = serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read comparison criteria {}", path.display()))?,
     )
@@ -2726,11 +2731,17 @@ mod tests {
     fn declared_criteria_match_the_executable_workloads() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let criteria = temp.path().join("criteria.json");
-        fs::write(
-            &criteria,
-            include_bytes!("../../../../benchmarks/vector-backend-spike/criteria.json"),
-        )?;
-        verify_criteria_contract(&criteria)
+        let bytes = include_bytes!("../../../../benchmarks/vector-backend-spike/criteria.json");
+        fs::write(&criteria, bytes)?;
+        verify_criteria_contract(&criteria)?;
+
+        let changed =
+            String::from_utf8(bytes.to_vec())?.replace("\"warmups\": 5", "\"warmups\": 4");
+        fs::write(&criteria, changed)?;
+        let error = verify_criteria_contract(&criteria)
+            .expect_err("changed acceptance criteria must fail closed");
+        assert!(error.to_string().contains("criteria digest"));
+        Ok(())
     }
 
     #[test]
