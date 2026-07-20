@@ -16,7 +16,7 @@ Criterion targets.
 | Store/publication | Store tests plus named fault/concurrency cases | Workspace source gate |
 | Retrieval/embedding | Retrieval tests, runtime admission tests, engine proof self-test | Same-run quality/performance gate and required hardware proof |
 | CLI/stdio | Named CLI contract suites | Workspace source gate and packaged proof when package behavior changed |
-| Plugin launcher | `node --test plugins/codestory/tests/plugin-static.test.mjs` | Packaged plugin handoff |
+| Plugin launcher or CodeStoryDev staging | Installer tests plus `plugin-static` | Packaged plugin handoff |
 | Worktree setup | Node suite plus one platform adapter smoke | Mac/Windows platform cell when adapter changed |
 | Docs only | Read changed pages, doc links, `git diff --check` | No package matrix |
 | Release/version | Release and workflow policy scripts | Main-only signing, notarization, publish, install, and live runtime proof |
@@ -308,6 +308,7 @@ schema/adapter fixtures enforce the combined 16-probe and 240-character limits.
 Plugin adapter changes run:
 
 ```sh
+node --test scripts/tests/install-codestory-dev-plugin.test.mjs
 node --test plugins/codestory/tests/plugin-static.test.mjs
 ```
 

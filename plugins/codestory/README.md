@@ -69,6 +69,28 @@ Marketplace refresh updates the catalog only. Package refresh replaces the
 installed plugin, and a fresh host session loads that replacement. See the
 [Codex update guide](../../docs/users/codex.md#update).
 
+## CodeStoryDev refresh
+
+Maintainers dogfood an unpublished head through the local `CodeStoryDev`
+marketplace. Build the exact CLI, commit the plugin package, then run:
+
+```sh
+node scripts/install-codestory-dev-plugin.mjs \
+  --cli "$(pwd)/target/release/codestory-cli"
+```
+
+The installer stages the clean committed `plugins/codestory` package, the
+platform-native CLI, and `.codestory-dev-cli.json`, then refreshes only
+`codestory@CodeStoryDev`. The receipt binds the source-package digest, plugin
+ID/version, platform, direct executable name/path, bytes, SHA-256, and reported
+CLI version. It preserves `~/.codex/plugins/data/codestory-CodeStoryDev`.
+
+The installed launcher validates the cached receipt again with an empty
+`PATH`. If the receipt, package, cache copy, or CLI changed—or if
+`CODESTORY_CLI` is also set—it reports the receipt failure and does not try the
+production release installer. Start a fresh Codex host after a successful
+refresh to load the new adapter.
+
 ## Diagnostics
 
 Normal calls prepare the repository automatically. Agents call the intended
@@ -85,6 +107,7 @@ Blocked session steps: [Troubleshooting](../../docs/users/troubleshooting.md).
 
 ```sh
 node scripts/generate-codestory-skill-syntax.mjs --check
+node --test scripts/tests/install-codestory-dev-plugin.test.mjs
 node --test plugins/codestory/tests/plugin-static.test.mjs
 node .github/scripts/check-doc-links.mjs
 git diff --check

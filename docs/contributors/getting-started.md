@@ -140,6 +140,21 @@ cargo build --release --locked -p codestory-cli
 On Windows, use `.\target\release\codestory-cli.exe`. Set `CODESTORY_CLI` to
 that exact binary when testing the plugin adapter against a local build.
 
+To refresh the installed local `CodeStoryDev` package, use the attested staging
+installer after committing the plugin source:
+
+```sh
+node scripts/install-codestory-dev-plugin.mjs \
+  --cli "$(pwd)/target/release/codestory-cli"
+```
+
+The installer requires the exact platform filename and matching plugin/CLI
+version, rejects plugin-source drift, stages a package-and-CLI receipt, refreshes
+only `codestory@CodeStoryDev`, and leaves plugin data intact. Start a fresh
+Codex host after the package refresh. Do not edit the checked-in `.mcp.json` or
+add `CODESTORY_CLI` to it; production packages continue to use the authenticated
+managed-release path.
+
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache. Reserve full refresh for an empty cache,
 schema change, diagnosed corruption, or an explicit proof lane.
