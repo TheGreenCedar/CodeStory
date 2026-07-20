@@ -152,6 +152,14 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_node_load_rows: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_selected_nodes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_context_file_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_context_path_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_node_lookup_entries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_context_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_doc_build_ms: Option<u32>,
@@ -377,6 +385,10 @@ mod tests {
             semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
+            semantic_selected_nodes: None,
+            semantic_context_file_count: None,
+            semantic_context_path_bytes: None,
+            semantic_node_lookup_entries: None,
             semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
@@ -483,6 +495,10 @@ mod tests {
         assert!(value.get("semantic_doc_build_ms").is_none());
         assert!(value.get("semantic_node_load_ms").is_none());
         assert!(value.get("semantic_node_load_rows").is_none());
+        assert!(value.get("semantic_selected_nodes").is_none());
+        assert!(value.get("semantic_context_file_count").is_none());
+        assert!(value.get("semantic_context_path_bytes").is_none());
+        assert!(value.get("semantic_node_lookup_entries").is_none());
         assert!(value.get("semantic_context_ms").is_none());
         assert!(value.get("semantic_embedding_ms").is_none());
         assert!(value.get("semantic_db_upsert_ms").is_none());

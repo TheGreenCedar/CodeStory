@@ -8944,6 +8944,10 @@ mod tests {
             semantic_context_index_ms: Some(59),
             semantic_node_load_ms: Some(66),
             semantic_node_load_rows: Some(8_192),
+            semantic_selected_nodes: Some(2_048),
+            semantic_context_file_count: Some(128),
+            semantic_context_path_bytes: Some(16_384),
+            semantic_node_lookup_entries: Some(8_192),
             semantic_context_ms: Some(67),
             semantic_doc_build_ms: Some(7),
             semantic_embedding_ms: Some(8),
@@ -9204,8 +9208,11 @@ mod tests {
         ));
         assert!(
             markdown
-                .contains("semantic_ms: context_index=59 node_load=66 node_rows=8192 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
+                .contains("semantic_ms: context_index=59 node_load=66 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
         );
+        assert!(markdown.contains(
+            "semantic_context: node_rows=8192 selected_nodes=2048 files=128 path_bytes=16384 lookup_entries=8192"
+        ));
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(
             "staged_publish_ms: deferred_indexes=7 summary_snapshot=8 detail_snapshot=9 publish=10"
