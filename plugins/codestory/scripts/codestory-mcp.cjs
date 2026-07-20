@@ -2104,8 +2104,19 @@ function strictUriComponentDecode(value, label) {
   return decoded;
 }
 
+function cleanPublicProjectPath(value, platform = process.platform) {
+  if (platform !== 'win32') return String(value);
+  let project = String(value).replaceAll('\\', '/');
+  if (project.startsWith('//?/UNC/')) {
+    project = `//${project.slice('//?/UNC/'.length)}`;
+  } else if (project.startsWith('//?/')) {
+    project = project.slice('//?/'.length);
+  }
+  return project;
+}
+
 function projectBoundResourceUri(baseUri, project) {
-  return `${baseUri}?project=${strictUriComponentEncode(project)}`;
+  return `${baseUri}?project=${strictUriComponentEncode(cleanPublicProjectPath(project))}`;
 }
 
 function parseFailOpenResourceRequest(uri, legacyProject) {
@@ -2142,11 +2153,12 @@ function parseFailOpenResourceRequest(uri, legacyProject) {
   if (!selection.ok) {
     throw new Error(`${selection.code}: ${selection.message}`);
   }
+  const project = cleanPublicProjectPath(selection.project);
   return {
     kind: 'status',
-    project: selection.project,
+    project,
     projectSource: query === null ? 'request_argument' : 'resource_uri',
-    uri: projectBoundResourceUri(baseUri, selection.project),
+    uri: projectBoundResourceUri(baseUri, project),
   };
 }
 
@@ -2499,6 +2511,12 @@ function runFailOpenMcp(status, options = {}) {
           statusValue.project_root = project;
           statusValue.project_root_source = parsedResource.projectSource;
           statusValue.diagnostics_uri = parsedResource.uri;
+          if (Array.isArray(statusValue.recommended_next_calls)) {
+            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) =>
+              call?.method === 'resources/read' && call?.uri === 'codestory://status'
+                ? { ...call, uri: parsedResource.uri }
+                : call);
+          }
           response = jsonrpcResult(
             request.id,
             resourceContents(parsedResource.uri, statusValue),
@@ -2727,6 +2745,7 @@ if (require.main === module) {
   module.exports = {
     _test: {
       compareManagedCliVersions,
+      cleanPublicProjectPath,
       downloadFile,
       extractArchive,
       failOpenToolCatalog,

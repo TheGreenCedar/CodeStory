@@ -59,7 +59,14 @@ REQUIRED_HOLDOUT_TASK_FILES = {
 
 
 def project_resource_uri(base_uri: str, project: Path) -> str:
-    return f"{base_uri}?project={quote(str(project), safe='-._~')}"
+    value = str(project)
+    if os.name == "nt":
+        value = value.replace("\\", "/")
+        if value.startswith("//?/UNC/"):
+            value = f"//{value[len('//?/UNC/'):]}"
+        elif value.startswith("//?/"):
+            value = value[len("//?/"):]
+    return f"{base_uri}?project={quote(value, safe='-._~')}"
 
 
 EXTERNAL_QUALIFICATION_METRICS = {

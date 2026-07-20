@@ -13,7 +13,7 @@ grounding skill chooses the CodeStory tool.
 | --- | --- |
 | Grep the whole repo for `UserService` and read every hit. | Where is `UserService` defined, who constructs it, and which files should I read first? |
 | Run `find . -name "*.rs"` and open files until you find the handler. | How does the HTTP handler for `[route]` work? Cite concrete files and flag gaps. |
-| Read `codestory://status` and paste the JSON here. | I am changing `[path/to/file]`. What symbols are affected and what tests should I run first? |
+| Read `codestory://status{?project}` for this repository and paste the JSON here. | I am changing `[path/to/file]`. What symbols are affected and what tests should I run first? |
 | Use packet/search no matter what. | How does `[subsystem]` interact with `[other area]`? Use CodeStory and cite sources; say if broad search is not ready. |
 
 **Anti-pattern:** asking the agent to grep, glob, or walk the tree **before**

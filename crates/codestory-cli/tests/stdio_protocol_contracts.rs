@@ -2283,7 +2283,6 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
     assert_eq!(
         sorted_field_values(&templates, "resourceTemplates", "uriTemplate"),
         vec![
-            "codestory://diagnostics/retrieval-engine{?project}",
             "codestory://grounding{?project}",
             "codestory://project{?project}",
             "codestory://references/{node_id}{?project}",
@@ -2293,7 +2292,7 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
             "codestory://symbols/root{?project}",
             "codestory://trail/{node_id}{?project}",
         ],
-        "every repository-reading resource template should carry an explicit project selector: {templates}"
+        "every advertised repository-reading resource template should carry an explicit project selector: {templates}"
     );
 
     let prompts = assert_success_envelope(

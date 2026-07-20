@@ -158,7 +158,7 @@ For a live MCP process that has initialized the engine, issue an MCP
 `resources/read` request with URI:
 
 ```text
-codestory://diagnostics/retrieval-engine
+codestory://diagnostics/retrieval-engine?project=<percent-encoded-absolute-root>
 ```
 
 The resource is intentionally omitted from ordinary user routing. It reports

@@ -75,11 +75,20 @@ test("fail-open project resource URIs use the native strict encoding contract", 
   for (const project of ["/tmp/Code Story/%/café", String.raw`C:\Code Story\100% data\Δ`]) {
     const encoded = launcherTest.strictUriComponentEncode(project);
     assert.equal(launcherTest.strictUriComponentDecode(encoded, "resource project"), project);
+    const publicProject = launcherTest.cleanPublicProjectPath(project);
     assert.equal(
       launcherTest.projectBoundResourceUri("codestory://status", project),
-      `codestory://status?project=${encoded}`,
+      `codestory://status?project=${launcherTest.strictUriComponentEncode(publicProject)}`,
     );
   }
+  assert.equal(
+    launcherTest.cleanPublicProjectPath(String.raw`\\?\C:\Code Story\repo`, "win32"),
+    "C:/Code Story/repo",
+  );
+  assert.equal(
+    launcherTest.cleanPublicProjectPath(String.raw`/tmp/a\b`, "linux"),
+    String.raw`/tmp/a\b`,
+  );
   for (const uri of [
     "codestory://status",
     "codestory://status?project=%2ftmp%2Frepo",
@@ -2540,6 +2549,9 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(Object.hasOwn(status, "readiness_broker"), false);
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.equal(status.managed_retrieval.automatic, true);
+    assert.deepEqual(status.recommended_next_calls, [
+      { method: "resources/read", uri: statusUri },
+    ]);
     const toolNames = responses[2].result.tools.map((tool) => tool.name);
     const catalogSource = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_catalog.rs"), "utf8");
     const canonicalTools = catalogSource.slice(
@@ -2946,6 +2958,10 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(status.project_root, repoRoot);
     assert.equal(status.project_root_source, "resource_uri");
     assert.equal(statusResponse.result.contents[0].uri, statusUri);
+    assert.ok(
+      status.recommended_next_calls.every((call) =>
+        call.method !== "resources/read" || call.uri === statusUri),
+    );
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
     assert.equal(status.runtime.state, "preparing");
     const coldResources = await request({

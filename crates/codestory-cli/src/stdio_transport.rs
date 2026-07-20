@@ -581,7 +581,11 @@ fn canonical_hex_value(byte: u8) -> Option<u8> {
 }
 
 fn stdio_resource_uri_for_project(resource: &StdioResource, project_root: &Path) -> String {
-    resource.uri(Some(project_root.to_string_lossy().as_ref()))
+    #[cfg(windows)]
+    let project = crate::display::clean_path_string(&project_root.to_string_lossy());
+    #[cfg(not(windows))]
+    let project = project_root.to_string_lossy().into_owned();
+    resource.uri(Some(&project))
 }
 
 struct StdioProjectSession {
@@ -6835,7 +6839,11 @@ version = "0.11.20"
 
     #[test]
     fn project_bound_resource_uris_round_trip_strict_components() {
-        for project in ["/tmp/Code Story/%/café", r"C:\Code Story\100% data\Δ"] {
+        for project in [
+            "/tmp/Code Story/%/café",
+            r"/tmp/Code Story/a\b",
+            r"C:\Code Story\100% data\Δ",
+        ] {
             let resource = StdioResource::Snippet(NodeId("node/% id:Δ".to_string()));
             let uri = resource.uri(Some(project));
             let parsed = StdioResource::parse(&uri).expect("parse canonical resource URI");
@@ -6855,6 +6863,20 @@ version = "0.11.20"
             assert!(
                 StdioResource::parse(uri).is_err(),
                 "malformed or non-canonical resource URI was accepted: {uri}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let windows_uri = stdio_resource_uri_for_project(
+                &StdioResource::Status,
+                Path::new(r"\\?\C:\Code Story\100% data\Δ"),
+            );
+            let windows =
+                StdioResource::parse(&windows_uri).expect("parse normalized Windows resource URI");
+            assert_eq!(
+                windows.project.as_deref(),
+                Some("C:/Code Story/100% data/Δ")
             );
         }
     }
@@ -7665,8 +7687,10 @@ version = "0.11.20"
                 "id": 2,
                 "method": "resources/read",
                 "params": {
-                    "uri": "codestory://project",
-                    "project": project.path()
+                    "uri": format!(
+                        "codestory://project?project={}",
+                        strict_uri_component_encode(project.path().to_string_lossy().as_ref())
+                    )
                 }
             })
             .to_string(),

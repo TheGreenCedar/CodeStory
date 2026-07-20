@@ -2020,11 +2020,6 @@ static RESOURCE_TEMPLATES: &[ResourceTemplateSpec] = &[
         mime_type: "application/json",
     },
     ResourceTemplateSpec {
-        uri_template: "codestory://diagnostics/retrieval-engine{?project}",
-        name: "Retrieval engine diagnostics",
-        mime_type: "application/json",
-    },
-    ResourceTemplateSpec {
         uri_template: "codestory://project{?project}",
         name: "Project summary",
         mime_type: "application/json",

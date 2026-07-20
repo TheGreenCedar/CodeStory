@@ -4019,11 +4019,6 @@
     },
     {
       "mimeType": "application/json",
-      "name": "Retrieval engine diagnostics",
-      "uriTemplate": "codestory://diagnostics/retrieval-engine{?project}"
-    },
-    {
-      "mimeType": "application/json",
       "name": "Project summary",
       "uriTemplate": "codestory://project{?project}"
     },

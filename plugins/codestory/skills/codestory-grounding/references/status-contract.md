@@ -75,10 +75,11 @@ physical non-software adapter, and verified accelerator work.
 ## Maintainer recovery
 
 CLI status, doctor, install records, and
-`codestory://diagnostics/retrieval-engine` are maintainer surfaces. The engine
-diagnostic reports the live model digest, linked ggml build, selected adapter,
-policy, smoke timing, and per-user server/model-load identity. It is intentionally
-absent from the normal resource catalog and user flow. Use these surfaces only
-after automatic retries stop converging or when collecting an explicit proof
-transcript. `CODESTORY_CLI` remains a local-development override; installed
-plugin sessions use the managed launcher.
+the project-bound `codestory://diagnostics/retrieval-engine{?project}` resource
+are maintainer surfaces. The engine diagnostic reports the live model digest,
+linked ggml build, selected adapter, policy, smoke timing, and per-user
+server/model-load identity. It is intentionally absent from the normal resource
+catalog and user flow. Use these surfaces only after automatic retries stop
+converging or when collecting an explicit proof transcript. `CODESTORY_CLI`
+remains a local-development override; installed plugin sessions use the managed
+launcher.

@@ -38,7 +38,8 @@ Preflight exposes `safe_surfaces`, `blocked_surfaces`, and the next normal retri
 `ready --format json` returns `verdicts[]` with per-goal `status`, `summary`,
 and `minimum_next`. `retrieval status --format json` reports
 `retrieval_mode` (trust packet/search only when `full`).
-When MCP is live, prefer `codestory://status` instead.
+When MCP is live, prefer the project-bound `codestory://status{?project}`
+resource instead.
 
 ## Local navigation
 
@@ -130,7 +131,7 @@ Embedding never uses a network endpoint. Put `cache_dir` in user home `.codestor
 | Orientation | `ground --project <repo> --why` | `files` for language mix or coverage gaps |
 | Where to edit | `symbol --project <repo> --query "<feature>"` | `callers`, `callees`, `trail` after picking a node |
 | Change impact | `affected` with `--stdin` from `git diff` | Pick focused tests; not a test run |
-| Readiness | `agent preflight --format json` | `codestory://status` when MCP is live |
+| Readiness | `agent preflight --format json` | `codestory://status{?project}` when MCP is live |
 | Broad evidence | `retrieval status --format json` | `packet` or `search` only after `full` mode |
 
 ## Managed search internals
