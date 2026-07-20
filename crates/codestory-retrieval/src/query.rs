@@ -186,6 +186,7 @@ impl PinnedQuerySession {
             )?;
         if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
             project_root,
+            storage_path,
             &storage,
             runtime,
             &producer_compatibility_identity,

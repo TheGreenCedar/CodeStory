@@ -555,7 +555,8 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     )?;
 
     let storage = Store::open(storage_path).context("open storage for retrieval sidecar input")?;
-    let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
+    let lexical_source =
+        lexical_source_input(project_root, storage_path).context("hash lexical source input")?;
     let input_snapshot = storage
         .read_snapshot()
         .context("open coherent sidecar input snapshot")?;
@@ -1293,7 +1294,7 @@ fn persist_finalized_manifest(
                 sidecar_input,
                 &manifest,
                 |storage| {
-                    let lexical_source = lexical_source_input(project_root)
+                    let lexical_source = lexical_source_input(project_root, storage_path)
                         .context("rescan lexical source at publication fence")?;
                     let embedding_contract = SidecarEmbeddingContract {
                         backend: &embedding_backend,
@@ -1855,12 +1856,14 @@ fn retain_published_generations(
 pub(crate) fn compute_sidecar_input_fingerprint(
     storage: &Store,
     project_root: &Path,
+    storage_path: &Path,
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
     producer_compatibility_identity: &str,
 ) -> Result<SidecarInputFingerprint> {
-    let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
+    let lexical_source =
+        lexical_source_input(project_root, storage_path).context("hash lexical source input")?;
     let embedding_contract = SidecarEmbeddingContract {
         backend: embedding_backend,
         dimension: embedding_dim,
@@ -2853,6 +2856,7 @@ mod tests {
         std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
             .expect("write source");
         let mut storage = Store::new_in_memory().expect("storage");
+        let storage_path = project.path().join("codestory.db");
         insert_matching_semantic_doc(&mut storage, project.path());
 
         assert_eq!(
@@ -2864,6 +2868,7 @@ mod tests {
         let empty_projection = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             "project",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -2880,6 +2885,7 @@ mod tests {
         let stale_projection = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             "project",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -2918,6 +2924,7 @@ mod tests {
         let first_input = compute_sidecar_input_fingerprint(
             &first_storage,
             first_project.path(),
+            &first_storage_path,
             &first_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -2927,6 +2934,7 @@ mod tests {
         let second_input = compute_sidecar_input_fingerprint(
             &second_storage,
             second_project.path(),
+            &second_storage_path,
             &second_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -2946,6 +2954,7 @@ mod tests {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "pub fn stable() {}\n").expect("source");
         let storage = Store::new_in_memory().expect("storage");
+        let storage_path = project.path().join("codestory.db");
         storage
             .put_index_publication(&codestory_store::IndexPublicationRecord {
                 generation: 1,
@@ -2959,6 +2968,7 @@ mod tests {
         let package_a = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -2968,6 +2978,7 @@ mod tests {
         let package_b = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -3056,6 +3067,7 @@ mod tests {
         let first = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -3078,6 +3090,7 @@ mod tests {
         let rebound = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -3109,6 +3122,7 @@ mod tests {
         let second = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -3131,7 +3145,8 @@ mod tests {
             &first,
         );
         rejected_manifest.built_at_epoch_ms += 1;
-        let lexical_source = lexical_source_input(project.path()).expect("lexical source");
+        let lexical_source =
+            lexical_source_input(project.path(), &storage_path).expect("lexical source");
         let rejected = promote_retrieval_manifest(
             &mut storage,
             &first,
@@ -3244,6 +3259,7 @@ mod tests {
         let cpu_input = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
+            &storage_path,
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
@@ -3405,8 +3421,8 @@ mod tests {
             &second,
             &new_manifest,
             |snapshot| {
-                let lexical_source =
-                    lexical_source_input(project.path()).expect("fresh lexical source");
+                let lexical_source = lexical_source_input(project.path(), &storage_path)
+                    .expect("fresh lexical source");
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
@@ -3445,8 +3461,8 @@ mod tests {
             &second,
             &new_manifest,
             |snapshot| {
-                let lexical_source =
-                    lexical_source_input(project.path()).expect("fresh lexical source");
+                let lexical_source = lexical_source_input(project.path(), &storage_path)
+                    .expect("fresh lexical source");
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
@@ -3496,8 +3512,8 @@ mod tests {
             &second,
             &new_manifest,
             |snapshot| {
-                let lexical_source =
-                    lexical_source_input(project.path()).expect("fresh lexical source");
+                let lexical_source = lexical_source_input(project.path(), &storage_path)
+                    .expect("fresh lexical source");
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),

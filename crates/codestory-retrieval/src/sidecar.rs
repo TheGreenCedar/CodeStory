@@ -113,6 +113,7 @@ fn status_with_runtime(
             && let Some(manifest) = manifest.as_ref()
             && let Some(reason) = strict_readiness_unavailable_reason_for_runtime(
                 project_root,
+                path,
                 &storage,
                 &project_id,
                 manifest,
@@ -231,6 +232,7 @@ fn enrich_status(
 
 pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
     project_root: &Path,
+    storage_path: &Path,
     storage: &Store,
     runtime: &SidecarRuntimeConfig,
     producer_compatibility_identity: &str,
@@ -246,6 +248,7 @@ pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
     };
     if let Some(reason) = strict_readiness_unavailable_reason_for_runtime(
         project_root,
+        storage_path,
         storage,
         &project_id,
         &manifest,
@@ -259,6 +262,7 @@ pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
 
 fn strict_readiness_unavailable_reason_for_runtime(
     project_root: &Path,
+    storage_path: &Path,
     storage: &Store,
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
@@ -304,6 +308,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
     let current_input = compute_sidecar_input_fingerprint(
         storage,
         project_root,
+        storage_path,
         project_id,
         &embedding_backend,
         embedding_dim,
@@ -333,8 +338,11 @@ fn strict_readiness_unavailable_reason_for_runtime(
         return Ok(None);
     }
 
-    let workspace = WorkspaceManifest::open(project_root.to_path_buf())
-        .context("open workspace manifest for strict retrieval readiness")?;
+    let workspace = WorkspaceManifest::open_with_storage_owned_exclusions(
+        project_root.to_path_buf(),
+        storage_path,
+    )
+    .context("open workspace manifest for strict retrieval readiness")?;
     let plan = workspace
         .build_execution_plan(&RefreshInputs {
             stored_files,
@@ -379,6 +387,75 @@ fn strict_readiness_unavailable_reason_for_runtime(
             .unwrap_or_else(|| "<missing>".into()),
         current_input.projection_count
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn strict_readiness_ignores_storage_owned_search_metadata() {
+        let project = TempDir::new().expect("project");
+        let storage_path = project.path().join("cache").join("custom-core.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("storage parent");
+        let storage = Store::open(&storage_path).expect("store");
+        let runtime = SidecarRuntimeConfig::local();
+        let project_id =
+            sidecar_project_id_for_runtime(project.path(), &runtime).expect("project id");
+        let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(&runtime);
+        let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
+            .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
+        let producer_compatibility_identity = "strict-readiness-test-producer";
+        let input = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            &storage_path,
+            &project_id,
+            &embedding_backend,
+            embedding_dim,
+            producer_compatibility_identity,
+        )
+        .expect("sidecar input");
+        let mut manifest =
+            crate::test_support::retrieval_manifest_fixture(&project_id, &input.hash);
+        manifest.embedding_backend = Some(embedding_backend);
+        manifest.embedding_dim = Some(embedding_dim);
+        manifest.projection_count = Some(input.projection_count);
+        manifest.symbol_doc_count = Some(input.symbol_doc_count);
+        manifest.dense_projection_count = Some(input.dense_projection_count);
+        manifest.semantic_policy_version = input.semantic_policy_version.clone();
+        manifest.graph_artifact_hash = Some(input.graph_artifact_hash.clone());
+        manifest.dense_reason_counts_json = Some(input.dense_reason_counts_json.clone());
+        assert!(manifest_has_current_sidecar_contract(
+            &project_id,
+            &manifest
+        ));
+
+        let generations =
+            codestory_workspace::search_generation_directory_for_storage(&storage_path);
+        std::fs::create_dir_all(generations.join("generation-1")).expect("generation directory");
+        std::fs::write(
+            generations.join("generation-1").join("meta.json"),
+            "{\"generated\":true}\n",
+        )
+        .expect("generation metadata");
+
+        assert_eq!(
+            strict_readiness_unavailable_reason_for_runtime(
+                project.path(),
+                &storage_path,
+                &storage,
+                &project_id,
+                &manifest,
+                &runtime,
+                producer_compatibility_identity,
+            )
+            .expect("strict readiness"),
+            None
+        );
+    }
 }
 
 fn graph_indexed_source_path(path: &Path) -> bool {

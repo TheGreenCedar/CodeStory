@@ -376,6 +376,25 @@ impl WorkspaceManifest {
         }
     }
 
+    /// Open a workspace while excluding the exact CodeStory core/search
+    /// artifacts owned by `storage_path`.
+    pub fn open_with_storage_owned_exclusions(
+        root_path: PathBuf,
+        storage_path: &Path,
+    ) -> Result<Self> {
+        let mut manifest = Self::open(root_path)?;
+        manifest.exclude_discovery_files([
+            storage_path.to_path_buf(),
+            storage_path.with_extension("db-wal"),
+            storage_path.with_extension("db-shm"),
+        ]);
+        manifest.exclude_discovery_directory_roots([
+            legacy_search_directory_for_storage(storage_path),
+            search_generation_directory_for_storage(storage_path),
+        ]);
+        Ok(manifest)
+    }
+
     fn load_workspace_members(root_path: PathBuf, manifest_path: PathBuf) -> Result<Self> {
         let content = fs::read_to_string(&manifest_path)?;
         let workspace: WorkspaceMembersManifest = serde_json::from_str(&content)?;
@@ -612,6 +631,25 @@ impl WorkspaceManifest {
     ) -> Result<WorkspaceRefreshOutcome> {
         WorkspaceDiscovery.build_refresh_outcome_inner(self, inputs, Some(max_current_files))
     }
+}
+
+/// Legacy mutable search directory associated with one core database.
+pub fn legacy_search_directory_for_storage(storage_path: &Path) -> PathBuf {
+    storage_owned_sibling_path(storage_path, "search")
+}
+
+/// Immutable search-generation directory associated with one core database.
+pub fn search_generation_directory_for_storage(storage_path: &Path) -> PathBuf {
+    storage_owned_sibling_path(storage_path, "search-generations")
+}
+
+fn storage_owned_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
+    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory");
+    parent.join(format!("{stem}.{suffix}"))
 }
 
 impl WorkspaceDiscovery {
@@ -2473,16 +2511,17 @@ mod tests {
             )?;
         }
 
-        let mut manifest = WorkspaceManifest::open(root.clone())?;
-        manifest.exclude_discovery_files([
-            root.join("cache/codestory.db"),
-            root.join("cache/codestory.db-wal"),
-            root.join("cache/codestory.db-shm"),
-        ]);
-        manifest.exclude_discovery_directory_roots([
-            root.join("cache/codestory.search"),
-            root.join("cache/codestory.search-generations"),
-        ]);
+        let storage_path = root.join("cache/custom-core.db");
+        let manifest =
+            WorkspaceManifest::open_with_storage_owned_exclusions(root.clone(), &storage_path)?;
+        assert_eq!(
+            legacy_search_directory_for_storage(&storage_path),
+            root.join("cache/custom-core.search")
+        );
+        assert_eq!(
+            search_generation_directory_for_storage(&storage_path),
+            root.join("cache/custom-core.search-generations")
+        );
         let files = manifest.source_files()?;
 
         assert_eq!(files.len(), 256);

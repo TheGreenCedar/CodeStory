@@ -6098,38 +6098,18 @@ fn current_embedding_contract_for_runtime(
 }
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.search"))
+    codestory_workspace::legacy_search_directory_for_storage(storage_path)
 }
 
 fn search_index_generation_root(storage_path: &Path) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.search-generations"))
+    codestory_workspace::search_generation_directory_for_storage(storage_path)
 }
 
 fn runtime_workspace_manifest(
     root: &Path,
     storage_path: &Path,
 ) -> anyhow::Result<WorkspaceManifest> {
-    let mut workspace = WorkspaceManifest::open(root.to_path_buf())?;
-    workspace.exclude_discovery_files([
-        storage_path.to_path_buf(),
-        storage_path.with_extension("db-wal"),
-        storage_path.with_extension("db-shm"),
-    ]);
-    workspace.exclude_discovery_directory_roots([
-        search_index_storage_path(storage_path),
-        search_index_generation_root(storage_path),
-    ]);
-    Ok(workspace)
+    WorkspaceManifest::open_with_storage_owned_exclusions(root.to_path_buf(), storage_path)
 }
 
 fn search_index_path_for_publication(
