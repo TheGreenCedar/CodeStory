@@ -1697,6 +1697,40 @@ mod activation_tests {
     }
 
     #[test]
+    fn serial_retries_keep_one_activation_identity_after_terminal_failure() {
+        let project = tempfile::tempdir().expect("project");
+        let missing = project.path().join("missing");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let service = Runtime::new().activation_service();
+
+        let first = service
+            .activate_project(
+                &missing,
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("missing project must fail activation");
+        assert_eq!(first.code, "project_unavailable");
+        let first_snapshot = service.snapshot().expect("first terminal snapshot");
+
+        let second = service
+            .activate_project(
+                &missing,
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("same missing project must fail activation again");
+        assert_eq!(second.code, "project_unavailable");
+        let second_snapshot = service.snapshot().expect("second terminal snapshot");
+
+        assert_eq!(
+            second_snapshot.operation_id, first_snapshot.operation_id,
+            "serial retries for one project must retain one activation identity"
+        );
+        assert_eq!(second_snapshot.attempt, first_snapshot.attempt + 1);
+    }
+
+    #[test]
     fn activation_error_is_unavailable_instead_of_ready() {
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
