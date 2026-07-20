@@ -5032,6 +5032,10 @@ fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
         }
         FileCoverageReason::SourceChanged => "source changed while its projection was collected",
         FileCoverageReason::Unreadable => "source bytes could not be read and verified",
+        FileCoverageReason::Malformed => {
+            "verified UTF-8 source is malformed for its structural format"
+        }
+        FileCoverageReason::Binary => "source is binary or is not valid UTF-8",
         FileCoverageReason::Oversized => "source exceeds the configured indexing size limit",
         FileCoverageReason::DiscoveryIncomplete => {
             "workspace discovery could not prove a complete source inventory"
@@ -5267,6 +5271,8 @@ fn source_coverage_failure_code(coverage_gaps: &[FileCoverageDiagnosticDto]) -> 
         FileCoverageReason::ParserPartial => "source_verification_failed",
         FileCoverageReason::SourceChanged => "source_changed",
         FileCoverageReason::Unreadable => "source_unreadable",
+        FileCoverageReason::Malformed => "source_malformed",
+        FileCoverageReason::Binary => "source_binary",
         FileCoverageReason::Oversized => "source_oversized",
         FileCoverageReason::DiscoveryIncomplete => "source_discovery_incomplete",
         FileCoverageReason::CollectorFailure => "source_collector_failure",
@@ -5347,6 +5353,11 @@ fn indexable_source_path(path: &Path) -> bool {
 }
 
 fn looks_like_openapi_source_path(path: &Path) -> bool {
+    if codestory_indexer::structural::is_structural_format_path(path)
+        && !codestory_indexer::structural::is_structural_candidate_path(path)
+    {
+        return false;
+    }
     if !codestory_indexer::is_openapi_candidate_path(path) {
         return false;
     }
@@ -18088,6 +18099,12 @@ mod tests {
             "public/index.html",
             "public/site.css",
             "db/schema.sql",
+            "docs/guide.mdx",
+            "config/service.yaml",
+            "config/service.toml",
+            "config/service.json",
+            "scripts/setup.zsh",
+            "scripts/build.ps1",
         ] {
             assert!(
                 indexable_source_path(Path::new(relative_path)),
@@ -18102,6 +18119,18 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+        for excluded in [
+            "vendor/config.json",
+            "generated/docs.md",
+            "config/package-lock.json",
+            "secrets/deploy.ps1",
+            "web/app.min.json",
+        ] {
+            assert!(
+                !indexable_source_path(Path::new(excluded)),
+                "runtime freshness should honor structural exclusion: {excluded}"
+            );
+        }
     }
 
     fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
@@ -21776,7 +21805,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn build_search_hit_marks_structural_collectors_as_structural_text() {
+    fn build_search_hit_marks_generic_structural_collectors_as_non_sufficient() {
         let mut storage = Storage::new_in_memory().expect("storage");
         let source_hash = "a".repeat(64);
         let unit = codestory_store::StructuralTextUnit {
@@ -21786,11 +21815,11 @@ fn build_llm_symbol_doc_text() -> String {
             content_hash: "c".repeat(64),
             source_content_hash: source_hash.clone(),
             descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
-            producer: "structural_cargo_manifest_collector".to_string(),
+            producer: "structural_markdown_collector".to_string(),
             evidence_tier: "structural_text".to_string(),
             resolution: "source_range_only".to_string(),
-            language: "cargo_manifest".to_string(),
-            kind: NodeKind::PACKAGE,
+            language: "markdown".to_string(),
+            kind: NodeKind::MODULE,
             start_line: 2,
             start_col: 1,
             end_line: 2,
@@ -21802,8 +21831,8 @@ fn build_llm_symbol_doc_text() -> String {
             .flush_projection_batch(codestory_store::ProjectionBatch {
                 files: &[codestory_store::FileInfo {
                     id: 40,
-                    path: PathBuf::from("crates/demo/Cargo.toml"),
-                    language: "cargo_manifest".to_string(),
+                    path: PathBuf::from("docs/demo.md"),
+                    language: "markdown".to_string(),
                     modification_time: 1,
                     indexed: true,
                     complete: true,
@@ -21818,12 +21847,12 @@ fn build_llm_symbol_doc_text() -> String {
                     Node {
                         id: CoreNodeId(40),
                         kind: NodeKind::FILE,
-                        serialized_name: "crates/demo/Cargo.toml".to_string(),
+                        serialized_name: "docs/demo.md".to_string(),
                         ..Default::default()
                     },
                     Node {
                         id: CoreNodeId(41),
-                        kind: NodeKind::PACKAGE,
+                        kind: NodeKind::MODULE,
                         serialized_name: "demo".to_string(),
                         file_node_id: Some(CoreNodeId(40)),
                         start_line: Some(2),
@@ -21838,8 +21867,8 @@ fn build_llm_symbol_doc_text() -> String {
                     file_id: 40,
                     source_content_hash: source_hash,
                     descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
-                    producer: "structural_cargo_manifest_collector".to_string(),
-                    language: "cargo_manifest".to_string(),
+                    producer: "structural_markdown_collector".to_string(),
+                    language: "markdown".to_string(),
                     file_role: codestory_store::FileRole::Source,
                     unit_count: 1,
                     unit_digest: codestory_store::structural_text_unit_digest(
@@ -21865,7 +21894,7 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert_eq!(
             hit.evidence_producer.as_deref(),
-            Some("structural_cargo_manifest_collector")
+            Some("structural_markdown_collector")
         );
         assert_eq!(
             hit.resolution_status,
@@ -26111,10 +26140,10 @@ fn build_llm_symbol_doc_text() -> String {
     #[test]
     fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
         let workspace = tempdir().expect("workspace dir");
-        let css_path = workspace.path().join("styles.css");
-        let sql_path = workspace.path().join("schema.sql");
-        fs::write(&css_path, ".card { color: red; }\n").expect("write css");
-        fs::write(&sql_path, "CREATE TABLE users (id INTEGER);\n").expect("write sql");
+        let markdown_path = workspace.path().join("guide.md");
+        let json_path = workspace.path().join("config.json");
+        fs::write(&markdown_path, "# Stable\n").expect("write markdown");
+        fs::write(&json_path, "{\"service\":{\"name\":\"api\"}}\n").expect("write JSON");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
         controller
@@ -26154,7 +26183,7 @@ fn build_llm_symbol_doc_text() -> String {
         drop(first_store);
         assert_eq!(first_cache.len(), 2);
 
-        fs::write(&css_path, ".card { color: blue; }\n").expect("change css");
+        fs::write(&markdown_path, "# Replacement\n").expect("change markdown");
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish second structural generation");
@@ -26184,20 +26213,17 @@ fn build_llm_symbol_doc_text() -> String {
                 .collect::<HashMap<String, String>>()
         };
         drop(second_store);
-        assert_ne!(
-            first_cache.get("styles.css"),
-            second_cache.get("styles.css")
-        );
+        assert_ne!(first_cache.get("guide.md"), second_cache.get("guide.md"));
         assert_eq!(
-            first_cache.get("schema.sql"),
-            second_cache.get("schema.sql")
+            first_cache.get("config.json"),
+            second_cache.get("config.json")
         );
 
-        fs::write(&sql_path, "CREATE TABLE accounts (id INTEGER);\n").expect("change sql");
+        fs::write(&json_path, "{\"replacement\":{\"name\":\"api\"}}\n").expect("change JSON");
         std::fs::File::options()
             .write(true)
-            .open(&sql_path)
-            .expect("open changed sql")
+            .open(&json_path)
+            .expect("open changed JSON")
             .set_times(
                 std::fs::FileTimes::new()
                     .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
@@ -26223,20 +26249,26 @@ fn build_llm_symbol_doc_text() -> String {
             .map(|node| node.serialized_name)
             .collect::<HashSet<_>>();
         assert!(
-            third_names.contains("public.accounts"),
+            third_names.contains("replacement"),
             "incremental structural nodes: {third_names:?}"
         );
-        assert!(!third_names.contains("public.users"));
+        assert!(!third_names.contains("service"));
         drop(third_store);
         let structural_before_failure = structural_live_identity(&storage_path);
         assert!(structural_before_failure.manifest.unit_count > 0);
         assert_eq!(structural_before_failure.cache_rows.len(), 2);
 
-        fs::write(&css_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+        fs::write(&markdown_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("invalid structural input must fail closed");
-        assert_eq!(error.code, "source_collector_failure");
+        assert_eq!(error.code, "source_binary");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Binary)
+        }));
         let preserved = Store::database_index_publication(&storage_path)
             .expect("read preserved publication")
             .expect("preserved publication");
@@ -26250,6 +26282,55 @@ fn build_llm_symbol_doc_text() -> String {
             structural_before_failure,
             "collector failure changed the prior structural manifest or cache identity"
         );
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        fs::write(&markdown_path, "# Replacement\n").expect("restore markdown");
+        fs::write(
+            workspace.path().join("malformed.json"),
+            "{\"missing_value\":",
+        )
+        .expect("write malformed JSON");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("malformed structural input must fail closed");
+        assert_eq!(error.code, "source_malformed");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Malformed)
+        }));
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "malformed input changed the prior structural manifest or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        fs::remove_file(workspace.path().join("malformed.json"))
+            .expect("remove malformed JSON fixture");
+        let unreadable_path = markdown_path.clone();
+        arm_source_policy_after_plan_hook(move || {
+            fs::remove_file(&unreadable_path).expect("remove planned markdown source");
+            fs::create_dir(&unreadable_path)
+                .expect("replace planned markdown source with unreadable directory");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("unreadable structural replacement must fail closed");
+        assert_eq!(error.code, "source_unreadable");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Unreadable)
+        }));
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "unreadable replacement changed the prior core publication, structural manifest, or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]

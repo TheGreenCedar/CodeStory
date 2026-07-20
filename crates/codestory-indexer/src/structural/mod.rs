@@ -11,6 +11,7 @@ mod cargo_manifest;
 mod common;
 pub(crate) mod css;
 mod docker_compose;
+mod generic;
 mod github_actions;
 mod html;
 mod sql;
@@ -34,12 +35,32 @@ use codestory_contracts::language_support::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+pub const MAX_STRUCTURAL_SOURCE_BYTES: u64 = 1024 * 1024;
+pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize = 2048;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StructuralCollectionError {
+    #[error("structural source is binary or not valid UTF-8")]
+    Binary,
+    #[error("{0}")]
+    Malformed(String),
+    #[error(
+        "structural source exceeds the {MAX_STRUCTURAL_SOURCE_BYTES}-byte collector limit: {0} bytes"
+    )]
+    SourceByteLimit(u64),
+    #[error(
+        "structural source exceeds the {MAX_STRUCTURAL_UNITS_PER_FILE}-unit collector limit: {0} units"
+    )]
+    UnitLimit(usize),
+}
+
 /// Return whether `path` is routed to a structural collector.
-///
-/// YAML/TOML admission is path-scoped for known workflow, compose, and Cargo
-/// manifest conventions. Generic YAML and TOML files are intentionally not
-/// admitted here.
 pub fn is_structural_candidate_path(path: &Path) -> bool {
+    is_structural_format_path(path) && structural_path_exclusion(path).is_none()
+}
+
+/// Return whether `path` has a dedicated or generic structural format route.
+pub fn is_structural_format_path(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
     if is_github_actions_workflow_path(path_text.as_ref())
         || is_docker_compose_file_path(path_text.as_ref())
@@ -49,17 +70,129 @@ pub fn is_structural_candidate_path(path: &Path) -> bool {
     }
     matches!(
         structural_extension(path).as_deref(),
-        Some("html" | "htm" | "css" | "sql")
+        Some(
+            "html"
+                | "htm"
+                | "css"
+                | "sql"
+                | "md"
+                | "markdown"
+                | "mdx"
+                | "yml"
+                | "yaml"
+                | "toml"
+                | "json"
+                | "zsh"
+                | "ksh"
+                | "command"
+                | "ps1"
+                | "psm1"
+        )
     )
+}
+
+/// Return the centralized path-only exclusion reason applied before reading.
+pub fn structural_path_exclusion(path: &Path) -> Option<&'static str> {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let components = normalized
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let file_name = components.last().copied().unwrap_or_default();
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            ".git"
+                | "node_modules"
+                | "vendor"
+                | "vendors"
+                | "third_party"
+                | "third-party"
+                | "generated"
+                | "dist"
+                | "build"
+                | "target"
+                | "coverage"
+                | ".next"
+                | ".cache"
+        )
+    }) {
+        return Some("generated_or_vendor");
+    }
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            "secret" | "secrets" | ".secrets" | "credentials"
+        )
+    }) || file_name.starts_with(".env")
+        || matches!(
+            file_name,
+            "credentials.json"
+                | "secrets.json"
+                | "secrets.yaml"
+                | "secrets.yml"
+                | "id_rsa"
+                | "id_ed25519"
+        )
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+    {
+        return Some("secret_bearing");
+    }
+    if matches!(
+        file_name,
+        "cargo.lock"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "bun.lockb"
+            | "poetry.lock"
+            | "pipfile.lock"
+            | "composer.lock"
+            | "gemfile.lock"
+    ) || file_name.ends_with(".lock")
+    {
+        return Some("lockfile");
+    }
+    if file_name.contains(".min.")
+        || file_name.ends_with(".min")
+        || file_name.contains(".generated.")
+        || file_name.contains("_generated.")
+        || file_name.ends_with(".map")
+    {
+        return Some("generated_or_high_noise");
+    }
+    None
 }
 
 /// Read and structurally index a file from disk.
 pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
     let bytes = std::fs::read(path)?;
-    let source = String::from_utf8(bytes.clone())?;
+    if bytes.len() as u64 > MAX_STRUCTURAL_SOURCE_BYTES {
+        return Err(StructuralCollectionError::SourceByteLimit(bytes.len() as u64).into());
+    }
+    let source = decode_structural_source(bytes.clone())?;
     let source_content_hash = format!("{:x}", Sha256::digest(&bytes));
     let storage = index_structural_source(path, &source)?;
     finalize_structural_storage(path, &source, &source_content_hash, storage)
+}
+
+pub(crate) fn decode_structural_source(
+    bytes: Vec<u8>,
+) -> std::result::Result<String, StructuralCollectionError> {
+    if bytes.iter().any(|byte| *byte == 0)
+        || bytes
+            .iter()
+            .any(|byte| *byte < 0x09 || (*byte > 0x0d && *byte < 0x20))
+    {
+        return Err(StructuralCollectionError::Binary);
+    }
+    String::from_utf8(bytes).map_err(|_| StructuralCollectionError::Binary)
 }
 
 pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {
@@ -77,6 +210,12 @@ pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {
         Some("html" | "htm") => Some("structural_html_collector"),
         Some("css") => Some("structural_css_collector"),
         Some("sql") => Some("structural_sql_collector"),
+        Some("md" | "markdown" | "mdx") => Some("structural_markdown_collector"),
+        Some("yml" | "yaml") => Some("structural_yaml_collector"),
+        Some("toml") => Some("structural_toml_collector"),
+        Some("json") => Some("structural_json_collector"),
+        Some("zsh" | "ksh" | "command") => Some("structural_shell_collector"),
+        Some("ps1" | "psm1") => Some("structural_powershell_collector"),
         _ => None,
     }
 }
@@ -265,7 +404,15 @@ pub fn collect_embedded_style_css(
 ///
 /// The returned storage is ready to merge into a projection batch and includes
 /// callable projection state derived from the structural edges.
-pub fn index_structural_source(path: &Path, source: &str) -> Result<IntermediateStorage> {
+pub fn index_structural_source(
+    path: &Path,
+    source: &str,
+) -> std::result::Result<IntermediateStorage, StructuralCollectionError> {
+    if source.len() as u64 > MAX_STRUCTURAL_SOURCE_BYTES {
+        return Err(StructuralCollectionError::SourceByteLimit(
+            source.len() as u64
+        ));
+    }
     let mut storage = IntermediateStorage::default();
     let (file_node, _file_name, file_id) = crate::file_node_from_source(path, source);
     storage.files.push(codestory_store::FileInfo {
@@ -299,8 +446,27 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
             }
             Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1, 0),
             Some("sql") => sql::collect_sql_entities(path, source, file_id, &mut storage),
+            Some("md" | "markdown" | "mdx") => {
+                generic::collect_markdown_entities(path, source, file_id, &mut storage)?
+            }
+            Some("yml" | "yaml") => {
+                generic::collect_yaml_entities(path, source, file_id, &mut storage)?
+            }
+            Some("toml") => generic::collect_toml_entities(path, source, file_id, &mut storage)?,
+            Some("json") => generic::collect_json_entities(path, source, file_id, &mut storage)?,
+            Some("zsh" | "ksh" | "command") => {
+                generic::collect_shell_entities(path, source, file_id, &mut storage)?
+            }
+            Some("ps1" | "psm1") => {
+                generic::collect_powershell_entities(path, source, file_id, &mut storage)?
+            }
             _ => {}
         }
+    }
+    if storage.structural_unit_node_ids.len() > MAX_STRUCTURAL_UNITS_PER_FILE {
+        return Err(StructuralCollectionError::UnitLimit(
+            storage.structural_unit_node_ids.len(),
+        ));
     }
 
     storage.callable_projection_states = crate::build_callable_projection_states(
@@ -400,6 +566,42 @@ mod tests {
                     "app.touch_users",
                 ],
             ),
+            (
+                "docs/guide.mdx",
+                "# Guide\n\n[api]: ./api.md\n\n```rust\nfn main() {}\n```\n",
+                "structural_markdown_collector",
+                &["Guide", "api", "rust"],
+            ),
+            (
+                "config/service.yaml",
+                "service:\n  name: demo\n  ports:\n    - 8080\n",
+                "structural_yaml_collector",
+                &["service", "name", "ports"],
+            ),
+            (
+                "config/service.toml",
+                "[server]\nhost = \"127.0.0.1\"\n",
+                "structural_toml_collector",
+                &["server", "host"],
+            ),
+            (
+                "config/service.json",
+                "{\"app\":{\"enabled\":true},\"count\":1}\n",
+                "structural_json_collector",
+                &["app", "enabled", "count"],
+            ),
+            (
+                "scripts/setup.zsh",
+                "autoload compinit\nfunction deploy { echo ok; }\nsource ./env.zsh\n",
+                "structural_shell_collector",
+                &["compinit", "deploy", "./env.zsh"],
+            ),
+            (
+                "scripts/build.ps1",
+                "function Invoke-Build { }\nImport-Module Pester\n. ./common.ps1\n",
+                "structural_powershell_collector",
+                &["Invoke-Build", "Pester", "./common.ps1"],
+            ),
         ];
 
         for &(relative, source, producer, expected_anchors) in fixtures {
@@ -463,6 +665,155 @@ mod tests {
             expected_anchors.sort();
             assert_eq!(actual_anchors, expected_anchors, "{relative}");
         }
+    }
+
+    #[test]
+    fn generic_structural_routing_keeps_specialized_and_parser_backed_precedence() {
+        assert_eq!(
+            structural_producer(Path::new(".github/workflows/ci.yaml")),
+            Some("structural_github_actions_workflow_collector")
+        );
+        assert_eq!(
+            structural_producer(Path::new("deploy/docker-compose.yml")),
+            Some("structural_docker_compose_collector")
+        );
+        assert_eq!(
+            structural_producer(Path::new("crates/app/Cargo.toml")),
+            Some("structural_cargo_manifest_collector")
+        );
+        assert_eq!(
+            structural_producer(Path::new("config/settings.yaml")),
+            Some("structural_yaml_collector")
+        );
+        assert_eq!(
+            structural_producer(Path::new("config/settings.toml")),
+            Some("structural_toml_collector")
+        );
+        assert!(!is_structural_candidate_path(Path::new("scripts/run.sh")));
+        assert!(!is_structural_candidate_path(Path::new("scripts/run.bash")));
+        assert!(is_structural_candidate_path(Path::new("scripts/run.zsh")));
+        assert!(is_structural_candidate_path(Path::new("scripts/run.ps1")));
+        assert_eq!(
+            codestory_contracts::language_support::parser_backed_language_name_for_path(Some(
+                "scripts/run.sh"
+            )),
+            Some("bash")
+        );
+    }
+
+    #[test]
+    fn structural_path_policy_rejects_noise_before_admission_on_both_path_spellings() {
+        for path in [
+            "vendor/config.json",
+            r"third_party\docs\guide.md",
+            "generated/settings.yaml",
+            r"target\release\metadata.json",
+            "config/package-lock.json",
+            r"config\pnpm-lock.yaml",
+            "config/.env.production.json",
+            r"secrets\deploy.ps1",
+            "web/app.min.json",
+            r"docs\guide.generated.md",
+        ] {
+            assert!(
+                is_structural_format_path(Path::new(path)),
+                "fixture must have a structural extension: {path}"
+            );
+            assert!(
+                structural_path_exclusion(Path::new(path)).is_some(),
+                "missing policy exclusion: {path}"
+            );
+            assert!(
+                !is_structural_candidate_path(Path::new(path)),
+                "excluded path was admitted: {path}"
+            );
+        }
+        assert!(is_structural_candidate_path(Path::new(
+            "config/package.json"
+        )));
+        assert!(is_structural_candidate_path(Path::new(
+            r"docs\architecture\guide.md"
+        )));
+    }
+
+    #[test]
+    fn generic_collectors_reject_malformed_binary_and_over_bound_input_without_units() {
+        for (path, source) in [
+            ("config.json", "{\"unterminated\":"),
+            ("config.toml", "[table\nkey = 1"),
+            ("config.yaml", "items: [one, two\n"),
+        ] {
+            assert!(
+                matches!(
+                    index_structural_source(Path::new(path), source),
+                    Err(StructuralCollectionError::Malformed(_))
+                ),
+                "{path} should reject malformed syntax"
+            );
+        }
+        assert!(matches!(
+            decode_structural_source(vec![0xff, 0xfe]),
+            Err(StructuralCollectionError::Binary)
+        ));
+        assert!(matches!(
+            decode_structural_source(b"key\0value".to_vec()),
+            Err(StructuralCollectionError::Binary)
+        ));
+
+        let oversized = "x".repeat(MAX_STRUCTURAL_SOURCE_BYTES as usize + 1);
+        assert!(matches!(
+            index_structural_source(Path::new("guide.md"), &oversized),
+            Err(StructuralCollectionError::SourceByteLimit(_))
+        ));
+
+        let mut keys = String::from("{");
+        for index in 0..=MAX_STRUCTURAL_UNITS_PER_FILE {
+            if index > 0 {
+                keys.push(',');
+            }
+            keys.push_str(&format!("\"key{index}\":{index}"));
+        }
+        keys.push('}');
+        assert!(matches!(
+            index_structural_source(Path::new("many.json"), &keys),
+            Err(StructuralCollectionError::UnitLimit(_))
+        ));
+    }
+
+    #[test]
+    fn moved_generic_structural_source_keeps_content_identity_and_changes_placement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = "# Guide\n\n[api]: ./api.md\n";
+        let first_path = dir.path().join("first/guide.md");
+        let second_path = dir.path().join("second/guide.md");
+        for path in [&first_path, &second_path] {
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture parent");
+            std::fs::write(path, source).expect("write markdown fixture");
+        }
+        let first = index_structural_file(&first_path).expect("index first markdown");
+        let second = index_structural_file(&second_path).expect("index second markdown");
+        assert_eq!(
+            first
+                .structural_text_units
+                .iter()
+                .map(|unit| &unit.content_hash)
+                .collect::<Vec<_>>(),
+            second
+                .structural_text_units
+                .iter()
+                .map(|unit| &unit.content_hash)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first
+                .structural_text_units
+                .iter()
+                .zip(&second.structural_text_units)
+                .all(|(left, right)| {
+                    left.node_id != right.node_id && left.placement_id != right.placement_id
+                })
+        );
     }
 
     #[test]
@@ -536,16 +887,15 @@ mod tests {
     #[test]
     fn duplicate_exact_bytes_at_distinct_spans_have_distinct_descriptor_and_placement_identity() {
         let source = "services:\n  web:\n    ports:\n      - shared:/data\n      - shared:/data\n";
-        let storage = index_structural_source(Path::new("docker-compose.yml"), source)
-            .and_then(|storage| {
-                finalize_structural_storage(
-                    Path::new("docker-compose.yml"),
-                    source,
-                    &format!("{:x}", Sha256::digest(source.as_bytes())),
-                    storage,
-                )
-            })
-            .expect("finalize duplicate structural anchors");
+        let collected = index_structural_source(Path::new("docker-compose.yml"), source)
+            .expect("collect duplicate structural anchors");
+        let storage = finalize_structural_storage(
+            Path::new("docker-compose.yml"),
+            source,
+            &format!("{:x}", Sha256::digest(source.as_bytes())),
+            collected,
+        )
+        .expect("finalize duplicate structural anchors");
         let duplicates = storage
             .structural_text_units
             .iter()
@@ -623,7 +973,7 @@ jobs:
                 .iter()
                 .any(|edge| edge.kind == EdgeKind::MEMBER)
         );
-        assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
+        assert!(is_structural_candidate_path(Path::new("openapi.yaml")));
     }
 
     #[test]
@@ -692,7 +1042,7 @@ services:
     }
 
     #[test]
-    fn docker_compose_admission_is_path_scoped_not_generic_yaml() {
+    fn docker_compose_admission_precedes_generic_yaml() {
         assert!(is_structural_candidate_path(Path::new(
             "docker/retrieval-compose.yml"
         )));
@@ -706,10 +1056,12 @@ services:
         assert!(is_structural_candidate_path(Path::new(
             ".github/workflows/ci.yml"
         )));
-        assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
-        assert!(!is_structural_candidate_path(Path::new(
-            "docs/workflow.yml"
-        )));
+        assert!(is_structural_candidate_path(Path::new("openapi.yaml")));
+        assert!(is_structural_candidate_path(Path::new("docs/workflow.yml")));
+        assert_eq!(
+            structural_producer(Path::new("docs/workflow.yml")),
+            Some("structural_yaml_collector")
+        );
 
         let storage = index_structural_source(Path::new("compose.yml"), "openapi: 3.1.0\n")
             .expect("index unsupported compose-shaped yaml");
@@ -743,16 +1095,20 @@ services:
     }
 
     #[test]
-    fn cargo_manifest_admission_is_basename_scoped_not_generic_toml() {
+    fn cargo_manifest_admission_precedes_generic_toml() {
         assert!(is_structural_candidate_path(Path::new("Cargo.toml")));
         assert!(is_structural_candidate_path(Path::new(
             "crates/codestory-cli/Cargo.toml"
         )));
-        assert!(!is_structural_candidate_path(Path::new("config.toml")));
-        assert!(!is_structural_candidate_path(Path::new(
+        assert!(is_structural_candidate_path(Path::new("config.toml")));
+        assert!(is_structural_candidate_path(Path::new(
             ".cargo/config.toml"
         )));
         assert!(!is_structural_candidate_path(Path::new("Cargo.lock")));
+        assert_eq!(
+            structural_producer(Path::new("config.toml")),
+            Some("structural_toml_collector")
+        );
     }
 
     #[test]
@@ -1028,16 +1384,15 @@ jobs:
     #[test]
     fn finalized_html_keeps_delegated_parser_descendants_out_of_structural_units() {
         let source = "<main id=\"app\"><script type=\"module\">function boot() { return 1; }</script></main>";
-        let storage = index_structural_source(Path::new("index.html"), source)
-            .and_then(|storage| {
-                finalize_structural_storage(
-                    Path::new("index.html"),
-                    source,
-                    &format!("{:x}", Sha256::digest(source.as_bytes())),
-                    storage,
-                )
-            })
-            .expect("finalize HTML structural units");
+        let collected = index_structural_source(Path::new("index.html"), source)
+            .expect("collect HTML structural units");
+        let storage = finalize_structural_storage(
+            Path::new("index.html"),
+            source,
+            &format!("{:x}", Sha256::digest(source.as_bytes())),
+            collected,
+        )
+        .expect("finalize HTML structural units");
         let unit_ids = storage
             .structural_text_units
             .iter()
@@ -1074,15 +1429,13 @@ jobs:
     #[test]
     fn zero_unit_structural_file_publishes_a_complete_projection() -> anyhow::Result<()> {
         let source = "/* deliberately contains no CSS anchors */\n";
-        let projected =
-            index_structural_source(Path::new("empty.css"), source).and_then(|storage| {
-                finalize_structural_storage(
-                    Path::new("empty.css"),
-                    source,
-                    &format!("{:x}", Sha256::digest(source.as_bytes())),
-                    storage,
-                )
-            })?;
+        let collected = index_structural_source(Path::new("empty.css"), source)?;
+        let projected = finalize_structural_storage(
+            Path::new("empty.css"),
+            source,
+            &format!("{:x}", Sha256::digest(source.as_bytes())),
+            collected,
+        )?;
         assert!(projected.structural_text_units.is_empty());
         assert_eq!(projected.structural_text_projections.len(), 1);
         assert_eq!(projected.structural_text_projections[0].unit_count, 0);

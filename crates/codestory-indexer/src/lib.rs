@@ -2442,6 +2442,11 @@ impl WorkspaceIndexer {
         stats: &mut IncrementalIndexingStats,
     ) -> std::result::Result<PreparedIndexWork, IntermediateStorage> {
         let full_path = Self::normalize_index_path(root, path);
+        if structural::is_structural_format_path(&full_path)
+            && !structural::is_structural_candidate_path(&full_path)
+        {
+            return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
+        }
         let compilation_info = self
             .compilation_db
             .as_ref()
@@ -2785,6 +2790,45 @@ impl WorkspaceIndexer {
         let language = structural::structural_language_name(&full_path);
         let producer = structural::structural_producer(&full_path)
             .expect("admitted structural paths have one producer");
+        let structural_size = std::fs::metadata(&full_path)
+            .map_err(|error| {
+                incomplete_file_storage(
+                    &full_path,
+                    None,
+                    language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to inspect {:?}: {}", path, error),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: true,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
+                    },
+                )
+            })?
+            .len();
+        if structural_size > structural::MAX_STRUCTURAL_SOURCE_BYTES {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Skipped structural source {:?}: {} bytes exceeds the {} byte structural collector limit",
+                        path,
+                        structural_size,
+                        structural::MAX_STRUCTURAL_SOURCE_BYTES
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let bytes = std::fs::read(&full_path).map_err(|error| {
             incomplete_file_storage(
                 &full_path,
@@ -2802,7 +2846,7 @@ impl WorkspaceIndexer {
             )
         })?;
         let content_hash = source_content_hash(&bytes);
-        let source = String::from_utf8(bytes).map_err(|error| {
+        let source = structural::decode_structural_source(bytes).map_err(|error| {
             incomplete_file_storage(
                 &full_path,
                 None,
@@ -2814,7 +2858,7 @@ impl WorkspaceIndexer {
                     column: None,
                     is_fatal: false,
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
-                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                    coverage_reason: Some(FileCoverageReason::Binary),
                 },
             )
         })?;
@@ -2973,14 +3017,19 @@ impl WorkspaceIndexer {
         &self,
         full_path: &Path,
     ) -> std::result::Result<Option<IntermediateStorage>, IntermediateStorage> {
-        if structural::is_structural_candidate_path(full_path) {
+        let path_text = full_path.to_string_lossy();
+        if codestory_contracts::language_support::is_github_actions_workflow_path(
+            path_text.as_ref(),
+        ) || codestory_contracts::language_support::is_docker_compose_file_path(
+            path_text.as_ref(),
+        ) {
             return Ok(None);
         }
         if !is_openapi_candidate_path(full_path) {
             return Ok(None);
         }
-        let source = match std::fs::read_to_string(full_path) {
-            Ok(source) => source,
+        let bytes = match std::fs::read(full_path) {
+            Ok(bytes) => bytes,
             Err(error) => {
                 let local_storage = incomplete_file_storage(
                     full_path,
@@ -2997,6 +3046,26 @@ impl WorkspaceIndexer {
                     },
                 );
                 return Err(local_storage);
+            }
+        };
+        let source = match structural::decode_structural_source(bytes) {
+            Ok(source) => source,
+            Err(_) if structural::is_structural_candidate_path(full_path) => return Ok(None),
+            Err(error) => {
+                return Err(incomplete_file_storage(
+                    full_path,
+                    None,
+                    "openapi",
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to decode {:?}: {}", full_path, error),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Binary),
+                    },
+                ));
             }
         };
         index_openapi_schema_file(full_path, &source).map_err(|error| {
@@ -3114,8 +3183,44 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedStructuralInput,
     ) -> PreparedIndexJobResult {
         let language = structural::structural_language_name(&prepared_input.full_path);
-        let collected =
-            structural::index_structural_source(&prepared_input.full_path, &prepared_input.source);
+        let collected = match structural::index_structural_source(
+            &prepared_input.full_path,
+            &prepared_input.source,
+        ) {
+            Ok(collected) => collected,
+            Err(error) => {
+                let reason = match error {
+                    structural::StructuralCollectionError::Malformed(_) => {
+                        FileCoverageReason::Malformed
+                    }
+                    structural::StructuralCollectionError::Binary => FileCoverageReason::Binary,
+                    structural::StructuralCollectionError::SourceByteLimit(_)
+                    | structural::StructuralCollectionError::UnitLimit(_) => {
+                        FileCoverageReason::Oversized
+                    }
+                };
+                return PreparedIndexJobResult {
+                    local_storage: incomplete_file_storage(
+                        &prepared_input.full_path,
+                        Some(&prepared_input.source),
+                        language,
+                        codestory_contracts::graph::ErrorInfo {
+                            message: format!(
+                                "Failed to index structural file {:?}: {}",
+                                prepared_input.full_path, error
+                            ),
+                            file_id: None,
+                            line: None,
+                            column: None,
+                            is_fatal: false,
+                            index_step: codestory_contracts::graph::IndexStep::Indexing,
+                            coverage_reason: Some(reason),
+                        },
+                    ),
+                    cache_write: None,
+                };
+            }
+        };
         let modification_time =
             match verify_source_snapshot(&prepared_input.full_path, &prepared_input.content_hash) {
                 Ok(modification_time) => modification_time,
@@ -3130,14 +3235,12 @@ impl WorkspaceIndexer {
                     };
                 }
             };
-        let mut local_storage = match collected.and_then(|storage| {
-            structural::finalize_structural_storage(
-                &prepared_input.full_path,
-                &prepared_input.source,
-                &prepared_input.content_hash,
-                storage,
-            )
-        }) {
+        let mut local_storage = match structural::finalize_structural_storage(
+            &prepared_input.full_path,
+            &prepared_input.source,
+            &prepared_input.content_hash,
+            collected,
+        ) {
             Ok(storage) => storage,
             Err(error) => {
                 return PreparedIndexJobResult {
@@ -22112,6 +22215,224 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
+    fn excluded_structural_paths_return_before_metadata_or_content_reads() -> Result<()> {
+        let dir = tempdir()?;
+        std::fs::create_dir_all(dir.path().join("vendor/unreadable.json"))?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let mut storage = Storage::new_in_memory()?;
+        let symbol_table = Arc::new(SymbolTable::new());
+        let mut stats = IncrementalIndexingStats::default();
+
+        for relative in ["vendor/unreadable.json", "secrets/missing.json"] {
+            let work = {
+                let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+                indexer.prepare_index_work(
+                    &mut cache_access,
+                    &PathBuf::from(relative),
+                    dir.path(),
+                    None,
+                    &symbol_table,
+                    &mut stats,
+                )
+            };
+            match work {
+                Ok(PreparedIndexWork::Immediate(local)) => {
+                    assert!(local.files.is_empty(), "{relative}");
+                    assert!(local.nodes.is_empty(), "{relative}");
+                    assert!(local.structural_text_units.is_empty(), "{relative}");
+                    assert!(local.structural_text_cache_writes.is_empty(), "{relative}");
+                    assert!(local.errors.is_empty(), "{relative}");
+                }
+                Ok(_) => panic!("excluded path was scheduled: {relative}"),
+                Err(_) => panic!("excluded path reached metadata or content reads: {relative}"),
+            }
+        }
+
+        assert!(storage.get_nodes()?.is_empty());
+        assert!(storage.get_errors(None)?.is_empty());
+        assert!(
+            storage
+                .get_structural_text_projection_file_ids()?
+                .is_empty()
+        );
+        let cache_rows: i64 = storage.get_connection().query_row(
+            "SELECT COUNT(*) FROM structural_text_artifact_cache",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cache_rows, 0);
+        assert_eq!(stats.artifact_cache_hits, 0);
+        assert_eq!(stats.artifact_cache_misses, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result<()> {
+        let dir = tempdir()?;
+        let fixtures = [
+            (
+                ".github/workflows/ci.yml",
+                "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+                "structural_github_actions_workflow_collector",
+            ),
+            (
+                "docker-compose.yaml",
+                "services:\n  web:\n    image: nginx\n",
+                "structural_docker_compose_collector",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                "[package]\nname = \"app\"\n",
+                "structural_cargo_manifest_collector",
+            ),
+        ];
+        for (relative, source, _expected_producer) in fixtures {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))?;
+            std::fs::write(&path, source)?;
+        }
+        for (relative, source) in [
+            (
+                "openapi.json",
+                "{\"openapi\":\"3.1.0\",\"paths\":{\"/health\":{\"get\":{}}}}",
+            ),
+            (
+                "openapi.yaml",
+                "openapi: 3.1.0\npaths:\n  /health:\n    get:\n      responses: {}\n",
+            ),
+        ] {
+            std::fs::write(dir.path().join(relative), source)?;
+        }
+        std::fs::create_dir_all(dir.path().join("scripts"))?;
+        std::fs::write(dir.path().join("scripts/run.sh"), "run() { echo ok; }\n")?;
+
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let mut storage = Storage::new_in_memory()?;
+        let symbol_table = Arc::new(SymbolTable::new());
+        let mut stats = IncrementalIndexingStats::default();
+
+        for (relative, _, expected_producer) in fixtures {
+            let prepared = {
+                let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+                indexer.prepare_index_work(
+                    &mut cache_access,
+                    &PathBuf::from(relative),
+                    dir.path(),
+                    None,
+                    &symbol_table,
+                    &mut stats,
+                )
+            };
+            let input = match prepared {
+                Ok(PreparedIndexWork::Structural(input)) => input,
+                Ok(_) => panic!("specialized structural route was bypassed: {relative}"),
+                Err(_) => panic!("specialized structural route failed: {relative}"),
+            };
+            let projected = indexer.execute_prepared_structural_index(&input);
+            assert!(projected.local_storage.errors.is_empty(), "{relative}");
+            assert_eq!(
+                projected.local_storage.structural_text_projections[0].producer, expected_producer,
+                "{relative}"
+            );
+        }
+
+        for relative in ["openapi.json", "openapi.yaml"] {
+            let prepared = {
+                let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+                indexer.prepare_index_work(
+                    &mut cache_access,
+                    &PathBuf::from(relative),
+                    dir.path(),
+                    None,
+                    &symbol_table,
+                    &mut stats,
+                )
+            };
+            let projected = match prepared {
+                Ok(PreparedIndexWork::Immediate(projected)) => projected,
+                Ok(_) => panic!("OpenAPI source entered generic structural routing: {relative}"),
+                Err(_) => panic!("OpenAPI source preparation failed: {relative}"),
+            };
+            assert_eq!(projected.files[0].language, "openapi", "{relative}");
+            assert!(projected.structural_text_units.is_empty(), "{relative}");
+            assert!(projected.nodes.iter().any(|node| {
+                node.canonical_id
+                    .as_deref()
+                    .is_some_and(|value| value == "openapi:endpoint:GET /health")
+            }));
+        }
+
+        let bash = {
+            let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+            indexer.prepare_index_work(
+                &mut cache_access,
+                &PathBuf::from("scripts/run.sh"),
+                dir.path(),
+                None,
+                &symbol_table,
+                &mut stats,
+            )
+        };
+        match bash {
+            Ok(PreparedIndexWork::Parse(input)) => {
+                assert_eq!(input.language_config.language_name, "bash")
+            }
+            Ok(_) => panic!("parser-backed .sh entered structural fallback"),
+            Err(_) => panic!("parser-backed .sh preparation failed"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structural_unit_bound_failure_writes_no_partial_projection_or_cache() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("many.json");
+        let mut source = String::from("{");
+        for index in 0..=structural::MAX_STRUCTURAL_UNITS_PER_FILE {
+            if index > 0 {
+                source.push(',');
+            }
+            source.push_str(&format!("\"key{index}\":{index}"));
+        }
+        source.push('}');
+        std::fs::write(&path, source)?;
+
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![path],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let mut storage = Storage::new_in_memory()?;
+        let stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert!(
+            storage
+                .get_structural_text_projection_file_ids()?
+                .is_empty()
+        );
+        let unit_rows: i64 = storage.get_connection().query_row(
+            "SELECT COUNT(*) FROM structural_text_unit",
+            [],
+            |row| row.get(0),
+        )?;
+        let cache_rows: i64 = storage.get_connection().query_row(
+            "SELECT COUNT(*) FROM structural_text_artifact_cache",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unit_rows, 0);
+        assert_eq!(cache_rows, 0);
+        assert_eq!(stats.artifact_cache_writes, 0);
+        assert!(storage.get_errors(None)?.iter().any(|error| {
+            error.coverage_reason == Some(FileCoverageReason::Oversized)
+                && error.message.contains("unit collector limit")
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn test_adaptive_full_refresh_planner_tracks_dense_and_sparse_node_output() -> Result<()> {
         use std::fs;
         use tempfile::tempdir;
@@ -24827,6 +25148,37 @@ function render() {
             edge.kind == EdgeKind::MEMBER
                 && edge.target == endpoint_id
                 && edge.certainty == Some(ResolutionCertainty::Certain)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_openapi_routing_precedes_generic_json_structural_collection() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("openapi.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "openapi": "3.1.0",
+  "paths": {
+    "/health": {
+      "get": {}
+    }
+  }
+}"#,
+        )?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let storage = match indexer.prepare_openapi_schema_work(&path) {
+            Ok(Some(storage)) => storage,
+            Ok(None) => panic!("expected dedicated OpenAPI projection"),
+            Err(_) => panic!("OpenAPI preparation failed"),
+        };
+        assert_eq!(storage.files[0].language, "openapi");
+        assert!(storage.structural_text_units.is_empty());
+        assert!(storage.nodes.iter().any(|node| {
+            node.canonical_id
+                .as_deref()
+                .is_some_and(|value| value == "openapi:endpoint:GET /health")
         }));
         Ok(())
     }

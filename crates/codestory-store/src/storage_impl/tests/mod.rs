@@ -5978,8 +5978,22 @@ fn test_error_storage_round_trips_coverage_reason() -> Result<(), StorageError> 
         index_step: codestory_contracts::graph::IndexStep::Indexing,
         coverage_reason: None,
     })?;
+    for (message, reason) in [
+        ("Malformed structural source", FileCoverageReason::Malformed),
+        ("Binary structural source", FileCoverageReason::Binary),
+    ] {
+        storage.insert_error(&codestory_contracts::graph::ErrorInfo {
+            message: message.to_string(),
+            file_id: Some(NodeId(1)),
+            line: None,
+            column: None,
+            is_fatal: false,
+            index_step: codestory_contracts::graph::IndexStep::Indexing,
+            coverage_reason: Some(reason),
+        })?;
+    }
     let stats = storage.get_stats()?;
-    assert_eq!(stats.error_count, 2);
+    assert_eq!(stats.error_count, 4);
     assert_eq!(stats.fatal_error_count, 1);
     let errors = storage.get_errors(None)?;
     let syntax_error = errors
@@ -5994,11 +6008,19 @@ fn test_error_storage_round_trips_coverage_reason() -> Result<(), StorageError> 
         syntax_error.coverage_reason,
         Some(FileCoverageReason::CollectorFailure)
     );
+    assert!(errors.iter().any(|error| {
+        error.message == "Malformed structural source"
+            && error.coverage_reason == Some(FileCoverageReason::Malformed)
+    }));
+    assert!(errors.iter().any(|error| {
+        error.message == "Binary structural source"
+            && error.coverage_reason == Some(FileCoverageReason::Binary)
+    }));
     assert_eq!(warning.coverage_reason, None);
     storage.refresh_grounding_summary_snapshots()?;
     assert!(storage.has_ready_grounding_summary_snapshots()?);
     let snapshot_stats = storage.get_stats()?;
-    assert_eq!(snapshot_stats.error_count, 2);
+    assert_eq!(snapshot_stats.error_count, 4);
     assert_eq!(snapshot_stats.fatal_error_count, 1);
     Ok(())
 }

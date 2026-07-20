@@ -4,6 +4,14 @@
 
 ### Release
 
+- Markdown/MDX, generic YAML, TOML, JSON, non-parser shell, and PowerShell now
+  emit bounded exact-source structural units through the same verified
+  publication and cache contract as the existing collectors. Dedicated
+  workflow, Compose, Cargo, OpenAPI, and parser-backed Bash routing keeps
+  precedence. Generated, vendor, secret-bearing, lockfile, minified, and other
+  declared high-noise paths are rejected before structural reads; malformed
+  text, binary/non-UTF-8 input, and unreadable sources now remain distinct
+  fail-closed coverage outcomes.
 - Structural workflow, Compose, Cargo manifest, HTML, CSS, and SQL collectors
   now persist versioned exact-source units with separate content and placement
   identity. Verified source hashes, per-file projections, and a dedicated

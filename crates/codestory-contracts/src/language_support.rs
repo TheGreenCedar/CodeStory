@@ -184,6 +184,13 @@ const CARGO_MANIFEST_UNSUPPORTED_SHAPES: &[&str] = &[
     "Target-scoped dependency tables, workspace dependency tables, dependency subtables, features, patch, and replace tables are not semantic proof.",
     "The collector records exact source anchors for selected manifest keys only; it does not validate Cargo behavior.",
 ];
+const GENERIC_STRUCTURAL_NODE_KINDS: &[NodeKind] =
+    &[NodeKind::MODULE, NodeKind::FUNCTION, NodeKind::ANNOTATION];
+const GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES: &[&str] = &[
+    "Anchors are conservative source labels, not a complete syntax tree.",
+    "Imports, references, substitutions, execution behavior, and typed targets are not resolved.",
+    "The collector records exact source anchors only; it does not admit packet semantic proof.",
+];
 
 pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
     StructuralSourceProofContract {
@@ -234,6 +241,78 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         claim_boundary: "structural exact-source proof only; not parser-backed graph parity, typed semantic resolution, not semantic dependency proof, Cargo resolution, or packet semantic-proof admission",
         semantic_proof_allowed: false,
     },
+    StructuralSourceProofContract {
+        collector_name: "markdown",
+        path_pattern: "**/*.{md,markdown,mdx}",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for heading text, link/reference labels, or fenced-block labels",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not Markdown or MDX semantic parsing, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "yaml",
+        path_pattern: "generic **/*.{yml,yaml} after dedicated workflow, Compose, and OpenAPI routing",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for a conservative mapping-key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not workflow, Compose, OpenAPI, YAML execution, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "toml",
+        path_pattern: "generic **/*.toml after dedicated Cargo manifest routing",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for a table header or key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not Cargo semantics, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "json",
+        path_pattern: "generic **/*.json after dedicated OpenAPI routing",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for an object-key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not OpenAPI semantics, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "shell",
+        path_pattern: "**/*.{zsh,ksh,command}; excludes parser-backed .sh and .bash",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for a function or import anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not parser-backed Bash graph coverage, shell execution, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "powershell",
+        path_pattern: "**/*.{ps1,psm1}",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for a function or import anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not PowerShell execution, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
 ];
 
 /// Public language profile exposed to callers and diagnostics.
@@ -280,6 +359,12 @@ pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     structural_profile("html", &["html", "htm"]),
     structural_profile("css", &["css"]),
     structural_profile("sql", &["sql"]),
+    structural_profile("markdown", &["md", "markdown", "mdx"]),
+    structural_profile("yaml", &["yml", "yaml"]),
+    structural_profile("toml", &["toml"]),
+    structural_profile("json", &["json"]),
+    structural_profile("shell", &["zsh", "ksh", "command"]),
+    structural_profile("powershell", &["ps1", "psm1"]),
     structural_profile("docker_compose", &[]),
     structural_profile("cargo_manifest", &[]),
 ];
@@ -485,6 +570,14 @@ mod tests {
             Some("css")
         );
         assert!(is_structural_language_name(" SQL "));
+        assert_eq!(
+            structural_language_name_for_path(Some("docs/guide.mdx")),
+            Some("markdown")
+        );
+        assert_eq!(
+            structural_language_name_for_path(Some("scripts/setup.ps1")),
+            Some("powershell")
+        );
         assert!(
             language_name_for_path(Some("src/app/Program.cshtml")).is_none(),
             "Razor .cshtml files are workspace-compatible, but not a public parser-backed C# claim"
@@ -681,10 +774,27 @@ mod tests {
                 .claim_boundary
                 .contains("not semantic dependency proof")
         );
+
+        for collector_name in ["markdown", "yaml", "toml", "json", "shell", "powershell"] {
+            let contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+                .iter()
+                .find(|contract| contract.collector_name == collector_name)
+                .unwrap_or_else(|| panic!("missing {collector_name} structural contract"));
+            assert_eq!(
+                contract.evidence_tier,
+                PacketEvidenceTierDto::StructuralText
+            );
+            assert_eq!(
+                contract.resolution,
+                PacketEvidenceResolutionDto::SourceRangeOnly
+            );
+            assert!(!contract.semantic_proof_allowed);
+            assert!(contract.claim_boundary.contains("packet semantic-proof"));
+        }
     }
 
     #[test]
-    fn github_actions_workflow_path_is_path_scoped_not_yaml_support() {
+    fn github_actions_workflow_path_keeps_specialized_scope_with_generic_yaml_support() {
         assert!(is_github_actions_workflow_path(
             "repo/.github/workflows/ci.yml"
         ));
@@ -701,11 +811,16 @@ mod tests {
         assert!(!is_github_actions_workflow_path(
             "repo/.github/workflows/readme.md"
         ));
-        assert!(language_support_profile_for_ext("yaml").is_none());
+        assert_eq!(
+            language_support_profile_for_ext("yaml")
+                .expect("generic YAML structural profile")
+                .support_mode,
+            LanguageSupportMode::StructuralCollector
+        );
     }
 
     #[test]
-    fn docker_compose_path_is_path_scoped_not_yaml_support() {
+    fn docker_compose_path_keeps_specialized_scope_with_generic_yaml_support() {
         assert!(is_docker_compose_file_path("compose.yaml"));
         assert!(is_docker_compose_file_path("deploy/compose.yml"));
         assert!(is_docker_compose_file_path("docker-compose.override.yml"));
@@ -715,7 +830,12 @@ mod tests {
         assert!(!is_docker_compose_file_path(".github/workflows/ci.yml"));
         assert!(!is_docker_compose_file_path("openapi.yaml"));
         assert!(!is_docker_compose_file_path("docs/service.yml"));
-        assert!(language_support_profile_for_ext("yaml").is_none());
+        assert_eq!(
+            language_support_profile_for_ext("yaml")
+                .expect("generic YAML structural profile")
+                .language_name,
+            "yaml"
+        );
         let profile = language_support_profile_for_language_name("docker_compose")
             .expect("docker compose structural profile");
         assert_eq!(
@@ -727,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_manifest_path_is_basename_scoped_not_toml_support() {
+    fn cargo_manifest_path_keeps_specialized_scope_with_generic_toml_support() {
         assert!(is_cargo_manifest_file_path("Cargo.toml"));
         assert!(is_cargo_manifest_file_path("crates/tool/Cargo.toml"));
         assert!(is_cargo_manifest_file_path(r"crates\tool\Cargo.toml"));
@@ -735,7 +855,12 @@ mod tests {
         assert!(!is_cargo_manifest_file_path("config.toml"));
         assert!(!is_cargo_manifest_file_path(".cargo/config.toml"));
         assert!(!is_cargo_manifest_file_path("Cargo.lock"));
-        assert!(language_support_profile_for_ext("toml").is_none());
+        assert_eq!(
+            language_support_profile_for_ext("toml")
+                .expect("generic TOML structural profile")
+                .language_name,
+            "toml"
+        );
         let profile = language_support_profile_for_language_name("cargo_manifest")
             .expect("cargo manifest structural profile");
         assert_eq!(

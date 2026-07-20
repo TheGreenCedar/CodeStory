@@ -66,7 +66,12 @@ pub enum Language {
     Html,
     Css,
     Bash,
+    Shell,
     PowerShell,
+    Markdown,
+    Yaml,
+    Toml,
+    Json,
     Svelte,
     Vue,
     Astro,
@@ -1351,6 +1356,12 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Html, "html")
             | (&Language::Css, "css")
             | (&Language::Bash, "bash")
+            | (&Language::Shell, "shell")
+            | (&Language::PowerShell, "powershell")
+            | (&Language::Markdown, "markdown")
+            | (&Language::Yaml, "yaml")
+            | (&Language::Toml, "toml")
+            | (&Language::Json, "json")
     )
 }
 
@@ -1362,7 +1373,6 @@ fn compatibility_extension_matches_source_group(extension: &str, language: &Lang
             | (&Language::CSharp, "cshtml")
             | (&Language::Lua, "lua")
             | (&Language::Css, "scss" | "sass" | "less")
-            | (&Language::PowerShell, "ps1" | "psm1")
             | (&Language::Svelte, "svelte")
             | (&Language::Vue, "vue")
             | (&Language::Astro, "astro")
@@ -2074,6 +2084,12 @@ mod tests {
             Language::Html,
             Language::Css,
             Language::Bash,
+            Language::Shell,
+            Language::PowerShell,
+            Language::Markdown,
+            Language::Yaml,
+            Language::Toml,
+            Language::Json,
         ];
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
@@ -2108,8 +2124,6 @@ mod tests {
             ("astro", Language::TypeScript),
             ("astro", Language::Astro),
             ("lua", Language::Lua),
-            ("ps1", Language::PowerShell),
-            ("psm1", Language::PowerShell),
             ("scss", Language::Css),
             ("sass", Language::Css),
             ("less", Language::Css),

@@ -206,9 +206,15 @@ named fault and race cases for:
 - prepared versus committed journal recovery;
 - cleanup failure after a committed publication;
 - stale/invalid backup ambiguity;
-- structural-unit descriptor determinism across all six collectors, exact
-  source spans, cross-file content-versus-placement identity, and zero-unit
-  projection completeness;
+- structural-unit descriptor determinism across all twelve unit collectors,
+  exact source spans, cross-file content-versus-placement identity, and
+  zero-unit projection completeness;
+- dedicated workflow, Compose, Cargo, OpenAPI JSON/YAML, and parser-backed Bash
+  precedence over generic structural routing;
+- centralized path-policy rejection before metadata/content reads, source-byte
+  and unit-count bounds, and no partial projection or cache rows after a bound;
+- distinct malformed, binary/non-UTF-8, and unreadable coverage round trips,
+  plus previous-publication survival for those outcomes;
 - structural cache compatibility, corruption, restored-mtime source changes,
   per-file incremental replacement, and structural-only copy-forward;
 - missing, legacy, corrupt, or source-drifted structural manifests at full,
