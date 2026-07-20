@@ -9,6 +9,7 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { Transform, pipeline } = require('stream');
+const { TextDecoder } = require('util');
 const zlib = require('zlib');
 
 const pluginRoot = path.dirname(__dirname);
@@ -1964,7 +1965,15 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     allowed_surfaces: Object.fromEntries(surfaces.map((surface) => [surface, blockedSurface()])),
     recommended_next_calls: preparing
       ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', retry_after_ms: 1500 }]
-      : [{ method: 'resources/read', uri: 'codestory://status' }],
+      : projectRoot
+        ? [{
+            method: 'resources/read',
+            uri: projectBoundResourceUri('codestory://status', projectRoot),
+          }]
+        : [{
+            method: 'resources/read',
+            uri_template: 'codestory://status{?project}',
+          }],
   };
 }
 
@@ -2057,6 +2066,110 @@ function resourceContents(uri, value) {
   };
 }
 
+function strictUriComponentEncode(value) {
+  let encoded = '';
+  for (const byte of Buffer.from(String(value), 'utf8')) {
+    const unreserved =
+      (byte >= 0x30 && byte <= 0x39)
+      || (byte >= 0x41 && byte <= 0x5A)
+      || (byte >= 0x61 && byte <= 0x7A)
+      || [0x2D, 0x2E, 0x5F, 0x7E].includes(byte);
+    encoded += unreserved ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return encoded;
+}
+
+function strictUriComponentDecode(value, label) {
+  const bytes = [];
+  for (let index = 0; index < value.length;) {
+    const code = value.charCodeAt(index);
+    const unreserved =
+      (code >= 0x30 && code <= 0x39)
+      || (code >= 0x41 && code <= 0x5A)
+      || (code >= 0x61 && code <= 0x7A)
+      || [0x2D, 0x2E, 0x5F, 0x7E].includes(code);
+    if (unreserved) {
+      bytes.push(code);
+      index += 1;
+      continue;
+    }
+    const escape = value.slice(index, index + 3);
+    if (!/^%[0-9A-F]{2}$/u.test(escape)) {
+      throw new Error(`${label} uses a non-canonical URI encoding`);
+    }
+    bytes.push(Number.parseInt(escape.slice(1), 16));
+    index += 3;
+  }
+  let decoded;
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
+  } catch {
+    throw new Error(`${label} is not valid UTF-8`);
+  }
+  if (strictUriComponentEncode(decoded) !== value) {
+    throw new Error(`${label} uses a non-canonical URI encoding`);
+  }
+  return decoded;
+}
+
+function cleanPublicProjectPath(value, platform = process.platform) {
+  if (platform !== 'win32') return String(value);
+  let project = String(value).replaceAll('\\', '/');
+  if (project.startsWith('//?/UNC/')) {
+    project = `//${project.slice('//?/UNC/'.length)}`;
+  } else if (project.startsWith('//?/')) {
+    project = project.slice('//?/'.length);
+  }
+  return project;
+}
+
+function projectBoundResourceUri(baseUri, project) {
+  return `${baseUri}?project=${strictUriComponentEncode(cleanPublicProjectPath(project))}`;
+}
+
+function parseFailOpenResourceRequest(uri, legacyProject) {
+  if (uri === 'codestory://agent-guide') {
+    if (legacyProject !== undefined) {
+      throw new Error('resource_project_unexpected: codestory://agent-guide is static and does not accept a project selector');
+    }
+    return { kind: 'agent-guide', project: null, uri };
+  }
+  const queryIndex = typeof uri === 'string' ? uri.indexOf('?') : -1;
+  const baseUri = queryIndex >= 0 ? uri.slice(0, queryIndex) : uri;
+  const query = queryIndex >= 0 ? uri.slice(queryIndex + 1) : null;
+  if (baseUri !== 'codestory://status') {
+    throw new Error(`unknown resource: ${uri || '<missing>'}`);
+  }
+  if (query !== null && (query.includes('?') || query.includes('&'))) {
+    throw new Error('resource_project_conflict: project-scoped resource URI must include exactly one `project` query selector');
+  }
+  if (query !== null && legacyProject !== undefined) {
+    throw new Error('resource_project_conflict: pass `project` exactly once, either in the resource URI or the legacy params field');
+  }
+  let projectValue = legacyProject;
+  if (query !== null) {
+    if (!query.startsWith('project=') || query.slice('project='.length).includes('=')) {
+      throw new Error('resource_project_malformed: expected one non-empty `project` query selector');
+    }
+    const encodedProject = query.slice('project='.length);
+    if (!encodedProject) {
+      throw new Error('resource_project_malformed: expected one non-empty `project` query selector');
+    }
+    projectValue = strictUriComponentDecode(encodedProject, 'resource project');
+  }
+  const selection = selectExplicitProject(projectValue);
+  if (!selection.ok) {
+    throw new Error(`${selection.code}: ${selection.message}`);
+  }
+  const project = cleanPublicProjectPath(selection.project);
+  return {
+    kind: 'status',
+    project,
+    projectSource: query === null ? 'request_argument' : 'resource_uri',
+    uri: projectBoundResourceUri(baseUri, project),
+  };
+}
+
 function failOpenToolCatalog() {
   if (!Array.isArray(canonicalMcpCatalog?.tools)) {
     throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
@@ -2114,7 +2227,6 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       tool,
       project: selection.project,
       state: selection.code === 'project_required' ? 'no_project' : 'unavailable',
-      diagnostics_uri: 'codestory://status',
     };
     if (tool === 'status' && selection.code === 'project_required') {
       return {
@@ -2130,6 +2242,7 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   }
   const project = selection.project;
   if (tool === 'status') {
+    const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
     const structuredContent = {
       project,
       state: preparing ? 'preparing' : 'unavailable',
@@ -2146,13 +2259,14 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       failure: preparing ? null : primaryFailure,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
       retry_after_ms: preparing ? 1500 : null,
-      diagnostics_uri: 'codestory://status',
+      diagnostics_uri: diagnosticsUri,
     };
     return {
       content: [{ type: 'text', text: `state: ${structuredContent.state}\nresult: structured\n` }],
       structuredContent,
     };
   }
+  const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
   const structuredContent = preparing ? {
     code: 'codestory_preparing',
     message: 'CodeStory is preparing. Retry the same tool shortly.',
@@ -2169,14 +2283,14 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       retry_after_ms: 1500,
       failure: null,
     },
-    diagnostics_uri: 'codestory://status',
+    diagnostics_uri: diagnosticsUri,
   } : {
     code: 'codestory_unavailable',
     message: 'CodeStory is unavailable. Continue with focused source inspection.',
     tool,
     project,
     state: 'unavailable',
-    diagnostics_uri: 'codestory://status',
+    diagnostics_uri: diagnosticsUri,
   };
   return {
     content: [{ type: 'text', text: structuredContent.message }],
@@ -2323,19 +2437,17 @@ function runFailOpenMcp(status, options = {}) {
   };
   const tools = failOpenToolCatalog();
   const resources = (canonicalMcpCatalog.resources || []).filter(({ uri }) =>
-    uri === 'codestory://status' || uri === 'codestory://agent-guide');
-  // Fail-open serves only the static diagnostic resources below. Do not
-  // advertise generated templates or prompts until the native runtime owns
-  // their read/get handlers.
-  const resourceTemplates = [];
+    uri === 'codestory://agent-guide');
+  // Fail-open serves the project-bound status template and static guide. Do
+  // not advertise other generated templates or prompts until the native
+  // runtime owns their read/get handlers.
+  const resourceTemplates = (canonicalMcpCatalog.resourceTemplates || []).filter(({ uriTemplate }) =>
+    uriTemplate === 'codestory://status{?project}');
   const prompts = [];
-  const guide = (project) => {
+  const guide = () => {
     return {
-      message: project
-        ? 'Call the tool that matches the task. If it reports preparing, retry that same tool after its delay.'
-        : 'Pass the caller\'s absolute repository root as `project` before using CodeStory.',
-      diagnostics_uri: 'codestory://status',
-      project,
+      message: 'Call the tool that matches the task and pass its absolute repository root. If it reports preparing, retry that same tool after its delay.',
+      diagnostics_uri_template: 'codestory://status{?project}',
     };
   };
   let buffer = '';
@@ -2394,35 +2506,31 @@ function runFailOpenMcp(status, options = {}) {
         response = jsonrpcResult(request.id, { prompts });
       } else if (request.method === 'resources/read') {
         const uri = request.params?.uri;
-        const selection = selectExplicitProject(request.params?.project);
-        const project = selection.ok ? selection.project : null;
-        if (uri === 'codestory://status') {
+        let parsedResource;
+        try {
+          parsedResource = parseFailOpenResourceRequest(uri, request.params?.project);
+        } catch (error) {
+          response = jsonrpcError(request.id, -32602, error.message);
+        }
+        if (parsedResource?.kind === 'status') {
+          const project = parsedResource.project;
           const statusValue = { ...currentStatus() };
-          if (selection.ok) {
-            statusValue.project_root = project;
-            statusValue.project_root_source = 'request_argument';
-          } else if (selection.code === 'project_required') {
-            statusValue.project_root = null;
-            statusValue.project_root_source = 'request_argument';
-            statusValue.project_state = 'no_project';
-            statusValue.project_selection = {
-              code: 'project_required',
-              state: 'no_project',
-              message: selection.message,
-            };
-            statusValue.degraded_reason ||= 'project_required';
-          } else {
-            response = jsonrpcError(request.id, -32602, selection.message);
+          statusValue.project_root = project;
+          statusValue.project_root_source = parsedResource.projectSource;
+          statusValue.diagnostics_uri = parsedResource.uri;
+          if (Array.isArray(statusValue.recommended_next_calls)) {
+            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) =>
+              call?.method === 'resources/read'
+                && call?.uri_template === 'codestory://status{?project}'
+                ? { method: call.method, uri: parsedResource.uri }
+                : call);
           }
-          if (!response) {
-            response = jsonrpcResult(request.id, resourceContents(uri, statusValue));
-          }
-        } else if (uri === 'codestory://agent-guide') {
-          response = selection.ok || selection.code === 'project_required'
-            ? jsonrpcResult(request.id, resourceContents(uri, guide(project)))
-            : jsonrpcError(request.id, -32602, selection.message);
-        } else {
-          response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
+          response = jsonrpcResult(
+            request.id,
+            resourceContents(parsedResource.uri, statusValue),
+          );
+        } else if (parsedResource?.kind === 'agent-guide') {
+          response = jsonrpcResult(request.id, resourceContents(parsedResource.uri, guide()));
         }
       } else if (request.method === 'tools/call') {
         const tool = request.params?.name;
@@ -2645,9 +2753,14 @@ if (require.main === module) {
   module.exports = {
     _test: {
       compareManagedCliVersions,
+      cleanPublicProjectPath,
       downloadFile,
       extractArchive,
       failOpenToolCatalog,
+      parseFailOpenResourceRequest,
+      projectBoundResourceUri,
+      strictUriComponentDecode,
+      strictUriComponentEncode,
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,

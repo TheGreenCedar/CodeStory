@@ -89,6 +89,29 @@ impl ResolvedTarget {
             alternatives: target.alternatives,
         }
     }
+
+    fn into_runtime(self) -> codestory_runtime::ResolvedTarget {
+        codestory_runtime::ResolvedTarget {
+            selector: match self.selector {
+                QuerySelectorOutput::Id => codestory_runtime::TargetSelector::Id,
+                QuerySelectorOutput::Query => codestory_runtime::TargetSelector::Query,
+            },
+            requested: self.requested,
+            file_filter: self.file_filter,
+            selected: self.selected,
+            alternatives: self.alternatives,
+        }
+    }
+}
+
+pub(crate) fn prefer_function_body_target(
+    project_root: &Path,
+    target: ResolvedTarget,
+) -> ResolvedTarget {
+    ResolvedTarget::from_runtime(codestory_runtime::prefer_function_body_target(
+        project_root,
+        target.into_runtime(),
+    ))
 }
 
 #[derive(Debug, Clone)]

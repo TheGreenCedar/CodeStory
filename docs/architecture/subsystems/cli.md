@@ -31,8 +31,12 @@ native workspace identity with a non-secret fingerprint of the immutable cache,
 retrieval, embedding, and summary configuration captured at process start.
 Equivalent path spellings converge on one context; configuration changes do
 not silently reuse another context. Project selection requires an absolute,
-existing repository root; projectless status reports `no_project`, while
-relative or unavailable roots fail closed.
+existing repository root. Every repository-reading resource advertises a
+`{?project}` URI template and binds the canonical percent-encoded native root
+before dispatch. Missing, relative, unavailable, duplicate, malformed, or
+conflicting selectors fail closed. `codestory://agent-guide` is the static,
+project-free exception. A legacy `params.project` resource selector remains an
+unadvertised compatibility input, but it cannot be combined with a bound URI.
 
 Status and resources use the runtime's observational summary path. They may
 read existing complete publications and operation snapshots, but they do not
@@ -55,6 +59,12 @@ schema is a strict tagged union, so fields from another probe kind are rejected.
 Search and definition links bind continuations to the selected project, stable
 node ID, contract version, and evidence generation.
 
+MCP `snippet` accepts `scope=line_context|function_body`, bounded `context`,
+the `lines` compatibility alias, and the CLI-compatible `function_body`
+selector. The adapter normalizes aliases and rejects conflicts before runtime
+selection. Function-body target preference is owned by
+`codestory-runtime::target_resolution`, so CLI and stdio cannot diverge.
+
 ## Serving contract
 
 Status and diagnostics are observational. Activating product calls may perform
@@ -76,6 +86,9 @@ packet/search implementation.
 ## Failure signatures
 
 - an invalid resource activates or mutates a project;
+- a repository resource is advertised or returned without its canonical
+  project-bound URI;
+- stdio silently ignores an unknown or conflicting snippet option;
 - adapter code assembles graph/retrieval product semantics;
 - project switching changes frozen defaults or the shared engine policy;
 - CLI output hides stale, partial, or unavailable evidence.

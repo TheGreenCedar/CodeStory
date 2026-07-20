@@ -35,6 +35,15 @@ Do not serialize tests to hide leaked global state. CLI integration tests use
 their isolated test support, never the real user cache, and drain anything they
 start.
 
+MCP resource or snippet-contract changes run the complete
+`stdio_protocol_contracts` binary, regenerate and check the MCP catalog, and
+run `plugin-static`. Resource proof covers strict Unix/Windows path
+round-tripping, malformed and conflicting selectors, static project-free
+resources, observational status reads, and interleaved A/B/A repository and
+node isolation. Snippet proof covers the canonical scope/context inputs, both
+documented aliases, conflicts, unknown fields, and actual function-body
+selection through the runtime owner.
+
 Artifact-cache access-policy changes prove four separate boundaries with
 focused tests: a file-backed `known_empty` full refresh still uses the
 capacity-one pipeline without opening a reader; verified copied structural rows

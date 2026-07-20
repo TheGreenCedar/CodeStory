@@ -169,6 +169,7 @@ pub use symbol_workflow::{
 };
 pub use target_resolution::{
     AmbiguousTarget, ResolvedTarget, TargetResolution, TargetSelection, TargetSelector,
+    prefer_function_body_target,
 };
 
 #[cfg(feature = "test-support")]

@@ -4,6 +4,15 @@
 
 ### Release
 
+- MCP repository resources now advertise canonical project-bound URI templates
+  while the static agent guide remains project-free. Strict URI parsing
+  preserves native path identity across spaces, percent characters, Unicode,
+  Unix roots, and Windows drive paths, and rejects missing, duplicate,
+  relative, malformed, or conflicting selectors before project selection.
+  MCP `snippet` now exposes the CLI's bounded line-context and function-body
+  controls through one runtime-owned target-selection path. The generated
+  catalog, fail-open launcher, packaged proof, and multi-project tests enforce
+  the same contract.
 - Packet probes now use one tagged exact-target grammar across contracts,
   runtime, CLI, and stdio: exact project-relative path, stable symbol ID,
   file-scoped symbol, free query, or generation-bound continuation. Legacy

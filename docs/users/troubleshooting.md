@@ -137,7 +137,8 @@ codestory-cli doctor --project <repo>
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-When MCP is live, `codestory://status` is the authoritative host-visible
+When MCP is live, the project-bound `codestory://status{?project}` resource is
+the authoritative host-visible
 diagnostic. It is observational and does not start indexing or engine work.
 
 Further detail:

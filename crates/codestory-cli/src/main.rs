@@ -109,8 +109,9 @@ use runtime::{
 use serde::Deserialize;
 #[cfg(test)]
 use stdio_catalog::{
-    prompts_list_json as stdio_prompts_list_json, resources_list_json as stdio_resources_list_json,
-    tools_list_json as stdio_tools_list_json,
+    prompts_list_json as stdio_prompts_list_json,
+    resource_templates_list_json as stdio_resource_templates_list_json,
+    resources_list_json as stdio_resources_list_json, tools_list_json as stdio_tools_list_json,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -5022,78 +5023,6 @@ fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> 
     )]
 }
 
-fn prefer_function_body_target(
-    project_root: &std::path::Path,
-    mut target: runtime::ResolvedTarget,
-) -> runtime::ResolvedTarget {
-    if hit_looks_like_function_body(project_root, &target.selected) {
-        return target;
-    }
-    if !matches!(target.selected.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
-        return target;
-    }
-    let Some((index, preferred)) = target
-        .alternatives
-        .iter()
-        .enumerate()
-        .find(|(_, hit)| {
-            function_body_promotion_matches(&target.selected, hit)
-                && hit_looks_like_function_body(project_root, hit)
-        })
-        .map(|(index, hit)| (index, hit.clone()))
-    else {
-        return target;
-    };
-    target.selected = preferred;
-    let promoted = target.alternatives.remove(index);
-    target.alternatives.insert(0, promoted);
-    target
-}
-
-fn function_body_promotion_matches(selected: &SearchHit, candidate: &SearchHit) -> bool {
-    if selected.display_name == candidate.display_name {
-        return true;
-    }
-    terminal_display_name(&selected.display_name) == terminal_display_name(&candidate.display_name)
-}
-
-fn terminal_display_name(name: &str) -> &str {
-    name.rsplit_once("::")
-        .map(|(_, terminal)| terminal)
-        .or_else(|| name.rsplit_once('.').map(|(_, terminal)| terminal))
-        .unwrap_or(name)
-}
-
-fn hit_looks_like_function_body(project_root: &std::path::Path, hit: &SearchHit) -> bool {
-    if !matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
-        return false;
-    }
-    let Some(path) = hit.file_path.as_deref() else {
-        return false;
-    };
-    let Some(line) = hit.line else {
-        return false;
-    };
-    let path = std::path::Path::new(path);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
-    };
-    let Ok(contents) = fs::read_to_string(&resolved) else {
-        return false;
-    };
-    let line_index = line.saturating_sub(1) as usize;
-    let window = contents
-        .lines()
-        .skip(line_index)
-        .take(8)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let before_body = window.split('{').next().unwrap_or(window.as_str());
-    window.contains('{') && !before_body.contains(';')
-}
-
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -5119,7 +5048,7 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
             cmd.output_file.as_deref(),
         )?;
         let target = if cmd.function_body {
-            prefer_function_body_target(&runtime.project_root, target)
+            runtime::prefer_function_body_target(&runtime.project_root, target)
         } else {
             target
         };
@@ -10595,7 +10524,24 @@ mod tests {
                 .as_array()
                 .expect("resources")
                 .iter()
-                .any(|resource| resource["uri"] == "codestory://grounding")
+                .any(|resource| resource["uri"] == "codestory://agent-guide")
+        );
+        assert_eq!(
+            resources["result"]["resources"]
+                .as_array()
+                .expect("resources")
+                .len(),
+            1,
+            "only static project-free resources belong in resources/list"
+        );
+
+        let templates = stdio_resource_templates_list_json();
+        assert!(
+            templates["result"]["resourceTemplates"]
+                .as_array()
+                .expect("resource templates")
+                .iter()
+                .any(|resource| { resource["uriTemplate"] == "codestory://grounding{?project}" })
         );
 
         let prompts = stdio_prompts_list_json();
@@ -10753,7 +10699,7 @@ mod tests {
             alternatives: vec![alternative],
         };
 
-        let promoted = prefer_function_body_target(temp.path(), target);
+        let promoted = runtime::prefer_function_body_target(temp.path(), target);
 
         assert_eq!(promoted.selected.node_id.0, "posts");
         assert_eq!(promoted.selected.display_name, "Posts");
@@ -10793,7 +10739,7 @@ mod tests {
             alternatives: vec![alternative],
         };
 
-        let promoted = prefer_function_body_target(temp.path(), target);
+        let promoted = runtime::prefer_function_body_target(temp.path(), target);
 
         assert_eq!(promoted.selected.node_id.0, "implementation");
     }

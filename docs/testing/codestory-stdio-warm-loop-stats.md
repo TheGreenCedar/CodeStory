@@ -112,6 +112,9 @@ so a changed index bypasses the cached packet.
 
 - The baseline is a small-fixture release-binary smoke, not a repo-scale promotion gate.
 - Response bytes are run-local smoke metrics because temp paths appear in JSON payloads.
-- `warm per-loop ms` covers `search -> symbol -> trail -> snippet`; `resources/read codestory://status` is measured separately as `retrieval_status` because it includes the mandatory retrieval fingerprint/status check, not the cold one-shot comparison.
+- `warm per-loop ms` covers `search -> symbol -> trail -> snippet`; the
+  project-bound `resources/read codestory://status{?project}` call is measured
+  separately as `retrieval_status` because it includes the mandatory retrieval
+  fingerprint/status check, not the cold one-shot comparison.
 - `warm stdio semantic reload ms` is `null` because `serve --stdio` does not currently expose a dedicated semantic reload phase; any warm-server load cost is included in `startup ms`.
 - Add hard latency budgets only after several local runs establish variance.

@@ -20,8 +20,9 @@ A lower tier cannot support a higher-tier claim.
 
 ## Required engine assertions
 
-After an engine-initializing operation, packaged proof reads
-`codestory://diagnostics/retrieval-engine` and verifies:
+After an engine-initializing operation, packaged proof reads the project-bound
+`codestory://diagnostics/retrieval-engine{?project}` maintainer resource and
+verifies:
 
 - endpoint authority, listener, server process, engine owner, native worker,
   load generation, and model-load identities;

@@ -26,7 +26,8 @@ the requested surface.
 
 ### allowed surfaces
 
-Per-operation readiness decisions reported in `codestory://status` and enforced
+Per-operation readiness decisions reported in the project-bound
+`codestory://status{?project}` resource and enforced
 inside normal tool calls. They are diagnostic; agents should call the intended
 tool and follow its structured result.
 
