@@ -1,6 +1,5 @@
 use codestory_contracts::api::{
-    IndexMode, LayoutDirection, ListRootSymbolsRequest, OpenProjectRequest, TrailCallerScope,
-    TrailDirection, TrailMode,
+    IndexMode, LayoutDirection, ListRootSymbolsRequest, TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_runtime::AppController;
 use codestory_store::Store;
@@ -35,12 +34,11 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
     fs::write(src_dir.join("main.rs"), code)?;
 
     let controller = AppController::new();
+    let storage_path = root.join(".cache").join("codestory.db");
 
     // 1. Open project
     let summary = controller
-        .open_project(OpenProjectRequest {
-            path: root.to_string_lossy().to_string(),
-        })
+        .open_project_with_storage_path(root.to_path_buf(), storage_path.clone())
         .unwrap();
     assert_eq!(summary.stats.node_count, 0, "Should start empty");
 
@@ -52,9 +50,7 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
 
     // Re-open to get refresh stats
     let summary = controller
-        .open_project(OpenProjectRequest {
-            path: root.to_string_lossy().to_string(),
-        })
+        .open_project_with_storage_path(root.to_path_buf(), storage_path)
         .unwrap();
     assert!(summary.stats.node_count > 0);
 
