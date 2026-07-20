@@ -9,6 +9,12 @@
   and presentation uncertainty. The stdio schema and `ground --why` render the
   same contract, so weak orientation cannot be reported as high-confidence
   coverage.
+- The native sqlite-vec/USearch evidence harness now uses 75,000 as its largest
+  nested real-anchor workload while retaining 100 incremental anchors, two
+  clean roots, six paired counterbalanced blocks, and the existing identity,
+  failure, and replay proof. The frozen input now binds the declared workload
+  criteria byte-for-byte, and changed fixtures use a new selection seed and
+  schema.
 - Incremental freshness now carries forward unchanged verified structural-unit
   exclusions even though they intentionally have no parser-backed file row.
   This stops managed activation from republishing the same excluded inputs as

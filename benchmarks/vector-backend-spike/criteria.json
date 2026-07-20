@@ -12,7 +12,7 @@
     "usearch": "2.26.0, HNSW F32, cosine, default features disabled"
   },
   "shared_workload": {
-    "vector_counts": [1000, 10000, 25000, 100000],
+    "vector_counts": [1000, 10000, 25000, 75000],
     "dimensions": 768,
     "query_count": 30,
     "top_k": 20,
