@@ -17,6 +17,7 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
 const launcherTest = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"))._test;
+const devCliContract = require(join(pluginRoot, "scripts", "codestory-dev-cli-contract.cjs"));
 const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
   dirtyMarkerPathForProject,
@@ -446,6 +447,55 @@ async function writeManagedCliFixture(dataDir, version, body = version) {
   return { cliPath, versionDir };
 }
 
+async function writeAttestedDevPluginFixture(root, version) {
+  const { cp } = await import("node:fs/promises");
+  const installRoot = join(
+    root,
+    ".codex",
+    "plugins",
+    "cache",
+    "CodeStoryDev",
+    "codestory",
+    version,
+  );
+  await cp(pluginRoot, installRoot, { recursive: true });
+  const sourcePackageSha256 = devCliContract.directoryContractSha256(installRoot);
+  const cliName = devCliContract.expectedBinaryName();
+  const cliPath = join(installRoot, "bin", cliName);
+  await mkdir(dirname(cliPath), { recursive: true });
+  await writeFakeCli(cliPath);
+  const cliBytes = await readFile(cliPath);
+  const cliSha256 = createHash("sha256").update(cliBytes).digest("hex");
+  await writeFile(
+    join(installRoot, devCliContract.receiptName),
+    `${JSON.stringify({
+      schema_version: devCliContract.receiptSchemaVersion,
+      purpose: devCliContract.receiptPurpose,
+      plugin_id: devCliContract.receiptPluginId,
+      plugin_name: devCliContract.receiptPluginName,
+      plugin_version: version,
+      source_commit: "a".repeat(40),
+      source_package_sha256: sourcePackageSha256,
+      target: devCliContract.assetTarget(),
+      cli: {
+        path: `bin/${cliName}`,
+        name: cliName,
+        bytes: cliBytes.length,
+        sha256: cliSha256,
+        version,
+      },
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  return {
+    cliPath,
+    cliSha256,
+    installRoot,
+    launcher: join(installRoot, "scripts", "codestory-mcp.cjs"),
+    sourcePackageSha256,
+  };
+}
+
 test("plugin metadata maps skill and direct stdio server", async () => {
   const manifest = JSON.parse(
     await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
@@ -752,6 +802,104 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher uses an attested CodeStoryDev CLI from the installed cache without PATH", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "codestory-attested-dev-cli-"));
+  const dataDir = join(root, "plugin-data");
+  const outFile = join(root, "env.json");
+  const version = await readPluginVersion();
+  try {
+    const fixture = await writeAttestedDevPluginFixture(root, version);
+    await mkdir(dataDir, { recursive: true });
+    const result = spawnSync(process.execPath, [fixture.launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: outFile,
+        PATH: "",
+      },
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(await readFile(outFile, "utf8"));
+    assert.equal(observed.source, "local_dev_override");
+    assert.equal(observed.buildSource, "codestory_dev_receipt");
+    assert.equal(observed.sha256, fixture.cliSha256);
+    assert.equal(await realpath(observed.path), await realpath(fixture.cliPath));
+    assert.equal(await realpath(observed.pluginRoot), await realpath(fixture.installRoot));
+    assert.equal(observed.pluginCacheVersion, version);
+    assert.match(observed.warnings, /codestory_dev_receipt:verified/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("declared CodeStoryDev receipt failures never fall through to raw or managed CLI selection", async () => {
+  if (process.platform === "win32") return;
+  const version = await readPluginVersion();
+  for (const variant of ["invalid-receipt", "ambiguous-raw-override"]) {
+    const root = await mkdtemp(join(tmpdir(), "codestory-dev-receipt-no-fallback-"));
+    const dataDir = join(root, "plugin-data");
+    const runtimeOut = join(root, "runtime.json");
+    try {
+      const fixture = await writeAttestedDevPluginFixture(root, version);
+      const managedDir = join(dataDir, "codestory-cli", version);
+      const managedCli = join(managedDir, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+      await mkdir(managedDir, { recursive: true });
+      await writeFakeCli(managedCli);
+      const managedSha256 = createHash("sha256").update(await readFile(managedCli)).digest("hex");
+      await writeFile(
+        join(managedDir, "manifest.json"),
+        JSON.stringify(managedReleaseManifest(version, managedCli.slice(managedDir.length + 1), managedSha256)),
+        "utf8",
+      );
+      if (variant === "invalid-receipt") {
+        await writeFile(join(fixture.installRoot, "README.md"), "changed package bytes", "utf8");
+      }
+      const input = `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: variant,
+        method: "resources/read",
+        params: { uri: statusUri },
+      })}\n`;
+      const result = spawnSync(process.execPath, [fixture.launcher], {
+        env: {
+          ...process.env,
+          CODESTORY_CLI: variant === "ambiguous-raw-override" ? fixture.cliPath : "",
+          CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_OUT: runtimeOut,
+          PATH: "",
+        },
+        input,
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const response = JSON.parse(result.stdout.trim());
+      const status = JSON.parse(response.result.contents[0].text);
+      assert.equal(status.plugin_runtime.cli_source, "local_dev_receipt_invalid");
+      assert.equal(status.plugin_runtime.cli_path, null);
+      assert.equal(status.plugin_runtime.managed_binary_path, null);
+      if (variant === "invalid-receipt") {
+        assert.equal(
+          status.degraded_reason,
+          "codestory_dev_receipt_invalid:codestory_dev_receipt_package_digest",
+        );
+      } else {
+        assert.equal(status.degraded_reason, "codestory_dev_cli_ambiguous_override");
+      }
+      assert.equal(fs.existsSync(runtimeOut), false, `${variant} unexpectedly launched a runtime`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -2431,6 +2579,10 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
       launcher,
       await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8"),
       "utf8",
+    );
+    await copyFile(
+      join(pluginRoot, "scripts", "codestory-dev-cli-contract.cjs"),
+      join(installRoot, "scripts", "codestory-dev-cli-contract.cjs"),
     );
     await copyFile(
       join(pluginRoot, "generated-mcp-catalog.json"),

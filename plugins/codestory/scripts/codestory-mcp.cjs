@@ -11,6 +11,9 @@ const path = require('path');
 const { Transform, pipeline } = require('stream');
 const { TextDecoder } = require('util');
 const zlib = require('zlib');
+const {
+  validateDevCliReceipt,
+} = require('./codestory-dev-cli-contract.cjs');
 
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = process.cwd();
@@ -1367,6 +1370,66 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
 async function resolveCli(options = {}) {
   const version = pluginVersion();
   const warnings = [];
+  const devReceipt = validateDevCliReceipt(pluginRoot, {
+    expectedPluginVersion: version,
+  });
+  if (process.env.CODESTORY_CLI && devReceipt.state !== 'absent') {
+    const reason = 'codestory_dev_cli_ambiguous_override';
+    warnings.push(reason);
+    return {
+      source: 'local_dev_receipt_invalid',
+      path: null,
+      sha256: null,
+      version,
+      cliVersion: null,
+      repoRef: null,
+      buildSource: 'local_dev_receipt_invalid',
+      sourcePackageSha256: null,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      localDevReceiptFailure: reason,
+      warnings,
+    };
+  }
+  if (devReceipt.state === 'verified') {
+    warnings.push('codestory_dev_receipt:verified');
+    return {
+      source: 'local_dev_override',
+      path: devReceipt.path,
+      sha256: devReceipt.sha256,
+      version,
+      cliVersion: devReceipt.cliVersion,
+      repoRef: devReceipt.sourceCommit,
+      buildSource: 'codestory_dev_receipt',
+      sourcePackageSha256: devReceipt.sourcePackageSha256,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      manifestPath: devReceipt.receiptPath,
+      warnings,
+    };
+  }
+  if (devReceipt.state === 'invalid') {
+    const reason = `codestory_dev_receipt_invalid:${devReceipt.reason}`;
+    warnings.push(reason);
+    return {
+      source: 'local_dev_receipt_invalid',
+      path: null,
+      sha256: null,
+      version,
+      cliVersion: null,
+      repoRef: null,
+      buildSource: 'local_dev_receipt_invalid',
+      sourcePackageSha256: null,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      manifestPath: devReceipt.receiptPath,
+      localDevReceiptFailure: reason,
+      warnings,
+    };
+  }
   if (process.env.CODESTORY_CLI) {
     const cliPath = path.isAbsolute(process.env.CODESTORY_CLI)
       ? process.env.CODESTORY_CLI
@@ -1383,6 +1446,7 @@ async function resolveCli(options = {}) {
       cliVersion: null,
       repoRef: null,
       buildSource: 'local_dev_override',
+      sourcePackageSha256: null,
       archiveSha256: null,
       archiveUrl: null,
       provisionedAt: null,
@@ -1406,6 +1470,7 @@ async function resolveCli(options = {}) {
     cliVersion: null,
     repoRef: null,
     buildSource: 'managed_unavailable',
+    sourcePackageSha256: null,
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
@@ -1453,6 +1518,9 @@ function failOpenReasonForProbe(resolved, probe) {
   if (batchRejection) return batchRejection;
   if (resolved.source === 'managed_unavailable') {
     return resolved.managedProvisionFailure || 'managed_cli_unavailable';
+  }
+  if (resolved.source === 'local_dev_receipt_invalid') {
+    return resolved.localDevReceiptFailure || 'codestory_dev_receipt_invalid';
   }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
@@ -1888,6 +1956,7 @@ function pluginRuntimeForResolved(resolved) {
     cli_sha256: resolved.sha256,
     build_source: resolved.buildSource,
     repo_ref: resolved.repoRef,
+    source_package_sha256: resolved.sourcePackageSha256 || null,
     local_dev_override: resolved.source === 'local_dev_override',
     managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
     managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
@@ -2572,6 +2641,7 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
       cliVersion: resolved.cliVersion || null,
       repoRef: resolved.repoRef || null,
       buildSource: resolved.buildSource || null,
+      sourcePackageSha256: resolved.sourcePackageSha256 || null,
       archiveSha256: resolved.archiveSha256 || null,
       archiveUrl: resolved.archiveUrl || null,
       provisionedAt: resolved.provisionedAt || null,
@@ -2598,6 +2668,7 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
     CODESTORY_PLUGIN_CLI_MANIFEST_PATH: resolved.manifestPath || '',
     CODESTORY_PLUGIN_CLI_BUILD_SOURCE: resolved.buildSource || '',
     CODESTORY_PLUGIN_CLI_REPO_REF: resolved.repoRef || '',
+    CODESTORY_PLUGIN_SOURCE_PACKAGE_SHA256: resolved.sourcePackageSha256 || '',
     CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256: resolved.archiveSha256 || '',
     CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
     CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',

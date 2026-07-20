@@ -34,6 +34,16 @@ The fail-open catalog prevents installation work from looking like a missing
 plugin. It keeps diagnostics and the complete tool schema visible while the
 native executable is prepared, then forwards requests to that executable.
 
+The local `CodeStoryDev` marketplace uses a separate, explicit trust contract.
+Its repository-owned staging installer copies one clean committed plugin
+package and one exact CLI into the development package, then writes a receipt
+that binds the package digest, plugin identity and version, platform target,
+direct executable path, size, checksum, and CLI version. The cached launcher
+revalidates that receipt before treating the CLI as a local-development
+override. A declared but invalid receipt, or a receipt combined with the raw
+`CODESTORY_CLI` override, fails closed and cannot fall through to managed
+release provisioning.
+
 ## Request routing
 
 Every tool and resource request includes an absolute `project` root. The
