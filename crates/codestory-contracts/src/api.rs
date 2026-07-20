@@ -73,7 +73,7 @@ pub use errors::{
 };
 pub use events::{
     AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, FullRefreshWallTimings,
-    IndexingPhaseTimings,
+    IndexingPhaseTimings, ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
 };
 pub use ids::{EdgeId, NodeId};
 pub use types::{

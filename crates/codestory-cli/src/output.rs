@@ -364,6 +364,42 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
         "projection_batches",
         &[("transactions", timings.projection_batch_transactions)],
     );
+    if let Some(persistence) = timings.projection_persistence.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "projection_persistence: transactions={} rows={} bound_bytes={} statements={} transaction_wall_ms={} setup_ms={} commit_ms={}",
+            persistence.transactions,
+            persistence.row_attempts,
+            persistence.bound_bytes,
+            persistence.statement_executions,
+            persistence.transaction_wall_ms,
+            persistence.transaction_setup_ms,
+            persistence.commit_ms,
+        );
+        for (name, family) in [
+            ("files", &persistence.files),
+            ("nodes", &persistence.nodes),
+            ("structural_text", &persistence.structural_text),
+            ("edges", &persistence.edges),
+            ("occurrences", &persistence.occurrences),
+            ("component_access", &persistence.component_access),
+            ("callable_projection", &persistence.callable_projection),
+            ("file_errors", &persistence.file_errors),
+            ("dirty_state", &persistence.dirty_state),
+        ] {
+            if family.statement_executions == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                markdown,
+                "projection_persistence.{name}: rows={} bound_bytes={} statements={} wall_ms={}",
+                family.row_attempts,
+                family.bound_bytes,
+                family.statement_executions,
+                family.wall_ms,
+            );
+        }
+    }
     append_optional_timings_line(
         markdown,
         "artifact_cache",

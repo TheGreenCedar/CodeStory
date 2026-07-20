@@ -8005,8 +8005,9 @@ mod tests {
         IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId, PacketBudgetDto,
         PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanDto,
         PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, ProjectSummary,
-        RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin, SemanticModeDto,
-        SourcePolicyExclusionDto, StorageStatsDto, TrailContextDto,
+        ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings, RetrievalModeDto,
+        RetrievalStateDto, SearchHit, SearchHitOrigin, SemanticModeDto, SourcePolicyExclusionDto,
+        StorageStatsDto, TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8886,6 +8887,28 @@ mod tests {
             source_prepare_ms: Some(41),
             projection_batch_wall_ms: Some(50),
             projection_batch_transactions: Some(2),
+            projection_persistence: Some(ProjectionPersistenceTimings {
+                transactions: 2,
+                row_attempts: 40,
+                bound_bytes: 4096,
+                statement_executions: 35,
+                transaction_wall_ms: 48,
+                transaction_setup_ms: 1,
+                commit_ms: 7,
+                files: ProjectionPersistenceFamilyTimings {
+                    row_attempts: 4,
+                    bound_bytes: 512,
+                    statement_executions: 4,
+                    wall_ms: 3,
+                },
+                dirty_state: ProjectionPersistenceFamilyTimings {
+                    row_attempts: 8,
+                    bound_bytes: 96,
+                    statement_executions: 8,
+                    wall_ms: 2,
+                },
+                ..Default::default()
+            }),
             artifact_cache_write_ms: Some(6),
             artifact_cache_writes: Some(24),
             artifact_cache_write_transactions: Some(1),
@@ -9170,6 +9193,15 @@ mod tests {
         ));
         assert!(markdown.contains("indexer_io_ms: source_prepare=41 projection_batch_wall=50"));
         assert!(markdown.contains("projection_batches: transactions=2"));
+        assert!(markdown.contains(
+            "projection_persistence: transactions=2 rows=40 bound_bytes=4096 statements=35 transaction_wall_ms=48 setup_ms=1 commit_ms=7"
+        ));
+        assert!(markdown.contains(
+            "projection_persistence.files: rows=4 bound_bytes=512 statements=4 wall_ms=3"
+        ));
+        assert!(markdown.contains(
+            "projection_persistence.dirty_state: rows=8 bound_bytes=96 statements=8 wall_ms=2"
+        ));
         assert!(
             markdown
                 .contains("semantic_ms: context_index=59 node_load=66 node_rows=8192 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")

@@ -1618,6 +1618,7 @@ mod tests {
                     occurrences: &projected.occurrences,
                     component_access: &projected.component_access,
                     callable_projection_states: &projected.callable_projection_states,
+                    file_errors: &[],
                 })
                 .expect("insert verified manifest projection");
         }

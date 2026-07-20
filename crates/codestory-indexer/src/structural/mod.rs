@@ -1388,6 +1388,7 @@ jobs:
                 occurrences: &projected.occurrences,
                 component_access: &projected.component_access,
                 callable_projection_states: &projected.callable_projection_states,
+                file_errors: &[],
             })?;
         Ok(())
     }
@@ -1465,6 +1466,7 @@ jobs:
                 occurrences: &projected.occurrences,
                 component_access: &projected.component_access,
                 callable_projection_states: &projected.callable_projection_states,
+                file_errors: &[],
             })?;
         let publication = codestory_store::IndexPublicationRecord {
             generation: 1,

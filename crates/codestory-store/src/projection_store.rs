@@ -3,7 +3,7 @@ use crate::{
     StructuralTextArtifactCacheWrite, StructuralTextProjection, StructuralTextUnit,
 };
 use codestory_contracts::graph::{
-    AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
+    AccessKind, CallableProjectionState, Edge, ErrorInfo, Node, NodeId, Occurrence,
 };
 
 /// Mutable graph/search projection facade.
@@ -28,6 +28,7 @@ pub struct ProjectionBatch<'a> {
     pub occurrences: &'a [Occurrence],
     pub component_access: &'a [(NodeId, AccessKind)],
     pub callable_projection_states: &'a [CallableProjectionState],
+    pub file_errors: &'a [ErrorInfo],
 }
 
 impl<'a> ProjectionStore<'a> {
@@ -61,6 +62,7 @@ impl<'a> ProjectionStore<'a> {
                 occurrences: batch.occurrences,
                 component_access: batch.component_access,
                 callable_projection_states: batch.callable_projection_states,
+                file_errors: batch.file_errors,
             })
     }
 }

@@ -59,6 +59,13 @@ hash, graph rows, units, projection, and dedicated cache entry is atomic and
 invalidates the complete manifest until runtime republishes it. Schema migration
 creates the tables but no synthetic completeness claim.
 
+The projection transaction also replaces file-scoped errors and marks
+grounding summary/detail plus resolution-support state dirty. Those writes do
+not follow the graph commit as independent autocommits. Store telemetry counts
+logical row attempts, prepared-statement executions, and estimated raw bind
+payload bytes by family; the byte count describes input shape, not database,
+WAL, or physical-write bytes.
+
 Promotion journals record candidate and rollback structural identities.
 Prepared install, committed recovery, and rollback validate the recorded
 manifest and current row digest before accepting a database. Missing, legacy,

@@ -78,9 +78,13 @@ Projection flushes are broader than just graph rows. `IntermediateStorage` carri
 - indexing errors
 
 `flush_projection_batch` writes the projection payload through
-`codestory-store`. For structural files, source identity, graph rows, units,
-projection, and cache write share one transaction. Resolution changes happen
-later, after those rows already exist.
+`codestory-store`. Source identity, graph rows, structural units and cache
+writes, file-scoped error replacement, and derived-snapshot invalidation share
+one transaction. Resolution changes happen later, after those rows already
+exist. Indexer telemetry keeps row-family work nested under the complete
+projection transaction wall and reports attempted rows, estimated bound-input
+bytes, statement executions, setup, and commit time without treating them as
+additive phases.
 
 ## Structural Unit Identity
 

@@ -889,6 +889,7 @@ pub struct IncrementalIndexingStats {
     pub projection_flush_ms: u64,
     pub projection_batch_wall_ms: u64,
     pub projection_batch_transactions: usize,
+    pub projection_persistence: codestory_store::ProjectionPersistenceStats,
     pub flush_files_ms: u64,
     pub flush_nodes_ms: u64,
     pub flush_structural_text_units_ms: u64,
@@ -1166,7 +1167,6 @@ struct ProjectionWriter<'a> {
     replaced_projection_ids: HashSet<i64>,
     batched_storage: IntermediateStorage,
     all_errors: Vec<codestory_contracts::graph::ErrorInfo>,
-    pending_error_file_ids: HashSet<i64>,
     pending_file_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     had_edges: bool,
     pipeline_telemetry: bool,
@@ -1189,7 +1189,6 @@ impl<'a> ProjectionWriter<'a> {
             replaced_projection_ids: HashSet::new(),
             batched_storage: IntermediateStorage::default(),
             all_errors: Vec::new(),
-            pending_error_file_ids: HashSet::new(),
             pending_file_errors: Vec::new(),
             had_edges: false,
             pipeline_telemetry,
@@ -1310,11 +1309,8 @@ impl<'a> ProjectionWriter<'a> {
                     .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
             }
         }
-        self.pending_error_file_ids
-            .extend(local_storage.files.iter().map(|file| file.id));
         for error in local_storage.errors.drain(..) {
-            if let Some(file_id) = error.file_id {
-                self.pending_error_file_ids.insert(file_id.0);
+            if error.file_id.is_some() {
                 self.pending_file_errors.push(error);
             } else {
                 self.all_errors.push(error);
@@ -1344,15 +1340,11 @@ impl<'a> ProjectionWriter<'a> {
             let breakdown = WorkspaceIndexer::flush_projection_batch(
                 self.storage,
                 &mut self.batched_storage,
+                &mut self.pending_file_errors,
                 &mut self.had_edges,
                 &mut self.stats,
             )?;
             accumulate_flush_breakdown(&mut self.stats, breakdown);
-            WorkspaceIndexer::flush_file_errors(
-                self.storage,
-                &mut self.pending_error_file_ids,
-                &mut self.pending_file_errors,
-            )?;
         }
 
         if self.all_errors.len() >= self.batch_config.error_batch_size {
@@ -1374,15 +1366,11 @@ impl<'a> ProjectionWriter<'a> {
         let breakdown = WorkspaceIndexer::flush_projection_batch(
             self.storage,
             &mut self.batched_storage,
+            &mut self.pending_file_errors,
             &mut self.had_edges,
             &mut self.stats,
         )?;
         accumulate_flush_breakdown(&mut self.stats, breakdown);
-        WorkspaceIndexer::flush_file_errors(
-            self.storage,
-            &mut self.pending_error_file_ids,
-            &mut self.pending_file_errors,
-        )?;
         Ok(ProjectionWriterOutput {
             stats: self.stats,
             all_errors: self.all_errors,
@@ -2586,26 +2574,10 @@ impl WorkspaceIndexer {
         Ok(())
     }
 
-    fn flush_file_errors(
-        storage: &mut Storage,
-        file_ids: &mut HashSet<i64>,
-        errors: &mut Vec<codestory_contracts::graph::ErrorInfo>,
-    ) -> Result<()> {
-        if file_ids.is_empty() {
-            return Ok(());
-        }
-
-        let file_ids = file_ids.drain().collect::<Vec<_>>();
-        storage
-            .replace_errors_for_files_batch(&file_ids, errors)
-            .map_err(|e| anyhow!("Storage file error replacement error: {:?}", e))?;
-        errors.clear();
-        Ok(())
-    }
-
     fn flush_projection_batch(
         storage: &mut Storage,
         batched_storage: &mut IntermediateStorage,
+        file_errors: &mut Vec<codestory_contracts::graph::ErrorInfo>,
         had_edges: &mut bool,
         stats: &mut IncrementalIndexingStats,
     ) -> Result<codestory_store::ProjectionFlushBreakdown> {
@@ -2635,6 +2607,7 @@ impl WorkspaceIndexer {
                 occurrences: &batched_storage.occurrences,
                 component_access: &batched_storage.component_access,
                 callable_projection_states: &batched_storage.callable_projection_states,
+                file_errors,
             })
             .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         if let Some(flush_started) = flush_started {
@@ -2650,6 +2623,7 @@ impl WorkspaceIndexer {
         }
 
         batched_storage.clear();
+        file_errors.clear();
         Ok(breakdown)
     }
 
@@ -3737,6 +3711,9 @@ fn accumulate_projection_writer_stats(
     stats.projection_batch_transactions = stats
         .projection_batch_transactions
         .saturating_add(writer_stats.projection_batch_transactions);
+    stats
+        .projection_persistence
+        .accumulate(writer_stats.projection_persistence);
     stats.flush_files_ms = stats
         .flush_files_ms
         .saturating_add(writer_stats.flush_files_ms);
@@ -3768,6 +3745,9 @@ fn accumulate_flush_breakdown(
     stats: &mut IncrementalIndexingStats,
     breakdown: codestory_store::ProjectionFlushBreakdown,
 ) {
+    stats
+        .projection_persistence
+        .accumulate(breakdown.persistence);
     let total = projection_flush_breakdown_ms(&breakdown);
     stats.projection_flush_ms = stats.projection_flush_ms.saturating_add(total);
     stats.flush_files_ms = stats
@@ -21896,6 +21876,44 @@ public:
     }
 
     #[test]
+    fn test_file_scoped_errors_share_projection_transaction() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let broken = dir.path().join("broken.rs");
+        std::fs::write(&broken, "fn broken( {\n")?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![broken],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(8)
+            .run(&mut storage, &plan, &EventBus::new(), None)?;
+
+        let errors = storage.get_errors(None)?;
+        assert!(!errors.is_empty());
+        assert!(errors.iter().all(|error| error.file_id.is_some()));
+        assert_eq!(stats.projection_batch_transactions, 1);
+        assert_eq!(stats.projection_persistence.transactions, 1);
+        assert_eq!(
+            stats
+                .projection_persistence
+                .file_errors
+                .statement_executions,
+            1 + errors.len() as u64
+        );
+        assert_eq!(
+            stats.projection_persistence.file_errors.row_attempts,
+            1 + errors.len() as u64
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_rust_2024_constructs_are_complete() -> Result<()> {
         let language_config = get_language_for_ext("rs").unwrap();
         let result = index_file(
@@ -22791,6 +22809,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                 occurrences: &projected.occurrences,
                 component_access: &projected.component_access,
                 callable_projection_states: &projected.callable_projection_states,
+                file_errors: &[],
             })?;
         let publication = codestory_store::IndexPublicationRecord {
             generation: 1,
@@ -23459,6 +23478,33 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             pipeline_stats.projection_batch_transactions
         );
         assert!(serial_stats.projection_batch_transactions > 0);
+        assert_eq!(
+            serial_stats.projection_persistence.transactions,
+            serial_stats.projection_batch_transactions as u64
+        );
+        assert_eq!(
+            pipeline_stats.projection_persistence.transactions,
+            pipeline_stats.projection_batch_transactions as u64
+        );
+        assert_eq!(
+            serial_stats.projection_persistence.row_attempts(),
+            pipeline_stats.projection_persistence.row_attempts()
+        );
+        assert_eq!(
+            serial_stats.projection_persistence.bound_bytes(),
+            pipeline_stats.projection_persistence.bound_bytes()
+        );
+        assert_eq!(
+            serial_stats.projection_persistence.statement_executions(),
+            pipeline_stats.projection_persistence.statement_executions()
+        );
+        assert!(
+            serial_stats
+                .projection_persistence
+                .file_errors
+                .statement_executions
+                > 0
+        );
         assert!(serial_stats.projection_batch_wall_ms >= serial_stats.projection_flush_ms);
         assert!(pipeline_stats.projection_batch_wall_ms >= pipeline_stats.projection_flush_ms);
         Ok(())
@@ -26140,6 +26186,7 @@ jobs:
                 occurrences: &local.occurrences,
                 component_access: &local.component_access,
                 callable_projection_states: &local.callable_projection_states,
+                file_errors: &[],
             })?;
 
         let edges = storage.get_edges()?;

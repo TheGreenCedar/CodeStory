@@ -306,13 +306,13 @@ Projection flushes write more than the core graph:
 - structural artifact-cache writes
 
 The store flush path writes the verified hash beside the file row and clears it
-when a refreshed row has no verified content identity. For a structural file,
-the source hash, graph rows, units, projection, and dedicated cache entry
-advance in the same SQLite transaction. Modification time is captured only
-after the verification read matches. The same flush invalidates grounding
-snapshots and the prior complete structural-unit manifest as part of
-persistence. Projection flush is both a write boundary and a derived-state
-invalidation boundary.
+when a refreshed row has no verified content identity. The source hash, graph
+rows, structural units and cache entry, file-scoped error replacement, and
+grounding/resolution dirty markers advance in the same SQLite transaction.
+Modification time is captured only after the verification read matches.
+Projection flush is both a write boundary and a derived-state invalidation
+boundary; it does not follow the graph commit with a second error transaction
+or snapshot autocommits.
 
 Full-refresh timing output includes produced and persisted chunk counts, queue
 capacity and high-water mark, producer backpressure time, and writer idle time.
@@ -322,8 +322,11 @@ Those fields are omitted for the serial incremental path.
 artifact lookup before a file is parsed or reused. `projection_batch_wall_ms`
 covers complete nonempty store flush calls, including transaction setup and
 commit; `projection_flush_ms` and its per-table breakdown are nested inside it.
-The accompanying transaction count is therefore a persistence boundary count,
-not a row count.
+The accompanying `projection_persistence` object reports transactions,
+transaction/setup/commit wall, and each persisted family's logical row
+attempts, estimated raw bind-input bytes, statement executions, and wall. These
+are nested diagnostics, not additive phases. Bound-input bytes are not
+database, WAL, or physical-write bytes.
 
 ### 8. Resolution happens after flushes
 
@@ -491,6 +494,7 @@ The index summary reports graph and semantic work separately:
 - `symbol_index.stream_ms`, `stream_rows`, and `stream_batches`: nested canonical-node read telemetry; stream time is part of `cache_ms.search_index`, not an additive phase
 - `symbol_index`: documents written plus Tantivy writer, commit, and reader-reload counts and final commit/reload durations; all are nested inside `cache_ms.search_index`, and completed-generation reuse reports zero
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
+- `projection_persistence`: transaction count and wall plus per-family row attempts, estimated bound-input bytes, statement executions, and wall; setup, commit, and family walls are nested in `projection_batch_wall_ms`
 - `semantic_ms.context_index`: creating the four staged edge endpoint indexes before semantic context reads; this is nested in `timings_ms.deferred_indexes`
 - `semantic_ms.node_load` and `node_rows`: loading the complete staged node set before semantic selection
 - `semantic_ms.context`: loading the graph context used by generated semantic documents

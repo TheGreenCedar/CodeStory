@@ -24,10 +24,11 @@ use codestory_contracts::api::{
     IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
     ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    ProjectSummary, ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
+    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
@@ -4305,6 +4306,40 @@ fn artifact_cache_access_timings(stats: &ArtifactCacheFamilyStats) -> ArtifactCa
         misses: clamp_usize_to_u32(stats.misses),
         reader_opens: clamp_usize_to_u32(stats.reader_opens),
         lookup_wall_ms: clamp_u64_to_u32(stats.lookup_wall_ns / 1_000_000),
+    }
+}
+
+fn projection_persistence_family_timings(
+    stats: codestory_store::ProjectionPersistenceFamilyStats,
+) -> ProjectionPersistenceFamilyTimings {
+    ProjectionPersistenceFamilyTimings {
+        row_attempts: stats.row_attempts,
+        bound_bytes: stats.bound_bytes,
+        statement_executions: stats.statement_executions,
+        wall_ms: stats.wall_ms,
+    }
+}
+
+fn projection_persistence_timings(
+    stats: &codestory_store::ProjectionPersistenceStats,
+) -> ProjectionPersistenceTimings {
+    ProjectionPersistenceTimings {
+        transactions: stats.transactions.min(u32::MAX as u64) as u32,
+        row_attempts: stats.row_attempts(),
+        bound_bytes: stats.bound_bytes(),
+        statement_executions: stats.statement_executions(),
+        transaction_wall_ms: stats.transaction_wall_ms,
+        transaction_setup_ms: stats.transaction_setup_ms,
+        commit_ms: stats.commit_ms,
+        files: projection_persistence_family_timings(stats.files),
+        nodes: projection_persistence_family_timings(stats.nodes),
+        structural_text: projection_persistence_family_timings(stats.structural_text),
+        edges: projection_persistence_family_timings(stats.edges),
+        occurrences: projection_persistence_family_timings(stats.occurrences),
+        component_access: projection_persistence_family_timings(stats.component_access),
+        callable_projection: projection_persistence_family_timings(stats.callable_projection),
+        file_errors: projection_persistence_family_timings(stats.file_errors),
+        dirty_state: projection_persistence_family_timings(stats.dirty_state),
     }
 }
 
@@ -15055,6 +15090,9 @@ fn index_full_for_runtime(
             projection_batch_transactions: Some(clamp_usize_to_u32(
                 index_stats.projection_batch_transactions,
             )),
+            projection_persistence: Some(projection_persistence_timings(
+                &index_stats.projection_persistence,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_stream_ms: None,
@@ -15784,6 +15822,9 @@ fn run_incremental_indexing_common(
             projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
             projection_batch_transactions: Some(clamp_usize_to_u32(
                 index_stats.projection_batch_transactions,
+            )),
+            projection_persistence: Some(projection_persistence_timings(
+                &index_stats.projection_persistence,
             )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
@@ -22335,6 +22376,7 @@ fn build_llm_symbol_doc_text() -> String {
                 occurrences: &[],
                 component_access: &[],
                 callable_projection_states: &[],
+                file_errors: &[],
             })
             .expect("insert verified structural projection");
         let node_names = HashMap::from([(CoreNodeId(41), "demo".to_string())]);
@@ -26487,6 +26529,21 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(full_timings.full_refresh_chunk_max_nodes.is_some());
         assert_eq!(full_timings.full_refresh_chunk_budget_overruns, Some(0));
         assert!(full_timings.full_refresh_chunk_planning_ms.is_some());
+        let full_projection = full_timings
+            .projection_persistence
+            .as_ref()
+            .expect("full projection persistence telemetry");
+        assert_eq!(
+            Some(full_projection.transactions),
+            full_timings.projection_batch_transactions
+        );
+        assert!(full_projection.row_attempts > 0);
+        assert!(full_projection.bound_bytes > 0);
+        assert!(full_projection.statement_executions > 0);
+        assert_eq!(
+            full_projection.dirty_state.statement_executions,
+            u64::from(full_projection.transactions) * 4
+        );
         assert_eq!(
             full_timings.staged_sqlite_wal_autocheckpoint_bytes,
             Some(64 * 1024 * 1024)
@@ -26586,6 +26643,19 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(incremental_timings.full_refresh_chunk_planning_ms.is_none());
         assert!(incremental_timings.full_refresh_wall.is_none());
+        let incremental_projection = incremental_timings
+            .projection_persistence
+            .as_ref()
+            .expect("incremental projection persistence telemetry");
+        assert_eq!(
+            Some(incremental_projection.transactions),
+            incremental_timings.projection_batch_transactions
+        );
+        assert!(incremental_projection.row_attempts > 0);
+        assert_eq!(
+            incremental_projection.dirty_state.statement_executions,
+            u64::from(incremental_projection.transactions) * 4
+        );
         assert!(
             incremental_timings
                 .staged_sqlite_wal_autocheckpoint_bytes
