@@ -11509,6 +11509,12 @@ mod grounding_snapshot_fast_path_tests {
             "src/second/main.ts",
             &[(201, NodeKind::FUNCTION, "main", 1)],
         )?;
+        insert_grounding_test_file(
+            &mut storage,
+            30,
+            "src/app/page.tsx",
+            &[(301, NodeKind::FUNCTION, "Page", 40)],
+        )?;
 
         let fallback = storage
             .get_grounding_root_symbols_for_files(&[10], 1)?
@@ -11521,15 +11527,26 @@ mod grounding_snapshot_fast_path_tests {
             "startapplication".to_string(),
             "main".to_string(),
         ];
+        let uppercase_globs = [
+            "Page".to_string(),
+            "Layout".to_string(),
+            "[A-Z]*Page".to_string(),
+            "[A-Z]*Layout".to_string(),
+        ];
         let mut named_fallback = storage
-            .get_grounding_named_root_symbols_for_files(&[5, 10, 20], &named_exact, &[], 2)?
+            .get_grounding_named_root_symbols_for_files(
+                &[5, 10, 20, 30],
+                &named_exact,
+                &uppercase_globs,
+                2,
+            )?
             .into_iter()
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
         named_fallback.sort();
         assert_eq!(
             named_fallback,
-            vec!["main", "run_app", "run_app", "start_application"]
+            vec!["Page", "main", "run_app", "run_app", "start_application"]
         );
 
         storage.refresh_grounding_summary_snapshots()?;
@@ -11541,7 +11558,12 @@ mod grounding_snapshot_fast_path_tests {
             .collect::<Vec<_>>();
         assert_eq!(snapshot, fallback);
         let mut named_snapshot = storage
-            .get_grounding_named_root_symbols_for_files(&[5, 10, 20], &named_exact, &[], 2)?
+            .get_grounding_named_root_symbols_for_files(
+                &[5, 10, 20, 30],
+                &named_exact,
+                &uppercase_globs,
+                2,
+            )?
             .into_iter()
             .map(|record| record.display_name)
             .collect::<Vec<_>>();

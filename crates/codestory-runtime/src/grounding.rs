@@ -50,7 +50,8 @@ const ARCHITECTURE_ROOT_EXACT_NAMES: &[&str] = &[
     "head",
     "options",
 ];
-const ARCHITECTURE_ROOT_UPPERCASE_GLOBS: &[&str] = &["[A-Z]*Page", "[A-Z]*Layout"];
+const ARCHITECTURE_ROOT_UPPERCASE_GLOBS: &[&str] =
+    &["Page", "Layout", "[A-Z]*Page", "[A-Z]*Layout"];
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
