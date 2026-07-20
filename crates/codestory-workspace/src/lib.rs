@@ -1079,13 +1079,14 @@ impl WorkspaceDiscovery {
         inputs: &RefreshInputs,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let inventory = self.source_inventory_with_policy_inner(
+        let mut inventory = self.source_inventory_with_policy_inner(
             manifest,
             policy.byte_cap,
             &policy.policy_version,
             policy.structural_unit_cap,
             None,
         )?;
+        self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1136,13 +1137,14 @@ impl WorkspaceDiscovery {
         max_current_files: usize,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        let inventory = self.source_inventory_with_policy_inner(
+        let mut inventory = self.source_inventory_with_policy_inner(
             manifest,
             policy.byte_cap,
             &policy.policy_version,
             policy.structural_unit_cap,
             Some(max_current_files),
         )?;
+        self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1154,6 +1156,56 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
         })
+    }
+
+    fn carry_forward_verified_policy_exclusions(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        policy: &SourceIndexPolicy,
+        inventory: &mut WorkspacePolicyFileInventory,
+    ) {
+        if !inventory.outcome.is_complete() || inputs.policy_exclusions.is_empty() {
+            return;
+        }
+
+        let root = workspace_root(manifest);
+        let mut current_policy_paths = inventory
+            .policy_exclusions
+            .iter()
+            .map(|candidate| candidate.normalized_path.clone())
+            .collect::<HashSet<_>>();
+        for candidate in &inputs.policy_exclusions {
+            if current_policy_paths.contains(&candidate.normalized_path)
+                || candidate.observed_unit_count == 0
+                || self
+                    .revalidate_source_policy_exclusions(
+                        manifest,
+                        std::slice::from_ref(candidate),
+                        policy,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+
+            let candidate_key =
+                normalized_compare_key(&root, &root.join(&candidate.normalized_path));
+            let Some(position) = inventory
+                .files
+                .iter()
+                .position(|path| normalized_compare_key(&root, path) == candidate_key)
+            else {
+                continue;
+            };
+            inventory.files.swap_remove(position);
+            current_policy_paths.insert(candidate.normalized_path.clone());
+            inventory.policy_exclusions.push(candidate.clone());
+        }
+        inventory.files.sort();
+        inventory
+            .policy_exclusions
+            .sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
     }
 
     /// Compare current discovery with stored inventory unless discovery exceeds
@@ -2073,6 +2125,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
         )?;
@@ -2128,6 +2181,7 @@ mod tests {
             &manifest,
             &RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([(
                     excluded,
                     IndexedFileRecord {
@@ -2244,6 +2298,46 @@ mod tests {
     }
 
     #[test]
+    fn refresh_carries_forward_unchanged_structural_unit_exclusions() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let path = root.join("evidence.json");
+        fs::write(&path, "{\"one\":1,\"two\":2,\"three\":3}\n")?;
+        let policy = SourceIndexPolicy {
+            policy_version: "test-structural-policy-v1".to_string(),
+            byte_cap: 1_000,
+            structural_unit_cap: 2,
+        };
+        let (content_hash, observed_size) = current_content_identity(&path)?;
+        let retained = OversizedSourceExclusionCandidate {
+            normalized_path: "evidence.json".to_string(),
+            content_hash,
+            observed_size,
+            observed_unit_count: 3,
+            policy_version: policy.policy_version.clone(),
+            byte_cap: policy.byte_cap,
+            structural_unit_cap: policy.structural_unit_cap,
+        };
+        let manifest = WorkspaceManifest::open(root)?;
+        let inputs = RefreshInputs {
+            stored_files: Vec::new(),
+            policy_exclusions: vec![retained.clone()],
+            inventory: WorkspaceInventory::default(),
+        };
+
+        let unchanged = manifest.build_execution_outcome_with_policy(&inputs, &policy)?;
+        assert!(unchanged.refresh.plan.files_to_index.is_empty());
+        assert_eq!(unchanged.policy_exclusions, vec![retained.clone()]);
+
+        fs::write(&path, "{\"one\":1,\"two\":2,\"three\":4}\n")?;
+        let changed = manifest.build_execution_outcome_with_policy(&inputs, &policy)?;
+        assert_eq!(changed.refresh.plan.files_to_index, vec![path]);
+        assert!(changed.policy_exclusions.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn partial_discovery_never_classifies_a_deletion_capable_exclusion_set() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
@@ -2283,6 +2377,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
         )?;
@@ -2318,6 +2413,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
         )?;
@@ -2347,10 +2443,12 @@ mod tests {
                     complete: false,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
             RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([(
                     file.clone(),
                     IndexedFileRecord {
@@ -2396,10 +2494,12 @@ mod tests {
                     complete: false,
                     retry_required: true,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
             RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([(
                     file.clone(),
                     IndexedFileRecord {
@@ -2437,6 +2537,7 @@ mod tests {
             &manifest,
             &RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([
                     (
                         file.clone(),
@@ -2497,6 +2598,7 @@ mod tests {
                 complete: true,
                 retry_required: false,
             }],
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })?;
 
@@ -2528,6 +2630,7 @@ mod tests {
                 complete: true,
                 retry_required: false,
             }],
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })?;
 
@@ -2563,6 +2666,7 @@ mod tests {
                 complete: true,
                 retry_required: false,
             }],
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })?;
 
@@ -2615,6 +2719,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
             1,

@@ -58,7 +58,7 @@ use codestory_store::{
     DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
     GroundingNodeRecord, IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc,
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, SourcePolicyExclusionPolicyIdentity,
-    Store, SymbolSearchDoc, SymbolSummaryRecord,
+    SourcePolicyExclusionRecord, Store, SymbolSearchDoc, SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 #[cfg(test)]
@@ -5262,6 +5262,20 @@ fn publish_source_policy_exclusions(
     Ok(())
 }
 
+fn source_policy_exclusion_candidate(
+    record: &SourcePolicyExclusionRecord,
+) -> OversizedSourceExclusionCandidate {
+    OversizedSourceExclusionCandidate {
+        normalized_path: record.normalized_path.clone(),
+        content_hash: record.content_hash.clone(),
+        observed_size: record.observed_size,
+        observed_unit_count: record.observed_unit_count,
+        policy_version: record.policy_version.clone(),
+        byte_cap: record.byte_cap,
+        structural_unit_cap: record.structural_unit_cap,
+    }
+}
+
 fn revalidate_source_policy_exclusions(
     workspace: &WorkspaceManifest,
     exclusions: &[OversizedSourceExclusionCandidate],
@@ -5662,8 +5676,22 @@ where
         .iter()
         .map(|file| (file.id, file.path.clone()))
         .collect::<HashMap<_, _>>();
+    let stored_policy_exclusions = match storage.get_source_policy_exclusions() {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                format!("failed to read source policy exclusions: {error}"),
+                indexed_file_count,
+                started_at,
+            ));
+        }
+    };
     let refresh_inputs = RefreshInputs {
         stored_files,
+        policy_exclusions: stored_policy_exclusions
+            .iter()
+            .map(source_policy_exclusion_candidate)
+            .collect(),
         inventory: Default::default(),
     };
     let refresh = match workspace.build_execution_outcome_bounded_with_policy(
@@ -5727,16 +5755,6 @@ where
         }
     }
 
-    let stored_policy_exclusions = match storage.get_source_policy_exclusions() {
-        Ok(exclusions) => exclusions,
-        Err(error) => {
-            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
-                format!("failed to read source policy exclusions: {error}"),
-                indexed_file_count,
-                started_at,
-            ));
-        }
-    };
     let previous_policy_by_path = stored_policy_exclusions
         .iter()
         .map(|entry| (entry.normalized_path.as_str(), entry))
@@ -5755,8 +5773,10 @@ where
             Some(previous)
                 if previous.content_hash == exclusion.content_hash
                     && previous.observed_size == exclusion.observed_size
+                    && previous.observed_unit_count == exclusion.observed_unit_count
                     && previous.policy_version == exclusion.policy_version
-                    && previous.byte_cap == exclusion.byte_cap =>
+                    && previous.byte_cap == exclusion.byte_cap
+                    && previous.structural_unit_cap == exclusion.structural_unit_cap =>
             {
                 continue;
             }
@@ -16843,6 +16863,14 @@ fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
             .files()
             .inventory()
             .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?,
+        policy_exclusions: store
+            .get_source_policy_exclusions()
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to read source policy exclusions: {e}"))
+            })?
+            .iter()
+            .map(source_policy_exclusion_candidate)
+            .collect(),
         inventory: Default::default(),
     })
 }
@@ -24203,6 +24231,14 @@ fn build_llm_symbol_doc_text() -> String {
             files.policy_exclusions[0].observed_unit_count,
             codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
         );
+        let workspace_manifest =
+            WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+        let freshness =
+            index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 0);
+        assert_eq!(freshness.removed_file_count, 0);
     }
 
     #[test]

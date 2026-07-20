@@ -296,6 +296,7 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
     let refresh = workspace
         .build_execution_outcome(&RefreshInputs {
             stored_files: storage.files().inventory()?,
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })
         .context("build source cache refresh plan")?;

@@ -50,6 +50,7 @@ fn refresh_inputs_from_storage(storage: &Storage) -> codestory_workspace::Refres
             .files()
             .inventory()
             .expect("list benchmark storage inventory"),
+        policy_exclusions: Vec::new(),
         inventory: Default::default(),
     }
 }

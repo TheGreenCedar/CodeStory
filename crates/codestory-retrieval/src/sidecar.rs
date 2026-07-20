@@ -346,6 +346,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
     let plan = workspace
         .build_execution_plan(&RefreshInputs {
             stored_files,
+            policy_exclusions: Vec::new(),
             inventory: Default::default(),
         })
         .context("build strict retrieval freshness plan")?;

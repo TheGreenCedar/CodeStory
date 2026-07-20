@@ -4,6 +4,12 @@
 
 ### Release
 
+- Incremental freshness now carries forward unchanged verified structural-unit
+  exclusions even though they intentionally have no parser-backed file row.
+  This stops managed activation from republishing the same excluded inputs as
+  new files on every retry. If a replacement core does publish before later
+  freshness validation fails, retained local navigation now rebinds to that
+  exact live generation so `ground` can continue without widening broad search.
 - Project activation retries now retain one operation ID with monotonic
   revision, stage, attempt, and progress fields. Request cancellation no longer
   replaces shared preparation, and failed replacements bind any still-complete
