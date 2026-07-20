@@ -129,14 +129,18 @@ budget, checkpoint time, and sync time. Generic build stores and incremental
 clones keep WAL/NORMAL throughout.
 
 Incremental clone telemetry records the successful live-to-staged SQLite
-backup wall and the logical source/target database bytes. Every successful
-core publication also reports nested promotion telemetry for lock/recovery,
-candidate and prior-live validation, the optional rollback-backup copy and
-validation, prepared-journal write/file sync/directory sync, staged-to-live
-restore, promoted-live validation, committed-journal transition, and cleanup.
-The promotion object retains candidate, prior-live, and rollback-backup logical
-bytes plus a saturating residual that reconciles its displayed total. These are
-diagnostics inside publication wall, not additional top-level phases.
+backup call and the logical source/target database bytes. The clone happens
+before incremental indexing begins, so `staged_snapshot_copy` is independent
+of the later `publish_ms` wall. Every successful core publication also reports
+nested promotion telemetry for lock/recovery, candidate and prior-live
+validation, the optional rollback-backup copy and validation, prepared-journal
+write/file sync/directory sync, staged-to-live restore, promoted-live
+validation, committed-journal transition, and cleanup. The promotion object
+retains candidate, prior-live, and rollback-backup logical bytes plus a
+saturating residual that reconciles its displayed total. Logical bytes use
+SQLite `page_count * page_size`, including committed pages still backed by WAL;
+they do not measure filesystem allocation or physical writes. Only
+`core_promotion` is a diagnostic nested inside the publication wall.
 
 The indexer does not know whether the store is staged or live.
 
@@ -546,14 +550,15 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
 - `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v1`
-- `staged_snapshot_copy`: successful incremental live-to-staged SQLite backup wall and logical source/target database bytes; absent for full refresh
+- `staged_snapshot_copy`: successful incremental live-to-staged SQLite backup-call wall and logical source/target database bytes (`page_count * page_size`); this clone happens before incremental indexing, is outside `publish_ms`, and is absent for full refresh
 - `core_promotion`: successful nested promotion wall, validation/copy/journal/restore/cleanup subphases, logical candidate/prior/rollback database bytes, and its saturating residual; rollback backup fields are absent for a first publication
 
 Only the sibling fields inside `full_refresh_wall_ms` are additive. Indexer
 children, semantic diagnostics, search stream/commit/reload timings, snapshot
-timings, SQLite checkpoint/sync and snapshot-copy timings, core-promotion
-timings, and runtime-cache publication are nested diagnostics and must not be
-added again. Inside `core_promotion`, named millisecond fields plus
+timings, SQLite checkpoint/sync, core-promotion timings, and runtime-cache
+publication are nested diagnostics and must not be added again.
+`staged_snapshot_copy` is an earlier independent wall and is not part of
+`publish_ms`. Inside `core_promotion`, named millisecond fields plus
 `unattributed_ms` reconcile to `total_ms`; optional backup fields distinguish a
 first publication from a replacement instead of reporting fabricated zero-work
 phases. The repo-scale evidence artifact retains the complete first and repeat

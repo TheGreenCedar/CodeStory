@@ -250,8 +250,8 @@ named fault and race cases for:
 - stale/invalid backup ambiguity;
 - successful first and replacement publication telemetry, including
   incremental live-to-staged copy bytes, optional rollback-backup phases,
-  candidate/prior/backup logical bytes, and exact named-plus-residual
-  reconciliation inside the promotion wall;
+  candidate/prior/backup SQLite logical bytes (`page_count * page_size`), and
+  exact named-plus-residual reconciliation inside the promotion wall;
 - structural-unit descriptor determinism across all twelve unit collectors,
   exact source spans, cross-file content-versus-placement identity, and
   zero-unit projection completeness;

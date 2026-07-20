@@ -329,6 +329,23 @@ mod tests {
         root
     }
 
+    fn logical_database_bytes(path: &Path) -> u64 {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open database for logical byte count");
+        let page_count: i64 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .expect("read database page count");
+        let page_size: i64 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("read database page size");
+        let page_count = u64::try_from(page_count).expect("non-negative database page count");
+        let page_size = u64::try_from(page_size).expect("non-negative database page size");
+        page_count
+            .checked_mul(page_size)
+            .expect("logical database bytes")
+    }
+
     fn publish_empty_source_policy(store: &mut Store, publication: &crate::IndexPublicationRecord) {
         store
             .publish_structural_text_unit_generation(publication)
@@ -520,9 +537,7 @@ mod tests {
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,
-            fs::metadata(&live_path)
-                .expect("read full replacement database size")
-                .len()
+            logical_database_bytes(&live_path)
         );
 
         let _ = fs::remove_dir_all(&temp);
@@ -690,9 +705,7 @@ mod tests {
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,
-            fs::metadata(&live_path)
-                .expect("read promoted database size")
-                .len()
+            logical_database_bytes(&live_path)
         );
 
         let live = Store::open(&live_path).expect("open promoted live store");
@@ -854,38 +867,51 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_copy_reports_bounded_database_image_bytes() {
+    fn snapshot_copy_reports_wal_backed_logical_database_image_bytes() {
         const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
         let temp = fresh_temp_root("copy-telemetry");
         let source_path = temp.join("source.sqlite");
         let target_path = temp.join("target.sqlite");
-        {
-            let source = Store::open(&source_path).expect("open copy source");
-            source
-                .get_connection()
-                .execute_batch(
-                    "CREATE TABLE bounded_copy_payload (payload BLOB NOT NULL);
-                     INSERT INTO bounded_copy_payload(payload) VALUES (zeroblob(2097152));",
-                )
-                .expect("seed bounded copy payload");
-        }
-        let source_bytes = fs::metadata(&source_path)
+        let source = Store::open(&source_path).expect("open copy source");
+        source
+            .get_connection()
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable automatic checkpoint");
+        source
+            .get_connection()
+            .execute_batch(
+                "CREATE TABLE bounded_copy_payload (payload BLOB NOT NULL);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("checkpoint copy fixture schema");
+        let checkpointed_file_bytes = fs::metadata(&source_path)
             .expect("read source database size")
             .len();
-        assert!(source_bytes >= PAYLOAD_BYTES as u64);
+        source
+            .get_connection()
+            .execute(
+                "INSERT INTO bounded_copy_payload(payload) VALUES (zeroblob(?1))",
+                [PAYLOAD_BYTES as i64],
+            )
+            .expect("seed uncheckpointed WAL payload");
+        let wal_path = PathBuf::from(format!("{}-wal", source_path.display()));
+        assert!(
+            fs::metadata(&wal_path).expect("read source WAL size").len() > 0,
+            "fixture must retain committed pages in WAL"
+        );
+        let source_logical_bytes = logical_database_bytes(&source_path);
+        assert!(
+            source_logical_bytes > checkpointed_file_bytes,
+            "logical bytes must include the uncheckpointed WAL-backed pages"
+        );
 
         let stats =
             Store::copy_database_snapshot(&source_path, &target_path).expect("copy database");
 
-        assert_eq!(stats.source_bytes, source_bytes);
-        assert_eq!(
-            stats.target_bytes,
-            fs::metadata(&target_path)
-                .expect("read target database size")
-                .len()
-        );
+        assert_eq!(stats.source_bytes, source_logical_bytes);
         assert_eq!(stats.source_bytes, stats.target_bytes);
+        assert_eq!(stats.target_bytes, logical_database_bytes(&target_path));
         let copied = Store::open_read_only(&target_path).expect("open copied database");
         let payload_bytes: i64 = copied
             .get_connection()
@@ -897,6 +923,8 @@ mod tests {
             .expect("read copied payload");
         assert_eq!(payload_bytes, PAYLOAD_BYTES as i64);
 
+        drop(copied);
+        drop(source);
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -1106,9 +1134,7 @@ mod tests {
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,
-            fs::metadata(&live_path)
-                .expect("read incremental promoted database size")
-                .len()
+            logical_database_bytes(&live_path)
         );
 
         let old_paths = old_reader

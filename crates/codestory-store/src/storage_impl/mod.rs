@@ -90,6 +90,10 @@ const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
+///
+/// Logical bytes are SQLite `page_count * page_size` for the source snapshot
+/// and copied target. They are not filesystem allocation or physical-write
+/// telemetry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DatabaseSnapshotCopyStats {
     pub copy_ms: u32,
@@ -204,10 +208,29 @@ fn duration_ms(duration: Duration) -> u32 {
     duration.as_millis().min(u32::MAX as u128) as u32
 }
 
-fn database_logical_bytes(path: &Path) -> Result<u64, StorageError> {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| promotion_path_error("read database metadata for", path, error))
+fn database_logical_bytes(connection: &Connection) -> Result<u64, StorageError> {
+    let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count = u64::try_from(page_count).map_err(|_| {
+        promotion_error(format!(
+            "SQLite reported an invalid negative page_count: {page_count}"
+        ))
+    })?;
+    let page_size = u64::try_from(page_size).map_err(|_| {
+        promotion_error(format!(
+            "SQLite reported an invalid negative page_size: {page_size}"
+        ))
+    })?;
+    page_count.checked_mul(page_size).ok_or_else(|| {
+        promotion_error(format!(
+            "SQLite logical database bytes overflowed: page_count={page_count}, page_size={page_size}"
+        ))
+    })
+}
+
+fn database_logical_bytes_at_path(path: &Path) -> Result<u64, StorageError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    database_logical_bytes(&connection)
 }
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
@@ -3436,7 +3459,6 @@ impl Storage {
         source_path: &Path,
         target_path: &Path,
     ) -> Result<DatabaseSnapshotCopyStats, StorageError> {
-        let copy_started = Instant::now();
         recover_interrupted_promotion(source_path)?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -3446,12 +3468,15 @@ impl Storage {
                 ))
             })?;
         }
-        let source_bytes = database_logical_bytes(source_path)?;
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let source_bytes = database_logical_bytes(&source)?;
+        let copy_started = Instant::now();
         source.backup(MAIN_DB, target_path, None::<fn(rusqlite::backup::Progress)>)?;
-        let target_bytes = database_logical_bytes(target_path)?;
+        let copy_ms = duration_ms(copy_started.elapsed());
+        let target = Connection::open_with_flags(target_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let target_bytes = database_logical_bytes(&target)?;
         Ok(DatabaseSnapshotCopyStats {
-            copy_ms: duration_ms(copy_started.elapsed()),
+            copy_ms,
             source_bytes,
             target_bytes,
         })
@@ -4816,7 +4841,7 @@ impl Storage {
                 staged_path.display()
             )));
         }
-        let candidate_bytes = database_logical_bytes(staged_path)?;
+        let candidate_bytes = database_logical_bytes_at_path(staged_path)?;
         durations.candidate_validation = candidate_validation_started.elapsed();
 
         let previous_validation_started = Instant::now();
@@ -4833,7 +4858,7 @@ impl Storage {
         cleanup_sqlite_sidecars(&backup_path)?;
         let previous_live_bytes = previous
             .as_ref()
-            .map(|_| database_logical_bytes(live_path))
+            .map(|_| database_logical_bytes_at_path(live_path))
             .transpose()?;
         durations.previous_validation = previous_validation_started.elapsed();
 
@@ -4874,7 +4899,7 @@ impl Storage {
                 &previous_structural_text,
                 "Promotion backup",
             )?;
-            rollback_backup_bytes = Some(database_logical_bytes(&backup_path)?);
+            rollback_backup_bytes = Some(database_logical_bytes_at_path(&backup_path)?);
             durations.backup_validation = Some(backup_validation_started.elapsed());
         }
 
