@@ -18335,6 +18335,154 @@ mod tests {
     }
 
     #[test]
+    fn incremental_openapi_structural_transitions_replace_file_owned_projection_atomically() {
+        fn endpoint_ids(storage: &Storage) -> HashSet<String> {
+            storage
+                .get_nodes()
+                .expect("load endpoint nodes")
+                .into_iter()
+                .filter_map(|node| node.canonical_id)
+                .filter(|canonical_id| canonical_id.starts_with("openapi:endpoint:"))
+                .collect()
+        }
+
+        let workspace = tempdir().expect("workspace");
+        let schema_path = workspace.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/old\":{\"get\":{}}}}\n",
+        )
+        .expect("write baseline OpenAPI source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open OpenAPI project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline OpenAPI projection");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        assert_eq!(
+            endpoint_ids(&Storage::open(&storage_path).expect("reopen baseline")),
+            HashSet::from(["openapi:endpoint:GET /old".to_string()])
+        );
+
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/renamed\":{\"post\":{}}}}\n",
+        )
+        .expect("write renamed OpenAPI endpoint");
+        arm_publication_test_fault(
+            PublicationTestBoundary::MarkerCompletion,
+            PublicationTestAction::Fail,
+        );
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("injected staged transition failure must reject publication");
+        assert_eq!(error.code, "internal");
+        let preserved = Storage::open(&storage_path).expect("open preserved baseline");
+        assert_eq!(
+            preserved
+                .get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline)
+        );
+        assert_eq!(
+            endpoint_ids(&preserved),
+            HashSet::from(["openapi:endpoint:GET /old".to_string()])
+        );
+        drop(preserved);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish renamed OpenAPI endpoint");
+        let renamed = Storage::open(&storage_path).expect("open renamed projection");
+        assert_eq!(
+            endpoint_ids(&renamed),
+            HashSet::from(["openapi:endpoint:POST /renamed".to_string()])
+        );
+        let file = renamed
+            .get_file_by_path(&schema_path)
+            .expect("read renamed file")
+            .expect("renamed file");
+        assert_eq!(file.language, "openapi");
+        assert!(
+            renamed
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("authenticate renamed endpoint")
+        );
+        drop(renamed);
+
+        fs::write(&schema_path, "{\"enabled\":true}\n").expect("write generic JSON source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish OpenAPI to generic transition");
+        let generic = Storage::open(&storage_path).expect("open generic projection");
+        assert!(endpoint_ids(&generic).is_empty());
+        let file = generic
+            .get_file_by_path(&schema_path)
+            .expect("read generic file")
+            .expect("generic file");
+        assert_eq!(file.language, "json");
+        assert!(
+            !generic
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("reject removed OpenAPI endpoint")
+        );
+        assert!(
+            generic
+                .get_structural_text_projection_file_ids()
+                .expect("read generic structural projections")
+                .contains(&file.id)
+        );
+        drop(generic);
+
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/restored\":{\"get\":{}}}}\n",
+        )
+        .expect("write restored OpenAPI source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish generic to OpenAPI transition");
+        let restored = Storage::open(&storage_path).expect("open restored projection");
+        assert_eq!(
+            endpoint_ids(&restored),
+            HashSet::from(["openapi:endpoint:GET /restored".to_string()])
+        );
+        let file = restored
+            .get_file_by_path(&schema_path)
+            .expect("read restored file")
+            .expect("restored file");
+        assert_eq!(file.language, "openapi");
+        assert!(
+            restored
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("authenticate restored endpoint")
+        );
+        assert!(
+            !restored
+                .get_structural_text_projection_file_ids()
+                .expect("read restored structural projections")
+                .contains(&file.id)
+        );
+        assert!(
+            stored_file_coverage_diagnostics(workspace.path(), &restored)
+                .expect("verify restored coverage")
+                .is_empty()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
     fn affected_absolute_excluded_structural_path_is_valid_but_uncovered() {
         let project = tempdir().expect("project");
         let excluded = project.path().join("vendor/config.json");

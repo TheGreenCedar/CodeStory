@@ -1199,6 +1199,46 @@ fn openapi_endpoint_projection_requires_file_owned_graph_evidence() -> Result<()
 }
 
 #[test]
+fn projection_file_upsert_updates_language_across_structural_transitions()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let path = PathBuf::from("config.json");
+    let mut file = FileInfo {
+        id: 77,
+        path: path.clone(),
+        language: "json".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    };
+    storage.insert_file(&file)?;
+
+    for language in ["openapi", "json"] {
+        file.language = language.to_string();
+        file.modification_time += 1;
+        storage.flush_projection_batch(ProjectionBatch {
+            files: std::slice::from_ref(&file),
+            file_content_hashes: &[],
+            nodes: &[],
+            structural_text_units: &[],
+            structural_text_projections: &[],
+            structural_text_cache_writes: &[],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+        })?;
+        let stored = storage.get_files()?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].path, path);
+        assert_eq!(stored[0].language, language);
+    }
+    Ok(())
+}
+
+#[test]
 fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     insert_file_row(&storage, 1, "src/routes/+page.svelte")?;

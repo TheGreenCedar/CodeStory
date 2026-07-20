@@ -587,6 +587,19 @@ mod tests {
                 ["after_unicode_escape", "./after-unicode-escape.zsh"],
             ),
             (
+                "arithmetic-shift",
+                "typeset -i mask=$((1 << 8))\n(( mask = mask << 1 ))\nfunction after_arithmetic { echo ok; }\nsource ./after-arithmetic.zsh\n",
+                ["after_arithmetic", "./after-arithmetic.zsh"],
+            ),
+            (
+                "multiline-arithmetic-shift",
+                "typeset -i mask=$((\n  1 << 8\n))\nfunction after_multiline_arithmetic { echo ok; }\nsource ./after-multiline-arithmetic.zsh\n",
+                [
+                    "after_multiline_arithmetic",
+                    "./after-multiline-arithmetic.zsh",
+                ],
+            ),
+            (
                 "multiline-single-quoted",
                 "payload='\n<<NOT_A_HEREDOC\nfunction hidden_single_literal { echo hidden; }\nsource ./hidden-single-literal.zsh\n'\nfunction after_multiline_single { echo ok; }\nsource ./after-multiline-single.zsh\n",
                 ["after_multiline_single", "./after-multiline-single.zsh"],
@@ -629,7 +642,7 @@ mod tests {
     fn shell_real_quoted_heredocs_hide_body_anchors() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("quoted-heredocs.zsh");
-        let source = "cat <<'SINGLE'\nfunction hidden_single { echo hidden; }\nsource ./hidden-single.zsh\nSINGLE\ncat <<\"DOUBLE\"\nfunction hidden_double { echo hidden; }\nsource ./hidden-double.zsh\nDOUBLE\ncat <<-'TABBED'\n\tfunction hidden_tabbed { echo hidden; }\n\tsource ./hidden-tabbed.zsh\n\tTABBED\nfunction visible { echo ok; }\nsource ./visible.zsh\n";
+        let source = "cat <<'SINGLE'\nfunction hidden_single { echo hidden; }\nsource ./hidden-single.zsh\nSINGLE\ncat <<\"DOUBLE\"\nfunction hidden_double { echo hidden; }\nsource ./hidden-double.zsh\nDOUBLE\ncat <<-'TABBED'\n\tfunction hidden_tabbed { echo hidden; }\n\tsource ./hidden-tabbed.zsh\n\tTABBED\ncat <<FIRST <<-'SECOND'\nfunction hidden_first { echo hidden; }\nFIRST\n\tfunction hidden_second { echo hidden; }\n\tSECOND\nfunction visible { echo ok; }\nsource ./visible.zsh\n";
         std::fs::write(&path, source).expect("write shell fixture");
 
         let storage = index_structural_file(&path).expect("index shell fixture");

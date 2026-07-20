@@ -1142,7 +1142,13 @@ impl<'a> ProjectionWriter<'a> {
                     .get_callable_projection_states_for_file(file_id)
                     .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
                 let cleanup_started = Instant::now();
-                let update_mode = if !local_storage.structural_text_projections.is_empty() {
+                let replace_file_owned_projection =
+                    !local_storage.structural_text_projections.is_empty()
+                        || local_storage
+                            .files
+                            .first()
+                            .is_some_and(|file| file.language == "openapi");
+                let update_mode = if replace_file_owned_projection {
                     ProjectionUpdateMode::FullReplace
                 } else {
                     classify_projection_update(

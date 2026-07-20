@@ -319,6 +319,7 @@ enum ShellQuote {
 #[derive(Default)]
 struct ShellLexicalState {
     quote: Option<ShellQuote>,
+    arithmetic_paren_depth: usize,
 }
 
 struct ShellLineAnalysis {
@@ -722,6 +723,22 @@ fn analyze_shell_line(line: &str, state: &mut ShellLexicalState) -> ShellLineAna
             }
             continue;
         }
+        if state.arithmetic_paren_depth > 0 {
+            masked[cursor] = b' ';
+            if byte == b'\\' {
+                cursor = mask_shell_escape(line, &mut masked, cursor);
+            } else {
+                match byte {
+                    b'\'' => state.quote = Some(ShellQuote::Single),
+                    b'"' => state.quote = Some(ShellQuote::Double),
+                    b'(' => state.arithmetic_paren_depth += 1,
+                    b')' => state.arithmetic_paren_depth -= 1,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            continue;
+        }
         if byte == b'#' {
             masked[cursor..].fill(b' ');
             break;
@@ -740,6 +757,19 @@ fn analyze_shell_line(line: &str, state: &mut ShellLexicalState) -> ShellLineAna
             masked[cursor] = b' ';
             state.quote = Some(ShellQuote::Double);
             cursor += 1;
+            continue;
+        }
+        let arithmetic_opener_len = if bytes[cursor..].starts_with(b"$((") {
+            Some(3)
+        } else if bytes[cursor..].starts_with(b"((") {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(opener_len) = arithmetic_opener_len {
+            masked[cursor..cursor + opener_len].fill(b' ');
+            state.arithmetic_paren_depth = 2;
+            cursor += opener_len;
             continue;
         }
         if bytes[cursor..].starts_with(b"<<<") {

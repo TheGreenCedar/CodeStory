@@ -5422,6 +5422,7 @@ impl Storage {
                 "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role, content_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
+                    language=excluded.language,
                     modification_time=excluded.modification_time,
                     indexed=excluded.indexed,
                     complete=excluded.complete,
