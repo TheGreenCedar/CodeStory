@@ -1285,6 +1285,8 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
+        .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } = open_agent_surface(
         &cmd.project,
         cmd.profile,
@@ -1300,6 +1302,7 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
                 question: cmd.question.clone(),
                 budget: cmd.budget.into(),
                 task_class: cmd.task_class.map(Into::into),
+                probes: cmd.probes.clone(),
                 extra_probes: cmd.extra_probes.clone(),
                 include_evidence: !cmd.no_evidence,
                 latency_budget_ms: cmd.latency_budget_ms,
@@ -1333,6 +1336,8 @@ fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
+        .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
@@ -1343,6 +1348,7 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
                 question: cmd.prompt.clone(),
                 budget: cmd.budget.into(),
                 task_class: Some(PacketTaskClassDto::EditPlanning),
+                probes: cmd.probes.clone(),
                 extra_probes: cmd.extra_probes.clone(),
                 include_evidence: !cmd.no_evidence,
                 latency_budget_ms: cmd.latency_budget_ms,
@@ -2797,6 +2803,7 @@ fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperatio
         question,
         budget: PacketBudgetModeDto::Standard,
         task_class: None,
+        probes: Vec::new(),
         extra_probes: drill_anchors.clone(),
         include_evidence: true,
         latency_budget_ms: None,
@@ -8789,6 +8796,7 @@ mod tests {
                     query: "task brief packet surface".to_string(),
                     purpose: "find packet entry points".to_string(),
                 }],
+                probe_resolutions: Vec::new(),
                 trace: Vec::new(),
             },
             answer: AgentAnswerDto {
@@ -10273,6 +10281,7 @@ mod tests {
             question: packet.question.clone(),
             budget: PacketBudgetModeDto::Standard,
             task_class: None,
+            probes: Vec::new(),
             extra_probes: vec!["WorkspaceIndexer".to_string()],
             include_evidence: true,
             latency_budget_ms: None,

@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -1725,6 +1725,97 @@ pub fn workspace_relative_path(workspace_root: &Path, path: &Path) -> Option<Pat
         .map(Path::to_path_buf)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectRelativePathResolution {
+    Existing {
+        absolute: PathBuf,
+        relative: PathBuf,
+    },
+    Missing {
+        absolute: PathBuf,
+        relative: PathBuf,
+    },
+    NotFile {
+        absolute: PathBuf,
+        relative: PathBuf,
+    },
+    OutOfProject,
+}
+
+/// Resolve an exact path against one project using the workspace's native
+/// containment rules.
+///
+/// Existing paths are checked after filesystem resolution so a symlink cannot
+/// turn an apparently project-relative spelling into an outside target.
+/// Missing paths use the operation-scoped native lexical identity contract.
+pub fn resolve_project_relative_path(
+    workspace_root: &Path,
+    requested: &Path,
+) -> io::Result<ProjectRelativePathResolution> {
+    if requested.as_os_str().is_empty() {
+        return Ok(ProjectRelativePathResolution::OutOfProject);
+    }
+    let root = normalize_lexical_path(workspace_root);
+    let candidate = normalize_lexical_path(&if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    });
+    let Some(relative) = workspace_relative_path(&root, &candidate) else {
+        return Ok(ProjectRelativePathResolution::OutOfProject);
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(ProjectRelativePathResolution::NotFile {
+            absolute: candidate,
+            relative,
+        });
+    }
+
+    match fs::metadata(&candidate) {
+        Ok(metadata) => {
+            let resolved = candidate.canonicalize()?;
+            let resolved_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if workspace_relative_path(&resolved_root, &resolved).is_none() {
+                return Ok(ProjectRelativePathResolution::OutOfProject);
+            }
+            if metadata.is_file() {
+                Ok(ProjectRelativePathResolution::Existing {
+                    absolute: candidate,
+                    relative,
+                })
+            } else {
+                Ok(ProjectRelativePathResolution::NotFile {
+                    absolute: candidate,
+                    relative,
+                })
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let resolved_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let mut ancestor = candidate.parent();
+            while let Some(path) = ancestor {
+                match path.canonicalize() {
+                    Ok(resolved) => {
+                        if workspace_relative_path(&resolved_root, &resolved).is_none() {
+                            return Ok(ProjectRelativePathResolution::OutOfProject);
+                        }
+                        break;
+                    }
+                    Err(ancestor_error) if ancestor_error.kind() == io::ErrorKind::NotFound => {
+                        ancestor = path.parent();
+                    }
+                    Err(ancestor_error) => return Err(ancestor_error),
+                }
+            }
+            Ok(ProjectRelativePathResolution::Missing {
+                absolute: candidate,
+                relative,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn normalize_path_key(path: &Path) -> String {
     #[cfg(windows)]
     {
@@ -1763,6 +1854,113 @@ mod tests {
     use std::io;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn exact_project_path_resolution_distinguishes_existing_missing_and_outside() -> Result<()> {
+        let project = tempdir()?;
+        let source = project.path().join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "pub fn exact() {}\n")?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("src/./lib.rs"))?,
+            ProjectRelativePathResolution::Existing {
+                absolute: source.clone(),
+                relative: PathBuf::from("src/lib.rs"),
+            }
+        );
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("src/missing.rs"))?,
+            ProjectRelativePathResolution::Missing {
+                absolute: project.path().join("src").join("missing.rs"),
+                relative: PathBuf::from("src/missing.rs"),
+            }
+        );
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("../outside.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_project_path_resolution_rejects_outside_symlink_targets() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir()?;
+        let outside = tempdir()?;
+        let target = outside.path().join("target.rs");
+        fs::write(&target, "pub fn outside() {}\n")?;
+        let link = project.path().join("inside.rs");
+        symlink(&target, &link)?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("inside.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_leaf_beneath_outside_symlink_is_out_of_project() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir()?;
+        let outside = tempdir()?;
+        let link = project.path().join("linked-out");
+        symlink(outside.path(), &link)?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("linked-out/missing.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_project_path_resolution_accepts_a_native_project_alias() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempdir()?;
+        let project = parent.path().join("project");
+        let alias = parent.path().join("project-alias");
+        let source = project.join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "pub fn exact() {}\n")?;
+        symlink(&project, &alias)?;
+
+        assert_eq!(
+            resolve_project_relative_path(&alias, Path::new("src/lib.rs"))?,
+            ProjectRelativePathResolution::Existing {
+                absolute: alias.join("src").join("lib.rs"),
+                relative: PathBuf::from("src/lib.rs"),
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_project_path_resolution_uses_windows_native_alias_identity() -> Result<()> {
+        let parent = tempdir()?;
+        let project = parent.path().join("CodeStory");
+        let source = project.join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "pub fn exact() {}\n")?;
+        let alias = parent.path().join("codestory").join("SRC").join("LIB.RS");
+
+        assert_eq!(
+            resolve_project_relative_path(&project, &alias)?,
+            ProjectRelativePathResolution::Existing {
+                absolute: alias,
+                relative: PathBuf::from("SRC").join("LIB.RS"),
+            }
+        );
+        Ok(())
+    }
 
     fn write_repo_manifest(root: &Path, source_paths: Vec<PathBuf>) -> Result<()> {
         let settings = WorkspaceSettings {

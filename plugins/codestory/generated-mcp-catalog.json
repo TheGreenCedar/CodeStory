@@ -102,6 +102,264 @@
       "description": "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
       "inputSchema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 16
+                },
+                "probes": {
+                  "minItems": 1
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 15
+                },
+                "probes": {
+                  "minItems": 2
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 14
+                },
+                "probes": {
+                  "minItems": 3
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 13
+                },
+                "probes": {
+                  "minItems": 4
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 12
+                },
+                "probes": {
+                  "minItems": 5
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 11
+                },
+                "probes": {
+                  "minItems": 6
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 10
+                },
+                "probes": {
+                  "minItems": 7
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 9
+                },
+                "probes": {
+                  "minItems": 8
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 8
+                },
+                "probes": {
+                  "minItems": 9
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 7
+                },
+                "probes": {
+                  "minItems": 10
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 6
+                },
+                "probes": {
+                  "minItems": 11
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 5
+                },
+                "probes": {
+                  "minItems": 12
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 4
+                },
+                "probes": {
+                  "minItems": 13
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 3
+                },
+                "probes": {
+                  "minItems": 14
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 2
+                },
+                "probes": {
+                  "minItems": 15
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 1
+                },
+                "probes": {
+                  "minItems": 16
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          }
+        ],
         "description": "Build a broad task packet with budget and sufficiency metadata.",
         "properties": {
           "budget": {
@@ -116,10 +374,14 @@
             "type": "string"
           },
           "extra_probes": {
-            "description": "Optional audited file, symbol, or file-scoped symbol probes to add to the packet plan.",
+            "description": "Legacy string probes normalized through the same typed runtime resolver.",
             "items": {
+              "maxLength": 240,
+              "minLength": 1,
               "type": "string"
             },
+            "maxItems": 16,
+            "minItems": 1,
             "type": "array"
           },
           "include_evidence": {
@@ -135,6 +397,182 @@
               "integer",
               "null"
             ]
+          },
+          "probes": {
+            "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "description": "Exact project-relative path probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "exact_path"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "description": "Exact project-relative path.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Stable symbol-id probe.",
+                  "properties": {
+                    "id": {
+                      "description": "Stable symbol id.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "symbol_id"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "id"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Exact file-scoped symbol probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "file_symbol"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "description": "Exact project-relative path.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "symbol": {
+                      "description": "File-scoped symbol name.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "symbol"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Free-query probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "free_query"
+                      ],
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Free query.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "query"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Project- and generation-bound continuation probe.",
+                  "properties": {
+                    "contract_version": {
+                      "description": "Continuation probe contract version.",
+                      "maximum": 1,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "core_generation_id": {
+                      "description": "Continuation core evidence generation.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "continuation"
+                      ],
+                      "type": "string"
+                    },
+                    "project_id": {
+                      "description": "Continuation project identity.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Continuation display query.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "retrieval_generation": {
+                      "description": "Optional continuation retrieval generation.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "symbol_id": {
+                      "description": "Optional exact continuation symbol id.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "contract_version",
+                    "project_id",
+                    "core_generation_id",
+                    "query"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
           },
           "project": {
             "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
@@ -384,6 +822,10 @@
                     "additionalProperties": false,
                     "description": "Continuation resource link.",
                     "properties": {
+                      "probe": {
+                        "description": "Optional generation-bound continuation probe for packet reuse.",
+                        "type": "object"
+                      },
                       "rel": {
                         "description": "Link relation.",
                         "type": "string"
@@ -1621,6 +2063,10 @@
                     "additionalProperties": false,
                     "description": "Continuation resource link.",
                     "properties": {
+                      "probe": {
+                        "description": "Optional generation-bound continuation probe for packet reuse.",
+                        "type": "object"
+                      },
                       "rel": {
                         "description": "Link relation.",
                         "type": "string"
@@ -2891,6 +3337,10 @@
               "additionalProperties": false,
               "description": "Continuation resource link.",
               "properties": {
+                "probe": {
+                  "description": "Optional generation-bound continuation probe for packet reuse.",
+                  "type": "object"
+                },
                 "rel": {
                   "description": "Link relation.",
                   "type": "string"

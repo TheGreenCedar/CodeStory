@@ -4,6 +4,16 @@
 
 ### Release
 
+- Packet probes now use one tagged exact-target grammar across contracts,
+  runtime, CLI, and stdio: exact project-relative path, stable symbol ID,
+  file-scoped symbol, free query, or generation-bound continuation. Legacy
+  string probes enter the same resolver. Exact paths retain native filesystem
+  identity and remain distinct when valid but outside graph coverage;
+  ambiguity, text-only evidence, stale identity, malformed input, missing
+  targets, and out-of-project targets fail or report separately. Probe inputs
+  resolve to exact path/node citations rather than display-name searches and
+  cannot promote packet sufficiency. CLI and stdio share a combined 16-probe
+  limit and 240-character field limit.
 - Markdown/MDX, generic YAML, TOML, JSON, non-parser shell, and PowerShell now
   emit bounded exact-source structural units through the same verified
   publication and cache contract as the existing collectors. Dedicated

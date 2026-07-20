@@ -111,6 +111,27 @@ snapshots from `codestory-store` and assembles contract DTOs. `explore` and
 fallbacks. When broad retrieval is unavailable, local graph tools can remain
 usable, but their output must not be presented as a full packet/search result.
 
+Packet callers may supply tagged probes for an exact project-relative path,
+stable symbol ID, file-scoped symbol, free query, or continuation. CLI and
+stdio normalize those forms and legacy string probes into the same runtime
+resolver. Workspace owns native path containment; runtime resolves exact paths
+and IDs before fuzzy discovery and returns ordered ambiguity candidates rather
+than choosing one. A valid source file outside graph coverage remains a
+`valid_uncovered_path`, and source-range-only text remains distinct from an
+indexed symbol.
+
+Resolved path and symbol probes enter packet evidence as exact citations keyed
+by normalized project path or stable node ID. They do not become display-name
+searches. Exact citations remain explicit inputs and cannot satisfy packet
+sufficiency by themselves.
+
+Continuation probes carry the probe contract version, project identity, core
+generation, and optional retrieval generation. Runtime rejects a continuation
+when any bound identity differs from the selected public operation. Resolved
+free-query probes may add broad packet evidence work, but exact resolutions do
+not. Neither form changes task-class route order or packet sufficiency
+requirements.
+
 ## Failure boundaries
 
 - adapters never choose a global active project;

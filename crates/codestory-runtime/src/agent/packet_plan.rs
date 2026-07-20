@@ -131,6 +131,7 @@ pub(crate) fn build_packet_plan_with_extra(
         task_class,
         inferred_task_class: requested.is_none(),
         queries,
+        probe_resolutions: Vec::new(),
         trace,
     };
     dedupe_packet_plan_queries(&mut plan);
@@ -158,26 +159,6 @@ pub(crate) fn packet_rank_terms(question: &str) -> Vec<String> {
         push_unique_term(&mut terms, &normalize_identifier(&query));
     }
     terms
-}
-
-pub(crate) fn packet_request_extra_probes(extra_probes: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for probe in extra_probes {
-        let probe = probe.trim();
-        if probe.is_empty() || probe.len() > 240 {
-            continue;
-        }
-        if !normalized
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(probe))
-        {
-            normalized.push(probe.to_string());
-        }
-        if normalized.len() >= 16 {
-            break;
-        }
-    }
-    normalized
 }
 
 pub(crate) fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {

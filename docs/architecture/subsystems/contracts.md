@@ -9,6 +9,8 @@ runtime, and adapters. It contains contracts, not orchestration or rendering.
 - workspace and refresh DTOs;
 - API requests, responses, IDs, structured errors, and lifecycle events;
 - grounding, readiness, status, publication, and symbol-workflow DTOs;
+- tagged packet probes plus normalized resolution, ambiguity, and rejection
+  metadata;
 - language-support profiles and evidence tiers.
 
 ## Entry points

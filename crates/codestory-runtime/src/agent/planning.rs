@@ -83,6 +83,7 @@ mod tests {
                     purpose: "b".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
         dedupe_packet_plan_queries(&mut plan);

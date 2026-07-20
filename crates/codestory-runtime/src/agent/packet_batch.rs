@@ -897,6 +897,7 @@ mod tests {
                     purpose: "concrete symbol, file, route, or code term".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 
@@ -929,6 +930,7 @@ mod tests {
                     purpose: "concrete symbol, file, route, or code term".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 
@@ -981,6 +983,7 @@ mod tests {
                     purpose: "concrete symbol, file, route, or code term".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 
@@ -1021,6 +1024,7 @@ mod tests {
                     purpose: "symbol probe expanded from task wording".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 
@@ -1055,6 +1059,7 @@ mod tests {
                     purpose: "symbol probe expanded from task wording".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 
@@ -1124,6 +1129,7 @@ mod tests {
                     purpose: "task-class retrieval seed".to_string(),
                 },
             ],
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 
@@ -1183,6 +1189,7 @@ mod tests {
             task_class: PacketTaskClassDto::ArchitectureExplanation,
             inferred_task_class: false,
             queries,
+            probe_resolutions: Vec::new(),
             trace: Vec::new(),
         };
 

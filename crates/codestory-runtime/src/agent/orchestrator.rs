@@ -34,11 +34,14 @@ use crate::agent::packet_evidence_roles::{
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
-    build_packet_plan, build_packet_plan_with_extra, packet_concept_queries,
-    packet_symbol_probe_queries,
+    build_packet_plan, packet_concept_queries, packet_symbol_probe_queries,
 };
 use crate::agent::packet_plan::{
-    packet_plan_annotation, packet_rank_terms, packet_request_extra_probes,
+    build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
+};
+use crate::agent::packet_probe::{
+    exact_packet_probe_citations, normalize_packet_probe_request, resolve_packet_probes,
+    resolved_packet_probe_queries,
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
@@ -367,11 +370,19 @@ pub(crate) fn agent_packet(
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
     }
+    codestory_contracts::api::validate_packet_probe_request(&req.probes, &req.extra_probes)
+        .map_err(ApiError::invalid_argument)?;
     let project_root = controller.require_project_root()?;
     controller.begin_packet_retrieval();
 
-    let plan = super::plan_packet(&req)?;
-    let extra_probes = packet_request_extra_probes(req.extra_probes);
+    let probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
+    let probe_resolutions = resolve_packet_probes(controller, probes);
+    let exact_probe_citations =
+        exact_packet_probe_citations(controller, &probe_resolutions, req.include_evidence);
+    let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
+    let mut plan =
+        build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
+    plan.probe_resolutions = probe_resolutions;
     let limits = packet_budget_limits(req.budget);
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
@@ -395,6 +406,13 @@ pub(crate) fn agent_packet(
             hybrid_weights: initial_hybrid_weights.clone(),
         },
     )?;
+    if !exact_probe_citations.is_empty() {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_exact_probe_citations appended={}",
+            exact_probe_citations.len()
+        ));
+        answer.citations.extend(exact_probe_citations);
+    }
     if packet_initial_retrieval_is_lexical_only(initial_hybrid_weights.as_ref()) {
         answer.retrieval_trace.annotations.push(format!(
             "packet_initial_retrieval semantic_skipped=true reason=compact_exact_anchor_probes probe_count={}",
@@ -442,6 +460,7 @@ pub(crate) fn agent_packet(
         &question,
         plan.task_class,
         &file_scoped_source_probes,
+        &extra_probes,
         &mut answer,
     );
     append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
@@ -548,15 +567,13 @@ fn packet_non_trace_phase_annotation(label: &str, duration_ms: u32) -> String {
 
 fn packet_plan_sufficiency_extra_probes(
     plan: &PacketPlanDto,
-    explicit_extra_probes: &[String],
+    _explicit_extra_probes: &[String],
 ) -> Vec<String> {
     let mut probes = Vec::new();
-    for probe in explicit_extra_probes {
-        push_packet_sufficiency_extra_probe(&mut probes, probe);
-    }
     for query in &plan.queries {
-        if packet_plan_query_can_gate_sufficiency(&query.query)
-            || packet_file_scoped_symbol_probe_parts(&query.query).is_some()
+        if !query.purpose.contains("explicit")
+            && (packet_plan_query_can_gate_sufficiency(&query.query)
+                || packet_file_scoped_symbol_probe_parts(&query.query).is_some())
         {
             push_packet_sufficiency_extra_probe(&mut probes, &query.query);
         }
@@ -2903,6 +2920,7 @@ fn maybe_append_required_file_scoped_source_citations(
     question: &str,
     task_class: PacketTaskClassDto,
     extra_probes: &[String],
+    explicit_probes: &[String],
     answer: &mut AgentAnswerDto,
 ) {
     let required_queries =
@@ -2957,6 +2975,9 @@ fn maybe_append_required_file_scoped_source_citations(
             already_cited = already_cited.saturating_add(1);
             continue;
         }
+        let explicit = explicit_probes
+            .iter()
+            .any(|probe| probe.eq_ignore_ascii_case(&query));
         answer.citations.push(AgentCitationDto {
             node_id: NodeId(format!(
                 "packet::required_source_probe::{}::{}::{}",
@@ -2988,8 +3009,12 @@ fn maybe_append_required_file_scoped_source_citations(
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
             ),
             loss_reason: None,
-            coverage_role: Some("required source probe".to_string()),
-            eligible_for_sufficiency: Some(true),
+            coverage_role: Some(if explicit {
+                "explicit source probe".to_string()
+            } else {
+                "required source probe".to_string()
+            }),
+            eligible_for_sufficiency: Some(!explicit),
         });
         appended += 1;
     }
@@ -7511,7 +7536,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_plan_uses_explicit_request_probes_with_required_sufficiency() {
+    fn packet_plan_uses_explicit_request_probes_without_promoting_sufficiency() {
         let question = "Explain how request dispatch reaches validation and callbacks.";
         let extra_probes = vec![
             "Source/Core/RequestSession.swift Session.request".to_string(),
@@ -7546,17 +7571,13 @@ mod tests {
             plan.trace
         );
 
-        let required = packet_sufficiency_required_probe_queries_with_extra(
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &extra_probes,
-        );
+        let required = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
         for expected in &extra_probes {
             assert!(
-                required
+                !required
                     .iter()
                     .any(|query| query.eq_ignore_ascii_case(expected)),
-                "expected explicit probe {expected} in sufficiency requirements: {required:?}"
+                "explicit probe {expected} must not become a sufficiency requirement: {required:?}"
             );
         }
     }
@@ -10174,6 +10195,7 @@ mod tests {
                     query: question.to_string(),
                     purpose: "fixture".to_string(),
                 }],
+                probe_resolutions: Vec::new(),
                 trace: Vec::new(),
             },
             answer,
@@ -12396,6 +12418,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::DataFlow,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -12532,6 +12555,37 @@ mod tests {
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
             annotation.starts_with("packet_generic_source_shape_citations appended=")
         }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_file_scoped_probe_citation_cannot_promote_sufficiency() {
+        let root = packet_temp_root("explicit-source-probe-sufficiency");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/session.rs",
+            "impl Session {\n    fn request(&self) {}\n}\n",
+        );
+
+        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let probes = ["src/session.rs Session::request".to_string()];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::RouteTracing,
+            &probes,
+            &probes,
+            &mut answer,
+        );
+
+        let explicit = answer
+            .citations
+            .iter()
+            .find(|citation| citation.coverage_role.as_deref() == Some("explicit source probe"))
+            .expect("explicit source probe citation");
+        assert_eq!(explicit.eligible_for_sufficiency, Some(false));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -13418,6 +13472,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::ArchitectureExplanation,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -13478,6 +13533,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::ArchitectureExplanation,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -13555,6 +13611,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::RouteTracing,
             &probes,
+            &[],
             &mut answer,
         );
 
