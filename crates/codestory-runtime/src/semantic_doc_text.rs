@@ -258,7 +258,17 @@ mod tests {
             ("index.html", Some("html")),
             ("style.css", Some("css")),
             ("schema.sql", Some("sql")),
-            ("README.md", None),
+            ("README.md", Some("markdown")),
+            ("guide.mdx", Some("markdown")),
+            ("config.yaml", Some("yaml")),
+            ("config.yml", Some("yaml")),
+            ("config.toml", Some("toml")),
+            ("config.json", Some("json")),
+            ("script.zsh", Some("shell")),
+            ("script.ksh", Some("shell")),
+            ("script.command", Some("shell")),
+            ("script.ps1", Some("powershell")),
+            ("module.psm1", Some("powershell")),
         ];
 
         for (path, language) in cases {

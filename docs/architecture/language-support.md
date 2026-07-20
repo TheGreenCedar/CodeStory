@@ -26,15 +26,16 @@ a partial tree. Runtime treats it as `parser_partial` only when the indexed byte
 have a verified content hash, the file carries no file-level error, and storage
 does not require a retry. That row remains `complete=false` so diagnostics do
 not overstate parser coverage, but it does not block an otherwise atomic core
-publication. Unreadable, oversized, changed, incompletely discovered, or
-collector-failed source remains a publication blocker.
+publication. Malformed, binary/non-UTF-8, unreadable, oversized, changed,
+incompletely discovered, or collector-failed source remains a publication
+blocker.
 
 ## Current Runtime Claims
 
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
+| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
 
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
@@ -82,13 +83,36 @@ execution semantics.
 Cargo manifest support is basename-scoped to `Cargo.toml`. It emits `[workspace]`
 member, `[package]` name, and direct dependency-key anchors from `[dependencies]`,
 `[dev-dependencies]`, and `[build-dependencies]` with the same `structural_text` /
-`source_range_only` boundary. It does not admit generic TOML, `Cargo.lock`,
-target-scoped dependency tables, `[workspace.dependencies]`, dependency
-subtables, feature tables, patch or replace tables, dependency resolution,
-feature activation, workspace inheritance, build-script behavior, or lockfile
-proof. Packet evidence treats these anchors as diagnostic unless a future
-structural role explicitly admits them; they must not satisfy semantic proof
-roles or semantic dependency proof.
+`source_range_only` boundary. Its dedicated producer does not handle generic
+TOML, `Cargo.lock`, target-scoped dependency tables, `[workspace.dependencies]`,
+dependency subtables, feature tables, patch or replace tables, dependency
+resolution, feature activation, workspace inheritance, build-script behavior,
+or lockfile proof. Packet evidence treats these anchors as diagnostic unless a
+future structural role explicitly admits them; they must not satisfy semantic
+proof roles or semantic dependency proof.
+
+Generic Markdown/MDX emits heading, link/reference-definition, and fenced-block
+labels while suppressing heading/reference syntax inside fences. Generic YAML
+emits conservative block mapping keys without treating URL colons or block
+scalar bodies as mappings; generic TOML emits table and key labels outside
+multiline strings; generic JSON emits object keys in source order. The shell
+fallback emits function and import anchors outside heredocs only for `.zsh`,
+`.ksh`, and `.command`; `.sh` and `.bash` remain parser-backed Bash. PowerShell
+`.ps1` and `.psm1` emit function and module/dot-source anchors outside block
+comments. These collectors do not interpret references, substitutions,
+imports, execution behavior, or typed targets.
+
+Dedicated routing wins before generic collection: workflow and Compose paths
+keep their YAML producers, `Cargo.toml` keeps its manifest producer, and
+OpenAPI/Swagger JSON or YAML keeps its `exact_source` endpoint path. Structural
+admission evaluates only workspace-relative paths and rejects
+generated/vendor, secret-bearing, lockfile, minified, and declared high-noise
+descendants before inventory metadata or content reads. Repository ancestors
+with those names do not affect admission. A structural file is accepted only
+as a complete UTF-8 projection within the 1 MiB and 2,048-unit bounds;
+malformed, binary, unreadable, source-drifted, cancelled, or failed collection
+does not publish reusable units. Cache identity v2 invalidates pre-limit
+artifacts, and cache hits independently enforce the same unit bound.
 
 Safe wording: structural-text anchors prove only that their collector found the
 cited source span; their `source_range_only` status and non-sufficient result
@@ -99,8 +123,9 @@ can complete measured suites, but publishable agent-facing packet quality is not
 promoted until one coherent run has all quality, sufficiency, and cold-SLA gates
 green. Run-specific scorecards belong in PRs, issues, release notes, or ignored
 `target/` artifacts; this page records the durable claim boundaries. HTML, CSS,
-SQL, GitHub Actions workflows, Docker Compose manifests, and Cargo manifests
-remain structural source-proof collectors; OpenAPI schemas remain a dedicated
+SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser shell, PowerShell, GitHub
+Actions workflows, Docker Compose manifests, and Cargo manifests remain
+structural source-proof collectors; OpenAPI schemas remain a dedicated
 schema-anchor path.
 
 ## Resolution Claims
@@ -140,7 +165,8 @@ Workspace parser policy:
 
 Validation: each listed candidate passed an isolated `cargo check` probe with
 the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,
-GitHub Actions workflows, and Docker Compose manifests remain structural runtime
+GitHub Actions workflows, Docker Compose manifests, Markdown/MDX, generic
+YAML/TOML/JSON, non-parser shell, and PowerShell remain structural runtime
 paths, not parser-backed runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |

@@ -731,6 +731,8 @@ fn classify_activation_api_error(mut error: ApiError) -> ApiError {
         }
         "cancelled" | "activation_preparing" | "activation_retryable" => error,
         "source_unreadable"
+        | "source_malformed"
+        | "source_binary"
         | "source_oversized"
         | "source_discovery_incomplete"
         | "source_collector_failure"

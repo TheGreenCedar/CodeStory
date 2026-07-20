@@ -1003,6 +1003,7 @@ struct AffectedRelevantEvidenceGaps {
 }
 
 struct AffectedRelevantEvidenceGapInput<'a> {
+    workspace_root: Option<&'a Path>,
     resolved_inputs: &'a [AffectedResolvedInput],
     matched_record_flags: &'a [bool],
     current_identity_errors: &'a [Option<String>],
@@ -1029,7 +1030,7 @@ fn affected_relevant_evidence_gaps(
                 .get(index)
                 .copied()
                 .unwrap_or(false)
-                || indexable_source_path(&resolved.current))
+                || indexable_source_path_with_root(input.workspace_root, &resolved.current))
             .then_some(error)
         })
         .collect::<Vec<_>>();
@@ -1045,10 +1046,9 @@ fn affected_relevant_evidence_gaps(
                 .get(index)
                 .copied()
                 .unwrap_or(false)
-                && resolved
-                    .previous
-                    .as_deref()
-                    .is_some_and(indexable_source_path))
+                && resolved.previous.as_deref().is_some_and(|path| {
+                    indexable_source_path_with_root(input.workspace_root, path)
+                }))
             .then_some(error)
         })
         .collect::<Vec<_>>();
@@ -1063,11 +1063,10 @@ fn affected_relevant_evidence_gaps(
                     .get(index)
                     .copied()
                     .unwrap_or(false)
-                    || indexable_source_path(&resolved.current)
-                    || resolved
-                        .previous
-                        .as_deref()
-                        .is_some_and(indexable_source_path)
+                    || indexable_source_path_with_root(input.workspace_root, &resolved.current)
+                    || resolved.previous.as_deref().is_some_and(|path| {
+                        indexable_source_path_with_root(input.workspace_root, path)
+                    })
             });
 
     AffectedRelevantEvidenceGaps {
@@ -1242,6 +1241,11 @@ enum AffectedPathMetadataObservation {
     },
 }
 
+struct AffectedUnmatchedPathObservation<'a> {
+    workspace_root: Option<&'a Path>,
+    metadata: AffectedPathMetadataObservation,
+}
+
 fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
@@ -1259,6 +1263,7 @@ fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
 }
 
 fn classify_unmatched_affected_input(
+    workspace_root: Option<&Path>,
     record: &AffectedChangeRecordDto,
     resolved: &AffectedResolvedInput,
     freshness: &IndexFreshnessObservation,
@@ -1273,7 +1278,10 @@ fn classify_unmatched_affected_input(
         current_identity,
         current_identity_error,
         previous_identity_error,
-        affected_path_metadata(&resolved.current),
+        AffectedUnmatchedPathObservation {
+            workspace_root,
+            metadata: affected_path_metadata(&resolved.current),
+        },
     )
 }
 
@@ -1284,11 +1292,11 @@ fn classify_unmatched_affected_input_with_metadata(
     current_identity: Option<&WorkspacePathIdentity>,
     current_identity_error: Option<&str>,
     previous_identity_error: Option<&str>,
-    metadata: AffectedPathMetadataObservation,
+    observation: AffectedUnmatchedPathObservation<'_>,
 ) -> (AffectedInputClassificationDto, String, Vec<String>) {
     let mut evidence = Vec::new();
     let path = &resolved.current;
-    let regular_file = match metadata {
+    let regular_file = match observation.metadata {
         AffectedPathMetadataObservation::RegularFile => {
             evidence.push(format!(
                 "resolved existing regular project file: {}",
@@ -1326,7 +1334,7 @@ fn classify_unmatched_affected_input_with_metadata(
     };
 
     if regular_file {
-        if !indexable_source_path(path) {
+        if !indexable_source_path_with_root(observation.workspace_root, path) {
             return (
                 AffectedInputClassificationDto::ValidUncovered,
                 "regular file exists inside the project but is outside current graph/index coverage"
@@ -5032,6 +5040,10 @@ fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
         }
         FileCoverageReason::SourceChanged => "source changed while its projection was collected",
         FileCoverageReason::Unreadable => "source bytes could not be read and verified",
+        FileCoverageReason::Malformed => {
+            "verified UTF-8 source is malformed for its structural format"
+        }
+        FileCoverageReason::Binary => "source is binary or is not valid UTF-8",
         FileCoverageReason::Oversized => "source exceeds the configured indexing size limit",
         FileCoverageReason::DiscoveryIncomplete => {
             "workspace discovery could not prove a complete source inventory"
@@ -5219,6 +5231,22 @@ fn stored_file_coverage_diagnostics(
         })?
         .into_iter()
         .collect::<HashSet<_>>();
+    let mut dedicated_openapi_projection_file_ids = HashSet::new();
+    for file in &files {
+        if file.language == "openapi"
+            && verified_file_ids.contains(&file.id)
+            && storage
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to verify staged OpenAPI projection identity for {}: {error}",
+                        runtime_relative_path(root, &file.path)
+                    ))
+                })?
+        {
+            dedicated_openapi_projection_file_ids.insert(file.id);
+        }
+    }
     let mut errors_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
     for error in storage.get_errors(None).map_err(|error| {
         ApiError::internal(format!("Failed to load staged file errors: {error}"))
@@ -5235,9 +5263,12 @@ fn stored_file_coverage_diagnostics(
         .iter()
         .filter_map(|file| {
             let verified_source = verified_file_ids.contains(&file.id);
-            let structural_projection_verified =
-                !codestory_indexer::structural::is_structural_candidate_path(&file.path)
-                    || (verified_source && structural_projection_file_ids.contains(&file.id));
+            let dedicated_openapi_source = file.language == "openapi"
+                && verified_source
+                && dedicated_openapi_projection_file_ids.contains(&file.id);
+            let structural_projection_verified = dedicated_openapi_source
+                || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+                || (verified_source && structural_projection_file_ids.contains(&file.id));
             let reason = if file.complete && !structural_projection_verified {
                 Some(FileCoverageReason::CollectorFailure)
             } else {
@@ -5267,6 +5298,8 @@ fn source_coverage_failure_code(coverage_gaps: &[FileCoverageDiagnosticDto]) -> 
         FileCoverageReason::ParserPartial => "source_verification_failed",
         FileCoverageReason::SourceChanged => "source_changed",
         FileCoverageReason::Unreadable => "source_unreadable",
+        FileCoverageReason::Malformed => "source_malformed",
+        FileCoverageReason::Binary => "source_binary",
         FileCoverageReason::Oversized => "source_oversized",
         FileCoverageReason::DiscoveryIncomplete => "source_discovery_incomplete",
         FileCoverageReason::CollectorFailure => "source_collector_failure",
@@ -5334,6 +5367,14 @@ fn not_checked_index_freshness(
 }
 
 fn indexable_source_path(path: &Path) -> bool {
+    if path.to_str().is_some_and(|path| {
+        !Path::new(path).is_absolute()
+            && codestory_contracts::language_support::is_structural_source_path(path)
+            && codestory_contracts::language_support::structural_source_path_exclusion(path)
+                .is_some()
+    }) {
+        return false;
+    }
     let tree_sitter_supported = path
         .extension()
         .and_then(|value| value.to_str())
@@ -5344,6 +5385,20 @@ fn indexable_source_path(path: &Path) -> bool {
         || codestory_indexer::structural::is_structural_candidate_path(path)
         || codestory_indexer::is_text_only_candidate_path(path)
         || looks_like_openapi_source_path(path)
+}
+
+fn indexable_source_path_in_workspace(root: &Path, path: &Path) -> bool {
+    let Some(relative) = codestory_workspace::workspace_relative_path(root, path) else {
+        return false;
+    };
+    indexable_source_path(&relative)
+}
+
+fn indexable_source_path_with_root(root: Option<&Path>, path: &Path) -> bool {
+    root.map_or_else(
+        || indexable_source_path(path),
+        |root| indexable_source_path_in_workspace(root, path),
+    )
 }
 
 fn looks_like_openapi_source_path(path: &Path) -> bool {
@@ -5535,7 +5590,7 @@ where
     let mut samples = Vec::new();
     for path in &plan.files_to_index {
         let existing_indexed_file = plan.existing_file_ids.contains_key(path);
-        if !existing_indexed_file && !indexable_source_path(path) {
+        if !existing_indexed_file && !indexable_source_path_in_workspace(root, path) {
             continue;
         }
         let kind = if existing_indexed_file {
@@ -6049,21 +6104,18 @@ fn current_embedding_contract_for_runtime(
 }
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.search"))
+    codestory_workspace::legacy_search_directory_for_storage(storage_path)
 }
 
 fn search_index_generation_root(storage_path: &Path) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.search-generations"))
+    codestory_workspace::search_generation_directory_for_storage(storage_path)
+}
+
+fn runtime_workspace_manifest(
+    root: &Path,
+    storage_path: &Path,
+) -> anyhow::Result<WorkspaceManifest> {
+    WorkspaceManifest::open_with_storage_owned_exclusions(root.to_path_buf(), storage_path)
 }
 
 fn search_index_path_for_publication(
@@ -10332,7 +10384,8 @@ impl AppController {
     fn index_freshness_uncached(&self) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
         let storage = self.open_storage_for_freshness()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
         Ok(index_freshness_from_storage_with_policy(
             &root,
@@ -10991,7 +11044,7 @@ impl AppController {
             error_count: clamp_i64_to_u32(stats.error_count),
             fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
-        let workspace = WorkspaceManifest::open(root.to_path_buf())
+        let workspace = runtime_workspace_manifest(root, storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
         let freshness =
@@ -11625,7 +11678,7 @@ impl AppController {
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let mut incomplete_incremental_run = false;
         let refresh_inputs = if storage_path.exists() {
@@ -12649,7 +12702,8 @@ impl AppController {
             }
         }
 
-        let workspace = WorkspaceManifest::open(root.clone())
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
         let mut path_identities = AffectedOperationIdentityIndex::native();
         let freshness_observation = index_freshness_observation_from_storage_with_identities(
@@ -12758,6 +12812,7 @@ impl AppController {
             .filter(|(index, _)| !current_matched_record_flags[*index])
             .map(|(index, record)| {
                 let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
+                    Some(&root),
                     record,
                     &resolved_inputs[index],
                     &freshness_observation,
@@ -12768,7 +12823,7 @@ impl AppController {
                 unmatched_freshness_unavailable |= matches!(
                     affected_path_metadata(&resolved_inputs[index].current),
                     AffectedPathMetadataObservation::RegularFile
-                ) && indexable_source_path(&resolved_inputs[index].current)
+                ) && indexable_source_path_in_workspace(&root, &resolved_inputs[index].current)
                     && current_identity_error_by_record[index].is_none()
                     && current_identity_by_record[index]
                         .as_ref()
@@ -13086,6 +13141,7 @@ impl AppController {
             unmatched_freshness_unavailable || matched_freshness_unavailable;
         let relevant_evidence_gaps =
             affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+                workspace_root: Some(&root),
                 resolved_inputs: &resolved_inputs,
                 matched_record_flags: &current_matched_record_flags,
                 current_identity_errors: &current_identity_error_by_record,
@@ -13306,7 +13362,7 @@ impl AppController {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
         let storage = self.open_storage_for_freshness()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let freshness =
             self.cached_index_freshness_from_storage(&root, &storage_path, &workspace, &storage);
@@ -14524,7 +14580,7 @@ fn index_full_for_runtime(
         });
     wall_durations.live_inspection = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let workspace = WorkspaceManifest::open(root.to_path_buf())
+    let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let (execution_plan, policy_exclusions) =
         full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
@@ -15228,7 +15284,7 @@ fn run_incremental_indexing_common(
                 ))
             })?;
 
-        let workspace = WorkspaceManifest::open(root.to_path_buf())
+        let workspace = runtime_workspace_manifest(root, storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
         let policy_refresh = workspace
@@ -15496,7 +15552,7 @@ fn run_incremental_indexing_common(
     }
     #[cfg(test)]
     run_source_policy_before_revalidate_hook();
-    let workspace = WorkspaceManifest::open(root.to_path_buf())
+    let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|error| ApiError::internal(format!("Failed to reopen project: {error}")))?;
     let policy_exclusions = match revalidate_source_policy_exclusions(
         &workspace,
@@ -16835,6 +16891,7 @@ mod tests {
         let previous_errors = vec![Some("previous gap".to_string())];
         let unmatched = [false];
         let all_relevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
             resolved_inputs: &resolved,
             matched_record_flags: &unmatched,
             current_identity_errors: &current_errors,
@@ -16852,6 +16909,7 @@ mod tests {
 
         let matched = [true];
         let current_wins = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
             resolved_inputs: &resolved,
             matched_record_flags: &matched,
             current_identity_errors: &current_errors,
@@ -16870,6 +16928,7 @@ mod tests {
             previous: None,
         }];
         let irrelevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
             resolved_inputs: &svg,
             matched_record_flags: &[false],
             current_identity_errors: &current_errors,
@@ -16978,6 +17037,7 @@ mod tests {
     ) -> (AffectedInputClassificationDto, String, Vec<String>) {
         let current_identity = codestory_workspace::workspace_path_identity(&resolved.current).ok();
         classify_unmatched_affected_input(
+            None,
             record,
             resolved,
             freshness,
@@ -17152,9 +17212,12 @@ mod tests {
             None,
             None,
             None,
-            AffectedPathMetadataObservation::Unavailable {
-                kind: io::ErrorKind::PermissionDenied,
-                message: "injected metadata denial".to_string(),
+            AffectedUnmatchedPathObservation {
+                workspace_root: None,
+                metadata: AffectedPathMetadataObservation::Unavailable {
+                    kind: io::ErrorKind::PermissionDenied,
+                    message: "injected metadata denial".to_string(),
+                },
             },
         );
 
@@ -18088,6 +18151,12 @@ mod tests {
             "public/index.html",
             "public/site.css",
             "db/schema.sql",
+            "docs/guide.mdx",
+            "config/service.yaml",
+            "config/service.toml",
+            "config/service.json",
+            "scripts/setup.zsh",
+            "scripts/build.ps1",
         ] {
             assert!(
                 indexable_source_path(Path::new(relative_path)),
@@ -18102,6 +18171,357 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+        for excluded in [
+            "vendor/config.json",
+            "generated/docs.md",
+            "config/package-lock.json",
+            "skills-lock.json",
+            "secrets/deploy.ps1",
+            "web/app.min.json",
+        ] {
+            assert!(
+                !indexable_source_path(Path::new(excluded)),
+                "runtime freshness should honor structural exclusion: {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_openapi_coverage_requires_authenticated_file_owned_projection_evidence() {
+        let project = tempdir().expect("project");
+        let mut storage = Storage::new_in_memory().expect("storage");
+        let sources = [
+            (
+                "openapi.json",
+                "{\"openapi\":\"3.1.0\",\"paths\":{\"/json-ready\":{\"get\":{}}}}\n",
+            ),
+            (
+                "openapi.yaml",
+                "openapi: 3.1.0\npaths:\n  /yaml-ready:\n    get:\n      responses: {}\n",
+            ),
+            ("config.json", "{\"enabled\":true}\n"),
+        ];
+        let files_to_index = sources
+            .iter()
+            .map(|(relative, source)| {
+                let path = project.path().join(relative);
+                fs::write(&path, source).expect("write projected source");
+                path
+            })
+            .collect::<Vec<_>>();
+        V2WorkspaceIndexer::new(project.path().to_path_buf())
+            .run(
+                &mut storage,
+                &RefreshExecutionPlan {
+                    mode: RefreshMode::FullRefresh,
+                    files_to_index,
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )
+            .expect("index real OpenAPI and generic JSON projections");
+        let real_diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
+            .expect("verify real projections");
+        assert!(
+            real_diagnostics.is_empty(),
+            "real projections must authenticate coverage: {real_diagnostics:#?}"
+        );
+
+        for (id, relative, language) in [
+            (9_000_001, "metadata-only.json", "openapi"),
+            (9_000_002, "forged-openapi.json", "openapi"),
+            (9_000_003, "wrong-language.json", "json"),
+        ] {
+            let path = project.path().join(relative);
+            fs::write(&path, "{}\n").expect("write structural source");
+            let file = FileInfo {
+                id,
+                path,
+                language: language.to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            };
+            storage.insert_file(&file).expect("insert indexed file");
+            storage
+                .update_file_metadata(&file, Some(&format!("{id:064x}")))
+                .expect("persist verified source identity");
+        }
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(9_000_002),
+                    kind: NodeKind::FILE,
+                    serialized_name: project
+                        .path()
+                        .join("forged-openapi.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_100_002),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /forged".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /forged".to_string()),
+                    file_node_id: Some(CoreNodeId(9_000_002)),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_000_003),
+                    kind: NodeKind::FILE,
+                    serialized_name: project
+                        .path()
+                        .join("wrong-language.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_100_003),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /wrong-language".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /wrong-language".to_string()),
+                    file_node_id: Some(CoreNodeId(9_000_003)),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert forged endpoint nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(9_200_003),
+                source: CoreNodeId(9_000_003),
+                target: CoreNodeId(9_100_003),
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(CoreNodeId(9_000_003)),
+                ..Default::default()
+            }])
+            .expect("insert wrong-language member edge");
+        storage
+            .insert_occurrences_batch(&[Occurrence {
+                element_id: 9_100_003,
+                kind: OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: CoreNodeId(9_000_003),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 2,
+                },
+            }])
+            .expect("insert wrong-language definition occurrence");
+        assert!(
+            storage
+                .has_file_owned_openapi_endpoint_projection(9_000_003)
+                .expect("verify wrong-language graph evidence"),
+            "runtime language check must reject otherwise authenticated OpenAPI graph evidence"
+        );
+
+        let diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
+            .expect("load stored file coverage");
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "metadata-only.json",
+                "forged-openapi.json",
+                "wrong-language.json",
+            ])
+        );
+        assert!(diagnostics.iter().all(|diagnostic| diagnostic.reason
+            == FileCoverageReason::CollectorFailure
+            && diagnostic.verified_source
+            && !diagnostic.projection_available));
+    }
+
+    #[test]
+    fn incremental_openapi_structural_transitions_replace_file_owned_projection_atomically() {
+        fn endpoint_ids(storage: &Storage) -> HashSet<String> {
+            storage
+                .get_nodes()
+                .expect("load endpoint nodes")
+                .into_iter()
+                .filter_map(|node| node.canonical_id)
+                .filter(|canonical_id| canonical_id.starts_with("openapi:endpoint:"))
+                .collect()
+        }
+
+        let workspace = tempdir().expect("workspace");
+        let schema_path = workspace.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/old\":{\"get\":{}}}}\n",
+        )
+        .expect("write baseline OpenAPI source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open OpenAPI project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline OpenAPI projection");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        assert_eq!(
+            endpoint_ids(&Storage::open(&storage_path).expect("reopen baseline")),
+            HashSet::from(["openapi:endpoint:GET /old".to_string()])
+        );
+
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/renamed\":{\"post\":{}}}}\n",
+        )
+        .expect("write renamed OpenAPI endpoint");
+        arm_publication_test_fault(
+            PublicationTestBoundary::MarkerCompletion,
+            PublicationTestAction::Fail,
+        );
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("injected staged transition failure must reject publication");
+        assert_eq!(error.code, "internal");
+        let preserved = Storage::open(&storage_path).expect("open preserved baseline");
+        assert_eq!(
+            preserved
+                .get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline)
+        );
+        assert_eq!(
+            endpoint_ids(&preserved),
+            HashSet::from(["openapi:endpoint:GET /old".to_string()])
+        );
+        drop(preserved);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish renamed OpenAPI endpoint");
+        let renamed = Storage::open(&storage_path).expect("open renamed projection");
+        assert_eq!(
+            endpoint_ids(&renamed),
+            HashSet::from(["openapi:endpoint:POST /renamed".to_string()])
+        );
+        let file = renamed
+            .get_file_by_path(&schema_path)
+            .expect("read renamed file")
+            .expect("renamed file");
+        assert_eq!(file.language, "openapi");
+        assert!(
+            renamed
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("authenticate renamed endpoint")
+        );
+        drop(renamed);
+
+        fs::write(&schema_path, "{\"enabled\":true}\n").expect("write generic JSON source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish OpenAPI to generic transition");
+        let generic = Storage::open(&storage_path).expect("open generic projection");
+        assert!(endpoint_ids(&generic).is_empty());
+        let file = generic
+            .get_file_by_path(&schema_path)
+            .expect("read generic file")
+            .expect("generic file");
+        assert_eq!(file.language, "json");
+        assert!(
+            !generic
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("reject removed OpenAPI endpoint")
+        );
+        assert!(
+            generic
+                .get_structural_text_projection_file_ids()
+                .expect("read generic structural projections")
+                .contains(&file.id)
+        );
+        drop(generic);
+
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/restored\":{\"get\":{}}}}\n",
+        )
+        .expect("write restored OpenAPI source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish generic to OpenAPI transition");
+        let restored = Storage::open(&storage_path).expect("open restored projection");
+        assert_eq!(
+            endpoint_ids(&restored),
+            HashSet::from(["openapi:endpoint:GET /restored".to_string()])
+        );
+        let file = restored
+            .get_file_by_path(&schema_path)
+            .expect("read restored file")
+            .expect("restored file");
+        assert_eq!(file.language, "openapi");
+        assert!(
+            restored
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("authenticate restored endpoint")
+        );
+        assert!(
+            !restored
+                .get_structural_text_projection_file_ids()
+                .expect("read restored structural projections")
+                .contains(&file.id)
+        );
+        assert!(
+            stored_file_coverage_diagnostics(workspace.path(), &restored)
+                .expect("verify restored coverage")
+                .is_empty()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn affected_absolute_excluded_structural_path_is_valid_but_uncovered() {
+        let project = tempdir().expect("project");
+        let excluded = project.path().join("vendor/config.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))
+            .expect("create excluded parent");
+        fs::write(&excluded, "{\"ignored\":true}\n").expect("write excluded source");
+        assert!(!indexable_source_path_in_workspace(
+            project.path(),
+            &excluded
+        ));
+        let resolved = AffectedResolvedInput {
+            current: excluded.clone(),
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        let identity =
+            codestory_workspace::workspace_path_identity(&excluded).expect("excluded identity");
+        let (classification, reason, _) = classify_unmatched_affected_input(
+            Some(project.path()),
+            &affected_test_record(AffectedChangeKindDto::Modified, "vendor/config.json"),
+            &resolved,
+            &freshness,
+            Some(&identity),
+            None,
+            None,
+        );
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert!(reason.contains("outside current graph/index coverage"));
     }
 
     fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
@@ -21776,7 +22196,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn build_search_hit_marks_structural_collectors_as_structural_text() {
+    fn build_search_hit_marks_generic_structural_collectors_as_non_sufficient() {
         let mut storage = Storage::new_in_memory().expect("storage");
         let source_hash = "a".repeat(64);
         let unit = codestory_store::StructuralTextUnit {
@@ -21786,11 +22206,11 @@ fn build_llm_symbol_doc_text() -> String {
             content_hash: "c".repeat(64),
             source_content_hash: source_hash.clone(),
             descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
-            producer: "structural_cargo_manifest_collector".to_string(),
+            producer: "structural_markdown_collector".to_string(),
             evidence_tier: "structural_text".to_string(),
             resolution: "source_range_only".to_string(),
-            language: "cargo_manifest".to_string(),
-            kind: NodeKind::PACKAGE,
+            language: "markdown".to_string(),
+            kind: NodeKind::MODULE,
             start_line: 2,
             start_col: 1,
             end_line: 2,
@@ -21802,8 +22222,8 @@ fn build_llm_symbol_doc_text() -> String {
             .flush_projection_batch(codestory_store::ProjectionBatch {
                 files: &[codestory_store::FileInfo {
                     id: 40,
-                    path: PathBuf::from("crates/demo/Cargo.toml"),
-                    language: "cargo_manifest".to_string(),
+                    path: PathBuf::from("docs/demo.md"),
+                    language: "markdown".to_string(),
                     modification_time: 1,
                     indexed: true,
                     complete: true,
@@ -21818,12 +22238,12 @@ fn build_llm_symbol_doc_text() -> String {
                     Node {
                         id: CoreNodeId(40),
                         kind: NodeKind::FILE,
-                        serialized_name: "crates/demo/Cargo.toml".to_string(),
+                        serialized_name: "docs/demo.md".to_string(),
                         ..Default::default()
                     },
                     Node {
                         id: CoreNodeId(41),
-                        kind: NodeKind::PACKAGE,
+                        kind: NodeKind::MODULE,
                         serialized_name: "demo".to_string(),
                         file_node_id: Some(CoreNodeId(40)),
                         start_line: Some(2),
@@ -21838,8 +22258,8 @@ fn build_llm_symbol_doc_text() -> String {
                     file_id: 40,
                     source_content_hash: source_hash,
                     descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
-                    producer: "structural_cargo_manifest_collector".to_string(),
-                    language: "cargo_manifest".to_string(),
+                    producer: "structural_markdown_collector".to_string(),
+                    language: "markdown".to_string(),
                     file_role: codestory_store::FileRole::Source,
                     unit_count: 1,
                     unit_digest: codestory_store::structural_text_unit_digest(
@@ -21865,7 +22285,7 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert_eq!(
             hit.evidence_producer.as_deref(),
-            Some("structural_cargo_manifest_collector")
+            Some("structural_markdown_collector")
         );
         assert_eq!(
             hit.resolution_status,
@@ -26111,10 +26531,10 @@ fn build_llm_symbol_doc_text() -> String {
     #[test]
     fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
         let workspace = tempdir().expect("workspace dir");
-        let css_path = workspace.path().join("styles.css");
-        let sql_path = workspace.path().join("schema.sql");
-        fs::write(&css_path, ".card { color: red; }\n").expect("write css");
-        fs::write(&sql_path, "CREATE TABLE users (id INTEGER);\n").expect("write sql");
+        let markdown_path = workspace.path().join("guide.md");
+        let json_path = workspace.path().join("config.json");
+        fs::write(&markdown_path, "# Stable\n").expect("write markdown");
+        fs::write(&json_path, "{\"service\":{\"name\":\"api\"}}\n").expect("write JSON");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
         controller
@@ -26154,7 +26574,7 @@ fn build_llm_symbol_doc_text() -> String {
         drop(first_store);
         assert_eq!(first_cache.len(), 2);
 
-        fs::write(&css_path, ".card { color: blue; }\n").expect("change css");
+        fs::write(&markdown_path, "# Replacement\n").expect("change markdown");
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish second structural generation");
@@ -26184,20 +26604,17 @@ fn build_llm_symbol_doc_text() -> String {
                 .collect::<HashMap<String, String>>()
         };
         drop(second_store);
-        assert_ne!(
-            first_cache.get("styles.css"),
-            second_cache.get("styles.css")
-        );
+        assert_ne!(first_cache.get("guide.md"), second_cache.get("guide.md"));
         assert_eq!(
-            first_cache.get("schema.sql"),
-            second_cache.get("schema.sql")
+            first_cache.get("config.json"),
+            second_cache.get("config.json")
         );
 
-        fs::write(&sql_path, "CREATE TABLE accounts (id INTEGER);\n").expect("change sql");
+        fs::write(&json_path, "{\"replacement\":{\"name\":\"api\"}}\n").expect("change JSON");
         std::fs::File::options()
             .write(true)
-            .open(&sql_path)
-            .expect("open changed sql")
+            .open(&json_path)
+            .expect("open changed JSON")
             .set_times(
                 std::fs::FileTimes::new()
                     .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
@@ -26223,20 +26640,26 @@ fn build_llm_symbol_doc_text() -> String {
             .map(|node| node.serialized_name)
             .collect::<HashSet<_>>();
         assert!(
-            third_names.contains("public.accounts"),
+            third_names.contains("replacement"),
             "incremental structural nodes: {third_names:?}"
         );
-        assert!(!third_names.contains("public.users"));
+        assert!(!third_names.contains("service"));
         drop(third_store);
         let structural_before_failure = structural_live_identity(&storage_path);
         assert!(structural_before_failure.manifest.unit_count > 0);
         assert_eq!(structural_before_failure.cache_rows.len(), 2);
 
-        fs::write(&css_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+        fs::write(&markdown_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("invalid structural input must fail closed");
-        assert_eq!(error.code, "source_collector_failure");
+        assert_eq!(error.code, "source_binary");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Binary)
+        }));
         let preserved = Store::database_index_publication(&storage_path)
             .expect("read preserved publication")
             .expect("preserved publication");
@@ -26250,6 +26673,55 @@ fn build_llm_symbol_doc_text() -> String {
             structural_before_failure,
             "collector failure changed the prior structural manifest or cache identity"
         );
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        fs::write(&markdown_path, "# Replacement\n").expect("restore markdown");
+        fs::write(
+            workspace.path().join("malformed.json"),
+            "{\"missing_value\":",
+        )
+        .expect("write malformed JSON");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("malformed structural input must fail closed");
+        assert_eq!(error.code, "source_malformed");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Malformed)
+        }));
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "malformed input changed the prior structural manifest or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        fs::remove_file(workspace.path().join("malformed.json"))
+            .expect("remove malformed JSON fixture");
+        let unreadable_path = markdown_path.clone();
+        arm_source_policy_after_plan_hook(move || {
+            fs::remove_file(&unreadable_path).expect("remove planned markdown source");
+            fs::create_dir(&unreadable_path)
+                .expect("replace planned markdown source with unreadable directory");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("unreadable structural replacement must fail closed");
+        assert_eq!(error.code, "source_unreadable");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Unreadable)
+        }));
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "unreadable replacement changed the prior core publication, structural manifest, or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]
@@ -26661,8 +27133,8 @@ fn build_llm_symbol_doc_text() -> String {
             "pub fn first_value() -> i32 { 1 }\n",
         )
         .expect("write source");
-        let instructions = workspace.path().join("AGENTS.md");
-        fs::write(&instructions, "# Initial instructions\n").expect("write instructions");
+        let unsupported = workspace.path().join("notes.txt");
+        fs::write(&unsupported, "Initial notes\n").expect("write unsupported file");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
         controller
@@ -26680,7 +27152,7 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("read first publication")
             .expect("first publication identity");
 
-        fs::write(&instructions, "# Updated instructions\n").expect("update instructions");
+        fs::write(&unsupported, "Updated notes\n").expect("update unsupported file");
         let dry_run = controller
             .dry_run_index(IndexMode::Incremental)
             .expect("plan unsupported file refresh");
@@ -26688,7 +27160,7 @@ fn build_llm_symbol_doc_text() -> String {
             dry_run
                 .sample_files_to_index
                 .iter()
-                .any(|path| path == "AGENTS.md"),
+                .any(|path| path == "notes.txt"),
             "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
         );
         controller
@@ -26704,7 +27176,7 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             Storage::open(&storage_path)
                 .expect("open published storage")
-                .get_file_by_path(&instructions)
+                .get_file_by_path(&unsupported)
                 .expect("look up unsupported file")
                 .is_none(),
             "files without graph collectors should not be invented in semantic scope"

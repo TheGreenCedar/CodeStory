@@ -33,11 +33,11 @@ pub use repository_identity::{
     PROJECT_IDENTITY_SCHEMA_VERSION, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV2,
     ProjectIdentityV3, REPOSITORY_IDENTITY_SCHEMA_VERSION, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
     RepositoryIdentity, RepositoryIdentityV2, SidecarProjectIdentity, WorkspacePathIdentity,
-    cached_project_identity_v2, cached_project_identity_v3, inspect_repository_identity,
-    inspect_repository_identity_v2, project_identity_v2, project_identity_v3,
-    project_identity_v3_from_repository, same_workspace_path, sidecar_project_identity,
-    workspace_file_identity, workspace_id_for_root, workspace_id_v3_for_root,
-    workspace_path_identity,
+    WorkspacePathLexicalIdentity, cached_project_identity_v2, cached_project_identity_v3,
+    inspect_repository_identity, inspect_repository_identity_v2, project_identity_v2,
+    project_identity_v3, project_identity_v3_from_repository, same_workspace_path,
+    sidecar_project_identity, workspace_file_identity, workspace_id_for_root,
+    workspace_id_v3_for_root, workspace_path_identity, workspace_path_lexical_identity,
 };
 
 /// Source-group language selector used during workspace discovery.
@@ -66,7 +66,12 @@ pub enum Language {
     Html,
     Css,
     Bash,
+    Shell,
     PowerShell,
+    Markdown,
+    Yaml,
+    Toml,
+    Json,
     Svelte,
     Vue,
     Astro,
@@ -158,6 +163,10 @@ pub struct WorkspaceManifest {
     is_synthetic_default: Cell<bool>,
     trusted_source_paths: Cell<bool>,
     members: Vec<PathBuf>,
+    discovery_excluded_files: Vec<PathBuf>,
+    discovery_excluded_directory_roots: Vec<PathBuf>,
+    #[cfg(test)]
+    discovery_exclusion_observation_count: Cell<usize>,
 }
 
 /// Multi-member workspace manifest.
@@ -238,6 +247,33 @@ struct CompiledExcludePattern {
     match_absolute: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ObservedDiscoveryDirectoryRoot {
+    containment_paths: Vec<WorkspacePathLexicalIdentity>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservedDiscoveryExclusions {
+    file_identities: HashSet<WorkspacePathIdentity>,
+    file_lexical_paths: HashSet<WorkspacePathLexicalIdentity>,
+    directory_roots: Vec<ObservedDiscoveryDirectoryRoot>,
+}
+
+struct DiscoveryPathFilter<'a> {
+    workspace_root: &'a Path,
+    source_root: &'a Path,
+    filter_by_language: bool,
+    language: &'a Language,
+    exclude_patterns: &'a [CompiledExcludePattern],
+    discovery_exclusions: &'a ObservedDiscoveryExclusions,
+}
+
+#[derive(Debug)]
+struct DiscoveryExclusionObservationError {
+    path: PathBuf,
+    error: std::io::Error,
+}
+
 impl WorkspaceManifest {
     /// Build a manifest from already-parsed settings.
     ///
@@ -250,6 +286,10 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(true),
             members: Vec::new(),
+            discovery_excluded_files: Vec::new(),
+            discovery_excluded_directory_roots: Vec::new(),
+            #[cfg(test)]
+            discovery_exclusion_observation_count: Cell::new(0),
         }
     }
 
@@ -263,6 +303,10 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(false),
             members: Vec::new(),
+            discovery_excluded_files: Vec::new(),
+            discovery_excluded_directory_roots: Vec::new(),
+            #[cfg(test)]
+            discovery_exclusion_observation_count: Cell::new(0),
         })
     }
 
@@ -289,6 +333,10 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(false),
             members: Vec::new(),
+            discovery_excluded_files: Vec::new(),
+            discovery_excluded_directory_roots: Vec::new(),
+            #[cfg(test)]
+            discovery_exclusion_observation_count: Cell::new(0),
         }
     }
 
@@ -337,6 +385,25 @@ impl WorkspaceManifest {
         }
     }
 
+    /// Open a workspace while excluding the exact CodeStory core/search
+    /// artifacts owned by `storage_path`.
+    pub fn open_with_storage_owned_exclusions(
+        root_path: PathBuf,
+        storage_path: &Path,
+    ) -> Result<Self> {
+        let mut manifest = Self::open(root_path)?;
+        manifest.exclude_discovery_files([
+            storage_path.to_path_buf(),
+            storage_path.with_extension("db-wal"),
+            storage_path.with_extension("db-shm"),
+        ]);
+        manifest.exclude_discovery_directory_roots([
+            legacy_search_directory_for_storage(storage_path),
+            search_generation_directory_for_storage(storage_path),
+        ]);
+        Ok(manifest)
+    }
+
     fn load_workspace_members(root_path: PathBuf, manifest_path: PathBuf) -> Result<Self> {
         let content = fs::read_to_string(&manifest_path)?;
         let workspace: WorkspaceMembersManifest = serde_json::from_str(&content)?;
@@ -377,6 +444,27 @@ impl WorkspaceManifest {
     /// Return the effective manifest settings used by discovery.
     pub fn settings(&self) -> &WorkspaceSettings {
         &self.settings
+    }
+
+    /// Exclude caller-owned generated files from source discovery.
+    ///
+    /// These exclusions are runtime-only and are never persisted into a
+    /// project manifest.
+    pub fn exclude_discovery_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.discovery_excluded_files.extend(paths);
+    }
+
+    /// Exclude caller-owned generated directory trees from source discovery.
+    ///
+    /// These exclusions are runtime-only and are never persisted into a
+    /// project manifest.
+    pub fn exclude_discovery_directory_roots(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        self.discovery_excluded_directory_roots.extend(roots);
+    }
+
+    #[cfg(test)]
+    fn discovery_exclusion_observation_count(&self) -> usize {
+        self.discovery_exclusion_observation_count.get()
     }
 
     /// Return the manifest path that defines the workspace root.
@@ -552,6 +640,25 @@ impl WorkspaceManifest {
     ) -> Result<WorkspaceRefreshOutcome> {
         WorkspaceDiscovery.build_refresh_outcome_inner(self, inputs, Some(max_current_files))
     }
+}
+
+/// Legacy mutable search directory associated with one core database.
+pub fn legacy_search_directory_for_storage(storage_path: &Path) -> PathBuf {
+    storage_owned_sibling_path(storage_path, "search")
+}
+
+/// Immutable search-generation directory associated with one core database.
+pub fn search_generation_directory_for_storage(storage_path: &Path) -> PathBuf {
+    storage_owned_sibling_path(storage_path, "search-generations")
+}
+
+fn storage_owned_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
+    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory");
+    parent.join(format!("{stem}.{suffix}"))
 }
 
 impl WorkspaceDiscovery {
@@ -740,12 +847,47 @@ impl WorkspaceDiscovery {
         let mut seen = HashSet::new();
         let mut issues = Vec::new();
         let mut inspected_source_roots = 0usize;
+        let discovery_exclusions = match observe_discovery_exclusions(manifest) {
+            Ok(exclusions) => exclusions,
+            Err(error) => {
+                return Ok(WorkspaceFileInventory {
+                    files: Vec::new(),
+                    outcome: WorkspaceInventoryOutcome::Unreadable,
+                    issues: vec![WorkspaceInventoryIssue {
+                        path: error.path,
+                        message: format!(
+                            "failed to observe caller-owned discovery exclusion: {}",
+                            error.error
+                        ),
+                    }],
+                });
+            }
+        };
 
         for group in &manifest.settings.source_groups {
             let exclude_patterns = compile_exclude_patterns(&group.exclude_patterns)?;
             let filter_by_language = manifest.should_filter_source_group_language();
             for source_path in &group.source_paths {
                 let full_path = resolve_manifest_source_path(manifest, source_path)?;
+                if discovery_exclusions.directory_contains(&full_path) {
+                    continue;
+                }
+                match discovery_exclusions.file_is_excluded(&full_path) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: full_path,
+                            message: format!(
+                                "failed to observe source identity against caller-owned exclusions: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                if workspace_structural_source_exclusion(&workspace_root, &full_path).is_some() {
+                    continue;
+                }
                 let source_root = discovery_root(&full_path);
 
                 let metadata = match fs::metadata(&full_path) {
@@ -768,15 +910,15 @@ impl WorkspaceDiscovery {
                 inspected_source_roots += 1;
 
                 if metadata.is_file() {
-                    if !should_include_discovered_path(
-                        &full_path,
-                        false,
-                        &workspace_root,
-                        &source_root,
+                    let path_filter = DiscoveryPathFilter {
+                        workspace_root: &workspace_root,
+                        source_root: &source_root,
                         filter_by_language,
-                        &group.language,
-                        &exclude_patterns,
-                    ) {
+                        language: &group.language,
+                        exclude_patterns: &exclude_patterns,
+                        discovery_exclusions: &discovery_exclusions,
+                    };
+                    if !should_include_discovered_path(&full_path, false, &path_filter) {
                         continue;
                     }
                     if !push_discovered_file_within_limit(
@@ -802,18 +944,19 @@ impl WorkspaceDiscovery {
                     let workspace_root_for_filter = workspace_root.clone();
                     let source_root_for_filter = source_root.clone();
                     let exclude_patterns = exclude_patterns.clone();
+                    let filter_discovery_exclusions = discovery_exclusions.clone();
                     let language = group.language.clone();
                     builder.filter_entry(move |entry| {
                         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                        should_include_discovered_path(
-                            entry.path(),
-                            is_dir,
-                            &workspace_root_for_filter,
-                            &source_root_for_filter,
+                        let path_filter = DiscoveryPathFilter {
+                            workspace_root: &workspace_root_for_filter,
+                            source_root: &source_root_for_filter,
                             filter_by_language,
-                            &language,
-                            &exclude_patterns,
-                        )
+                            language: &language,
+                            exclude_patterns: &exclude_patterns,
+                            discovery_exclusions: &filter_discovery_exclusions,
+                        };
+                        should_include_discovered_path(entry.path(), is_dir, &path_filter)
                     });
                     for entry in builder.build() {
                         let entry = match entry {
@@ -828,6 +971,19 @@ impl WorkspaceDiscovery {
                         }
                         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                             continue;
+                        }
+                        match discovery_exclusions.file_is_excluded(entry.path()) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                issues.push(WorkspaceInventoryIssue {
+                                    path: entry.path().to_path_buf(),
+                                    message: format!(
+                                        "failed to observe source identity against caller-owned exclusions: {error}"
+                                    ),
+                                });
+                                continue;
+                            }
                         }
                         if !push_discovered_file_within_limit(
                             &mut all_files,
@@ -1211,28 +1367,170 @@ fn discovery_root(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| normalize_lexical_path(path))
 }
 
+fn observe_discovery_exclusions(
+    manifest: &WorkspaceManifest,
+) -> std::result::Result<ObservedDiscoveryExclusions, DiscoveryExclusionObservationError> {
+    #[cfg(test)]
+    manifest.discovery_exclusion_observation_count.set(0);
+
+    let mut observed = ObservedDiscoveryExclusions::default();
+    for path in &manifest.discovery_excluded_files {
+        #[cfg(test)]
+        manifest
+            .discovery_exclusion_observation_count
+            .set(manifest.discovery_exclusion_observation_count.get() + 1);
+        let identity =
+            workspace_path_identity(path).map_err(|error| DiscoveryExclusionObservationError {
+                path: path.clone(),
+                error,
+            })?;
+        observed.file_identities.insert(identity);
+        observed
+            .file_lexical_paths
+            .insert(workspace_path_lexical_identity(path).map_err(|error| {
+                DiscoveryExclusionObservationError {
+                    path: path.clone(),
+                    error,
+                }
+            })?);
+    }
+    for root in &manifest.discovery_excluded_directory_roots {
+        #[cfg(test)]
+        manifest
+            .discovery_exclusion_observation_count
+            .set(manifest.discovery_exclusion_observation_count.get() + 1);
+        workspace_path_identity(root).map_err(|error| DiscoveryExclusionObservationError {
+            path: root.clone(),
+            error,
+        })?;
+
+        let mut containment_paths =
+            vec![workspace_path_lexical_identity(root).map_err(|error| {
+                DiscoveryExclusionObservationError {
+                    path: root.clone(),
+                    error,
+                }
+            })?];
+        match root.canonicalize() {
+            Ok(canonical) => {
+                let canonical = workspace_path_lexical_identity(&canonical).map_err(|error| {
+                    DiscoveryExclusionObservationError {
+                        path: root.clone(),
+                        error,
+                    }
+                })?;
+                if !containment_paths.contains(&canonical) {
+                    containment_paths.push(canonical);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DiscoveryExclusionObservationError {
+                    path: root.clone(),
+                    error,
+                });
+            }
+        }
+        observed
+            .directory_roots
+            .push(ObservedDiscoveryDirectoryRoot { containment_paths });
+    }
+    Ok(observed)
+}
+
+impl ObservedDiscoveryExclusions {
+    fn file_is_excluded(&self, path: &Path) -> std::io::Result<bool> {
+        if self.file_identities.is_empty() {
+            return Ok(false);
+        }
+        if self
+            .file_lexical_paths
+            .contains(&workspace_path_lexical_identity(path)?)
+        {
+            return Ok(true);
+        }
+        workspace_path_identity(path).map(|identity| self.file_identities.contains(&identity))
+    }
+
+    fn directory_contains(&self, path: &Path) -> bool {
+        if self.directory_roots.is_empty() {
+            return false;
+        }
+        let Ok(lexical) = workspace_path_lexical_identity(path) else {
+            return true;
+        };
+        let canonical = path
+            .canonicalize()
+            .ok()
+            .and_then(|path| workspace_path_lexical_identity(&path).ok());
+        self.directory_contains_observed(&lexical, canonical.as_ref())
+    }
+
+    fn directory_contains_observed(
+        &self,
+        lexical: &WorkspacePathLexicalIdentity,
+        canonical: Option<&WorkspacePathLexicalIdentity>,
+    ) -> bool {
+        self.directory_roots
+            .iter()
+            .flat_map(|root| &root.containment_paths)
+            .any(|root| {
+                lexical.is_within(root) || canonical.is_some_and(|path| path.is_within(root))
+            })
+    }
+}
+
 fn should_include_discovered_path(
     path: &Path,
     is_dir: bool,
-    workspace_root: &Path,
-    source_root: &Path,
-    filter_by_language: bool,
-    language: &Language,
-    exclude_patterns: &[CompiledExcludePattern],
+    filter: &DiscoveryPathFilter<'_>,
 ) -> bool {
     let normalized = normalize_lexical_path(path);
-    if let Ok(canonical) = normalized.canonicalize()
-        && !canonical.starts_with(source_root)
+    let canonical = normalized.canonicalize().ok();
+    let Ok(exclusion_lexical) = workspace_path_lexical_identity(&normalized) else {
+        return false;
+    };
+    let exclusion_canonical = canonical
+        .as_deref()
+        .and_then(|path| workspace_path_lexical_identity(path).ok());
+    if filter
+        .discovery_exclusions
+        .directory_contains_observed(&exclusion_lexical, exclusion_canonical.as_ref())
     {
         return false;
     }
-    if is_excluded_path(&normalized, workspace_root, source_root, exclude_patterns) {
+    if !is_dir
+        && workspace_structural_source_exclusion(filter.workspace_root, &normalized).is_some()
+    {
+        return false;
+    }
+    if canonical.is_some_and(|canonical| !canonical.starts_with(filter.source_root)) {
+        return false;
+    }
+    if is_excluded_path(
+        &normalized,
+        filter.workspace_root,
+        filter.source_root,
+        filter.exclude_patterns,
+    ) {
         return false;
     }
     if is_dir {
         return true;
     }
-    !filter_by_language || matches_source_group_language(&normalized, language)
+    !filter.filter_by_language || matches_source_group_language(&normalized, filter.language)
+}
+
+fn workspace_structural_source_exclusion(
+    workspace_root: &Path,
+    path: &Path,
+) -> Option<&'static str> {
+    let relative = workspace_relative_path(workspace_root, path)?;
+    let relative = relative.to_str()?.replace('\\', "/");
+    if !codestory_contracts::language_support::is_structural_source_path(&relative) {
+        return None;
+    }
+    codestory_contracts::language_support::structural_source_path_exclusion(&relative)
 }
 
 fn is_excluded_path(
@@ -1351,6 +1649,12 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Html, "html")
             | (&Language::Css, "css")
             | (&Language::Bash, "bash")
+            | (&Language::Shell, "shell")
+            | (&Language::PowerShell, "powershell")
+            | (&Language::Markdown, "markdown")
+            | (&Language::Yaml, "yaml")
+            | (&Language::Toml, "toml")
+            | (&Language::Json, "json")
     )
 }
 
@@ -1362,7 +1666,6 @@ fn compatibility_extension_matches_source_group(extension: &str, language: &Lang
             | (&Language::CSharp, "cshtml")
             | (&Language::Lua, "lua")
             | (&Language::Css, "scss" | "sass" | "less")
-            | (&Language::PowerShell, "ps1" | "psm1")
             | (&Language::Svelte, "svelte")
             | (&Language::Vue, "vue")
             | (&Language::Astro, "astro")
@@ -1511,6 +1814,94 @@ mod tests {
         assert_eq!(plan.mode, RefreshMode::Incremental);
         assert_eq!(plan.files_to_index, vec![file]);
         assert!(plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn structural_exclusion_uses_only_workspace_relative_descendants() -> Result<()> {
+        let temp = tempdir()?;
+        for ancestor in ["build", "target", "vendor", "secrets"] {
+            let root = temp.path().join(ancestor).join("repo");
+            fs::create_dir_all(&root)?;
+            let root_source = root.join("config.json");
+            fs::write(&root_source, "{\"root\":true}\n")?;
+            for excluded_dir in ["build", "target", "vendor", "secrets"] {
+                let excluded = root.join(excluded_dir).join("config.json");
+                fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+                fs::write(excluded, "{\"excluded\":true}\n")?;
+            }
+
+            let manifest = WorkspaceManifest::open(root.clone())?;
+            let inventory = manifest.source_inventory()?;
+            assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+            assert!(
+                inventory.files.contains(&root_source),
+                "workspace ancestor `{ancestor}` excluded the root source"
+            );
+            for excluded_dir in ["build", "target", "vendor", "secrets"] {
+                assert!(
+                    !inventory
+                        .files
+                        .contains(&root.join(excluded_dir).join("config.json")),
+                    "workspace-relative `{excluded_dir}` descendant remained admitted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_structural_inventory_entry_schedules_pre_policy_row_removal() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let excluded = root.join("vendor/config.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        fs::write(&excluded, "{\"legacy\":true}\n")?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let outcome = WorkspaceDiscovery.build_refresh_outcome(
+            &manifest,
+            &RefreshInputs {
+                stored_files: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    excluded,
+                    IndexedFileRecord {
+                        file_id: 44,
+                        modification_time: 0,
+                        content_hash: Some("a".repeat(64)),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    },
+                )]),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert_eq!(outcome.plan.files_to_remove, vec![44]);
+        assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn declared_json_lockfiles_are_excluded_without_hiding_ordinary_json() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let lockfile = root.join("skills-lock.json");
+        let ordinary = root.join("config.json");
+        fs::write(&lockfile, "{\"skills\":[]}\n")?;
+        fs::write(&ordinary, "{\"enabled\":true}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&lockfile));
+        assert!(inventory.files.contains(&ordinary));
         Ok(())
     }
 
@@ -1990,6 +2381,187 @@ mod tests {
     }
 
     #[test]
+    fn caller_owned_generated_roots_exclude_descendants_without_hiding_siblings() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let generated = root.join("cache").join("search-generations");
+        let sibling = root.join("cache").join("search-generations-user");
+        fs::create_dir_all(&generated)?;
+        fs::create_dir_all(&sibling)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+        fs::write(generated.join("meta.json"), "{\"generated\":true}\n")?;
+        fs::write(sibling.join("config.json"), "{\"indexed\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::open(root.clone())?;
+        manifest.exclude_discovery_directory_roots([generated.clone()]);
+        let files = manifest.source_files()?;
+
+        assert!(files.contains(&root.join("config.json")));
+        assert!(files.contains(&sibling.join("config.json")));
+        assert!(!files.contains(&generated.join("meta.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_file_identity_excludes_hardlink_aliases() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let owned = root.join("cache").join("codestory.db");
+        let alias = root.join("looks-like-user-source.json");
+        fs::create_dir_all(owned.parent().expect("owned parent"))?;
+        fs::write(&owned, "{\"generated\":true}\n")?;
+        fs::hard_link(&owned, &alias)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::open(root.clone())?;
+        manifest.exclude_discovery_files([owned]);
+        let files = manifest.source_files()?;
+
+        assert!(!files.contains(&alias));
+        assert!(files.contains(&root.join("config.json")));
+
+        let mut direct = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![SourceGroupSettings {
+                    id: Uuid::new_v4(),
+                    language: Language::Json,
+                    standard: LanguageStandard::Default,
+                    source_paths: vec![alias],
+                    exclude_patterns: Vec::new(),
+                    include_paths: Vec::new(),
+                    defines: HashMap::new(),
+                    language_specific: LanguageSpecificSettings::Other,
+                }],
+            },
+            root.join("codestory_project.json"),
+        );
+        direct.exclude_discovery_files([root.join("cache").join("codestory.db")]);
+        let direct_inventory = direct.source_inventory()?;
+        assert_eq!(
+            direct_inventory.outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(direct_inventory.files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_missing_file_uses_platform_lexical_identity() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("cache"))?;
+        let missing = root.join("cache").join("codestory.db-wal");
+        let dotted = root
+            .join("cache")
+            .join("nested")
+            .join("..")
+            .join("codestory.db-wal");
+        assert_eq!(
+            workspace_path_identity(&missing)?,
+            workspace_path_identity(&dotted)?
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            workspace_path_identity(&missing)?,
+            workspace_path_identity(&root.join("CACHE").join("CODESTORY.DB-WAL"))?
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            workspace_path_identity(&missing)?,
+            workspace_path_identity(&root.join("cache").join("CODESTORY.DB-WAL"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_directory_excludes_a_direct_configured_source() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let generated = root.join("cache").join("search-generations");
+        fs::create_dir_all(&generated)?;
+        fs::write(generated.join("meta.json"), "{\"generated\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![SourceGroupSettings {
+                    id: Uuid::new_v4(),
+                    language: Language::Json,
+                    standard: LanguageStandard::Default,
+                    source_paths: vec![generated.clone()],
+                    exclude_patterns: Vec::new(),
+                    include_paths: Vec::new(),
+                    defines: HashMap::new(),
+                    language_specific: LanguageSpecificSettings::Other,
+                }],
+            },
+            root.join("codestory_project.json"),
+        );
+        manifest.exclude_discovery_directory_roots([generated]);
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_exclusion_roots_are_observed_once_per_inventory() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        for index in 0..256 {
+            fs::write(
+                root.join(format!("config-{index}.json")),
+                format!("{{\"index\":{index}}}\n"),
+            )?;
+        }
+
+        let storage_path = root.join("cache/custom-core.db");
+        let manifest =
+            WorkspaceManifest::open_with_storage_owned_exclusions(root.clone(), &storage_path)?;
+        assert_eq!(
+            legacy_search_directory_for_storage(&storage_path),
+            root.join("cache/custom-core.search")
+        );
+        assert_eq!(
+            search_generation_directory_for_storage(&storage_path),
+            root.join("cache/custom-core.search-generations")
+        );
+        let files = manifest.source_files()?;
+
+        assert_eq!(files.len(), 256);
+        assert_eq!(manifest.discovery_exclusion_observation_count(), 5);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_caller_owned_exclusion_fails_inventory_closed() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+        let unavailable = root.join(std::ffi::OsString::from_vec(b"bad\0root".to_vec()));
+
+        let mut manifest = WorkspaceManifest::open(root)?;
+        manifest.exclude_discovery_directory_roots([unavailable.clone()]);
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Unreadable);
+        assert!(inventory.files.is_empty());
+        assert_eq!(inventory.issues.len(), 1);
+        assert_eq!(inventory.issues[0].path, unavailable);
+        Ok(())
+    }
+
+    #[test]
     fn source_files_apply_language_filter_and_prune_ignored_directories() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
@@ -2074,6 +2646,12 @@ mod tests {
             Language::Html,
             Language::Css,
             Language::Bash,
+            Language::Shell,
+            Language::PowerShell,
+            Language::Markdown,
+            Language::Yaml,
+            Language::Toml,
+            Language::Json,
         ];
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
@@ -2108,8 +2686,6 @@ mod tests {
             ("astro", Language::TypeScript),
             ("astro", Language::Astro),
             ("lua", Language::Lua),
-            ("ps1", Language::PowerShell),
-            ("psm1", Language::PowerShell),
             ("scss", Language::Css),
             ("sass", Language::Css),
             ("less", Language::Css),

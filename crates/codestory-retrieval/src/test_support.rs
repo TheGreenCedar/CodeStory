@@ -80,6 +80,7 @@ pub fn publish_zero_dense_pinned_query_fixture(
     let input = crate::index::compute_sidecar_input_fingerprint(
         &storage,
         project_root,
+        storage_path,
         &project_id,
         &embedding_backend,
         embedding_dim,

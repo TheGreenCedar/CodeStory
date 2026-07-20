@@ -283,8 +283,9 @@ struct SourceCacheFreshness {
 }
 
 fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCacheFreshness> {
-    let workspace = WorkspaceManifest::open(project.to_path_buf())
-        .with_context(|| format!("open source workspace {}", project.display()))?;
+    let workspace =
+        WorkspaceManifest::open_with_storage_owned_exclusions(project.to_path_buf(), source_db)
+            .with_context(|| format!("open source workspace {}", project.display()))?;
     let storage = Store::open(source_db).context("open source cache for freshness")?;
     if storage
         .has_incomplete_incremental_run()
@@ -779,6 +780,29 @@ mod tests {
         assert_eq!(output.status, "skipped");
         assert_eq!(output.reason.as_deref(), Some("git tree mismatch"));
         assert!(!target_cache.path().join("codestory.db").exists());
+    }
+
+    #[test]
+    fn source_cache_freshness_ignores_custom_in_worktree_storage_artifacts() {
+        let project = tempdir().expect("project");
+        let source_db = project.path().join("cache").join("custom-core.db");
+        fs::create_dir_all(source_db.parent().expect("cache parent")).expect("cache parent");
+        let _storage = Store::open(&source_db).expect("source store");
+        let legacy = codestory_workspace::legacy_search_directory_for_storage(&source_db);
+        let generations = codestory_workspace::search_generation_directory_for_storage(&source_db);
+        fs::create_dir_all(&legacy).expect("legacy search directory");
+        fs::create_dir_all(generations.join("generation-1")).expect("search generation directory");
+        fs::write(legacy.join("meta.json"), "{\"generated\":true}\n").expect("legacy metadata");
+        fs::write(
+            generations.join("generation-1").join("meta.json"),
+            "{\"generated\":true}\n",
+        )
+        .expect("generation metadata");
+
+        let freshness =
+            source_cache_freshness(project.path(), &source_db).expect("fresh source cache");
+        assert_eq!(freshness.changed_or_new_files, 0);
+        assert_eq!(freshness.removed_files, 0);
     }
 
     #[test]

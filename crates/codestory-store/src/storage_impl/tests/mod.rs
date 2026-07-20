@@ -1095,6 +1095,169 @@ fn insert_file_row(storage: &Storage, id: i64, path: &str) -> Result<(), Storage
 }
 
 #[test]
+fn openapi_endpoint_projection_requires_file_owned_graph_evidence() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let file_rows = [
+        (1, "openapi.json"),
+        (2, "metadata-only.json"),
+        (3, "wrong-file.yaml"),
+        (4, "ordinary-function.json"),
+        (5, "empty-endpoint.json"),
+    ];
+    for &(id, path) in &file_rows {
+        insert_file_row(&storage, id, path)?;
+    }
+    let file_nodes = file_rows
+        .iter()
+        .map(|(id, path)| file_node(*id, path))
+        .collect::<Vec<_>>();
+    let endpoints = [
+        Node {
+            id: NodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "GET /ready".to_string(),
+            canonical_id: Some("openapi:endpoint:GET /ready".to_string()),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(201),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "GET /forged".to_string(),
+            canonical_id: Some("openapi:endpoint:GET /forged".to_string()),
+            file_node_id: Some(NodeId(2)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(301),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "GET /wrong-file".to_string(),
+            canonical_id: Some("openapi:endpoint:GET /wrong-file".to_string()),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(401),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "ordinary".to_string(),
+            canonical_id: Some("route_endpoint:GET /ordinary".to_string()),
+            file_node_id: Some(NodeId(4)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(501),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "empty".to_string(),
+            canonical_id: Some("openapi:endpoint:".to_string()),
+            file_node_id: Some(NodeId(5)),
+            ..Default::default()
+        },
+    ];
+    let mut nodes = file_nodes;
+    nodes.extend(endpoints.iter().cloned());
+    storage.insert_nodes_batch(&nodes)?;
+
+    let graph_files = [(1, 101), (3, 301), (4, 401), (5, 501)];
+    storage.insert_edges_batch(
+        &graph_files
+            .iter()
+            .map(|(file_id, endpoint_id)| Edge {
+                id: EdgeId(10_000 + endpoint_id),
+                source: NodeId(*file_id),
+                target: NodeId(*endpoint_id),
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(NodeId(*file_id)),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    storage.insert_occurrences_batch(
+        &graph_files
+            .iter()
+            .map(|(file_id, endpoint_id)| Occurrence {
+                element_id: *endpoint_id,
+                kind: OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: NodeId(*file_id),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 2,
+                },
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    assert!(storage.has_file_owned_openapi_endpoint_projection(1)?);
+    for file_id in [2, 3, 4, 5] {
+        assert!(
+            !storage.has_file_owned_openapi_endpoint_projection(file_id)?,
+            "file {file_id} must not authenticate forged OpenAPI projection evidence"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn projection_file_upsert_updates_language_across_structural_transitions()
+-> Result<(), StorageError> {
+    fn flush_file(storage: &mut Storage, file: &FileInfo) -> Result<(), StorageError> {
+        storage
+            .flush_projection_batch(ProjectionBatch {
+                files: std::slice::from_ref(file),
+                file_content_hashes: &[],
+                nodes: &[],
+                structural_text_units: &[],
+                structural_text_projections: &[],
+                structural_text_cache_writes: &[],
+                edges: &[],
+                occurrences: &[],
+                component_access: &[],
+                callable_projection_states: &[],
+            })
+            .map(|_| ())
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    let path = PathBuf::from("config.json");
+    let mut file = FileInfo {
+        id: 77,
+        path: path.clone(),
+        language: "json".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    };
+    storage.insert_file(&file)?;
+
+    for language in ["openapi", "json"] {
+        file.language = language.to_string();
+        file.modification_time += 1;
+        flush_file(&mut storage, &file)?;
+        let stored = storage.get_files()?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].path, path);
+        assert_eq!(stored[0].language, language);
+    }
+
+    file.language = "openapi".to_string();
+    file.complete = false;
+    file.modification_time += 1;
+    flush_file(&mut storage, &file)?;
+    let stored = storage.get_files()?;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].path, path);
+    assert_eq!(
+        stored[0].language, "json",
+        "incomplete retry evidence must retain the previous verified classification"
+    );
+    assert!(!stored[0].complete);
+    Ok(())
+}
+
+#[test]
 fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     insert_file_row(&storage, 1, "src/routes/+page.svelte")?;
@@ -5978,8 +6141,22 @@ fn test_error_storage_round_trips_coverage_reason() -> Result<(), StorageError> 
         index_step: codestory_contracts::graph::IndexStep::Indexing,
         coverage_reason: None,
     })?;
+    for (message, reason) in [
+        ("Malformed structural source", FileCoverageReason::Malformed),
+        ("Binary structural source", FileCoverageReason::Binary),
+    ] {
+        storage.insert_error(&codestory_contracts::graph::ErrorInfo {
+            message: message.to_string(),
+            file_id: Some(NodeId(1)),
+            line: None,
+            column: None,
+            is_fatal: false,
+            index_step: codestory_contracts::graph::IndexStep::Indexing,
+            coverage_reason: Some(reason),
+        })?;
+    }
     let stats = storage.get_stats()?;
-    assert_eq!(stats.error_count, 2);
+    assert_eq!(stats.error_count, 4);
     assert_eq!(stats.fatal_error_count, 1);
     let errors = storage.get_errors(None)?;
     let syntax_error = errors
@@ -5994,11 +6171,19 @@ fn test_error_storage_round_trips_coverage_reason() -> Result<(), StorageError> 
         syntax_error.coverage_reason,
         Some(FileCoverageReason::CollectorFailure)
     );
+    assert!(errors.iter().any(|error| {
+        error.message == "Malformed structural source"
+            && error.coverage_reason == Some(FileCoverageReason::Malformed)
+    }));
+    assert!(errors.iter().any(|error| {
+        error.message == "Binary structural source"
+            && error.coverage_reason == Some(FileCoverageReason::Binary)
+    }));
     assert_eq!(warning.coverage_reason, None);
     storage.refresh_grounding_summary_snapshots()?;
     assert!(storage.has_ready_grounding_summary_snapshots()?);
     let snapshot_stats = storage.get_stats()?;
-    assert_eq!(snapshot_stats.error_count, 2);
+    assert_eq!(snapshot_stats.error_count, 4);
     assert_eq!(snapshot_stats.fatal_error_count, 1);
     Ok(())
 }

@@ -49,6 +49,44 @@ enum WorkspacePathIdentityKind {
     MissingWindows(Vec<u16>),
 }
 
+/// Operation-scoped platform-lexical path spelling for containment checks.
+///
+/// Unix preserves case. Windows uses the same normalized invariant ordinal
+/// ignore-case spelling as missing [`WorkspacePathIdentity`] values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspacePathLexicalIdentity(WorkspacePathLexicalIdentityKind);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WorkspacePathLexicalIdentityKind {
+    #[cfg(unix)]
+    Unix(PathBuf),
+    #[cfg(windows)]
+    Windows(Vec<u16>),
+}
+
+impl WorkspacePathLexicalIdentity {
+    /// Whether this candidate is the root itself or one of its descendants.
+    pub fn is_within(&self, root: &Self) -> bool {
+        match (&self.0, &root.0) {
+            #[cfg(unix)]
+            (
+                WorkspacePathLexicalIdentityKind::Unix(candidate),
+                WorkspacePathLexicalIdentityKind::Unix(root),
+            ) => candidate == root || candidate.starts_with(root),
+            #[cfg(windows)]
+            (
+                WorkspacePathLexicalIdentityKind::Windows(candidate),
+                WorkspacePathLexicalIdentityKind::Windows(root),
+            ) => {
+                candidate == root
+                    || (candidate.starts_with(root)
+                        && (root.last() == Some(&u16::from(b'\\'))
+                            || candidate.get(root.len()) == Some(&u16::from(b'\\'))))
+            }
+        }
+    }
+}
+
 /// Git-derived identity used to decide whether portable sidecar cache reuse is
 /// safe for a project root.
 #[derive(Debug, Clone, Serialize)]
@@ -649,6 +687,31 @@ pub fn workspace_path_identity(path: &Path) -> io::Result<WorkspacePathIdentity>
             missing_workspace_path_identity(path)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Normalize one path for operation-scoped native lexical containment.
+pub fn workspace_path_lexical_identity(path: &Path) -> io::Result<WorkspacePathLexicalIdentity> {
+    #[cfg(unix)]
+    {
+        Ok(WorkspacePathLexicalIdentity(
+            WorkspacePathLexicalIdentityKind::Unix(normalize_missing_unix_path(path)),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let normalized = normalize_windows_lexical_path(path);
+        Ok(WorkspacePathLexicalIdentity(
+            WorkspacePathLexicalIdentityKind::Windows(windows_ordinal_case_fold(&normalized)?),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "lexical workspace path identity is unsupported on this platform",
+        ))
     }
 }
 

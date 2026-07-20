@@ -21,7 +21,8 @@
 - `crates/codestory-indexer/src/cache.rs`: serialized parser and structural
   artifact-cache formats and cache-key construction
 - `crates/codestory-indexer/src/structural/`: workflow, Compose, Cargo
-  manifest, HTML, CSS, and SQL collectors plus structural unit finalization
+  manifest, HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser
+  shell, and PowerShell collectors plus structural unit finalization
 - `crates/codestory-indexer/src/compilation_database.rs`: `compile_commands.json` discovery and parsed compilation metadata
 - `crates/codestory-indexer/src/resolution/`: post-flush `ResolutionPass`, candidate selection, scoped resolution, and semantic fallback
 - `crates/codestory-indexer/src/semantic/`: language-aware semantic helpers used by resolution
@@ -83,9 +84,9 @@ later, after those rows already exist.
 
 ## Structural Unit Identity
 
-The six structural collector families emit source-range-only evidence without
-claiming parser-backed graph resolution. Finalization slices the exact UTF-8
-source span and records the collector producer, evidence tier, resolution
+The twelve structural unit collector families emit source-range-only evidence
+without claiming parser-backed graph resolution. Finalization slices the exact
+UTF-8 source span and records the collector producer, evidence tier, resolution
 status, language, kind, file role, descriptor version, source hash, and span.
 The content identity is stable for an equivalent descriptor and exact source
 slice; placement identity additionally includes file and node identity.
@@ -94,6 +95,25 @@ Only collector-marked nodes become structural units. Delegated parser nodes,
 including HTML script or style descendants, remain parser-owned. Cache hits
 must reproduce the complete unit and projection digests after a fresh source
 read or the indexer recollects the file.
+
+Format routing is ordered. GitHub Actions, Docker Compose, and Cargo manifests
+keep their dedicated producers; OpenAPI JSON/YAML is checked on its dedicated
+schema path before generic collection; `.sh` and `.bash` remain parser-backed
+Bash. Generic shell structural fallback is limited to `.zsh`, `.ksh`, and
+`.command`.
+
+Structural admission applies one contracts-owned policy to workspace-relative
+inventory paths before metadata or content reads. Generated and vendor trees,
+secret-bearing conventions, lockfiles, minified/generated outputs, and
+declared high-noise forms do not create file, unit, projection, or cache rows;
+an excluded path already present in stored inventory is scheduled for normal
+incremental deletion. Repository ancestors are never policy inputs. Admitted
+files are capped at 1 MiB and 2,048 units. A bound failure rejects the whole
+file instead of publishing a truncated projection. Structural cache identity
+v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
+Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources
+retain distinct coverage reasons and do not create reusable structural cache
+entries.
 
 ## Resolution and Semantic Fallback
 

@@ -105,7 +105,7 @@ impl CachedStructuralArtifact {
     }
 }
 
-pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 1;
+pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 2;
 
 pub(crate) fn build_structural_artifact_cache_key(
     cache_path: &Path,
