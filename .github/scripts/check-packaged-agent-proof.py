@@ -30,6 +30,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
 from native_binary_contract import (
     NativeBinaryError,
@@ -55,6 +56,12 @@ REQUIRED_HOLDOUT_TASK_FILES = {
     "redis-server-event-loop.task.json",
     "ripgrep-search-pipeline.task.json",
 }
+
+
+def project_resource_uri(base_uri: str, project: Path) -> str:
+    return f"{base_uri}?project={quote(str(project), safe='-._~')}"
+
+
 EXTERNAL_QUALIFICATION_METRICS = {
     "retrieval_quality",
     "total_codestory_process_memory",
@@ -2951,20 +2958,22 @@ class McpProcess:
         self.process.stdin.flush()
 
     def status(self, project: Path, request_id: str) -> dict:
+        uri = project_resource_uri(STATUS_URI, project)
         return extract_resource(self.send({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "resources/read",
-            "params": {"uri": STATUS_URI, "project": str(project)},
-        }), STATUS_URI)
+            "params": {"uri": uri},
+        }), uri)
 
     def engine_diagnostics(self, project: Path, request_id: str) -> dict:
+        uri = project_resource_uri(ENGINE_DIAGNOSTICS_URI, project)
         return extract_resource(self.send({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "resources/read",
-            "params": {"uri": ENGINE_DIAGNOSTICS_URI, "project": str(project)},
-        }), ENGINE_DIAGNOSTICS_URI)
+            "params": {"uri": uri},
+        }), uri)
 
     def tool(self, name: str, arguments: dict, request_id: str) -> dict:
         response = self.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})

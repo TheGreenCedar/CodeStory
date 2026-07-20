@@ -15,6 +15,12 @@ Markdown output includes `context: scope=<line_context|function_body> requested_
 
 When `--function-body` is set, snippet prefers an implementation/body-looking function or method hit over a declaration-looking hit when possible. If indexed source ranges are missing or suspicious, supported brace languages attempt a bounded brace-balanced fallback before degrading. If fallback fails, output keeps `scope=line_context` and reports the fallback reason explicitly.
 
+The MCP `snippet` tool exposes the same behavior with
+`scope=line_context|function_body` and `context=0..200`. `lines` aliases
+`context`, and the CLI-compatible `function_body` boolean aliases `scope`.
+Pass only one member of each alias pair; unknown or conflicting fields fail
+instead of being ignored.
+
 ```
 # Snippet
 resolved: `AppController::new` -> [abc123] new [FUNCTION] `src/lib.rs`:100

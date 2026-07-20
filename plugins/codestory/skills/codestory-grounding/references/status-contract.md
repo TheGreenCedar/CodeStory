@@ -32,9 +32,13 @@ using it during refresh and never read a half-published generation.
 
 ## Diagnostic status
 
-`codestory://status` is an observational diagnostic surface. Read it only when
-the direct tool loop stops converging, the tool reports stale evidence, or the
-task explicitly asks for runtime diagnostics. A status read never starts work.
+`codestory://status{?project}` is an observational diagnostic resource
+template. Expand `project` with the percent-encoded absolute repository root;
+the returned content URI remains bound to that canonical root.
+`codestory://agent-guide` is the project-free static resource. Read status only
+when the direct tool loop stops converging, the tool reports stale evidence, or
+the task explicitly asks for runtime diagnostics. A status read never starts
+work.
 
 The most useful fields are:
 

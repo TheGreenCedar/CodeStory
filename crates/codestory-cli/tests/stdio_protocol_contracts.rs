@@ -726,7 +726,12 @@ fn json_resource_content(result: &Value, uri: &str) -> Value {
         .as_array()
         .expect("resource contents")
         .iter()
-        .find(|content| content["uri"] == uri)
+        .find(|content| {
+            content["uri"] == uri
+                || content["uri"]
+                    .as_str()
+                    .is_some_and(|candidate| candidate.starts_with(&format!("{uri}?project=")))
+        })
         .unwrap_or_else(|| panic!("resource read should include content for {uri}: {result}"));
     assert_eq!(content["mimeType"], "application/json");
     let text = content["text"]
@@ -734,6 +739,26 @@ fn json_resource_content(result: &Value, uri: &str) -> Value {
         .unwrap_or_else(|| panic!("resource {uri} content should include JSON text: {content}"));
     serde_json::from_str(text)
         .unwrap_or_else(|error| panic!("resource {uri} should be parseable JSON: {error}\n{text}"))
+}
+
+fn strict_resource_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("encode resource component");
+        }
+    }
+    encoded
+}
+
+fn project_resource_uri(base_uri: &str, project: &Path) -> String {
+    format!(
+        "{base_uri}?project={}",
+        strict_resource_component(project.to_string_lossy().as_ref())
+    )
 }
 
 fn assert_tool_safety_metadata(tool: &Value) {
@@ -856,6 +881,7 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
 fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     let fixture = unindexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
+    let status_uri = project_resource_uri("codestory://status", fixture.workspace.path());
 
     let init = send_json(
         &mut server,
@@ -878,7 +904,7 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
             "jsonrpc": "2.0",
             "id": "status-unindexed",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": status_uri}
         }),
     );
     let status_result = assert_success_envelope(&status_response, json!("status-unindexed"));
@@ -926,7 +952,7 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
             "jsonrpc": "2.0",
             "id": "status-indexed-after-ground",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let refreshed = json_resource_content(
@@ -1157,11 +1183,12 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     );
 
     let status_request = |id: &str, project: &Path| {
+        let uri = project_resource_uri("codestory://status", project);
         json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "resources/read",
-            "params": {"uri": "codestory://status", "project": project}
+            "params": {"uri": uri}
         })
     };
     let read_status = |server: &mut StdioServer, id: &str, project: &Path| {
@@ -1198,6 +1225,50 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
             "A/B/A status identity drifted at {pointer}"
         );
     }
+
+    let first_symbol = assert_tool_success(
+        &send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "multi-first-symbol",
+                "method": "tools/call",
+                "params": {
+                    "name": "symbol",
+                    "arguments": {"project": first.path(), "query": "first_only"}
+                }
+            }),
+        ),
+        json!("multi-first-symbol"),
+    )
+    .clone();
+    let first_node_id = first_symbol
+        .pointer("/node/id")
+        .or_else(|| first_symbol.pointer("/resolution/resolved/node_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("first project should resolve first_only: {first_symbol}"));
+    let wrong_project_uri = format!(
+        "codestory://symbol/{}?project={}",
+        strict_resource_component(first_node_id),
+        strict_resource_component(second.path().to_string_lossy().as_ref())
+    );
+    let wrong_project = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "multi-first-node-through-second",
+            "method": "resources/read",
+            "params": {"uri": wrong_project_uri}
+        }),
+    );
+    assert!(
+        wrong_project.get("error").is_some()
+            || wrong_project
+                .pointer("/result/contents/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("not found")),
+        "a node selected from the first repository must not resolve through the second: {wrong_project}"
+    );
 }
 
 #[test]
@@ -1692,6 +1763,28 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
             "{name}.choose should document the 1-based lower bound: {schema}"
         );
     }
+    let snippet = tool_input_schema(&tools, "snippet");
+    assert_schema_enum_values(
+        snippet,
+        "/properties/scope/enum",
+        &["function_body", "line_context"],
+    );
+    assert_eq!(
+        schema_property(snippet, "scope").get("default"),
+        Some(&json!("line_context"))
+    );
+    for field in ["context", "lines"] {
+        assert_eq!(
+            schema_property(snippet, field).get("maximum"),
+            Some(&json!(200)),
+            "snippet.{field} should expose the bounded source window: {snippet}"
+        );
+    }
+    assert_eq!(
+        schema_property(snippet, "function_body")["type"],
+        "boolean",
+        "snippet.function_body should preserve the documented CLI selector: {snippet}"
+    );
 
     let symbols = tool_input_schema(&tools, "symbols");
     let symbols_limit = schema_property(symbols, "limit");
@@ -2175,14 +2268,8 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
     .clone();
     assert_eq!(
         sorted_field_values(&resources, "resources", "uri"),
-        vec![
-            "codestory://agent-guide",
-            "codestory://grounding",
-            "codestory://project",
-            "codestory://status",
-            "codestory://symbols/root",
-        ],
-        "resource catalog should stay compact and stable: {resources}"
+        vec!["codestory://agent-guide"],
+        "only static project-free resources belong in resources/list: {resources}"
     );
 
     let templates = assert_success_envelope(
@@ -2196,12 +2283,17 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
     assert_eq!(
         sorted_field_values(&templates, "resourceTemplates", "uriTemplate"),
         vec![
-            "codestory://references/{node_id}",
-            "codestory://snippet/{node_id}",
-            "codestory://symbol/{node_id}",
-            "codestory://trail/{node_id}",
+            "codestory://diagnostics/retrieval-engine{?project}",
+            "codestory://grounding{?project}",
+            "codestory://project{?project}",
+            "codestory://references/{node_id}{?project}",
+            "codestory://snippet/{node_id}{?project}",
+            "codestory://status{?project}",
+            "codestory://symbol/{node_id}{?project}",
+            "codestory://symbols/root{?project}",
+            "codestory://trail/{node_id}{?project}",
         ],
-        "resource template catalog should stay compact and stable: {templates}"
+        "every repository-reading resource template should carry an explicit project selector: {templates}"
     );
 
     let prompts = assert_success_envelope(
@@ -2284,24 +2376,11 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
         json!(2),
     )
     .clone();
-    assert!(
-        resources["resources"]
-            .as_array()
-            .expect("resources array")
-            .iter()
-            .any(|resource| resource["uri"] == "codestory://project"),
-        "resources/list should include the project resource: {resources}"
+    assert_eq!(
+        sorted_field_values(&resources, "resources", "uri"),
+        vec!["codestory://agent-guide"],
+        "resources/list should contain only static project-free resources: {resources}"
     );
-    for expected in ["codestory://status", "codestory://agent-guide"] {
-        assert!(
-            resources["resources"]
-                .as_array()
-                .expect("resources array")
-                .iter()
-                .any(|resource| resource["uri"] == expected),
-            "resources/list should include {expected}: {resources}"
-        );
-    }
 
     let templates = assert_success_envelope(
         &send_json(
@@ -2316,8 +2395,10 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
             .as_array()
             .expect("resource templates array")
             .iter()
-            .any(|template| template["uriTemplate"] == "codestory://symbol/{node_id}"),
-        "resources/templates/list should include symbol template: {templates}"
+            .any(|template| {
+                template["uriTemplate"] == "codestory://symbol/{node_id}{?project}"
+            }),
+        "resources/templates/list should include a project-bound symbol template: {templates}"
     );
 
     let prompts = assert_success_envelope(
@@ -3235,7 +3316,7 @@ fn malformed_affected_on_cold_project_does_not_activate_before_legacy_retry() {
             "jsonrpc": "2.0",
             "id": "affected-cold-status",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let cold_status = json_resource_content(
@@ -3281,7 +3362,7 @@ fn transcript_reads_project_resource() {
             "jsonrpc": "2.0",
             "id": "project-resource",
             "method": "resources/read",
-            "params": {"uri": "codestory://project"}
+            "params": {"uri": "codestory://project", "project": fixture.workspace.path()}
         }),
     );
 
@@ -3291,7 +3372,12 @@ fn transcript_reads_project_resource() {
         .expect("resource contents")
         .first()
         .expect("first resource content");
-    assert_eq!(content["uri"], "codestory://project");
+    assert!(
+        content["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("codestory://project?project=")),
+        "project resource should echo its canonical project-bound URI: {content}"
+    );
     assert_eq!(content["mimeType"], "application/json");
     let text = content["text"].as_str().expect("project resource text");
     let project: Value = serde_json::from_str(text).expect("project resource json text");
@@ -3315,7 +3401,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             "jsonrpc": "2.0",
             "id": "status-resource",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
 
@@ -3343,7 +3429,12 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         json!("ready"),
         "{compact}"
     );
-    assert_eq!(compact["diagnostics_uri"], json!("codestory://status"));
+    assert!(
+        compact["diagnostics_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("codestory://status?project=")),
+        "compact status should link to its project-bound diagnostic resource: {compact}"
+    );
     for diagnostic in ["allowed_surfaces", "retrieval_diagnostics"] {
         assert!(compact.get(diagnostic).is_none(), "{compact}");
     }
@@ -3600,7 +3691,7 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
             "jsonrpc": "2.0",
             "id": "status-dirty-marker",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&response, json!("status-dirty-marker"));
@@ -3664,7 +3755,7 @@ fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
             "jsonrpc": "2.0",
             "id": "status-dirty-marker-indexed",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&response, json!("status-dirty-marker-indexed"));
@@ -3702,7 +3793,7 @@ fn resources_read_status_reports_unknown_dirty_marker_without_blocking_local_ind
             "jsonrpc": "2.0",
             "id": "status-unknown-marker",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&response, json!("status-unknown-marker"));
@@ -3800,7 +3891,7 @@ fn resources_read_status_dirty_marker_fail_open_matrix() {
                 "jsonrpc": "2.0",
                 "id": format!("status-dirty-marker-{name}"),
                 "method": "resources/read",
-                "params": {"uri": "codestory://status"}
+                "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
             }),
         );
         let result =
@@ -3850,7 +3941,7 @@ fn update_available_is_advisory_and_preserves_compatible_surfaces() {
             "jsonrpc": "2.0",
             "id": "status-update-advisory",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&response, json!("status-update-advisory"));
@@ -3924,7 +4015,7 @@ fn offline_release_metadata_is_non_blocking_and_unknown() {
             "jsonrpc": "2.0",
             "id": "status-offline-release-metadata",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&response, json!("status-offline-release-metadata"));
@@ -3958,7 +4049,7 @@ fn local_dev_override_does_not_recommend_restart_for_managed_history() {
             "jsonrpc": "2.0",
             "id": "status-local-dev-override",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&response, json!("status-local-dev-override"));
@@ -3983,7 +4074,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
             "jsonrpc": "2.0",
             "id": "status-freshness-warmup",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let warmup_result = assert_success_envelope(&warmup, json!("status-freshness-warmup"));
@@ -4017,7 +4108,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
             "jsonrpc": "2.0",
             "id": "status-observes-stale",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let stale = json_resource_content(
@@ -4060,7 +4151,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
                 "jsonrpc": "2.0",
                 "id": id.clone(),
                 "method": "resources/read",
-                "params": {"uri": "codestory://status"}
+                "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
             }),
         );
         let refreshed_result = assert_success_envelope(&refreshed, json!(id));
@@ -4119,7 +4210,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
                 "jsonrpc": "2.0",
                 "id": format!("status-freshness-{index}"),
                 "method": "resources/read",
-                "params": {"uri": "codestory://status"}
+                "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
             }),
         );
         elapsed.push(started.elapsed());
@@ -4179,7 +4270,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
             "jsonrpc": "2.0",
             "id": "status-freshness-after-reindex",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
@@ -4290,7 +4381,7 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
             "jsonrpc": "2.0",
             "id": "concurrent-status",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let status = json_resource_content(
@@ -4357,7 +4448,10 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
             "jsonrpc": "2.0",
             "id": "concurrent-root-symbols",
             "method": "resources/read",
-            "params": {"uri": "codestory://symbols/root"}
+            "params": {
+                "uri": "codestory://symbols/root",
+                "project": fixture.workspace.path()
+            }
         }),
     );
     let root_symbols = json_resource_content(
@@ -4386,7 +4480,7 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             "jsonrpc": "2.0",
             "id": "warmup-generation",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let old_generation = json_resource_content(
@@ -4443,7 +4537,10 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             "jsonrpc": "2.0",
             "id": "reader-ground-during-lock",
             "method": "resources/read",
-            "params": {"uri": "codestory://grounding"}
+            "params": {
+                "uri": "codestory://grounding",
+                "project": fixture.workspace.path()
+            }
         }),
     );
     let concurrent_ground = json_resource_content(
@@ -4468,7 +4565,10 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
                 "jsonrpc": "2.0",
                 "id": "reader-status",
                 "method": "resources/read",
-                "params": {"uri": "codestory://status"}
+                "params": {
+                    "uri": "codestory://status",
+                    "project": fixture.workspace.path()
+                }
             }),
         );
         let status = json_resource_content(
@@ -4614,7 +4714,7 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
             "jsonrpc": "2.0",
             "id": "tool-refresh-status",
             "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "params": {"uri": "codestory://status", "project": fixture.workspace.path()}
         }),
     );
     let status_result = assert_success_envelope(&status_response, json!("tool-refresh-status"));
@@ -4686,6 +4786,11 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         ("trail", "tool-refresh-trail"),
         ("trace", "tool-refresh-trace"),
     ] {
+        let arguments = if tool == "snippet" {
+            json!({"id": node_id, "function_body": true, "lines": 0})
+        } else {
+            json!({"id": node_id, "depth": 1, "max_nodes": 20})
+        };
         let response = send_json(
             &mut server,
             json!({
@@ -4694,7 +4799,7 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
                 "method": "tools/call",
                 "params": {
                     "name": tool,
-                    "arguments": {"id": node_id, "depth": 1, "max_nodes": 20}
+                    "arguments": arguments
                 }
             }),
         );
@@ -4705,6 +4810,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
                 .contains("stdio_tool_added_after_mutation"),
             "{tool} should serve refreshed graph evidence for the post-mutation symbol: {result}"
         );
+        if tool == "snippet" {
+            assert_eq!(result["scope"], json!("function_body"), "{result}");
+            assert_eq!(result["requested_context"], json!(0), "{result}");
+        }
     }
 
     let affected_response = send_json(
@@ -4956,7 +5065,12 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     );
     let error = assert_tool_error(&search, json!("cold-search-unavailable"));
     assert_eq!(error["tool"], json!("search"));
-    assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
+    assert!(
+        error["diagnostics_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("codestory://status?project=")),
+        "tool errors should return a project-bound diagnostics resource: {error}"
+    );
     assert_eq!(
         error["operation"]["capabilities"]["local_navigation"],
         json!("ready")

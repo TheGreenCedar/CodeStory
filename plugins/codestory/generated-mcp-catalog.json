@@ -3615,7 +3615,7 @@
             ]
           }
         ],
-        "description": "Resolve a symbol by query or stable node id.",
+        "description": "Resolve a symbol and return bounded line or function-body source context.",
         "properties": {
           "choose": {
             "description": "Resolve by the 1-based alternative number from an ambiguity error.",
@@ -3623,10 +3623,27 @@
             "minimum": 1,
             "type": "integer"
           },
+          "context": {
+            "default": 4,
+            "description": "Surrounding context lines above and below the selected source range.",
+            "maximum": 200,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "function_body": {
+            "description": "CLI-compatible scope selector; true requests `function_body`, false requests `line_context`.",
+            "type": "boolean"
+          },
           "id": {
             "description": "Stable node id.",
             "minLength": 1,
             "type": "string"
+          },
+          "lines": {
+            "description": "Agent-friendly compatibility alias for `context`.",
+            "maximum": 200,
+            "minimum": 0,
+            "type": "integer"
           },
           "project": {
             "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
@@ -3636,6 +3653,15 @@
           "query": {
             "description": "Symbol query.",
             "minLength": 1,
+            "type": "string"
+          },
+          "scope": {
+            "default": "line_context",
+            "description": "Snippet scope.",
+            "enum": [
+              "line_context",
+              "function_body"
+            ],
             "type": "string"
           }
         },
@@ -3981,50 +4007,55 @@
   "resources": [
     {
       "mimeType": "application/json",
-      "name": "Status",
-      "uri": "codestory://status"
-    },
-    {
-      "mimeType": "application/json",
       "name": "Agent guide",
       "uri": "codestory://agent-guide"
-    },
-    {
-      "mimeType": "application/json",
-      "name": "Project summary",
-      "uri": "codestory://project"
-    },
-    {
-      "mimeType": "application/json",
-      "name": "Grounding snapshot",
-      "uri": "codestory://grounding"
-    },
-    {
-      "mimeType": "application/json",
-      "name": "Root symbols",
-      "uri": "codestory://symbols/root"
     }
   ],
   "resourceTemplates": [
     {
       "mimeType": "application/json",
+      "name": "Status",
+      "uriTemplate": "codestory://status{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Retrieval engine diagnostics",
+      "uriTemplate": "codestory://diagnostics/retrieval-engine{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Project summary",
+      "uriTemplate": "codestory://project{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Grounding snapshot",
+      "uriTemplate": "codestory://grounding{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Root symbols",
+      "uriTemplate": "codestory://symbols/root{?project}"
+    },
+    {
+      "mimeType": "application/json",
       "name": "Symbol details",
-      "uriTemplate": "codestory://symbol/{node_id}"
+      "uriTemplate": "codestory://symbol/{node_id}{?project}"
     },
     {
       "mimeType": "application/json",
       "name": "Symbol references",
-      "uriTemplate": "codestory://references/{node_id}"
+      "uriTemplate": "codestory://references/{node_id}{?project}"
     },
     {
       "mimeType": "application/json",
       "name": "Symbol snippet",
-      "uriTemplate": "codestory://snippet/{node_id}"
+      "uriTemplate": "codestory://snippet/{node_id}{?project}"
     },
     {
       "mimeType": "application/json",
       "name": "Symbol trail",
-      "uriTemplate": "codestory://trail/{node_id}"
+      "uriTemplate": "codestory://trail/{node_id}{?project}"
     }
   ],
   "prompts": [

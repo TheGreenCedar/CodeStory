@@ -17,6 +17,7 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
 const launcherTest = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"))._test;
+const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
   dirtyMarkerPathForProject,
   dirtyHookStatus,
@@ -54,6 +55,53 @@ async function stopChildProcess(child) {
 test("fail-open tool schemas are the generated canonical MCP catalog", async () => {
   const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
   assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
+  assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
+  assert.ok(
+    catalog.resourceTemplates.some(({ uriTemplate }) =>
+      uriTemplate === "codestory://status{?project}"),
+  );
+  assert.ok(
+    catalog.resourceTemplates.every(({ uriTemplate }) => uriTemplate.endsWith("{?project}")),
+    "every advertised repository resource template must carry a project selector",
+  );
+  const snippet = catalog.tools.find(({ name }) => name === "snippet");
+  assert.deepEqual(
+    Object.keys(snippet.inputSchema.properties).sort(),
+    ["choose", "context", "function_body", "id", "lines", "project", "query", "scope"],
+  );
+});
+
+test("fail-open project resource URIs use the native strict encoding contract", () => {
+  for (const project of ["/tmp/Code Story/%/café", String.raw`C:\Code Story\100% data\Δ`]) {
+    const encoded = launcherTest.strictUriComponentEncode(project);
+    assert.equal(launcherTest.strictUriComponentDecode(encoded, "resource project"), project);
+    assert.equal(
+      launcherTest.projectBoundResourceUri("codestory://status", project),
+      `codestory://status?project=${encoded}`,
+    );
+  }
+  for (const uri of [
+    "codestory://status",
+    "codestory://status?project=%2ftmp%2Frepo",
+    "codestory://status?project=/tmp/repo",
+    "codestory://status?project=%2Ftmp%2Frepo&project=%2Fother",
+    "codestory://status?project=%ZZ",
+  ]) {
+    assert.throws(
+      () => launcherTest.parseFailOpenResourceRequest(uri, undefined),
+      /project|canonical|unknown/u,
+      uri,
+    );
+  }
+  assert.throws(
+    () => launcherTest.parseFailOpenResourceRequest("codestory://agent-guide", "/tmp/repo"),
+    /resource_project_unexpected/u,
+  );
+  const bound = launcherTest.parseFailOpenResourceRequest(statusUri, undefined);
+  const legacy = launcherTest.parseFailOpenResourceRequest("codestory://status", repoRoot);
+  assert.equal(bound.projectSource, "resource_uri");
+  assert.equal(legacy.projectSource, "request_argument");
+  assert.equal(bound.uri, legacy.uri);
 });
 
 test("fail-open handoff shutdown is bounded for a child that ignores stdin and SIGTERM", async () => {
@@ -290,7 +338,7 @@ function spawnLauncher(launcher, env) {
   let stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: statusUri } })}\n`);
   const runtimeMetadata = env.PLUGIN_DATA && join(env.PLUGIN_DATA, ".codestory-mcp-runtime.json");
   let handoffRequestId = 2;
   const handoffPoll = runtimeMetadata && setInterval(() => {
@@ -1659,7 +1707,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
   const cliPath = await writeNodeCli(
     binDir,
@@ -1700,8 +1748,8 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     assert.equal(responses.length, 1, result.stdout);
     const status = JSON.parse(responses[0].result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "request_argument");
+    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.readiness[0].setup.probe_status, 17);
     assert.match(
       status.readiness[0].setup.probe_error,
@@ -1731,7 +1779,7 @@ test("mcp launcher does not route from another thread's global active project st
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -1908,7 +1956,7 @@ test("mcp launcher ignores fresh global active project state when current thread
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -1991,7 +2039,7 @@ test("mcp launcher ignores unscoped global active project state", async () => {
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2071,7 +2119,7 @@ test("mcp launcher uses fresh active project state from before launcher start", 
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2147,7 +2195,7 @@ test("mcp launcher ignores stale active project state from plugin root", async (
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2445,7 +2493,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = [
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: statusUri } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
     JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
     JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } }),
@@ -2454,6 +2502,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
   ].join("\n") + "\n";
 
   try {
+    const realRepoRoot = await realpath(repoRoot);
     const result = spawnSync(process.execPath, [launcher], {
       env: {
         PLUGIN_DATA: "",
@@ -2473,11 +2522,10 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.equal(responses.length, 7, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_state, "no_project");
+    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.degraded_reason, "managed_cli_unavailable");
-    assert.equal(status.project_selection.code, "project_required");
-    assert.equal(status.project_selection.state, "no_project");
+    assert.equal(status.project_selection, undefined);
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
@@ -2603,7 +2651,7 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2644,7 +2692,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
   let child;
 
@@ -2887,15 +2935,17 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(initialized.result.serverInfo.name, "codestory");
     assert.equal(initialized.result.capabilities.tools.listChanged, true);
     assert.equal(initialized.result.capabilities.prompts.listChanged, true);
+    const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
     const statusResponse = await request({
       jsonrpc: "2.0",
       id: 2,
       method: "resources/read",
-      params: { uri: "codestory://status", project: repoRoot },
+      params: { uri: statusUri },
     });
     const status = JSON.parse(statusResponse.result.contents[0].text);
     assert.equal(status.project_root, repoRoot);
-    assert.equal(status.project_root_source, "request_argument");
+    assert.equal(status.project_root_source, "resource_uri");
+    assert.equal(statusResponse.result.contents[0].uri, statusUri);
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
     assert.equal(status.runtime.state, "preparing");
     const coldResources = await request({
@@ -2905,23 +2955,26 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     });
     assert.deepEqual(
       coldResources.result.resources.map(({ uri }) => uri),
-      ["codestory://status", "codestory://agent-guide"],
+      ["codestory://agent-guide"],
     );
     const coldGuideResponse = await request({
       jsonrpc: "2.0",
       id: "cold-guide",
       method: "resources/read",
-      params: { uri: "codestory://agent-guide", project: repoRoot },
+      params: { uri: "codestory://agent-guide" },
     });
     const coldGuide = JSON.parse(coldGuideResponse.result.contents[0].text);
-    assert.equal(coldGuide.project, repoRoot);
-    assert.equal(coldGuide.diagnostics_uri, "codestory://status");
+    assert.equal(coldGuide.project, undefined);
+    assert.equal(coldGuide.diagnostics_uri_template, "codestory://status{?project}");
     const coldTemplates = await request({
       jsonrpc: "2.0",
       id: "cold-templates",
       method: "resources/templates/list",
     });
-    assert.deepEqual(coldTemplates.result.resourceTemplates, []);
+    assert.deepEqual(
+      coldTemplates.result.resourceTemplates.map(({ uriTemplate }) => uriTemplate),
+      ["codestory://status{?project}"],
+    );
     const coldPrompts = await request({
       jsonrpc: "2.0",
       id: "cold-prompts",
@@ -3006,7 +3059,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       jsonrpc: "2.0",
       id: 5,
       method: "resources/read",
-      params: { uri: "codestory://status" },
+      params: { uri: statusUri },
     })}\n`);
     const recoveryDeadline = Date.now() + 2000;
     while (Date.now() < recoveryDeadline && !responses.some((response) => response.id === 5)) {
@@ -3068,7 +3121,7 @@ test("managed publication waiter keeps diagnostic MCP responsive", { timeout: 15
     waiter.stdout.on("data", (chunk) => { output += chunk; });
     waiter.stdin.write([
       JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
-      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/read", params: { uri: "codestory://status" } }),
+      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/read", params: { uri: statusUri } }),
       "",
     ].join("\n"));
     const deadline = Date.now() + 2000;
@@ -3121,7 +3174,7 @@ test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async
     jsonrpc: "2.0",
     id: 3,
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   })}\n`);
   assert.equal((await completed)[0], 0);
   const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
@@ -3632,7 +3685,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
     jsonrpc: "2.0",
     id: 1,
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
   let child;
 

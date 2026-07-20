@@ -1529,6 +1529,39 @@ static TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_any_of_required(&[&["query"], &["id"]]);
 
+static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Resolve a symbol and return bounded line or function-body source context.",
+    &[
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
+        SchemaProperty::string("scope", "Snippet scope.")
+            .with_enum(SNIPPET_SCOPES)
+            .with_default(ValueLiteral::String("line_context")),
+        SchemaProperty::integer(
+            "context",
+            "Surrounding context lines above and below the selected source range.",
+        )
+        .with_default(ValueLiteral::Integer(4))
+        .with_bounds(0, 200),
+        SchemaProperty::integer(
+            "lines",
+            "Agent-friendly compatibility alias for `context`.",
+        )
+        .with_bounds(0, 200),
+        SchemaProperty::boolean(
+            "function_body",
+            "CLI-compatible scope selector; true requests `function_body`, false requests `line_context`.",
+        ),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
+
 static GRAPH_TARGET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Resolve a single indexed graph node by stable id or query.",
     &[
@@ -1961,7 +1994,7 @@ static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "snippet",
         description: "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
-        input_schema: TARGET_INPUT_SCHEMA,
+        input_schema: SNIPPET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
     },
@@ -1974,52 +2007,55 @@ static TOOLS: &[ToolSpec] = &[
     },
 ];
 
-static RESOURCES: &[ResourceSpec] = &[
-    ResourceSpec {
-        uri: "codestory://status",
-        name: "Status",
-        mime_type: "application/json",
-    },
-    ResourceSpec {
-        uri: "codestory://agent-guide",
-        name: "Agent guide",
-        mime_type: "application/json",
-    },
-    ResourceSpec {
-        uri: "codestory://project",
-        name: "Project summary",
-        mime_type: "application/json",
-    },
-    ResourceSpec {
-        uri: "codestory://grounding",
-        name: "Grounding snapshot",
-        mime_type: "application/json",
-    },
-    ResourceSpec {
-        uri: "codestory://symbols/root",
-        name: "Root symbols",
-        mime_type: "application/json",
-    },
-];
+static RESOURCES: &[ResourceSpec] = &[ResourceSpec {
+    uri: "codestory://agent-guide",
+    name: "Agent guide",
+    mime_type: "application/json",
+}];
 
 static RESOURCE_TEMPLATES: &[ResourceTemplateSpec] = &[
     ResourceTemplateSpec {
-        uri_template: "codestory://symbol/{node_id}",
+        uri_template: "codestory://status{?project}",
+        name: "Status",
+        mime_type: "application/json",
+    },
+    ResourceTemplateSpec {
+        uri_template: "codestory://diagnostics/retrieval-engine{?project}",
+        name: "Retrieval engine diagnostics",
+        mime_type: "application/json",
+    },
+    ResourceTemplateSpec {
+        uri_template: "codestory://project{?project}",
+        name: "Project summary",
+        mime_type: "application/json",
+    },
+    ResourceTemplateSpec {
+        uri_template: "codestory://grounding{?project}",
+        name: "Grounding snapshot",
+        mime_type: "application/json",
+    },
+    ResourceTemplateSpec {
+        uri_template: "codestory://symbols/root{?project}",
+        name: "Root symbols",
+        mime_type: "application/json",
+    },
+    ResourceTemplateSpec {
+        uri_template: "codestory://symbol/{node_id}{?project}",
         name: "Symbol details",
         mime_type: "application/json",
     },
     ResourceTemplateSpec {
-        uri_template: "codestory://references/{node_id}",
+        uri_template: "codestory://references/{node_id}{?project}",
         name: "Symbol references",
         mime_type: "application/json",
     },
     ResourceTemplateSpec {
-        uri_template: "codestory://snippet/{node_id}",
+        uri_template: "codestory://snippet/{node_id}{?project}",
         name: "Symbol snippet",
         mime_type: "application/json",
     },
     ResourceTemplateSpec {
-        uri_template: "codestory://trail/{node_id}",
+        uri_template: "codestory://trail/{node_id}{?project}",
         name: "Symbol trail",
         mime_type: "application/json",
     },

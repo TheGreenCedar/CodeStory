@@ -72,7 +72,10 @@ installed plugin, and a fresh host session loads that replacement. See the
 ## Diagnostics
 
 Normal calls prepare the repository automatically. Agents call the intended
-tool first and retry it while preparation runs. `codestory://status` and the
+tool first and retry it while preparation runs. Project-scoped resources use
+the advertised `{?project}` templates; for example, status binds the caller's
+percent-encoded absolute root in `codestory://status?project=...`.
+`codestory://agent-guide` stays static and project-free. Status and the
 [CLI reference](../../docs/users/cli-reference.md) are diagnostic surfaces for
 failed convergence, not first-use steps.
 

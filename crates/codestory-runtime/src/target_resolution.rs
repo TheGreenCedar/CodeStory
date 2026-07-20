@@ -39,6 +39,78 @@ pub struct ResolvedTarget {
     pub alternatives: Vec<SearchHit>,
 }
 
+pub fn prefer_function_body_target(
+    project_root: &Path,
+    mut target: ResolvedTarget,
+) -> ResolvedTarget {
+    if hit_looks_like_function_body(project_root, &target.selected) {
+        return target;
+    }
+    if !matches!(target.selected.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return target;
+    }
+    let Some((index, preferred)) = target
+        .alternatives
+        .iter()
+        .enumerate()
+        .find(|(_, hit)| {
+            function_body_promotion_matches(&target.selected, hit)
+                && hit_looks_like_function_body(project_root, hit)
+        })
+        .map(|(index, hit)| (index, hit.clone()))
+    else {
+        return target;
+    };
+    target.selected = preferred;
+    let promoted = target.alternatives.remove(index);
+    target.alternatives.insert(0, promoted);
+    target
+}
+
+fn function_body_promotion_matches(selected: &SearchHit, candidate: &SearchHit) -> bool {
+    if selected.display_name == candidate.display_name {
+        return true;
+    }
+    terminal_display_name(&selected.display_name) == terminal_display_name(&candidate.display_name)
+}
+
+fn terminal_display_name(name: &str) -> &str {
+    name.rsplit_once("::")
+        .map(|(_, terminal)| terminal)
+        .or_else(|| name.rsplit_once('.').map(|(_, terminal)| terminal))
+        .unwrap_or(name)
+}
+
+fn hit_looks_like_function_body(project_root: &Path, hit: &SearchHit) -> bool {
+    if !matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return false;
+    }
+    let Some(path) = hit.file_path.as_deref() else {
+        return false;
+    };
+    let Some(line) = hit.line else {
+        return false;
+    };
+    let path = Path::new(path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    let Ok(contents) = fs::read_to_string(&resolved) else {
+        return false;
+    };
+    let line_index = line.saturating_sub(1) as usize;
+    let window = contents
+        .lines()
+        .skip(line_index)
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let before_body = window.split('{').next().unwrap_or(window.as_str());
+    window.contains('{') && !before_body.contains(';')
+}
+
 #[derive(Debug, Clone)]
 pub struct AmbiguousTarget {
     pub query: String,

@@ -35,8 +35,9 @@ ceremony.
 
 CodeStory prepares its local repository map and shared per-user retrieval server
 automatically. `status` and
-`codestory://status` are optional diagnostics for a failed or unexpectedly slow
-request, not prerequisites for normal grounding.
+the project-bound `codestory://status{?project}` resource are optional
+diagnostics for a failed or unexpectedly slow request, not prerequisites for
+normal grounding.
 
 If CodeStory tools are hidden and deferred discovery is available,
 search only for the intended tool, for example `codestory mcp packet`, then call
