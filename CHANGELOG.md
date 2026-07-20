@@ -12,6 +12,11 @@
   fail closed without falling through to the production release installer.
   The launcher now owns the MCP initialize handshake and relays the verified
   native runtime through explicit pipes instead of grandchild stdio inheritance.
+- Repo-scale warning baselines now bind headline runtime values and phase
+  timings to one unique date/commit row. The evidence parser recognizes each
+  Markdown table by its header, ignores older over-wide phase rows as runtime
+  sources, and fails closed on missing or malformed headline data and duplicate
+  row identities instead of combining measurements from different runs.
 - MCP repository resources now advertise canonical project-bound URI templates
   while the static agent guide remains project-free. Strict URI parsing
   preserves native path identity across spaces, percent characters, Unicode,
