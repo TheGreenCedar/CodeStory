@@ -254,90 +254,195 @@ fn latest_phase_stats_baseline(repo_root: &Path) -> StatsLogBaseline {
             source_path.display()
         )
     });
-    let mut baseline = latest_phase_stats_baseline_from_str(&log)
-        .expect("docs/testing/codestory-e2e-stats-log.md must contain a Phase Metrics row");
+    let mut baseline = latest_phase_stats_baseline_from_str(&log).expect(
+        "docs/testing/codestory-e2e-stats-log.md must contain one valid latest Phase Metrics row and one unique matching headline row",
+    );
     baseline.source_path = source_path.display().to_string();
     baseline
 }
 
+#[derive(Clone, Copy)]
+enum StatsLogTable {
+    Headline,
+    Phase,
+}
+
+struct HeadlineStatsRow {
+    date: String,
+    commit: String,
+    runtime: Option<(f64, f64, f64)>,
+}
+
+struct PhaseStatsRow {
+    date: String,
+    commit: String,
+    scenario: String,
+    index_seconds: f64,
+    graph_phase_seconds: f64,
+    semantic_phase_seconds: f64,
+    repeat_full_refresh_seconds: f64,
+}
+
+const HEADLINE_STATS_HEADER: [&str; 6] = [
+    "Date",
+    "Commit",
+    "Result",
+    "Index seconds",
+    "Ground seconds",
+    "Search seconds",
+];
+const PHASE_STATS_HEADER: [&str; 6] = [
+    "Date",
+    "Commit",
+    "Scenario",
+    "Index seconds",
+    "Graph phase seconds",
+    "Semantic phase seconds",
+];
+
 fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
-    let mut in_phase_table = false;
-    let mut latest = None;
-    let mut latest_runtime = None;
+    let mut table = None;
+    let mut headline_rows = Vec::new();
+    let mut phase_rows = Vec::new();
     for line in log.lines() {
-        if line.trim() == "## Phase Metrics" {
-            in_phase_table = true;
+        let Some(fields) = stats_log_table_fields(line) else {
+            table = None;
+            continue;
+        };
+        if fields.starts_with(&HEADLINE_STATS_HEADER) {
+            table = Some(StatsLogTable::Headline);
             continue;
         }
-        if !line.starts_with('|') {
+        if fields.starts_with(&PHASE_STATS_HEADER) {
+            table = Some(StatsLogTable::Phase);
             continue;
         }
-        let fields = line.split('|').skip(1).map(str::trim).collect::<Vec<_>>();
-        if fields.len() >= 15 && fields[0] != "Date" && !fields[0].starts_with("---") {
-            let Some(search_seconds) = parse_stats_seconds(fields[5]) else {
+        if fields.first() == Some(&"Date") {
+            table = None;
+            continue;
+        }
+        if fields.first().is_none_or(|field| field.starts_with("---")) {
+            continue;
+        }
+        match table {
+            Some(StatsLogTable::Headline) => {
+                let Some((date, commit)) = stats_log_row_identity(&fields) else {
+                    continue;
+                };
+                let runtime = (|| {
+                    let search_seconds = parse_stats_seconds(fields.get(5)?)?;
+                    let result = *fields.get(2)?;
+                    let retrieval_index_seconds =
+                        parse_named_result_seconds(result, "retrieval_index_seconds")?;
+                    let retrieval_status_seconds =
+                        parse_named_result_seconds(result, "retrieval_status_seconds")?;
+                    Some((
+                        retrieval_index_seconds,
+                        retrieval_status_seconds,
+                        search_seconds,
+                    ))
+                })();
+                headline_rows.push(HeadlineStatsRow {
+                    date: date.to_string(),
+                    commit: commit.to_string(),
+                    runtime,
+                });
+            }
+            Some(StatsLogTable::Phase) => {
+                let Some((date, commit)) = stats_log_row_identity(&fields) else {
+                    continue;
+                };
+                let Some(scenario) = fields.get(2) else {
+                    continue;
+                };
+                let Some(index_seconds) =
+                    fields.get(3).and_then(|value| parse_stats_seconds(value))
+                else {
+                    continue;
+                };
+                let Some(graph_phase_seconds) =
+                    fields.get(4).and_then(|value| parse_stats_seconds(value))
+                else {
+                    continue;
+                };
+                let Some(semantic_phase_seconds) =
+                    fields.get(5).and_then(|value| parse_stats_seconds(value))
+                else {
+                    continue;
+                };
+                let Some(repeat_full_refresh_seconds) = parse_repeat_full_refresh_seconds(scenario)
+                else {
+                    continue;
+                };
+                phase_rows.push(PhaseStatsRow {
+                    date: date.to_string(),
+                    commit: commit.to_string(),
+                    scenario: scenario.to_string(),
+                    index_seconds,
+                    graph_phase_seconds,
+                    semantic_phase_seconds,
+                    repeat_full_refresh_seconds,
+                });
+            }
+            None => {
                 continue;
-            };
-            let Some(retrieval_index_seconds) =
-                parse_named_result_seconds(fields[2], "retrieval_index_seconds")
-            else {
-                continue;
-            };
-            let Some(retrieval_status_seconds) =
-                parse_named_result_seconds(fields[2], "retrieval_status_seconds")
-            else {
-                continue;
-            };
-            latest_runtime = Some((
-                retrieval_index_seconds,
-                retrieval_status_seconds,
-                search_seconds,
-            ));
-            continue;
+            }
         }
-        if !in_phase_table {
-            continue;
-        }
-        if fields.len() < 9 || fields[0] == "Date" || fields[0].starts_with("---") {
-            continue;
-        }
-        let Some(index_seconds) = parse_stats_seconds(fields[3]) else {
-            continue;
-        };
-        let Some(graph_phase_seconds) = parse_stats_seconds(fields[4]) else {
-            continue;
-        };
-        let Some(semantic_phase_seconds) = parse_stats_seconds(fields[5]) else {
-            continue;
-        };
-        let Some(repeat_full_refresh_seconds) = parse_repeat_full_refresh_seconds(fields[2]) else {
-            continue;
-        };
-        let (retrieval_index_seconds, retrieval_status_seconds, search_seconds) = latest_runtime?;
-        latest = Some(StatsLogBaseline {
-            source_path: String::new(),
-            date: fields[0].to_string(),
-            commit: fields[1].to_string(),
-            scenario: fields[2].to_string(),
-            index_seconds,
-            graph_phase_seconds,
-            semantic_phase_seconds,
-            repeat_full_refresh_seconds,
-            retrieval_index_seconds,
-            retrieval_status_seconds,
-            search_seconds,
-        });
     }
-    latest
+    let latest_phase = phase_rows.pop()?;
+    if phase_rows
+        .iter()
+        .any(|row| row.date == latest_phase.date && row.commit == latest_phase.commit)
+    {
+        return None;
+    }
+    let mut matching_headlines = headline_rows
+        .iter()
+        .filter(|row| row.date == latest_phase.date && row.commit == latest_phase.commit);
+    let matching_headline = matching_headlines.next()?;
+    if matching_headlines.next().is_some() {
+        return None;
+    }
+    let (retrieval_index_seconds, retrieval_status_seconds, search_seconds) =
+        matching_headline.runtime?;
+    Some(StatsLogBaseline {
+        source_path: String::new(),
+        date: latest_phase.date,
+        commit: latest_phase.commit,
+        scenario: latest_phase.scenario,
+        index_seconds: latest_phase.index_seconds,
+        graph_phase_seconds: latest_phase.graph_phase_seconds,
+        semantic_phase_seconds: latest_phase.semantic_phase_seconds,
+        repeat_full_refresh_seconds: latest_phase.repeat_full_refresh_seconds,
+        retrieval_index_seconds,
+        retrieval_status_seconds,
+        search_seconds,
+    })
+}
+
+fn stats_log_table_fields(line: &str) -> Option<Vec<&str>> {
+    let row = line.trim().strip_prefix('|')?.strip_suffix('|')?;
+    Some(row.split('|').map(str::trim).collect())
+}
+
+fn stats_log_row_identity<'a>(fields: &'a [&str]) -> Option<(&'a str, &'a str)> {
+    let date = *fields.first()?;
+    let commit = *fields.get(1)?;
+    if date.is_empty() || commit.is_empty() {
+        return None;
+    }
+    Some((date, commit))
 }
 
 fn parse_named_result_seconds(value: &str, marker: &str) -> Option<f64> {
-    let start = value.find(marker)? + marker.len();
-    let seconds = value[start..]
-        .split(';')
-        .next()?
-        .trim()
-        .trim_end_matches('s');
-    parse_stats_seconds(seconds)
+    value.match_indices(marker).find_map(|(start, _)| {
+        let seconds = value[start + marker.len()..]
+            .split(';')
+            .next()?
+            .trim()
+            .trim_end_matches('s');
+        parse_stats_seconds(seconds)
+    })
 }
 
 fn parse_repeat_full_refresh_seconds(value: &str) -> Option<f64> {
@@ -496,6 +601,146 @@ fn latest_phase_stats_baseline_parses_last_valid_phase_row() {
     assert_eq!(baseline.retrieval_index_seconds, 9.50);
     assert_eq!(baseline.retrieval_status_seconds, 0.70);
     assert_eq!(baseline.search_seconds, 3.40);
+}
+
+#[test]
+fn latest_phase_stats_baseline_does_not_borrow_runtime_from_an_older_wide_phase_row() {
+    let baseline = latest_phase_stats_baseline_from_str(
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-14 | b09b8c44 | older headline; retrieval_index_seconds 46.67; retrieval_status_seconds 0.51 | 14.50 | 0.06 | 1.52 | 0.22 | 0.05 | 0.05 | 151,319 | 125,723 | 313 | 0 | 1,010 | true |
+| 2026-07-20 | 29d36459+1311wt | warnings retrieval_index_seconds, retrieval_status_seconds, and search_seconds exceeded an older baseline; latest headline; retrieval_index_seconds 77.32; retrieval_status_seconds 0.91 | 9.05 | 0.56 | 5.74 | 1.54 | 1.48 | 1.48 | 162,955 | 136,565 | 495 | 0 | 2,542 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-14 | b09b8c44 | older wide phase; retrieval_index_seconds 46.67; retrieval_status_seconds 0.51; repeat full refresh 14.43s with 0 embedded | 14.50 | 0.06 | 1.52 | 0.22 | 0.05 | 0.05 | 151,319 | 125,723 | 313 | 0 | 1,010 | true |
+| 2026-07-20 | 29d36459+1311wt | latest phase; repeat full refresh 9.92s with 2,539 reused and 0 embedded | 9.05 | 4.63 | 0.46 | 0 | 0 | 0 |
+"#,
+    )
+    .expect("phase baseline");
+
+    assert_eq!(baseline.date, "2026-07-20");
+    assert_eq!(baseline.commit, "29d36459+1311wt");
+    assert_eq!(baseline.retrieval_index_seconds, 77.32);
+    assert_eq!(baseline.retrieval_status_seconds, 0.91);
+    assert_eq!(baseline.search_seconds, 5.74);
+    assert_eq!(
+        release_readiness_warnings(11.8384, 0.45, 84.7086, 0.9807, 6.0637, &baseline),
+        vec![
+            "index_seconds exceeded latest stats-log baseline by >25%: current 11.84s > threshold 11.31s from 2026-07-20 29d36459+1311wt (9.05s)"
+                .to_string(),
+        ]
+    );
+}
+
+#[test]
+fn latest_phase_stats_baseline_fails_closed_without_one_valid_matching_headline() {
+    for log in [
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-19 | old+wt | old headline; retrieval_index_seconds 80.00; retrieval_status_seconds 0.80 | 90.00 | 0.20 | 8.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | new+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | new+wt | malformed headline; retrieval_index_seconds 10.00 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | new+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | duplicate+wt | first headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+| 2026-07-20 | duplicate+wt | second headline; retrieval_index_seconds 20.00; retrieval_status_seconds 0.20 | 86.00 | 0.20 | 4.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | duplicate+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | duplicate+wt | matching headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | duplicate+wt | first phase; repeat full refresh 31.00s with 1 reused and 0 embedded | 84.00 | 16.00 | 54.00 | 1 | 0 | 0 |
+| 2026-07-20 | duplicate+wt | duplicate phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+    ] {
+        assert_eq!(latest_phase_stats_baseline_from_str(log), None);
+    }
+}
+
+#[test]
+fn latest_phase_stats_baseline_binds_the_latest_run_across_reordered_tables() {
+    let baseline = latest_phase_stats_baseline_from_str(
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-19 | old+wt | old headline; retrieval_index_seconds 80.00; retrieval_status_seconds 0.80 | 90.00 | 0.20 | 8.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-19 | old+wt | old phase; repeat full refresh 30.00s with 0 embedded | 90.00 | 15.00 | 60.00 | 0 | 1 | 0 |
+
+## Later run with tables emitted in the opposite order
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | new+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | new+wt | latest headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+"#,
+    )
+    .expect("latest matching baseline");
+
+    assert_eq!(baseline.date, "2026-07-20");
+    assert_eq!(baseline.commit, "new+wt");
+    assert_eq!(
+        baseline.scenario,
+        "latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded"
+    );
+    assert_eq!(baseline.index_seconds, 85.00);
+    assert_eq!(baseline.graph_phase_seconds, 17.00);
+    assert_eq!(baseline.semantic_phase_seconds, 55.00);
+    assert_eq!(baseline.repeat_full_refresh_seconds, 32.00);
+    assert_eq!(baseline.retrieval_index_seconds, 10.00);
+    assert_eq!(baseline.retrieval_status_seconds, 0.10);
+    assert_eq!(baseline.search_seconds, 3.00);
+}
+
+#[test]
+fn latest_phase_stats_baseline_accepts_the_checked_in_ledger() {
+    let baseline = latest_phase_stats_baseline(&repo_root());
+
+    assert!(!baseline.date.is_empty());
+    assert!(!baseline.commit.is_empty());
+    assert!(baseline.index_seconds > 0.0);
+    assert!(baseline.repeat_full_refresh_seconds > 0.0);
+    assert!(baseline.retrieval_index_seconds > 0.0);
+    assert!(baseline.retrieval_status_seconds > 0.0);
+    assert!(baseline.search_seconds > 0.0);
 }
 
 fn repo_root() -> PathBuf {
