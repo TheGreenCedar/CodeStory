@@ -1,9 +1,10 @@
 use crate::agent::packet_capping::cap_packet_citations;
 use crate::agent::packet_command_profiles::packet_command_exact_probe_queries;
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
+use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_extra,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_probe_context,
     quote_packet_command_value, quote_packet_project_arg,
 };
 use crate::agent::trace_export::packet_retrieval_trace_summary;
@@ -236,7 +237,8 @@ fn rebuild_packet_budget_dependents(
     extra_probes: &[String],
 ) {
     packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
-    packet.sufficiency = build_packet_sufficiency_with_extra(
+    let exact_probe_paths = exact_packet_probe_paths(&packet.plan.probe_resolutions);
+    packet.sufficiency = build_packet_sufficiency_with_probe_context(
         project_root,
         &packet.question,
         packet
@@ -245,6 +247,7 @@ fn rebuild_packet_budget_dependents(
         &packet.answer,
         &packet.budget,
         extra_probes,
+        &exact_probe_paths,
     );
     let trim_avoid_opening = packet
         .budget

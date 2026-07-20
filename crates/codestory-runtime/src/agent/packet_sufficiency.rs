@@ -58,6 +58,7 @@ pub(crate) fn build_packet_sufficiency(
     build_packet_sufficiency_with_extra(project_root, question, task_class, answer, budget, &[])
 }
 
+#[cfg(test)]
 pub(crate) fn build_packet_sufficiency_with_extra(
     project_root: &Path,
     question: &str,
@@ -65,6 +66,26 @@ pub(crate) fn build_packet_sufficiency_with_extra(
     answer: &AgentAnswerDto,
     budget: &PacketBudgetDto,
     extra_probes: &[String],
+) -> PacketSufficiencyDto {
+    build_packet_sufficiency_with_probe_context(
+        project_root,
+        question,
+        task_class,
+        answer,
+        budget,
+        extra_probes,
+        &[],
+    )
+}
+
+pub(crate) fn build_packet_sufficiency_with_probe_context(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+    extra_probes: &[String],
+    exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
     let supported_claims = packet_supported_claims(answer);
     let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
@@ -74,7 +95,7 @@ pub(crate) fn build_packet_sufficiency_with_extra(
         &supported_claims,
         extra_probes,
     );
-    assemble_packet_sufficiency_with_route_probes(
+    assemble_packet_sufficiency_with_probe_context(
         PacketSufficiencyInput {
             project_root,
             question,
@@ -86,17 +107,27 @@ pub(crate) fn build_packet_sufficiency_with_extra(
             targeted_follow_up_queries: packet_targeted_follow_up_queries(question, task_class),
         },
         extra_probes,
+        exact_probe_paths,
     )
 }
 
 #[cfg(test)]
 fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
-    assemble_packet_sufficiency_with_route_probes(input, &[])
+    assemble_packet_sufficiency_with_probe_context(input, &[], &[])
 }
 
+#[cfg(test)]
 fn assemble_packet_sufficiency_with_route_probes(
     input: PacketSufficiencyInput<'_>,
     selected_probes: &[String],
+) -> PacketSufficiencyDto {
+    assemble_packet_sufficiency_with_probe_context(input, selected_probes, &[])
+}
+
+fn assemble_packet_sufficiency_with_probe_context(
+    input: PacketSufficiencyInput<'_>,
+    selected_probes: &[String],
+    exact_probe_paths: &[String],
 ) -> PacketSufficiencyDto {
     let PacketSufficiencyInput {
         project_root,
@@ -142,6 +173,8 @@ fn assemble_packet_sufficiency_with_route_probes(
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
     let has_minimum_claim_families =
         packet_has_minimum_claim_family_coverage(task_class, &sufficiency_claims);
+    let missing_exact_path_claims =
+        packet_missing_exact_path_claims(task_class, exact_probe_paths, &sufficiency_claims);
     let route_proof = packet_route_proof_assessment(
         task_class,
         answer,
@@ -184,6 +217,7 @@ fn assemble_packet_sufficiency_with_route_probes(
         has_minimum_claim_families,
         has_required_flow_roles,
         has_route_proof: route_proof.complete,
+        missing_exact_path_claims: &missing_exact_path_claims,
         has_sufficiency_blocking_budget_omission,
         missing_required_probe_queries: &blocking_missing_probe_queries,
         unresolved_sidecar_queries: &blocking_unresolved_sidecar_queries,
@@ -204,6 +238,7 @@ fn assemble_packet_sufficiency_with_route_probes(
         has_minimum_claim_families,
         has_required_flow_roles,
         &route_proof,
+        &missing_exact_path_claims,
         has_sufficiency_blocking_budget_omission,
         &blocking_missing_probe_queries,
         &missing_required_flow_requirements,
@@ -220,6 +255,9 @@ fn assemble_packet_sufficiency_with_route_probes(
     }
     for query in &route_proof.follow_up_queries {
         push_unique_term(&mut blocking_follow_up_probe_queries, query);
+    }
+    for path in &missing_exact_path_claims {
+        push_unique_term(&mut blocking_follow_up_probe_queries, path);
     }
     let follow_up_probe_queries = if blocking_follow_up_probe_queries.is_empty() {
         &missing_required_probe_queries
@@ -241,14 +279,16 @@ fn assemble_packet_sufficiency_with_route_probes(
         flow_context: &flow_context,
         missing_required_flow_requirements: &missing_required_flow_requirements,
         route_proof: &route_proof,
+        missing_exact_path_claims: &missing_exact_path_claims,
         unresolved_sidecar_queries: &unresolved_sidecar_queries,
         budget,
         has_sufficiency_blocking_budget_omission,
     });
     let open_next = follow_up_commands.clone();
-    let avoid_opening_paths = answer
-        .citations
+    let avoid_opening_paths = sufficiency_claims
         .iter()
+        .flat_map(|claim| &claim.citations)
+        .filter(|citation| citation_sufficiency_eligible(citation))
         .filter_map(|citation| citation.file_path.as_ref())
         .map(|path| packet_display_path(path))
         .collect::<BTreeSet<_>>()
@@ -306,6 +346,7 @@ struct PacketSufficiencyStatusInput<'a> {
     has_minimum_claim_families: bool,
     has_required_flow_roles: bool,
     has_route_proof: bool,
+    missing_exact_path_claims: &'a [String],
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &'a [String],
     unresolved_sidecar_queries: &'a [String],
@@ -322,6 +363,7 @@ fn packet_sufficiency_status(
         || !input.has_minimum_claim_families
         || !input.has_required_flow_roles
         || !input.has_route_proof
+        || !input.missing_exact_path_claims.is_empty()
         || !input.missing_required_probe_queries.is_empty()
         || !input.unresolved_sidecar_queries.is_empty()
         || input.has_sufficiency_blocking_budget_omission
@@ -852,6 +894,7 @@ fn packet_sufficiency_gaps(
     has_minimum_claim_families: bool,
     has_required_flow_roles: bool,
     route_proof: &RouteProofAssessment,
+    missing_exact_path_claims: &[String],
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &[String],
     missing_required_flow_requirements: &[FlowRequirement],
@@ -901,6 +944,12 @@ fn packet_sufficiency_gaps(
     }
     if task_class == PacketTaskClassDto::RouteTracing && !route_proof.complete {
         gaps.extend(route_proof.gaps.clone());
+    }
+    if !missing_exact_path_claims.is_empty() {
+        gaps.push(format!(
+            "ArchitectureExplanation packet did not establish a proof-bearing claim from explicit exact path(s): {}.",
+            missing_exact_path_claims.join(", ")
+        ));
     }
     if !missing_required_probe_queries.is_empty() {
         gaps.push(format!(
@@ -1412,6 +1461,45 @@ fn packet_claim_is_generic_navigation_or_source_evidence(claim: &PacketClaimDto)
         || (lower.contains(" is defined in cited source ") && lower.contains("exact source anchor"))
 }
 
+fn packet_missing_exact_path_claims(
+    task_class: PacketTaskClassDto,
+    exact_probe_paths: &[String],
+    sufficiency_claims: &[PacketClaimDto],
+) -> Vec<String> {
+    if task_class != PacketTaskClassDto::ArchitectureExplanation {
+        return Vec::new();
+    }
+
+    exact_probe_paths
+        .iter()
+        .filter(|path| {
+            !sufficiency_claims.iter().any(|claim| {
+                claim.citations.iter().any(|citation| {
+                    citation_sufficiency_eligible(citation)
+                        && citation.file_path.as_deref().is_some_and(|citation_path| {
+                            packet_paths_match_exact_probe(citation_path, path)
+                        })
+                })
+            })
+        })
+        .map(|path| packet_display_path(path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn packet_paths_match_exact_probe(citation_path: &str, exact_probe_path: &str) -> bool {
+    let citation_path = citation_path
+        .trim_start_matches("\\\\?\\")
+        .replace('\\', "/");
+    let exact_probe_path = exact_probe_path
+        .trim_start_matches("\\\\?\\")
+        .replace('\\', "/");
+    citation_path == exact_probe_path
+        || citation_path.ends_with(&format!("/{exact_probe_path}"))
+        || exact_probe_path.ends_with(&format!("/{citation_path}"))
+}
+
 fn packet_role_label_is_generic_source_evidence(role: &str) -> bool {
     normalize_identifier(role) == "sourceevidence"
 }
@@ -1422,6 +1510,7 @@ struct PacketCoverageReportInput<'a> {
     flow_context: &'a PacketFlowContext,
     missing_required_flow_requirements: &'a [FlowRequirement],
     route_proof: &'a RouteProofAssessment,
+    missing_exact_path_claims: &'a [String],
     unresolved_sidecar_queries: &'a [String],
     budget: &'a PacketBudgetDto,
     has_sufficiency_blocking_budget_omission: bool,
@@ -1434,6 +1523,7 @@ fn packet_coverage_report(input: PacketCoverageReportInput<'_>) -> PacketCoverag
         flow_context,
         missing_required_flow_requirements,
         route_proof,
+        missing_exact_path_claims,
         unresolved_sidecar_queries,
         budget,
         has_sufficiency_blocking_budget_omission,
@@ -1470,6 +1560,9 @@ fn packet_coverage_report(input: PacketCoverageReportInput<'_>) -> PacketCoverag
         .collect::<Vec<_>>();
     for route_gap in &route_proof.missing {
         push_unique_term(&mut missing, route_gap);
+    }
+    for path in missing_exact_path_claims {
+        push_unique_term(&mut missing, &format!("exact path: {path}"));
     }
     let budget_omitted = if has_sufficiency_blocking_budget_omission {
         budget.omitted_sections.clone()
@@ -4076,6 +4169,202 @@ mod tests {
                 .all(|entry| entry.contains("tier=\"resolved_graph\"")),
             "ineligible diagnostics should include the citation tier: {report:?}"
         );
+    }
+
+    #[test]
+    fn architecture_exact_paths_require_proof_bearing_claims_from_each_path() {
+        let question = "Explain the architecture represented by these exact paths.";
+        let budget = budget_fixture();
+        let stdio_path = "crates/codestory-cli/src/stdio_transport.rs";
+        let runtime_path = "crates/codestory-runtime/src/agent/orchestrator.rs";
+        let launcher_path = "plugins/codestory/scripts/launcher.mjs";
+        let stdio = cited_anchor_with_tier(
+            "dispatch_stdio_request",
+            stdio_path,
+            PacketEvidenceTierDto::ResolvedGraph,
+            Some(true),
+        );
+        let runtime = cited_anchor_with_tier(
+            "agent_packet",
+            runtime_path,
+            PacketEvidenceTierDto::ResolvedGraph,
+            Some(true),
+        );
+        let publication = cited_anchor_with_tier(
+            "publish_generation",
+            "crates/codestory-store/src/publication.rs",
+            PacketEvidenceTierDto::ResolvedGraph,
+            Some(true),
+        );
+        let mut launcher_probe = cited_anchor_with_tier(
+            launcher_path,
+            launcher_path,
+            PacketEvidenceTierDto::ExactSource,
+            Some(false),
+        );
+        launcher_probe.evidence_producer = Some("packet_exact_path_probe".to_string());
+        launcher_probe.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+
+        let mut answer = answer_fixture(question);
+        answer.citations = vec![
+            stdio.clone(),
+            runtime.clone(),
+            publication.clone(),
+            launcher_probe,
+        ];
+        let claims = vec![
+            cited_claim(
+                "The stdio adapter dispatches the host request.",
+                Some("transport adapter"),
+                stdio,
+                Some(true),
+            ),
+            cited_claim(
+                "Runtime orchestration coordinates the packet request.",
+                Some("runtime orchestration"),
+                runtime,
+                Some(true),
+            ),
+            cited_claim(
+                "Publication evidence exposes the completed generation.",
+                Some("evidence publication"),
+                publication,
+                Some(true),
+            ),
+        ];
+        let input = || PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims.clone(),
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        };
+
+        let without_exact_paths = assemble_packet_sufficiency(input());
+        assert_eq!(
+            without_exact_paths.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "fixture should isolate the exact-path relevance contract: {without_exact_paths:?}"
+        );
+
+        let exact_paths = vec![
+            launcher_path.to_string(),
+            stdio_path.to_string(),
+            runtime_path.to_string(),
+        ];
+        let sufficiency =
+            assemble_packet_sufficiency_with_probe_context(input(), &[], &exact_paths);
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains(launcher_path)),
+            "missing exact-path relevance should be explicit: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains(launcher_path)),
+            "missing exact path should produce a targeted follow-up: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report
+                    .missing
+                    .contains(&format!("exact path: {launcher_path}"))),
+            "coverage report should retain the exact missing path: {sufficiency:?}"
+        );
+        assert!(
+            !sufficiency
+                .avoid_opening_paths
+                .contains(&launcher_path.to_string()),
+            "diagnostic exact-path citations must not discourage source inspection: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_exact_paths_remain_non_promoting_when_role_backed_claims_cover_them() {
+        let question = "Explain the architecture represented by these exact paths.";
+        let budget = budget_fixture();
+        let paths = [
+            "plugins/codestory/scripts/launcher.mjs",
+            "crates/codestory-cli/src/stdio_transport.rs",
+            "crates/codestory-runtime/src/agent/orchestrator.rs",
+        ];
+        let citations = [
+            cited_anchor_with_tier(
+                "launch",
+                paths[0],
+                PacketEvidenceTierDto::LexicalSource,
+                Some(true),
+            ),
+            cited_anchor_with_tier(
+                "dispatch_stdio_request",
+                paths[1],
+                PacketEvidenceTierDto::ResolvedGraph,
+                Some(true),
+            ),
+            cited_anchor_with_tier(
+                "agent_packet",
+                paths[2],
+                PacketEvidenceTierDto::ResolvedGraph,
+                Some(true),
+            ),
+        ];
+        let mut answer = answer_fixture(question);
+        answer.citations = citations.to_vec();
+        let claims = vec![
+            cited_claim(
+                "The launcher delegates a packaged request to the managed CLI.",
+                Some("package entrypoint"),
+                citations[0].clone(),
+                Some(true),
+            ),
+            cited_claim(
+                "The stdio adapter dispatches the host request.",
+                Some("transport adapter"),
+                citations[1].clone(),
+                Some(true),
+            ),
+            cited_claim(
+                "Runtime orchestration coordinates the packet request.",
+                Some("runtime orchestration"),
+                citations[2].clone(),
+                Some(true),
+            ),
+        ];
+        let exact_paths = paths.map(str::to_string);
+
+        let sufficiency = assemble_packet_sufficiency_with_probe_context(
+            PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/project"),
+                question,
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                answer: &answer,
+                budget: &budget,
+                supported_claims: claims,
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            },
+            &[],
+            &exact_paths,
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "exact probes should constrain relevance without promoting diagnostic citations: {sufficiency:?}"
+        );
+        assert!(sufficiency.gaps.is_empty(), "{sufficiency:?}");
+        assert!(sufficiency.follow_up_commands.is_empty(), "{sufficiency:?}");
     }
 
     #[test]

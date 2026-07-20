@@ -83,6 +83,25 @@ pub(crate) fn resolved_packet_probe_queries(
         .collect()
 }
 
+pub(crate) fn exact_packet_probe_paths(resolutions: &[PacketProbeResolutionDto]) -> Vec<String> {
+    resolutions
+        .iter()
+        .filter(|resolution| {
+            matches!(
+                resolution.status,
+                PacketProbeResolutionStatusDto::ExactPath
+                    | PacketProbeResolutionStatusDto::ValidUncoveredPath
+            )
+        })
+        .filter_map(|resolution| match &resolution.probe {
+            PacketProbeDto::ExactPath { path } => {
+                Some(resolution.path.clone().unwrap_or_else(|| path.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn resolve_packet_probes(
     controller: &AppController,
     probes: Vec<PacketProbeDto>,
@@ -895,6 +914,11 @@ mod tests {
         assert!(
             resolved_packet_probe_queries(&resolutions).is_empty(),
             "exact and valid-uncovered paths must not be replaced by broad fuzzy retrieval"
+        );
+        assert_eq!(
+            exact_packet_probe_paths(&resolutions),
+            vec!["assets/desk.svg".to_string()],
+            "only resolved in-project exact paths should constrain architecture sufficiency"
         );
         let citations = exact_packet_probe_citations(&controller, &resolutions, true);
         assert_eq!(citations.len(), 1);

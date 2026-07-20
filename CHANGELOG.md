@@ -80,6 +80,11 @@
   resolve to exact path/node citations rather than display-name searches and
   cannot promote packet sufficiency. CLI and stdio share a combined 16-probe
   limit and 240-character field limit.
+- Architecture packets now keep explicit exact paths as relevance constraints
+  through initial sufficiency and output-budget rebuilds. Each requested path
+  needs a separate proof-bearing claim before the packet can report
+  `sufficient`; missing paths produce explicit gaps and targeted follow-ups,
+  while diagnostic exact-path citations no longer discourage source reads.
 - Markdown/MDX, generic YAML, TOML, JSON, non-parser shell, and PowerShell now
   emit bounded exact-source structural units through the same verified
   publication and cache contract as the existing collectors. Dedicated
