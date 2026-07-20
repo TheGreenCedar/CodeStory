@@ -93,8 +93,12 @@ Semantic document allocation changes use focused runtime proof before the
 broad gate. Cover shared-file path cardinality, byte-identical and
 deterministically ordered symbol documents and dense inputs, cancellation, and
 injected staged-publication failure. Telemetry must distinguish selected
-symbols, retained file/path state, and the all-node lookup still awaiting its
-own streaming change.
+symbols, retained file/path state, streamed node pages, cache-isolated endpoint
+rows/query batches, and peak page-local lookup entries. Full-refresh streaming
+also requires an integer-primary-key query-plan proof with no temporary sort,
+cross-page shared endpoints, exact component-report accumulation, and
+old-or-new publication survival on cancellation or injected node/edge reads.
+Incremental dependency-scope streaming remains a separate change.
 
 ## Retrieval engine
 

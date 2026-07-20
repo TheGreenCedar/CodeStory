@@ -18,11 +18,11 @@ pub use snapshot_store::{
     StagedSnapshotPublishStats,
 };
 pub use storage_impl::{
-    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
-    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata,
-    DenseAnchorPublicationManifest, DenseReasonCounts, FileContentHash, FileInfo,
-    FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
-    GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
+    BuildNodeLookup, CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary,
+    DENSE_ANCHOR_MIGRATION_STATE_NATIVE, DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DenseAnchorInput,
+    DenseAnchorInputReuseMetadata, DenseAnchorPublicationManifest, DenseReasonCounts,
+    FileContentHash, FileInfo, FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount,
+    GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
     IndexArtifactCacheReader, IndexArtifactCacheWrite, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
     ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats, ProjectionPersistenceStats,

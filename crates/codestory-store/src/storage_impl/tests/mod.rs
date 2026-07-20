@@ -3180,6 +3180,246 @@ fn canonical_search_symbol_batches_reject_zero_limit() -> Result<(), StorageErro
 }
 
 #[test]
+fn staged_build_node_pages_filter_and_order_across_keyset_boundaries() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("semantic-node-pages");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let mut storage = Storage::open_build(&db_path)?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(700),
+            kind: NodeKind::FILE,
+            serialized_name: "src/seven.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(500),
+            kind: NodeKind::FILE,
+            serialized_name: "src/five.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(30),
+            kind: NodeKind::METHOD,
+            serialized_name: "third".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(10),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "first".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(40),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "excluded".to_string(),
+            file_node_id: Some(NodeId(500)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(20),
+            kind: NodeKind::CLASS,
+            serialized_name: "second".to_string(),
+            file_node_id: Some(NodeId(500)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(60),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "fourth".to_string(),
+            ..Default::default()
+        },
+    ])?;
+    storage.cache.nodes.write().clear();
+
+    let accepted_kinds = [
+        NodeKind::METHOD,
+        NodeKind::FUNCTION,
+        NodeKind::CLASS,
+        NodeKind::FUNCTION,
+    ];
+    let first_page = storage.get_nodes_by_kinds_batch_after_for_build(&accepted_kinds, None, 2)?;
+    assert_eq!(
+        first_page.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![NodeId(10), NodeId(20)]
+    );
+    let second_page =
+        storage.get_nodes_by_kinds_batch_after_for_build(&accepted_kinds, Some(NodeId(20)), 2)?;
+    assert_eq!(
+        second_page.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![NodeId(30), NodeId(60)]
+    );
+    assert!(
+        storage
+            .get_nodes_by_kinds_batch_after_for_build(&accepted_kinds, Some(NodeId(60)), 2)?
+            .is_empty()
+    );
+    assert_eq!(
+        storage.get_node_file_ids_by_kinds_for_build(&accepted_kinds)?,
+        vec![NodeId(500), NodeId(700)]
+    );
+    assert!(
+        storage
+            .get_nodes_by_kinds_batch_after_for_build(&[], None, 2)?
+            .is_empty()
+    );
+    assert!(
+        storage
+            .get_node_file_ids_by_kinds_for_build(&[])?
+            .is_empty()
+    );
+    assert!(
+        storage.cache.nodes.read().is_empty(),
+        "build node scans must not populate StorageCache"
+    );
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+    Ok(())
+}
+
+#[test]
+fn staged_build_node_page_rejects_zero_limit_and_live_stores() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("semantic-node-page-limit");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let storage = Storage::open_build(&db_path)?;
+    assert!(matches!(
+        storage.get_nodes_by_kinds_batch_after_for_build(&[NodeKind::FUNCTION], None, 0),
+        Err(StorageError::InvalidBatchLimit(
+            "get_nodes_by_kinds_batch_after_for_build"
+        ))
+    ));
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+
+    let live = Storage::new_in_memory()?;
+    assert!(matches!(
+        live.get_nodes_by_kinds_batch_after_for_build(&[NodeKind::FUNCTION], None, 1),
+        Err(StorageError::BuildModeRequired(
+            "get_nodes_by_kinds_batch_after_for_build"
+        ))
+    ));
+    assert!(matches!(
+        live.get_node_file_ids_by_kinds_for_build(&[NodeKind::FUNCTION]),
+        Err(StorageError::BuildModeRequired(
+            "get_node_file_ids_by_kinds_for_build"
+        ))
+    ));
+    assert!(matches!(
+        live.get_nodes_by_ids_no_cache_for_build(&[NodeId(1)]),
+        Err(StorageError::BuildModeRequired(
+            "get_nodes_by_ids_no_cache_for_build"
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn staged_build_node_page_plan_uses_integer_primary_key_without_temp_sort()
+-> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("semantic-node-page-plan");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let storage = Storage::open_build(&db_path)?;
+    let page_sql = nodes_by_kinds_batch_sql(3, true);
+    assert!(page_sql.contains("FROM node NOT INDEXED"));
+    let mut statement = storage
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {page_sql}"))?;
+    let plan = statement
+        .query_map(
+            rusqlite::params![
+                NodeKind::FUNCTION as i32,
+                NodeKind::METHOD as i32,
+                NodeKind::CLASS as i32,
+                0_i64,
+                4_096_i64
+            ],
+            |row| row.get::<_, String>(3),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("INTEGER PRIMARY KEY (rowid>?)")),
+        "semantic node page did not use integer-primary-key traversal: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|line| !line.contains("USE TEMP B-TREE")),
+        "semantic node page introduced a temporary sort: {plan:?}"
+    );
+
+    drop(statement);
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+    Ok(())
+}
+
+#[test]
+fn staged_build_node_lookup_batches_duplicates_without_touching_cache() -> Result<(), StorageError>
+{
+    let db_path = unique_temp_db_path("semantic-node-lookup");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let mut storage = Storage::open_build(&db_path)?;
+    let nodes = (1_i64..=205)
+        .map(|id| Node {
+            id: NodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("cached-{id}"),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    storage.insert_nodes_batch(&nodes)?;
+    storage.conn.execute(
+        "UPDATE node SET serialized_name = 'database-1' WHERE id = 1",
+        [],
+    )?;
+    let cache_len_before = storage.cache.nodes.read().len();
+    assert_eq!(
+        storage
+            .cache
+            .nodes
+            .read()
+            .get(&NodeId(1))
+            .map(|node| node.serialized_name.as_str()),
+        Some("cached-1")
+    );
+
+    let mut requested_ids = (1_i64..=205).map(NodeId).collect::<Vec<_>>();
+    requested_ids.extend([NodeId(1), NodeId(200), NodeId(205), NodeId(999)]);
+    let lookup = storage.get_nodes_by_ids_no_cache_for_build(&requested_ids)?;
+    assert_eq!(lookup.query_batches, 2);
+    assert_eq!(lookup.nodes.len(), 205);
+    assert_eq!(
+        lookup
+            .nodes
+            .get(&NodeId(1))
+            .map(|node| node.serialized_name.as_str()),
+        Some("database-1"),
+        "uncached lookup read a stale cached node"
+    );
+    assert!(!lookup.nodes.contains_key(&NodeId(999)));
+    assert_eq!(storage.cache.nodes.read().len(), cache_len_before);
+    assert_eq!(
+        storage
+            .cache
+            .nodes
+            .read()
+            .get(&NodeId(1))
+            .map(|node| node.serialized_name.as_str()),
+        Some("cached-1"),
+        "uncached lookup mutated StorageCache"
+    );
+    let empty = storage.get_nodes_by_ids_no_cache_for_build(&[])?;
+    assert!(empty.nodes.is_empty());
+    assert_eq!(empty.query_batches, 0);
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+    Ok(())
+}
+
+#[test]
 fn test_scoped_search_symbol_projection_rebuild() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[

@@ -536,6 +536,7 @@ fn append_index_semantic_timings(markdown: &mut String, timings: &IndexingPhaseT
         &[
             ("context_index", timings.semantic_context_index_ms),
             ("node_load", timings.semantic_node_load_ms),
+            ("endpoint_load", timings.semantic_endpoint_load_ms),
             ("context", timings.semantic_context_ms),
             ("doc_build", timings.semantic_doc_build_ms),
             ("embedding", timings.semantic_embedding_ms),
@@ -549,10 +550,13 @@ fn append_index_semantic_timings(markdown: &mut String, timings: &IndexingPhaseT
         "semantic_context",
         &[
             ("node_rows", timings.semantic_node_load_rows),
+            ("node_batches", timings.semantic_node_stream_batches),
+            ("endpoint_rows", timings.semantic_endpoint_load_rows),
+            ("endpoint_batches", timings.semantic_endpoint_load_batches),
             ("selected_nodes", timings.semantic_selected_nodes),
             ("files", timings.semantic_context_file_count),
             ("path_bytes", timings.semantic_context_path_bytes),
-            ("lookup_entries", timings.semantic_node_lookup_entries),
+            ("lookup_peak", timings.semantic_node_lookup_entries),
         ],
     );
     append_optional_timings_line(
