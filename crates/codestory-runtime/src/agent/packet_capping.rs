@@ -34,8 +34,7 @@ pub(crate) fn cap_citations_with_protected(
     let mut deferred = Vec::new();
 
     let mut candidates = answer.citations.drain(..).collect::<Vec<_>>();
-    candidates
-        .sort_by_key(|citation| !packet_citation_is_protected(citation, protected_citation_keys));
+    prioritize_protected_citations(&mut candidates, protected_citation_keys);
     for citation in candidates {
         let file = citation.file_path.as_deref().map(packet_display_path);
         let role = packet_evidence_role(&citation);
@@ -186,8 +185,28 @@ fn packet_citation_is_protected(
     citation: &AgentCitationDto,
     protected_citation_keys: &HashSet<String>,
 ) -> bool {
-    citation.coverage_role.as_deref() == Some("explicit exact probe")
-        || protected_citation_keys.contains(&packet_citation_key(citation))
+    packet_citation_protection_rank(citation, protected_citation_keys) < 2
+}
+
+fn packet_citation_protection_rank(
+    citation: &AgentCitationDto,
+    protected_citation_keys: &HashSet<String>,
+) -> u8 {
+    if citation.coverage_role.as_deref() == Some("explicit exact probe") {
+        0
+    } else if protected_citation_keys.contains(&packet_citation_key(citation)) {
+        1
+    } else {
+        2
+    }
+}
+
+fn prioritize_protected_citations(
+    citations: &mut [AgentCitationDto],
+    protected_citation_keys: &HashSet<String>,
+) {
+    citations
+        .sort_by_key(|citation| packet_citation_protection_rank(citation, protected_citation_keys));
 }
 
 fn replace_weaker_same_role_or_low_priority_citation(
@@ -515,6 +534,7 @@ pub(crate) fn cap_packet_citations(
     let focus_neighborhood_keys =
         promote_focus_neighborhood_citations(answer, &protected_citation_keys);
     protected_citation_keys.extend(focus_neighborhood_keys);
+    prioritize_protected_citations(&mut answer.citations, &protected_citation_keys);
     if protected_citation_keys.is_empty() {
         cap_citations(answer, limits)
     } else {
@@ -609,6 +629,7 @@ pub(crate) fn promote_required_probe_citations(
             reordered.push(citation);
         }
     }
+    prioritize_protected_citations(&mut reordered, &protected_citation_keys);
     answer.citations = reordered;
     answer.retrieval_trace.annotations.push(format!(
         "packet_required_probe_citations promoted={} required={}",
@@ -842,6 +863,8 @@ pub(crate) fn promote_focus_neighborhood_citations(
         .iter()
         .map(|index| packet_citation_key(&answer.citations[*index]))
         .collect::<HashSet<_>>();
+    let mut all_protected_citation_keys = protected_citation_keys.clone();
+    all_protected_citation_keys.extend(promoted_keys.iter().cloned());
     let mut reordered = Vec::with_capacity(answer.citations.len());
     for citation in &answer.citations {
         if packet_citation_is_protected(citation, protected_citation_keys) {
@@ -858,6 +881,7 @@ pub(crate) fn promote_focus_neighborhood_citations(
             reordered.push(citation);
         }
     }
+    prioritize_protected_citations(&mut reordered, &all_protected_citation_keys);
     answer.citations = reordered;
     answer.retrieval_trace.annotations.push(format!(
         "packet_focus_neighborhood_citations promoted={} roots={}",
@@ -1362,6 +1386,53 @@ mod tests {
                 .iter()
                 .all(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
         );
+    }
+
+    #[test]
+    fn packet_promotion_pipeline_keeps_exact_probes_ahead_of_required_and_focus_anchors() {
+        let ordinary_required = citation("dispatch command", "crates/other/src/dispatch.rs", 500.0);
+        let focus_root = citation("demo::Cli", "crates/demo/src/cli.rs", 450.0);
+        let focus_neighbor = citation("runtime work", "crates/demo/src/runtime.rs", 400.0);
+        let mut first_exact = citation("selected", "crates/demo/src/selected.rs", 1.0);
+        first_exact.coverage_role = Some("explicit exact probe".to_string());
+        first_exact.eligible_for_sufficiency = Some(false);
+        let mut second_exact = citation("selected helper", "crates/demo/src/helper.rs", 0.5);
+        second_exact.coverage_role = Some("explicit exact probe".to_string());
+        second_exact.eligible_for_sufficiency = Some(false);
+        let mut answer = answer_fixture(vec![
+            ordinary_required,
+            focus_root,
+            focus_neighbor,
+            first_exact,
+            second_exact,
+        ]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 2,
+            max_files: 2,
+            max_snippets: 2,
+            max_trail_edges: 2,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_packet_citations(
+            &mut answer,
+            &limits,
+            &["dispatch command".to_string()]
+        ));
+        assert_eq!(
+            answer
+                .citations
+                .iter()
+                .map(|citation| citation.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["selected", "selected helper"]
+        );
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_probe_citations promoted=1")
+        }));
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_focus_neighborhood_citations promoted=")
+        }));
     }
 
     #[test]
