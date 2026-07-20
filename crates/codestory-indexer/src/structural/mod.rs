@@ -56,118 +56,13 @@ pub enum StructuralCollectionError {
 
 /// Return whether `path` is routed to a structural collector.
 pub fn is_structural_candidate_path(path: &Path) -> bool {
-    is_structural_format_path(path) && structural_path_exclusion(path).is_none()
+    is_structural_format_path(path)
 }
 
 /// Return whether `path` has a dedicated or generic structural format route.
 pub fn is_structural_format_path(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
-    if is_github_actions_workflow_path(path_text.as_ref())
-        || is_docker_compose_file_path(path_text.as_ref())
-        || is_cargo_manifest_file_path(path_text.as_ref())
-    {
-        return true;
-    }
-    matches!(
-        structural_extension(path).as_deref(),
-        Some(
-            "html"
-                | "htm"
-                | "css"
-                | "sql"
-                | "md"
-                | "markdown"
-                | "mdx"
-                | "yml"
-                | "yaml"
-                | "toml"
-                | "json"
-                | "zsh"
-                | "ksh"
-                | "command"
-                | "ps1"
-                | "psm1"
-        )
-    )
-}
-
-/// Return the centralized path-only exclusion reason applied before reading.
-pub fn structural_path_exclusion(path: &Path) -> Option<&'static str> {
-    let normalized = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let components = normalized
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    let file_name = components.last().copied().unwrap_or_default();
-    if components.iter().any(|component| {
-        matches!(
-            *component,
-            ".git"
-                | "node_modules"
-                | "vendor"
-                | "vendors"
-                | "third_party"
-                | "third-party"
-                | "generated"
-                | "dist"
-                | "build"
-                | "target"
-                | "coverage"
-                | ".next"
-                | ".cache"
-        )
-    }) {
-        return Some("generated_or_vendor");
-    }
-    if components.iter().any(|component| {
-        matches!(
-            *component,
-            "secret" | "secrets" | ".secrets" | "credentials"
-        )
-    }) || file_name.starts_with(".env")
-        || matches!(
-            file_name,
-            "credentials.json"
-                | "secrets.json"
-                | "secrets.yaml"
-                | "secrets.yml"
-                | "id_rsa"
-                | "id_ed25519"
-        )
-        || file_name.ends_with(".pem")
-        || file_name.ends_with(".key")
-    {
-        return Some("secret_bearing");
-    }
-    if matches!(
-        file_name,
-        "cargo.lock"
-            | "package-lock.json"
-            | "npm-shrinkwrap.json"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-            | "bun.lock"
-            | "bun.lockb"
-            | "poetry.lock"
-            | "pipfile.lock"
-            | "composer.lock"
-            | "gemfile.lock"
-    ) || file_name.ends_with(".lock")
-    {
-        return Some("lockfile");
-    }
-    if file_name.contains(".min.")
-        || file_name.ends_with(".min")
-        || file_name.contains(".generated.")
-        || file_name.contains("_generated.")
-        || file_name.ends_with(".map")
-    {
-        return Some("generated_or_high_noise");
-    }
-    None
+    codestory_contracts::language_support::is_structural_source_path(path_text.as_ref())
 }
 
 /// Read and structurally index a file from disk.
@@ -568,21 +463,21 @@ mod tests {
             ),
             (
                 "docs/guide.mdx",
-                "# Guide\n\n[api]: ./api.md\n\n```rust\nfn main() {}\n```\n",
+                "# Guide\n\n```rust\n# Hidden\n[hidden]: ./hidden.md\n```\n\n[api]: ./api.md\n",
                 "structural_markdown_collector",
                 &["Guide", "api", "rust"],
             ),
             (
                 "config/service.yaml",
-                "service:\n  name: demo\n  ports:\n    - 8080\n",
+                "service:\n  literal: |\n    text: [not, a, flow\n    url: https://example.com\n  url: https://example.com\n  endpoints:\n    - https://example.com\n",
                 "structural_yaml_collector",
-                &["service", "name", "ports"],
+                &["service", "literal", "url", "endpoints"],
             ),
             (
                 "config/service.toml",
-                "[server]\nhost = \"127.0.0.1\"\n",
+                "[server]\ndescription = \"\"\"\nfake = \"not a key\"\n[hidden]\n\"\"\"\nhost = \"127.0.0.1\"\n",
                 "structural_toml_collector",
-                &["server", "host"],
+                &["server", "description", "host"],
             ),
             (
                 "config/service.json",
@@ -592,13 +487,13 @@ mod tests {
             ),
             (
                 "scripts/setup.zsh",
-                "autoload compinit\nfunction deploy { echo ok; }\nsource ./env.zsh\n",
+                "cat <<'EOF'\nfake() { echo hidden; }\nsource ./hidden.zsh\nEOF\nautoload compinit\nfunction deploy { echo ok; }\nsource ./env.zsh\n",
                 "structural_shell_collector",
                 &["compinit", "deploy", "./env.zsh"],
             ),
             (
                 "scripts/build.ps1",
-                "function Invoke-Build { }\nImport-Module Pester\n. ./common.ps1\n",
+                "<#\nfunction Invoke-Hidden { }\nImport-Module Hidden\n#>\nfunction Invoke-Build { }\nImport-Module Pester\n. ./common.ps1\n",
                 "structural_powershell_collector",
                 &["Invoke-Build", "Pester", "./common.ps1"],
             ),
@@ -681,6 +576,16 @@ mod tests {
             structural_producer(Path::new("crates/app/Cargo.toml")),
             Some("structural_cargo_manifest_collector")
         );
+        #[cfg(windows)]
+        assert_eq!(
+            structural_producer(Path::new("crates/app/CARGO.TOML")),
+            Some("structural_cargo_manifest_collector")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            structural_producer(Path::new("crates/app/CARGO.TOML")),
+            Some("structural_toml_collector")
+        );
         assert_eq!(
             structural_producer(Path::new("config/settings.yaml")),
             Some("structural_yaml_collector")
@@ -702,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_path_policy_rejects_noise_before_admission_on_both_path_spellings() {
+    fn structural_format_routing_defers_relative_exclusion_to_the_shared_policy() {
         for path in [
             "vendor/config.json",
             r"third_party\docs\guide.md",
@@ -720,12 +625,13 @@ mod tests {
                 "fixture must have a structural extension: {path}"
             );
             assert!(
-                structural_path_exclusion(Path::new(path)).is_some(),
+                codestory_contracts::language_support::structural_source_path_exclusion(path)
+                    .is_some(),
                 "missing policy exclusion: {path}"
             );
             assert!(
-                !is_structural_candidate_path(Path::new(path)),
-                "excluded path was admitted: {path}"
+                is_structural_candidate_path(Path::new(path)),
+                "format routing should remain independent of policy: {path}"
             );
         }
         assert!(is_structural_candidate_path(Path::new(
@@ -793,18 +699,19 @@ mod tests {
         }
         let first = index_structural_file(&first_path).expect("index first markdown");
         let second = index_structural_file(&second_path).expect("index second markdown");
-        assert_eq!(
-            first
-                .structural_text_units
-                .iter()
-                .map(|unit| &unit.content_hash)
-                .collect::<Vec<_>>(),
-            second
-                .structural_text_units
-                .iter()
-                .map(|unit| &unit.content_hash)
-                .collect::<Vec<_>>()
-        );
+        let mut first_content = first
+            .structural_text_units
+            .iter()
+            .map(|unit| &unit.content_hash)
+            .collect::<Vec<_>>();
+        let mut second_content = second
+            .structural_text_units
+            .iter()
+            .map(|unit| &unit.content_hash)
+            .collect::<Vec<_>>();
+        first_content.sort();
+        second_content.sort();
+        assert_eq!(first_content, second_content);
         assert!(
             first
                 .structural_text_units

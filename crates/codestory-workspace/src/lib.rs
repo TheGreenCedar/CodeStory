@@ -751,6 +751,9 @@ impl WorkspaceDiscovery {
             let filter_by_language = manifest.should_filter_source_group_language();
             for source_path in &group.source_paths {
                 let full_path = resolve_manifest_source_path(manifest, source_path)?;
+                if workspace_structural_source_exclusion(&workspace_root, &full_path).is_some() {
+                    continue;
+                }
                 let source_root = discovery_root(&full_path);
 
                 let metadata = match fs::metadata(&full_path) {
@@ -1226,6 +1229,9 @@ fn should_include_discovered_path(
     exclude_patterns: &[CompiledExcludePattern],
 ) -> bool {
     let normalized = normalize_lexical_path(path);
+    if !is_dir && workspace_structural_source_exclusion(workspace_root, &normalized).is_some() {
+        return false;
+    }
     if let Ok(canonical) = normalized.canonicalize()
         && !canonical.starts_with(source_root)
     {
@@ -1238,6 +1244,18 @@ fn should_include_discovered_path(
         return true;
     }
     !filter_by_language || matches_source_group_language(&normalized, language)
+}
+
+fn workspace_structural_source_exclusion(
+    workspace_root: &Path,
+    path: &Path,
+) -> Option<&'static str> {
+    let relative = workspace_relative_path(workspace_root, path)?;
+    let relative = relative.to_str()?.replace('\\', "/");
+    if !codestory_contracts::language_support::is_structural_source_path(&relative) {
+        return None;
+    }
+    codestory_contracts::language_support::structural_source_path_exclusion(&relative)
 }
 
 fn is_excluded_path(
@@ -1521,6 +1539,75 @@ mod tests {
         assert_eq!(plan.mode, RefreshMode::Incremental);
         assert_eq!(plan.files_to_index, vec![file]);
         assert!(plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn structural_exclusion_uses_only_workspace_relative_descendants() -> Result<()> {
+        let temp = tempdir()?;
+        for ancestor in ["build", "target", "vendor", "secrets"] {
+            let root = temp.path().join(ancestor).join("repo");
+            fs::create_dir_all(&root)?;
+            let root_source = root.join("config.json");
+            fs::write(&root_source, "{\"root\":true}\n")?;
+            for excluded_dir in ["build", "target", "vendor", "secrets"] {
+                let excluded = root.join(excluded_dir).join("config.json");
+                fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+                fs::write(excluded, "{\"excluded\":true}\n")?;
+            }
+
+            let manifest = WorkspaceManifest::open(root.clone())?;
+            let inventory = manifest.source_inventory()?;
+            assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+            assert!(
+                inventory.files.contains(&root_source),
+                "workspace ancestor `{ancestor}` excluded the root source"
+            );
+            for excluded_dir in ["build", "target", "vendor", "secrets"] {
+                assert!(
+                    !inventory
+                        .files
+                        .contains(&root.join(excluded_dir).join("config.json")),
+                    "workspace-relative `{excluded_dir}` descendant remained admitted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_structural_inventory_entry_schedules_pre_policy_row_removal() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let excluded = root.join("vendor/config.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        fs::write(&excluded, "{\"legacy\":true}\n")?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let outcome = WorkspaceDiscovery.build_refresh_outcome(
+            &manifest,
+            &RefreshInputs {
+                stored_files: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    excluded,
+                    IndexedFileRecord {
+                        file_id: 44,
+                        modification_time: 0,
+                        content_hash: Some("a".repeat(64)),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    },
+                )]),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert_eq!(outcome.plan.files_to_remove, vec![44]);
+        assert!(outcome.plan.existing_file_ids.is_empty());
         Ok(())
     }
 

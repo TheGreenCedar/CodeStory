@@ -102,14 +102,18 @@ schema path before generic collection; `.sh` and `.bash` remain parser-backed
 Bash. Generic shell structural fallback is limited to `.zsh`, `.ksh`, and
 `.command`.
 
-Structural admission applies one normalized path policy before metadata or
-content reads. Generated and vendor trees, secret-bearing conventions,
-lockfiles, minified/generated outputs, and declared high-noise forms do not
-create file, unit, projection, or cache rows. Admitted files are capped at 1
-MiB and 2,048 units. A bound failure rejects the whole file instead of
-publishing a truncated projection. Invalid UTF-8/binary bytes, malformed
-format syntax, and unreadable sources retain distinct coverage reasons and do
-not create reusable structural cache entries.
+Structural admission applies one contracts-owned policy to workspace-relative
+inventory paths before metadata or content reads. Generated and vendor trees,
+secret-bearing conventions, lockfiles, minified/generated outputs, and
+declared high-noise forms do not create file, unit, projection, or cache rows;
+an excluded path already present in stored inventory is scheduled for normal
+incremental deletion. Repository ancestors are never policy inputs. Admitted
+files are capped at 1 MiB and 2,048 units. A bound failure rejects the whole
+file instead of publishing a truncated projection. Structural cache identity
+v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
+Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources
+retain distinct coverage reasons and do not create reusable structural cache
+entries.
 
 ## Resolution and Semantic Fallback
 

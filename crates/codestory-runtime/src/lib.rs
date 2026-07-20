@@ -1003,6 +1003,7 @@ struct AffectedRelevantEvidenceGaps {
 }
 
 struct AffectedRelevantEvidenceGapInput<'a> {
+    workspace_root: Option<&'a Path>,
     resolved_inputs: &'a [AffectedResolvedInput],
     matched_record_flags: &'a [bool],
     current_identity_errors: &'a [Option<String>],
@@ -1029,7 +1030,7 @@ fn affected_relevant_evidence_gaps(
                 .get(index)
                 .copied()
                 .unwrap_or(false)
-                || indexable_source_path(&resolved.current))
+                || indexable_source_path_with_root(input.workspace_root, &resolved.current))
             .then_some(error)
         })
         .collect::<Vec<_>>();
@@ -1045,10 +1046,9 @@ fn affected_relevant_evidence_gaps(
                 .get(index)
                 .copied()
                 .unwrap_or(false)
-                && resolved
-                    .previous
-                    .as_deref()
-                    .is_some_and(indexable_source_path))
+                && resolved.previous.as_deref().is_some_and(|path| {
+                    indexable_source_path_with_root(input.workspace_root, path)
+                }))
             .then_some(error)
         })
         .collect::<Vec<_>>();
@@ -1063,11 +1063,10 @@ fn affected_relevant_evidence_gaps(
                     .get(index)
                     .copied()
                     .unwrap_or(false)
-                    || indexable_source_path(&resolved.current)
-                    || resolved
-                        .previous
-                        .as_deref()
-                        .is_some_and(indexable_source_path)
+                    || indexable_source_path_with_root(input.workspace_root, &resolved.current)
+                    || resolved.previous.as_deref().is_some_and(|path| {
+                        indexable_source_path_with_root(input.workspace_root, path)
+                    })
             });
 
     AffectedRelevantEvidenceGaps {
@@ -1259,6 +1258,7 @@ fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
 }
 
 fn classify_unmatched_affected_input(
+    workspace_root: Option<&Path>,
     record: &AffectedChangeRecordDto,
     resolved: &AffectedResolvedInput,
     freshness: &IndexFreshnessObservation,
@@ -1267,6 +1267,7 @@ fn classify_unmatched_affected_input(
     previous_identity_error: Option<&str>,
 ) -> (AffectedInputClassificationDto, String, Vec<String>) {
     classify_unmatched_affected_input_with_metadata(
+        workspace_root,
         record,
         resolved,
         freshness,
@@ -1278,6 +1279,7 @@ fn classify_unmatched_affected_input(
 }
 
 fn classify_unmatched_affected_input_with_metadata(
+    workspace_root: Option<&Path>,
     record: &AffectedChangeRecordDto,
     resolved: &AffectedResolvedInput,
     freshness: &IndexFreshnessObservation,
@@ -1326,7 +1328,7 @@ fn classify_unmatched_affected_input_with_metadata(
     };
 
     if regular_file {
-        if !indexable_source_path(path) {
+        if !indexable_source_path_with_root(workspace_root, path) {
             return (
                 AffectedInputClassificationDto::ValidUncovered,
                 "regular file exists inside the project but is outside current graph/index coverage"
@@ -5340,6 +5342,14 @@ fn not_checked_index_freshness(
 }
 
 fn indexable_source_path(path: &Path) -> bool {
+    if path.to_str().is_some_and(|path| {
+        !Path::new(path).is_absolute()
+            && codestory_contracts::language_support::is_structural_source_path(path)
+            && codestory_contracts::language_support::structural_source_path_exclusion(path)
+                .is_some()
+    }) {
+        return false;
+    }
     let tree_sitter_supported = path
         .extension()
         .and_then(|value| value.to_str())
@@ -5352,12 +5362,21 @@ fn indexable_source_path(path: &Path) -> bool {
         || looks_like_openapi_source_path(path)
 }
 
-fn looks_like_openapi_source_path(path: &Path) -> bool {
-    if codestory_indexer::structural::is_structural_format_path(path)
-        && !codestory_indexer::structural::is_structural_candidate_path(path)
-    {
+fn indexable_source_path_in_workspace(root: &Path, path: &Path) -> bool {
+    let Some(relative) = codestory_workspace::workspace_relative_path(root, path) else {
         return false;
-    }
+    };
+    indexable_source_path(&relative)
+}
+
+fn indexable_source_path_with_root(root: Option<&Path>, path: &Path) -> bool {
+    root.map_or_else(
+        || indexable_source_path(path),
+        |root| indexable_source_path_in_workspace(root, path),
+    )
+}
+
+fn looks_like_openapi_source_path(path: &Path) -> bool {
     if !codestory_indexer::is_openapi_candidate_path(path) {
         return false;
     }
@@ -5546,7 +5565,7 @@ where
     let mut samples = Vec::new();
     for path in &plan.files_to_index {
         let existing_indexed_file = plan.existing_file_ids.contains_key(path);
-        if !existing_indexed_file && !indexable_source_path(path) {
+        if !existing_indexed_file && !indexable_source_path_in_workspace(root, path) {
             continue;
         }
         let kind = if existing_indexed_file {
@@ -12769,6 +12788,7 @@ impl AppController {
             .filter(|(index, _)| !current_matched_record_flags[*index])
             .map(|(index, record)| {
                 let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
+                    Some(&root),
                     record,
                     &resolved_inputs[index],
                     &freshness_observation,
@@ -12779,7 +12799,7 @@ impl AppController {
                 unmatched_freshness_unavailable |= matches!(
                     affected_path_metadata(&resolved_inputs[index].current),
                     AffectedPathMetadataObservation::RegularFile
-                ) && indexable_source_path(&resolved_inputs[index].current)
+                ) && indexable_source_path_in_workspace(&root, &resolved_inputs[index].current)
                     && current_identity_error_by_record[index].is_none()
                     && current_identity_by_record[index]
                         .as_ref()
@@ -13097,6 +13117,7 @@ impl AppController {
             unmatched_freshness_unavailable || matched_freshness_unavailable;
         let relevant_evidence_gaps =
             affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+                workspace_root: Some(&root),
                 resolved_inputs: &resolved_inputs,
                 matched_record_flags: &current_matched_record_flags,
                 current_identity_errors: &current_identity_error_by_record,
@@ -16846,6 +16867,7 @@ mod tests {
         let previous_errors = vec![Some("previous gap".to_string())];
         let unmatched = [false];
         let all_relevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
             resolved_inputs: &resolved,
             matched_record_flags: &unmatched,
             current_identity_errors: &current_errors,
@@ -16863,6 +16885,7 @@ mod tests {
 
         let matched = [true];
         let current_wins = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
             resolved_inputs: &resolved,
             matched_record_flags: &matched,
             current_identity_errors: &current_errors,
@@ -16881,6 +16904,7 @@ mod tests {
             previous: None,
         }];
         let irrelevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
             resolved_inputs: &svg,
             matched_record_flags: &[false],
             current_identity_errors: &current_errors,
@@ -16989,6 +17013,7 @@ mod tests {
     ) -> (AffectedInputClassificationDto, String, Vec<String>) {
         let current_identity = codestory_workspace::workspace_path_identity(&resolved.current).ok();
         classify_unmatched_affected_input(
+            None,
             record,
             resolved,
             freshness,
@@ -17157,6 +17182,7 @@ mod tests {
             affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
 
         let (classification, reason, evidence) = classify_unmatched_affected_input_with_metadata(
+            None,
             &affected_test_record(AffectedChangeKindDto::Modified, "unreadable.rs"),
             &resolved,
             &freshness,
@@ -18131,6 +18157,41 @@ mod tests {
                 "runtime freshness should honor structural exclusion: {excluded}"
             );
         }
+    }
+
+    #[test]
+    fn affected_absolute_excluded_structural_path_is_valid_but_uncovered() {
+        let project = tempdir().expect("project");
+        let excluded = project.path().join("vendor/config.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))
+            .expect("create excluded parent");
+        fs::write(&excluded, "{\"ignored\":true}\n").expect("write excluded source");
+        assert!(!indexable_source_path_in_workspace(
+            project.path(),
+            &excluded
+        ));
+        let resolved = AffectedResolvedInput {
+            current: excluded.clone(),
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        let identity =
+            codestory_workspace::workspace_path_identity(&excluded).expect("excluded identity");
+        let (classification, reason, _) = classify_unmatched_affected_input(
+            Some(project.path()),
+            &affected_test_record(AffectedChangeKindDto::Modified, "vendor/config.json"),
+            &resolved,
+            &freshness,
+            Some(&identity),
+            None,
+            None,
+        );
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert!(reason.contains("outside current graph/index coverage"));
     }
 
     fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {

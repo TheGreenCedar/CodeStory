@@ -2442,9 +2442,7 @@ impl WorkspaceIndexer {
         stats: &mut IncrementalIndexingStats,
     ) -> std::result::Result<PreparedIndexWork, IntermediateStorage> {
         let full_path = Self::normalize_index_path(root, path);
-        if structural::is_structural_format_path(&full_path)
-            && !structural::is_structural_candidate_path(&full_path)
-        {
+        if workspace_structural_source_exclusion(root, &full_path).is_some() {
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         }
         let compilation_info = self
@@ -2895,6 +2893,14 @@ impl WorkspaceIndexer {
         if artifact.descriptor_version != codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
             || artifact.files.first().map(|file| file.id)
                 != Some(Self::canonical_file_node_id_for_path(&full_path))
+            || artifact.structural_unit_node_ids.len() > structural::MAX_STRUCTURAL_UNITS_PER_FILE
+            || artifact.structural_text_units.len() > structural::MAX_STRUCTURAL_UNITS_PER_FILE
+            || artifact
+                .structural_text_projections
+                .iter()
+                .any(|projection| {
+                    projection.unit_count > structural::MAX_STRUCTURAL_UNITS_PER_FILE as u64
+                })
         {
             stats.artifact_cache_invalid_entries += 1;
             stats.artifact_cache_misses += 1;
@@ -3332,6 +3338,18 @@ fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64)
+}
+
+fn workspace_structural_source_exclusion(
+    workspace_root: &Path,
+    path: &Path,
+) -> Option<&'static str> {
+    if !structural::is_structural_format_path(path) {
+        return None;
+    }
+    let relative = codestory_workspace::workspace_relative_path(workspace_root, path)?;
+    let relative = relative.to_str()?.replace('\\', "/");
+    codestory_contracts::language_support::structural_source_path_exclusion(&relative)
 }
 
 #[allow(clippy::result_large_err)]
@@ -22267,6 +22285,89 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
     }
 
     #[test]
+    fn incremental_policy_upgrade_removes_pre_policy_structural_publication_and_cache() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let excluded = dir.path().join("vendor/config.json");
+        std::fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        std::fs::write(&excluded, "{\"legacy\":true}\n")?;
+        let source = std::fs::read(&excluded)?;
+        let producer = structural::structural_producer(&excluded).expect("JSON producer");
+        let cache_path = PathBuf::from("vendor/config.json");
+        let cache_key =
+            build_structural_artifact_cache_key(&cache_path, &source, producer).expect("cache key");
+        let artifact =
+            CachedStructuralArtifact::from_storage(structural::index_structural_file(&excluded)?);
+        let artifact_blob = serde_json::to_vec(&artifact)?;
+        let projected = artifact.into_intermediate_storage();
+        let cache_write = codestory_store::StructuralTextArtifactCacheWrite {
+            path: &cache_path,
+            file_id: projected.files[0].id,
+            cache_key: &cache_key,
+            artifact_blob: &artifact_blob,
+        };
+        let mut storage = Storage::new_in_memory()?;
+        storage
+            .projections()
+            .flush_projection_batch(codestory_store::ProjectionBatch {
+                files: &projected.files,
+                file_content_hashes: &projected.file_content_hashes,
+                nodes: &projected.nodes,
+                structural_text_units: &projected.structural_text_units,
+                structural_text_projections: &projected.structural_text_projections,
+                structural_text_cache_writes: std::slice::from_ref(&cache_write),
+                edges: &projected.edges,
+                occurrences: &projected.occurrences,
+                component_access: &projected.component_access,
+                callable_projection_states: &projected.callable_projection_states,
+            })?;
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "pre-policy-generation".to_string(),
+            run_id: "pre-policy-run".to_string(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        storage.publish_structural_text_unit_generation(&publication)?;
+        storage.validate_structural_text_unit_publication(&publication)?;
+        assert_eq!(storage.get_structural_text_projection_file_ids()?.len(), 1);
+
+        let manifest = codestory_workspace::WorkspaceManifest::open(dir.path().to_path_buf())?;
+        let outcome = manifest.build_execution_outcome(&codestory_workspace::RefreshInputs {
+            stored_files: storage.files().inventory()?,
+            inventory: codestory_workspace::WorkspaceInventory::default(),
+        })?;
+        assert_eq!(outcome.plan.files_to_remove, vec![projected.files[0].id]);
+        assert!(outcome.plan.files_to_index.is_empty());
+        WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &outcome.plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert!(storage.get_files()?.is_empty());
+        assert!(
+            storage
+                .get_structural_text_projection_file_ids()?
+                .is_empty()
+        );
+        for table in [
+            "structural_text_unit",
+            "structural_text_artifact_cache",
+            "structural_text_unit_publication",
+        ] {
+            let count: i64 = storage.get_connection().query_row(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0, "{table} copied forward excluded data");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result<()> {
         let dir = tempdir()?;
         let fixtures = [
@@ -22429,6 +22530,155 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             error.coverage_reason == Some(FileCoverageReason::Oversized)
                 && error.message.contains("unit collector limit")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn pre_limit_v1_cache_is_ineligible_and_matches_fresh_unit_bound_failure() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("many.json");
+        let mut source = String::from("{");
+        for index in 0..=structural::MAX_STRUCTURAL_UNITS_PER_FILE {
+            if index > 0 {
+                source.push(',');
+            }
+            source.push_str(&format!("\"key{index}\":{index}"));
+        }
+        source.push('}');
+        std::fs::write(&path, &source)?;
+        let source_hash = source_content_hash(source.as_bytes());
+        let file_id = WorkspaceIndexer::canonical_file_node_id_for_path(&path);
+        let legacy_artifact = CachedStructuralArtifact {
+            descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            files: vec![codestory_store::FileInfo {
+                id: file_id,
+                path: path.clone(),
+                language: "json".to_string(),
+                modification_time: file_modification_time(&path),
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            }],
+            file_content_hashes: vec![codestory_store::FileContentHash {
+                file_id,
+                content_hash: source_hash.clone(),
+            }],
+            nodes: Vec::new(),
+            structural_unit_node_ids: vec![
+                NodeId(1);
+                structural::MAX_STRUCTURAL_UNITS_PER_FILE + 1
+            ],
+            structural_text_units: Vec::new(),
+            structural_text_projections: Vec::new(),
+            edges: Vec::new(),
+            occurrences: Vec::new(),
+            component_access: Vec::new(),
+            callable_projection_states: Vec::new(),
+        };
+        let blob = serde_json::to_vec(&legacy_artifact)?;
+        let mut legacy_cache = Storage::new_in_memory()?;
+        legacy_cache.get_connection().execute(
+            "INSERT INTO structural_text_artifact_cache (
+                file_path, file_id, cache_key, source_content_hash,
+                descriptor_version, producer, artifact_digest, artifact_blob,
+                updated_at_epoch_ms
+             ) VALUES ('many.json', ?1, 'v1:pre-limit', ?2, ?3,
+                       'structural_json_collector', ?4, ?5, 1)",
+            rusqlite::params![
+                file_id,
+                source_hash,
+                codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64,
+                format!("{:x}", Sha256::digest(&blob)),
+                blob,
+            ],
+        )?;
+        let current_key = build_structural_artifact_cache_key(
+            Path::new("many.json"),
+            source.as_bytes(),
+            "structural_json_collector",
+        )
+        .expect("current structural cache key");
+        assert!(current_key.starts_with("v2:"));
+
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let symbol_table = Arc::new(SymbolTable::new());
+        let mut legacy_stats = IncrementalIndexingStats::default();
+        let legacy_prepared = {
+            let mut access = ArtifactCacheAccess::Storage(&mut legacy_cache);
+            indexer.prepare_index_work(
+                &mut access,
+                &PathBuf::from("many.json"),
+                dir.path(),
+                None,
+                &symbol_table,
+                &mut legacy_stats,
+            )
+        };
+        let Ok(PreparedIndexWork::Structural(legacy_input)) = legacy_prepared else {
+            panic!("v1 cache must not satisfy the v2 structural cache lookup");
+        };
+        let legacy_result = indexer.execute_prepared_structural_index(&legacy_input);
+        assert_eq!(legacy_stats.artifact_cache_hits, 0);
+        assert_eq!(legacy_stats.artifact_cache_misses, 1);
+
+        legacy_cache.get_connection().execute(
+            "UPDATE structural_text_artifact_cache SET cache_key = ?1",
+            [&current_key],
+        )?;
+        let mut over_limit_hit_stats = IncrementalIndexingStats::default();
+        let over_limit_hit_prepared = {
+            let mut access = ArtifactCacheAccess::Storage(&mut legacy_cache);
+            indexer.prepare_index_work(
+                &mut access,
+                &PathBuf::from("many.json"),
+                dir.path(),
+                None,
+                &symbol_table,
+                &mut over_limit_hit_stats,
+            )
+        };
+        let Ok(PreparedIndexWork::Structural(over_limit_hit_input)) = over_limit_hit_prepared
+        else {
+            panic!("over-limit current cache artifact must be recollected");
+        };
+        let over_limit_hit_result =
+            indexer.execute_prepared_structural_index(&over_limit_hit_input);
+        assert_eq!(over_limit_hit_stats.artifact_cache_hits, 0);
+        assert_eq!(over_limit_hit_stats.artifact_cache_invalid_entries, 1);
+
+        let mut fresh_cache = Storage::new_in_memory()?;
+        let mut fresh_stats = IncrementalIndexingStats::default();
+        let fresh_prepared = {
+            let mut access = ArtifactCacheAccess::Storage(&mut fresh_cache);
+            indexer.prepare_index_work(
+                &mut access,
+                &PathBuf::from("many.json"),
+                dir.path(),
+                None,
+                &symbol_table,
+                &mut fresh_stats,
+            )
+        };
+        let Ok(PreparedIndexWork::Structural(fresh_input)) = fresh_prepared else {
+            panic!("fresh over-limit structural source must be collected");
+        };
+        let fresh_result = indexer.execute_prepared_structural_index(&fresh_input);
+        assert_eq!(
+            legacy_result.local_storage.errors[0].coverage_reason,
+            Some(FileCoverageReason::Oversized)
+        );
+        assert_eq!(
+            fresh_result.local_storage.errors[0].coverage_reason,
+            legacy_result.local_storage.errors[0].coverage_reason
+        );
+        assert_eq!(
+            over_limit_hit_result.local_storage.errors[0].coverage_reason,
+            legacy_result.local_storage.errors[0].coverage_reason
+        );
+        assert!(legacy_result.cache_write.is_none());
+        assert!(over_limit_hit_result.cache_write.is_none());
+        assert!(fresh_result.cache_write.is_none());
         Ok(())
     }
 

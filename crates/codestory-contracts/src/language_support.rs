@@ -457,6 +457,30 @@ pub fn is_structural_language_name(language_name: &str) -> bool {
         .is_some_and(|profile| profile.support_mode == LanguageSupportMode::StructuralCollector)
 }
 
+/// Native lexical case rules used for basename-only routing.
+///
+/// Existing filesystem identity remains owned by the workspace layer. This
+/// enum is only for the final basename spelling after a path has already been
+/// selected for indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePathCase {
+    Sensitive,
+    Insensitive,
+}
+
+impl NativePathCase {
+    pub const fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Insensitive
+        }
+        #[cfg(not(windows))]
+        {
+            Self::Sensitive
+        }
+    }
+}
+
 /// Whether a path is in the GitHub Actions workflow collector scope.
 pub fn is_github_actions_workflow_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
@@ -498,10 +522,126 @@ pub fn is_docker_compose_file_path(path: &str) -> bool {
 
 /// Whether a path is exactly a Cargo manifest by basename.
 pub fn is_cargo_manifest_file_path(path: &str) -> bool {
+    is_cargo_manifest_file_path_with_case(path, NativePathCase::current())
+}
+
+/// Whether a path is exactly a Cargo manifest under explicit native lexical rules.
+pub fn is_cargo_manifest_file_path_with_case(path: &str, path_case: NativePathCase) -> bool {
     path.replace('\\', "/")
         .rsplit('/')
         .next()
-        .is_some_and(|file_name| file_name == "Cargo.toml")
+        .is_some_and(|file_name| match path_case {
+            NativePathCase::Sensitive => file_name == "Cargo.toml",
+            NativePathCase::Insensitive => file_name.eq_ignore_ascii_case("Cargo.toml"),
+        })
+}
+
+/// Whether a path belongs to a structural source format.
+///
+/// JSONC is deliberately absent: the public structural contract is JSON only.
+pub fn is_structural_source_path(path: &str) -> bool {
+    structural_language_name_for_path(Some(path)).is_some()
+        || is_github_actions_workflow_path(path)
+        || is_docker_compose_file_path(path)
+        || is_cargo_manifest_file_path(path)
+}
+
+/// Return the shared exclusion reason for one workspace-relative structural path.
+///
+/// Absolute paths are intentionally ignored so repository ancestors named
+/// `build`, `target`, `vendor`, or `secrets` cannot affect source admission.
+pub fn structural_source_path_exclusion(path: &str) -> Option<&'static str> {
+    let normalized = path.replace('\\', "/");
+    let normalized = normalized.trim();
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("//")
+        || normalized.as_bytes().get(1) == Some(&b':')
+            && normalized
+                .as_bytes()
+                .get(2)
+                .is_some_and(|byte| *byte == b'/')
+    {
+        return None;
+    }
+    let normalized = normalized
+        .strip_prefix("./")
+        .unwrap_or(normalized)
+        .to_ascii_lowercase();
+    let components = normalized
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| *component == "..") {
+        return None;
+    }
+    let file_name = components.last().copied().unwrap_or_default();
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            ".git"
+                | "node_modules"
+                | "vendor"
+                | "vendors"
+                | "third_party"
+                | "third-party"
+                | "generated"
+                | "dist"
+                | "build"
+                | "target"
+                | "coverage"
+                | ".next"
+                | ".cache"
+        )
+    }) {
+        return Some("generated_or_vendor");
+    }
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            "secret" | "secrets" | ".secrets" | "credentials"
+        )
+    }) || file_name.starts_with(".env")
+        || matches!(
+            file_name,
+            "credentials.json"
+                | "secrets.json"
+                | "secrets.yaml"
+                | "secrets.yml"
+                | "id_rsa"
+                | "id_ed25519"
+        )
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+    {
+        return Some("secret_bearing");
+    }
+    if matches!(
+        file_name,
+        "cargo.lock"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "bun.lockb"
+            | "poetry.lock"
+            | "pipfile.lock"
+            | "composer.lock"
+            | "gemfile.lock"
+    ) || file_name.ends_with(".lock")
+    {
+        return Some("lockfile");
+    }
+    if file_name.contains(".min.")
+        || file_name.ends_with(".min")
+        || file_name.contains(".generated.")
+        || file_name.contains("_generated.")
+        || file_name.ends_with(".map")
+    {
+        return Some("generated_or_high_noise");
+    }
+    None
 }
 
 /// All extensions that have a public language profile.
@@ -851,7 +991,18 @@ mod tests {
         assert!(is_cargo_manifest_file_path("Cargo.toml"));
         assert!(is_cargo_manifest_file_path("crates/tool/Cargo.toml"));
         assert!(is_cargo_manifest_file_path(r"crates\tool\Cargo.toml"));
+        #[cfg(not(windows))]
         assert!(!is_cargo_manifest_file_path("cargo.toml"));
+        #[cfg(windows)]
+        assert!(is_cargo_manifest_file_path("cargo.toml"));
+        assert!(is_cargo_manifest_file_path_with_case(
+            r"crates\tool\CARGO.TOML",
+            NativePathCase::Insensitive
+        ));
+        assert!(!is_cargo_manifest_file_path_with_case(
+            r"crates\tool\CARGO.TOML",
+            NativePathCase::Sensitive
+        ));
         assert!(!is_cargo_manifest_file_path("config.toml"));
         assert!(!is_cargo_manifest_file_path(".cargo/config.toml"));
         assert!(!is_cargo_manifest_file_path("Cargo.lock"));
@@ -869,5 +1020,47 @@ mod tests {
         );
         assert_eq!(profile.evidence_tier, LanguageEvidenceTier::StructuralOnly);
         assert!(profile.extensions.is_empty());
+    }
+
+    #[test]
+    fn structural_exclusion_requires_a_workspace_relative_structural_path() {
+        for relative in [
+            "vendor/config.json",
+            r"target\docs\guide.md",
+            "build/settings.yaml",
+            r"secrets\deploy.ps1",
+            "web/app.min.json",
+            "config/package-lock.json",
+        ] {
+            assert!(is_structural_source_path(relative), "{relative}");
+            assert!(
+                structural_source_path_exclusion(relative).is_some(),
+                "{relative}"
+            );
+        }
+        for absolute in [
+            "/tmp/vendor/repo/config.json",
+            r"C:\target\repo\config.json",
+            r"\\server\secrets\repo\config.json",
+        ] {
+            assert_eq!(
+                structural_source_path_exclusion(absolute),
+                None,
+                "{absolute}"
+            );
+        }
+        for root_relative in [
+            "config.json",
+            "docs/guide.md",
+            "scripts/deploy.ps1",
+            "config/service.yaml",
+        ] {
+            assert_eq!(
+                structural_source_path_exclusion(root_relative),
+                None,
+                "{root_relative}"
+            );
+        }
+        assert!(!is_structural_source_path("config.jsonc"));
     }
 }

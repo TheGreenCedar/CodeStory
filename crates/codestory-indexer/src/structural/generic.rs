@@ -1,5 +1,6 @@
 use crate::intermediate_storage::IntermediateStorage;
 use codestory_contracts::graph::{NodeId, NodeKind};
+use std::collections::VecDeque;
 use std::path::Path;
 
 use super::StructuralCollectionError;
@@ -12,11 +13,37 @@ pub(crate) fn collect_markdown_entities(
     storage: &mut IntermediateStorage,
 ) -> Result<(), StructuralCollectionError> {
     let mut ordinal = 0usize;
+    let mut active_fence: Option<(u8, usize)> = None;
     for (line_index, line_text) in source.lines().enumerate() {
         let line = line_number(line_index);
         let trimmed = line_text.trim_start();
         let indent = line_text.len().saturating_sub(trimmed.len());
 
+        if let Some((marker, marker_len)) = active_fence {
+            if markdown_fence_closes(trimmed, marker, marker_len) {
+                active_fence = None;
+            }
+            continue;
+        }
+        if let Some((marker, marker_len)) = markdown_fence_marker(trimmed) {
+            if let Some((label, offset, len)) = markdown_fence_label(trimmed) {
+                ordinal += 1;
+                push_anchor(
+                    path,
+                    storage,
+                    file_id,
+                    NodeKind::ANNOTATION,
+                    "fence",
+                    &label,
+                    ordinal,
+                    line,
+                    indent + offset,
+                    len,
+                );
+            }
+            active_fence = Some((marker, marker_len));
+            continue;
+        }
         if let Some((label, offset, len)) = markdown_heading(trimmed) {
             ordinal += 1;
             push_anchor(
@@ -49,21 +76,6 @@ pub(crate) fn collect_markdown_entities(
             );
             continue;
         }
-        if let Some((label, offset, len)) = markdown_fence_label(trimmed) {
-            ordinal += 1;
-            push_anchor(
-                path,
-                storage,
-                file_id,
-                NodeKind::ANNOTATION,
-                "fence",
-                &label,
-                ordinal,
-                line,
-                indent + offset,
-                len,
-            );
-        }
     }
     Ok(())
 }
@@ -76,10 +88,18 @@ pub(crate) fn collect_yaml_entities(
 ) -> Result<(), StructuralCollectionError> {
     validate_yaml_source(source)?;
     let mut ordinal = 0usize;
+    let mut block_scalar_parent_indent = None;
     for (line_index, line_text) in source.lines().enumerate() {
         let line = line_number(line_index);
         let code = strip_yaml_comment(line_text);
         let trimmed = code.trim_start();
+        let indent = code.len().saturating_sub(trimmed.len());
+        if let Some(parent_indent) = block_scalar_parent_indent {
+            if trimmed.is_empty() || indent > parent_indent {
+                continue;
+            }
+            block_scalar_parent_indent = None;
+        }
         if trimmed.is_empty()
             || trimmed.starts_with("---")
             || trimmed.starts_with("...")
@@ -87,13 +107,15 @@ pub(crate) fn collect_yaml_entities(
         {
             continue;
         }
-        let indent = code.len().saturating_sub(trimmed.len());
+        if yaml_block_scalar_header(trimmed) {
+            block_scalar_parent_indent = Some(indent);
+        }
         let (candidate, candidate_offset) = if let Some(rest) = trimmed.strip_prefix("- ") {
             (rest, indent + 2)
         } else {
             (trimmed, indent)
         };
-        let Some(colon) = mapping_delimiter(candidate) else {
+        let Some(colon) = yaml_mapping_delimiter(candidate) else {
             continue;
         };
         let raw_key = candidate[..colon].trim();
@@ -133,9 +155,11 @@ pub(crate) fn collect_toml_entities(
     })?;
 
     let mut ordinal = 0usize;
+    let mut multiline_quote = None;
     for (line_index, line_text) in source.lines().enumerate() {
         let line = line_number(line_index);
-        let code = strip_toml_comment(line_text);
+        let masked = mask_toml_multiline_strings(line_text, &mut multiline_quote);
+        let code = strip_toml_comment(&masked);
         let trimmed = code.trim();
         if trimmed.is_empty() {
             continue;
@@ -294,34 +318,61 @@ fn collect_script_entities(
     family: ScriptFamily,
 ) {
     let mut ordinal = 0usize;
+    let mut shell_heredocs = VecDeque::new();
+    let mut powershell_block_comment_depth = 0usize;
     for (line_index, line_text) in source.lines().enumerate() {
         let line = line_number(line_index);
-        let code = strip_script_comment(line_text);
+        let masked;
+        let code = match family {
+            ScriptFamily::Shell => {
+                if let Some((terminator, strip_tabs)) = shell_heredocs.front() {
+                    let candidate = if *strip_tabs {
+                        line_text.trim_start_matches('\t')
+                    } else {
+                        line_text
+                    };
+                    if candidate.trim_end() == terminator {
+                        shell_heredocs.pop_front();
+                    }
+                    continue;
+                }
+                line_text
+            }
+            ScriptFamily::PowerShell => {
+                masked =
+                    mask_powershell_block_comments(line_text, &mut powershell_block_comment_depth);
+                &masked
+            }
+        };
+        let code = strip_script_comment(code);
         let trimmed = code.trim_start();
         if trimmed.is_empty() {
             continue;
         }
         let indent = code.len().saturating_sub(trimmed.len());
+        let new_heredocs = matches!(family, ScriptFamily::Shell)
+            .then(|| shell_heredoc_delimiters(code))
+            .unwrap_or_default();
         let anchor = match family {
             ScriptFamily::Shell => shell_anchor(trimmed),
             ScriptFamily::PowerShell => powershell_anchor(trimmed),
         };
-        let Some((kind, role, label, offset, len)) = anchor else {
-            continue;
-        };
-        ordinal += 1;
-        push_anchor(
-            path,
-            storage,
-            file_id,
-            kind,
-            role,
-            &label,
-            ordinal,
-            line,
-            indent + offset,
-            len,
-        );
+        if let Some((kind, role, label, offset, len)) = anchor {
+            ordinal += 1;
+            push_anchor(
+                path,
+                storage,
+                file_id,
+                kind,
+                role,
+                &label,
+                ordinal,
+                line,
+                indent + offset,
+                len,
+            );
+        }
+        shell_heredocs.extend(new_heredocs);
     }
 }
 
@@ -371,23 +422,47 @@ fn markdown_fence_label(line: &str) -> Option<(String, usize, usize)> {
     Some((label.to_string(), offset, label.len()))
 }
 
+fn markdown_fence_marker(line: &str) -> Option<(u8, usize)> {
+    let marker = match line.as_bytes().first().copied()? {
+        b'`' => b'`',
+        b'~' => b'~',
+        _ => return None,
+    };
+    let marker_len = line.bytes().take_while(|byte| *byte == marker).count();
+    (marker_len >= 3).then_some((marker, marker_len))
+}
+
+fn markdown_fence_closes(line: &str, marker: u8, opening_len: usize) -> bool {
+    let marker_len = line.bytes().take_while(|byte| *byte == marker).count();
+    marker_len >= opening_len && line[marker_len..].trim().is_empty()
+}
+
 fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
     let mut flow = Vec::new();
     let mut quote = None;
     let mut escaped = false;
+    let mut block_scalar_parent_indent = None;
     for (line_index, line) in source.lines().enumerate() {
-        if line
+        let indentation = line
             .as_bytes()
             .iter()
             .take_while(|byte| byte.is_ascii_whitespace())
-            .any(|byte| *byte == b'\t')
-        {
+            .count();
+        if line.as_bytes()[..indentation].contains(&b'\t') {
             return Err(StructuralCollectionError::Malformed(format!(
                 "YAML indentation contains a tab on line {}",
                 line_index + 1
             )));
         }
-        for ch in strip_yaml_comment(line).chars() {
+        let trimmed = line[indentation..].trim_end();
+        if let Some(parent_indent) = block_scalar_parent_indent {
+            if trimmed.is_empty() || indentation > parent_indent {
+                continue;
+            }
+            block_scalar_parent_indent = None;
+        }
+        let code = strip_yaml_comment(line);
+        for ch in code.chars() {
             if let Some(active) = quote {
                 if escaped {
                     escaped = false;
@@ -419,6 +494,9 @@ fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
                 }
                 _ => {}
             }
+        }
+        if flow.is_empty() && yaml_block_scalar_header(code.trim_start()) {
+            block_scalar_parent_indent = Some(indentation);
         }
     }
     if !flow.is_empty() {
@@ -473,8 +551,218 @@ fn strip_comment(line: &str, comment: char) -> &str {
     line
 }
 
-fn mapping_delimiter(value: &str) -> Option<usize> {
-    assignment_delimiter(value, ':')
+fn yaml_mapping_delimiter(value: &str) -> Option<usize> {
+    let delimiter = assignment_delimiter(value, ':')?;
+    value
+        .as_bytes()
+        .get(delimiter + 1)
+        .is_none_or(u8::is_ascii_whitespace)
+        .then_some(delimiter)
+}
+
+fn yaml_block_scalar_header(value: &str) -> bool {
+    let value = value.strip_prefix("- ").unwrap_or(value);
+    let scalar = yaml_mapping_delimiter(value)
+        .map(|delimiter| value[delimiter + 1..].trim_start())
+        .unwrap_or(value.trim_start());
+    let scalar = scalar.trim();
+    scalar
+        .strip_prefix('|')
+        .or_else(|| scalar.strip_prefix('>'))
+        .is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '-'))
+        })
+}
+
+#[derive(Clone, Copy)]
+enum TomlMultilineQuote {
+    Basic,
+    Literal,
+}
+
+impl TomlMultilineQuote {
+    fn delimiter(self) -> &'static [u8; 3] {
+        match self {
+            Self::Basic => b"\"\"\"",
+            Self::Literal => b"'''",
+        }
+    }
+}
+
+fn mask_toml_multiline_strings(line: &str, active: &mut Option<TomlMultilineQuote>) -> String {
+    let bytes = line.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut cursor = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+
+    while cursor < bytes.len() {
+        if let Some(multiline) = *active {
+            let delimiter = multiline.delimiter();
+            if let Some(close) = find_bytes(bytes, cursor, delimiter) {
+                masked[cursor..close + delimiter.len()].fill(b' ');
+                cursor = close + delimiter.len();
+                *active = None;
+                continue;
+            }
+            masked[cursor..].fill(b' ');
+            break;
+        }
+
+        let byte = bytes[cursor];
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                cursor += 1;
+                continue;
+            }
+            if active_quote == b'"' && byte == b'\\' {
+                escaped = true;
+                cursor += 1;
+                continue;
+            }
+            if byte == active_quote {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if byte == b'#' {
+            break;
+        }
+        let multiline = if bytes[cursor..].starts_with(b"\"\"\"") {
+            Some(TomlMultilineQuote::Basic)
+        } else if bytes[cursor..].starts_with(b"'''") {
+            Some(TomlMultilineQuote::Literal)
+        } else {
+            None
+        };
+        if let Some(multiline) = multiline {
+            let delimiter = multiline.delimiter();
+            let content_start = cursor + delimiter.len();
+            if let Some(close) = find_bytes(bytes, content_start, delimiter) {
+                masked[cursor..close + delimiter.len()].fill(b' ');
+                cursor = close + delimiter.len();
+            } else {
+                masked[cursor..].fill(b' ');
+                *active = Some(multiline);
+                break;
+            }
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        }
+        cursor += 1;
+    }
+
+    String::from_utf8(masked).expect("masking UTF-8 source with ASCII spaces preserves UTF-8")
+}
+
+fn find_bytes(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    haystack
+        .get(start..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| start + offset)
+}
+
+fn shell_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+    let bytes = line.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 1 < bytes.len() {
+        if bytes[cursor..].starts_with(b"<<<") || !bytes[cursor..].starts_with(b"<<") {
+            cursor += 1;
+            continue;
+        }
+        cursor += 2;
+        let strip_tabs = bytes.get(cursor) == Some(&b'-');
+        if strip_tabs {
+            cursor += 1;
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let quote = bytes
+            .get(cursor)
+            .copied()
+            .filter(|byte| matches!(byte, b'\'' | b'"'));
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while let Some(byte) = bytes.get(cursor) {
+            if quote.is_some_and(|quote| *byte == quote)
+                || quote.is_none()
+                    && (byte.is_ascii_whitespace()
+                        || matches!(*byte, b';' | b'|' | b'&' | b'<' | b'>'))
+            {
+                break;
+            }
+            cursor += 1;
+        }
+        if cursor > start {
+            delimiters.push((line[start..cursor].to_string(), strip_tabs));
+        }
+        if quote.is_some() && bytes.get(cursor) == quote.as_ref() {
+            cursor += 1;
+        }
+    }
+    delimiters
+}
+
+fn mask_powershell_block_comments(line: &str, depth: &mut usize) -> String {
+    let bytes = line.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut cursor = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        if *depth > 0 {
+            if bytes[cursor..].starts_with(b"<#") {
+                masked[cursor..cursor + 2].fill(b' ');
+                *depth += 1;
+                cursor += 2;
+            } else if bytes[cursor..].starts_with(b"#>") {
+                masked[cursor..cursor + 2].fill(b' ');
+                *depth -= 1;
+                cursor += 2;
+            } else {
+                masked[cursor] = b' ';
+                cursor += 1;
+            }
+            continue;
+        }
+        let byte = bytes[cursor];
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'`' {
+                escaped = true;
+            } else if byte == active_quote {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            cursor += 1;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"<#") {
+            masked[cursor..cursor + 2].fill(b' ');
+            *depth = 1;
+            cursor += 2;
+            continue;
+        }
+        cursor += 1;
+    }
+    String::from_utf8(masked).expect("masking UTF-8 source with ASCII spaces preserves UTF-8")
 }
 
 fn assignment_delimiter(value: &str, delimiter: char) -> Option<usize> {

@@ -92,22 +92,27 @@ future structural role explicitly admits them; they must not satisfy semantic
 proof roles or semantic dependency proof.
 
 Generic Markdown/MDX emits heading, link/reference-definition, and fenced-block
-labels. Generic YAML emits conservative mapping keys; generic TOML emits table
-and key labels; generic JSON emits object keys in source order. The shell
-fallback emits function and import anchors only for `.zsh`, `.ksh`, and
-`.command`; `.sh` and `.bash` remain parser-backed Bash. PowerShell `.ps1` and
-`.psm1` emit function and module/dot-source anchors. These collectors do not
-interpret references, substitutions, imports, execution behavior, or typed
-targets.
+labels while suppressing heading/reference syntax inside fences. Generic YAML
+emits conservative block mapping keys without treating URL colons or block
+scalar bodies as mappings; generic TOML emits table and key labels outside
+multiline strings; generic JSON emits object keys in source order. The shell
+fallback emits function and import anchors outside heredocs only for `.zsh`,
+`.ksh`, and `.command`; `.sh` and `.bash` remain parser-backed Bash. PowerShell
+`.ps1` and `.psm1` emit function and module/dot-source anchors outside block
+comments. These collectors do not interpret references, substitutions,
+imports, execution behavior, or typed targets.
 
 Dedicated routing wins before generic collection: workflow and Compose paths
 keep their YAML producers, `Cargo.toml` keeps its manifest producer, and
 OpenAPI/Swagger JSON or YAML keeps its `exact_source` endpoint path. Structural
-admission rejects generated/vendor, secret-bearing, lockfile, minified, and
-declared high-noise paths before reading. A structural file is accepted only
+admission evaluates only workspace-relative paths and rejects
+generated/vendor, secret-bearing, lockfile, minified, and declared high-noise
+descendants before inventory metadata or content reads. Repository ancestors
+with those names do not affect admission. A structural file is accepted only
 as a complete UTF-8 projection within the 1 MiB and 2,048-unit bounds;
 malformed, binary, unreadable, source-drifted, cancelled, or failed collection
-does not publish reusable units.
+does not publish reusable units. Cache identity v2 invalidates pre-limit
+artifacts, and cache hits independently enforce the same unit bound.
 
 Safe wording: structural-text anchors prove only that their collector found the
 cited source span; their `source_range_only` status and non-sufficient result
