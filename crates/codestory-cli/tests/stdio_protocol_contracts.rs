@@ -2251,6 +2251,18 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "/properties/scope/enum",
         &["line_context", "function_body"],
     );
+    for field in [
+        "max_snippet_bytes",
+        "range_source",
+        "fallback_reason",
+        "truncation_guidance",
+    ] {
+        assert!(
+            !required_fields(snippet).contains(field),
+            "snippet outputSchema should keep conditionally emitted DTO field {field} optional: {snippet}"
+        );
+        let _ = schema_property(snippet, field);
+    }
 }
 
 #[test]
@@ -4636,6 +4648,19 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
 fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "tool-refresh-catalog",
+                "method": "tools/list"
+            }),
+        ),
+        json!("tool-refresh-catalog"),
+    )
+    .clone();
+    let snippet_output_schema = tool_output_schema(&tools, "snippet").clone();
 
     let ground_before = send_json(
         &mut server,
@@ -4812,6 +4837,23 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         if tool == "snippet" {
             assert_eq!(result["scope"], json!("function_body"), "{result}");
             assert_eq!(result["requested_context"], json!(0), "{result}");
+            assert!(
+                result["range_source"].as_str().is_some(),
+                "function-body snippets should identify their selected range source: {result}"
+            );
+            let declared_properties = snippet_output_schema["properties"]
+                .as_object()
+                .expect("snippet outputSchema properties");
+            for field in result
+                .as_object()
+                .expect("snippet structuredContent object")
+                .keys()
+            {
+                assert!(
+                    declared_properties.contains_key(field),
+                    "function-body structuredContent field {field} is absent from the strict outputSchema: schema={snippet_output_schema}, result={result}"
+                );
+            }
         }
     }
 

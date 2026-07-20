@@ -1281,6 +1281,18 @@ static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("requested_context", "Requested context line count."),
         SchemaProperty::boolean("snippet_truncated", "Whether the snippet hit a byte cap."),
         SchemaProperty::integer("max_snippet_bytes", "Snippet byte cap.").nullable(),
+        SchemaProperty::string(
+            "range_source",
+            "Source of the selected function-body range, when available.",
+        ),
+        SchemaProperty::string(
+            "fallback_reason",
+            "Reason function-body selection fell back to line context, when applicable.",
+        ),
+        SchemaProperty::string(
+            "truncation_guidance",
+            "Follow-up guidance when the snippet hit its byte cap.",
+        ),
     ],
     &[
         "node",

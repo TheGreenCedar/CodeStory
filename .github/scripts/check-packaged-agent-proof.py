@@ -69,6 +69,14 @@ def project_resource_uri(base_uri: str, project: Path) -> str:
     return f"{base_uri}?project={quote(value, safe='-._~')}"
 
 
+def project_node_resource_uri(base_uri: str, node_id: str, project: Path) -> str:
+    require(node_id != "", "project-bound node resource requires a node id")
+    return project_resource_uri(
+        f"{base_uri}/{quote(node_id, safe='-._~')}",
+        project,
+    )
+
+
 EXTERNAL_QUALIFICATION_METRICS = {
     "retrieval_quality",
     "total_codestory_process_memory",
@@ -2902,12 +2910,12 @@ def assert_public_status(status: dict) -> None:
 
 
 def extract_resource(response: dict, uri: str) -> dict:
-    require("error" not in response, f"status resource failed: {response.get('error')}")
+    require("error" not in response, f"resource read failed: {response.get('error')}")
     contents = response.get("result", {}).get("contents", [])
     for item in contents:
         if isinstance(item, dict) and item.get("uri") == uri:
             payload = json.loads(item.get("text", "{}"))
-            require(isinstance(payload, dict), "status resource emitted non-object JSON")
+            require(isinstance(payload, dict), "resource emitted non-object JSON")
             return payload
     raise ProofFailure(f"resource response did not contain {uri}")
 
@@ -2975,6 +2983,14 @@ class McpProcess:
 
     def engine_diagnostics(self, project: Path, request_id: str) -> dict:
         uri = project_resource_uri(ENGINE_DIAGNOSTICS_URI, project)
+        return extract_resource(self.send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "resources/read",
+            "params": {"uri": uri},
+        }), uri)
+
+    def resource(self, uri: str, request_id: str) -> dict:
         return extract_resource(self.send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -3910,6 +3926,90 @@ def prove_runtime(
         status_b = host_b.status(project_b, "status-b")
         assert_public_status(status_a)
         assert_public_status(status_b)
+        search_b = cold_results["search-b"][0]["result"]["structuredContent"]
+        search_b_hits = search_b["hits"]
+        linked_hit = next(
+            (
+                hit
+                for hit in search_b_hits
+                if isinstance(hit, dict)
+                and isinstance(hit.get("node_id"), str)
+                and isinstance(hit.get("links"), list)
+            ),
+            None,
+        )
+        require(
+            isinstance(linked_hit, dict),
+            f"packaged search omitted a resolvable hit with continuation links: {search_b!r}",
+        )
+        linked_node_id = linked_hit["node_id"]
+        expected_snippet_uri = project_node_resource_uri(
+            "codestory://snippet",
+            linked_node_id,
+            project_b,
+        )
+        linked_snippet_uri = next(
+            (
+                link.get("uri")
+                for link in linked_hit["links"]
+                if isinstance(link, dict) and link.get("rel") == "snippet"
+            ),
+            None,
+        )
+        require(
+            linked_snippet_uri == expected_snippet_uri,
+            "packaged search returned a missing or noncanonical project-bound snippet link",
+        )
+        snippet_resource = host_b.resource(
+            linked_snippet_uri,
+            "snippet-resource-contract",
+        )
+        snippet_resource_node = snippet_resource.get("node")
+        require(
+            isinstance(snippet_resource_node, dict)
+            and snippet_resource_node.get("id") == linked_node_id,
+            "project-bound snippet resource returned a different node",
+        )
+        snippet_response, snippet_attempts = host_b.tool_until_ready(
+            "snippet",
+            {
+                "project": str(project_b),
+                "id": linked_node_id,
+                "function_body": True,
+                "lines": 0,
+            },
+            "snippet-contract",
+        )
+        snippet = snippet_response["result"]["structuredContent"]
+        require(
+            snippet.get("scope") == "function_body",
+            f"packaged snippet ignored function_body selection: {snippet!r}",
+        )
+        require(
+            snippet.get("requested_context") == 0,
+            f"packaged snippet ignored the bounded lines alias: {snippet!r}",
+        )
+        require_nonempty_string(
+            snippet.get("range_source"),
+            "packaged function-body snippet range source",
+        )
+        require(
+            query_b in snippet.get("snippet", ""),
+            f"packaged function-body snippet omitted the selected symbol: {snippet!r}",
+        )
+        snippet_node = snippet.get("node")
+        require(
+            isinstance(snippet_node, dict),
+            f"packaged function-body snippet omitted node identity: {snippet!r}",
+        )
+        snippet_node_id = require_nonempty_string(
+            snippet_node.get("id"),
+            "packaged function-body snippet node id",
+        )
+        require(
+            snippet_node_id == linked_node_id,
+            "function-body snippet changed the exact linked node identity",
+        )
         managed_runtime = None
         if args.proof_tier == "installed_runtime":
             managed_runtime = verify_managed_runtime_status(
@@ -4089,6 +4189,13 @@ def prove_runtime(
             "cold_search_attempts": {
                 "host_a": cold_results["search-a"][1],
                 "host_b": cold_results["search-b"][1],
+            },
+            "mcp_public_contract": {
+                "snippet_scope": snippet["scope"],
+                "requested_context": snippet["requested_context"],
+                "snippet_attempts": snippet_attempts,
+                "named_resource": "snippet",
+                "project_bound": True,
             },
             "shared_identity": shared_identity,
             "snapshot_a": snapshot_a,
@@ -9041,6 +9148,34 @@ def build_calibration_self_test_bundle(
 
 def self_test() -> None:
     require(parse_byte_quantity("24.1M") == 25_270_682, "memory quantity parser failed")
+    uri_project = Path("proof root")
+    node_uri = project_node_resource_uri(
+        "codestory://snippet",
+        "node/id %1",
+        uri_project,
+    )
+    require(
+        node_uri
+        == "codestory://snippet/node%2Fid%20%251?project=proof%20root",
+        f"project-bound node resource URI encoding drifted: {node_uri}",
+    )
+    require(
+        extract_resource(
+            {
+                "result": {
+                    "contents": [
+                        {
+                            "uri": node_uri,
+                            "text": json.dumps({"node": {"id": "node/id %1"}}),
+                        }
+                    ]
+                }
+            },
+            node_uri,
+        )
+        == {"node": {"id": "node/id %1"}},
+        "project-bound named resource extraction failed",
+    )
     def fail_parallel(message: str) -> None:
         raise ProofFailure(message)
 

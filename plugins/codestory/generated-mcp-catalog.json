@@ -3675,6 +3675,10 @@
         "additionalProperties": false,
         "description": "CodeStory snippet context DTO.",
         "properties": {
+          "fallback_reason": {
+            "description": "Reason function-body selection fell back to line context, when applicable.",
+            "type": "string"
+          },
           "line": {
             "description": "One-based focused line.",
             "type": "integer"
@@ -3692,6 +3696,10 @@
           },
           "path": {
             "description": "Project-relative file path.",
+            "type": "string"
+          },
+          "range_source": {
+            "description": "Source of the selected function-body range, when available.",
             "type": "string"
           },
           "requested_context": {
@@ -3713,6 +3721,10 @@
           "snippet_truncated": {
             "description": "Whether the snippet hit a byte cap.",
             "type": "boolean"
+          },
+          "truncation_guidance": {
+            "description": "Follow-up guidance when the snippet hit its byte cap.",
+            "type": "string"
           }
         },
         "required": [
