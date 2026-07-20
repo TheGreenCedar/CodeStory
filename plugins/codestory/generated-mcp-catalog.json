@@ -116,10 +116,12 @@
             "type": "string"
           },
           "extra_probes": {
-            "description": "Optional audited file, symbol, or file-scoped symbol probes to add to the packet plan.",
+            "description": "Legacy string probes normalized through the same typed runtime resolver.",
             "items": {
               "type": "string"
             },
+            "maxItems": 16,
+            "minItems": 1,
             "type": "array"
           },
           "include_evidence": {
@@ -135,6 +137,85 @@
               "integer",
               "null"
             ]
+          },
+          "probes": {
+            "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Tagged packet probe. Fields not used by the selected kind are rejected by the runtime contract.",
+              "properties": {
+                "contract_version": {
+                  "description": "Continuation probe contract version.",
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "core_generation_id": {
+                  "description": "Continuation core evidence generation.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Stable symbol id.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "Probe kind.",
+                  "enum": [
+                    "exact_path",
+                    "symbol_id",
+                    "file_symbol",
+                    "free_query",
+                    "continuation"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Exact project-relative path.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "project_id": {
+                  "description": "Continuation project identity.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "query": {
+                  "description": "Free query or continuation target.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "retrieval_generation": {
+                  "description": "Optional continuation retrieval generation.",
+                  "minLength": 1,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "symbol": {
+                  "description": "File-scoped symbol name.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "symbol_id": {
+                  "description": "Optional exact continuation symbol id.",
+                  "minLength": 1,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
           },
           "project": {
             "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
@@ -384,6 +465,10 @@
                     "additionalProperties": false,
                     "description": "Continuation resource link.",
                     "properties": {
+                      "probe": {
+                        "description": "Optional generation-bound continuation probe for packet reuse.",
+                        "type": "object"
+                      },
                       "rel": {
                         "description": "Link relation.",
                         "type": "string"
@@ -1621,6 +1706,10 @@
                     "additionalProperties": false,
                     "description": "Continuation resource link.",
                     "properties": {
+                      "probe": {
+                        "description": "Optional generation-bound continuation probe for packet reuse.",
+                        "type": "object"
+                      },
                       "rel": {
                         "description": "Link relation.",
                         "type": "string"
@@ -2891,6 +2980,10 @@
               "additionalProperties": false,
               "description": "Continuation resource link.",
               "properties": {
+                "probe": {
+                  "description": "Optional generation-bound continuation probe for packet reuse.",
+                  "type": "object"
+                },
                 "rel": {
                   "description": "Link relation.",
                   "type": "string"

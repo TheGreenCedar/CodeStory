@@ -7,6 +7,8 @@ project, calls runtime or retrieval services, and renders stable DTOs.
 ## Ownership
 
 - argument, tool, resource, and prompt schemas;
+- tagged packet-probe parsing plus legacy-string compatibility at the adapter
+  boundary;
 - process-start configuration capture and trusted config precedence;
 - explicit per-request project selection and retained `RuntimeContext` values;
 - bounded local activation/readiness integration;
@@ -43,6 +45,11 @@ is not a stronger consistency boundary than the CLI.
 
 Generated `--help` owns option syntax. User guides own workflows. This page owns
 the adapter boundary.
+
+The canonical packet probe is a tagged JSON object. CLI `--probe` and stdio
+`probes[]` accept the same five kinds; `--extra-probe` and stdio
+`extra_probes[]` remain compatibility inputs and are passed to the same runtime
+resolver without adapter-side inference.
 
 ## Serving contract
 

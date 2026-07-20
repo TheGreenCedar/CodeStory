@@ -11,11 +11,11 @@ use codestory_contracts::api::{
     AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
     NodeId, NodeKind, PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
-    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
-    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
-    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
-    TrailDirection, TrailMode,
+    PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
+    ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
+    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
+    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
+    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
@@ -183,6 +183,14 @@ fn parse_read_output_format(value: &str) -> Result<OutputFormat, String> {
             "invalid output format `{other}`; expected `markdown` or `json`"
         )),
     }
+}
+
+fn parse_packet_probe(value: &str) -> Result<PacketProbeDto, String> {
+    serde_json::from_str(value).map_err(|error| {
+        format!(
+            "invalid tagged packet probe JSON: {error}; expected an object with kind exact_path, symbol_id, file_symbol, free_query, or continuation"
+        )
+    })
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -470,9 +478,16 @@ pub(crate) struct PacketCommand {
     #[arg(long, value_enum)]
     pub(crate) task_class: Option<CliPacketTaskClass>,
     #[arg(
+        long = "probe",
+        value_name = "TAGGED_JSON",
+        value_parser = parse_packet_probe,
+        help = "Add a typed packet probe as tagged JSON. Kinds: exact_path, symbol_id, file_symbol, free_query, continuation. Repeatable."
+    )]
+    pub(crate) probes: Vec<PacketProbeDto>,
+    #[arg(
         long = "extra-probe",
         value_name = "QUERY",
-        help = "Add an explicit file, symbol, or file-scoped symbol probe to the packet plan. Repeatable; intended for audited benchmark or operator-supplied anchors."
+        help = "Add a legacy string probe. It is normalized through the same typed resolver as --probe."
     )]
     pub(crate) extra_probes: Vec<String>,
     #[arg(
@@ -542,9 +557,16 @@ pub(crate) struct TaskBriefCommand {
     #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
     pub(crate) budget: CliPacketBudget,
     #[arg(
+        long = "probe",
+        value_name = "TAGGED_JSON",
+        value_parser = parse_packet_probe,
+        help = "Add a typed packet probe as tagged JSON. Repeatable."
+    )]
+    pub(crate) probes: Vec<PacketProbeDto>,
+    #[arg(
         long = "extra-probe",
         value_name = "QUERY",
-        help = "Add an explicit file, symbol, or file-scoped symbol probe to the underlying packet plan."
+        help = "Add a legacy string probe normalized through the typed packet resolver."
     )]
     pub(crate) extra_probes: Vec<String>,
     #[arg(
@@ -2436,6 +2458,49 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
+    }
+
+    #[test]
+    fn packet_cli_parses_tagged_and_legacy_probes() {
+        let parsed = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--question",
+            "Explain the target",
+            "--probe",
+            r#"{"kind":"exact_path","path":"assets/desk.svg"}"#,
+            "--extra-probe",
+            "WorkspaceIndexer",
+        ])
+        .expect("packet probes should parse");
+        let Command::Packet(packet) = parsed.command else {
+            panic!("expected packet command");
+        };
+        assert_eq!(
+            packet.probes,
+            [PacketProbeDto::ExactPath {
+                path: "assets/desk.svg".into()
+            }]
+        );
+        assert_eq!(packet.extra_probes, ["WorkspaceIndexer"]);
+    }
+
+    #[test]
+    fn packet_cli_rejects_malformed_tagged_probe_before_runtime() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--question",
+            "Explain the target",
+            "--probe",
+            r#"{"kind":"file_symbol","path":"src/lib.rs"}"#,
+        ])
+        .expect_err("incomplete tagged probe must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid tagged packet probe JSON")
+        );
     }
 
     #[test]

@@ -21,5 +21,17 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 
 - `packet` is for broad questions; `context` is for one concrete target.
 - Prefer `packet --budget compact` before manually opening source files for a broad explanation or plan.
+- `probes` uses tagged objects with `kind` equal to `exact_path`, `symbol_id`,
+  `file_symbol`, `free_query`, or `continuation`. For example,
+  `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
+  project-relative file without fuzzy substitution. CLI accepts the same
+  object through repeatable `--probe '<json>'`.
+- A continuation also supplies `contract_version`, `project_id`,
+  `core_generation_id`, optional `retrieval_generation`, optional exact
+  `symbol_id`, and `query`; reuse fails closed when the selected evidence
+  generation changes.
+- `extra_probes` and CLI `--extra-probe` remain legacy compatibility inputs.
+  They enter the same runtime resolver. Neither typed nor legacy probes promote
+  packet sufficiency or choose route order.
 - Treat `sufficiency.status=partial` as useful but incomplete evidence. The packet should say which next command would deepen or verify the answer.
 - Architecture, data-flow, and route-tracing sufficiency requires causal flow-role coverage, not just citation or claim counts. Generic "inspect this anchor" claims may guide follow-up, but they do not make a packet safe to answer from.

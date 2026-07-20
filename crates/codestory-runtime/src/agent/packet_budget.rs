@@ -854,6 +854,7 @@ mod tests {
                     query: question.to_string(),
                     purpose: "fixture".to_string(),
                 }],
+                probe_resolutions: Vec::new(),
                 trace: Vec::new(),
             },
             answer,

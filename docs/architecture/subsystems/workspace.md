@@ -14,6 +14,11 @@ Windows-native case and verbatim-path rules on Windows.
 for bounded operation-local maps. Callers must treat an unavailable identity as
 incomplete evidence and must not retain the key across file replacement.
 
+`resolve_project_relative_path` applies the same native identity and containment
+rules to exact-target probes. Existing symlinks are checked after filesystem
+resolution, while missing paths use only operation-scoped native lexical
+identity. It never turns an outside target into a project-relative path.
+
 `codestory_project.json` defines source groups. An optional
 `codestory_workspace.json` can name monorepo members; without either file the
 crate creates a synthetic single-root manifest.

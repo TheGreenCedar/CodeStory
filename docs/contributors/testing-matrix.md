@@ -256,6 +256,13 @@ CLI args/rendering use named contract suites before the broad gate. Stdio tests
 must send an absolute `project` on every request and prove multi-project routing
 does not depend on active-state files.
 
+Packet-probe changes additionally prove deterministic tagged serialization,
+legacy normalization, native Unix/Windows exact-path containment,
+valid-uncovered and text-only distinctions, stable ambiguity ordering,
+stale-ID and continuation rejection, CLI/stdio schema parity, and that probes
+cannot promote sufficiency or route order. A named exact-path fixture resolves
+without first invoking broad grounding or retrieval.
+
 Plugin adapter changes run:
 
 ```sh

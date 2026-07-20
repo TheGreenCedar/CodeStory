@@ -14,6 +14,7 @@ pub(crate) mod packet_evidence;
 pub(crate) mod packet_evidence_roles;
 pub(crate) mod packet_flow_requirements;
 pub(crate) mod packet_plan;
+pub(crate) mod packet_probe;
 pub(crate) mod packet_required_probes;
 pub(crate) mod packet_scoring;
 pub(crate) mod packet_search;
@@ -40,7 +41,9 @@ pub fn plan_packet(
             "Question cannot be empty.",
         ));
     }
-    let extra_probes = packet_plan::packet_request_extra_probes(request.extra_probes.clone());
+    let probes =
+        packet_probe::normalize_packet_probe_request(&request.probes, &request.extra_probes);
+    let extra_probes = packet_probe::unresolved_packet_probe_queries(&probes);
     Ok(packet_plan::build_packet_plan_with_extra(
         question,
         request.task_class,

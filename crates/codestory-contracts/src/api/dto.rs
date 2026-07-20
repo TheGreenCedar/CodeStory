@@ -2286,12 +2286,101 @@ pub struct PacketPlanQueryDto {
     pub purpose: String,
 }
 
+pub const PACKET_PROBE_CONTRACT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PacketProbeDto {
+    ExactPath {
+        path: String,
+    },
+    SymbolId {
+        id: String,
+    },
+    FileSymbol {
+        path: String,
+        symbol: String,
+    },
+    FreeQuery {
+        query: String,
+    },
+    Continuation {
+        contract_version: u32,
+        project_id: String,
+        core_generation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retrieval_generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol_id: Option<String>,
+        query: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketProbeResolutionStatusDto {
+    ExactPath,
+    ValidUncoveredPath,
+    IndexedSymbol,
+    FileScopedSymbol,
+    TextHit,
+    FreeQuery,
+    Continuation,
+    Ambiguous,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketProbeRejectionCodeDto {
+    MalformedProbe,
+    MissingTarget,
+    OutOfProject,
+    StaleSymbolId,
+    StaleContinuation,
+    IncompatibleContinuation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketProbeRejectionDto {
+    pub code: PacketProbeRejectionCodeDto,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketProbeAmbiguityCandidateDto {
+    pub symbol_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub kind: NodeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketProbeResolutionDto {
+    pub input_index: u32,
+    pub probe: PacketProbeDto,
+    pub status: PacketProbeResolutionStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<PacketProbeAmbiguityCandidateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<PacketProbeRejectionDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketPlanDto {
     pub task_class: PacketTaskClassDto,
     pub inferred_task_class: bool,
     #[serde(default)]
     pub queries: Vec<PacketPlanQueryDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_resolutions: Vec<PacketProbeResolutionDto>,
     #[serde(default)]
     pub trace: Vec<String>,
 }
@@ -2303,6 +2392,8 @@ pub struct AgentPacketRequestDto {
     pub budget: PacketBudgetModeDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_class: Option<PacketTaskClassDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<PacketProbeDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_probes: Vec<String>,
     #[serde(default = "default_include_evidence")]
@@ -2631,6 +2722,55 @@ mod packet_tests {
 
         assert_eq!(request.budget, PacketBudgetModeDto::Compact);
         assert!(request.include_evidence);
+    }
+
+    #[test]
+    fn tagged_packet_probes_round_trip_deterministically() {
+        let probes = vec![
+            PacketProbeDto::ExactPath {
+                path: "assets/desk.svg".into(),
+            },
+            PacketProbeDto::SymbolId { id: "42".into() },
+            PacketProbeDto::FileSymbol {
+                path: "src/lib.rs".into(),
+                symbol: "AppController".into(),
+            },
+            PacketProbeDto::FreeQuery {
+                query: "runtime publication fence".into(),
+            },
+            PacketProbeDto::Continuation {
+                contract_version: PACKET_PROBE_CONTRACT_VERSION,
+                project_id: "project-v3".into(),
+                core_generation_id: "core-generation".into(),
+                retrieval_generation: Some("retrieval-generation".into()),
+                symbol_id: Some("42".into()),
+                query: "AppController".into(),
+            },
+        ];
+
+        for probe in probes {
+            let encoded = serde_json::to_string(&probe).expect("serialize probe");
+            let decoded: PacketProbeDto =
+                serde_json::from_str(&encoded).expect("deserialize probe");
+            assert_eq!(decoded, probe);
+            assert_eq!(
+                serde_json::to_string(&decoded).expect("reserialize probe"),
+                encoded
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_packet_probe_rejects_unknown_and_incomplete_forms() {
+        for malformed in [
+            r#"{"kind":"unknown","query":"x"}"#,
+            r#"{"kind":"exact_path"}"#,
+            r#"{"kind":"exact_path","path":"src/lib.rs","query":"ignored"}"#,
+            r#"{"kind":"file_symbol","path":"src/lib.rs"}"#,
+            r#"{"kind":"continuation","contract_version":1,"project_id":"p","core_generation_id":"g"}"#,
+        ] {
+            assert!(serde_json::from_str::<PacketProbeDto>(malformed).is_err());
+        }
     }
 
     #[test]

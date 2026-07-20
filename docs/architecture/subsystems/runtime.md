@@ -13,6 +13,9 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - graph-native symbol-document and dense-anchor synchronization;
 - grounding, trails, symbol workflows, target context, search, and packet
   assembly;
+- one packet-probe normalization and resolution path for exact paths, stable
+  symbol IDs, file-scoped symbols, free queries, and generation-bound
+  continuations;
 - managed retrieval preparation and user-facing gap mapping;
 - generation-coherent candidate resolution and one bounded publication retry.
 
@@ -48,6 +51,8 @@ never treat them as indexed evidence.
 - keep command parsing/rendering in CLI and persistence in store;
 - extend packet/search through the existing retrieval-primary path rather than
   creating a second scoring or readiness system.
+- keep probe resolution metadata diagnostic: a requested probe may add evidence
+  work but cannot promote sufficiency or invent route order.
 
 ## Failure signatures
 

@@ -622,6 +622,13 @@ const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
+const PACKET_PROBE_KINDS: &[&str] = &[
+    "exact_path",
+    "symbol_id",
+    "file_symbol",
+    "free_query",
+    "continuation",
+];
 const AFFECTED_CHANGE_KINDS: &[&str] = &[
     "added",
     "modified",
@@ -688,6 +695,10 @@ static RESOURCE_LINK_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("rel", "Link relation."),
         SchemaProperty::string("uri", "CodeStory resource URI."),
+        SchemaProperty::object(
+            "probe",
+            "Optional generation-bound continuation probe for packet reuse.",
+        ),
     ],
     &["rel", "uri"],
 );
@@ -1586,6 +1597,35 @@ static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_any_of_required(&[&["query"], &["id"], &["bookmark"]]);
 
+static PACKET_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Tagged packet probe. Fields not used by the selected kind are rejected by the runtime contract.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.").with_enum(PACKET_PROBE_KINDS),
+        SchemaProperty::string("path", "Exact project-relative path.").with_min_length(1),
+        SchemaProperty::string("id", "Stable symbol id.").with_min_length(1),
+        SchemaProperty::string("symbol", "File-scoped symbol name.").with_min_length(1),
+        SchemaProperty::string("query", "Free query or continuation target.").with_min_length(1),
+        SchemaProperty::integer("contract_version", "Continuation probe contract version.")
+            .with_bounds(1, 1),
+        SchemaProperty::string("project_id", "Continuation project identity.").with_min_length(1),
+        SchemaProperty::string(
+            "core_generation_id",
+            "Continuation core evidence generation.",
+        )
+        .with_min_length(1),
+        SchemaProperty::string(
+            "retrieval_generation",
+            "Optional continuation retrieval generation.",
+        )
+        .with_min_length(1)
+        .nullable(),
+        SchemaProperty::string("symbol_id", "Optional exact continuation symbol id.")
+            .with_min_length(1)
+            .nullable(),
+    ],
+    &["kind"],
+);
+
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Build a broad task packet with budget and sufficiency metadata.",
     &[
@@ -1597,10 +1637,17 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("task_class", "Optional task class.")
             .with_enum(PACKET_TASK_CLASSES)
             .nullable(),
+        SchemaProperty::array(
+            "probes",
+            "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            &PACKET_PROBE_SCHEMA,
+        )
+        .with_item_bounds(1, 16),
         SchemaProperty::string_array(
             "extra_probes",
-            "Optional audited file, symbol, or file-scoped symbol probes to add to the packet plan.",
-        ),
+            "Legacy string probes normalized through the same typed runtime resolver.",
+        )
+        .with_item_bounds(1, 16),
         SchemaProperty::boolean(
             "include_evidence",
             "Include citation edge ids and score details.",

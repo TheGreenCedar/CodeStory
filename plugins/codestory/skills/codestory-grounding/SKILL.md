@@ -49,7 +49,7 @@ plugin result unless the user explicitly asks.
 | Situation | Route |
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
-| Exact named file, path, or static asset with file-local evidence | Inspect it directly; if the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
+| Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
 | Find a symbol | `symbol`, then `definition` or `snippet`. |
 | Follow a call path | `callers`, `callees`, `trace`, or `trail`. |
 | Review change impact | `affected` with explicit Git-changed paths, then focused symbol or trace evidence. |
@@ -67,6 +67,8 @@ plugin result unless the user explicitly asks.
   When it reports `partial`, run the named follow-up before making proof claims.
 - `affected` is planning evidence, not a guarantee that every runtime effect was
   found.
+- Tagged probes select exact or additional evidence work. They do not choose
+  route order or upgrade packet sufficiency.
 - Do not paste empty grounding output as context. If a repository truly has no
   supported files, fall back to ordinary inspection or resolve the intended
   root when it is ambiguous.
