@@ -399,7 +399,7 @@ fn grounding_root_subsystem_key(
     {
         return format!("{language}:plugins/{plugin_name}");
     }
-    if segments.iter().any(|segment| *segment == "src-tauri") {
+    if segments.contains(&"src-tauri") {
         return format!("{language}:src-tauri");
     }
     if let Some(index) = segments.iter().rposition(|segment| *segment == "src") {
