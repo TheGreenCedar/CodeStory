@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
-use codestory_store::{RetrievalIndexManifest, Store};
+use codestory_store::{RetrievalIndexManifest, SourcePolicyExclusionPolicyIdentity, Store};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -200,9 +200,11 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
             &publication,
             &source_policy.project_id,
             &source_policy.workspace_id,
-            &source_policy.policy_version,
-            source_policy.byte_cap,
-            source_policy.structural_unit_cap,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &source_policy.policy_version,
+                source_policy.byte_cap,
+                source_policy.structural_unit_cap,
+            ),
             &source_policy_candidates,
         )
         .context("publish replacement core source policy manifest")?;

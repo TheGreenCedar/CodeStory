@@ -3115,6 +3115,24 @@ pub struct SourcePolicyExclusionRecord {
     pub core_run_id: String,
 }
 
+/// Immutable policy identity bound to one complete exclusion publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePolicyExclusionPolicyIdentity<'a> {
+    pub policy_version: &'a str,
+    pub byte_cap: u64,
+    pub structural_unit_cap: u64,
+}
+
+impl<'a> SourcePolicyExclusionPolicyIdentity<'a> {
+    pub const fn new(policy_version: &'a str, byte_cap: u64, structural_unit_cap: u64) -> Self {
+        Self {
+            policy_version,
+            byte_cap,
+            structural_unit_cap,
+        }
+    }
+}
+
 /// Complete exclusion set published with one core generation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourcePolicyExclusionManifest {
@@ -7643,20 +7661,18 @@ impl Storage {
         publication: &IndexPublicationRecord,
         project_id: &str,
         workspace_id: &str,
-        policy_version: &str,
-        byte_cap: u64,
-        structural_unit_cap: u64,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
         candidates: &[OversizedSourceExclusionCandidate],
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
         if publication.generation_id.trim().is_empty()
             || publication.run_id.trim().is_empty()
             || project_id.trim().is_empty()
             || workspace_id.trim().is_empty()
-            || policy_version.trim().is_empty()
-            || byte_cap == 0
-            || byte_cap > i64::MAX as u64
-            || structural_unit_cap == 0
-            || structural_unit_cap > i64::MAX as u64
+            || policy.policy_version.trim().is_empty()
+            || policy.byte_cap == 0
+            || policy.byte_cap > i64::MAX as u64
+            || policy.structural_unit_cap == 0
+            || policy.structural_unit_cap > i64::MAX as u64
         {
             return Err(StorageError::Other(
                 "source policy exclusion publication identity is invalid".into(),
@@ -7682,12 +7698,13 @@ impl Storage {
                     .all(|value| value.is_ascii_hexdigit())
                 || candidate.observed_size > i64::MAX as u64
                 || candidate.observed_unit_count > i64::MAX as u64
-                || !((candidate.observed_size > byte_cap && candidate.observed_unit_count == 0)
-                    || (candidate.observed_size <= byte_cap
-                        && candidate.observed_unit_count > structural_unit_cap))
-                || candidate.policy_version != policy_version
-                || candidate.byte_cap != byte_cap
-                || candidate.structural_unit_cap != structural_unit_cap
+                || !((candidate.observed_size > policy.byte_cap
+                    && candidate.observed_unit_count == 0)
+                    || (candidate.observed_size <= policy.byte_cap
+                        && candidate.observed_unit_count > policy.structural_unit_cap))
+                || candidate.policy_version != policy.policy_version
+                || candidate.byte_cap != policy.byte_cap
+                || candidate.structural_unit_cap != policy.structural_unit_cap
             {
                 return Err(StorageError::Other(format!(
                     "invalid source policy exclusion candidate: {path}"
@@ -7719,9 +7736,9 @@ impl Storage {
             core_run_id: publication.run_id.clone(),
             exclusion_count: records.len() as u64,
             exclusion_digest,
-            policy_version: policy_version.to_string(),
-            byte_cap,
-            structural_unit_cap,
+            policy_version: policy.policy_version.to_string(),
+            byte_cap: policy.byte_cap,
+            structural_unit_cap: policy.structural_unit_cap,
             published_at_epoch_ms: publication.published_at_epoch_ms,
         };
         let tx = self.conn.transaction()?;
@@ -7780,9 +7797,7 @@ impl Storage {
         publication: &IndexPublicationRecord,
         project_id: &str,
         workspace_id: &str,
-        policy_version: &str,
-        byte_cap: u64,
-        structural_unit_cap: u64,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
         let manifest = self
             .get_source_policy_exclusion_manifest()?
@@ -7795,9 +7810,9 @@ impl Storage {
             || manifest.workspace_id != workspace_id
             || manifest.core_generation_id != publication.generation_id
             || manifest.core_run_id != publication.run_id
-            || manifest.policy_version != policy_version
-            || manifest.byte_cap != byte_cap
-            || manifest.structural_unit_cap != structural_unit_cap
+            || manifest.policy_version != policy.policy_version
+            || manifest.byte_cap != policy.byte_cap
+            || manifest.structural_unit_cap != policy.structural_unit_cap
             || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
         {
             return Err(StorageError::Other(

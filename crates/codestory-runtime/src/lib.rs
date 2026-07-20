@@ -57,8 +57,8 @@ use codestory_store::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
     DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
     GroundingNodeRecord, IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc,
-    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
-    SymbolSummaryRecord,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, SourcePolicyExclusionPolicyIdentity,
+    Store, SymbolSearchDoc, SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 #[cfg(test)]
@@ -5239,9 +5239,11 @@ fn publish_source_policy_exclusions(
             publication,
             &identity.project_id,
             &identity.workspace_id,
-            &policy.policy_version,
-            policy.byte_cap,
-            policy.structural_unit_cap,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &policy.policy_version,
+                policy.byte_cap,
+                policy.structural_unit_cap,
+            ),
             exclusions,
         )
         .map_err(|error| {
@@ -5281,9 +5283,11 @@ fn validate_source_policy_exclusions(
             publication,
             &identity.project_id,
             &identity.workspace_id,
-            &policy.policy_version,
-            policy.byte_cap,
-            policy.structural_unit_cap,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &policy.policy_version,
+                policy.byte_cap,
+                policy.structural_unit_cap,
+            ),
         )
         .map_err(|error| {
             ApiError::new(
@@ -17224,6 +17228,14 @@ mod tests {
     #[path = "activation_coverage_tests.rs"]
     mod activation_coverage_tests;
 
+    fn default_source_policy_identity() -> SourcePolicyExclusionPolicyIdentity<'static> {
+        SourcePolicyExclusionPolicyIdentity::new(
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        )
+    }
+
     #[test]
     fn full_refresh_wall_residual_uses_raw_durations_before_millis_conversion() {
         let wall = FullRefreshWallDurations {
@@ -23363,9 +23375,7 @@ fn build_llm_symbol_doc_text() -> String {
                     &publication,
                     &identity.project_id,
                     &identity.workspace_id,
-                    OVERSIZED_SOURCE_POLICY_VERSION,
-                    DEFAULT_SOURCE_FILE_BYTE_CAP,
-                    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                    default_source_policy_identity(),
                     &[],
                 )
                 .expect("publish source policy identity");
@@ -24147,9 +24157,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("verified exclusion manifest");
         assert_eq!(manifest.exclusion_count, 1);
@@ -24408,9 +24416,11 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                &excluding_policy.policy_version,
-                excluding_policy.byte_cap,
-                excluding_policy.structural_unit_cap,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &excluding_policy.policy_version,
+                    excluding_policy.byte_cap,
+                    excluding_policy.structural_unit_cap,
+                ),
             )
             .expect("custom unit cap manifest");
         assert_eq!(excluded_manifest.structural_unit_cap, 2);
@@ -24460,9 +24470,11 @@ fn build_llm_symbol_doc_text() -> String {
                 &admitted_publication,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                &admitting_policy.policy_version,
-                admitting_policy.byte_cap,
-                admitting_policy.structural_unit_cap,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &admitting_policy.policy_version,
+                    admitting_policy.byte_cap,
+                    admitting_policy.structural_unit_cap,
+                ),
             )
             .expect("changed-cap manifest");
         assert_eq!(admitted_manifest.structural_unit_cap, 3);
@@ -24517,9 +24529,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("verified exclusion manifest");
         assert_eq!(manifest.exclusion_count, 3);
@@ -24655,9 +24665,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &baseline,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("baseline exclusion manifest remains valid");
         assert_eq!(manifest.exclusion_count, 0);
@@ -24716,9 +24724,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &baseline,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("baseline exclusion manifest remains valid");
         assert_eq!(manifest.exclusion_count, 0);
@@ -24795,9 +24801,11 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &project_identity_v3(workspace.path()).project_id,
                 &project_identity_v3(workspace.path()).workspace_id,
-                &policy.policy_version,
-                policy.byte_cap,
-                policy.structural_unit_cap,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &policy.policy_version,
+                    policy.byte_cap,
+                    policy.structural_unit_cap,
+                ),
             )
             .expect("manifest uses the injected policy");
         assert_eq!(published.byte_cap, 64);
@@ -25015,9 +25023,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &identity.project_id,
                 &identity.workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("complete exclusion publication");
         let first_exclusion = storage
@@ -25126,9 +25132,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &identity.project_id,
                 &identity.workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("replacement exclusion manifest");
         assert_eq!(manifest.exclusion_count, 1);
@@ -25196,9 +25200,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &publication,
                 &identity.project_id,
                 &identity.workspace_id,
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
             )
             .expect("recovered exclusion manifest");
         assert_eq!(manifest.exclusion_count, 1);
@@ -27201,9 +27203,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &old_publication,
                 "test-project",
                 "test-workspace",
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
                 &[],
             )
             .expect("publish old source policy identity");
@@ -27253,9 +27253,7 @@ fn build_llm_symbol_doc_text() -> String {
                 &new_publication,
                 "test-project",
                 "test-workspace",
-                OVERSIZED_SOURCE_POLICY_VERSION,
-                DEFAULT_SOURCE_FILE_BYTE_CAP,
-                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                default_source_policy_identity(),
                 &[],
             )
             .expect("publish staged source policy identity");
