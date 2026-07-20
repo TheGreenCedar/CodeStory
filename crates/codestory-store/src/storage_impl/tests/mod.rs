@@ -1095,6 +1095,110 @@ fn insert_file_row(storage: &Storage, id: i64, path: &str) -> Result<(), Storage
 }
 
 #[test]
+fn openapi_endpoint_projection_requires_file_owned_graph_evidence() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let file_rows = [
+        (1, "openapi.json"),
+        (2, "metadata-only.json"),
+        (3, "wrong-file.yaml"),
+        (4, "ordinary-function.json"),
+        (5, "empty-endpoint.json"),
+    ];
+    for &(id, path) in &file_rows {
+        insert_file_row(&storage, id, path)?;
+    }
+    let file_nodes = file_rows
+        .iter()
+        .map(|(id, path)| file_node(*id, path))
+        .collect::<Vec<_>>();
+    let endpoints = [
+        Node {
+            id: NodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "GET /ready".to_string(),
+            canonical_id: Some("openapi:endpoint:GET /ready".to_string()),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(201),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "GET /forged".to_string(),
+            canonical_id: Some("openapi:endpoint:GET /forged".to_string()),
+            file_node_id: Some(NodeId(2)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(301),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "GET /wrong-file".to_string(),
+            canonical_id: Some("openapi:endpoint:GET /wrong-file".to_string()),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(401),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "ordinary".to_string(),
+            canonical_id: Some("route_endpoint:GET /ordinary".to_string()),
+            file_node_id: Some(NodeId(4)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(501),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "empty".to_string(),
+            canonical_id: Some("openapi:endpoint:".to_string()),
+            file_node_id: Some(NodeId(5)),
+            ..Default::default()
+        },
+    ];
+    let mut nodes = file_nodes;
+    nodes.extend(endpoints.iter().cloned());
+    storage.insert_nodes_batch(&nodes)?;
+
+    let graph_files = [(1, 101), (3, 301), (4, 401), (5, 501)];
+    storage.insert_edges_batch(
+        &graph_files
+            .iter()
+            .map(|(file_id, endpoint_id)| Edge {
+                id: EdgeId(10_000 + endpoint_id),
+                source: NodeId(*file_id),
+                target: NodeId(*endpoint_id),
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(NodeId(*file_id)),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    storage.insert_occurrences_batch(
+        &graph_files
+            .iter()
+            .map(|(file_id, endpoint_id)| Occurrence {
+                element_id: *endpoint_id,
+                kind: OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: NodeId(*file_id),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 2,
+                },
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    assert!(storage.has_file_owned_openapi_endpoint_projection(1)?);
+    for file_id in [2, 3, 4, 5] {
+        assert!(
+            !storage.has_file_owned_openapi_endpoint_projection(file_id)?,
+            "file {file_id} must not authenticate forged OpenAPI projection evidence"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn framework_synthetic_node_source_metadata_prefers_definitions() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     insert_file_row(&storage, 1, "src/routes/+page.svelte")?;

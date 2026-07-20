@@ -3054,6 +3054,7 @@ impl WorkspaceIndexer {
                 return Err(local_storage);
             }
         };
+        let content_hash = source_content_hash(&bytes);
         let source = match structural::decode_structural_source(bytes) {
             Ok(source) => source,
             Err(_) if structural::is_structural_candidate_path(full_path) => return Ok(None),
@@ -3074,7 +3075,7 @@ impl WorkspaceIndexer {
                 ));
             }
         };
-        index_openapi_schema_file(full_path, &source).map_err(|error| {
+        let mut projected = index_openapi_schema_file(full_path, &source).map_err(|error| {
             incomplete_file_storage(
                 full_path,
                 Some(&source),
@@ -3089,7 +3090,21 @@ impl WorkspaceIndexer {
                     coverage_reason: Some(FileCoverageReason::CollectorFailure),
                 },
             )
-        })
+        })?;
+        if let Some(projected) = projected.as_mut() {
+            let modification_time = verify_source_snapshot(full_path, &content_hash)
+                .map_err(|error| changed_source_storage(full_path, "openapi", error))?;
+            if let Some(file) = projected.files.first_mut() {
+                file.modification_time = modification_time;
+                projected
+                    .file_content_hashes
+                    .push(codestory_store::FileContentHash {
+                        file_id: file.id,
+                        content_hash,
+                    });
+            }
+        }
+        Ok(projected)
     }
 
     fn execute_prepared_index(
@@ -22455,6 +22470,16 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                 Err(_) => panic!("OpenAPI source preparation failed: {relative}"),
             };
             assert_eq!(projected.files[0].language, "openapi", "{relative}");
+            assert_eq!(
+                projected.file_content_hashes.len(),
+                1,
+                "{relative} must retain its verified source identity"
+            );
+            assert_eq!(
+                projected.file_content_hashes[0].content_hash.len(),
+                64,
+                "{relative}"
+            );
             assert!(projected.structural_text_units.is_empty(), "{relative}");
             assert!(projected.nodes.iter().any(|node| {
                 node.canonical_id

@@ -5225,6 +5225,22 @@ fn stored_file_coverage_diagnostics(
         })?
         .into_iter()
         .collect::<HashSet<_>>();
+    let mut dedicated_openapi_projection_file_ids = HashSet::new();
+    for file in &files {
+        if file.language == "openapi"
+            && verified_file_ids.contains(&file.id)
+            && storage
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to verify staged OpenAPI projection identity for {}: {error}",
+                        runtime_relative_path(root, &file.path)
+                    ))
+                })?
+        {
+            dedicated_openapi_projection_file_ids.insert(file.id);
+        }
+    }
     let mut errors_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
     for error in storage.get_errors(None).map_err(|error| {
         ApiError::internal(format!("Failed to load staged file errors: {error}"))
@@ -5241,7 +5257,9 @@ fn stored_file_coverage_diagnostics(
         .iter()
         .filter_map(|file| {
             let verified_source = verified_file_ids.contains(&file.id);
-            let dedicated_openapi_source = file.language == "openapi";
+            let dedicated_openapi_source = file.language == "openapi"
+                && verified_source
+                && dedicated_openapi_projection_file_ids.contains(&file.id);
             let structural_projection_verified = dedicated_openapi_source
                 || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
                 || (verified_source && structural_projection_file_ids.contains(&file.id));
@@ -18162,13 +18180,52 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_openapi_coverage_does_not_require_a_structural_text_manifest() {
+    fn dedicated_openapi_coverage_requires_authenticated_file_owned_projection_evidence() {
         let project = tempdir().expect("project");
-        let storage = Storage::new_in_memory().expect("storage");
+        let mut storage = Storage::new_in_memory().expect("storage");
+        let sources = [
+            (
+                "openapi.json",
+                "{\"openapi\":\"3.1.0\",\"paths\":{\"/json-ready\":{\"get\":{}}}}\n",
+            ),
+            (
+                "openapi.yaml",
+                "openapi: 3.1.0\npaths:\n  /yaml-ready:\n    get:\n      responses: {}\n",
+            ),
+            ("config.json", "{\"enabled\":true}\n"),
+        ];
+        let files_to_index = sources
+            .iter()
+            .map(|(relative, source)| {
+                let path = project.path().join(relative);
+                fs::write(&path, source).expect("write projected source");
+                path
+            })
+            .collect::<Vec<_>>();
+        V2WorkspaceIndexer::new(project.path().to_path_buf())
+            .run(
+                &mut storage,
+                &RefreshExecutionPlan {
+                    mode: RefreshMode::FullRefresh,
+                    files_to_index,
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )
+            .expect("index real OpenAPI and generic JSON projections");
+        let real_diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
+            .expect("verify real projections");
+        assert!(
+            real_diagnostics.is_empty(),
+            "real projections must authenticate coverage: {real_diagnostics:#?}"
+        );
+
         for (id, relative, language) in [
-            (1, "openapi.json", "openapi"),
-            (2, "openapi.yaml", "openapi"),
-            (3, "config.json", "json"),
+            (9_000_001, "metadata-only.json", "openapi"),
+            (9_000_002, "forged-openapi.json", "openapi"),
+            (9_000_003, "wrong-language.json", "json"),
         ] {
             let path = project.path().join(relative);
             fs::write(&path, "{}\n").expect("write structural source");
@@ -18187,14 +18244,94 @@ mod tests {
                 .update_file_metadata(&file, Some(&format!("{id:064x}")))
                 .expect("persist verified source identity");
         }
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(9_000_002),
+                    kind: NodeKind::FILE,
+                    serialized_name: project
+                        .path()
+                        .join("forged-openapi.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_100_002),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /forged".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /forged".to_string()),
+                    file_node_id: Some(CoreNodeId(9_000_002)),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_000_003),
+                    kind: NodeKind::FILE,
+                    serialized_name: project
+                        .path()
+                        .join("wrong-language.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_100_003),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /wrong-language".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /wrong-language".to_string()),
+                    file_node_id: Some(CoreNodeId(9_000_003)),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert forged endpoint nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(9_200_003),
+                source: CoreNodeId(9_000_003),
+                target: CoreNodeId(9_100_003),
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(CoreNodeId(9_000_003)),
+                ..Default::default()
+            }])
+            .expect("insert wrong-language member edge");
+        storage
+            .insert_occurrences_batch(&[Occurrence {
+                element_id: 9_100_003,
+                kind: OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: CoreNodeId(9_000_003),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 2,
+                },
+            }])
+            .expect("insert wrong-language definition occurrence");
+        assert!(
+            storage
+                .has_file_owned_openapi_endpoint_projection(9_000_003)
+                .expect("verify wrong-language graph evidence"),
+            "runtime language check must reject otherwise authenticated OpenAPI graph evidence"
+        );
 
         let diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
             .expect("load stored file coverage");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].path, "config.json");
-        assert_eq!(diagnostics[0].reason, FileCoverageReason::CollectorFailure);
-        assert!(diagnostics[0].verified_source);
-        assert!(!diagnostics[0].projection_available);
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "metadata-only.json",
+                "forged-openapi.json",
+                "wrong-language.json",
+            ])
+        );
+        assert!(diagnostics.iter().all(|diagnostic| diagnostic.reason
+            == FileCoverageReason::CollectorFailure
+            && diagnostic.verified_source
+            && !diagnostic.projection_available));
     }
 
     #[test]

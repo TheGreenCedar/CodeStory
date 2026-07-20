@@ -3632,6 +3632,54 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    /// Whether one file owns a complete dedicated OpenAPI endpoint projection.
+    ///
+    /// This stays file-scoped and bounded in SQLite rather than loading graph
+    /// rows into memory. The member edge and definition occurrence authenticate
+    /// the endpoint node as output from the dedicated collector.
+    pub fn has_file_owned_openapi_endpoint_projection(
+        &self,
+        file_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM file f
+                    JOIN node file_node
+                      ON file_node.id = f.id
+                     AND file_node.kind = ?2
+                     AND file_node.serialized_name = f.path
+                    JOIN node endpoint
+                      ON endpoint.file_node_id = file_node.id
+                     AND endpoint.kind = ?3
+                     AND endpoint.canonical_id LIKE 'openapi:endpoint:%'
+                     AND length(endpoint.canonical_id) > length('openapi:endpoint:')
+                    JOIN edge member
+                      ON member.source_node_id = file_node.id
+                     AND member.target_node_id = endpoint.id
+                     AND member.file_node_id = file_node.id
+                     AND member.kind = ?4
+                    JOIN occurrence definition
+                      ON definition.element_id = endpoint.id
+                     AND definition.file_node_id = file_node.id
+                     AND definition.kind = ?5
+                    WHERE f.id = ?1
+                    LIMIT 1
+                 )",
+                params![
+                    file_id,
+                    NodeKind::FILE as i32,
+                    NodeKind::FUNCTION as i32,
+                    EdgeKind::MEMBER as i32,
+                    OccurrenceKind::DEFINITION as i32,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(StorageError::from)
+    }
+
     pub(crate) fn get_file_content_hashes(&self) -> Result<HashMap<i64, String>, StorageError> {
         let mut stmt = self
             .conn
