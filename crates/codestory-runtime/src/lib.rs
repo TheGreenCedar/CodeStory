@@ -5241,9 +5241,10 @@ fn stored_file_coverage_diagnostics(
         .iter()
         .filter_map(|file| {
             let verified_source = verified_file_ids.contains(&file.id);
-            let structural_projection_verified =
-                !codestory_indexer::structural::is_structural_candidate_path(&file.path)
-                    || (verified_source && structural_projection_file_ids.contains(&file.id));
+            let dedicated_openapi_source = file.language == "openapi";
+            let structural_projection_verified = dedicated_openapi_source
+                || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+                || (verified_source && structural_projection_file_ids.contains(&file.id));
             let reason = if file.complete && !structural_projection_verified {
                 Some(FileCoverageReason::CollectorFailure)
             } else {
@@ -18149,6 +18150,7 @@ mod tests {
             "vendor/config.json",
             "generated/docs.md",
             "config/package-lock.json",
+            "skills-lock.json",
             "secrets/deploy.ps1",
             "web/app.min.json",
         ] {
@@ -18157,6 +18159,42 @@ mod tests {
                 "runtime freshness should honor structural exclusion: {excluded}"
             );
         }
+    }
+
+    #[test]
+    fn dedicated_openapi_coverage_does_not_require_a_structural_text_manifest() {
+        let project = tempdir().expect("project");
+        let storage = Storage::new_in_memory().expect("storage");
+        for (id, relative, language) in [
+            (1, "openapi.json", "openapi"),
+            (2, "openapi.yaml", "openapi"),
+            (3, "config.json", "json"),
+        ] {
+            let path = project.path().join(relative);
+            fs::write(&path, "{}\n").expect("write structural source");
+            let file = FileInfo {
+                id,
+                path,
+                language: language.to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            };
+            storage.insert_file(&file).expect("insert indexed file");
+            storage
+                .update_file_metadata(&file, Some(&format!("{id:064x}")))
+                .expect("persist verified source identity");
+        }
+
+        let diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
+            .expect("load stored file coverage");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path, "config.json");
+        assert_eq!(diagnostics[0].reason, FileCoverageReason::CollectorFailure);
+        assert!(diagnostics[0].verified_source);
+        assert!(!diagnostics[0].projection_available);
     }
 
     #[test]

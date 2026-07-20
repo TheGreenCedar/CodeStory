@@ -630,6 +630,7 @@ pub fn structural_source_path_exclusion(path: &str) -> Option<&'static str> {
             | "composer.lock"
             | "gemfile.lock"
     ) || file_name.ends_with(".lock")
+        || file_name.ends_with("-lock.json")
     {
         return Some("lockfile");
     }
@@ -1031,6 +1032,7 @@ mod tests {
             r"secrets\deploy.ps1",
             "web/app.min.json",
             "config/package-lock.json",
+            "skills-lock.json",
         ] {
             assert!(is_structural_source_path(relative), "{relative}");
             assert!(
@@ -1051,6 +1053,7 @@ mod tests {
         }
         for root_relative in [
             "config.json",
+            "lock.json",
             "docs/guide.md",
             "scripts/deploy.ps1",
             "config/service.yaml",

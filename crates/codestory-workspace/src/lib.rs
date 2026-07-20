@@ -1612,6 +1612,25 @@ mod tests {
     }
 
     #[test]
+    fn declared_json_lockfiles_are_excluded_without_hiding_ordinary_json() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let lockfile = root.join("skills-lock.json");
+        let ordinary = root.join("config.json");
+        fs::write(&lockfile, "{\"skills\":[]}\n")?;
+        fs::write(&ordinary, "{\"enabled\":true}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&lockfile));
+        assert!(inventory.files.contains(&ordinary));
+        Ok(())
+    }
+
+    #[test]
     fn classifies_generated_vendor_and_ordinary_oversized_sources_before_scheduling() -> Result<()>
     {
         let temp = tempdir()?;
