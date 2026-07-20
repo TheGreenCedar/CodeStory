@@ -277,10 +277,44 @@ pub(crate) fn search_hit_matches_file_filter(
     file_filter_match_bucket(project_root, hit, fragment) > 0
 }
 
+pub(crate) fn search_hit_matches_exact_file(
+    project_root: &Path,
+    hit: &SearchHit,
+    exact_path: &Path,
+) -> bool {
+    let Some(file_path) = hit.file_path.as_deref() else {
+        return false;
+    };
+    let file_path = Path::new(file_path);
+    let candidate = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        project_root.join(file_path)
+    };
+    #[cfg(unix)]
+    {
+        let candidate_relative =
+            codestory_workspace::workspace_relative_path(project_root, &candidate);
+        let exact_relative = codestory_workspace::workspace_relative_path(project_root, exact_path);
+        if candidate_relative != exact_relative {
+            return false;
+        }
+    }
+    candidate.is_file() && codestory_workspace::same_workspace_path(&candidate, exact_path)
+}
+
 pub(crate) fn file_filter_match_bucket(project_root: &Path, hit: &SearchHit, fragment: &str) -> u8 {
     let Some(file_path) = hit.file_path.as_deref() else {
         return 0;
     };
+    let fragment_path = Path::new(fragment);
+    if fragment_path.is_absolute() {
+        return if search_hit_matches_exact_file(project_root, hit, fragment_path) {
+            4
+        } else {
+            0
+        };
+    }
 
     let absolute = normalize_path_fragment(file_path);
     let relative = normalize_path_fragment(&relative_path(project_root, file_path));
@@ -989,6 +1023,47 @@ mod tests {
             score_breakdown: None,
             ..test_search_hit_defaults()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_file_matching_is_case_sensitive_on_unix() {
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let exact = project.path().join("src").join("lib.rs");
+        std::fs::write(&exact, "fn target() {}\n").expect("source");
+        let matching = hit("1", "target", NodeKind::FUNCTION, 1.0, "src/lib.rs");
+        let wrong_case = hit("2", "target", NodeKind::FUNCTION, 1.0, "src/LIB.rs");
+
+        assert!(search_hit_matches_exact_file(
+            project.path(),
+            &matching,
+            &exact
+        ));
+        assert!(!search_hit_matches_exact_file(
+            project.path(),
+            &wrong_case,
+            &exact
+        ));
+        assert_eq!(
+            file_filter_match_bucket(project.path(), &wrong_case, &exact.to_string_lossy()),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_file_matching_is_case_insensitive_on_windows() {
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let exact = project.path().join("src").join("lib.rs");
+        std::fs::write(&exact, "fn target() {}\n").expect("source");
+        let alias = hit("1", "target", NodeKind::FUNCTION, 1.0, "SRC/LIB.RS");
+        assert!(search_hit_matches_exact_file(
+            project.path(),
+            &alias,
+            &exact
+        ));
     }
 
     #[test]

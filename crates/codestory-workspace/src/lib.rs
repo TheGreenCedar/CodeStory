@@ -1791,6 +1791,22 @@ pub fn resolve_project_relative_path(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let resolved_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let mut ancestor = candidate.parent();
+            while let Some(path) = ancestor {
+                match path.canonicalize() {
+                    Ok(resolved) => {
+                        if workspace_relative_path(&resolved_root, &resolved).is_none() {
+                            return Ok(ProjectRelativePathResolution::OutOfProject);
+                        }
+                        break;
+                    }
+                    Err(ancestor_error) if ancestor_error.kind() == io::ErrorKind::NotFound => {
+                        ancestor = path.parent();
+                    }
+                    Err(ancestor_error) => return Err(ancestor_error),
+                }
+            }
             Ok(ProjectRelativePathResolution::Missing {
                 absolute: candidate,
                 relative,
@@ -1881,6 +1897,23 @@ mod tests {
 
         assert_eq!(
             resolve_project_relative_path(project.path(), Path::new("inside.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_leaf_beneath_outside_symlink_is_out_of_project() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir()?;
+        let outside = tempdir()?;
+        let link = project.path().join("linked-out");
+        symlink(outside.path(), &link)?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("linked-out/missing.rs"))?,
             ProjectRelativePathResolution::OutOfProject
         );
         Ok(())

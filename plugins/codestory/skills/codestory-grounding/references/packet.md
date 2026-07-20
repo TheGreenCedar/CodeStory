@@ -25,11 +25,15 @@ Use `<codestory-cli> <command> --help` for the complete option set.
   `file_symbol`, `free_query`, or `continuation`. For example,
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
   project-relative file without fuzzy substitution. CLI accepts the same
-  object through repeatable `--probe '<json>'`.
+  object through repeatable `--probe '<json>'`. Typed and legacy probes share
+  one combined 16-item limit; every string field is limited to 240 characters.
+- Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
+  exact citations keyed by path or stable node ID. They are not converted back
+  into display-name searches.
 - A continuation also supplies `contract_version`, `project_id`,
   `core_generation_id`, optional `retrieval_generation`, optional exact
   `symbol_id`, and `query`; reuse fails closed when the selected evidence
-  generation changes.
+  generation changes. Search and definition links emit this bound form.
 - `extra_probes` and CLI `--extra-probe` remain legacy compatibility inputs.
   They enter the same runtime resolver. Neither typed nor legacy probes promote
   packet sufficiency or choose route order.

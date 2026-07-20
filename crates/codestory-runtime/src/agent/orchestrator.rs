@@ -40,7 +40,8 @@ use crate::agent::packet_plan::{
     build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
 };
 use crate::agent::packet_probe::{
-    normalize_packet_probe_request, resolve_packet_probes, resolved_packet_probe_queries,
+    exact_packet_probe_citations, normalize_packet_probe_request, resolve_packet_probes,
+    resolved_packet_probe_queries,
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
@@ -369,11 +370,15 @@ pub(crate) fn agent_packet(
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
     }
+    codestory_contracts::api::validate_packet_probe_request(&req.probes, &req.extra_probes)
+        .map_err(ApiError::invalid_argument)?;
     let project_root = controller.require_project_root()?;
     controller.begin_packet_retrieval();
 
     let probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
     let probe_resolutions = resolve_packet_probes(controller, probes);
+    let exact_probe_citations =
+        exact_packet_probe_citations(controller, &probe_resolutions, req.include_evidence);
     let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
     let mut plan =
         build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
@@ -401,6 +406,13 @@ pub(crate) fn agent_packet(
             hybrid_weights: initial_hybrid_weights.clone(),
         },
     )?;
+    if !exact_probe_citations.is_empty() {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_exact_probe_citations appended={}",
+            exact_probe_citations.len()
+        ));
+        answer.citations.extend(exact_probe_citations);
+    }
     if packet_initial_retrieval_is_lexical_only(initial_hybrid_weights.as_ref()) {
         answer.retrieval_trace.annotations.push(format!(
             "packet_initial_retrieval semantic_skipped=true reason=compact_exact_anchor_probes probe_count={}",

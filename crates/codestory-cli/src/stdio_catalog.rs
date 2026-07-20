@@ -6,6 +6,7 @@
 //! from these responses before calling into the transport.
 
 use anyhow::Result;
+use codestory_contracts::api::{PACKET_PROBE_MAX_COUNT, PACKET_PROBE_MAX_TEXT_LENGTH};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, Copy)]
@@ -209,9 +210,11 @@ impl SchemaSpec {
 #[derive(Debug, Clone, Copy)]
 enum SchemaItems {
     Object(&'static SchemaObject),
+    OneOf(&'static [&'static SchemaObject]),
     Type {
         schema_type: SchemaType,
         min_length: Option<u64>,
+        max_length: Option<u64>,
     },
 }
 
@@ -219,14 +222,24 @@ impl SchemaItems {
     fn to_json(self) -> Value {
         match self {
             Self::Object(object) => object.to_json(),
+            Self::OneOf(variants) => json!({
+                "oneOf": variants
+                    .iter()
+                    .map(|variant| variant.to_json())
+                    .collect::<Vec<_>>()
+            }),
             Self::Type {
                 schema_type,
                 min_length,
+                max_length,
             } => {
                 let mut schema =
                     Map::from_iter([("type".to_string(), json!(schema_type.as_str()))]);
                 if let Some(min_length) = min_length {
                     schema.insert("minLength".to_string(), json!(min_length));
+                }
+                if let Some(max_length) = max_length {
+                    schema.insert("maxLength".to_string(), json!(max_length));
                 }
                 Value::Object(schema)
             }
@@ -244,6 +257,7 @@ pub(crate) struct SchemaProperty {
     minimum: Option<u64>,
     maximum: Option<u64>,
     min_length: Option<u64>,
+    max_length: Option<u64>,
     min_items: Option<u64>,
     max_items: Option<u64>,
     items: Option<SchemaItems>,
@@ -262,6 +276,7 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: None,
@@ -284,6 +299,7 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: None,
@@ -302,6 +318,7 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: None,
@@ -320,6 +337,7 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: None,
@@ -338,6 +356,7 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: None,
@@ -360,12 +379,23 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: Some(SchemaItems::Object(items)),
             object_schema: None,
             nullable: false,
         }
+    }
+
+    const fn tagged_union_array(
+        name: &'static str,
+        description: &'static str,
+        variants: &'static [&'static SchemaObject],
+    ) -> Self {
+        let mut property = Self::array(name, description, variants[0]);
+        property.items = Some(SchemaItems::OneOf(variants));
+        property
     }
 
     const fn string_array(name: &'static str, description: &'static str) -> Self {
@@ -378,11 +408,13 @@ impl SchemaProperty {
             minimum: None,
             maximum: None,
             min_length: None,
+            max_length: None,
             min_items: None,
             max_items: None,
             items: Some(SchemaItems::Type {
                 schema_type: SchemaType::String,
                 min_length: None,
+                max_length: None,
             }),
             object_schema: None,
             nullable: false,
@@ -410,6 +442,11 @@ impl SchemaProperty {
         self
     }
 
+    const fn with_max_length(mut self, max_length: u64) -> Self {
+        self.max_length = Some(max_length);
+        self
+    }
+
     const fn with_item_bounds(mut self, min_items: u64, max_items: u64) -> Self {
         self.min_items = Some(min_items);
         self.max_items = Some(max_items);
@@ -418,9 +455,30 @@ impl SchemaProperty {
 
     const fn with_item_min_length(mut self, min_length: u64) -> Self {
         self.items = match self.items {
-            Some(SchemaItems::Type { schema_type, .. }) => Some(SchemaItems::Type {
+            Some(SchemaItems::Type {
+                schema_type,
+                max_length,
+                ..
+            }) => Some(SchemaItems::Type {
                 schema_type,
                 min_length: Some(min_length),
+                max_length,
+            }),
+            items => items,
+        };
+        self
+    }
+
+    const fn with_item_max_length(mut self, max_length: u64) -> Self {
+        self.items = match self.items {
+            Some(SchemaItems::Type {
+                schema_type,
+                min_length,
+                ..
+            }) => Some(SchemaItems::Type {
+                schema_type,
+                min_length,
+                max_length: Some(max_length),
             }),
             items => items,
         };
@@ -461,6 +519,9 @@ impl SchemaProperty {
         }
         if let Some(min_length) = self.min_length {
             schema.insert("minLength".to_string(), json!(min_length));
+        }
+        if let Some(max_length) = self.max_length {
+            schema.insert("maxLength".to_string(), json!(max_length));
         }
         if let Some(min_items) = self.min_items {
             schema.insert("minItems".to_string(), json!(min_items));
@@ -509,6 +570,7 @@ pub(crate) struct SchemaObject {
     required: &'static [&'static str],
     any_of_required: &'static [&'static [&'static str]],
     one_of_required: &'static [&'static [&'static str]],
+    combined_item_limit: Option<(&'static str, &'static str, u64)>,
     additional_properties: bool,
 }
 
@@ -524,6 +586,7 @@ impl SchemaObject {
             required,
             any_of_required: &[],
             one_of_required: &[],
+            combined_item_limit: None,
             additional_properties: false,
         }
     }
@@ -535,6 +598,7 @@ impl SchemaObject {
             required: &[],
             any_of_required: &[],
             one_of_required: &[],
+            combined_item_limit: None,
             additional_properties: true,
         }
     }
@@ -552,6 +616,16 @@ impl SchemaObject {
         one_of_required: &'static [&'static [&'static str]],
     ) -> Self {
         self.one_of_required = one_of_required;
+        self
+    }
+
+    const fn with_combined_item_limit(
+        mut self,
+        left: &'static str,
+        right: &'static str,
+        limit: u64,
+    ) -> Self {
+        self.combined_item_limit = Some((left, right, limit));
         self
     }
 
@@ -595,6 +669,26 @@ impl SchemaObject {
                 ),
             );
         }
+        if let Some((left, right, limit)) = self.combined_item_limit {
+            schema.insert(
+                "allOf".to_string(),
+                Value::Array(
+                    (1..=limit)
+                        .map(|left_minimum| {
+                            json!({
+                                "not": {
+                                    "required": [left, right],
+                                    "properties": {
+                                        (left): {"minItems": left_minimum},
+                                        (right): {"minItems": limit + 1 - left_minimum}
+                                    }
+                                }
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
         Value::Object(schema)
     }
 }
@@ -622,13 +716,11 @@ const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
-const PACKET_PROBE_KINDS: &[&str] = &[
-    "exact_path",
-    "symbol_id",
-    "file_symbol",
-    "free_query",
-    "continuation",
-];
+const PACKET_PROBE_EXACT_PATH_KIND: &[&str] = &["exact_path"];
+const PACKET_PROBE_SYMBOL_ID_KIND: &[&str] = &["symbol_id"];
+const PACKET_PROBE_FILE_SYMBOL_KIND: &[&str] = &["file_symbol"];
+const PACKET_PROBE_FREE_QUERY_KIND: &[&str] = &["free_query"];
+const PACKET_PROBE_CONTINUATION_KIND: &[&str] = &["continuation"];
 const AFFECTED_CHANGE_KINDS: &[&str] = &[
     "added",
     "modified",
@@ -1597,34 +1689,104 @@ static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_any_of_required(&[&["query"], &["id"], &["bookmark"]]);
 
-static PACKET_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
-    "Tagged packet probe. Fields not used by the selected kind are rejected by the runtime contract.",
+static PACKET_EXACT_PATH_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Exact project-relative path probe.",
     &[
-        SchemaProperty::string_required("kind", "Probe kind.").with_enum(PACKET_PROBE_KINDS),
-        SchemaProperty::string("path", "Exact project-relative path.").with_min_length(1),
-        SchemaProperty::string("id", "Stable symbol id.").with_min_length(1),
-        SchemaProperty::string("symbol", "File-scoped symbol name.").with_min_length(1),
-        SchemaProperty::string("query", "Free query or continuation target.").with_min_length(1),
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_EXACT_PATH_KIND),
+        SchemaProperty::string_required("path", "Exact project-relative path.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+    ],
+    &["kind", "path"],
+);
+
+static PACKET_SYMBOL_ID_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Stable symbol-id probe.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_SYMBOL_ID_KIND),
+        SchemaProperty::string_required("id", "Stable symbol id.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+    ],
+    &["kind", "id"],
+);
+
+static PACKET_FILE_SYMBOL_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Exact file-scoped symbol probe.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_FILE_SYMBOL_KIND),
+        SchemaProperty::string_required("path", "Exact project-relative path.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string_required("symbol", "File-scoped symbol name.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+    ],
+    &["kind", "path", "symbol"],
+);
+
+static PACKET_FREE_QUERY_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Free-query probe.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_FREE_QUERY_KIND),
+        SchemaProperty::string_required("query", "Free query.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+    ],
+    &["kind", "query"],
+);
+
+static PACKET_CONTINUATION_PROBE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Project- and generation-bound continuation probe.",
+    &[
+        SchemaProperty::string_required("kind", "Probe kind.")
+            .with_enum(PACKET_PROBE_CONTINUATION_KIND),
         SchemaProperty::integer("contract_version", "Continuation probe contract version.")
             .with_bounds(1, 1),
-        SchemaProperty::string("project_id", "Continuation project identity.").with_min_length(1),
-        SchemaProperty::string(
+        SchemaProperty::string_required("project_id", "Continuation project identity.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
+        SchemaProperty::string_required(
             "core_generation_id",
             "Continuation core evidence generation.",
         )
-        .with_min_length(1),
+        .with_min_length(1)
+        .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
         SchemaProperty::string(
             "retrieval_generation",
             "Optional continuation retrieval generation.",
         )
         .with_min_length(1)
+        .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64)
         .nullable(),
         SchemaProperty::string("symbol_id", "Optional exact continuation symbol id.")
             .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64)
             .nullable(),
+        SchemaProperty::string_required("query", "Continuation display query.")
+            .with_min_length(1)
+            .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
     ],
-    &["kind"],
+    &[
+        "kind",
+        "contract_version",
+        "project_id",
+        "core_generation_id",
+        "query",
+    ],
 );
+
+static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
+    &PACKET_EXACT_PATH_PROBE_SCHEMA,
+    &PACKET_SYMBOL_ID_PROBE_SCHEMA,
+    &PACKET_FILE_SYMBOL_PROBE_SCHEMA,
+    &PACKET_FREE_QUERY_PROBE_SCHEMA,
+    &PACKET_CONTINUATION_PROBE_SCHEMA,
+];
 
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Build a broad task packet with budget and sufficiency metadata.",
@@ -1637,17 +1799,19 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("task_class", "Optional task class.")
             .with_enum(PACKET_TASK_CLASSES)
             .nullable(),
-        SchemaProperty::array(
+        SchemaProperty::tagged_union_array(
             "probes",
             "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
-            &PACKET_PROBE_SCHEMA,
+            PACKET_PROBE_SCHEMAS,
         )
-        .with_item_bounds(1, 16),
+        .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64),
         SchemaProperty::string_array(
             "extra_probes",
             "Legacy string probes normalized through the same typed runtime resolver.",
         )
-        .with_item_bounds(1, 16),
+        .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64)
+        .with_item_min_length(1)
+        .with_item_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
         SchemaProperty::boolean(
             "include_evidence",
             "Include citation edge ids and score details.",
@@ -1661,7 +1825,8 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
     ],
     &["question"],
-);
+)
+.with_combined_item_limit("probes", "extra_probes", PACKET_PROBE_MAX_COUNT as u64);
 
 static STATUS_INPUT_SCHEMA: SchemaObject =
     SchemaObject::object("Read readiness for one explicit repository.", &[], &[]);
@@ -1929,4 +2094,110 @@ pub(crate) fn prompt_get_json(name: &str) -> Result<Value> {
         .find(|prompt| prompt.name == name)
         .map(|prompt| prompt.get_json())
         .ok_or_else(|| anyhow::anyhow!("Unknown prompt: {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet_probe_schema() -> Value {
+        let catalog = tools_list_json();
+        catalog["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "packet")
+            .expect("packet tool")["inputSchema"]["properties"]["probes"]["items"]
+            .clone()
+    }
+
+    fn tagged_union_accepts(schema: &Value, value: &Value) -> bool {
+        let Some(value) = value.as_object() else {
+            return false;
+        };
+        schema["oneOf"]
+            .as_array()
+            .expect("probe oneOf")
+            .iter()
+            .filter(|variant| {
+                let properties = variant["properties"].as_object().expect("properties");
+                let required = variant["required"].as_array().expect("required");
+                if value.keys().any(|key| !properties.contains_key(key))
+                    || required
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|field| !value.contains_key(field))
+                {
+                    return false;
+                }
+                value.iter().all(|(field, field_value)| {
+                    let property = &properties[field];
+                    if let Some(allowed) = property["enum"].as_array()
+                        && !allowed.contains(field_value)
+                    {
+                        return false;
+                    }
+                    if let Some(text) = field_value.as_str() {
+                        let length = text.chars().count() as u64;
+                        if property["minLength"]
+                            .as_u64()
+                            .is_some_and(|minimum| length < minimum)
+                            || property["maxLength"]
+                                .as_u64()
+                                .is_some_and(|maximum| length > maximum)
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+            })
+            .count()
+            == 1
+    }
+
+    #[test]
+    fn packet_probe_schema_is_a_strict_bounded_tagged_union() {
+        let schema = packet_probe_schema();
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(5));
+        for valid in [
+            json!({"kind": "exact_path", "path": "assets/desk.svg"}),
+            json!({"kind": "symbol_id", "id": "42"}),
+            json!({"kind": "file_symbol", "path": "src/lib.rs", "symbol": "run"}),
+            json!({"kind": "free_query", "query": "runtime path"}),
+            json!({
+                "kind": "continuation",
+                "contract_version": 1,
+                "project_id": "project",
+                "core_generation_id": "core",
+                "query": "run"
+            }),
+        ] {
+            assert!(tagged_union_accepts(&schema, &valid), "{valid}");
+        }
+        for invalid in [
+            json!({"kind": "exact_path"}),
+            json!({"kind": "exact_path", "path": "src/lib.rs", "query": "extra"}),
+            json!({"kind": "file_symbol", "path": "src/lib.rs"}),
+            json!({"kind": "free_query", "query": ""}),
+            json!({
+                "kind": "free_query",
+                "query": "x".repeat(PACKET_PROBE_MAX_TEXT_LENGTH + 1)
+            }),
+        ] {
+            assert!(!tagged_union_accepts(&schema, &invalid), "{invalid}");
+        }
+
+        let catalog = tools_list_json();
+        let packet = catalog["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "packet")
+            .expect("packet tool");
+        assert_eq!(
+            packet["inputSchema"]["allOf"].as_array().map(Vec::len),
+            Some(PACKET_PROBE_MAX_COUNT)
+        );
+    }
 }

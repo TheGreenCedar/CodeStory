@@ -120,11 +120,17 @@ than choosing one. A valid source file outside graph coverage remains a
 `valid_uncovered_path`, and source-range-only text remains distinct from an
 indexed symbol.
 
+Resolved path and symbol probes enter packet evidence as exact citations keyed
+by normalized project path or stable node ID. They do not become display-name
+searches. Exact citations remain explicit inputs and cannot satisfy packet
+sufficiency by themselves.
+
 Continuation probes carry the probe contract version, project identity, core
 generation, and optional retrieval generation. Runtime rejects a continuation
 when any bound identity differs from the selected public operation. Resolved
-probe queries may add packet evidence work, but they do not change task-class
-route order or packet sufficiency requirements.
+free-query probes may add broad packet evidence work, but exact resolutions do
+not. Neither form changes task-class route order or packet sufficiency
+requirements.
 
 ## Failure boundaries
 

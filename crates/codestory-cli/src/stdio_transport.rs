@@ -2162,8 +2162,10 @@ fn handle_stdio_packet(
         Ok(extra_probes) => extra_probes,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    if probes.len() + extra_probes.len() > 16 {
-        return serde_json::json!({"error": "packet accepts at most 16 typed and legacy probes combined"});
+    if let Err(error) =
+        codestory_contracts::api::validate_packet_probe_request(&probes, &extra_probes)
+    {
+        return serde_json::json!({"error": error});
     }
     let include_evidence = request
         .pointer("/params/arguments/include_evidence")
@@ -2495,15 +2497,16 @@ fn stdio_packet_probes(request: &serde_json::Value) -> Result<Vec<PacketProbeDto
     let Some(values) = value.as_array() else {
         bail!("packet.probes must be an array of tagged probe objects");
     };
-    if values.len() > 16 {
-        bail!("packet.probes accepts at most 16 probes");
-    }
     values
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            serde_json::from_value(value.clone())
-                .with_context(|| format!("packet.probes[{index}] is not a valid tagged probe"))
+            let probe: PacketProbeDto = serde_json::from_value(value.clone())
+                .with_context(|| format!("packet.probes[{index}] is not a valid tagged probe"))?;
+            codestory_contracts::api::validate_packet_probe(&probe)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("packet.probes[{index}] is not a valid tagged probe"))?;
+            Ok(probe)
         })
         .collect()
 }
@@ -2515,28 +2518,14 @@ fn stdio_packet_extra_probes(request: &serde_json::Value) -> Result<Vec<String>>
     let Some(values) = value.as_array() else {
         bail!("packet.extra_probes must be an array of strings");
     };
-    if values.len() > 16 {
-        bail!("packet.extra_probes accepts at most 16 probes");
-    }
-
-    let mut probes = Vec::new();
+    let mut probes = Vec::with_capacity(values.len());
     for value in values {
         let Some(probe) = value.as_str() else {
             bail!("packet.extra_probes must be an array of strings");
         };
-        let probe = probe.trim();
-        if probe.is_empty() {
-            continue;
-        }
-        if probe.len() > 240 {
-            bail!("packet.extra_probes entries must be at most 240 characters");
-        }
-        if !probes
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(probe))
-        {
-            probes.push(probe.to_string());
-        }
+        codestory_contracts::api::validate_packet_probe_request(&[], &[probe.to_string()])
+            .map_err(anyhow::Error::msg)?;
+        probes.push(probe.to_string());
     }
     Ok(probes)
 }
@@ -2701,7 +2690,12 @@ fn handle_stdio_definition(
                 .map_err(map_api_error)
                 .map(|symbol| {
                     let node_id = target.selected.node_id.0.clone();
-                    let links = stdio_node_links(&node_id, None, None);
+                    let continuation = stdio_continuation_binding(runtime);
+                    let links = stdio_definition_links(
+                        &node_id,
+                        &target.selected.display_name,
+                        continuation.as_ref(),
+                    );
                     let mut definition = serde_json::to_value(build_search_hit_output(
                         &runtime.project_root,
                         &target.selected,
@@ -4959,7 +4953,7 @@ fn enrich_stdio_search_result(
             .map(|publication| StdioContinuationBinding {
                 project_id: project_identity_v3(project_root).project_id,
                 core_generation_id: publication.core_generation_id.clone(),
-                retrieval_generation: publication.retrieval_generation.clone(),
+                retrieval_generation: Some(publication.retrieval_generation.clone()),
             });
     let mut value = serde_json::to_value(result)
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
@@ -5080,7 +5074,23 @@ fn add_stdio_links(hit: &mut serde_json::Value, links: serde_json::Value) {
 struct StdioContinuationBinding {
     project_id: String,
     core_generation_id: String,
-    retrieval_generation: String,
+    retrieval_generation: Option<String>,
+}
+
+fn stdio_continuation_binding(runtime: &RuntimeContext) -> Option<StdioContinuationBinding> {
+    let publication = runtime.public_operation.active_publication()?;
+    let retrieval_generation = publication
+        .retrieval_publication
+        .filter(|retrieval| {
+            retrieval.core_generation_id == publication.core_publication.generation_id
+                && retrieval.core_run_id == publication.core_publication.run_id
+        })
+        .map(|retrieval| retrieval.retrieval_generation);
+    Some(StdioContinuationBinding {
+        project_id: project_identity_v3(&runtime.project_root).project_id,
+        core_generation_id: publication.core_publication.generation_id,
+        retrieval_generation,
+    })
 }
 
 fn stdio_node_links(
@@ -5095,7 +5105,7 @@ fn stdio_node_links(
                 contract_version: PACKET_PROBE_CONTRACT_VERSION,
                 project_id: continuation.project_id.clone(),
                 core_generation_id: continuation.core_generation_id.clone(),
-                retrieval_generation: Some(continuation.retrieval_generation.clone()),
+                retrieval_generation: continuation.retrieval_generation.clone(),
                 symbol_id: Some(node_id.to_string()),
                 query: query.to_string(),
             });
@@ -5130,6 +5140,14 @@ fn stdio_node_links(
         }
     }
     links
+}
+
+fn stdio_definition_links(
+    node_id: &str,
+    display_name: &str,
+    continuation: Option<&StdioContinuationBinding>,
+) -> serde_json::Value {
+    stdio_node_links(node_id, Some(display_name), continuation)
 }
 
 fn read_stdio_template_resource(
@@ -5838,7 +5856,7 @@ version = "0.11.20"
         let binding = StdioContinuationBinding {
             project_id: "project-v3".into(),
             core_generation_id: "core-generation".into(),
-            retrieval_generation: "retrieval-generation".into(),
+            retrieval_generation: Some("retrieval-generation".into()),
         };
         let links = stdio_node_links("42", Some("AppController"), Some(&binding));
         let probe = &links[0]["probe"];
@@ -5849,6 +5867,9 @@ version = "0.11.20"
         assert_eq!(probe["retrieval_generation"], "retrieval-generation");
         assert_eq!(probe["symbol_id"], "42");
         assert_eq!(probe["query"], "AppController");
+
+        let definition_links = stdio_definition_links("42", "AppController", Some(&binding));
+        assert_eq!(definition_links[0]["probe"], *probe);
     }
 
     #[test]
@@ -6253,6 +6274,28 @@ version = "0.11.20"
             "params": {"arguments": {"probes": [{"kind": "file_symbol", "path": "src/lib.rs"}]}}
         });
         assert!(stdio_packet_probes(&malformed).is_err());
+
+        let too_long = serde_json::json!({
+            "params": {"arguments": {"probes": [{
+                "kind": "free_query",
+                "query": "x".repeat(codestory_contracts::api::PACKET_PROBE_MAX_TEXT_LENGTH + 1)
+            }]}}
+        });
+        assert!(stdio_packet_probes(&too_long).is_err());
+
+        let empty_legacy = serde_json::json!({
+            "params": {"arguments": {"extra_probes": ["   "]}}
+        });
+        assert!(stdio_packet_extra_probes(&empty_legacy).is_err());
+
+        let probes = vec![
+            PacketProbeDto::FreeQuery { query: "x".into() };
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT
+        ];
+        assert!(
+            codestory_contracts::api::validate_packet_probe_request(&probes, &["overflow".into()])
+                .is_err()
+        );
     }
 
     #[test]

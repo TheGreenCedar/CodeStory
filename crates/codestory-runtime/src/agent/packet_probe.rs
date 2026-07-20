@@ -1,19 +1,18 @@
 use crate::AppController;
+use crate::agent::citation::to_citation_from_hit;
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
-use crate::target_resolution::{TargetResolution, TargetSelection};
+use crate::target_resolution::{TargetResolution, TargetSelection, search_hit_matches_exact_file};
 use codestory_contracts::api::{
-    NodeId, PACKET_PROBE_CONTRACT_VERSION, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    PacketProbeAmbiguityCandidateDto, PacketProbeDto, PacketProbeRejectionCodeDto,
-    PacketProbeRejectionDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
+    AgentCitationDto, NodeId, NodeKind, PACKET_PROBE_CONTRACT_VERSION, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, PacketProbeAmbiguityCandidateDto, PacketProbeDto,
+    PacketProbeRejectionCodeDto, PacketProbeRejectionDto, PacketProbeResolutionDto,
+    PacketProbeResolutionStatusDto, SearchHit, SearchHitOrigin,
 };
 use codestory_workspace::{
     ProjectRelativePathResolution, project_identity_v3, resolve_project_relative_path,
     same_workspace_path,
 };
 use std::path::Path;
-
-const MAX_PACKET_PROBES: usize = 16;
-const MAX_PACKET_PROBE_LEN: usize = 240;
 
 pub(crate) fn normalize_packet_probe_request(
     probes: &[PacketProbeDto],
@@ -22,16 +21,12 @@ pub(crate) fn normalize_packet_probe_request(
     probes
         .iter()
         .cloned()
-        .chain(legacy_probes.iter().filter_map(|probe| {
+        .chain(legacy_probes.iter().map(|probe| {
             let probe = probe.trim();
-            if probe.is_empty() || probe.len() > MAX_PACKET_PROBE_LEN {
-                return None;
-            }
             serde_json::from_str::<PacketProbeDto>(probe)
                 .ok()
-                .or_else(|| Some(legacy_packet_probe(probe)))
+                .unwrap_or_else(|| legacy_packet_probe(probe))
         }))
-        .take(MAX_PACKET_PROBES)
         .collect()
 }
 
@@ -80,13 +75,9 @@ pub(crate) fn resolved_packet_probe_queries(
     resolutions
         .iter()
         .filter(|resolution| {
-            !matches!(
-                resolution.status,
-                PacketProbeResolutionStatusDto::ExactPath
-                    | PacketProbeResolutionStatusDto::ValidUncoveredPath
-                    | PacketProbeResolutionStatusDto::Ambiguous
-                    | PacketProbeResolutionStatusDto::Rejected
-            )
+            resolution.status == PacketProbeResolutionStatusDto::FreeQuery
+                || (resolution.status == PacketProbeResolutionStatusDto::Continuation
+                    && resolution.symbol_id.is_none())
         })
         .filter_map(|resolution| resolution.normalized_query.clone())
         .collect()
@@ -101,6 +92,93 @@ pub(crate) fn resolve_packet_probes(
         .enumerate()
         .map(|(index, probe)| resolve_packet_probe(controller, index as u32, probe))
         .collect()
+}
+
+pub(crate) fn exact_packet_probe_citations(
+    controller: &AppController,
+    resolutions: &[PacketProbeResolutionDto],
+    include_evidence: bool,
+) -> Vec<AgentCitationDto> {
+    let mut citations = Vec::new();
+    for resolution in resolutions {
+        let citation = match resolution.status {
+            PacketProbeResolutionStatusDto::ExactPath
+            | PacketProbeResolutionStatusDto::ValidUncoveredPath => {
+                exact_path_probe_citation(controller, resolution)
+            }
+            PacketProbeResolutionStatusDto::IndexedSymbol
+            | PacketProbeResolutionStatusDto::FileScopedSymbol
+            | PacketProbeResolutionStatusDto::TextHit
+            | PacketProbeResolutionStatusDto::Continuation => {
+                resolution.symbol_id.as_deref().and_then(|symbol_id| {
+                    exact_symbol_probe_citation(controller, symbol_id, include_evidence)
+                })
+            }
+            PacketProbeResolutionStatusDto::FreeQuery
+            | PacketProbeResolutionStatusDto::Ambiguous
+            | PacketProbeResolutionStatusDto::Rejected => None,
+        };
+        let Some(citation) = citation else {
+            continue;
+        };
+        if !citations.iter().any(|existing: &AgentCitationDto| {
+            existing.node_id == citation.node_id && existing.file_path == citation.file_path
+        }) {
+            citations.push(citation);
+        }
+    }
+    citations
+}
+
+fn exact_symbol_probe_citation(
+    controller: &AppController,
+    symbol_id: &str,
+    include_evidence: bool,
+) -> Option<AgentCitationDto> {
+    let TargetResolution::Resolved(resolved) = controller
+        .resolve_source_target(TargetSelection::Id(NodeId(symbol_id.to_string())), None)
+        .ok()?
+    else {
+        return None;
+    };
+    let mut citation = to_citation_from_hit(&resolved.selected, None, None, include_evidence);
+    citation.score = 100.0;
+    citation.coverage_role = Some("explicit exact probe".to_string());
+    citation.eligible_for_sufficiency = Some(false);
+    Some(citation)
+}
+
+fn exact_path_probe_citation(
+    controller: &AppController,
+    resolution: &PacketProbeResolutionDto,
+) -> Option<AgentCitationDto> {
+    let project_root = controller.require_project_root().ok()?;
+    let relative = resolution.path.as_deref()?;
+    let ProjectRelativePathResolution::Existing { relative, .. } =
+        resolve_project_relative_path(&project_root, Path::new(relative)).ok()?
+    else {
+        return None;
+    };
+    let path = display_relative_path(&relative);
+    Some(AgentCitationDto {
+        node_id: NodeId(format!("packet::exact_path::{path}")),
+        display_name: path.clone(),
+        kind: NodeKind::FILE,
+        file_path: Some(path),
+        line: Some(1),
+        score: 100.0,
+        origin: SearchHitOrigin::TextMatch,
+        resolvable: false,
+        subgraph_id: None,
+        evidence_edge_ids: Vec::new(),
+        retrieval_score_breakdown: None,
+        evidence_tier: Some(PacketEvidenceTierDto::ExactSource),
+        evidence_producer: Some("packet_exact_path_probe".to_string()),
+        resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
+        loss_reason: None,
+        coverage_role: Some("explicit exact probe".to_string()),
+        eligible_for_sufficiency: Some(false),
+    })
 }
 
 fn resolve_packet_probe(
@@ -259,12 +337,15 @@ fn resolve_symbol_id_probe(
             "symbol-id probe must not be empty",
         );
     }
-    match controller.resolve_target(TargetSelection::Id(NodeId(id.to_string())), None) {
+    match controller.resolve_source_target(TargetSelection::Id(NodeId(id.to_string())), None) {
         Ok(TargetResolution::Resolved(resolved)) => {
             let mut resolution = base_resolution(
                 input_index,
                 probe,
-                PacketProbeResolutionStatusDto::IndexedSymbol,
+                probe_status_for_hit(
+                    &resolved.selected,
+                    PacketProbeResolutionStatusDto::IndexedSymbol,
+                ),
                 Some(resolved.selected.display_name),
             );
             resolution.symbol_id = Some(resolved.selected.node_id.0);
@@ -314,24 +395,28 @@ fn resolve_file_symbol_probe(
         return path_resolution;
     }
     let normalized_path = path_resolution.path.clone().unwrap_or_default();
+    let Ok(project_root) = controller.require_project_root() else {
+        return rejected_resolution(
+            input_index,
+            probe,
+            PacketProbeRejectionCodeDto::MalformedProbe,
+            "file-symbol probe requires an open project",
+        );
+    };
+    let exact_path = project_root.join(&normalized_path);
+    let exact_path_filter = exact_path.to_string_lossy();
     match controller.resolve_target(
         TargetSelection::Query {
             query: symbol.to_string(),
             choose: None,
         },
-        Some(&normalized_path),
+        Some(&exact_path_filter),
     ) {
         Ok(TargetResolution::Resolved(resolved)) => {
-            let status = if resolved.selected.evidence_tier
-                == Some(PacketEvidenceTierDto::StructuralText)
-                || resolved.selected.resolution_status
-                    == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
-                || !resolved.selected.resolvable
-            {
-                PacketProbeResolutionStatusDto::TextHit
-            } else {
-                PacketProbeResolutionStatusDto::FileScopedSymbol
-            };
+            let status = probe_status_for_hit(
+                &resolved.selected,
+                PacketProbeResolutionStatusDto::FileScopedSymbol,
+            );
             let mut resolution = base_resolution(
                 input_index,
                 probe,
@@ -354,7 +439,7 @@ fn resolve_file_symbol_probe(
                 .ok()
                 .and_then(|hits| {
                     hits.into_iter().find(|hit| {
-                        hit.file_path.as_deref() == Some(normalized_path.as_str())
+                        search_hit_matches_exact_file(&project_root, hit, &exact_path)
                             && (hit.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
                                 || hit.resolution_status
                                     == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
@@ -388,6 +473,20 @@ fn resolve_file_symbol_probe(
             error.message,
             normalized_path,
         ),
+    }
+}
+
+fn probe_status_for_hit(
+    hit: &SearchHit,
+    resolved_status: PacketProbeResolutionStatusDto,
+) -> PacketProbeResolutionStatusDto {
+    if hit.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
+        || hit.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        || !hit.resolvable
+    {
+        PacketProbeResolutionStatusDto::TextHit
+    } else {
+        resolved_status
     }
 }
 
@@ -608,6 +707,8 @@ mod tests {
             "pub fn indexed_target() {}\n// textual_target\n",
         )
         .expect("write source");
+        let duplicate_path = project.path().join("src").join("duplicate.rs");
+        std::fs::write(&duplicate_path, "pub fn indexed_target() {}\n").expect("write duplicate");
 
         let storage_path = project.path().join(".cache").join("codestory.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
@@ -625,6 +726,18 @@ mod tests {
                 file_role: FileRole::Source,
             })
             .expect("insert file");
+        storage
+            .insert_file(&FileInfo {
+                id: 10,
+                path: PathBuf::from("src/duplicate.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert duplicate file");
         storage
             .insert_nodes_batch(&[
                 Node {
@@ -650,6 +763,22 @@ mod tests {
                     canonical_id: Some("openapi:endpoint:get:/textual".to_string()),
                     file_node_id: Some(CoreNodeId(1)),
                     start_line: Some(2),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(10),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/duplicate.rs".to_string(),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "indexed_target".to_string(),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(1),
                     ..Default::default()
                 },
             ])
@@ -767,6 +896,14 @@ mod tests {
             resolved_packet_probe_queries(&resolutions).is_empty(),
             "exact and valid-uncovered paths must not be replaced by broad fuzzy retrieval"
         );
+        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].file_path.as_deref(), Some("assets/desk.svg"));
+        assert_eq!(
+            citations[0].evidence_producer.as_deref(),
+            Some("packet_exact_path_probe")
+        );
+        assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
     }
 
     #[test]
@@ -831,6 +968,66 @@ mod tests {
                 .as_ref()
                 .map(|rejection| rejection.code),
             Some(PacketProbeRejectionCodeDto::StaleSymbolId)
+        );
+    }
+
+    #[test]
+    fn duplicate_name_symbol_and_continuation_anchors_keep_stable_node_identity() {
+        let project = TempDir::new().expect("project");
+        let controller = controller_with_indexed_fixture(&project);
+        let resolutions = vec![
+            PacketProbeResolutionDto {
+                input_index: 0,
+                probe: PacketProbeDto::SymbolId { id: "2".into() },
+                status: PacketProbeResolutionStatusDto::IndexedSymbol,
+                normalized_query: Some("indexed_target".into()),
+                path: Some("src/lib.rs".into()),
+                symbol_id: Some("2".into()),
+                candidates: Vec::new(),
+                rejection: None,
+            },
+            PacketProbeResolutionDto {
+                input_index: 1,
+                probe: PacketProbeDto::Continuation {
+                    contract_version: PACKET_PROBE_CONTRACT_VERSION,
+                    project_id: "project".into(),
+                    core_generation_id: "generation".into(),
+                    retrieval_generation: None,
+                    symbol_id: Some("11".into()),
+                    query: "indexed_target".into(),
+                },
+                status: PacketProbeResolutionStatusDto::Continuation,
+                normalized_query: Some("indexed_target".into()),
+                path: Some("src/duplicate.rs".into()),
+                symbol_id: Some("11".into()),
+                candidates: Vec::new(),
+                rejection: None,
+            },
+        ];
+
+        let citations = exact_packet_probe_citations(&controller, &resolutions, true);
+        assert_eq!(
+            citations
+                .iter()
+                .map(|citation| citation.node_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "11"]
+        );
+        assert_eq!(
+            citations
+                .iter()
+                .filter_map(|citation| citation.file_path.as_deref())
+                .collect::<Vec<_>>(),
+            ["src/lib.rs", "src/duplicate.rs"]
+        );
+        assert!(
+            citations
+                .iter()
+                .all(|citation| citation.eligible_for_sufficiency == Some(false))
+        );
+        assert!(
+            resolved_packet_probe_queries(&resolutions).is_empty(),
+            "stable node identities must not be reduced back to display-name retrieval"
         );
     }
 

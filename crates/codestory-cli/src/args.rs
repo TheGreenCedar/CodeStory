@@ -15,7 +15,7 @@ use codestory_contracts::api::{
     ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
     RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
     SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode, validate_packet_probe,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
@@ -186,11 +186,26 @@ fn parse_read_output_format(value: &str) -> Result<OutputFormat, String> {
 }
 
 fn parse_packet_probe(value: &str) -> Result<PacketProbeDto, String> {
-    serde_json::from_str(value).map_err(|error| {
+    let probe: PacketProbeDto = serde_json::from_str(value).map_err(|error| {
         format!(
             "invalid tagged packet probe JSON: {error}; expected an object with kind exact_path, symbol_id, file_symbol, free_query, or continuation"
         )
-    })
+    })?;
+    validate_packet_probe(&probe)
+        .map_err(|error| format!("invalid tagged packet probe: {error}"))?;
+    Ok(probe)
+}
+
+fn parse_legacy_packet_probe(value: &str) -> Result<String, String> {
+    codestory_contracts::api::validate_packet_probe_request(&[], &[value.to_string()])
+        .map(|()| value.to_string())
+}
+
+pub(crate) fn validate_packet_probe_arguments(
+    probes: &[PacketProbeDto],
+    legacy_probes: &[String],
+) -> Result<(), String> {
+    codestory_contracts::api::validate_packet_probe_request(probes, legacy_probes)
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -487,6 +502,7 @@ pub(crate) struct PacketCommand {
     #[arg(
         long = "extra-probe",
         value_name = "QUERY",
+        value_parser = parse_legacy_packet_probe,
         help = "Add a legacy string probe. It is normalized through the same typed resolver as --probe."
     )]
     pub(crate) extra_probes: Vec<String>,
@@ -566,6 +582,7 @@ pub(crate) struct TaskBriefCommand {
     #[arg(
         long = "extra-probe",
         value_name = "QUERY",
+        value_parser = parse_legacy_packet_probe,
         help = "Add a legacy string probe normalized through the typed packet resolver."
     )]
     pub(crate) extra_probes: Vec<String>,
@@ -2501,6 +2518,26 @@ mod tests {
                 .to_string()
                 .contains("invalid tagged packet probe JSON")
         );
+    }
+
+    #[test]
+    fn packet_cli_uses_shared_probe_count_and_text_limits() {
+        assert!(
+            Cli::try_parse_from([
+                "codestory-cli",
+                "packet",
+                "--question",
+                "Explain the target",
+                "--extra-probe",
+                &"x".repeat(codestory_contracts::api::PACKET_PROBE_MAX_TEXT_LENGTH + 1),
+            ])
+            .is_err()
+        );
+        let typed = vec![
+            PacketProbeDto::FreeQuery { query: "x".into() };
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT
+        ];
+        assert!(validate_packet_probe_arguments(&typed, &["overflow".into()]).is_err());
     }
 
     #[test]

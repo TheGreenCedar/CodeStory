@@ -2287,6 +2287,8 @@ pub struct PacketPlanQueryDto {
 }
 
 pub const PACKET_PROBE_CONTRACT_VERSION: u32 = 1;
+pub const PACKET_PROBE_MAX_COUNT: usize = 16;
+pub const PACKET_PROBE_MAX_TEXT_LENGTH: usize = 240;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -2314,6 +2316,70 @@ pub enum PacketProbeDto {
         symbol_id: Option<String>,
         query: String,
     },
+}
+
+pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
+    match probe {
+        PacketProbeDto::ExactPath { path } => validate_packet_probe_text("path", path),
+        PacketProbeDto::SymbolId { id } => validate_packet_probe_text("id", id),
+        PacketProbeDto::FileSymbol { path, symbol } => {
+            validate_packet_probe_text("path", path)?;
+            validate_packet_probe_text("symbol", symbol)
+        }
+        PacketProbeDto::FreeQuery { query } => validate_packet_probe_text("query", query),
+        PacketProbeDto::Continuation {
+            project_id,
+            core_generation_id,
+            retrieval_generation,
+            symbol_id,
+            query,
+            ..
+        } => {
+            validate_packet_probe_text("project_id", project_id)?;
+            validate_packet_probe_text("core_generation_id", core_generation_id)?;
+            if let Some(retrieval_generation) = retrieval_generation {
+                validate_packet_probe_text("retrieval_generation", retrieval_generation)?;
+            }
+            if let Some(symbol_id) = symbol_id {
+                validate_packet_probe_text("symbol_id", symbol_id)?;
+            }
+            validate_packet_probe_text("query", query)
+        }
+    }
+}
+
+pub fn validate_packet_probe_request(
+    probes: &[PacketProbeDto],
+    legacy_probes: &[String],
+) -> Result<(), String> {
+    let count = probes.len().saturating_add(legacy_probes.len());
+    if count > PACKET_PROBE_MAX_COUNT {
+        return Err(format!(
+            "packet accepts at most {PACKET_PROBE_MAX_COUNT} typed and legacy probes combined; received {count}"
+        ));
+    }
+    for (index, probe) in probes.iter().enumerate() {
+        validate_packet_probe(probe)
+            .map_err(|error| format!("packet probe {index} is invalid: {error}"))?;
+    }
+    for (index, probe) in legacy_probes.iter().enumerate() {
+        validate_packet_probe_text("legacy probe", probe)
+            .map_err(|error| format!("legacy packet probe {index} is invalid: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_packet_probe_text(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    let length = value.chars().count();
+    if length > PACKET_PROBE_MAX_TEXT_LENGTH {
+        return Err(format!(
+            "{field} must be at most {PACKET_PROBE_MAX_TEXT_LENGTH} characters; received {length}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -2771,6 +2837,28 @@ mod packet_tests {
         ] {
             assert!(serde_json::from_str::<PacketProbeDto>(malformed).is_err());
         }
+    }
+
+    #[test]
+    fn packet_probe_validation_enforces_shared_count_and_text_limits() {
+        let valid = PacketProbeDto::FreeQuery {
+            query: "x".repeat(PACKET_PROBE_MAX_TEXT_LENGTH),
+        };
+        assert!(validate_packet_probe(&valid).is_ok());
+        assert!(
+            validate_packet_probe(&PacketProbeDto::FreeQuery {
+                query: "x".repeat(PACKET_PROBE_MAX_TEXT_LENGTH + 1),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_packet_probe_request(
+                &vec![valid; PACKET_PROBE_MAX_COUNT],
+                &["overflow".to_string()]
+            )
+            .is_err()
+        );
+        assert!(validate_packet_probe_request(&[], &["   ".to_string()]).is_err());
     }
 
     #[test]

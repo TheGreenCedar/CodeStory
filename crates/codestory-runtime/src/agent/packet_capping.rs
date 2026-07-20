@@ -33,13 +33,17 @@ pub(crate) fn cap_citations_with_protected(
     let mut kept = Vec::new();
     let mut deferred = Vec::new();
 
-    for citation in answer.citations.drain(..) {
+    let mut candidates = answer.citations.drain(..).collect::<Vec<_>>();
+    candidates
+        .sort_by_key(|citation| citation.coverage_role.as_deref() != Some("explicit exact probe"));
+    for citation in candidates {
         let citation_key = packet_citation_key(&citation);
         let file = citation.file_path.as_deref().map(packet_display_path);
         let role = packet_evidence_role(&citation);
         let claim_key = role.map(|role| packet_claim_key_for_citation(role, &citation));
         let low_priority_role = packet_low_priority_cap_role(role);
-        let protected = protected_citation_keys.contains(&citation_key);
+        let protected = protected_citation_keys.contains(&citation_key)
+            || citation.coverage_role.as_deref() == Some("explicit exact probe");
         if protected
             && kept.len() < limits.max_anchors as usize
             && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
@@ -1290,6 +1294,26 @@ mod tests {
                 retrieval_shadow: None,
             },
         }
+    }
+
+    #[test]
+    fn explicit_exact_probe_anchor_survives_citation_capping() {
+        let ordinary = citation("ordinary", "src/ordinary.rs", 500.0);
+        let mut exact = citation("selected", "src/selected.rs", 1.0);
+        exact.coverage_role = Some("explicit exact probe".to_string());
+        exact.eligible_for_sufficiency = Some(false);
+        let mut answer = answer_fixture(vec![ordinary, exact]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_citations(&mut answer, &limits));
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].display_name, "selected");
     }
 
     #[test]

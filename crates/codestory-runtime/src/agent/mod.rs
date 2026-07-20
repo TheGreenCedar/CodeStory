@@ -41,6 +41,8 @@ pub fn plan_packet(
             "Question cannot be empty.",
         ));
     }
+    codestory_contracts::api::validate_packet_probe_request(&request.probes, &request.extra_probes)
+        .map_err(codestory_contracts::api::ApiError::invalid_argument)?;
     let probes =
         packet_probe::normalize_packet_probe_request(&request.probes, &request.extra_probes);
     let extra_probes = packet_probe::unresolved_packet_probe_queries(&probes);

@@ -1285,6 +1285,8 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
+        .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } = open_agent_surface(
         &cmd.project,
         cmd.profile,
@@ -1334,6 +1336,8 @@ fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
+        .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
