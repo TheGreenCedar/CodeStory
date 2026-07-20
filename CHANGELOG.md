@@ -4,6 +4,11 @@
 
 ### Release
 
+- Compact grounding now ranks roots with architecture evidence and reports a
+  typed orientation confidence with bounded-candidate, entrypoint, subsystem,
+  and presentation uncertainty. The stdio schema and `ground --why` render the
+  same contract, so weak orientation cannot be reported as high-confidence
+  coverage.
 - Incremental freshness now carries forward unchanged verified structural-unit
   exclusions even though they intentionally have no parser-backed file row.
   This stops managed activation from republishing the same excluded inputs as

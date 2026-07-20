@@ -1356,6 +1356,38 @@ pub struct GroundingCoverageDto {
     pub compressed_files: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingOrientationConfidenceDto {
+    Strong,
+    Partial,
+    #[default]
+    Weak,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingOrientationUncertaintyDto {
+    BoundedCandidateWindow,
+    NoEntrypointEvidence,
+    EntrypointEvidenceOmitted,
+    LimitedSubsystemBreadth,
+    CompressedPresentation,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct GroundingOrientationDto {
+    pub confidence: GroundingOrientationConfidenceDto,
+    pub total_root_candidates: u32,
+    pub evaluated_root_candidates: u32,
+    pub candidate_entrypoint_roots: u32,
+    pub selected_entrypoint_roots: u32,
+    pub candidate_subsystems: u32,
+    pub selected_subsystems: u32,
+    #[serde(default)]
+    pub uncertainty: Vec<GroundingOrientationUncertaintyDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct GroundingSnapshotDto {
     pub root: String,
@@ -1365,6 +1397,8 @@ pub struct GroundingSnapshotDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalStateDto>,
     pub coverage: GroundingCoverageDto,
+    #[serde(default)]
+    pub orientation: GroundingOrientationDto,
     pub root_symbols: Vec<GroundingSymbolDigestDto>,
     pub files: Vec<GroundingFileDigestDto>,
     #[serde(default)]

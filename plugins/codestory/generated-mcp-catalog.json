@@ -1039,6 +1039,70 @@
             },
             "type": "array"
           },
+          "orientation": {
+            "additionalProperties": false,
+            "description": "Typed architecture-orientation confidence and uncertainty.",
+            "properties": {
+              "candidate_entrypoint_roots": {
+                "description": "Evaluated roots with entrypoint evidence.",
+                "type": "integer"
+              },
+              "candidate_subsystems": {
+                "description": "Distinct architecture subsystems represented by evaluated roots.",
+                "type": "integer"
+              },
+              "confidence": {
+                "description": "Confidence that selected roots orient an agent to the repository architecture.",
+                "enum": [
+                  "strong",
+                  "partial",
+                  "weak"
+                ],
+                "type": "string"
+              },
+              "evaluated_root_candidates": {
+                "description": "Root symbols evaluated inside the bounded orientation candidate window.",
+                "type": "integer"
+              },
+              "selected_entrypoint_roots": {
+                "description": "Entrypoint-evidenced roots retained in the snapshot.",
+                "type": "integer"
+              },
+              "selected_subsystems": {
+                "description": "Distinct architecture subsystems retained in the snapshot.",
+                "type": "integer"
+              },
+              "total_root_candidates": {
+                "description": "Total root symbols available in the published repository map.",
+                "type": "integer"
+              },
+              "uncertainty": {
+                "description": "Typed reasons the compact orientation is incomplete or compressed.",
+                "items": {
+                  "enum": [
+                    "bounded_candidate_window",
+                    "no_entrypoint_evidence",
+                    "entrypoint_evidence_omitted",
+                    "limited_subsystem_breadth",
+                    "compressed_presentation"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "confidence",
+              "total_root_candidates",
+              "evaluated_root_candidates",
+              "candidate_entrypoint_roots",
+              "selected_entrypoint_roots",
+              "candidate_subsystems",
+              "selected_subsystems",
+              "uncertainty"
+            ],
+            "type": "object"
+          },
           "recommended_queries": {
             "description": "Suggested follow-up queries.",
             "items": {
@@ -1072,6 +1136,7 @@
           "generated_at_epoch_ms",
           "stats",
           "coverage",
+          "orientation",
           "root_symbols",
           "files"
         ],
