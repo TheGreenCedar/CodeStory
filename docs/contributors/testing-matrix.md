@@ -89,6 +89,13 @@ The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start
 behavior changed. Intermediate commits do not append telemetry.
 
+Semantic document allocation changes use focused runtime proof before the
+broad gate. Cover shared-file path cardinality, byte-identical and
+deterministically ordered symbol documents and dense inputs, cancellation, and
+injected staged-publication failure. Telemetry must distinguish selected
+symbols, retained file/path state, and the all-node lookup still awaiting its
+own streaming change.
+
 ## Retrieval engine
 
 The supported product path is one packaged executable whose hidden mode owns

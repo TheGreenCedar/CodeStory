@@ -58,6 +58,12 @@
 
 ### Performance
 
+- Semantic document preparation now keeps normalized display/read paths once
+  per owning file instead of cloning them for every symbol, derives display
+  names inside the existing bounded document window, and avoids an
+  all-semantic intermediate selection. Telemetry reports selected symbols,
+  retained context files/path bytes, and the still-retained all-node lookup so
+  later streaming work remains measurable.
 - Projection batches now replace errors owned by their refreshed file rows and
   mark grounding and resolution snapshots dirty inside the owning SQLite
   transaction instead of following each flush with a second error transaction

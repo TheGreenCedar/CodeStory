@@ -45,6 +45,14 @@ manifest on freshness and read surfaces. `files` exposes those paths as source
 inventory with explicit false graph and semantic coverage; packet and search
 never treat them as indexed evidence.
 
+Semantic document preparation normalizes the file table once and retains
+display/read paths by owning file-node identity. Symbols resolve those paths
+through `file_node_id`; runtime does not duplicate path strings or retain a
+second owned display-name map per symbol. The current all-node load and graph
+lookup remain a separate bounded-streaming concern. Index telemetry exposes
+selected symbols, retained context files and path bytes, and lookup entries so
+that boundary stays visible.
+
 ## Extension rules
 
 - put reusable product workflows here and expose typed contract DTOs;

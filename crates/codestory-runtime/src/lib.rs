@@ -4827,6 +4827,10 @@ struct SemanticProjectionStats {
     semantic_context_index_ms: u32,
     node_load_ms: u32,
     node_load_rows: u32,
+    selected_nodes: u32,
+    context_file_count: u32,
+    context_path_bytes: u32,
+    node_lookup_entries: u32,
     context_ms: u32,
     doc_build_ms: u32,
     embedding_ms: u32,
@@ -4898,6 +4902,10 @@ fn apply_semantic_projection_stats(
     timings.semantic_context_index_ms = Some(stats.semantic_context_index_ms);
     timings.semantic_node_load_ms = Some(stats.node_load_ms);
     timings.semantic_node_load_rows = Some(stats.node_load_rows);
+    timings.semantic_selected_nodes = Some(stats.selected_nodes);
+    timings.semantic_context_file_count = Some(stats.context_file_count);
+    timings.semantic_context_path_bytes = Some(stats.context_path_bytes);
+    timings.semantic_node_lookup_entries = Some(stats.node_lookup_entries);
     timings.semantic_context_ms = Some(stats.context_ms);
     timings.semantic_doc_build_ms = Some(stats.doc_build_ms);
     timings.semantic_embedding_ms = Some(stats.embedding_ms);
@@ -7301,11 +7309,6 @@ fn semantic_file_table_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, St
     display_paths
 }
 
-fn semantic_file_table_read_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
-    let (_, read_paths) = semantic_file_table_path_maps(files);
-    read_paths
-}
-
 #[derive(Default)]
 struct SemanticDocGraphContext {
     child_labels: HashMap<GraphNodeId, Vec<String>>,
@@ -7322,11 +7325,17 @@ impl SemanticDocGraphContext {
         semantic_nodes: &[&GraphNode],
         all_nodes: &[GraphNode],
     ) -> Result<Self, ApiError> {
+        let files = storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+        let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
         Self::build_for_scope(
             storage,
             semantic_nodes,
             all_nodes,
             semantic_doc_scope_from_env(),
+            file_paths,
+            file_read_paths,
         )
     }
 
@@ -7335,6 +7344,8 @@ impl SemanticDocGraphContext {
         semantic_nodes: &[&GraphNode],
         all_nodes: &[GraphNode],
         scope: SemanticDocScope,
+        mut file_paths: HashMap<GraphNodeId, String>,
+        mut file_read_paths: HashMap<GraphNodeId, String>,
     ) -> Result<Self, ApiError> {
         let nodes_by_id = all_nodes
             .iter()
@@ -7347,29 +7358,29 @@ impl SemanticDocGraphContext {
         let edges_by_node = storage.get_edges_for_node_ids(&node_ids).map_err(|e| {
             ApiError::internal(format!("Failed to load semantic doc graph context: {e}"))
         })?;
-        let files = storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
-        let file_table_paths = semantic_file_table_path_map(files.clone());
-        let file_table_read_paths = semantic_file_table_read_path_map(files);
-
-        let mut context = Self::default();
-        for node in semantic_nodes {
-            if let Some(file_id) = node.file_node_id
-                && let Some(file_node) = nodes_by_id.get(&file_id)
-            {
-                let file_path = file_table_paths
-                    .get(&file_id)
-                    .cloned()
-                    .unwrap_or_else(|| file_node.serialized_name.clone());
-                context.file_paths.insert(node.id, file_path);
-                let read_path = file_table_read_paths
-                    .get(&file_id)
-                    .cloned()
-                    .unwrap_or_else(|| file_node.serialized_name.clone());
-                context.file_read_paths.insert(node.id, read_path);
+        let context_file_ids = semantic_nodes
+            .iter()
+            .filter_map(|node| node.file_node_id)
+            .collect::<HashSet<_>>();
+        file_paths.retain(|file_id, _| context_file_ids.contains(file_id));
+        file_read_paths.retain(|file_id, _| context_file_ids.contains(file_id));
+        for file_id in context_file_ids {
+            if let Some(file_node) = nodes_by_id.get(&file_id) {
+                file_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
+                file_read_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
             }
+        }
 
+        let mut context = Self {
+            file_paths,
+            file_read_paths,
+            ..Default::default()
+        };
+        for node in semantic_nodes {
             let edges = edges_by_node
                 .get(&node.id)
                 .map(Vec::as_slice)
@@ -7391,14 +7402,18 @@ impl SemanticDocGraphContext {
     }
 
     fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
-        self.file_paths.get(&node.id).map(String::as_str)
+        node.file_node_id
+            .and_then(|file_id| self.file_paths.get(&file_id))
+            .map(String::as_str)
     }
 
     fn file_read_path_for_node(&self, node: &GraphNode) -> Option<&str> {
-        self.file_read_paths
-            .get(&node.id)
-            .or_else(|| self.file_paths.get(&node.id))
-            .map(String::as_str)
+        node.file_node_id.and_then(|file_id| {
+            self.file_read_paths
+                .get(&file_id)
+                .or_else(|| self.file_paths.get(&file_id))
+                .map(String::as_str)
+        })
     }
 }
 
@@ -8474,7 +8489,6 @@ fn flush_pending_dense_anchor_inputs(
 fn sync_llm_symbol_projection_for_runtime(
     storage: &mut Storage,
     nodes: &[codestory_contracts::graph::Node],
-    node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
     engine: &mut SearchEngine,
     refresh_scope: SemanticRefreshScope<'_>,
     hydrate_semantic_docs: bool,
@@ -8541,19 +8555,11 @@ fn sync_llm_symbol_projection_for_runtime(
     let mut component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut dense_component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut doc_build_ns = 0_u128;
-    let all_semantic_nodes = nodes
+    let semantic_scope = semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope);
+    let semantic_nodes = nodes
         .iter()
-        .filter(|node| {
-            llm_indexable_kind_for_scope(
-                node.kind,
-                semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
-            )
-        })
+        .filter(|node| llm_indexable_kind_for_scope(node.kind, semantic_scope))
         .filter(|node| !is_retrieval_artifact_node(node))
-        .collect::<Vec<_>>();
-    let semantic_nodes = all_semantic_nodes
-        .iter()
-        .copied()
         .filter(|node| {
             effective_llm_refresh_file_scope
                 .map(|scope| {
@@ -8564,11 +8570,10 @@ fn sync_llm_symbol_projection_for_runtime(
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
-    let file_paths = semantic_file_table_path_map(
-        storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?,
-    );
+    let files = storage
+        .get_files()
+        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+    let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
     let effective_component_report_scope = if expand_semantic_scope_for_contract_repair {
         None
     } else if let Some(refresh) = refresh_scope.component_reports {
@@ -8615,9 +8620,10 @@ fn sync_llm_symbol_projection_for_runtime(
             }
         }
     }
-    let report_semantic_nodes = all_semantic_nodes
+    let report_semantic_nodes = nodes
         .iter()
-        .copied()
+        .filter(|node| llm_indexable_kind_for_scope(node.kind, semantic_scope))
+        .filter(|node| !is_retrieval_artifact_node(node))
         .filter(|node| {
             effective_component_report_scope
                 .as_ref()
@@ -8652,9 +8658,22 @@ fn sync_llm_symbol_projection_for_runtime(
         storage,
         &context_nodes,
         nodes,
-        semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
+        semantic_scope,
+        file_paths,
+        file_read_paths,
     )?;
     stats.context_ms = clamp_u128_to_u32(context_started.elapsed().as_millis());
+    stats.selected_nodes = clamp_usize_to_u32(semantic_nodes.len());
+    stats.context_file_count = clamp_usize_to_u32(graph_context.file_paths.len());
+    stats.context_path_bytes = clamp_usize_to_u32(
+        graph_context
+            .file_paths
+            .values()
+            .chain(graph_context.file_read_paths.values())
+            .map(String::len)
+            .sum(),
+    );
+    stats.node_lookup_entries = clamp_usize_to_u32(nodes.len());
     let file_cache_started = Instant::now();
     let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
     doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
@@ -8667,10 +8686,7 @@ fn sync_llm_symbol_projection_for_runtime(
         let built_docs = semantic_window
             .par_iter()
             .map(|node| {
-                let display_name = node_names
-                    .get(&node.id)
-                    .cloned()
-                    .unwrap_or_else(|| node_display_name(node));
+                let display_name = node_display_name(node);
                 let file_path = graph_context
                     .file_path_for_node(node)
                     .map(ToString::to_string);
@@ -9007,16 +9023,11 @@ fn finalize_staged_semantic_docs_for_runtime(
         .map_err(|error| ApiError::internal(format!("Failed to load staged nodes: {error}")))?;
     let node_load_ms = clamp_u128_to_u32(node_load_started.elapsed().as_millis());
     let node_load_rows = clamp_usize_to_u32(nodes.len());
-    let node_names = nodes
-        .iter()
-        .map(|node| (node.id, node_display_name(node)))
-        .collect::<HashMap<_, _>>();
     let mut engine = SearchEngine::new(None)
         .map_err(|error| ApiError::internal(format!("Failed to init semantic engine: {error}")))?;
     let mut stats = sync_llm_symbol_projection_for_runtime(
         storage,
         &nodes,
-        &node_names,
         &mut engine,
         SemanticRefreshScope {
             file_ids: llm_refresh_file_scope,
@@ -15109,6 +15120,10 @@ fn index_full_for_runtime(
             semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
+            semantic_selected_nodes: None,
+            semantic_context_file_count: None,
+            semantic_context_path_bytes: None,
+            semantic_node_lookup_entries: None,
             semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
@@ -15842,6 +15857,10 @@ fn run_incremental_indexing_common(
             semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
+            semantic_selected_nodes: None,
+            semantic_context_file_count: None,
+            semantic_context_path_bytes: None,
+            semantic_node_lookup_entries: None,
             semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
@@ -19392,16 +19411,19 @@ mod tests {
         }
     }
 
-    fn semantic_policy_context(path: &str, node_id: CoreNodeId) -> SemanticDocGraphContext {
+    fn semantic_policy_context(path: &str, node: &Node) -> SemanticDocGraphContext {
         let mut context = SemanticDocGraphContext::default();
-        context.file_paths.insert(node_id, path.to_string());
+        context.file_paths.insert(
+            node.file_node_id.expect("semantic policy test file id"),
+            path.to_string(),
+        );
         context
     }
 
     #[test]
     fn dense_policy_skips_private_trivial_helpers() {
         let node = semantic_policy_node(10, NodeKind::FUNCTION, "helper", 1);
-        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+        let context = semantic_policy_context("src/internal/helper.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -19418,7 +19440,7 @@ mod tests {
     #[test]
     fn dense_policy_does_not_treat_every_handler_name_as_entrypoint() {
         let node = semantic_policy_node(14, NodeKind::FUNCTION, "handler", 1);
-        let context = semantic_policy_context("src/internal/request.rs", node.id);
+        let context = semantic_policy_context("src/internal/request.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -19436,10 +19458,7 @@ mod tests {
     fn dense_policy_only_embeds_high_signal_central_nodes() {
         let ordinary = semantic_policy_node(15, NodeKind::FUNCTION, "ordinary", 1);
         let central = semantic_policy_node(16, NodeKind::FUNCTION, "central", 1);
-        let mut context = semantic_policy_context("src/internal/graph.rs", ordinary.id);
-        context
-            .file_paths
-            .insert(central.id, "src/internal/graph.rs".to_string());
+        let mut context = semantic_policy_context("src/internal/graph.rs", &ordinary);
         context.child_labels.insert(
             ordinary.id,
             ["a", "b", "c", "d"]
@@ -19486,7 +19505,7 @@ mod tests {
         let public_node = semantic_policy_node(11, NodeKind::STRUCT, "ReportBuilder", 1);
         let entrypoint_node = semantic_policy_node(12, NodeKind::FUNCTION, "main", 1);
         let documented_node = semantic_policy_node(13, NodeKind::METHOD, "parse_config", 1);
-        let context = semantic_policy_context("src/lib.rs", public_node.id);
+        let context = semantic_policy_context("src/lib.rs", &public_node);
 
         assert_eq!(
             dense_anchor_reason_for_node(
@@ -19526,30 +19545,34 @@ mod tests {
     #[test]
     fn dense_policy_classifies_cross_language_entrypoints_and_surfaces() {
         let python_app = semantic_policy_node(21, NodeKind::FUNCTION, "app", 1);
-        let go_command = semantic_policy_node(22, NodeKind::FUNCTION, "run", 1);
-        let csharp_program = semantic_policy_node(23, NodeKind::CLASS, "Program", 1);
-        let java_application = semantic_policy_node(24, NodeKind::CLASS, "Application", 1);
-        let c_header_api = semantic_policy_node(25, NodeKind::STRUCT, "ClientApi", 1);
-        let python_package_api = semantic_policy_node(26, NodeKind::CLASS, "PackageClient", 1);
+        let go_command = semantic_policy_node(22, NodeKind::FUNCTION, "run", 2);
+        let csharp_program = semantic_policy_node(23, NodeKind::CLASS, "Program", 3);
+        let java_application = semantic_policy_node(24, NodeKind::CLASS, "Application", 4);
+        let c_header_api = semantic_policy_node(25, NodeKind::STRUCT, "ClientApi", 5);
+        let python_package_api = semantic_policy_node(26, NodeKind::CLASS, "PackageClient", 6);
         let mut context = SemanticDocGraphContext::default();
-        context
-            .file_paths
-            .insert(python_app.id, "service/app.py".to_string());
-        context
-            .file_paths
-            .insert(go_command.id, "cmd/server/main.go".to_string());
-        context
-            .file_paths
-            .insert(csharp_program.id, "src/Program.cs".to_string());
         context.file_paths.insert(
-            java_application.id,
+            python_app.file_node_id.expect("file id"),
+            "service/app.py".to_string(),
+        );
+        context.file_paths.insert(
+            go_command.file_node_id.expect("file id"),
+            "cmd/server/main.go".to_string(),
+        );
+        context.file_paths.insert(
+            csharp_program.file_node_id.expect("file id"),
+            "src/Program.cs".to_string(),
+        );
+        context.file_paths.insert(
+            java_application.file_node_id.expect("file id"),
             "src/main/java/com/acme/Application.java".to_string(),
         );
-        context
-            .file_paths
-            .insert(c_header_api.id, "include/acme/client_api.hpp".to_string());
         context.file_paths.insert(
-            python_package_api.id,
+            c_header_api.file_node_id.expect("file id"),
+            "include/acme/client_api.hpp".to_string(),
+        );
+        context.file_paths.insert(
+            python_package_api.file_node_id.expect("file id"),
             "packages/acme_sdk/__init__.py".to_string(),
         );
 
@@ -19603,7 +19626,7 @@ mod tests {
     #[test]
     fn dense_policy_does_not_embed_plain_public_callables_by_default() {
         let node = semantic_policy_node(17, NodeKind::FUNCTION, "plain_public_function", 1);
-        let context = semantic_policy_context("src/lib.rs", node.id);
+        let context = semantic_policy_context("src/lib.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -19620,7 +19643,7 @@ mod tests {
     #[test]
     fn dense_policy_embeds_package_public_callables_for_dynamic_frameworks() {
         let node = semantic_policy_node(19, NodeKind::FUNCTION, "handle", 1);
-        let context = semantic_policy_context("lib/router/index.js", node.id);
+        let context = semantic_policy_context("lib/router/index.js", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -19635,7 +19658,7 @@ mod tests {
 
         let windows_node = semantic_policy_node(29, NodeKind::METHOD, "GET /json", 1);
         let windows_path = r"\\?\C:\repo\expressjs-express\lib\response.js";
-        let windows_context = semantic_policy_context(windows_path, windows_node.id);
+        let windows_context = semantic_policy_context(windows_path, &windows_node);
 
         let windows_reason = dense_anchor_reason_for_node(
             &windows_context,
@@ -19652,7 +19675,7 @@ mod tests {
     #[test]
     fn dense_policy_does_not_embed_comment_only_symbols_by_default() {
         let node = semantic_policy_node(18, NodeKind::FUNCTION, "commented_helper", 1);
-        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+        let context = semantic_policy_context("src/internal/helper.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -19669,7 +19692,7 @@ mod tests {
     #[test]
     fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
         let node = semantic_policy_node(20, NodeKind::FUNCTION, "central_service", 1);
-        let mut context = semantic_policy_context("crates/app/src/service.rs", node.id);
+        let mut context = semantic_policy_context("crates/app/src/service.rs", &node);
         context
             .edge_digests
             .insert(node.id, vec!["CALL=9".to_string()]);
@@ -19713,7 +19736,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_graph_context_uses_repo_relative_file_table_paths() {
+    fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
         let temp = tempdir().expect("create temp dir");
         let storage_path = temp.path().join("codestory.db");
         let mut storage = Storage::open(&storage_path).expect("open storage");
@@ -19744,15 +19767,37 @@ mod tests {
             start_line: Some(1),
             ..Default::default()
         };
+        let second_function_node = Node {
+            id: CoreNodeId(102),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "nvm_echo".to_string(),
+            file_node_id: Some(CoreNodeId(11)),
+            start_line: Some(2),
+            ..Default::default()
+        };
         storage
-            .insert_nodes_batch(&[file_node.clone(), function_node.clone()])
+            .insert_nodes_batch(&[
+                file_node.clone(),
+                function_node.clone(),
+                second_function_node.clone(),
+            ])
             .expect("insert nodes");
-        let nodes = vec![file_node, function_node.clone()];
-        let semantic_nodes = vec![&function_node];
+        let nodes = vec![
+            file_node,
+            function_node.clone(),
+            second_function_node.clone(),
+        ];
+        let semantic_nodes = vec![&function_node, &second_function_node];
         let context =
             SemanticDocGraphContext::build(&storage, &semantic_nodes, &nodes).expect("context");
 
+        assert_eq!(context.file_paths.len(), 1);
+        assert_eq!(context.file_read_paths.len(), 1);
         assert_eq!(context.file_path_for_node(&function_node), Some("nvm.sh"));
+        assert_eq!(
+            context.file_path_for_node(&second_function_node),
+            Some("nvm.sh")
+        );
         assert_eq!(
             context.file_read_path_for_node(&function_node),
             Some("C:/work/nvm/nvm.sh")
@@ -19843,10 +19888,11 @@ mod tests {
             start_line: Some(1),
             ..Default::default()
         };
-        context.file_paths.insert(node.id, display_path.to_string());
+        let file_id = node.file_node_id.expect("semantic cache test file id");
+        context.file_paths.insert(file_id, display_path.to_string());
         context
             .file_read_paths
-            .insert(node.id, read_path.to_string_lossy().to_string());
+            .insert(file_id, read_path.to_string_lossy().to_string());
         node
     }
 
@@ -26573,6 +26619,25 @@ fn build_llm_symbol_doc_text() -> String {
             full_timings
                 .semantic_node_load_rows
                 .is_some_and(|rows| rows > 0)
+        );
+        assert!(
+            full_timings
+                .semantic_selected_nodes
+                .is_some_and(|rows| rows > 0)
+        );
+        assert!(
+            full_timings
+                .semantic_context_file_count
+                .is_some_and(|files| files > 0)
+        );
+        assert!(
+            full_timings
+                .semantic_context_path_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert_eq!(
+            full_timings.semantic_node_lookup_entries,
+            full_timings.semantic_node_load_rows
         );
         assert!(full_timings.semantic_context_ms.is_some());
         let full_refresh_wall = full_timings
