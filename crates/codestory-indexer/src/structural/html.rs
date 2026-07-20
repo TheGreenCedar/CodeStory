@@ -1,6 +1,6 @@
 use crate::intermediate_storage::IntermediateStorage;
 use crate::structural::blanking::{
-    EmbeddedRegionKind, blank_non_script_regions, extract_embedded_regions,
+    EmbeddedRegionKind, blank_non_script_regions, byte_offset_line_col, extract_embedded_regions,
     extract_style_block_sources,
 };
 use crate::{get_language_for_ext, index_file};
@@ -8,7 +8,9 @@ use codestory_contracts::graph::{EdgeId, EdgeKind, NodeId, NodeKind};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::common::{push_import_edge, push_member_edge, push_structural_node, push_usage_edge};
+use super::common::{
+    StructuralSourceSpan, push_import_edge, push_member_edge, push_structural_node, push_usage_edge,
+};
 use super::css::collect_css_entities;
 
 pub(crate) fn collect_html_entities(
@@ -28,7 +30,7 @@ pub(crate) fn collect_html_entities(
         {
             region_nodes.insert(line_number, region_id);
         }
-        for id in extract_html_ids(line_text) {
+        for (id, id_start) in extract_html_ids(line_text) {
             if id_nodes.contains_key(&id) {
                 continue;
             }
@@ -39,8 +41,7 @@ pub(crate) fn collect_html_entities(
                 NodeKind::CONSTANT,
                 &id,
                 &canonical,
-                line_number,
-                1,
+                StructuralSourceSpan::token(line_number, id_start, id.len()),
             );
             id_nodes.insert(id.clone(), node_id);
             if let Some(region_id) = region_nodes.values().last().copied() {
@@ -75,8 +76,15 @@ pub(crate) fn collect_html_entities(
         }
     }
 
-    for (line, style_source) in extract_style_block_sources(source) {
-        collect_css_entities(path, &style_source, file_id, storage, line);
+    for (line, col, style_source) in extract_style_block_sources(source) {
+        collect_css_entities(
+            path,
+            &style_source,
+            file_id,
+            storage,
+            line,
+            col.saturating_sub(1) as usize,
+        );
     }
 
     delegate_script_blocks(path, source, file_id, storage);
@@ -93,7 +101,7 @@ fn maybe_region_node(
     if !lower.contains('<') {
         return None;
     }
-    let is_region_tag = [
+    let region_tag = [
         "<main",
         "<body",
         "<section",
@@ -102,10 +110,8 @@ fn maybe_region_node(
         "<div",
     ]
     .iter()
-    .any(|tag| lower.contains(tag));
-    if !is_region_tag {
-        return None;
-    }
+    .filter_map(|tag| lower.find(tag).map(|start| (start, *tag)))
+    .min_by_key(|(start, _)| *start)?;
     let canonical = format!("html:region:{path_key}:{line}");
     Some(push_structural_node(
         storage,
@@ -113,8 +119,7 @@ fn maybe_region_node(
         NodeKind::MODULE,
         &format!("region:{line}"),
         &canonical,
-        line,
-        1,
+        StructuralSourceSpan::token(line, region_tag.0, region_tag.1.len()),
     ))
 }
 
@@ -143,14 +148,18 @@ fn delegate_script_blocks(
                 path.to_string_lossy(),
                 region.start_line
             );
+            let (open_line, open_col) = byte_offset_line_col(source, region.open_start_byte);
             let node_id = push_structural_node(
                 storage,
                 file_id,
                 NodeKind::MODULE,
                 &format!("script:{}", region.start_line),
                 &canonical,
-                region.start_line,
-                1,
+                StructuralSourceSpan::token(
+                    open_line,
+                    open_col.saturating_sub(1) as usize,
+                    "<script".len(),
+                ),
             );
             push_import_edge(storage, file_id, file_id, node_id, region.start_line);
         }
@@ -158,7 +167,7 @@ fn delegate_script_blocks(
     };
 
     if let Ok(index_result) = index_file(&delegate_path, &blanked, &language_config, None, None) {
-        merge_delegated_script_graph(storage, file_id, index_result, &script_regions);
+        merge_delegated_script_graph(storage, file_id, index_result, &script_regions, source);
     }
 }
 
@@ -179,6 +188,7 @@ fn merge_delegated_script_graph(
     host_file_id: NodeId,
     index_result: crate::IndexResult,
     script_regions: &[super::blanking::EmbeddedRegion],
+    source: &str,
 ) {
     let delegated_file_id = index_result
         .nodes
@@ -187,14 +197,18 @@ fn merge_delegated_script_graph(
         .map(|node| node.id);
     let script_module = script_regions.first().map(|region| {
         let canonical = format!("html:script-block:{}", region.start_line);
+        let (open_line, open_col) = byte_offset_line_col(source, region.open_start_byte);
         push_structural_node(
             storage,
             host_file_id,
             NodeKind::MODULE,
             "script",
             &canonical,
-            region.start_line,
-            1,
+            StructuralSourceSpan::token(
+                open_line,
+                open_col.saturating_sub(1) as usize,
+                "<script".len(),
+            ),
         )
     });
 
@@ -282,7 +296,7 @@ fn merge_delegated_script_graph(
     }
 }
 
-fn extract_html_ids(line: &str) -> Vec<String> {
+fn extract_html_ids(line: &str) -> Vec<(String, usize)> {
     let mut ids = Vec::new();
     let lower = line.to_ascii_lowercase();
     let mut search = 0usize;
@@ -292,10 +306,10 @@ fn extract_html_ids(line: &str) -> Vec<String> {
     {
         let idx = search + rel;
         let rest = &line[idx..];
-        if let Some(value) = extract_attr_value(rest)
+        if let Some((value, value_start)) = extract_attr_value(rest)
             && !value.is_empty()
         {
-            ids.push(value);
+            ids.push((value.to_string(), idx + value_start));
         }
         search = idx + 3;
     }
@@ -312,7 +326,7 @@ fn extract_html_classes(line: &str) -> Vec<String> {
     {
         let idx = search + rel;
         let rest = &line[idx..];
-        if let Some(value) = extract_attr_value(rest) {
+        if let Some((value, _)) = extract_attr_value(rest) {
             for class_name in value.split_whitespace() {
                 let class_name = class_name.trim();
                 if !class_name.is_empty() {
@@ -325,20 +339,26 @@ fn extract_html_classes(line: &str) -> Vec<String> {
     classes
 }
 
-fn extract_attr_value(text: &str) -> Option<String> {
-    let after_eq = text.split('=').nth(1)?.trim();
+fn extract_attr_value(text: &str) -> Option<(&str, usize)> {
+    let equals = text.find('=')?;
+    let raw_after_eq = &text[equals + 1..];
+    let leading = raw_after_eq
+        .len()
+        .saturating_sub(raw_after_eq.trim_start().len());
+    let after_eq = raw_after_eq.trim_start();
+    let value_start = equals.saturating_add(1).saturating_add(leading);
     if let Some(stripped) = after_eq.strip_prefix('"') {
         let end = stripped.find('"')?;
-        return Some(stripped[..end].to_string());
+        return Some((&stripped[..end], value_start.saturating_add(1)));
     }
     if let Some(stripped) = after_eq.strip_prefix('\'') {
         let end = stripped.find('\'')?;
-        return Some(stripped[..end].to_string());
+        return Some((&stripped[..end], value_start.saturating_add(1)));
     }
     let end = after_eq
         .find(|c: char| c.is_whitespace() || c == '>')
         .unwrap_or(after_eq.len());
-    Some(after_eq[..end].to_string())
+    Some((&after_eq[..end], value_start))
 }
 
 #[cfg(test)]

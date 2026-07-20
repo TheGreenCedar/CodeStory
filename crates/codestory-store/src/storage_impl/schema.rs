@@ -98,7 +98,12 @@ const TABLE_STATEMENTS: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS structural_text_artifact_cache (
         file_path TEXT PRIMARY KEY,
+        file_id INTEGER NOT NULL UNIQUE,
         cache_key TEXT NOT NULL,
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        artifact_digest TEXT NOT NULL CHECK(length(artifact_digest) = 64),
         artifact_blob BLOB NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL
     )",
@@ -434,6 +439,8 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
      ON structural_text_unit(content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_structural_text_artifact_cache_key
      ON structural_text_artifact_cache(cache_key)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_artifact_cache_file
+     ON structural_text_artifact_cache(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
      ON retrieval_index_manifest(built_at_epoch_ms)",
 ];
@@ -1107,10 +1114,35 @@ pub(super) fn migrate_v28_structural_text_units(conn: &Connection) -> Result<(),
         )",
         [],
     )?;
+    let structural_cache_columns = table_columns(conn, "structural_text_artifact_cache")?;
+    if !structural_cache_columns.is_empty()
+        && ![
+            "file_id",
+            "source_content_hash",
+            "descriptor_version",
+            "producer",
+            "artifact_digest",
+        ]
+        .iter()
+        .all(|required| {
+            structural_cache_columns
+                .iter()
+                .any(|column| column == required)
+        })
+    {
+        // This cache is disposable. Rebuild the pre-binding v28 shape rather
+        // than preserving rows that cannot be tied to a verified projection.
+        conn.execute("DROP TABLE structural_text_artifact_cache", [])?;
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS structural_text_artifact_cache (
             file_path TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL UNIQUE,
             cache_key TEXT NOT NULL,
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            artifact_digest TEXT NOT NULL CHECK(length(artifact_digest) = 64),
             artifact_blob BLOB NOT NULL,
             updated_at_epoch_ms INTEGER NOT NULL
         )",

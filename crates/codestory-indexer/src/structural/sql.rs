@@ -4,9 +4,22 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::common::{
-    push_annotation_usage_edge, push_member_edge, push_structural_node, push_type_usage_edge,
-    push_usage_edge,
+    StructuralSourceSpan, push_annotation_usage_edge, push_member_edge, push_structural_node,
+    push_synthetic_structural_node, push_type_usage_edge, push_usage_edge,
 };
+
+struct LocatedSqlIdentifier {
+    value: String,
+    start: usize,
+    len: usize,
+}
+
+struct LocatedQualifiedName {
+    schema: String,
+    name: String,
+    start: usize,
+    len: usize,
+}
 
 pub(crate) fn collect_sql_entities(
     path: &Path,
@@ -25,8 +38,13 @@ pub(crate) fn collect_sql_entities(
         if upper.starts_with("CREATE SCHEMA ") || upper.starts_with("CREATE DATABASE ") {
             continue;
         }
-        if let Some((schema, name)) = parse_qualified_name_after_keyword(line_text, "CREATE TABLE")
-        {
+        if let Some(object) = parse_qualified_name_after_keyword(line_text, "CREATE TABLE") {
+            let LocatedQualifiedName {
+                schema,
+                name,
+                start,
+                len,
+            } = object;
             let schema_id = schema_nodes
                 .get(&schema)
                 .copied()
@@ -38,8 +56,7 @@ pub(crate) fn collect_sql_entities(
                 NodeKind::CLASS,
                 &format!("{schema}.{name}"),
                 &canonical,
-                line_number,
-                1,
+                StructuralSourceSpan::token(line_number, start, len),
             );
             push_member_edge(storage, file_id, schema_id, node_id, line_number);
             tables.insert(format!("{schema}.{name}"), node_id);
@@ -52,9 +69,13 @@ pub(crate) fn collect_sql_entities(
                 node_id,
                 line_number,
             );
-        } else if let Some((schema, name)) =
-            parse_qualified_name_after_keyword(line_text, "CREATE VIEW")
-        {
+        } else if let Some(object) = parse_qualified_name_after_keyword(line_text, "CREATE VIEW") {
+            let LocatedQualifiedName {
+                schema,
+                name,
+                start,
+                len,
+            } = object;
             let schema_id = schema_nodes
                 .get(&schema)
                 .copied()
@@ -66,8 +87,7 @@ pub(crate) fn collect_sql_entities(
                 NodeKind::CLASS,
                 &format!("{schema}.{name}"),
                 &canonical,
-                line_number,
-                1,
+                StructuralSourceSpan::token(line_number, start, len),
             );
             push_member_edge(storage, file_id, schema_id, node_id, line_number);
             views.insert(format!("{schema}.{name}"), node_id);
@@ -78,22 +98,27 @@ pub(crate) fn collect_sql_entities(
             }
         } else if let Some((schema, table, index_name)) = parse_create_index(line_text) {
             if let Some(table_id) = tables.get(&format!("{schema}.{table}")).copied() {
-                let canonical = format!("sql:index:{schema}.{table}.{index_name}");
+                let canonical = format!("sql:index:{schema}.{table}.{}", index_name.value);
                 let node_id = push_structural_node(
                     storage,
                     file_id,
                     NodeKind::ANNOTATION,
-                    &index_name,
+                    &index_name.value,
                     &canonical,
-                    line_number,
-                    1,
+                    StructuralSourceSpan::token(line_number, index_name.start, index_name.len),
                 );
                 push_annotation_usage_edge(storage, file_id, node_id, table_id, line_number);
             }
-        } else if let Some((schema, name)) =
+        } else if let Some(object) =
             parse_qualified_name_after_keyword(line_text, "CREATE FUNCTION")
                 .or_else(|| parse_qualified_name_after_keyword(line_text, "CREATE PROCEDURE"))
         {
+            let LocatedQualifiedName {
+                schema,
+                name,
+                start,
+                len,
+            } = object;
             let schema_id = schema_nodes
                 .get(&schema)
                 .copied()
@@ -105,8 +130,7 @@ pub(crate) fn collect_sql_entities(
                 NodeKind::FUNCTION,
                 &format!("{schema}.{name}"),
                 &canonical,
-                line_number,
-                1,
+                StructuralSourceSpan::token(line_number, start, len),
             );
             push_member_edge(storage, file_id, schema_id, node_id, line_number);
             for table_key in referenced_tables(line_text, &schema) {
@@ -126,12 +150,12 @@ fn infer_default_schema(source: &str) -> String {
         if upper.starts_with("CREATE SCHEMA ")
             && let Some(name) = next_ident(line)
         {
-            return name;
+            return name.value;
         }
         if upper.starts_with("SET SEARCH_PATH ")
             && let Some(name) = next_ident(line)
         {
-            return name;
+            return name.value;
         }
     }
     "public".to_string()
@@ -154,18 +178,17 @@ fn collect_schemas(
         if upper.starts_with("CREATE SCHEMA ")
             && let Some(name) = next_ident(line_text)
         {
-            let canonical = format!("sql:schema:{name}");
+            let canonical = format!("sql:schema:{}", name.value);
             let node_id = push_structural_node(
                 storage,
                 file_id,
                 NodeKind::NAMESPACE,
-                &name,
+                &name.value,
                 &canonical,
-                line_number,
-                1,
+                StructuralSourceSpan::token(line_number, name.start, name.len),
             );
             push_member_edge(storage, file_id, file_id, node_id, line_number);
-            schemas.insert(name, node_id);
+            schemas.insert(name.value, node_id);
         }
     }
     schemas
@@ -173,25 +196,28 @@ fn collect_schemas(
 
 fn default_schema_node(file_id: NodeId, storage: &mut IntermediateStorage, schema: &str) -> NodeId {
     let canonical = format!("sql:schema:{schema}");
-    push_structural_node(
-        storage,
-        file_id,
-        NodeKind::NAMESPACE,
-        schema,
-        &canonical,
-        1,
-        1,
-    )
+    push_synthetic_structural_node(storage, file_id, NodeKind::NAMESPACE, schema, &canonical)
 }
 
-fn parse_qualified_name_after_keyword(line: &str, keyword: &str) -> Option<(String, String)> {
+fn parse_qualified_name_after_keyword(line: &str, keyword: &str) -> Option<LocatedQualifiedName> {
     let lower = line.to_ascii_lowercase();
     let keyword_lower = keyword.to_ascii_lowercase();
     let idx = lower.find(&keyword_lower)?;
-    let rest = line[idx + keyword.len()..].trim();
-    let rest = rest.trim_start_matches("IF NOT EXISTS").trim();
-    let (schema, name) = split_qualified_ident(rest)?;
-    Some((schema, name))
+    let mut start = skip_ascii_whitespace(line, idx + keyword.len());
+    if line[start..]
+        .to_ascii_uppercase()
+        .starts_with("IF NOT EXISTS")
+    {
+        start = skip_ascii_whitespace(line, start + "IF NOT EXISTS".len());
+    }
+    let identifier = located_sql_identifier(line, start)?;
+    let (schema, name) = split_qualified_ident(&identifier.value)?;
+    Some(LocatedQualifiedName {
+        schema,
+        name,
+        start: identifier.start,
+        len: identifier.len,
+    })
 }
 
 fn split_qualified_ident(text: &str) -> Option<(String, String)> {
@@ -204,41 +230,58 @@ fn split_qualified_ident(text: &str) -> Option<(String, String)> {
 }
 
 fn take_sql_ident(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let first = trimmed.chars().next()?;
-    if first == '"' || first == '\'' || first == '`' {
-        let end = trimmed[1..].find(first)?;
-        let ident = &trimmed[1..1 + end];
-        return (!ident.is_empty()).then(|| ident.to_string());
-    }
-    let end = trimmed
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
-        .unwrap_or(trimmed.len());
-    if end == 0 {
-        return None;
-    }
-    Some(trimmed[..end].to_string())
+    located_sql_identifier(text, 0).map(|identifier| identifier.value)
 }
 
-fn next_ident(line: &str) -> Option<String> {
+fn next_ident(line: &str) -> Option<LocatedSqlIdentifier> {
     let trimmed = line.trim();
     let upper = trimmed.to_ascii_uppercase();
-    if let Some(rest) = upper.strip_prefix("CREATE SCHEMA ") {
-        return take_sql_ident(trimmed[trimmed.len() - rest.len()..].trim());
-    }
-    if let Some(rest) = upper.strip_prefix("CREATE DATABASE ") {
-        return take_sql_ident(trimmed[trimmed.len() - rest.len()..].trim());
-    }
-    if let Some(rest) = upper.strip_prefix("SET SEARCH_PATH TO ") {
-        return take_sql_ident(trimmed[trimmed.len() - rest.len()..].trim());
-    }
-    if let Some(rest) = upper.strip_prefix("SET SEARCH_PATH ") {
-        return take_sql_ident(trimmed[trimmed.len() - rest.len()..].trim());
+    for keyword in [
+        "CREATE SCHEMA",
+        "CREATE DATABASE",
+        "SET SEARCH_PATH TO",
+        "SET SEARCH_PATH",
+    ] {
+        if upper.starts_with(keyword) {
+            let leading = line.len().saturating_sub(trimmed.len());
+            return located_sql_identifier(line, leading + keyword.len());
+        }
     }
     None
+}
+
+fn located_sql_identifier(line: &str, from: usize) -> Option<LocatedSqlIdentifier> {
+    let start = skip_ascii_whitespace(line, from);
+    let rest = line.get(start..)?;
+    let first = rest.chars().next()?;
+    if matches!(first, '"' | '\'' | '`') {
+        let inner_start = start + first.len_utf8();
+        let end = line[inner_start..].find(first)? + inner_start;
+        return (end > inner_start).then(|| LocatedSqlIdentifier {
+            value: line[inner_start..end].to_string(),
+            start: inner_start,
+            len: end - inner_start,
+        });
+    }
+    let len = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+        .unwrap_or(rest.len());
+    (len > 0).then(|| LocatedSqlIdentifier {
+        value: rest[..len].to_string(),
+        start,
+        len,
+    })
+}
+
+fn skip_ascii_whitespace(line: &str, mut index: usize) -> usize {
+    while line
+        .as_bytes()
+        .get(index)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        index += 1;
+    }
+    index
 }
 
 fn collect_inline_columns(
@@ -259,35 +302,35 @@ fn collect_inline_columns(
     let Some(end) = line.rfind(')') else {
         return;
     };
-    let body = &line[start + 1..end];
-    for part in body.split(',') {
-        let part = part.trim();
-        if part.is_empty() || part.to_ascii_uppercase().starts_with("CONSTRAINT") {
+    let body_start = start + 1;
+    let body = &line[body_start..end];
+    let mut part_start = 0usize;
+    for raw_part in body.split(',') {
+        let absolute_part_start = body_start + part_start;
+        let Some(identifier) = located_sql_identifier(line, absolute_part_start) else {
+            part_start = part_start.saturating_add(raw_part.len()).saturating_add(1);
+            continue;
+        };
+        if identifier.value.eq_ignore_ascii_case("CONSTRAINT") {
+            part_start = part_start.saturating_add(raw_part.len()).saturating_add(1);
             continue;
         }
-        let col = part
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_matches('"');
-        if col.is_empty() {
-            continue;
-        }
+        let col = identifier.value;
         let canonical = format!("sql:column:{schema}.{table}.{col}");
         let node_id = push_structural_node(
             storage,
             file_id,
             NodeKind::FIELD,
-            col,
+            &col,
             &canonical,
-            line_no,
-            1,
+            StructuralSourceSpan::token(line_no, identifier.start, identifier.len),
         );
         push_member_edge(storage, file_id, table_id, node_id, line_no);
+        part_start = part_start.saturating_add(raw_part.len()).saturating_add(1);
     }
 }
 
-fn parse_create_index(line: &str) -> Option<(String, String, String)> {
+fn parse_create_index(line: &str) -> Option<(String, String, LocatedSqlIdentifier)> {
     let upper = line.trim().to_ascii_uppercase();
     if !upper.starts_with("CREATE ") || !upper.contains(" INDEX ") {
         return None;
@@ -300,11 +343,10 @@ fn parse_create_index(line: &str) -> Option<(String, String, String)> {
     Some((schema, table, index_name))
 }
 
-fn next_token_after(line: &str, keyword: &str) -> Option<String> {
+fn next_token_after(line: &str, keyword: &str) -> Option<LocatedSqlIdentifier> {
     let upper = line.to_ascii_uppercase();
     let idx = upper.find(&keyword.to_ascii_uppercase())?;
-    let rest = line[idx + keyword.len()..].trim();
-    take_sql_ident(rest)
+    located_sql_identifier(line, idx + keyword.len())
 }
 
 fn parse_view_base_table(line: &str) -> Option<String> {

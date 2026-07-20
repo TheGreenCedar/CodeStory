@@ -15,6 +15,7 @@ mod github_actions;
 mod html;
 mod sql;
 
+pub(crate) use blanking::byte_offset_line_col;
 pub use blanking::{
     EmbeddedRegion, EmbeddedRegionKind, blank_non_script_regions, blank_outside_regions,
     extract_embedded_regions,
@@ -145,11 +146,6 @@ pub(crate) fn finalize_structural_storage(
         for coordinate in [start_line, start_col, end_line, end_col] {
             hash_part(&mut content_hasher, &coordinate.to_le_bytes());
         }
-        hash_part(&mut content_hasher, node.serialized_name.as_bytes());
-        hash_part(
-            &mut content_hasher,
-            node.canonical_id.as_deref().unwrap_or("").as_bytes(),
-        );
         hash_part(&mut content_hasher, exact_source);
 
         let content_hash = format!("{:x}", content_hasher.finalize());
@@ -253,8 +249,16 @@ pub fn collect_embedded_style_css(
     file_id: NodeId,
     storage: &mut IntermediateStorage,
     line_offset: u32,
+    first_line_col: u32,
 ) {
-    css::collect_css_entities(path, style_source, file_id, storage, line_offset);
+    css::collect_css_entities(
+        path,
+        style_source,
+        file_id,
+        storage,
+        line_offset,
+        first_line_col.saturating_sub(1) as usize,
+    );
 }
 
 /// Structurally index source text for an already admitted path.
@@ -293,7 +297,7 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
             Some("html" | "htm") => {
                 html::collect_html_entities(path, source, file_id, &mut storage)
             }
-            Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1),
+            Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1, 0),
             Some("sql") => sql::collect_sql_entities(path, source, file_id, &mut storage),
             _ => {}
         }
@@ -344,42 +348,61 @@ mod tests {
     }
 
     #[test]
-    fn existing_structural_families_emit_deterministic_verified_unit_descriptors() {
+    fn structural_families_emit_only_explicit_exact_source_anchors() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let fixtures = [
+        let fixtures: &[(&str, &str, &str, &[&str])] = &[
             (
                 ".github/workflows/ci.yml",
-                "name: CI\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+                "name: CI\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\n",
                 "structural_github_actions_workflow_collector",
+                &[
+                    "CI",
+                    "build",
+                    "- uses: actions/checkout@v4",
+                    "- run: cargo test",
+                ],
             ),
             (
                 "docker-compose.yml",
-                "services:\n  web:\n    image: nginx:1.27\n",
+                "name: demo\nservices:\n  web:\n    image: nginx:1.27\n    ports:\n      - \"8080:80\"\n",
                 "structural_docker_compose_collector",
+                &["demo", "web", "image: nginx:1.27", "- \"8080:80\""],
             ),
             (
                 "Cargo.toml",
-                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+                "[workspace]\nmembers = [\"crates/api\"]\n[package]\nname = \"demo\"\n[dependencies]\nserde = \"1\"\n",
                 "structural_cargo_manifest_collector",
+                &["crates/api", "demo", "serde"],
             ),
             (
                 "web/index.html",
-                "<main id=\"app\" class=\"shell\">Hello</main>\n",
+                "<main id=\"app\">\n<style>.shell { --accent: blue; }</style>\n<script type=\"module\">const boot = () => 1;</script>\n</main>\n",
                 "structural_html_collector",
+                &["<main", "app", "shell", "--accent", "<script"],
             ),
             (
                 "web/styles.css",
-                ".shell { color: red; --accent: blue; }\n",
+                ".shell, #app { color: red; --accent: blue; }\n",
                 "structural_css_collector",
+                &["shell", "app", "--accent"],
             ),
             (
                 "db/schema.sql",
-                "CREATE TABLE users (id INTEGER);\n",
+                "CREATE SCHEMA app;\nCREATE TABLE app.users (id INTEGER, email TEXT);\nCREATE INDEX users_email_idx ON app.users (email);\nCREATE VIEW app.active_users AS SELECT * FROM app.users;\nCREATE FUNCTION app.touch_users() RETURNS void AS 'SELECT 1';\n",
                 "structural_sql_collector",
+                &[
+                    "app",
+                    "app.users",
+                    "id",
+                    "email",
+                    "users_email_idx",
+                    "app.active_users",
+                    "app.touch_users",
+                ],
             ),
         ];
 
-        for (relative, source, producer) in fixtures {
+        for &(relative, source, producer, expected_anchors) in fixtures {
             let path = dir.path().join(relative);
             std::fs::create_dir_all(path.parent().expect("fixture parent"))
                 .expect("create fixture parent");
@@ -408,6 +431,7 @@ mod tests {
                 projection.unit_digest,
                 codestory_store::structural_text_unit_digest(&first.structural_text_units)
             );
+            let mut actual_anchors = Vec::new();
             for unit in &first.structural_text_units {
                 assert_eq!(unit.producer, producer);
                 assert_eq!(unit.evidence_tier, "structural_text");
@@ -416,53 +440,129 @@ mod tests {
                 assert_eq!(unit.content_hash.len(), 64);
                 assert_eq!(unit.placement_id.len(), 64);
                 assert_eq!(unit.file_role, first.files[0].file_role);
+                let exact = exact_source_range_bytes(
+                    source,
+                    unit.start_line,
+                    unit.start_col,
+                    unit.end_line,
+                    unit.end_col,
+                )
+                .expect("unit exact source span");
+                let exact = std::str::from_utf8(exact).expect("UTF-8 structural source span");
                 assert!(
-                    !exact_source_range_bytes(
-                        source,
-                        unit.start_line,
-                        unit.start_col,
-                        unit.end_line,
-                        unit.end_col,
-                    )
-                    .expect("unit exact source span")
-                    .is_empty(),
-                    "{relative}"
+                    expected_anchors.contains(&exact),
+                    "{relative} emitted fabricated or unexpected unit slice {exact:?}"
                 );
+                actual_anchors.push(exact.to_string());
             }
+            actual_anchors.sort();
+            let mut expected_anchors = expected_anchors
+                .iter()
+                .map(|anchor| (*anchor).to_string())
+                .collect::<Vec<_>>();
+            expected_anchors.sort();
+            assert_eq!(actual_anchors, expected_anchors, "{relative}");
         }
     }
 
     #[test]
-    fn identical_structural_content_keeps_content_identity_but_not_file_placement_or_node_identity()
-    {
+    fn path_embedding_collectors_keep_content_identity_out_of_graph_placement() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let source = ".card { color: red; }\n";
-        let first_path = dir.path().join("first/styles.css");
-        let second_path = dir.path().join("second/styles.css");
-        for path in [&first_path, &second_path] {
-            std::fs::create_dir_all(path.parent().expect("fixture parent"))
-                .expect("create fixture parent");
-            std::fs::write(path, source).expect("write css");
-        }
+        let fixtures = [
+            (
+                "workflow",
+                ".github/workflows/first.yml",
+                ".github/workflows/second.yml",
+                "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+            ),
+            (
+                "cargo",
+                "first/Cargo.toml",
+                "second/Cargo.toml",
+                "[package]\nname = \"demo\"\n[dependencies]\nserde = \"1\"\n",
+            ),
+            (
+                "compose",
+                "first/docker-compose.yml",
+                "second/docker-compose.yml",
+                "services:\n  web:\n    image: nginx\n",
+            ),
+            (
+                "html",
+                "first/index.html",
+                "second/index.html",
+                "<main id=\"app\"><script>const boot = 1;</script></main>\n",
+            ),
+            (
+                "css",
+                "first/styles.css",
+                "second/styles.css",
+                ".card { color: red; }\n",
+            ),
+        ];
 
-        let first = index_structural_file(&first_path).expect("index first css");
-        let second = index_structural_file(&second_path).expect("index second css");
-        let first_content = first
-            .structural_text_units
-            .iter()
-            .map(|unit| unit.content_hash.clone())
-            .collect::<HashSet<_>>();
-        let second_content = second
-            .structural_text_units
-            .iter()
-            .map(|unit| unit.content_hash.clone())
-            .collect::<HashSet<_>>();
-        assert_eq!(first_content, second_content);
-        assert!(first.structural_text_units.iter().all(|left| {
-            second.structural_text_units.iter().all(|right| {
-                left.node_id != right.node_id && left.placement_id != right.placement_id
+        for (label, first_relative, second_relative, source) in fixtures {
+            let first_path = dir.path().join(first_relative);
+            let second_path = dir.path().join(second_relative);
+            for path in [&first_path, &second_path] {
+                std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                    .expect("create fixture parent");
+                std::fs::write(path, source).expect("write structural fixture");
+            }
+
+            let first = index_structural_file(&first_path).expect("index first fixture");
+            let second = index_structural_file(&second_path).expect("index second fixture");
+            let mut first_content = first
+                .structural_text_units
+                .iter()
+                .map(|unit| unit.content_hash.clone())
+                .collect::<Vec<_>>();
+            let mut second_content = second
+                .structural_text_units
+                .iter()
+                .map(|unit| unit.content_hash.clone())
+                .collect::<Vec<_>>();
+            first_content.sort();
+            second_content.sort();
+            assert_eq!(first_content, second_content, "{label}");
+            assert!(first.structural_text_units.iter().all(|left| {
+                second.structural_text_units.iter().all(|right| {
+                    left.node_id != right.node_id && left.placement_id != right.placement_id
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn duplicate_exact_bytes_at_distinct_spans_have_distinct_descriptor_and_placement_identity() {
+        let source = "services:\n  web:\n    ports:\n      - shared:/data\n      - shared:/data\n";
+        let storage = index_structural_source(Path::new("docker-compose.yml"), source)
+            .and_then(|storage| {
+                finalize_structural_storage(
+                    Path::new("docker-compose.yml"),
+                    source,
+                    &format!("{:x}", Sha256::digest(source.as_bytes())),
+                    storage,
+                )
             })
-        }));
+            .expect("finalize duplicate structural anchors");
+        let duplicates = storage
+            .structural_text_units
+            .iter()
+            .filter(|unit| {
+                exact_source_range_bytes(
+                    source,
+                    unit.start_line,
+                    unit.start_col,
+                    unit.end_line,
+                    unit.end_col,
+                ) == Some(b"- shared:/data".as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert_ne!(duplicates[0].content_hash, duplicates[1].content_hash);
+        assert_ne!(duplicates[0].node_id, duplicates[1].node_id);
+        assert_ne!(duplicates[0].placement_id, duplicates[1].placement_id);
     }
 
     #[test]
@@ -922,6 +1022,97 @@ jobs:
                 component_access: &projected.component_access,
                 callable_projection_states: &projected.callable_projection_states,
             })?;
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_html_keeps_delegated_parser_descendants_out_of_structural_units() {
+        let source = "<main id=\"app\"><script type=\"module\">function boot() { return 1; }</script></main>";
+        let storage = index_structural_source(Path::new("index.html"), source)
+            .and_then(|storage| {
+                finalize_structural_storage(
+                    Path::new("index.html"),
+                    source,
+                    &format!("{:x}", Sha256::digest(source.as_bytes())),
+                    storage,
+                )
+            })
+            .expect("finalize HTML structural units");
+        let unit_ids = storage
+            .structural_text_units
+            .iter()
+            .map(|unit| unit.node_id)
+            .collect::<HashSet<_>>();
+        let delegated_boot = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name.contains("boot"))
+            .expect("delegated parser function");
+        assert!(!unit_ids.contains(&delegated_boot.id));
+        let mut anchors = storage
+            .structural_text_units
+            .iter()
+            .map(|unit| {
+                std::str::from_utf8(
+                    exact_source_range_bytes(
+                        source,
+                        unit.start_line,
+                        unit.start_col,
+                        unit.end_line,
+                        unit.end_col,
+                    )
+                    .expect("exact HTML unit span"),
+                )
+                .expect("UTF-8 HTML unit")
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        anchors.sort();
+        assert_eq!(anchors, vec!["<main", "<script", "app"]);
+    }
+
+    #[test]
+    fn zero_unit_structural_file_publishes_a_complete_projection() -> anyhow::Result<()> {
+        let source = "/* deliberately contains no CSS anchors */\n";
+        let projected =
+            index_structural_source(Path::new("empty.css"), source).and_then(|storage| {
+                finalize_structural_storage(
+                    Path::new("empty.css"),
+                    source,
+                    &format!("{:x}", Sha256::digest(source.as_bytes())),
+                    storage,
+                )
+            })?;
+        assert!(projected.structural_text_units.is_empty());
+        assert_eq!(projected.structural_text_projections.len(), 1);
+        assert_eq!(projected.structural_text_projections[0].unit_count, 0);
+
+        let mut storage = Storage::new_in_memory()?;
+        storage
+            .projections()
+            .flush_projection_batch(ProjectionBatch {
+                files: &projected.files,
+                file_content_hashes: &projected.file_content_hashes,
+                nodes: &projected.nodes,
+                structural_text_units: &projected.structural_text_units,
+                structural_text_projections: &projected.structural_text_projections,
+                structural_text_cache_writes: &[],
+                edges: &projected.edges,
+                occurrences: &projected.occurrences,
+                component_access: &projected.component_access,
+                callable_projection_states: &projected.callable_projection_states,
+            })?;
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "zero-unit-generation".into(),
+            run_id: "zero-unit-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let manifest = storage.publish_structural_text_unit_generation(&publication)?;
+        assert_eq!(manifest.unit_count, 0);
+        assert_eq!(manifest.projection_count, 1);
+        storage.validate_structural_text_unit_publication(&publication)?;
         Ok(())
     }
 }

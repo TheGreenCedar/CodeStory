@@ -441,12 +441,13 @@ Retrieval finalization binds its candidate to the resulting core generation and
 leaves the prior retrieval publication active if source or core identity drifts.
 
 Both core paths publish a complete structural-unit manifest immediately before
-the core publication record. It binds descriptor schema and producer version,
-row count and digest, project/workspace identity, and the exact candidate
-generation/run. Missing, legacy, corrupt, or source-incomplete structural state
-fails closed. Full refresh discards the stage; incremental refresh discards its
-clone; promotion and rollback validate the recorded structural identity before
-installing either database.
+the core publication record. It binds descriptor schema, migration state, unit
+and projection counts and digests, and the exact candidate generation/run.
+Per-file projections bind verified source identity and producer. Missing,
+legacy, corrupt, or source-incomplete structural state fails closed. Full
+refresh discards the stage; incremental refresh discards its clone; promotion
+and rollback validate the recorded structural identity before installing either
+database.
 
 ### How symbol docs and dense anchors are kept fast
 

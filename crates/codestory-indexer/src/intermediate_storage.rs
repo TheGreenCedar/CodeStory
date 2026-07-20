@@ -26,6 +26,7 @@ pub struct IntermediateStorage {
 
 pub struct StructuralTextArtifactCacheWrite {
     pub path: std::path::PathBuf,
+    pub file_id: i64,
     pub cache_key: String,
     pub artifact_blob: Vec<u8>,
 }

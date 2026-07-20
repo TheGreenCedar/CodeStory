@@ -2395,6 +2395,7 @@ impl WorkspaceIndexer {
             .iter()
             .map(|write| codestory_store::StructuralTextArtifactCacheWrite {
                 path: &write.path,
+                file_id: write.file_id,
                 cache_key: &write.cache_key,
                 artifact_blob: &write.artifact_blob,
             })
@@ -3164,27 +3165,26 @@ impl WorkspaceIndexer {
         if let Some(file_info) = local_storage.files.first_mut() {
             file_info.modification_time = modification_time;
         }
+        let structural_file_id = local_storage.files.first().map(|file| file.id);
         let artifact = CachedStructuralArtifact::from_storage(local_storage);
         let structural_cache_write = prepared_input
             .artifact_cache_path
             .as_ref()
             .zip(prepared_input.artifact_cache_key.as_ref())
-            .and_then(|(path, cache_key)| {
+            .zip(structural_file_id)
+            .and_then(|((path, cache_key), file_id)| {
                 serde_json::to_vec(&artifact)
                     .ok()
-                    .map(|artifact_blob| ArtifactCacheWrite {
-                        path: path.clone(),
-                        cache_key: cache_key.clone(),
-                        artifact_blob,
-                    })
+                    .map(|artifact_blob| (file_id, path.clone(), cache_key.clone(), artifact_blob))
             });
         local_storage = artifact.into_intermediate_storage();
-        if let Some(write) = structural_cache_write {
+        if let Some((file_id, path, cache_key, artifact_blob)) = structural_cache_write {
             local_storage.structural_text_cache_writes.push(
                 intermediate_storage::StructuralTextArtifactCacheWrite {
-                    path: write.path,
-                    cache_key: write.cache_key,
-                    artifact_blob: write.artifact_blob,
+                    path,
+                    file_id,
+                    cache_key,
+                    artifact_blob,
                 },
             );
         }

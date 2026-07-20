@@ -10557,10 +10557,10 @@ impl AppController {
         node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
         id: codestory_contracts::graph::NodeId,
         score: f32,
-    ) -> Option<SearchHit> {
+    ) -> Result<Option<SearchHit>, ApiError> {
         let node = match storage.get_node(id) {
             Ok(Some(node)) if node.kind != codestory_contracts::graph::NodeKind::UNKNOWN => node,
-            _ => return None,
+            _ => return Ok(None),
         };
 
         let display_name = node_names
@@ -10587,7 +10587,12 @@ impl AppController {
             .canonical_id
             .as_deref()
             .is_some_and(|value| value.starts_with("openapi:endpoint:"));
-        let structural_unit = storage.get_structural_text_unit(id).ok().flatten();
+        let structural_unit = storage.get_structural_text_unit(id).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load structural provenance for node {}: {error}",
+                id.0
+            ))
+        })?;
 
         let mut hit = SearchHit {
             node_id: NodeId::from(id),
@@ -10627,7 +10632,7 @@ impl AppController {
             score_breakdown: None,
         };
         decorate_search_hit_evidence(&mut hit);
-        Some(hit)
+        Ok(Some(hit))
     }
 
     #[cfg(test)]
@@ -10950,7 +10955,10 @@ impl AppController {
 
         let mut hits = matches
             .into_iter()
-            .filter_map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {
@@ -13259,7 +13267,10 @@ impl AppController {
         };
         Ok(expanded_matches
             .into_iter()
-            .filter_map(|(id, score)| Self::build_search_hit(storage, &node_names, id, score))
+            .map(|(id, score)| Self::build_search_hit(storage, &node_names, id, score))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect())
     }
 
@@ -13568,7 +13579,7 @@ impl AppController {
         let mut out = Vec::with_capacity(hybrid.len());
         for scored in hybrid {
             if let Some(mut hit) =
-                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)
+                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)?
             {
                 hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
                     lexical: scored.lexical_score,
@@ -21562,13 +21573,46 @@ fn build_llm_symbol_doc_text() -> String {
 
         let definition_hit =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(11), 1.0)
+                .expect("provenance lookup")
                 .expect("definition hit");
         assert_eq!(definition_hit.file_path.as_deref(), Some("src/lib.rs"));
         assert_eq!(definition_hit.line, Some(42));
 
         assert!(
-            AppController::build_search_hit(&storage, &node_names, CoreNodeId(12), 1.0).is_none(),
+            AppController::build_search_hit(&storage, &node_names, CoreNodeId(12), 1.0)
+                .expect("provenance lookup")
+                .is_none(),
             "unknown placeholder nodes should be dropped from indexed results"
+        );
+    }
+
+    #[test]
+    fn build_search_hit_fails_closed_when_structural_provenance_cannot_be_read() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(13),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "handler".to_string(),
+                ..Default::default()
+            }])
+            .expect("insert node");
+        storage
+            .get_connection()
+            .execute("DROP TABLE structural_text_unit", [])
+            .expect("inject structural provenance read failure");
+
+        let error = AppController::build_search_hit(
+            &storage,
+            &HashMap::from([(CoreNodeId(13), "handler".to_string())]),
+            CoreNodeId(13),
+            1.0,
+        )
+        .expect_err("provenance storage failures must abort indexed-symbol search");
+        assert!(
+            error
+                .message
+                .contains("Failed to load structural provenance for node 13")
         );
     }
 
@@ -21651,16 +21695,21 @@ fn build_llm_symbol_doc_text() -> String {
         ]);
 
         let ast = AppController::build_search_hit(&storage, &node_names, CoreNodeId(22), 1.0)
+            .expect("provenance lookup")
             .expect("ast route hit");
         let text_only = AppController::build_search_hit(&storage, &node_names, CoreNodeId(23), 1.0)
+            .expect("provenance lookup")
             .expect("text-only route hit");
         let normal = AppController::build_search_hit(&storage, &node_names, CoreNodeId(24), 1.0)
+            .expect("provenance lookup")
             .expect("normal hit");
         let tree_sitter =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(25), 1.0)
+                .expect("provenance lookup")
                 .expect("tree-sitter route hit");
         let lexical_fallback =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(26), 1.0)
+                .expect("provenance lookup")
                 .expect("lexical fallback route hit");
 
         assert!(
@@ -21672,6 +21721,11 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(tree_sitter.score, ast.score);
         assert_eq!(lexical_fallback.score, text_only.score);
         assert_eq!(normal.score, 1.0);
+        assert_eq!(
+            normal.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            "a valid missing unit remains resolved graph evidence"
+        );
 
         let mut hits = [text_only, ast.clone()];
         hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
@@ -21703,6 +21757,7 @@ fn build_llm_symbol_doc_text() -> String {
         let node_names = HashMap::from([(CoreNodeId(31), "GET /api/users".to_string())]);
 
         let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(31), 1.0)
+            .expect("provenance lookup")
             .expect("OpenAPI endpoint hit");
 
         assert_eq!(
@@ -21801,6 +21856,7 @@ fn build_llm_symbol_doc_text() -> String {
         let node_names = HashMap::from([(CoreNodeId(41), "demo".to_string())]);
 
         let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(41), 1.0)
+            .expect("provenance lookup")
             .expect("structural hit");
 
         assert_eq!(
@@ -26149,6 +26205,9 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(!third_names.contains("public.users"));
         drop(third_store);
+        let structural_before_failure = structural_live_identity(&storage_path);
+        assert!(structural_before_failure.manifest.unit_count > 0);
+        assert_eq!(structural_before_failure.cache_rows.len(), 2);
 
         fs::write(&css_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
         let error = controller
@@ -26163,6 +26222,197 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("open preserved publication")
             .validate_structural_text_unit_publication(&preserved)
             .expect("previous structural manifest remains valid");
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "collector failure changed the prior structural manifest or cache identity"
+        );
+    }
+
+    #[test]
+    fn structural_publication_survives_unreadable_and_partial_discovery_failures() {
+        for scenario in ["unreadable", "partial-discovery"] {
+            let workspace = tempdir().expect("workspace dir");
+            let source_root = workspace.path().join("src");
+            fs::create_dir_all(&source_root).expect("source directory");
+            let css_path = source_root.join("styles.css");
+            fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
+            let manifest_path = workspace.path().join("codestory_workspace.json");
+            fs::write(&manifest_path, r#"{"members":["src"]}"#)
+                .expect("write complete workspace manifest");
+            let storage_path = workspace.path().join(".cache/codestory.db");
+            let controller = AppController::new();
+            controller
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("open structural project");
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish structural baseline");
+            let baseline = structural_live_identity(&storage_path);
+            assert!(baseline.manifest.unit_count > 0);
+            assert_eq!(baseline.cache_rows.len(), 1);
+
+            let error = if scenario == "unreadable" {
+                let unreadable_path = css_path.clone();
+                arm_source_policy_after_plan_hook(move || {
+                    fs::remove_file(&unreadable_path).expect("remove planned structural source");
+                    fs::create_dir(&unreadable_path)
+                        .expect("replace planned source with unreadable directory");
+                });
+                controller
+                    .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                    .expect_err("unreadable structural source must reject publication")
+            } else {
+                fs::write(&manifest_path, r#"{"members":["src","missing-member"]}"#)
+                    .expect("make workspace discovery partial");
+                controller
+                    .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                    .expect_err("partial discovery must reject publication")
+            };
+            let expected_reason = if scenario == "unreadable" {
+                FileCoverageReason::Unreadable
+            } else {
+                FileCoverageReason::DiscoveryIncomplete
+            };
+            assert!(
+                error.details.as_ref().is_some_and(|details| details
+                    .coverage_gaps
+                    .iter()
+                    .any(|gap| gap.reason == expected_reason)),
+                "{scenario} did not report the expected coverage gap: {error:?}"
+            );
+            assert_eq!(
+                structural_live_identity(&storage_path),
+                baseline,
+                "{scenario} changed the prior structural manifest or cache identity"
+            );
+            assert_no_staged_publication_artifacts(&storage_path);
+        }
+    }
+
+    #[test]
+    fn staged_structural_cache_write_failure_preserves_nonempty_live_generation() {
+        let workspace = tempdir().expect("workspace dir");
+        let css_path = workspace.path().join("styles.css");
+        fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open structural project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish structural baseline");
+        let baseline = structural_live_identity(&storage_path);
+        assert!(baseline.manifest.unit_count > 0);
+        assert_eq!(baseline.cache_rows.len(), 1);
+
+        fs::write(&css_path, ".replacement { color: blue; }\n")
+            .expect("write replacement structural source");
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TRIGGER reject_structural_cache_write
+                     BEFORE INSERT ON structural_text_artifact_cache
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced staged structural cache failure');
+                     END;",
+                )
+                .expect("install staged structural cache fault");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("staged structural write failure must reject publication");
+        assert!(
+            error
+                .message
+                .contains("forced staged structural cache failure"),
+            "{error:?}"
+        );
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            baseline,
+            "staged structural write failure changed the live manifest or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn structural_publication_survives_cancellation_and_promotion_rollback_boundaries() {
+        for (boundary, action, mode) in [
+            (
+                PublicationTestBoundary::SearchBuild,
+                PublicationTestAction::Cancel,
+                IndexMode::Full,
+            ),
+            (
+                PublicationTestBoundary::DatabaseReplacement,
+                PublicationTestAction::Fail,
+                IndexMode::Full,
+            ),
+            (
+                PublicationTestBoundary::MarkerCompletion,
+                PublicationTestAction::Fail,
+                IndexMode::Incremental,
+            ),
+        ] {
+            let workspace = tempdir().expect("workspace dir");
+            let css_path = workspace.path().join("styles.css");
+            let rust_path = workspace.path().join("lib.rs");
+            fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
+            fs::write(&rust_path, "pub fn baseline() -> i32 { 1 }\n").expect("write parser source");
+            let storage_path = workspace.path().join(".cache/codestory.db");
+            let controller = AppController::new();
+            controller
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("open structural project");
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish structural baseline");
+            let baseline = structural_live_identity(&storage_path);
+            assert!(baseline.manifest.unit_count > 0);
+            assert_eq!(baseline.cache_rows.len(), 1);
+
+            fs::write(&rust_path, "pub fn replacement() -> i32 { 2 }\n")
+                .expect("write replacement parser source");
+            let cancel_token = CancellationToken::new();
+            arm_publication_test_fault(boundary, action);
+            let error = controller
+                .run_indexing_blocking_without_runtime_refresh_with_cancel(mode, &cancel_token)
+                .expect_err("injected transition must reject publication");
+            PUBLICATION_TEST_FAULT.with(|fault| {
+                assert!(
+                    fault.borrow().is_none(),
+                    "structural transition fault was not reached: {boundary:?}"
+                );
+            });
+            match action {
+                PublicationTestAction::Cancel => {
+                    assert_eq!(error.code, "cancelled");
+                    assert!(cancel_token.is_cancelled());
+                }
+                PublicationTestAction::Fail => {
+                    assert_eq!(error.code, "internal");
+                    assert!(error.message.contains(&format!("{boundary:?}")));
+                }
+            }
+            assert_eq!(
+                structural_live_identity(&storage_path),
+                baseline,
+                "{boundary:?} changed the prior structural manifest or cache identity"
+            );
+            assert_no_staged_publication_artifacts(&storage_path);
+        }
     }
 
     #[test]
@@ -26996,6 +27246,55 @@ fn build_llm_symbol_doc_text() -> String {
         PublicationTestBoundary::MarkerCompletion,
         PublicationTestBoundary::RuntimeCache,
     ];
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StructuralLiveIdentity {
+        publication: IndexPublicationRecord,
+        manifest: codestory_store::StructuralTextUnitPublicationManifest,
+        cache_rows: Vec<(String, i64, String, String, i64, String, String)>,
+    }
+
+    fn structural_live_identity(storage_path: &Path) -> StructuralLiveIdentity {
+        let storage = Storage::open_read_only(storage_path).expect("open structural publication");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read structural core publication")
+            .expect("complete structural core publication");
+        let manifest = storage
+            .validate_structural_text_unit_publication(&publication)
+            .expect("validate structural publication");
+        let cache_rows = {
+            let mut statement = storage
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, file_id, cache_key, source_content_hash,
+                            descriptor_version, producer, artifact_digest
+                     FROM structural_text_artifact_cache
+                     ORDER BY file_path",
+                )
+                .expect("prepare structural cache identity");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .expect("query structural cache identity")
+                .map(|row| row.expect("read structural cache identity"))
+                .collect()
+        };
+        StructuralLiveIdentity {
+            publication,
+            manifest,
+            cache_rows,
+        }
+    }
 
     fn assert_no_staged_publication_artifacts(storage_path: &Path) {
         let parent = storage_path.parent().expect("storage parent");

@@ -2,7 +2,7 @@ use crate::intermediate_storage::IntermediateStorage;
 use codestory_contracts::graph::{NodeId, NodeKind};
 use std::path::Path;
 
-use super::common::{push_member_edge, push_structural_node};
+use super::common::{StructuralSourceSpan, push_member_edge, push_structural_node};
 
 pub(crate) fn collect_cargo_manifest_entities(
     path: &Path,
@@ -40,8 +40,7 @@ pub(crate) fn collect_cargo_manifest_entities(
                     NodeKind::MODULE,
                     &member,
                     &format!("cargo-manifest:workspace-member:{path_key}:{member}"),
-                    line,
-                    col,
+                    StructuralSourceSpan::token(line, col.saturating_sub(1) as usize, member.len()),
                 );
                 push_member_edge(storage, file_id, file_id, member_id, line);
             }
@@ -56,8 +55,7 @@ pub(crate) fn collect_cargo_manifest_entities(
                     NodeKind::PACKAGE,
                     &name,
                     &format!("cargo-manifest:package:{path_key}:{name}"),
-                    line,
-                    col,
+                    StructuralSourceSpan::token(line, col.saturating_sub(1) as usize, name.len()),
                 );
                 push_member_edge(storage, file_id, file_id, id, line);
                 package_id = Some(id);
@@ -77,8 +75,7 @@ pub(crate) fn collect_cargo_manifest_entities(
                     "cargo-manifest:dependency:{path_key}:{}:{dependency}",
                     section.name()
                 ),
-                line,
-                col,
+                StructuralSourceSpan::token(line, col.saturating_sub(1) as usize, dependency.len()),
             );
             push_member_edge(
                 storage,

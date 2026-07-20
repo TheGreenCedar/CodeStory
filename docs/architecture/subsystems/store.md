@@ -13,8 +13,7 @@ recovery.
 - verified source-policy exclusion rows and their project/workspace/core-bound
   count-and-digest manifest;
 - versioned structural text units, per-file complete projections, their
-  dedicated artifact cache, and a project/workspace/core-bound publication
-  manifest;
+  dedicated artifact cache, and a core-generation-bound publication manifest;
 - core `generation_id`/`run_id` and retrieval-manifest records;
 - schema migrations and a versioned promotion journal.
 
@@ -50,13 +49,13 @@ and manifest replace together in one SQLite transaction, and staged promotion
 records their candidate and rollback identities. A schema migration creates no
 synthetic manifest; runtime must republish from a complete verified inventory.
 
-The structural-unit manifest binds descriptor schema and producer version,
-complete unit count and digest, project/workspace identity, and exact core
-generation/run. Each structural file has a verified source hash and a
-count-and-digest projection, including zero-unit files. Replacing one file's
+The structural-unit manifest binds descriptor schema, migration state, complete
+unit and projection counts and digests, and exact core generation/run. Each
+structural file has a verified source hash and a count-and-digest projection
+that carries its producer, including zero-unit files. Replacing one file's
 hash, graph rows, units, projection, and dedicated cache entry is atomic and
-invalidates the complete manifest until runtime republishes it. Schema
-migration creates the tables but no synthetic completeness claim.
+invalidates the complete manifest until runtime republishes it. Schema migration
+creates the tables but no synthetic completeness claim.
 
 Promotion journals record candidate and rollback structural identities.
 Prepared install, committed recovery, and rollback validate the recorded

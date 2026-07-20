@@ -79,6 +79,13 @@ const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
 const PROMOTION_JOURNAL_VERSION: u32 = 3;
+// Snapshot promotion first shipped with schema 21. Journal v2 added the
+// source-policy identity at schema 27, and journal v3 added structural-text
+// identity at schema 28. Recovery runs before schema migration, so these
+// boundaries are part of the durable journal contract.
+const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
+const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
+const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
@@ -210,6 +217,34 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<(), StorageError> {
 
 struct PromotionLock {
     file: File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDatabaseContract {
+    CurrentPromotion,
+    Journal(u32),
+    LegacyBackup,
+}
+
+impl RecoveryDatabaseContract {
+    fn supports_complete_schema(self, schema_version: u32) -> bool {
+        match self {
+            Self::CurrentPromotion => schema_version == SCHEMA_VERSION,
+            Self::Journal(LEGACY_PROMOTION_JOURNAL_VERSION) => (LEGACY_PROMOTION_MIN_SCHEMA_VERSION
+                ..=SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+                .contains(&schema_version),
+            Self::Journal(SOURCE_POLICY_PROMOTION_JOURNAL_VERSION) => {
+                schema_version == SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                schema_version == STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(_) => false,
+            Self::LegacyBackup => {
+                (LEGACY_PROMOTION_MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema_version)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,13 +629,13 @@ fn read_complete_promotion_database_identity(
 
 fn read_recovery_database_identity(
     path: &Path,
+    contract: RecoveryDatabaseContract,
 ) -> Result<Option<IndexPublicationRecord>, StorageError> {
     let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
         return Ok(None);
     };
     match schema_version {
         0 => Ok(None),
-        SCHEMA_VERSION => read_complete_index_publication(&conn),
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
             read_index_publication(&conn)
         }
@@ -608,9 +643,12 @@ fn read_recovery_database_identity(
             "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
             path.display()
         ))),
+        version if contract.supports_complete_schema(version) => {
+            read_complete_index_publication(&conn)
+        }
         _ => Err(promotion_error(format!(
-            "SQLite recovery artifact {} has unsupported schema version {schema_version}",
-            path.display()
+            "SQLite recovery artifact {} has unsupported schema version {schema_version} for {contract:?}",
+            path.display(),
         ))),
     }
 }
@@ -630,8 +668,9 @@ fn require_complete_promotion_database_identity(
 fn require_recovery_database_identity(
     path: &Path,
     role: &str,
+    contract: RecoveryDatabaseContract,
 ) -> Result<IndexPublicationRecord, StorageError> {
-    read_recovery_database_identity(path)?.ok_or_else(|| {
+    read_recovery_database_identity(path, contract)?.ok_or_else(|| {
         promotion_error(format!(
             "{role} {} has no complete publication identity",
             path.display()
@@ -797,8 +836,9 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
 
     if committed_path.exists() {
         let committed = read_promotion_journal(&committed_path)?;
+        let recovery_contract = RecoveryDatabaseContract::Journal(committed.version);
         let live_identity =
-            require_complete_promotion_database_identity(path, "Committed live database")?;
+            require_recovery_database_identity(path, "Committed live database", recovery_contract)?;
         if live_identity != committed.candidate {
             return Err(promotion_error(format!(
                 "Committed promotion identity does not match live database {}",
@@ -884,7 +924,8 @@ fn rollback_prepared_promotion(
     }
     let backup_path = live_path.with_extension("sqlite.backup");
     let prepared_path = promotion_prepared_journal_path(live_path);
-    let live_identity = read_recovery_database_identity(live_path)?;
+    let recovery_contract = RecoveryDatabaseContract::Journal(prepared.version);
+    let live_identity = read_recovery_database_identity(live_path, recovery_contract)?;
     if live_identity
         .as_ref()
         .is_some_and(|live| live != &prepared.candidate && Some(live) != prepared.previous.as_ref())
@@ -930,8 +971,11 @@ fn rollback_prepared_promotion(
 
     match prepared.previous.as_ref() {
         Some(expected_previous) => {
-            let backup_identity =
-                require_recovery_database_identity(&backup_path, "Prepared recovery backup")?;
+            let backup_identity = require_recovery_database_identity(
+                &backup_path,
+                "Prepared recovery backup",
+                recovery_contract,
+            )?;
             if &backup_identity != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion backup identity does not match {}",
@@ -953,7 +997,11 @@ fn rollback_prepared_promotion(
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
-            let restored = require_recovery_database_identity(live_path, "Restored live database")?;
+            let restored = require_recovery_database_identity(
+                live_path,
+                "Restored live database",
+                recovery_contract,
+            )?;
             if &restored != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion rollback did not restore the recorded identity for {}",
@@ -994,9 +1042,13 @@ fn recover_legacy_promotion_backup(
     live_path: &Path,
     backup_path: &Path,
 ) -> Result<(), StorageError> {
-    let backup_identity =
-        require_recovery_database_identity(backup_path, "Legacy promotion backup")?;
-    let live_identity = read_recovery_database_identity(live_path);
+    let recovery_contract = RecoveryDatabaseContract::LegacyBackup;
+    let backup_identity = require_recovery_database_identity(
+        backup_path,
+        "Legacy promotion backup",
+        recovery_contract,
+    )?;
+    let live_identity = read_recovery_database_identity(live_path, recovery_contract);
     let restore_backup = match live_identity {
         Ok(None) => true,
         Err(error) => {
@@ -1016,7 +1068,11 @@ fn recover_legacy_promotion_backup(
     };
     if restore_backup {
         restore_promotion_database(backup_path, live_path)?;
-        let restored = require_recovery_database_identity(live_path, "Recovered live database")?;
+        let restored = require_recovery_database_identity(
+            live_path,
+            "Recovered live database",
+            recovery_contract,
+        )?;
         if restored != backup_identity {
             return Err(promotion_error(format!(
                 "Legacy promotion recovery produced an unexpected identity for {}",
@@ -1497,6 +1553,7 @@ pub struct StructuralTextProjection {
 #[derive(Debug, Clone, Copy)]
 pub struct StructuralTextArtifactCacheWrite<'a> {
     pub path: &'a Path,
+    pub file_id: i64,
     pub cache_key: &'a str,
     pub artifact_blob: &'a [u8],
 }
@@ -1634,6 +1691,68 @@ fn read_structural_text_projections(
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn structural_text_artifact_cache_key_is_valid(cache_key: &str) -> bool {
+    let Some((version, identity)) = cache_key
+        .strip_prefix('v')
+        .and_then(|key| key.split_once(':'))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+        && version.parse::<u32>().is_ok_and(|version| version > 0)
+        && !identity.is_empty()
+}
+
+fn validate_structural_text_artifact_cache_rows(conn: &Connection) -> Result<(), StorageError> {
+    let orphaned_rows = conn.query_row(
+        "SELECT COUNT(*)
+         FROM structural_text_artifact_cache c
+         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
+         WHERE p.file_id IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if orphaned_rows != 0 {
+        return Err(StorageError::Other(
+            "structural artifact cache contains rows without verified projections".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT c.file_id, c.cache_key, c.source_content_hash,
+                c.descriptor_version, c.producer, c.artifact_digest, c.artifact_blob,
+                p.source_content_hash, p.descriptor_version, p.producer
+         FROM structural_text_artifact_cache c
+         INNER JOIN structural_text_projection p ON p.file_id = c.file_id
+         ORDER BY c.file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let file_id = row.get::<_, i64>(0)?;
+        let cache_key = row.get::<_, String>(1)?;
+        let source_content_hash = row.get::<_, String>(2)?;
+        let descriptor_version = row.get::<_, i64>(3)?;
+        let producer = row.get::<_, String>(4)?;
+        let artifact_digest = row.get::<_, String>(5)?;
+        let artifact_blob = row.get::<_, Vec<u8>>(6)?;
+        let projection_source_content_hash = row.get::<_, String>(7)?;
+        let projection_descriptor_version = row.get::<_, i64>(8)?;
+        let projection_producer = row.get::<_, String>(9)?;
+        let expected_digest = format!("{:x}", Sha256::digest(&artifact_blob));
+        if source_content_hash != projection_source_content_hash
+            || descriptor_version != projection_descriptor_version
+            || producer != projection_producer
+            || !structural_text_artifact_cache_key_is_valid(&cache_key)
+            || artifact_digest != expected_digest
+        {
+            return Err(StorageError::Other(format!(
+                "structural artifact cache row {file_id} does not match its verified projection"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_structural_text_projection_rows(conn: &Connection) -> Result<(), StorageError> {
@@ -3048,9 +3167,13 @@ impl Storage {
         )?;
         let copy_result = self.conn.execute(
             "INSERT OR REPLACE INTO structural_text_artifact_cache (
-                file_path, cache_key, artifact_blob, updated_at_epoch_ms
+                file_path, file_id, cache_key, source_content_hash,
+                descriptor_version, producer, artifact_digest, artifact_blob,
+                updated_at_epoch_ms
              )
-             SELECT file_path, cache_key, artifact_blob, updated_at_epoch_ms
+             SELECT file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
              FROM structural_cache_source.structural_text_artifact_cache",
             [],
         );
@@ -4126,7 +4249,8 @@ impl Storage {
                 staged_path.display()
             )));
         }
-        let previous = read_recovery_database_identity(live_path)?;
+        let recovery_contract = RecoveryDatabaseContract::CurrentPromotion;
+        let previous = read_recovery_database_identity(live_path, recovery_contract)?;
         let previous_source_policy = match previous.as_ref() {
             Some(previous) => read_source_policy_exclusion_rollback_identity(live_path, previous)?,
             None => None,
@@ -4146,8 +4270,11 @@ impl Storage {
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
             drop(live_conn);
-            let backup_identity =
-                require_recovery_database_identity(&backup_path, "Promotion backup")?;
+            let backup_identity = require_recovery_database_identity(
+                &backup_path,
+                "Promotion backup",
+                recovery_contract,
+            )?;
             if Some(&backup_identity) != previous.as_ref() {
                 return Err(promotion_error(format!(
                     "Promotion backup identity does not match live database {}",
@@ -5293,17 +5420,46 @@ impl Storage {
         if !batch.structural_text_cache_writes.is_empty() {
             let mut stmt = tx.prepare(
                 "INSERT INTO structural_text_artifact_cache (
-                    file_path, cache_key, artifact_blob, updated_at_epoch_ms
-                 ) VALUES (?1, ?2, ?3, ?4)
+                    file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(file_path) DO UPDATE SET
+                    file_id = excluded.file_id,
                     cache_key = excluded.cache_key,
+                    source_content_hash = excluded.source_content_hash,
+                    descriptor_version = excluded.descriptor_version,
+                    producer = excluded.producer,
+                    artifact_digest = excluded.artifact_digest,
                     artifact_blob = excluded.artifact_blob,
                     updated_at_epoch_ms = excluded.updated_at_epoch_ms",
             )?;
             for write in batch.structural_text_cache_writes {
+                let projection = batch
+                    .structural_text_projections
+                    .iter()
+                    .find(|projection| projection.file_id == write.file_id)
+                    .ok_or_else(|| {
+                        StorageError::Other(format!(
+                            "structural cache write {} has no matching projection",
+                            write.file_id
+                        ))
+                    })?;
+                if !structural_text_artifact_cache_key_is_valid(write.cache_key) {
+                    return Err(StorageError::Other(format!(
+                        "structural cache write {} has an invalid cache key",
+                        write.file_id
+                    )));
+                }
+                let artifact_digest = format!("{:x}", Sha256::digest(write.artifact_blob));
                 stmt.execute(params![
                     write.path.to_string_lossy().to_string(),
+                    write.file_id,
                     write.cache_key,
+                    &projection.source_content_hash,
+                    projection.descriptor_version as i64,
+                    &projection.producer,
+                    artifact_digest,
                     write.artifact_blob,
                     current_epoch_ms(),
                 ])?;
@@ -6065,6 +6221,21 @@ impl Storage {
             ));
         }
         let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM structural_text_artifact_cache
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM structural_text_projection p
+                WHERE p.file_id = structural_text_artifact_cache.file_id
+                  AND p.source_content_hash =
+                      structural_text_artifact_cache.source_content_hash
+                  AND p.descriptor_version =
+                      structural_text_artifact_cache.descriptor_version
+                  AND p.producer = structural_text_artifact_cache.producer
+             )",
+            [],
+        )?;
+        validate_structural_text_artifact_cache_rows(&tx)?;
         let invalid_structural_files = tx.query_row(
             "SELECT COUNT(*)
              FROM structural_text_projection p
@@ -6221,6 +6392,7 @@ impl Storage {
             ));
         }
         validate_structural_text_projection_rows(&self.conn)?;
+        validate_structural_text_artifact_cache_rows(&self.conn)?;
         Ok(manifest)
     }
 
@@ -9043,7 +9215,7 @@ impl Storage {
         )?;
         tx.execute(
             "DELETE FROM structural_text_artifact_cache
-             WHERE file_path = (SELECT path FROM file WHERE id = ?1)",
+             WHERE file_id = ?1",
             params![file_node_id],
         )?;
         tx.execute("DELETE FROM structural_text_unit_publication", [])?;

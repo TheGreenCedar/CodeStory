@@ -2,7 +2,7 @@ use crate::intermediate_storage::IntermediateStorage;
 use codestory_contracts::graph::{NodeId, NodeKind};
 use std::path::Path;
 
-use super::common::{push_member_edge, push_structural_node};
+use super::common::{StructuralSourceSpan, push_member_edge, push_structural_node};
 
 pub(crate) fn collect_github_actions_workflow_entities(
     path: &Path,
@@ -20,8 +20,11 @@ pub(crate) fn collect_github_actions_workflow_entities(
         NodeKind::MODULE,
         &workflow_name,
         &format!("github-actions:workflow:{path_key}"),
-        workflow_line,
-        workflow_col,
+        StructuralSourceSpan::token(
+            workflow_line,
+            workflow_col.saturating_sub(1) as usize,
+            workflow_name.len(),
+        ),
     );
     push_member_edge(storage, file_id, file_id, workflow_id, workflow_line);
 
@@ -74,8 +77,7 @@ fn collect_jobs_and_steps(
                 NodeKind::FUNCTION,
                 &job_name,
                 &format!("github-actions:job:{path_key}:{job_name}"),
-                line,
-                indent.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                StructuralSourceSpan::token(line, indent, job_name.len()),
             );
             push_member_edge(storage, file_id, workflow_id, job_id, line);
             current_job = Some((indent, job_id, job_name));
@@ -96,8 +98,7 @@ fn collect_jobs_and_steps(
                 NodeKind::FUNCTION,
                 &job_name,
                 &format!("github-actions:job:{path_key}:{job_name}"),
-                line,
-                indent.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                StructuralSourceSpan::token(line, indent, job_name.len()),
             );
             push_member_edge(storage, file_id, workflow_id, job_id, line);
             current_job = Some((indent, job_id, job_name));
@@ -129,8 +130,11 @@ fn collect_jobs_and_steps(
                 NodeKind::ANNOTATION,
                 &step_anchor,
                 &format!("github-actions:step:{path_key}:{job_name}:{step_index}"),
-                line,
-                step_col,
+                StructuralSourceSpan::token(
+                    line,
+                    step_col.saturating_sub(1) as usize,
+                    step_anchor.len(),
+                ),
             );
             push_member_edge(storage, file_id, *job_id, step_id, line);
         }
