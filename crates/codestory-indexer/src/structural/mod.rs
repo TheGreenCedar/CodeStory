@@ -581,6 +581,16 @@ mod tests {
                 "printf '%s\\n' \\<<NOT_A_HEREDOC\nfunction after_escape { echo ok; }\nsource ./after-escape.zsh\n",
                 ["after_escape", "./after-escape.zsh"],
             ),
+            (
+                "multiline-single-quoted",
+                "payload='\n<<NOT_A_HEREDOC\nfunction hidden_single_literal { echo hidden; }\nsource ./hidden-single-literal.zsh\n'\nfunction after_multiline_single { echo ok; }\nsource ./after-multiline-single.zsh\n",
+                ["after_multiline_single", "./after-multiline-single.zsh"],
+            ),
+            (
+                "multiline-double-quoted",
+                "payload=\"\nescaped quote: \\\"\n<<NOT_A_HEREDOC\nfunction hidden_double_literal { echo hidden; }\nsource ./hidden-double-literal.zsh\n\"\nfunction after_multiline_double { echo ok; }\nsource ./after-multiline-double.zsh\n",
+                ["after_multiline_double", "./after-multiline-double.zsh"],
+            ),
         ];
 
         for (name, source, expected) in fixtures {

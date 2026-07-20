@@ -310,6 +310,22 @@ enum ScriptFamily {
     PowerShell,
 }
 
+#[derive(Clone, Copy)]
+enum ShellQuote {
+    Single,
+    Double,
+}
+
+#[derive(Default)]
+struct ShellLexicalState {
+    quote: Option<ShellQuote>,
+}
+
+struct ShellLineAnalysis {
+    masked: String,
+    heredocs: Vec<(String, bool)>,
+}
+
 fn collect_script_entities(
     path: &Path,
     source: &str,
@@ -319,10 +335,12 @@ fn collect_script_entities(
 ) {
     let mut ordinal = 0usize;
     let mut shell_heredocs = VecDeque::new();
+    let mut shell_lexical_state = ShellLexicalState::default();
     let mut powershell_block_comment_depth = 0usize;
     for (line_index, line_text) in source.lines().enumerate() {
         let line = line_number(line_index);
         let masked;
+        let mut new_shell_heredocs = Vec::new();
         let code = match family {
             ScriptFamily::Shell => {
                 if let Some((terminator, strip_tabs)) = shell_heredocs.front() {
@@ -336,7 +354,10 @@ fn collect_script_entities(
                     }
                     continue;
                 }
-                line_text
+                let analysis = analyze_shell_line(line_text, &mut shell_lexical_state);
+                new_shell_heredocs = analysis.heredocs;
+                masked = analysis.masked;
+                &masked
             }
             ScriptFamily::PowerShell => {
                 masked =
@@ -344,17 +365,19 @@ fn collect_script_entities(
                 &masked
             }
         };
-        let code = strip_script_comment(code);
+        let code = if matches!(family, ScriptFamily::PowerShell) {
+            strip_script_comment(code)
+        } else {
+            code
+        };
         let trimmed = code.trim_start();
         if trimmed.is_empty() {
+            shell_heredocs.extend(new_shell_heredocs);
             continue;
         }
         let indent = code.len().saturating_sub(trimmed.len());
-        let new_heredocs = matches!(family, ScriptFamily::Shell)
-            .then(|| shell_heredoc_delimiters(code))
-            .unwrap_or_default();
         let anchor = match family {
-            ScriptFamily::Shell => shell_anchor(trimmed),
+            ScriptFamily::Shell => shell_anchor(trimmed, &line_text[indent..]),
             ScriptFamily::PowerShell => powershell_anchor(trimmed),
         };
         if let Some((kind, role, label, offset, len)) = anchor {
@@ -372,7 +395,7 @@ fn collect_script_entities(
                 len,
             );
         }
-        shell_heredocs.extend(new_heredocs);
+        shell_heredocs.extend(new_shell_heredocs);
     }
 }
 
@@ -670,30 +693,59 @@ fn find_bytes(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-fn shell_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+fn analyze_shell_line(line: &str, state: &mut ShellLexicalState) -> ShellLineAnalysis {
     let bytes = line.as_bytes();
-    let mut delimiters = Vec::new();
+    let mut masked = bytes.to_vec();
+    let mut heredocs = Vec::new();
     let mut cursor = 0usize;
-    let mut quote = None;
-    while cursor + 1 < bytes.len() {
+    while cursor < bytes.len() {
         let byte = bytes[cursor];
-        if let Some(active_quote) = quote {
-            if active_quote == b'"' && byte == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-            } else {
-                if byte == active_quote {
-                    quote = None;
+        if let Some(active_quote) = state.quote {
+            masked[cursor] = b' ';
+            match active_quote {
+                ShellQuote::Single => {
+                    if byte == b'\'' {
+                        state.quote = None;
+                    }
+                    cursor += 1;
                 }
-                cursor += 1;
+                ShellQuote::Double => {
+                    if byte == b'\\' {
+                        if let Some(escaped) = masked.get_mut(cursor + 1) {
+                            *escaped = b' ';
+                        }
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else {
+                        if byte == b'"' {
+                            state.quote = None;
+                        }
+                        cursor += 1;
+                    }
+                }
             }
             continue;
         }
+        if byte == b'#' {
+            masked[cursor..].fill(b' ');
+            break;
+        }
         if byte == b'\\' {
+            masked[cursor] = b' ';
+            if let Some(escaped) = masked.get_mut(cursor + 1) {
+                *escaped = b' ';
+            }
             cursor = (cursor + 2).min(bytes.len());
             continue;
         }
-        if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
+        if byte == b'\'' {
+            masked[cursor] = b' ';
+            state.quote = Some(ShellQuote::Single);
+            cursor += 1;
+            continue;
+        }
+        if byte == b'"' {
+            masked[cursor] = b' ';
+            state.quote = Some(ShellQuote::Double);
             cursor += 1;
             continue;
         }
@@ -732,13 +784,17 @@ fn shell_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
             cursor += 1;
         }
         if cursor > start {
-            delimiters.push((line[start..cursor].to_string(), strip_tabs));
+            heredocs.push((line[start..cursor].to_string(), strip_tabs));
         }
         if delimiter_quote.is_some() && bytes.get(cursor) == delimiter_quote.as_ref() {
             cursor += 1;
         }
     }
-    delimiters
+    ShellLineAnalysis {
+        masked: String::from_utf8(masked)
+            .expect("masking UTF-8 shell source with ASCII spaces preserves UTF-8"),
+        heredocs,
+    }
 }
 
 fn mask_powershell_block_comments(line: &str, depth: &mut usize) -> String {
@@ -830,39 +886,45 @@ fn toml_table_label(line: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-fn shell_anchor(line: &str) -> Option<(NodeKind, &'static str, String, usize, usize)> {
-    if let Some(rest) = line.strip_prefix("function ") {
+fn shell_anchor(
+    masked: &str,
+    original: &str,
+) -> Option<(NodeKind, &'static str, String, usize, usize)> {
+    if let Some(rest) = masked.strip_prefix("function ") {
         let name = script_identifier(rest)?;
-        let offset = line.find(name)?;
+        let offset = masked.find(name)?;
         return Some((
             NodeKind::FUNCTION,
             "function",
-            name.to_string(),
+            original.get(offset..offset + name.len())?.to_string(),
             offset,
             name.len(),
         ));
     }
-    if let Some(paren) = line.find("()") {
-        let raw = line[..paren].trim();
+    if let Some(paren) = masked.find("()") {
+        let raw = masked[..paren].trim();
         if is_script_identifier(raw) {
-            let offset = line.find(raw)?;
+            let offset = masked.find(raw)?;
             return Some((
                 NodeKind::FUNCTION,
                 "function",
-                raw.to_string(),
+                original.get(offset..offset + raw.len())?.to_string(),
                 offset,
                 raw.len(),
             ));
         }
     }
     for prefix in ["source ", ". ", "autoload "] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let raw = rest.split_ascii_whitespace().next()?;
+        if masked.strip_prefix(prefix).is_some() {
+            let raw = original
+                .get(prefix.len()..)?
+                .split_ascii_whitespace()
+                .next()?;
             let label = unquote_label(raw).to_string();
             if label.is_empty() {
                 return None;
             }
-            let offset = line.find(raw)?;
+            let offset = original.find(raw)?;
             return Some((NodeKind::ANNOTATION, "import", label, offset, raw.len()));
         }
     }
