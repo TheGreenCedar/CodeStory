@@ -2460,6 +2460,7 @@ impl WorkspaceIndexer {
             .as_ref()
             .map(|config| config.language_name)
             .or_else(|| template_pipeline::template_surface_language(&full_path))
+            .or_else(|| openapi_path_language_hint(&full_path).then_some("openapi"))
             .or_else(|| {
                 structural::is_structural_candidate_path(&full_path)
                     .then(|| structural::structural_language_name(&full_path))
@@ -16171,6 +16172,16 @@ pub fn is_openapi_candidate_path(path: &Path) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     matches!(extension.as_str(), "json" | "yaml" | "yml")
+}
+
+fn openapi_path_language_hint(path: &Path) -> bool {
+    if !is_openapi_candidate_path(path) {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|stem| stem.contains("openapi") || stem.contains("swagger"))
 }
 
 /// Return whether a path can receive text-only framework diagnostics.

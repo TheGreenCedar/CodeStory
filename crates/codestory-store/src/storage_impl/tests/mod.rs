@@ -1201,6 +1201,23 @@ fn openapi_endpoint_projection_requires_file_owned_graph_evidence() -> Result<()
 #[test]
 fn projection_file_upsert_updates_language_across_structural_transitions()
 -> Result<(), StorageError> {
+    fn flush_file(storage: &mut Storage, file: &FileInfo) -> Result<(), StorageError> {
+        storage
+            .flush_projection_batch(ProjectionBatch {
+                files: std::slice::from_ref(file),
+                file_content_hashes: &[],
+                nodes: &[],
+                structural_text_units: &[],
+                structural_text_projections: &[],
+                structural_text_cache_writes: &[],
+                edges: &[],
+                occurrences: &[],
+                component_access: &[],
+                callable_projection_states: &[],
+            })
+            .map(|_| ())
+    }
+
     let mut storage = Storage::new_in_memory()?;
     let path = PathBuf::from("config.json");
     let mut file = FileInfo {
@@ -1218,23 +1235,25 @@ fn projection_file_upsert_updates_language_across_structural_transitions()
     for language in ["openapi", "json"] {
         file.language = language.to_string();
         file.modification_time += 1;
-        storage.flush_projection_batch(ProjectionBatch {
-            files: std::slice::from_ref(&file),
-            file_content_hashes: &[],
-            nodes: &[],
-            structural_text_units: &[],
-            structural_text_projections: &[],
-            structural_text_cache_writes: &[],
-            edges: &[],
-            occurrences: &[],
-            component_access: &[],
-            callable_projection_states: &[],
-        })?;
+        flush_file(&mut storage, &file)?;
         let stored = storage.get_files()?;
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].path, path);
         assert_eq!(stored[0].language, language);
     }
+
+    file.language = "openapi".to_string();
+    file.complete = false;
+    file.modification_time += 1;
+    flush_file(&mut storage, &file)?;
+    let stored = storage.get_files()?;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].path, path);
+    assert_eq!(
+        stored[0].language, "json",
+        "incomplete retry evidence must retain the previous verified classification"
+    );
+    assert!(!stored[0].complete);
     Ok(())
 }
 
