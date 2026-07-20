@@ -79,6 +79,12 @@
 
 ### Performance
 
+- Grounding summary materialization now carries only node IDs and file ranks
+  through its window sort, rejoins full source rows afterward, and loads MEMBER
+  targets once through the existing covering edge index instead of issuing one
+  correlated lookup per snapshot node. The staged snapshot keeps the same rows,
+  file ranks, root direction, timing attribution, and bulk destination-index
+  order.
 - Full staged semantic publication now keyset-pages accepted symbol kinds
   directly from SQLite, resolves graph endpoints through cache-isolated bounded
   reads, and drops each page-local context after document emission instead of

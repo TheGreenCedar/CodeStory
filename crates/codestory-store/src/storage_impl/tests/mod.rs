@@ -6673,6 +6673,53 @@ fn staged_summary_build_uses_bulk_node_file_rank_index_for_file_aggregation()
         assert!(!sqlite_index_exists(&storage, index_name)?);
     }
 
+    let node_snapshot_plan_sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        grounding_node_snapshot_insert_sql()
+    );
+    let mut node_plan_stmt = storage.conn.prepare(&node_snapshot_plan_sql)?;
+    let node_plan = node_plan_stmt
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        node_plan
+            .iter()
+            .any(|line| line.contains("SCAN ranked_nodes")),
+        "node snapshot did not use the narrow ranking coroutine: {node_plan:?}"
+    );
+    assert!(
+        node_plan.iter().any(|line| {
+            line.contains("SEARCH n USING INTEGER PRIMARY KEY")
+                || line.contains("SEARCH n USING COVERING INDEX")
+        }),
+        "ranked node rows did not rejoin through a source-node index: {node_plan:?}"
+    );
+    assert!(
+        node_plan.iter().any(|line| line.contains("LIST SUBQUERY")),
+        "MEMBER targets were not materialized through one indexed list query: {node_plan:?}"
+    );
+    assert!(
+        node_plan
+            .iter()
+            .any(|line| line.contains("idx_edge_kind_target")),
+        "MEMBER-target root classification lost its covering lookup: {node_plan:?}"
+    );
+    assert!(
+        node_plan.iter().all(|line| !line.contains("CORRELATED")),
+        "MEMBER-target root classification regressed to per-node probes: {node_plan:?}"
+    );
+    assert!(
+        node_plan.iter().all(|line| !line.contains("AUTOMATIC")),
+        "node snapshot built an automatic duplicate index: {node_plan:?}"
+    );
+    assert!(
+        node_plan
+            .iter()
+            .all(|line| !line.contains("grounding_node_snapshot")),
+        "node snapshot maintained a destination index during insertion: {node_plan:?}"
+    );
+    drop(node_plan_stmt);
+
     storage.refresh_grounding_summary_snapshots_for_staged_finalize()?;
     assert!(sqlite_index_exists(
         &storage,
@@ -8015,6 +8062,234 @@ fn test_safe_enum_conversion() -> Result<(), StorageError> {
     let edges = storage.get_edges()?;
     assert_eq!(edges[0].kind, EdgeKind::ANNOTATION_USAGE);
 
+    Ok(())
+}
+
+#[test]
+fn grounding_node_snapshot_preserves_columns_rank_and_member_root_direction()
+-> Result<(), StorageError> {
+    #[derive(Debug, PartialEq)]
+    struct SnapshotRow {
+        node_id: i64,
+        kind: i32,
+        serialized_name: String,
+        qualified_name: Option<String>,
+        canonical_id: Option<String>,
+        file_node_id: Option<i64>,
+        start_line: Option<i64>,
+        start_col: Option<i64>,
+        end_line: Option<i64>,
+        end_col: Option<i64>,
+        display_name: String,
+        file_path: Option<String>,
+        node_rank: i64,
+        sort_start_line: i64,
+        is_root: i64,
+        file_symbol_rank: Option<i64>,
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_file(&FileInfo {
+        id: 100,
+        path: PathBuf::from("src/lib.rs"),
+        language: "rust".to_string(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 20,
+        file_role: FileRole::Source,
+    })?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: "source-node-path.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(200),
+            kind: NodeKind::FILE,
+            serialized_name: "generated/fallback.ts".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(101),
+            kind: NodeKind::STRUCT,
+            serialized_name: "Widget".to_string(),
+            qualified_name: Some("crate::Widget".to_string()),
+            canonical_id: Some("rust:struct:Widget".to_string()),
+            file_node_id: Some(NodeId(100)),
+            start_line: Some(2),
+            start_col: Some(3),
+            end_line: Some(8),
+            end_col: Some(1),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(102),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "run".to_string(),
+            file_node_id: Some(NodeId(100)),
+            start_line: Some(10),
+            start_col: Some(1),
+            end_line: Some(12),
+            end_col: Some(2),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(103),
+            kind: NodeKind::MODULE,
+            serialized_name: "\"./types\"".to_string(),
+            file_node_id: Some(NodeId(100)),
+            start_line: Some(1),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(201),
+            kind: NodeKind::CLASS,
+            serialized_name: "Fallback".to_string(),
+            file_node_id: Some(NodeId(200)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(202),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "excluded".to_string(),
+            file_node_id: Some(NodeId(200)),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[Edge {
+        id: EdgeId(1),
+        source: NodeId(101),
+        target: NodeId(102),
+        kind: EdgeKind::MEMBER,
+        file_node_id: Some(NodeId(100)),
+        ..Default::default()
+    }])?;
+
+    storage.refresh_grounding_summary_snapshots()?;
+    let mut stmt = storage.conn.prepare(
+        "SELECT
+            node_id,
+            kind,
+            serialized_name,
+            qualified_name,
+            canonical_id,
+            file_node_id,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            display_name,
+            file_path,
+            node_rank,
+            sort_start_line,
+            is_root,
+            file_symbol_rank
+         FROM grounding_node_snapshot
+         ORDER BY node_id",
+    )?;
+    let actual = stmt
+        .query_map([], |row| {
+            Ok(SnapshotRow {
+                node_id: row.get(0)?,
+                kind: row.get(1)?,
+                serialized_name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                canonical_id: row.get(4)?,
+                file_node_id: row.get(5)?,
+                start_line: row.get(6)?,
+                start_col: row.get(7)?,
+                end_line: row.get(8)?,
+                end_col: row.get(9)?,
+                display_name: row.get(10)?,
+                file_path: row.get(11)?,
+                node_rank: row.get(12)?,
+                sort_start_line: row.get(13)?,
+                is_root: row.get(14)?,
+                file_symbol_rank: row.get(15)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    assert_eq!(
+        actual,
+        vec![
+            SnapshotRow {
+                node_id: 101,
+                kind: NodeKind::STRUCT as i32,
+                serialized_name: "Widget".to_string(),
+                qualified_name: Some("crate::Widget".to_string()),
+                canonical_id: Some("rust:struct:Widget".to_string()),
+                file_node_id: Some(100),
+                start_line: Some(2),
+                start_col: Some(3),
+                end_line: Some(8),
+                end_col: Some(1),
+                display_name: "crate::Widget".to_string(),
+                file_path: Some("src/lib.rs".to_string()),
+                node_rank: 0,
+                sort_start_line: 2,
+                is_root: 1,
+                file_symbol_rank: Some(1),
+            },
+            SnapshotRow {
+                node_id: 102,
+                kind: NodeKind::FUNCTION as i32,
+                serialized_name: "run".to_string(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(100),
+                start_line: Some(10),
+                start_col: Some(1),
+                end_line: Some(12),
+                end_col: Some(2),
+                display_name: "run".to_string(),
+                file_path: Some("src/lib.rs".to_string()),
+                node_rank: 1,
+                sort_start_line: 10,
+                is_root: 0,
+                file_symbol_rank: Some(2),
+            },
+            SnapshotRow {
+                node_id: 103,
+                kind: NodeKind::MODULE as i32,
+                serialized_name: "\"./types\"".to_string(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(100),
+                start_line: Some(1),
+                start_col: None,
+                end_line: None,
+                end_col: None,
+                display_name: "\"./types\"".to_string(),
+                file_path: Some("src/lib.rs".to_string()),
+                node_rank: 5,
+                sort_start_line: 1,
+                is_root: 1,
+                file_symbol_rank: Some(3),
+            },
+            SnapshotRow {
+                node_id: 201,
+                kind: NodeKind::CLASS as i32,
+                serialized_name: "Fallback".to_string(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(200),
+                start_line: None,
+                start_col: None,
+                end_line: None,
+                end_col: None,
+                display_name: "Fallback".to_string(),
+                file_path: Some("generated/fallback.ts".to_string()),
+                node_rank: 0,
+                sort_start_line: 2_147_483_647,
+                is_root: 1,
+                file_symbol_rank: Some(1),
+            },
+        ]
+    );
     Ok(())
 }
 
