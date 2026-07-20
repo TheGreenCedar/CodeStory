@@ -674,8 +674,34 @@ fn shell_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
     let bytes = line.as_bytes();
     let mut delimiters = Vec::new();
     let mut cursor = 0usize;
+    let mut quote = None;
     while cursor + 1 < bytes.len() {
-        if bytes[cursor..].starts_with(b"<<<") || !bytes[cursor..].starts_with(b"<<") {
+        let byte = bytes[cursor];
+        if let Some(active_quote) = quote {
+            if active_quote == b'"' && byte == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else {
+                if byte == active_quote {
+                    quote = None;
+                }
+                cursor += 1;
+            }
+            continue;
+        }
+        if byte == b'\\' {
+            cursor = (cursor + 2).min(bytes.len());
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            cursor += 1;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"<<<") {
+            cursor += 3;
+            continue;
+        }
+        if !bytes[cursor..].starts_with(b"<<") {
             cursor += 1;
             continue;
         }
@@ -687,17 +713,17 @@ fn shell_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
-        let quote = bytes
+        let delimiter_quote = bytes
             .get(cursor)
             .copied()
             .filter(|byte| matches!(byte, b'\'' | b'"'));
-        if quote.is_some() {
+        if delimiter_quote.is_some() {
             cursor += 1;
         }
         let start = cursor;
         while let Some(byte) = bytes.get(cursor) {
-            if quote.is_some_and(|quote| *byte == quote)
-                || quote.is_none()
+            if delimiter_quote.is_some_and(|quote| *byte == quote)
+                || delimiter_quote.is_none()
                     && (byte.is_ascii_whitespace()
                         || matches!(*byte, b';' | b'|' | b'&' | b'<' | b'>'))
             {
@@ -708,7 +734,7 @@ fn shell_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
         if cursor > start {
             delimiters.push((line[start..cursor].to_string(), strip_tabs));
         }
-        if quote.is_some() && bytes.get(cursor) == quote.as_ref() {
+        if delimiter_quote.is_some() && bytes.get(cursor) == delimiter_quote.as_ref() {
             cursor += 1;
         }
     }

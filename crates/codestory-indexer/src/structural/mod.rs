@@ -563,6 +563,82 @@ mod tests {
     }
 
     #[test]
+    fn shell_literal_heredoc_operators_do_not_hide_later_anchors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixtures = [
+            (
+                "double-quoted",
+                "printf '%s\\n' \"<<NOT_A_HEREDOC\"\nfunction after_double { echo ok; }\nsource ./after-double.zsh\n",
+                ["after_double", "./after-double.zsh"],
+            ),
+            (
+                "single-quoted",
+                "printf '%s\\n' '<<NOT_A_HEREDOC'\nfunction after_single { echo ok; }\nsource ./after-single.zsh\n",
+                ["after_single", "./after-single.zsh"],
+            ),
+            (
+                "escaped",
+                "printf '%s\\n' \\<<NOT_A_HEREDOC\nfunction after_escape { echo ok; }\nsource ./after-escape.zsh\n",
+                ["after_escape", "./after-escape.zsh"],
+            ),
+        ];
+
+        for (name, source, expected) in fixtures {
+            let path = dir.path().join(format!("{name}.zsh"));
+            std::fs::write(&path, source).expect("write shell fixture");
+            let storage = index_structural_file(&path).expect("index shell fixture");
+            let mut actual = storage
+                .structural_text_units
+                .iter()
+                .map(|unit| {
+                    exact_source_range_bytes(
+                        source,
+                        unit.start_line,
+                        unit.start_col,
+                        unit.end_line,
+                        unit.end_col,
+                    )
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .expect("unit exact source span")
+                    .to_string()
+                })
+                .collect::<Vec<_>>();
+            actual.sort();
+            let mut expected = expected.map(str::to_string).to_vec();
+            expected.sort();
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_real_quoted_heredocs_hide_body_anchors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("quoted-heredocs.zsh");
+        let source = "cat <<'SINGLE'\nfunction hidden_single { echo hidden; }\nsource ./hidden-single.zsh\nSINGLE\ncat <<\"DOUBLE\"\nfunction hidden_double { echo hidden; }\nsource ./hidden-double.zsh\nDOUBLE\ncat <<-'TABBED'\n\tfunction hidden_tabbed { echo hidden; }\n\tsource ./hidden-tabbed.zsh\n\tTABBED\nfunction visible { echo ok; }\nsource ./visible.zsh\n";
+        std::fs::write(&path, source).expect("write shell fixture");
+
+        let storage = index_structural_file(&path).expect("index shell fixture");
+        let mut actual = storage
+            .structural_text_units
+            .iter()
+            .map(|unit| {
+                exact_source_range_bytes(
+                    source,
+                    unit.start_line,
+                    unit.start_col,
+                    unit.end_line,
+                    unit.end_col,
+                )
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .expect("unit exact source span")
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, ["./visible.zsh", "visible"]);
+    }
+
+    #[test]
     fn generic_structural_routing_keeps_specialized_and_parser_backed_precedence() {
         assert_eq!(
             structural_producer(Path::new(".github/workflows/ci.yaml")),
