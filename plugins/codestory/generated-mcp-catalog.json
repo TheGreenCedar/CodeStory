@@ -1148,7 +1148,8 @@
               "project_root",
               "usable",
               "summary",
-              "files"
+              "files",
+              "policy_exclusions"
             ]
           },
           {
@@ -1228,6 +1229,96 @@
           "message": {
             "description": "Human-readable API error message.",
             "type": "string"
+          },
+          "policy_exclusions": {
+            "description": "Verified policy exclusions without graph or semantic coverage.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Verified source intentionally excluded from parser scheduling without graph or semantic coverage.",
+              "properties": {
+                "byte_cap": {
+                  "description": "Bound source byte cap.",
+                  "type": "integer"
+                },
+                "content_hash": {
+                  "description": "Verified source content digest.",
+                  "type": "string"
+                },
+                "core_generation_id": {
+                  "description": "Bound source publication generation.",
+                  "type": "string"
+                },
+                "core_run_id": {
+                  "description": "Bound source publication run.",
+                  "type": "string"
+                },
+                "graph_coverage": {
+                  "description": "Always false for policy exclusions.",
+                  "type": "boolean"
+                },
+                "observed_size": {
+                  "description": "Observed source bytes.",
+                  "type": "integer"
+                },
+                "observed_unit_count": {
+                  "description": "Observed structural units, or zero for a byte-bound exclusion.",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "policy_version": {
+                  "description": "Bound exclusion policy version.",
+                  "type": "string"
+                },
+                "project_id": {
+                  "description": "Bound logical project identity.",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "Inferred file role.",
+                  "enum": [
+                    "source",
+                    "test",
+                    "generated",
+                    "vendor",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "semantic_coverage": {
+                  "description": "Always false for policy exclusions.",
+                  "type": "boolean"
+                },
+                "structural_unit_cap": {
+                  "description": "Bound structural unit cap.",
+                  "type": "integer"
+                },
+                "workspace_id": {
+                  "description": "Bound workspace identity.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "role",
+                "content_hash",
+                "observed_size",
+                "observed_unit_count",
+                "policy_version",
+                "byte_cap",
+                "structural_unit_cap",
+                "project_id",
+                "workspace_id",
+                "core_generation_id",
+                "core_run_id",
+                "graph_coverage",
+                "semantic_coverage"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "project_root": {
             "description": "Project root.",
