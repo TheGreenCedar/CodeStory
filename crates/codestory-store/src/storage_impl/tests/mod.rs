@@ -3420,6 +3420,106 @@ fn staged_build_node_lookup_batches_duplicates_without_touching_cache() -> Resul
 }
 
 #[test]
+fn staged_build_edge_batches_match_incident_edge_order_and_remain_bounded()
+-> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("semantic-edge-batches");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let mut storage = Storage::open_build(&db_path)?;
+    let nodes = (1_i64..=10)
+        .map(|id| Node {
+            id: NodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("node-{id}"),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    storage.insert_nodes_batch(&nodes)?;
+    let mut edges = vec![
+        Edge {
+            id: EdgeId(-9),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(3)),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            confidence: Some(0.2),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(-3),
+            source: NodeId(4),
+            target: NodeId(1),
+            kind: EdgeKind::USAGE,
+            ..Default::default()
+        },
+    ];
+    edges.extend((0_i64..9).map(|offset| Edge {
+        id: EdgeId(10 + offset),
+        source: NodeId(1),
+        target: NodeId(2 + offset),
+        kind: EdgeKind::MEMBER,
+        ..Default::default()
+    }));
+    storage.insert_edges_batch(&edges)?;
+    storage.cache.nodes.write().clear();
+
+    let expected = storage
+        .get_edges_for_node_ids(&[NodeId(1)])?
+        .remove(&NodeId(1))
+        .expect("seed edge list");
+    let mut streamed = Vec::new();
+    let mut after_edge_id = None;
+    loop {
+        let batch =
+            storage.get_edges_for_node_ids_batch_after_for_build(&[NodeId(1)], after_edge_id, 3)?;
+        assert!(batch.len() <= 3);
+        if batch.is_empty() {
+            break;
+        }
+        assert!(batch.windows(2).all(|pair| pair[0].id < pair[1].id));
+        after_edge_id = batch.last().map(|edge| edge.id);
+        streamed.extend(batch);
+    }
+    assert_eq!(streamed, expected);
+    assert_eq!(
+        streamed[0].resolved_target, None,
+        "streamed lookup must retain ignored CALL-resolution behavior"
+    );
+    assert!(
+        storage.cache.nodes.read().is_empty(),
+        "edge streaming must not populate StorageCache"
+    );
+    assert!(matches!(
+        storage.get_edges_for_node_ids_batch_after_for_build(&[NodeId(1)], None, 0),
+        Err(StorageError::InvalidBatchLimit(
+            "get_edges_for_node_ids_batch_after_for_build"
+        ))
+    ));
+    let too_many = (0..=BUILD_EDGE_SEED_BATCH_SIZE)
+        .map(|offset| NodeId(offset as i64 + 100))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        storage.get_edges_for_node_ids_batch_after_for_build(&too_many, None, 1),
+        Err(StorageError::BuildEdgeSeedBatchTooLarge {
+            actual,
+            maximum: BUILD_EDGE_SEED_BATCH_SIZE,
+            ..
+        }) if actual == BUILD_EDGE_SEED_BATCH_SIZE + 1
+    ));
+
+    drop(storage);
+    cleanup_sqlite_sidecars(&db_path)?;
+    let live = Storage::new_in_memory()?;
+    assert!(matches!(
+        live.get_edges_for_node_ids_batch_after_for_build(&[NodeId(1)], None, 1),
+        Err(StorageError::BuildModeRequired(
+            "get_edges_for_node_ids_batch_after_for_build"
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_scoped_search_symbol_projection_rebuild() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[

@@ -1,5 +1,5 @@
 use codestory_contracts::graph::{
-    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeKind,
+    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeId, EdgeKind,
     EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
@@ -54,7 +54,8 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
-const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
+pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
+const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
 const INDEX_ARTIFACT_CACHE_UPSERT_SQL: &str = "INSERT INTO index_artifact_cache (
@@ -1468,6 +1469,12 @@ pub enum StorageError {
     InvalidBatchLimit(&'static str),
     #[error("{0} requires build-mode storage")]
     BuildModeRequired(&'static str),
+    #[error("{operation} accepts at most {maximum} seed nodes per query, but received {actual}")]
+    BuildEdgeSeedBatchTooLarge {
+        operation: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
     #[error("Resolution support snapshot exceeds the current SQLite value limit")]
     ResolutionSupportSnapshotTooBig,
     #[error("Invalid enum value: {0}")]
@@ -5556,6 +5563,88 @@ impl Storage {
         }
 
         Ok(edges_by_node)
+    }
+
+    /// Reads one edge-ID-ordered batch incident to at most 200 staged-build seed nodes.
+    ///
+    /// Runtime callers keyset through one seed chunk until it is exhausted, then
+    /// discard the edge and endpoint payload before advancing. CALL resolution
+    /// filtering is identical to [`Self::get_edges_for_node_ids`].
+    pub fn get_edges_for_node_ids_batch_after_for_build(
+        &self,
+        node_ids: &[NodeId],
+        after_edge_id: Option<EdgeId>,
+        limit: usize,
+    ) -> Result<Vec<Edge>, StorageError> {
+        const OPERATION: &str = "get_edges_for_node_ids_batch_after_for_build";
+        self.require_build_mode(OPERATION)?;
+        let limit = build_node_batch_limit(OPERATION, limit)?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|node_id| node_id.0);
+        unique_node_ids.dedup();
+        if unique_node_ids.len() > BUILD_EDGE_SEED_BATCH_SIZE {
+            return Err(StorageError::BuildEdgeSeedBatchTooLarge {
+                operation: OPERATION,
+                actual: unique_node_ids.len(),
+                maximum: BUILD_EDGE_SEED_BATCH_SIZE,
+            });
+        }
+
+        let seed_count = unique_node_ids.len();
+        let source_placeholders = numbered_placeholders(1, seed_count);
+        let target_placeholders = numbered_placeholders(1 + seed_count, seed_count);
+        let resolved_source_placeholders = numbered_placeholders(1 + seed_count * 2, seed_count);
+        let resolved_target_placeholders = numbered_placeholders(1 + seed_count * 3, seed_count);
+        let after_placeholder = seed_count * 4 + 1;
+        let limit_placeholder = after_placeholder + usize::from(after_edge_id.is_some());
+        let after_clause = after_edge_id
+            .is_some()
+            .then(|| format!("AND e.id > ?{after_placeholder}"))
+            .unwrap_or_default();
+        let query = format!(
+            "{EDGE_SELECT_BASE}
+             WHERE (
+                    e.source_node_id IN ({source_placeholders})
+                 OR e.target_node_id IN ({target_placeholders})
+                 OR e.resolved_source_node_id IN ({resolved_source_placeholders})
+                 OR e.resolved_target_node_id IN ({resolved_target_placeholders})
+             )
+               {after_clause}
+             ORDER BY e.id
+             LIMIT ?{limit_placeholder}"
+        );
+        let mut params = unique_node_ids
+            .iter()
+            .map(|id| Value::from(id.0))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .collect::<Vec<_>>();
+        if let Some(after_edge_id) = after_edge_id {
+            params.push(Value::from(after_edge_id.0));
+        }
+        params.push(Value::from(limit));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut edge = Self::edge_from_row(row)?;
+            let target_symbol: String = row.get(12)?;
+            if edge.kind == EdgeKind::CALL
+                && edge.resolved_target.is_some()
+                && should_ignore_call_resolution(&target_symbol, edge.certainty, edge.confidence)
+            {
+                edge.resolved_target = None;
+                edge.confidence = None;
+                edge.certainty = None;
+            }
+            edges.push(edge);
+        }
+        Ok(edges)
     }
 
     pub fn get_present_node_kinds(&self) -> Result<Vec<NodeKind>, StorageError> {

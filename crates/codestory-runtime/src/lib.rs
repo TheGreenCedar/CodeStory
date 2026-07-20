@@ -53,10 +53,11 @@ use codestory_indexer::{
     IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
 use codestory_store::{
-    CURRENT_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata, FileInfo,
-    FileRole as StoreFileRole, GroundingEdgeKindCount, GroundingNodeRecord, IndexPublicationMode,
-    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore,
-    Store, SymbolSearchDoc, SymbolSummaryRecord,
+    BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
+    DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
+    GroundingNodeRecord, IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
+    SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 #[cfg(test)]
@@ -6040,6 +6041,7 @@ const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_STREAM_BATCH_SIZE: usize = 4_096;
 const SEMANTIC_NODE_STREAM_BATCH_SIZE: usize = 4_096;
+const SEMANTIC_EDGE_STREAM_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 512;
 #[cfg(test)]
 const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
@@ -7385,6 +7387,83 @@ struct SemanticDocGraphPageStats {
     lookup_entries: u32,
 }
 
+#[derive(Debug, Default)]
+struct SemanticNodeGraphSummary {
+    child_labels: Vec<String>,
+    referenced_labels: Vec<String>,
+    edge_kind_counts: HashMap<String, usize>,
+}
+
+impl SemanticNodeGraphSummary {
+    fn observe_edge(
+        &mut self,
+        node: &GraphNode,
+        edge: &GraphEdge,
+        page_nodes: &HashMap<GraphNodeId, &GraphNode>,
+        endpoint_nodes: &HashMap<GraphNodeId, GraphNode>,
+        scope: SemanticDocScope,
+    ) {
+        let kind = format!("{:?}", edge.kind);
+        *self.edge_kind_counts.entry(kind).or_insert(0) += 1;
+
+        if self.child_labels.len() < 6
+            && edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+            && edge.source == node.id
+            && let Some(child) = semantic_graph_node(edge.target, page_nodes, endpoint_nodes)
+            && llm_indexable_kind_for_scope(child.kind, scope)
+        {
+            let label = node_display_name(child);
+            if !label.is_empty() {
+                self.child_labels.push(label);
+            }
+        }
+
+        if self.referenced_labels.len() >= 6 {
+            return;
+        }
+        let (source, target) = edge.effective_endpoints();
+        let other = if source == node.id {
+            target
+        } else if target == node.id {
+            source
+        } else {
+            return;
+        };
+        let Some(other_node) = semantic_graph_node(other, page_nodes, endpoint_nodes) else {
+            return;
+        };
+        if !llm_indexable_kind_for_scope(other_node.kind, scope) {
+            return;
+        }
+        let label = node_display_name(other_node);
+        if !label.is_empty() && !self.referenced_labels.contains(&label) {
+            self.referenced_labels.push(label);
+        }
+    }
+
+    fn edge_digest(self, limit: usize) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut counts = self.edge_kind_counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        let edge_digest = counts
+            .into_iter()
+            .take(limit)
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect();
+        (self.child_labels, self.referenced_labels, edge_digest)
+    }
+}
+
+fn semantic_graph_node<'a>(
+    node_id: GraphNodeId,
+    page_nodes: &'a HashMap<GraphNodeId, &'a GraphNode>,
+    endpoint_nodes: &'a HashMap<GraphNodeId, GraphNode>,
+) -> Option<&'a GraphNode> {
+    page_nodes
+        .get(&node_id)
+        .copied()
+        .or_else(|| endpoint_nodes.get(&node_id))
+}
+
 impl SemanticDocGraphContext {
     #[cfg(test)]
     fn build(
@@ -7474,63 +7553,29 @@ impl SemanticDocGraphContext {
         scope: SemanticDocScope,
         all_file_paths: &HashMap<GraphNodeId, String>,
         all_file_read_paths: &HashMap<GraphNodeId, String>,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<(Self, SemanticDocGraphPageStats), ApiError> {
         let semantic_node_ids = semantic_nodes
             .iter()
             .map(|node| node.id)
             .collect::<Vec<_>>();
-        let page_node_ids = semantic_node_ids.iter().copied().collect::<HashSet<_>>();
-        let edges_by_node = storage
-            .get_edges_for_node_ids(&semantic_node_ids)
-            .map_err(|e| {
-                ApiError::internal(format!("Failed to load semantic doc graph context: {e}"))
-            })?;
+        let page_nodes = semantic_nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
         let context_file_ids = semantic_nodes
             .iter()
             .filter_map(|node| node.file_node_id)
             .collect::<HashSet<_>>();
-        let mut endpoint_ids = HashSet::new();
-        for edges in edges_by_node.values() {
-            for edge in edges {
-                let (effective_source, effective_target) = edge.effective_endpoints();
-                endpoint_ids.insert(effective_source);
-                endpoint_ids.insert(effective_target);
-                if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
-                    && page_node_ids.contains(&edge.source)
-                {
-                    endpoint_ids.insert(edge.target);
-                }
-            }
-        }
-        endpoint_ids.extend(
-            context_file_ids
-                .iter()
-                .filter(|file_id| !all_file_paths.contains_key(file_id))
-                .copied(),
-        );
-        endpoint_ids.retain(|node_id| !page_node_ids.contains(node_id));
-        let mut endpoint_ids = endpoint_ids.into_iter().collect::<Vec<_>>();
-        endpoint_ids.sort_unstable_by_key(|node_id| node_id.0);
-
-        let endpoint_load_started = Instant::now();
-        let endpoint_lookup = storage
-            .get_nodes_by_ids_no_cache_for_build(&endpoint_ids)
-            .map_err(|e| {
-                ApiError::internal(format!("Failed to load semantic endpoint nodes: {e}"))
-            })?;
-        let endpoint_load_ms = clamp_u128_to_u32(endpoint_load_started.elapsed().as_millis());
-        let endpoint_rows = endpoint_lookup.nodes.len();
-
-        let mut nodes_by_id = semantic_nodes
+        let mut stats = SemanticDocGraphPageStats {
+            lookup_entries: clamp_usize_to_u32(semantic_nodes.len()),
+            ..Default::default()
+        };
+        let mut summaries = semantic_node_ids
             .iter()
-            .map(|node| (node.id, node))
+            .copied()
+            .map(|node_id| (node_id, SemanticNodeGraphSummary::default()))
             .collect::<HashMap<_, _>>();
-        nodes_by_id.extend(
-            endpoint_lookup
-                .nodes
-                .iter()
-                .map(|(node_id, node)| (*node_id, node)),
-        );
         let mut file_paths = context_file_ids
             .iter()
             .filter_map(|file_id| {
@@ -7549,8 +7594,33 @@ impl SemanticDocGraphContext {
                     .map(|path| (*file_id, path))
             })
             .collect::<HashMap<_, _>>();
-        for file_id in context_file_ids {
-            if let Some(file_node) = nodes_by_id.get(&file_id) {
+
+        let mut missing_file_ids = context_file_ids
+            .iter()
+            .filter(|file_id| !all_file_paths.contains_key(file_id))
+            .copied()
+            .collect::<Vec<_>>();
+        missing_file_ids.sort_unstable_by_key(|node_id| node_id.0);
+        if !missing_file_ids.is_empty() {
+            let endpoint_load_started = Instant::now();
+            let file_lookup = storage
+                .get_nodes_by_ids_no_cache_for_build(&missing_file_ids)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to load semantic file-node fallbacks: {e}"))
+                })?;
+            stats.endpoint_load_ms = stats.endpoint_load_ms.saturating_add(clamp_u128_to_u32(
+                endpoint_load_started.elapsed().as_millis(),
+            ));
+            stats.endpoint_rows = stats
+                .endpoint_rows
+                .saturating_add(clamp_usize_to_u32(file_lookup.nodes.len()));
+            stats.endpoint_query_batches = stats
+                .endpoint_query_batches
+                .saturating_add(clamp_usize_to_u32(file_lookup.query_batches));
+            stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
+                semantic_nodes.len().saturating_add(file_lookup.nodes.len()),
+            ));
+            for (file_id, file_node) in file_lookup.nodes {
                 file_paths
                     .entry(file_id)
                     .or_insert_with(|| file_node.serialized_name.clone());
@@ -7560,40 +7630,118 @@ impl SemanticDocGraphContext {
             }
         }
 
+        for seed_node_ids in semantic_node_ids.chunks(BUILD_EDGE_SEED_BATCH_SIZE) {
+            let seed_node_id_set = seed_node_ids.iter().copied().collect::<HashSet<_>>();
+            let mut after_edge_id = None;
+            loop {
+                if is_indexing_cancelled(cancel_token) {
+                    return Err(indexing_cancelled_error());
+                }
+                let edges = storage
+                    .get_edges_for_node_ids_batch_after_for_build(
+                        seed_node_ids,
+                        after_edge_id,
+                        SEMANTIC_EDGE_STREAM_BATCH_SIZE,
+                    )
+                    .map_err(|e| {
+                        ApiError::internal(format!(
+                            "Failed to stream semantic doc graph context: {e}"
+                        ))
+                    })?;
+                if edges.is_empty() {
+                    break;
+                }
+                after_edge_id = edges.last().map(|edge| edge.id);
+
+                let mut endpoint_ids = HashSet::new();
+                for edge in &edges {
+                    let (source, target) = edge.effective_endpoints();
+                    let mut assigned_node_ids = [None, None];
+                    if seed_node_id_set.contains(&source) {
+                        assigned_node_ids[0] = Some(source);
+                    }
+                    if target != source && seed_node_id_set.contains(&target) {
+                        assigned_node_ids[1] = Some(target);
+                    }
+                    if assigned_node_ids.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    endpoint_ids.insert(source);
+                    endpoint_ids.insert(target);
+                    if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+                        && assigned_node_ids.contains(&Some(edge.source))
+                    {
+                        endpoint_ids.insert(edge.target);
+                    }
+                }
+                endpoint_ids.retain(|node_id| !page_nodes.contains_key(node_id));
+                let mut endpoint_ids = endpoint_ids.into_iter().collect::<Vec<_>>();
+                endpoint_ids.sort_unstable_by_key(|node_id| node_id.0);
+
+                let endpoint_load_started = Instant::now();
+                let endpoint_lookup = storage
+                    .get_nodes_by_ids_no_cache_for_build(&endpoint_ids)
+                    .map_err(|e| {
+                        ApiError::internal(format!("Failed to load semantic endpoint nodes: {e}"))
+                    })?;
+                stats.endpoint_load_ms = stats.endpoint_load_ms.saturating_add(clamp_u128_to_u32(
+                    endpoint_load_started.elapsed().as_millis(),
+                ));
+                stats.endpoint_rows = stats
+                    .endpoint_rows
+                    .saturating_add(clamp_usize_to_u32(endpoint_lookup.nodes.len()));
+                stats.endpoint_query_batches = stats
+                    .endpoint_query_batches
+                    .saturating_add(clamp_usize_to_u32(endpoint_lookup.query_batches));
+                stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
+                    semantic_nodes
+                        .len()
+                        .saturating_add(endpoint_lookup.nodes.len()),
+                ));
+
+                for edge in &edges {
+                    let (source, target) = edge.effective_endpoints();
+                    if seed_node_id_set.contains(&source)
+                        && let Some(node) = page_nodes.get(&source).copied()
+                    {
+                        summaries.entry(source).or_default().observe_edge(
+                            node,
+                            edge,
+                            &page_nodes,
+                            &endpoint_lookup.nodes,
+                            scope,
+                        );
+                    }
+                    if target != source
+                        && seed_node_id_set.contains(&target)
+                        && let Some(node) = page_nodes.get(&target).copied()
+                    {
+                        summaries.entry(target).or_default().observe_edge(
+                            node,
+                            edge,
+                            &page_nodes,
+                            &endpoint_lookup.nodes,
+                            scope,
+                        );
+                    }
+                }
+            }
+        }
+
         let mut context = Self {
             file_paths,
             file_read_paths,
             ..Default::default()
         };
         for node in semantic_nodes {
-            let edges = edges_by_node
-                .get(&node.id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            context.child_labels.insert(
-                node.id,
-                child_symbol_labels_from_edges(node, edges, &nodes_by_id, 6, scope),
-            );
-            context.referenced_labels.insert(
-                node.id,
-                referenced_symbol_labels_from_edges(node, edges, &nodes_by_id, 6, scope),
-            );
-            context
-                .edge_digests
-                .insert(node.id, edge_digest_for_edges(edges, 6));
+            let summary = summaries.remove(&node.id).unwrap_or_default();
+            let (child_labels, referenced_labels, edge_digest) = summary.edge_digest(6);
+            context.child_labels.insert(node.id, child_labels);
+            context.referenced_labels.insert(node.id, referenced_labels);
+            context.edge_digests.insert(node.id, edge_digest);
         }
 
-        Ok((
-            context,
-            SemanticDocGraphPageStats {
-                endpoint_load_ms,
-                endpoint_rows: clamp_usize_to_u32(endpoint_rows),
-                endpoint_query_batches: clamp_usize_to_u32(endpoint_lookup.query_batches),
-                lookup_entries: clamp_usize_to_u32(
-                    semantic_nodes.len().saturating_add(endpoint_rows),
-                ),
-            },
-        ))
+        Ok((context, stats))
     }
 
     fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
@@ -9461,6 +9609,7 @@ fn sync_full_llm_symbol_projection_streaming_for_runtime(
             semantic_scope,
             &file_paths,
             &file_read_paths,
+            cancel_token,
         )?;
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::SemanticEndpointRead, cancel_token)?;
@@ -25978,6 +26127,432 @@ fn build_llm_symbol_doc_text() -> String {
             4_097,
             "retained component-report artifacts must not re-enter the symbol stream"
         );
+    }
+
+    #[test]
+    fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
+        const INCIDENT_EDGE_COUNT: i64 = SEMANTIC_EDGE_STREAM_BATCH_SIZE as i64 * 2 + 17;
+        const RESOLVED_MEMBER_TARGET: CoreNodeId = CoreNodeId(10_000 + INCIDENT_EDGE_COUNT - 1);
+        const IGNORED_CALL_RAW_TARGET: CoreNodeId = CoreNodeId(90_000);
+        const IGNORED_CALL_RESOLVED_TARGET: CoreNodeId = CoreNodeId(90_001);
+
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("staged.db");
+        let mut storage = Storage::open_build(&storage_path).expect("open staged build");
+        let hub = Node {
+            id: CoreNodeId(1),
+            kind: NodeKind::CLASS,
+            serialized_name: "hub".to_string(),
+            ..Default::default()
+        };
+        let mut nodes = vec![hub.clone()];
+        nodes.extend((0_i64..INCIDENT_EDGE_COUNT).map(|offset| Node {
+            id: CoreNodeId(10_000 + offset),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("child_{offset:05}"),
+            ..Default::default()
+        }));
+        nodes.extend([
+            Node {
+                id: IGNORED_CALL_RAW_TARGET,
+                kind: NodeKind::BUILTIN_TYPE,
+                serialized_name: "ignored_raw_target".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: IGNORED_CALL_RESOLVED_TARGET,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "ignored_resolution_must_not_appear".to_string(),
+                ..Default::default()
+            },
+        ]);
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert high-degree nodes");
+        let mut edges = vec![Edge {
+            id: EdgeId(-1),
+            source: hub.id,
+            target: IGNORED_CALL_RAW_TARGET,
+            kind: EdgeKind::CALL,
+            resolved_target: Some(IGNORED_CALL_RESOLVED_TARGET),
+            confidence: Some(0.2),
+            certainty: Some(codestory_contracts::graph::ResolutionCertainty::Uncertain),
+            ..Default::default()
+        }];
+        edges.extend(
+            (0_i64..INCIDENT_EDGE_COUNT)
+                .map(|offset| Edge {
+                    id: EdgeId(offset + 1),
+                    source: hub.id,
+                    target: CoreNodeId(10_000 + offset),
+                    kind: EdgeKind::MEMBER,
+                    resolved_target: (offset == 0).then_some(RESOLVED_MEMBER_TARGET),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        );
+        storage
+            .insert_edges_batch(&edges)
+            .expect("insert high-degree edges");
+        storage
+            .create_semantic_context_endpoint_indexes_for_build()
+            .expect("create semantic endpoint indexes");
+
+        let legacy = SemanticDocGraphContext::build_for_scope(
+            &storage,
+            &[&hub],
+            &nodes,
+            SemanticDocScope::DurableSymbols,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("build legacy high-degree context");
+        let (streamed, stats) = SemanticDocGraphContext::build_for_full_page(
+            &storage,
+            std::slice::from_ref(&hub),
+            SemanticDocScope::DurableSymbols,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+        )
+        .expect("stream high-degree context");
+
+        assert_eq!(streamed.child_labels, legacy.child_labels);
+        assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+        assert_eq!(streamed.edge_digests, legacy.edge_digests);
+        assert_eq!(
+            streamed.child_labels.get(&hub.id),
+            Some(
+                &(0..6)
+                    .map(|offset| format!("child_{offset:05}"))
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(
+            streamed.edge_digests.get(&hub.id),
+            Some(&vec![
+                format!("MEMBER={INCIDENT_EDGE_COUNT}"),
+                "CALL=1".to_string(),
+            ])
+        );
+        assert!(
+            !streamed
+                .referenced_labels
+                .get(&hub.id)
+                .expect("hub referenced labels")
+                .iter()
+                .any(|label| label == "ignored_resolution_must_not_appear"),
+            "ignored CALL resolution must retain the raw non-indexable endpoint"
+        );
+        assert!(stats.endpoint_rows >= INCIDENT_EDGE_COUNT as u32);
+        assert!(
+            stats.lookup_entries <= (SEMANTIC_EDGE_STREAM_BATCH_SIZE + 3) as u32,
+            "high-degree endpoint state exceeded one bounded edge batch: {stats:?}"
+        );
+        assert!(
+            stats.endpoint_rows > stats.lookup_entries,
+            "telemetry must distinguish cumulative endpoint rows from peak lookup entries"
+        );
+    }
+
+    #[test]
+    fn staged_semantic_graph_context_counts_cross_seed_chunk_edge_once_per_endpoint() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("staged.db");
+        let mut storage = Storage::open_build(&storage_path).expect("open staged build");
+        let nodes = (1_i64..=BUILD_EDGE_SEED_BATCH_SIZE as i64 + 1)
+            .map(|id| Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("node_{id:03}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert cross-chunk nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(1),
+                source: nodes[0].id,
+                target: nodes[BUILD_EDGE_SEED_BATCH_SIZE].id,
+                kind: EdgeKind::USAGE,
+                ..Default::default()
+            }])
+            .expect("insert cross-chunk edge");
+        storage
+            .create_semantic_context_endpoint_indexes_for_build()
+            .expect("create semantic endpoint indexes");
+
+        let node_refs = nodes.iter().collect::<Vec<_>>();
+        let legacy = SemanticDocGraphContext::build_for_scope(
+            &storage,
+            &node_refs,
+            &nodes,
+            SemanticDocScope::DurableSymbols,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("build legacy cross-chunk context");
+        let (streamed, stats) = SemanticDocGraphContext::build_for_full_page(
+            &storage,
+            &nodes,
+            SemanticDocScope::DurableSymbols,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+        )
+        .expect("stream cross-chunk context");
+
+        assert_eq!(streamed.child_labels, legacy.child_labels);
+        assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+        assert_eq!(streamed.edge_digests, legacy.edge_digests);
+        for endpoint in [nodes[0].id, nodes[BUILD_EDGE_SEED_BATCH_SIZE].id] {
+            assert_eq!(
+                streamed.edge_digests.get(&endpoint),
+                Some(&vec!["USAGE=1".to_string()])
+            );
+        }
+        assert_eq!(stats.lookup_entries, nodes.len() as u32);
+    }
+
+    #[test]
+    fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_reports() {
+        const SYMBOL_COUNT: i64 = 4_097;
+        const FILE_COUNT: i64 = 13;
+        const STALE_NODE_ID: CoreNodeId = CoreNodeId(900_000);
+
+        let _env = hybrid_test_env();
+        let _tokens = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "8192");
+        let temp = tempdir().expect("create temp dir");
+        let mut files = Vec::new();
+        let mut file_nodes = Vec::new();
+        for file_index in 0_i64..FILE_COUNT {
+            let file_name = if file_index == 0 {
+                "lib.rs".to_string()
+            } else {
+                format!("unit_{file_index:02}.rs")
+            };
+            let path = temp.path().join("crates/demo/src").join(file_name);
+            fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture parent");
+            fs::write(&path, format!("pub fn source_{file_index:02}() {{}}\n"))
+                .expect("write semantic source fixture");
+            let file_id = CoreNodeId(100_000 + file_index);
+            files.push(FileInfo {
+                id: file_id.0,
+                path: path.clone(),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            });
+            file_nodes.push(Node {
+                id: file_id,
+                kind: NodeKind::FILE,
+                serialized_name: path.to_string_lossy().to_string(),
+                ..Default::default()
+            });
+        }
+        let symbols = (1_i64..=SYMBOL_COUNT)
+            .map(|id| Node {
+                id: CoreNodeId(id),
+                kind: if id == 1 {
+                    NodeKind::STRUCT
+                } else {
+                    NodeKind::FUNCTION
+                },
+                serialized_name: format!("symbol_{id:04}"),
+                qualified_name: Some(format!("demo::symbol_{id:04}")),
+                file_node_id: Some(CoreNodeId(100_000 + (id - 1) % FILE_COUNT)),
+                start_line: Some(1),
+                end_line: Some(1),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let external_nodes = (0_i64..10)
+            .map(|offset| Node {
+                id: CoreNodeId(200_000 + offset),
+                kind: NodeKind::BUILTIN_TYPE,
+                serialized_name: format!("external_{offset:02}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let ranked_node_ids = (1_i64..=9)
+            .chain(std::iter::once(SYMBOL_COUNT))
+            .collect::<Vec<_>>();
+        let edges = ranked_node_ids
+            .iter()
+            .enumerate()
+            .map(|(offset, node_id)| Edge {
+                id: EdgeId(offset as i64 + 1),
+                source: CoreNodeId(*node_id),
+                target: external_nodes[offset].id,
+                kind: EdgeKind::CALL,
+                resolved_target: (*node_id == SYMBOL_COUNT).then_some(CoreNodeId(2)),
+                confidence: (*node_id == SYMBOL_COUNT).then_some(0.2),
+                certainty: (*node_id == SYMBOL_COUNT)
+                    .then_some(codestory_contracts::graph::ResolutionCertainty::Uncertain),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let stale_symbol_doc = SymbolSearchDoc {
+            node_id: STALE_NODE_ID,
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "stale".to_string(),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: "stale".to_string(),
+            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            doc_hash: "stale".to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            updated_at_epoch_ms: 1,
+        };
+        let stale_dense_input = DenseAnchorInput {
+            node_id: STALE_NODE_ID,
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "stale".to_string(),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            file_role: codestory_store::FileRole::Source,
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: "stale".to_string(),
+            document_hash: "stale".to_string(),
+            selection_reason: DenseAnchorReason::PublicApi.as_str().to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: "core:stale".to_string(),
+            updated_at_epoch_ms: 1,
+        };
+
+        let seed = |storage: &mut Storage| {
+            storage
+                .insert_files_batch(&files)
+                .expect("insert semantic files");
+            let mut nodes = file_nodes.clone();
+            nodes.extend(symbols.clone());
+            nodes.extend(external_nodes.clone());
+            nodes.push(Node {
+                id: STALE_NODE_ID,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "component_report:stale".to_string(),
+                canonical_id: Some("codestory:component_report:stale".to_string()),
+                ..Default::default()
+            });
+            storage
+                .insert_nodes_batch(&nodes)
+                .expect("insert semantic nodes");
+            storage
+                .insert_component_access_batch(&[(CoreNodeId(1), AccessKind::Public)])
+                .expect("insert public semantic access");
+            storage
+                .insert_edges_batch(&edges)
+                .expect("insert semantic edges");
+            storage
+                .upsert_symbol_search_docs_batch(std::slice::from_ref(&stale_symbol_doc))
+                .expect("seed stale symbol doc");
+            storage
+                .upsert_dense_anchor_inputs_batch(std::slice::from_ref(&stale_dense_input))
+                .expect("seed stale dense input");
+        };
+
+        let legacy_path = temp.path().join("legacy.db");
+        let streamed_path = temp.path().join("streamed.db");
+        let mut legacy = Storage::open(&legacy_path).expect("open legacy store");
+        let mut streamed = Storage::open_build(&streamed_path).expect("open staged store");
+        seed(&mut legacy);
+        seed(&mut streamed);
+        let legacy_stats = finalize_staged_semantic_docs(&mut legacy, None, None, None)
+            .expect("build legacy semantic projection");
+        let streamed_stats = finalize_staged_semantic_docs(&mut streamed, None, None, None)
+            .expect("build streamed semantic projection");
+
+        let normalize_symbol_docs = |storage: &Storage| {
+            let mut docs = storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("load symbol docs");
+            for doc in &mut docs {
+                doc.updated_at_epoch_ms = 0;
+            }
+            docs
+        };
+        let normalize_dense_inputs = |storage: &Storage| {
+            let mut inputs = storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("load dense inputs");
+            for input in &mut inputs {
+                input.updated_at_epoch_ms = 0;
+            }
+            inputs
+        };
+        let legacy_docs = normalize_symbol_docs(&legacy);
+        let streamed_docs = normalize_symbol_docs(&streamed);
+        let legacy_dense = normalize_dense_inputs(&legacy);
+        let streamed_dense = normalize_dense_inputs(&streamed);
+
+        assert_eq!(streamed_stats.node_stream_batches, 2);
+        assert_eq!(legacy_stats.selected_nodes, SYMBOL_COUNT as u32);
+        assert_eq!(streamed_stats.selected_nodes, SYMBOL_COUNT as u32);
+        assert_eq!(legacy_stats.docs_stale, 2);
+        assert_eq!(streamed_stats.docs_stale, 2);
+        assert_eq!(streamed_docs, legacy_docs);
+        assert_eq!(streamed_dense, legacy_dense);
+        assert!(
+            streamed_docs
+                .windows(2)
+                .all(|pair| pair[0].node_id.0 < pair[1].node_id.0)
+        );
+        assert!(
+            streamed_dense
+                .windows(2)
+                .all(|pair| pair[0].node_id.0 < pair[1].node_id.0)
+        );
+        assert!(streamed_docs.iter().all(|doc| doc.node_id != STALE_NODE_ID));
+        assert!(
+            streamed_dense
+                .iter()
+                .all(|input| input.node_id != STALE_NODE_ID)
+        );
+        let dense_reasons = streamed_dense
+            .iter()
+            .map(|input| input.selection_reason.as_str())
+            .collect::<HashSet<_>>();
+        assert!(dense_reasons.contains(DenseAnchorReason::PublicApi.as_str()));
+        assert!(dense_reasons.contains(DenseAnchorReason::ComponentReport.as_str()));
+
+        let reports = streamed_docs
+            .iter()
+            .filter(|doc| doc.display_name.starts_with("component_report:"))
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0].doc_text;
+        assert!(report.contains("symbol_count: 4097"), "{report}");
+        assert!(report.contains("file_count: 12"), "{report}");
+        assert!(!report.contains("unit_12.rs"), "{report}");
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("- demo::symbol_"))
+                .count(),
+            8,
+            "{report}"
+        );
+        assert!(report.contains("- demo::symbol_0008 "), "{report}");
+        assert!(!report.contains("- demo::symbol_0009 "), "{report}");
+        assert!(!report.contains("- demo::symbol_4097 "), "{report}");
+        let dense_report = streamed_dense
+            .iter()
+            .find(|input| input.node_id == reports[0].node_id)
+            .expect("component report dense input");
+        assert_eq!(dense_report.text, reports[0].doc_text);
+        assert_eq!(dense_report.document_hash, reports[0].doc_hash);
     }
 
     #[test]
