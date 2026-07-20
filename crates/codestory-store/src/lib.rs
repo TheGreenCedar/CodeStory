@@ -19,11 +19,11 @@ pub use snapshot_store::{
 };
 pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BuildNodeLookup, CURRENT_SCHEMA_VERSION,
-    CallerProjectionRemovalSummary, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
-    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata,
-    DenseAnchorPublicationManifest, DenseReasonCounts, FileContentHash, FileInfo,
-    FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
-    GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
+    CallerProjectionRemovalSummary, CorePromotionStats, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorInput,
+    DenseAnchorInputReuseMetadata, DenseAnchorPublicationManifest, DenseReasonCounts,
+    FileContentHash, FileInfo, FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount,
+    GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
     IndexArtifactCacheReader, IndexArtifactCacheWrite, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
     ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats, ProjectionPersistenceStats,

@@ -365,6 +365,17 @@ fn retained_phase_timings_preserve_additive_diagnostics() {
     let index_json = serde_json::json!({
         "phase_timings": {
             "parse_index_ms": 12,
+            "staged_snapshot_copy": {
+                "copy_ms": 13,
+                "source_bytes": 1024,
+                "target_bytes": 1024
+            },
+            "core_promotion": {
+                "total_ms": 21,
+                "staged_to_live_restore_ms": 8,
+                "candidate_bytes": 2048,
+                "unattributed_ms": 1
+            },
             "future_additive_diagnostic": {"rows": 34}
         }
     });
@@ -372,6 +383,8 @@ fn retained_phase_timings_preserve_additive_diagnostics() {
     let retained = retained_phase_timings(&index_json);
 
     assert_eq!(retained["parse_index_ms"], 12);
+    assert_eq!(retained["staged_snapshot_copy"]["source_bytes"], 1_024);
+    assert_eq!(retained["core_promotion"]["total_ms"], 21);
     assert_eq!(retained["future_additive_diagnostic"]["rows"], 34);
 }
 

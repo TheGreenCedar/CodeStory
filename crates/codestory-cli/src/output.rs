@@ -492,6 +492,50 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             timings.staged_sqlite_sync_ms.unwrap_or(0),
         );
     }
+    if let Some(copy) = timings.staged_snapshot_copy.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "staged_snapshot_copy: copy_ms={} source_bytes={} target_bytes={}",
+            copy.copy_ms, copy.source_bytes, copy.target_bytes,
+        );
+    }
+    if let Some(promotion) = timings.core_promotion.as_ref() {
+        let rollback_backup_copy_ms = promotion
+            .rollback_backup_copy_ms
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
+        let backup_validation_ms = promotion
+            .backup_validation_ms
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
+        let previous_live_bytes = promotion
+            .previous_live_bytes
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
+        let rollback_backup_bytes = promotion
+            .rollback_backup_bytes
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
+        let _ = writeln!(
+            markdown,
+            "core_promotion_ms: total={} lock_recovery={} candidate_validation={} previous_validation={} rollback_backup_copy={} backup_validation={} prepared_journal_write={} prepared_journal_file_sync={} prepared_journal_directory_sync={} staged_to_live_restore={} promoted_validation={} committed_journal={} cleanup={} unattributed={}",
+            promotion.total_ms,
+            promotion.lock_recovery_ms,
+            promotion.candidate_validation_ms,
+            promotion.previous_validation_ms,
+            rollback_backup_copy_ms,
+            backup_validation_ms,
+            promotion.prepared_journal_write_ms,
+            promotion.prepared_journal_file_sync_ms,
+            promotion.prepared_journal_directory_sync_ms,
+            promotion.staged_to_live_restore_ms,
+            promotion.promoted_validation_ms,
+            promotion.committed_journal_ms,
+            promotion.cleanup_ms,
+            promotion.unattributed_ms,
+        );
+        let _ = writeln!(
+            markdown,
+            "core_promotion_bytes: candidate={} previous_live={} rollback_backup={}",
+            promotion.candidate_bytes, previous_live_bytes, rollback_backup_bytes,
+        );
+    }
     append_optional_timings_line(
         markdown,
         "setup_ms",
@@ -3991,6 +4035,32 @@ mod tests {
         assert!(markdown.contains(
             "structural_artifact_cache: policy=read_through logical_lookups=3 physical_queries=3 hits=2 misses=1 reader_opens=1 lookup_wall_ms=7"
         ));
+    }
+
+    #[test]
+    fn index_timings_render_first_promotion_without_fabricated_backup_work() {
+        let timings = IndexingPhaseTimings {
+            core_promotion: Some(codestory_contracts::api::CorePromotionTimings {
+                total_ms: 9,
+                candidate_validation_ms: 2,
+                previous_validation_ms: 1,
+                staged_to_live_restore_ms: 3,
+                promoted_validation_ms: 2,
+                unattributed_ms: 1,
+                candidate_bytes: 4_096,
+                ..Default::default()
+            }),
+            ..IndexingPhaseTimings::default()
+        };
+        let mut markdown = String::new();
+
+        append_index_phase_timings(&mut markdown, &timings);
+
+        assert!(markdown.contains("rollback_backup_copy=none backup_validation=none"));
+        assert!(markdown.contains(
+            "core_promotion_bytes: candidate=4096 previous_live=none rollback_backup=none"
+        ));
+        assert!(!markdown.contains("staged_snapshot_copy:"));
     }
 
     #[test]

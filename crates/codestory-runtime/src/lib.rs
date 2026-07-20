@@ -13,7 +13,8 @@ use codestory_contracts::api::{
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload,
     ArtifactCacheAccessTimings, ArtifactCachePolicyDto, BookmarkCategoryDto, BookmarkDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
+    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    DatabaseSnapshotCopyTimings, EdgeId, EdgeKind, EdgeOccurrencesRequest,
     EmbeddingProfileContractDto, FileCoverageDiagnosticDto, FrameworkRouteCoverageDto,
     FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
     GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
@@ -4341,6 +4342,38 @@ fn projection_persistence_timings(
         callable_projection: projection_persistence_family_timings(stats.callable_projection),
         file_errors: projection_persistence_family_timings(stats.file_errors),
         dirty_state: projection_persistence_family_timings(stats.dirty_state),
+    }
+}
+
+fn database_snapshot_copy_timings(
+    stats: codestory_store::DatabaseSnapshotCopyStats,
+) -> DatabaseSnapshotCopyTimings {
+    DatabaseSnapshotCopyTimings {
+        copy_ms: stats.copy_ms,
+        source_bytes: stats.source_bytes,
+        target_bytes: stats.target_bytes,
+    }
+}
+
+fn core_promotion_timings(stats: codestory_store::CorePromotionStats) -> CorePromotionTimings {
+    CorePromotionTimings {
+        total_ms: stats.total_ms,
+        lock_recovery_ms: stats.lock_recovery_ms,
+        candidate_validation_ms: stats.candidate_validation_ms,
+        previous_validation_ms: stats.previous_validation_ms,
+        rollback_backup_copy_ms: stats.rollback_backup_copy_ms,
+        backup_validation_ms: stats.backup_validation_ms,
+        prepared_journal_write_ms: stats.prepared_journal_write_ms,
+        prepared_journal_file_sync_ms: stats.prepared_journal_file_sync_ms,
+        prepared_journal_directory_sync_ms: stats.prepared_journal_directory_sync_ms,
+        staged_to_live_restore_ms: stats.staged_to_live_restore_ms,
+        promoted_validation_ms: stats.promoted_validation_ms,
+        committed_journal_ms: stats.committed_journal_ms,
+        cleanup_ms: stats.cleanup_ms,
+        unattributed_ms: stats.unattributed_ms,
+        candidate_bytes: stats.candidate_bytes,
+        previous_live_bytes: stats.previous_live_bytes,
+        rollback_backup_bytes: stats.rollback_backup_bytes,
     }
 }
 
@@ -15919,6 +15952,10 @@ fn index_full_for_runtime(
                 .sqlite_wal_autocheckpoint_bytes,
             staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
             staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
+            staged_snapshot_copy: staged_publish_stats
+                .snapshot_copy
+                .map(database_snapshot_copy_timings),
+            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -16660,6 +16697,10 @@ fn run_incremental_indexing_common(
                 .sqlite_wal_autocheckpoint_bytes,
             staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
             staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
+            staged_snapshot_copy: staged_publish_stats
+                .snapshot_copy
+                .map(database_snapshot_copy_timings),
+            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -27838,6 +27879,25 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn full_and_incremental_publications_advance_one_durable_generation() {
+        let assert_promotion_reconciles = |promotion: &CorePromotionTimings| {
+            let named_ms = promotion
+                .lock_recovery_ms
+                .saturating_add(promotion.candidate_validation_ms)
+                .saturating_add(promotion.previous_validation_ms)
+                .saturating_add(promotion.rollback_backup_copy_ms.unwrap_or_default())
+                .saturating_add(promotion.backup_validation_ms.unwrap_or_default())
+                .saturating_add(promotion.prepared_journal_write_ms)
+                .saturating_add(promotion.prepared_journal_file_sync_ms)
+                .saturating_add(promotion.prepared_journal_directory_sync_ms)
+                .saturating_add(promotion.staged_to_live_restore_ms)
+                .saturating_add(promotion.promoted_validation_ms)
+                .saturating_add(promotion.committed_journal_ms)
+                .saturating_add(promotion.cleanup_ms);
+            assert_eq!(
+                named_ms.saturating_add(promotion.unattributed_ms),
+                promotion.total_ms
+            );
+        };
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -27913,6 +27973,17 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(full_timings.staged_sqlite_checkpoint_ms.is_some());
         assert!(full_timings.staged_sqlite_sync_ms.is_some());
+        assert!(full_timings.staged_snapshot_copy.is_none());
+        let full_promotion = full_timings
+            .core_promotion
+            .as_ref()
+            .expect("first full promotion telemetry");
+        assert!(full_promotion.previous_live_bytes.is_none());
+        assert!(full_promotion.rollback_backup_copy_ms.is_none());
+        assert!(full_promotion.backup_validation_ms.is_none());
+        assert!(full_promotion.rollback_backup_bytes.is_none());
+        assert!(full_promotion.candidate_bytes > 0);
+        assert_promotion_reconciles(full_promotion);
         assert_eq!(full_timings.search_projection_rebuild_ms, Some(0));
         assert!(full_timings.search_symbol_stream_ms.is_some());
         assert!(
@@ -28065,6 +28136,27 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(incremental_timings.staged_sqlite_checkpoint_ms.is_none());
         assert!(incremental_timings.staged_sqlite_sync_ms.is_none());
+        let incremental_copy = incremental_timings
+            .staged_snapshot_copy
+            .as_ref()
+            .expect("incremental snapshot-copy telemetry");
+        assert!(incremental_copy.source_bytes > 0);
+        assert_eq!(incremental_copy.source_bytes, incremental_copy.target_bytes);
+        let incremental_promotion = incremental_timings
+            .core_promotion
+            .as_ref()
+            .expect("incremental promotion telemetry");
+        assert_eq!(
+            incremental_promotion.previous_live_bytes,
+            Some(incremental_copy.source_bytes)
+        );
+        assert_eq!(
+            incremental_promotion.rollback_backup_bytes,
+            incremental_promotion.previous_live_bytes
+        );
+        assert!(incremental_promotion.rollback_backup_copy_ms.is_some());
+        assert!(incremental_promotion.backup_validation_ms.is_some());
+        assert_promotion_reconciles(incremental_promotion);
         assert_eq!(incremental_timings.search_projection_rebuild_ms, Some(0));
         assert!(incremental_timings.search_symbol_stream_ms.is_some());
         assert!(
@@ -28082,9 +28174,22 @@ fn build_llm_symbol_doc_text() -> String {
         assert_ne!(second.generation_id, first.generation_id);
         assert_ne!(second.run_id, first.run_id);
 
-        controller
+        let second_full_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("second full publication");
+        assert!(second_full_timings.staged_snapshot_copy.is_none());
+        let second_full_promotion = second_full_timings
+            .core_promotion
+            .as_ref()
+            .expect("replacement full promotion telemetry");
+        assert!(second_full_promotion.previous_live_bytes.is_some());
+        assert!(second_full_promotion.rollback_backup_copy_ms.is_some());
+        assert!(second_full_promotion.backup_validation_ms.is_some());
+        assert_eq!(
+            second_full_promotion.rollback_backup_bytes,
+            second_full_promotion.previous_live_bytes
+        );
+        assert_promotion_reconciles(second_full_promotion);
         let third = controller
             .index_publication()
             .expect("read third publication")

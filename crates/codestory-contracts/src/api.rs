@@ -72,8 +72,9 @@ pub use errors::{
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto,
 };
 pub use events::{
-    AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, FullRefreshWallTimings,
-    IndexingPhaseTimings, ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
+    AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
+    DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IndexingPhaseTimings,
+    ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings,
 };
 pub use ids::{EdgeId, NodeId};
 pub use types::{
