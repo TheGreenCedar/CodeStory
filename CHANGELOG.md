@@ -10,6 +10,8 @@
   checksum, executable, and CLI version before using that development
   override. Missing or changed receipt inputs and simultaneous raw overrides
   fail closed without falling through to the production release installer.
+  The launcher now owns the MCP initialize handshake and relays the verified
+  native runtime through explicit pipes instead of grandchild stdio inheritance.
 - MCP repository resources now advertise canonical project-bound URI templates
   while the static agent guide remains project-free. Strict URI parsing
   preserves native path identity across spaces, percent characters, Unicode,

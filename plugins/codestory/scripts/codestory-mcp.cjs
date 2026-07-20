@@ -2760,37 +2760,33 @@ async function main() {
   }
   resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
   rememberLaunch(resolved, runtimeCwd);
-  const child = spawnStdioRuntime(resolved, runtimeCwd, 'inherit');
-
-  child.on('exit', (code, signal) => {
-    if (signal) process.kill(process.pid, signal);
-    if (!code) {
-      process.exit(0);
-      return;
-    }
-    runFailOpenMcp(fallbackDiagnostic(resolved, {
-      ...probe,
-      status: code,
-      error: `codestory-cli serve --stdio exited with status ${code}`,
-      stderr: probe.stderr || '',
-    }, 'runtime_stdio_child_exit', {
-      projectRoot: null,
-      projectRootSource: 'request_argument',
-      summary: 'CodeStory plugin MCP launched codestory-cli, but the stdio runtime exited before it could serve requests.',
-    }));
+  let status = fallbackDiagnostic(resolved, probe, 'runtime_stdio_handoff', {
+    projectRoot: null,
+    projectRootSource: 'request_argument',
+    summary: 'CodeStory is handing the initialized MCP session to its verified stdio runtime.',
   });
-
-  child.on('error', (error) => {
-    runFailOpenMcp(fallbackDiagnostic(resolved, {
-      status: null,
-      error: error.message,
-      version: null,
-      stdout: '',
-      stderr: '',
-    }, `${resolved.source}_cli_unspawnable`, {
-      projectRoot: null,
-      projectRootSource: 'request_argument',
-    }));
+  let handoffReady = true;
+  runFailOpenMcp(() => status, {
+    shouldHandoff: () => handoffReady,
+    startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
+    onRuntimeFailure: (failure) => {
+      handoffReady = false;
+      const reason = failure.error ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
+      const error = failure.error?.message
+        || (failure.code != null
+          ? `codestory-cli serve --stdio exited with status ${failure.code}`
+          : failure.reason);
+      status = fallbackDiagnostic(resolved, {
+        ...probe,
+        status: failure.code ?? null,
+        error,
+        stderr: probe.stderr || '',
+      }, reason, {
+        projectRoot: null,
+        projectRootSource: 'request_argument',
+        summary: 'CodeStory launched its verified CLI, but the stdio runtime failed during handoff.',
+      });
+    },
   });
 }
 

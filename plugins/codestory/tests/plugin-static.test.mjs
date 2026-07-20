@@ -29,6 +29,22 @@ const {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function launcherHandoffInput() {
+  return [
+    {
+      jsonrpc: "2.0",
+      id: "initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "plugin-static", version: "1" },
+      },
+    },
+    { jsonrpc: "2.0", id: "native-tools", method: "tools/list" },
+  ].map((request) => JSON.stringify(request)).join("\n") + "\n";
+}
+
 async function stopChildProcess(child) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   const closed = once(child, "close").catch(() => []);
@@ -782,6 +798,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
     });
 
@@ -823,6 +840,7 @@ test("mcp launcher uses an attested CodeStoryDev CLI from the installed cache wi
         TEST_OUT: outFile,
         PATH: "",
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
     });
 
@@ -1817,6 +1835,7 @@ test("mcp launcher starts projectless when host launches from plugin root", asyn
         TEST_LOG: logFile,
         TEST_OUT: marker,
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
       timeout: 15000,
     });
@@ -1854,18 +1873,11 @@ test("multi-project stdio ignores mutable active-workspace state", async () => {
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
-  const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-exit-"));
   const binDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-bin-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const realRepoRoot = await realpath(repoRoot);
-  const input = JSON.stringify({
-    jsonrpc: "2.0",
-    id: "status",
-    method: "resources/read",
-    params: { uri: statusUri },
-  }) + "\n";
   const cliPath = await writeNodeCli(
     binDir,
     [
@@ -1876,6 +1888,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     ].join("\n"),
   );
 
+  let child = null;
   try {
     await writeFile(
       join(dataDir, ".codestory-active"),
@@ -1886,7 +1899,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
       }),
       "utf8",
     );
-    const result = spawnSync(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       cwd: pluginRoot,
       env: {
         ...process.env,
@@ -1895,15 +1908,60 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
         PLUGIN_DATA: dataDir,
         TEST_CODESTORY_VERSION: version,
       },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    const responses = [];
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      const lines = stdout.split(/\r?\n/u);
+      stdout = lines.pop() || "";
+      for (const line of lines) {
+        if (line) responses.push(JSON.parse(line));
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const responseFor = async (id) => {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const response = responses.find((candidate) => candidate.id === id);
+        if (response) return response;
+        await delay(10);
+      }
+      assert.fail(`timed out waiting for ${id}: ${stderr}`);
+    };
+    const completed = once(child, "close");
 
-    assert.equal(result.status, 0, result.stderr);
-    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 1, result.stdout);
-    const status = JSON.parse(responses[0].result.contents[0].text);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: "initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "plugin-static", version: "1" },
+      },
+    })}\n`);
+    assert.equal((await responseFor("initialize")).result.serverInfo.version, version);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: "delegate",
+      method: "tools/list",
+    })}\n`);
+    assert.match(
+      (await responseFor("delegate")).error.message,
+      /stdio handoff exited before completing the request/u,
+    );
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: "status",
+      method: "resources/read",
+      params: { uri: statusUri },
+    })}\n`);
+    const status = JSON.parse((await responseFor("status")).result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
     assert.equal(status.project_root, realRepoRoot);
     assert.equal(status.project_root_source, "resource_uri");
@@ -1913,7 +1971,11 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
       /codestory-cli serve --stdio exited with status 17/u,
     );
     assert.equal(status.managed_retrieval.automatic, true);
+    child.stdin.end();
+    assert.equal((await completed)[0], 0);
+    child = null;
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });
   }
@@ -2077,6 +2139,7 @@ test("mcp launcher ignores thread-scoped and global project state", async () => 
         TEST_LOG: logFile,
         TEST_OUT: marker,
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
       timeout: 5000,
     });
@@ -2630,6 +2693,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
       cwd: repoRoot,
+      input: launcherHandoffInput(),
       encoding: "utf8",
       timeout: 5000,
     });
@@ -2735,7 +2799,61 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
   }
 });
 
-test("mcp launcher starts the multi-project stdio runtime directly", async () => {
+test("mcp launcher owns initialize before handing off to the native runtime", async () => {
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-initialize-owner-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-initialize-owner-bin-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const marker = join(dataDir, "serve-called.txt");
+  const cliPath = await writeNodeCli(
+    binDir,
+    [
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'serve') { fs.writeFileSync(process.env.TEST_OUT, 'serve-called'); setInterval(() => {}, 1000); }",
+      "else process.exit(2);",
+    ].join("\n"),
+  );
+  const initialize = {
+    jsonrpc: "2.0",
+    id: "initialize",
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "plugin-static", version: "1" },
+    },
+  };
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: dataDir,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: marker,
+      },
+      input: `${JSON.stringify(initialize)}\n`,
+      encoding: "utf8",
+      timeout: 2000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.error, undefined);
+    const response = JSON.parse(result.stdout.trim());
+    assert.equal(response.id, initialize.id);
+    assert.equal(response.result.serverInfo.version, version);
+    await assert.rejects(access(marker));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher starts the multi-project stdio runtime through its bridge", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-direct-stdio-"));
@@ -2760,7 +2878,39 @@ test("mcp launcher starts the multi-project stdio runtime directly", async () =>
         "const command = args[0];",
         "fs.appendFileSync(logFile, JSON.stringify({ args }) + '\\n');",
         "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
-        "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(0); }",
+        "if (command === 'serve') {",
+        "  fs.writeFileSync(marker, 'serve-called');",
+        "  let input = '';",
+        "  process.stdin.setEncoding('utf8');",
+        "  process.stdin.on('data', (chunk) => {",
+        "    input += chunk;",
+        "    const lines = input.split(/\\r?\\n/u);",
+        "    input = lines.pop() || '';",
+        "    for (const line of lines) {",
+        "      if (!line) continue;",
+        "      const request = JSON.parse(line);",
+        "      if (request.method === 'initialize') {",
+        "        console.log(JSON.stringify({",
+        "          jsonrpc: '2.0',",
+        "          id: request.id,",
+        "          result: {",
+        "            protocolVersion: request.params.protocolVersion,",
+        "            capabilities: {},",
+        "            serverInfo: { name: 'codestory', version },",
+        "          },",
+        "        }));",
+        "      } else if (request.method === 'tools/list') {",
+        "        console.log(JSON.stringify({",
+        "          jsonrpc: '2.0',",
+        "          id: request.id,",
+        "          result: { tools: [{ name: 'native-runtime' }] },",
+        "        }));",
+        "      }",
+        "    }",
+        "  });",
+        "  process.stdin.on('end', () => process.exit(0));",
+        "  return;",
+        "}",
         "process.exit(2);",
         "",
       ].join("\n"),
@@ -2783,12 +2933,35 @@ test("mcp launcher starts the multi-project stdio runtime directly", async () =>
         TEST_LOG: logFile,
         TEST_OUT: marker,
       },
+      input: [
+        {
+          jsonrpc: "2.0",
+          id: "initialize",
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "plugin-static", version: "1" },
+          },
+        },
+        { jsonrpc: "2.0", id: "native-tools", method: "tools/list" },
+      ].map((request) => JSON.stringify(request)).join("\n") + "\n",
       encoding: "utf8",
       timeout: 15000,
     });
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(await readFile(marker, "utf8"), "serve-called");
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(responses.filter((response) => response.id === "initialize").length, 1);
+    assert.equal(
+      responses.find((response) => response.id === "initialize")?.result.serverInfo.version,
+      version,
+    );
+    assert.deepEqual(
+      responses.find((response) => response.id === "native-tools")?.result.tools,
+      [{ name: "native-runtime" }],
+    );
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
     assert.ok(calls.some((call) => {
