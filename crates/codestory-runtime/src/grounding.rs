@@ -624,8 +624,19 @@ fn is_grounding_entrypoint_root(
     .any(|(prefix, suffixes)| {
         name.strip_prefix(prefix)
             .is_some_and(|suffix| suffixes.contains(&suffix))
-    }) || name.ends_with("page")
-        || name.ends_with("layout")
+    }) || {
+        let terminal = record
+            .display_name
+            .rsplit([':', '.', '/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        terminal
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+            && (name.ends_with("page") || name.ends_with("layout"))
+    }
 }
 
 fn grounding_orientation(
@@ -1982,6 +1993,16 @@ mod tests {
         assert!(!is_grounding_entrypoint_root(
             root,
             &record("startupCache"),
+            &roles
+        ));
+        assert!(is_grounding_entrypoint_root(
+            root,
+            &record("ComicPage"),
+            &roles
+        ));
+        assert!(!is_grounding_entrypoint_root(
+            root,
+            &record("isHomepage"),
             &roles
         ));
 
