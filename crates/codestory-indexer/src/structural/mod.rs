@@ -36,7 +36,8 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub const MAX_STRUCTURAL_SOURCE_BYTES: u64 = 1024 * 1024;
-pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize = 2048;
+pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize =
+    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP as usize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StructuralCollectionError {

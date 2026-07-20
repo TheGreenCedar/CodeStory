@@ -764,15 +764,19 @@ fn source_policy_exclusion_publication_binds_complete_rows_to_core_identity()
             normalized_path: "src/generated/registers.h".into(),
             content_hash: "a".repeat(64),
             observed_size: 4_000_000,
+            observed_unit_count: 0,
             policy_version: "oversized-source-v1".into(),
             byte_cap: 1_000_000,
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         },
         OversizedSourceExclusionCandidate {
             normalized_path: "vendor/ordinary.rs".into(),
             content_hash: "b".repeat(64),
             observed_size: 1_000_001,
+            observed_unit_count: 0,
             policy_version: "oversized-source-v1".into(),
             byte_cap: 1_000_000,
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         },
     ];
 
@@ -831,8 +835,10 @@ fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
         normalized_path: "vendor/first.h".into(),
         content_hash: "a".repeat(64),
         observed_size: 2_000_000,
+        observed_unit_count: 0,
         policy_version: "oversized-source-v1".into(),
         byte_cap: 1_000_000,
+        structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
     }];
     let expected = storage.publish_source_policy_exclusion_generation(
         &first_publication,
@@ -861,8 +867,10 @@ fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
         normalized_path: "vendor/reject.h".into(),
         content_hash: "b".repeat(64),
         observed_size: 3_000_000,
+        observed_unit_count: 0,
         policy_version: "oversized-source-v1".into(),
         byte_cap: 1_000_000,
+        structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
     }];
     assert!(
         storage
@@ -4936,8 +4944,10 @@ fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<()
             normalized_path: format!("vendor/registers-{id}.h"),
             content_hash: format!("{:064x}", id.max(0)),
             observed_size: DEFAULT_SOURCE_FILE_BYTE_CAP + id.max(0) as u64,
+            observed_unit_count: 0,
             policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
             byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         }],
     )?;
     storage.seal_disposable_full_build().map(|_| ())
@@ -4962,8 +4972,10 @@ fn publish_nonempty_test_source_policy(path: &Path, generation: u64) -> Result<(
             normalized_path: format!("vendor/registers-{generation}.h"),
             content_hash: format!("{generation:064x}"),
             observed_size: DEFAULT_SOURCE_FILE_BYTE_CAP + generation,
+            observed_unit_count: 0,
             policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
             byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         }],
     )?;
     Ok(())
@@ -5559,8 +5571,10 @@ fn promotion_journal_binds_source_policy_exclusion_count_and_digest() -> Result<
                 normalized_path: format!("vendor/registers-{generation}.h"),
                 content_hash: format!("{generation:x}").repeat(64),
                 observed_size: 1_000_000 + generation,
+                observed_unit_count: 0,
                 policy_version: "oversized-source-v1".into(),
                 byte_cap: 1_000_000,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             }],
         )?;
     }

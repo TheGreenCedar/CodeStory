@@ -39,11 +39,12 @@ automatically managed embedding server. Runtime may cause lazy server and
 engine activation and hold publication leases, but cannot reconfigure the
 engine per project or infer readiness from `retrieval_mode` alone.
 
-Runtime accepts an oversized-source exclusion set only from a complete
-inventory, publishes it with the candidate core, and requires its bound
-manifest on freshness and read surfaces. `files` exposes those paths as source
-inventory with explicit false graph and semantic coverage; packet and search
-never treat them as indexed evidence.
+Runtime accepts a bounded-source exclusion set only from a complete inventory
+and verified structural collector results, publishes it with the candidate
+core, and requires its bound manifest on freshness and read surfaces. `files`
+exposes those paths as source inventory with observed byte/unit bounds and
+explicit false graph and semantic coverage; packet and search never treat them
+as indexed evidence.
 
 Semantic document preparation normalizes the file table once and retains
 display/read paths by owning file-node identity. Symbols resolve those paths

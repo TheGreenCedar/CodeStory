@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Versioned policy that permits a verified source to remain outside parser scheduling.
-pub const OVERSIZED_SOURCE_POLICY_VERSION: &str = "oversized-source-v1";
+/// Versioned policy that permits a verified bounded source to remain outside scheduling.
+pub const OVERSIZED_SOURCE_POLICY_VERSION: &str = "bounded-source-exclusion-v2";
 /// Parser input bound shared by workspace planning and the indexer fallback guard.
 pub const DEFAULT_SOURCE_FILE_BYTE_CAP: u64 = 1_000_000;
+/// Structural-unit bound shared by the structural collector and exclusion publication.
+pub const DEFAULT_STRUCTURAL_UNIT_CAP: u64 = 2_048;
 /// Process-start override for the parser input and verified exclusion boundary.
 pub const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
 
@@ -14,6 +16,7 @@ pub const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP
 pub struct SourceIndexPolicy {
     pub policy_version: String,
     pub byte_cap: u64,
+    pub structural_unit_cap: u64,
 }
 
 impl SourceIndexPolicy {
@@ -21,6 +24,7 @@ impl SourceIndexPolicy {
         Self {
             policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
             byte_cap: byte_cap.max(1),
+            structural_unit_cap: DEFAULT_STRUCTURAL_UNIT_CAP,
         }
     }
 
@@ -55,8 +59,11 @@ pub struct OversizedSourceExclusionCandidate {
     pub normalized_path: String,
     pub content_hash: String,
     pub observed_size: u64,
+    /// Zero for a byte-bound exclusion; otherwise the collector-observed unit count.
+    pub observed_unit_count: u64,
     pub policy_version: String,
     pub byte_cap: u64,
+    pub structural_unit_cap: u64,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

@@ -13439,8 +13439,10 @@ impl AppController {
                 path: entry.normalized_path,
                 content_hash: entry.content_hash,
                 observed_size: entry.observed_size,
+                observed_unit_count: entry.observed_unit_count,
                 policy_version: entry.policy_version,
                 byte_cap: entry.byte_cap,
+                structural_unit_cap: entry.structural_unit_cap,
                 project_id: entry.project_id,
                 workspace_id: entry.workspace_id,
                 core_generation_id: entry.core_generation_id,
@@ -15464,7 +15466,7 @@ fn index_full_for_runtime(
     wall_stage_started = Instant::now();
     let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-    let (execution_plan, policy_exclusions) =
+    let (execution_plan, mut policy_exclusions) =
         full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
 
     wall_durations.source_discovery = wall_stage_started.elapsed();
@@ -15508,7 +15510,7 @@ fn index_full_for_runtime(
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
-        .with_source_file_byte_cap(source_index_policy.byte_cap)
+        .with_source_index_policy(source_index_policy.clone())
         .with_artifact_cache_policies(ArtifactCachePolicies {
             parser: ArtifactCachePolicy::KnownEmpty,
             structural: if copied_structural_artifacts > 0 {
@@ -15519,7 +15521,8 @@ fn index_full_for_runtime(
         });
     wall_durations.stage_open = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
+    let result =
+        indexer.run_with_policy_exclusions(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
     drop(bus);
     let _ = forwarder.join();
@@ -15529,7 +15532,10 @@ fn index_full_for_runtime(
             let _ = staged.discard();
             return Err(indexing_cancelled_error());
         }
-        Ok(stats) => stats,
+        Ok(outcome) => {
+            policy_exclusions.extend(outcome.policy_exclusions);
+            outcome.stats
+        }
         Err(_) if is_indexing_cancelled(cancel_token) => {
             let _ = staged.discard();
             return Err(indexing_cancelled_error());
@@ -16244,7 +16250,7 @@ fn run_incremental_indexing_common(
             ));
         }
         let execution_plan = policy_refresh.refresh.plan;
-        let policy_exclusions = policy_refresh.policy_exclusions;
+        let mut policy_exclusions = policy_refresh.policy_exclusions;
         let mut planned_semantic_seed_file_ids = execution_plan
             .files_to_remove
             .iter()
@@ -16314,8 +16320,13 @@ fn run_incremental_indexing_common(
             return Err(indexing_cancelled_error());
         }
         let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
-            .with_source_file_byte_cap(source_index_policy.byte_cap);
-        let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
+            .with_source_index_policy(source_index_policy.clone());
+        let result = indexer.run_with_policy_exclusions(
+            staged.store_mut(),
+            &execution_plan,
+            &bus,
+            cancel_token,
+        );
 
         // Drop bus so forwarder unblocks.
         drop(bus);
@@ -16325,7 +16336,10 @@ fn run_incremental_indexing_common(
             Ok(_) if is_indexing_cancelled(cancel_token) => {
                 return Err(indexing_cancelled_error());
             }
-            Ok(stats) => stats,
+            Ok(outcome) => {
+                policy_exclusions.extend(outcome.policy_exclusions);
+                outcome.stats
+            }
             Err(_) if is_indexing_cancelled(cancel_token) => {
                 return Err(indexing_cancelled_error());
             }
@@ -24066,6 +24080,87 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("small.rs"), "pub fn small() {}\n")
+            .expect("write control source");
+        let evidence_path = workspace.path().join("evidence-generated.json");
+        let mut evidence = String::from("{");
+        for index in 0..=codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP {
+            if index > 0 {
+                evidence.push(',');
+            }
+            evidence.push_str(&format!("\"key{index}\":{index}"));
+        }
+        evidence.push('}');
+        fs::write(&evidence_path, &evidence).expect("write bounded structural fixture");
+        assert!(evidence.len() as u64 <= DEFAULT_SOURCE_FILE_BYTE_CAP);
+
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("unit-bound source should not block core publication");
+
+        let storage = Storage::open(&storage_path).expect("open published storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read publication")
+            .expect("complete publication");
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+            )
+            .expect("verified exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 1);
+        let exclusions = storage
+            .get_source_policy_exclusions()
+            .expect("read exclusions");
+        assert_eq!(exclusions[0].normalized_path, "evidence-generated.json");
+        assert_eq!(
+            exclusions[0].observed_unit_count,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
+        );
+        assert_eq!(
+            exclusions[0].structural_unit_cap,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP
+        );
+        assert!(
+            storage
+                .get_file_by_path(&evidence_path)
+                .expect("read file row")
+                .is_none(),
+            "excluded content must not retain graph or structural projection"
+        );
+        let files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: Some("evidence-generated.json".into()),
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("read native exclusion diagnostics");
+        assert_eq!(files.policy_exclusions.len(), 1);
+        assert!(!files.policy_exclusions[0].graph_coverage);
+        assert!(!files.policy_exclusions[0].semantic_coverage);
+        assert_eq!(
+            files.policy_exclusions[0].observed_unit_count,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
+        );
+    }
+
+    #[test]
     fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_coverage() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -24403,6 +24498,7 @@ fn build_llm_symbol_doc_text() -> String {
             SourceIndexPolicy {
                 policy_version: "oversized-source-v2".into(),
                 byte_cap: 64,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             },
         ] {
             let reader = AppController::new_with_source_index_policy(

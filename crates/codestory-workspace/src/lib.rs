@@ -719,6 +719,7 @@ impl WorkspaceDiscovery {
         for candidate in &verified {
             if candidate.policy_version != policy.policy_version
                 || candidate.byte_cap != policy.byte_cap
+                || candidate.structural_unit_cap != policy.structural_unit_cap
                 || previous_path == Some(candidate.normalized_path.as_str())
             {
                 bail!(
@@ -736,9 +737,12 @@ impl WorkspaceDiscovery {
                 );
             }
             let (content_hash, observed_size) = current_content_identity(&path)?;
+            let byte_bound = observed_size > policy.byte_cap && candidate.observed_unit_count == 0;
+            let unit_bound = candidate.observed_unit_count > policy.structural_unit_cap
+                && observed_size <= policy.byte_cap;
             if content_hash != candidate.content_hash
                 || observed_size != candidate.observed_size
-                || observed_size <= policy.byte_cap
+                || !(byte_bound || unit_bound)
             {
                 bail!(
                     "source policy exclusion `{}` changed before publication",
@@ -819,8 +823,10 @@ impl WorkspaceDiscovery {
                 normalized_path,
                 content_hash,
                 observed_size,
+                observed_unit_count: 0,
                 policy_version: policy_version.to_string(),
                 byte_cap,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             });
         }
         policy_exclusions.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));

@@ -178,8 +178,10 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
                 normalized_path: record.normalized_path,
                 content_hash: record.content_hash,
                 observed_size: record.observed_size,
+                observed_unit_count: record.observed_unit_count,
                 policy_version: record.policy_version,
                 byte_cap: record.byte_cap,
+                structural_unit_cap: record.structural_unit_cap,
             },
         )
         .collect::<Vec<_>>();

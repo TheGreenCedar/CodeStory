@@ -37,7 +37,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 28;
+const SCHEMA_VERSION: u32 = 29;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -449,6 +449,7 @@ struct SourcePolicyExclusionRollbackIdentity {
     exclusion_digest: String,
     policy_version: String,
     byte_cap: u64,
+    structural_unit_cap: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,7 +488,7 @@ fn read_source_policy_exclusion_rollback_identity(
         .query_row(
             "SELECT project_id, workspace_id, core_generation_id, core_run_id,
                     published_at_epoch_ms, exclusion_count, exclusion_digest,
-                    policy_version, byte_cap
+                    policy_version, byte_cap, structural_unit_cap
              FROM source_policy_exclusion_publication
              WHERE id = 1 AND complete = 1 AND schema_version = ?1",
             params![SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION as i64],
@@ -502,6 +503,7 @@ fn read_source_policy_exclusion_rollback_identity(
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         )
@@ -516,6 +518,7 @@ fn read_source_policy_exclusion_rollback_identity(
         exclusion_digest,
         policy_version,
         byte_cap,
+        structural_unit_cap,
     )) = identity
     else {
         return Ok(None);
@@ -532,6 +535,9 @@ fn read_source_policy_exclusion_rollback_identity(
         policy_version,
         byte_cap: u64::try_from(byte_cap)
             .map_err(|_| promotion_error("Source policy exclusion rollback cap is invalid"))?,
+        structural_unit_cap: u64::try_from(structural_unit_cap).map_err(|_| {
+            promotion_error("Source policy exclusion rollback structural unit cap is invalid")
+        })?,
     };
     let records = read_source_policy_exclusions(&conn)?;
     if identity.core_generation_id != publication.generation_id
@@ -546,6 +552,7 @@ fn read_source_policy_exclusion_rollback_identity(
                 || record.core_run_id != identity.core_run_id
                 || record.policy_version != identity.policy_version
                 || record.byte_cap != identity.byte_cap
+                || record.structural_unit_cap != identity.structural_unit_cap
         })
     {
         return Err(promotion_error(format!(
@@ -3032,9 +3039,9 @@ fn dense_anchor_content_summary(
     Ok((count, format!("{:x}", hasher.finalize()), policies))
 }
 
-pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 2;
 const SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
-    b"codestory-source-policy-exclusion-publication-v1\0";
+    b"codestory-source-policy-exclusion-publication-v2\0";
 
 /// One verified source excluded from parser scheduling by an explicit policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3044,8 +3051,10 @@ pub struct SourcePolicyExclusionRecord {
     pub workspace_id: String,
     pub content_hash: String,
     pub observed_size: u64,
+    pub observed_unit_count: u64,
     pub policy_version: String,
     pub byte_cap: u64,
+    pub structural_unit_cap: u64,
     pub core_generation_id: String,
     pub core_run_id: String,
 }
@@ -3063,6 +3072,7 @@ pub struct SourcePolicyExclusionManifest {
     pub exclusion_digest: String,
     pub policy_version: String,
     pub byte_cap: u64,
+    pub structural_unit_cap: u64,
     pub published_at_epoch_ms: i64,
 }
 
@@ -3082,7 +3092,9 @@ fn source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]) -> St
             hash_dense_anchor_part(&mut hasher, value);
         }
         hash_dense_anchor_part(&mut hasher, &record.observed_size.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.observed_unit_count.to_le_bytes());
         hash_dense_anchor_part(&mut hasher, &record.byte_cap.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.structural_unit_cap.to_le_bytes());
     }
     format!("{:x}", hasher.finalize())
 }
@@ -3092,7 +3104,8 @@ fn read_source_policy_exclusions(
 ) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT normalized_path, project_id, workspace_id, content_hash,
-                observed_size, policy_version, byte_cap, core_generation_id, core_run_id
+                observed_size, observed_unit_count, policy_version, byte_cap,
+                structural_unit_cap, core_generation_id, core_run_id
          FROM source_policy_exclusion ORDER BY normalized_path ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -3102,10 +3115,12 @@ fn read_source_policy_exclusions(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     rows.map(|row| {
@@ -3115,8 +3130,10 @@ fn read_source_policy_exclusions(
             workspace_id,
             content_hash,
             observed_size,
+            observed_unit_count,
             policy_version,
             byte_cap,
+            structural_unit_cap,
             core_generation_id,
             core_run_id,
         ) = row?;
@@ -3128,9 +3145,19 @@ fn read_source_policy_exclusions(
             observed_size: u64::try_from(observed_size).map_err(|_| {
                 StorageError::Other("source policy exclusion has invalid observed size".into())
             })?,
+            observed_unit_count: u64::try_from(observed_unit_count).map_err(|_| {
+                StorageError::Other(
+                    "source policy exclusion has invalid observed unit count".into(),
+                )
+            })?,
             policy_version,
             byte_cap: u64::try_from(byte_cap).map_err(|_| {
                 StorageError::Other("source policy exclusion has invalid byte cap".into())
+            })?,
+            structural_unit_cap: u64::try_from(structural_unit_cap).map_err(|_| {
+                StorageError::Other(
+                    "source policy exclusion has invalid structural unit cap".into(),
+                )
             })?,
             core_generation_id,
             core_run_id,
@@ -7406,7 +7433,8 @@ impl Storage {
             .query_row(
                 "SELECT schema_version, complete, project_id, workspace_id,
                         core_generation_id, core_run_id, exclusion_count,
-                        exclusion_digest, policy_version, byte_cap, published_at_epoch_ms
+                        exclusion_digest, policy_version, byte_cap, structural_unit_cap,
+                        published_at_epoch_ms
                  FROM source_policy_exclusion_publication WHERE id = 1",
                 [],
                 |row| {
@@ -7422,6 +7450,7 @@ impl Storage {
                         row.get::<_, String>(8)?,
                         row.get::<_, i64>(9)?,
                         row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
                     ))
                 },
             )
@@ -7438,6 +7467,7 @@ impl Storage {
                     exclusion_digest,
                     policy_version,
                     byte_cap,
+                    structural_unit_cap,
                     published_at_epoch_ms,
                 )| {
                     Ok(SourcePolicyExclusionManifest {
@@ -7463,6 +7493,12 @@ impl Storage {
                                 "source policy exclusion manifest has invalid byte cap".into(),
                             )
                         })?,
+                        structural_unit_cap: u64::try_from(structural_unit_cap).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid structural unit cap"
+                                    .into(),
+                            )
+                        })?,
                         published_at_epoch_ms,
                     })
                 },
@@ -7480,6 +7516,7 @@ impl Storage {
         byte_cap: u64,
         candidates: &[OversizedSourceExclusionCandidate],
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        let structural_unit_cap = codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP;
         if publication.generation_id.trim().is_empty()
             || publication.run_id.trim().is_empty()
             || project_id.trim().is_empty()
@@ -7487,6 +7524,8 @@ impl Storage {
             || policy_version.trim().is_empty()
             || byte_cap == 0
             || byte_cap > i64::MAX as u64
+            || structural_unit_cap == 0
+            || structural_unit_cap > i64::MAX as u64
         {
             return Err(StorageError::Other(
                 "source policy exclusion publication identity is invalid".into(),
@@ -7510,10 +7549,14 @@ impl Storage {
                     .content_hash
                     .bytes()
                     .all(|value| value.is_ascii_hexdigit())
-                || candidate.observed_size <= byte_cap
                 || candidate.observed_size > i64::MAX as u64
+                || candidate.observed_unit_count > i64::MAX as u64
+                || !((candidate.observed_size > byte_cap && candidate.observed_unit_count == 0)
+                    || (candidate.observed_size <= byte_cap
+                        && candidate.observed_unit_count > structural_unit_cap))
                 || candidate.policy_version != policy_version
                 || candidate.byte_cap != byte_cap
+                || candidate.structural_unit_cap != structural_unit_cap
             {
                 return Err(StorageError::Other(format!(
                     "invalid source policy exclusion candidate: {path}"
@@ -7526,8 +7569,10 @@ impl Storage {
                 workspace_id: workspace_id.to_string(),
                 content_hash: candidate.content_hash.clone(),
                 observed_size: candidate.observed_size,
+                observed_unit_count: candidate.observed_unit_count,
                 policy_version: candidate.policy_version.clone(),
                 byte_cap: candidate.byte_cap,
+                structural_unit_cap: candidate.structural_unit_cap,
                 core_generation_id: publication.generation_id.clone(),
                 core_run_id: publication.run_id.clone(),
             });
@@ -7545,6 +7590,7 @@ impl Storage {
             exclusion_digest,
             policy_version: policy_version.to_string(),
             byte_cap,
+            structural_unit_cap,
             published_at_epoch_ms: publication.published_at_epoch_ms,
         };
         let tx = self.conn.transaction()?;
@@ -7554,8 +7600,9 @@ impl Storage {
             let mut stmt = tx.prepare(
                 "INSERT INTO source_policy_exclusion (
                     normalized_path, project_id, workspace_id, content_hash,
-                    observed_size, policy_version, byte_cap, core_generation_id, core_run_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    observed_size, observed_unit_count, policy_version, byte_cap,
+                    structural_unit_cap, core_generation_id, core_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for record in &records {
                 stmt.execute(params![
@@ -7564,8 +7611,10 @@ impl Storage {
                     &record.workspace_id,
                     &record.content_hash,
                     record.observed_size as i64,
+                    record.observed_unit_count as i64,
                     &record.policy_version,
                     record.byte_cap as i64,
+                    record.structural_unit_cap as i64,
                     &record.core_generation_id,
                     &record.core_run_id,
                 ])?;
@@ -7575,8 +7624,8 @@ impl Storage {
             "INSERT INTO source_policy_exclusion_publication (
                 id, schema_version, complete, project_id, workspace_id,
                 core_generation_id, core_run_id, exclusion_count, exclusion_digest,
-                policy_version, byte_cap, published_at_epoch_ms
-             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                policy_version, byte_cap, structural_unit_cap, published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 manifest.schema_version as i64,
                 &manifest.project_id,
@@ -7587,6 +7636,7 @@ impl Storage {
                 &manifest.exclusion_digest,
                 &manifest.policy_version,
                 manifest.byte_cap as i64,
+                manifest.structural_unit_cap as i64,
                 manifest.published_at_epoch_ms,
             ],
         )?;
@@ -7602,6 +7652,7 @@ impl Storage {
         policy_version: &str,
         byte_cap: u64,
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        let structural_unit_cap = codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP;
         let manifest = self
             .get_source_policy_exclusion_manifest()?
             .ok_or_else(|| {
@@ -7615,6 +7666,7 @@ impl Storage {
             || manifest.core_run_id != publication.run_id
             || manifest.policy_version != policy_version
             || manifest.byte_cap != byte_cap
+            || manifest.structural_unit_cap != structural_unit_cap
             || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
         {
             return Err(StorageError::Other(
@@ -7632,7 +7684,11 @@ impl Storage {
                     || record.core_run_id != manifest.core_run_id
                     || record.policy_version != manifest.policy_version
                     || record.byte_cap != manifest.byte_cap
-                    || record.observed_size <= record.byte_cap
+                    || record.structural_unit_cap != manifest.structural_unit_cap
+                    || !((record.observed_size > record.byte_cap
+                        && record.observed_unit_count == 0)
+                        || (record.observed_size <= record.byte_cap
+                            && record.observed_unit_count > record.structural_unit_cap))
             })
         {
             return Err(StorageError::Other(
