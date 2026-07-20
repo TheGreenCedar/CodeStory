@@ -173,8 +173,12 @@ fn assemble_packet_sufficiency_with_probe_context(
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
     let has_minimum_claim_families =
         packet_has_minimum_claim_family_coverage(task_class, &sufficiency_claims);
-    let missing_exact_path_claims =
-        packet_missing_exact_path_claims(task_class, exact_probe_paths, &sufficiency_claims);
+    let missing_exact_path_claims = packet_missing_exact_path_claims(
+        project_root,
+        task_class,
+        exact_probe_paths,
+        &sufficiency_claims,
+    );
     let route_proof = packet_route_proof_assessment(
         task_class,
         answer,
@@ -1462,6 +1466,7 @@ fn packet_claim_is_generic_navigation_or_source_evidence(claim: &PacketClaimDto)
 }
 
 fn packet_missing_exact_path_claims(
+    project_root: &Path,
     task_class: PacketTaskClassDto,
     exact_probe_paths: &[String],
     sufficiency_claims: &[PacketClaimDto],
@@ -1477,7 +1482,7 @@ fn packet_missing_exact_path_claims(
                 claim.citations.iter().any(|citation| {
                     citation_sufficiency_eligible(citation)
                         && citation.file_path.as_deref().is_some_and(|citation_path| {
-                            packet_paths_match_exact_probe(citation_path, path)
+                            packet_paths_match_exact_probe(project_root, citation_path, path)
                         })
                 })
             })
@@ -1488,16 +1493,23 @@ fn packet_missing_exact_path_claims(
         .collect()
 }
 
-fn packet_paths_match_exact_probe(citation_path: &str, exact_probe_path: &str) -> bool {
-    let citation_path = citation_path
-        .trim_start_matches("\\\\?\\")
-        .replace('\\', "/");
-    let exact_probe_path = exact_probe_path
-        .trim_start_matches("\\\\?\\")
-        .replace('\\', "/");
-    citation_path == exact_probe_path
-        || citation_path.ends_with(&format!("/{exact_probe_path}"))
-        || exact_probe_path.ends_with(&format!("/{citation_path}"))
+fn packet_paths_match_exact_probe(
+    project_root: &Path,
+    citation_path: &str,
+    exact_probe_path: &str,
+) -> bool {
+    let absolute = |path: &str| {
+        let path = Path::new(path.trim_start_matches("\\\\?\\"));
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        }
+    };
+    codestory_workspace::same_workspace_path(
+        absolute(citation_path).as_path(),
+        absolute(exact_probe_path).as_path(),
+    )
 }
 
 fn packet_role_label_is_generic_source_evidence(role: &str) -> bool {
@@ -4287,6 +4299,21 @@ mod tests {
                 .avoid_opening_paths
                 .contains(&launcher_path.to_string()),
             "diagnostic exact-path citations must not discourage source inspection: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_exact_path_matching_rejects_same_suffix_collisions() {
+        let project_root = Path::new("C:/workspace/project");
+
+        assert!(packet_paths_match_exact_probe(
+            project_root,
+            "crates/foo/src/lib.rs",
+            "crates/foo/src/lib.rs"
+        ));
+        assert!(
+            !packet_paths_match_exact_probe(project_root, "src/lib.rs", "crates/foo/src/lib.rs"),
+            "a shorter same-suffix citation must not satisfy a different exact path"
         );
     }
 
