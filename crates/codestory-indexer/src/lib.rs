@@ -2045,8 +2045,9 @@ impl WorkspaceIndexer {
             }
             if let Some(exclusion) = parsed.policy_exclusion {
                 policy_exclusions.push(exclusion);
+            } else {
+                storages.push(parsed.local_storage);
             }
-            storages.push(parsed.local_storage);
         }
         PreparedIndexChunk {
             cache_writes,

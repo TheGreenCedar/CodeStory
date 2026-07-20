@@ -79,14 +79,17 @@ const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTI
 const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
-const PROMOTION_JOURNAL_VERSION: u32 = 3;
+const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
+const PROMOTION_JOURNAL_VERSION: u32 = 4;
 // Snapshot promotion first shipped with schema 21. Journal v2 added the
 // source-policy identity at schema 27, and journal v3 added structural-text
-// identity at schema 28. Recovery runs before schema migration, so these
+// identity at schema 28. Journal v4 binds the structural-unit source-policy
+// identity added at schema 29. Recovery runs before schema migration, so these
 // boundaries are part of the durable journal contract.
 const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
 const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
+const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
@@ -412,8 +415,11 @@ impl RecoveryDatabaseContract {
             Self::Journal(SOURCE_POLICY_PROMOTION_JOURNAL_VERSION) => {
                 schema_version == SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION
             }
-            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+            Self::Journal(STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION) => {
                 schema_version == STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                schema_version == STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
             }
             Self::Journal(_) => false,
             Self::LegacyBackup => {
@@ -449,7 +455,12 @@ struct SourcePolicyExclusionRollbackIdentity {
     exclusion_digest: String,
     policy_version: String,
     byte_cap: u64,
+    #[serde(default = "default_structural_unit_cap")]
     structural_unit_cap: u64,
+}
+
+fn default_structural_unit_cap() -> u64 {
+    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,14 +495,46 @@ fn read_source_policy_exclusion_rollback_identity(
     if table_exists == 0 {
         return Ok(None);
     }
+    let source_policy_columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(source_policy_exclusion)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let publication_columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(source_policy_exclusion_publication)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let has_structural_policy_identity = source_policy_columns
+        .iter()
+        .any(|column| column == "observed_unit_count")
+        && source_policy_columns
+            .iter()
+            .any(|column| column == "structural_unit_cap")
+        && publication_columns
+            .iter()
+            .any(|column| column == "structural_unit_cap");
+    let structural_unit_cap_expression = if has_structural_policy_identity {
+        "structural_unit_cap"
+    } else {
+        "2048"
+    };
+    let manifest_schema_version = if has_structural_policy_identity {
+        SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION
+    } else {
+        1
+    };
+    let identity_query = format!(
+        "SELECT project_id, workspace_id, core_generation_id, core_run_id,
+                published_at_epoch_ms, exclusion_count, exclusion_digest,
+                policy_version, byte_cap, {structural_unit_cap_expression}
+         FROM source_policy_exclusion_publication
+         WHERE id = 1 AND complete = 1 AND schema_version = ?1"
+    );
     let identity = conn
         .query_row(
-            "SELECT project_id, workspace_id, core_generation_id, core_run_id,
-                    published_at_epoch_ms, exclusion_count, exclusion_digest,
-                    policy_version, byte_cap, structural_unit_cap
-             FROM source_policy_exclusion_publication
-             WHERE id = 1 AND complete = 1 AND schema_version = ?1",
-            params![SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION as i64],
+            &identity_query,
+            params![manifest_schema_version as i64],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -539,12 +582,21 @@ fn read_source_policy_exclusion_rollback_identity(
             promotion_error("Source policy exclusion rollback structural unit cap is invalid")
         })?,
     };
-    let records = read_source_policy_exclusions(&conn)?;
+    let records = if has_structural_policy_identity {
+        read_source_policy_exclusions(&conn)?
+    } else {
+        read_legacy_source_policy_exclusions(&conn)?
+    };
+    let records_digest = if has_structural_policy_identity {
+        source_policy_exclusion_digest(&records)
+    } else {
+        legacy_source_policy_exclusion_digest(&records)
+    };
     if identity.core_generation_id != publication.generation_id
         || identity.core_run_id != publication.run_id
         || identity.core_published_at_epoch_ms != publication.published_at_epoch_ms
         || identity.exclusion_count != records.len() as u64
-        || identity.exclusion_digest != source_policy_exclusion_digest(&records)
+        || identity.exclusion_digest != records_digest
         || records.iter().any(|record| {
             record.project_id != identity.project_id
                 || record.workspace_id != identity.workspace_id
@@ -875,6 +927,7 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
         journal.version,
         LEGACY_PROMOTION_JOURNAL_VERSION
             | SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
+            | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
             | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
@@ -1068,7 +1121,7 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
                 "Legacy committed live database",
             )?;
         }
-        if committed.version >= PROMOTION_JOURNAL_VERSION {
+        if committed.version >= STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION {
             require_candidate_structural_text_identity(
                 path,
                 &live_identity,
@@ -1123,7 +1176,8 @@ fn rollback_prepared_promotion(
             live_path.display()
         )));
     }
-    if prepared.version >= PROMOTION_JOURNAL_VERSION && prepared.candidate_structural_text.is_none()
+    if prepared.version >= STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
+        && prepared.candidate_structural_text.is_none()
     {
         return Err(promotion_error(format!(
             "Prepared promotion candidate structural text identity is missing for {}",
@@ -3042,6 +3096,8 @@ fn dense_anchor_content_summary(
 pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 2;
 const SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
     b"codestory-source-policy-exclusion-publication-v2\0";
+const LEGACY_SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
+    b"codestory-source-policy-exclusion-publication-v1\0";
 
 /// One verified source excluded from parser scheduling by an explicit policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3097,6 +3153,81 @@ fn source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]) -> St
         hash_dense_anchor_part(&mut hasher, &record.structural_unit_cap.to_le_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn legacy_source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(LEGACY_SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN);
+    for record in records {
+        for value in [
+            record.normalized_path.as_bytes(),
+            record.project_id.as_bytes(),
+            record.workspace_id.as_bytes(),
+            record.content_hash.as_bytes(),
+            record.policy_version.as_bytes(),
+            record.core_generation_id.as_bytes(),
+            record.core_run_id.as_bytes(),
+        ] {
+            hash_dense_anchor_part(&mut hasher, value);
+        }
+        hash_dense_anchor_part(&mut hasher, &record.observed_size.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.byte_cap.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn read_legacy_source_policy_exclusions(
+    conn: &Connection,
+) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_path, project_id, workspace_id, content_hash,
+                observed_size, policy_version, byte_cap, core_generation_id, core_run_id
+         FROM source_policy_exclusion ORDER BY normalized_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size,
+            policy_version,
+            byte_cap,
+            core_generation_id,
+            core_run_id,
+        ) = row?;
+        Ok(SourcePolicyExclusionRecord {
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size: u64::try_from(observed_size).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid observed size".into())
+            })?,
+            observed_unit_count: 0,
+            policy_version,
+            byte_cap: u64::try_from(byte_cap).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid byte cap".into())
+            })?,
+            structural_unit_cap: default_structural_unit_cap(),
+            core_generation_id,
+            core_run_id,
+        })
+    })
+    .collect()
 }
 
 fn read_source_policy_exclusions(

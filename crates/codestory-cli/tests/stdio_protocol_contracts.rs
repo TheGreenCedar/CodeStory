@@ -2003,7 +2003,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
             }
         }
         if name == "files" {
-            for field in ["project_root", "usable", "summary", "files"] {
+            for field in [
+                "project_root",
+                "usable",
+                "summary",
+                "files",
+                "policy_exclusions",
+            ] {
                 assert!(
                     output_schema["anyOf"]
                         .as_array()
@@ -2026,6 +2032,31 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "/properties/role/enum",
                 &["source", "test", "generated", "vendor", "unknown"],
             );
+            let exclusion_schema = output_schema
+                .pointer("/properties/policy_exclusions/items")
+                .unwrap_or_else(|| {
+                    panic!("files outputSchema should describe policy exclusions: {tool}")
+                });
+            for field in [
+                "path",
+                "content_hash",
+                "observed_size",
+                "observed_unit_count",
+                "policy_version",
+                "byte_cap",
+                "structural_unit_cap",
+                "project_id",
+                "workspace_id",
+                "core_generation_id",
+                "core_run_id",
+                "graph_coverage",
+                "semantic_coverage",
+            ] {
+                assert!(
+                    required_fields(exclusion_schema).contains(field),
+                    "policy exclusion schema should require {field}: {tool}"
+                );
+            }
         }
         if name == "affected" {
             for field in [

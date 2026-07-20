@@ -16257,6 +16257,8 @@ fn run_incremental_indexing_common(
             .copied()
             .map(codestory_contracts::graph::NodeId)
             .collect::<HashSet<_>>();
+        let mut previous_indexed_file_ids_by_path = HashMap::new();
+        let mut policy_excluded_semantic_seed_file_ids = HashSet::new();
         for path in &execution_plan.files_to_index {
             let normalized_path = if path.is_absolute() {
                 path.clone()
@@ -16273,8 +16275,10 @@ fn run_incremental_indexing_common(
                     ))
                 })?
             {
-                planned_semantic_seed_file_ids
-                    .insert(codestory_contracts::graph::NodeId(file_info.id));
+                let file_id = codestory_contracts::graph::NodeId(file_info.id);
+                planned_semantic_seed_file_ids.insert(file_id);
+                previous_indexed_file_ids_by_path
+                    .insert(runtime_relative_path(root, &normalized_path), file_id);
             }
         }
         let previous_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
@@ -16300,7 +16304,7 @@ fn run_incremental_indexing_common(
                 removed_component_keys.insert(component_key);
             }
         }
-        let component_report_refresh = ComponentReportRefreshScope {
+        let mut component_report_refresh = ComponentReportRefreshScope {
             previous_file_paths: existing_file_paths,
             removed_component_keys,
         };
@@ -16337,6 +16341,22 @@ fn run_incremental_indexing_common(
                 return Err(indexing_cancelled_error());
             }
             Ok(outcome) => {
+                for exclusion in &outcome.policy_exclusions {
+                    if let Some(file_id) =
+                        previous_indexed_file_ids_by_path.get(&exclusion.normalized_path)
+                    {
+                        policy_excluded_semantic_seed_file_ids.insert(*file_id);
+                        if let Some(component_key) = component_report_refresh
+                            .previous_file_paths
+                            .get(file_id)
+                            .and_then(|path| semantic_component_key_for_path(Some(path)))
+                        {
+                            component_report_refresh
+                                .removed_component_keys
+                                .insert(component_key);
+                        }
+                    }
+                }
                 policy_exclusions.extend(outcome.policy_exclusions);
                 outcome.stats
             }
@@ -16391,9 +16411,14 @@ fn run_incremental_indexing_common(
                     .insert(codestory_contracts::graph::NodeId(file_info.id));
             }
         }
-        for file_id in &execution_plan.files_to_remove {
-            semantic_refresh_seed_file_ids.insert(codestory_contracts::graph::NodeId(*file_id));
-        }
+        semantic_refresh_seed_file_ids.extend(
+            execution_plan
+                .files_to_remove
+                .iter()
+                .copied()
+                .map(codestory_contracts::graph::NodeId),
+        );
+        semantic_refresh_seed_file_ids.extend(policy_excluded_semantic_seed_file_ids);
         let current_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
             staged.store_mut(),
             &semantic_refresh_seed_file_ids,
@@ -24158,6 +24183,187 @@ fn build_llm_symbol_doc_text() -> String {
             files.policy_exclusions[0].observed_unit_count,
             codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
         );
+    }
+
+    #[test]
+    fn incremental_refresh_replaces_structural_projection_and_semantics_with_unit_exclusion() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let component_dir = workspace.path().join("alpha");
+        fs::create_dir_all(&component_dir).expect("component directory");
+        let evidence_path = component_dir.join("evidence.json");
+        fs::write(&evidence_path, "{\"kept\":1}").expect("initial structural source");
+        fs::write(workspace.path().join("control.rs"), "pub fn control() {}\n")
+            .expect("control source");
+
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full publication");
+
+        let initial_storage = Storage::open(&storage_path).expect("initial storage");
+        let initial_file = initial_storage
+            .get_file_by_path(&evidence_path)
+            .expect("initial file lookup")
+            .expect("initial parser-backed file");
+        let initial_file_id = codestory_contracts::graph::NodeId(initial_file.id);
+        assert!(
+            initial_storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("initial symbol docs")
+                .iter()
+                .any(|doc| doc.file_node_id == Some(initial_file_id)),
+            "the initial structural projection must have semantic evidence to invalidate"
+        );
+        assert!(
+            initial_storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("initial component reports")
+                .iter()
+                .any(|doc| doc.display_name == "component_report:dir:alpha"),
+            "the initial structural projection must contribute an alpha component report"
+        );
+        drop(initial_storage);
+
+        let mut over_bound = String::from("{");
+        for index in 0..=codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP {
+            if index > 0 {
+                over_bound.push(',');
+            }
+            over_bound.push_str(&format!("\"key{index}\":{index}"));
+        }
+        over_bound.push('}');
+        assert!(over_bound.len() as u64 <= DEFAULT_SOURCE_FILE_BYTE_CAP);
+        fs::write(&evidence_path, over_bound).expect("unit-bound structural source");
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental unit exclusion publication");
+        let excluded_storage = Storage::open(&storage_path).expect("excluded storage");
+        assert!(
+            excluded_storage
+                .get_file_by_path(&evidence_path)
+                .expect("excluded file lookup")
+                .is_none(),
+            "unit exclusion must remove the previous parser-backed projection"
+        );
+        assert!(
+            excluded_storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("excluded symbol docs")
+                .iter()
+                .all(|doc| {
+                    doc.file_node_id != Some(initial_file_id)
+                        && doc.display_name != "component_report:dir:alpha"
+                }),
+            "unit exclusion must remove stale file semantics and its component report"
+        );
+        assert!(
+            excluded_storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("excluded dense anchors")
+                .iter()
+                .all(|doc| doc.file_node_id != Some(initial_file_id)),
+            "unit exclusion must remove stale dense evidence"
+        );
+        assert_eq!(
+            excluded_storage
+                .get_source_policy_exclusions()
+                .expect("unit exclusions")
+                .len(),
+            1
+        );
+        drop(excluded_storage);
+
+        fs::write(&evidence_path, "{\"reevaluated\":2}")
+            .expect("source changed back below unit cap");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental policy reevaluation");
+        let restored_storage = Storage::open(&storage_path).expect("restored storage");
+        assert!(
+            restored_storage
+                .get_file_by_path(&evidence_path)
+                .expect("restored file lookup")
+                .is_some(),
+            "changed content below the policy cap must be indexed again"
+        );
+        assert!(
+            restored_storage
+                .get_source_policy_exclusions()
+                .expect("restored exclusions")
+                .is_empty(),
+            "the old content-bound exclusion must not survive reevaluation"
+        );
+    }
+
+    #[test]
+    fn incremental_structural_unit_exclusion_revalidates_content_at_identity_fence() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let evidence_path = workspace.path().join("evidence.json");
+        fs::write(&evidence_path, "{\"baseline\":1}").expect("baseline structural source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("baseline publication");
+        let baseline = Storage::open(&storage_path)
+            .expect("baseline storage")
+            .get_complete_index_publication()
+            .expect("baseline publication read")
+            .expect("complete baseline publication");
+
+        let mut over_bound = String::from("{");
+        for index in 0..=codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP {
+            if index > 0 {
+                over_bound.push(',');
+            }
+            over_bound.push_str(&format!("\"key{index}\":{index}"));
+        }
+        over_bound.push('}');
+        fs::write(&evidence_path, over_bound).expect("unit-bound structural source");
+        let changed_path = evidence_path.clone();
+        arm_source_policy_before_revalidate_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("classified unit exclusion");
+            bytes.push(b' ');
+            fs::write(&changed_path, bytes).expect("drift classified unit exclusion");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("drifted unit exclusion must fail closed");
+        assert_eq!(error.code, "source_verification_failed");
+        let live = Storage::open(&storage_path).expect("preserved live storage");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("preserved publication"),
+            Some(baseline)
+        );
+        assert!(
+            live.get_file_by_path(&evidence_path)
+                .expect("preserved parser-backed file")
+                .is_some()
+        );
+        assert!(
+            live.get_source_policy_exclusions()
+                .expect("preserved exclusions")
+                .is_empty()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]

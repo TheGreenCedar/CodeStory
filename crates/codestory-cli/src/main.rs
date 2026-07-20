@@ -8599,9 +8599,9 @@ mod tests {
                 path: "vendor/registers.h".into(),
                 role: IndexedFileRoleDto::Vendor,
                 content_hash: "a".repeat(64),
-                observed_size: 2_000_000,
-                observed_unit_count: 0,
-                policy_version: "oversized-source-v1".into(),
+                observed_size: 279_751,
+                observed_unit_count: 4_514,
+                policy_version: "bounded-source-exclusion-v2".into(),
                 byte_cap: 1_000_000,
                 structural_unit_cap:
                     codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
@@ -8622,6 +8622,8 @@ mod tests {
             "{markdown}"
         );
         assert!(markdown.contains("vendor/registers.h"), "{markdown}");
+        assert!(markdown.contains("4514 structural units"), "{markdown}");
+        assert!(markdown.contains("unit_cap=2048"), "{markdown}");
     }
 
     #[test]
