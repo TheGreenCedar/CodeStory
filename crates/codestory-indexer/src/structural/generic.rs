@@ -711,10 +711,7 @@ fn analyze_shell_line(line: &str, state: &mut ShellLexicalState) -> ShellLineAna
                 }
                 ShellQuote::Double => {
                     if byte == b'\\' {
-                        if let Some(escaped) = masked.get_mut(cursor + 1) {
-                            *escaped = b' ';
-                        }
-                        cursor = (cursor + 2).min(bytes.len());
+                        cursor = mask_shell_escape(line, &mut masked, cursor);
                     } else {
                         if byte == b'"' {
                             state.quote = None;
@@ -730,11 +727,7 @@ fn analyze_shell_line(line: &str, state: &mut ShellLexicalState) -> ShellLineAna
             break;
         }
         if byte == b'\\' {
-            masked[cursor] = b' ';
-            if let Some(escaped) = masked.get_mut(cursor + 1) {
-                *escaped = b' ';
-            }
-            cursor = (cursor + 2).min(bytes.len());
+            cursor = mask_shell_escape(line, &mut masked, cursor);
             continue;
         }
         if byte == b'\'' {
@@ -795,6 +788,17 @@ fn analyze_shell_line(line: &str, state: &mut ShellLexicalState) -> ShellLineAna
             .expect("masking UTF-8 shell source with ASCII spaces preserves UTF-8"),
         heredocs,
     }
+}
+
+fn mask_shell_escape(line: &str, masked: &mut [u8], cursor: usize) -> usize {
+    masked[cursor] = b' ';
+    let escaped_start = cursor + 1;
+    let Some(escaped) = line[escaped_start..].chars().next() else {
+        return line.len();
+    };
+    let escaped_end = escaped_start + escaped.len_utf8();
+    masked[escaped_start..escaped_end].fill(b' ');
+    escaped_end
 }
 
 fn mask_powershell_block_comments(line: &str, depth: &mut usize) -> String {

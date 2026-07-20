@@ -582,13 +582,18 @@ mod tests {
                 ["after_escape", "./after-escape.zsh"],
             ),
             (
+                "escaped-non-ascii",
+                "printf '%s\\n' \\é\nfunction after_unicode_escape { echo ok; }\nsource ./after-unicode-escape.zsh\n",
+                ["after_unicode_escape", "./after-unicode-escape.zsh"],
+            ),
+            (
                 "multiline-single-quoted",
                 "payload='\n<<NOT_A_HEREDOC\nfunction hidden_single_literal { echo hidden; }\nsource ./hidden-single-literal.zsh\n'\nfunction after_multiline_single { echo ok; }\nsource ./after-multiline-single.zsh\n",
                 ["after_multiline_single", "./after-multiline-single.zsh"],
             ),
             (
                 "multiline-double-quoted",
-                "payload=\"\nescaped quote: \\\"\n<<NOT_A_HEREDOC\nfunction hidden_double_literal { echo hidden; }\nsource ./hidden-double-literal.zsh\n\"\nfunction after_multiline_double { echo ok; }\nsource ./after-multiline-double.zsh\n",
+                "payload=\"\nescaped quote: \\\"\nescaped non-ASCII: \\é <<NOT_A_HEREDOC\nfunction hidden_double_literal { echo hidden; }\nsource ./hidden-double-literal.zsh\n\"\nfunction after_multiline_double { echo ok; }\nsource ./after-multiline-double.zsh\n",
                 ["after_multiline_double", "./after-multiline-double.zsh"],
             ),
         ];
