@@ -1003,6 +1003,19 @@ struct ArtifactCacheAccess<'a> {
     policies: ArtifactCachePolicies,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactCacheFamily {
+    Parser,
+    Structural,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FullRefreshCacheReadPlan {
+    parser: bool,
+    structural: bool,
+    reader_owner: Option<ArtifactCacheFamily>,
+}
+
 impl<'a> ArtifactCacheAccess<'a> {
     fn storage(storage: &'a mut Storage, policies: ArtifactCachePolicies) -> Self {
         Self {
@@ -1588,27 +1601,26 @@ impl WorkspaceIndexer {
         let writer_output = if plan.mode == codestory_workspace::BuildMode::FullRefresh
             && Self::full_refresh_pipeline_paths_are_unique(&root, &plan.files_to_index)
         {
-            let (has_parser_lookups, has_structural_lookups) =
-                self.full_refresh_cache_lookup_families(&root, &plan.files_to_index);
-            let needs_parser_reader =
-                self.artifact_cache_policies.parser.reads_storage() && has_parser_lookups;
-            let needs_structural_reader =
-                self.artifact_cache_policies.structural.reads_storage() && has_structural_lookups;
-            let needs_cache_reader = needs_parser_reader || needs_structural_reader;
+            let cache_read_plan = self.full_refresh_cache_read_plan(&root, &plan.files_to_index);
+            let needs_cache_reader = cache_read_plan.reader_owner.is_some();
             let cache_reader = needs_cache_reader
                 .then(|| storage.index_artifact_cache_reader())
                 .transpose()?
                 .flatten();
             if cache_reader.is_some() || !needs_cache_reader {
                 if cache_reader.is_some() {
-                    if needs_parser_reader {
-                        stats.parser_artifact_cache.reader_opens =
-                            stats.parser_artifact_cache.reader_opens.saturating_add(1);
-                    } else {
-                        stats.structural_artifact_cache.reader_opens = stats
-                            .structural_artifact_cache
-                            .reader_opens
-                            .saturating_add(1);
+                    match cache_read_plan.reader_owner {
+                        Some(ArtifactCacheFamily::Parser) => {
+                            stats.parser_artifact_cache.reader_opens =
+                                stats.parser_artifact_cache.reader_opens.saturating_add(1);
+                        }
+                        Some(ArtifactCacheFamily::Structural) => {
+                            stats.structural_artifact_cache.reader_opens = stats
+                                .structural_artifact_cache
+                                .reader_opens
+                                .saturating_add(1);
+                        }
+                        None => unreachable!("opened cache reader must have one owning family"),
                     }
                 }
                 self.run_full_refresh_pipeline(
@@ -2305,9 +2317,12 @@ impl WorkspaceIndexer {
         })
     }
 
-    fn full_refresh_cache_lookup_families(&self, root: &Path, files: &[PathBuf]) -> (bool, bool) {
-        let mut parser = false;
-        let mut structural = false;
+    fn full_refresh_cache_read_plan(
+        &self,
+        root: &Path,
+        files: &[PathBuf],
+    ) -> FullRefreshCacheReadPlan {
+        let mut plan = FullRefreshCacheReadPlan::default();
         for path in files {
             let full_path = Self::normalize_index_path(root, path);
             if workspace_structural_source_exclusion(root, &full_path).is_some() {
@@ -2318,15 +2333,25 @@ impl WorkspaceIndexer {
                 .as_ref()
                 .and_then(|database| database.get_parsed_info(&full_path));
             if get_language_config_for_path(&full_path, compilation_info.as_ref()).is_some() {
-                parser = true;
+                plan.parser = true;
+                if plan.reader_owner.is_none()
+                    && self.artifact_cache_policies.parser.reads_storage()
+                {
+                    plan.reader_owner = Some(ArtifactCacheFamily::Parser);
+                }
             } else if structural::is_structural_candidate_path(&full_path) {
-                structural = true;
+                plan.structural = true;
+                if plan.reader_owner.is_none()
+                    && self.artifact_cache_policies.structural.reads_storage()
+                {
+                    plan.reader_owner = Some(ArtifactCacheFamily::Structural);
+                }
             }
-            if parser && structural {
+            if plan.parser && plan.structural && plan.reader_owner.is_some() {
                 break;
             }
         }
-        (parser, structural)
+        plan
     }
 
     fn seed_symbol_table(
@@ -22230,6 +22255,76 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(stats.structural_artifact_cache.reader_opens, 0);
         assert!(storage.get_nodes()?.len() >= 24);
         Ok(())
+    }
+
+    fn assert_mixed_full_refresh_reader_owner(
+        files_to_index: Vec<PathBuf>,
+        expected_owner: ArtifactCacheFamily,
+    ) -> Result<()> {
+        use codestory_store::Store as Storage;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        std::fs::write(dir.path().join("lib.rs"), "pub fn parser_source() {}\n")?;
+        std::fs::write(
+            dir.path().join("config.json"),
+            "{\"service\":{\"name\":\"api\"}}\n",
+        )?;
+        let mut storage = Storage::open_build(dir.path().join("mixed.sqlite"))?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index,
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+
+        let stats = WorkspaceIndexer::new(dir.path().to_path_buf()).run(
+            &mut storage,
+            &plan,
+            &EventBus::new(),
+            None,
+        )?;
+
+        assert_eq!(stats.parser_artifact_cache.logical_lookups, 1);
+        assert_eq!(stats.parser_artifact_cache.physical_queries, 1);
+        assert_eq!(stats.structural_artifact_cache.logical_lookups, 1);
+        assert_eq!(stats.structural_artifact_cache.physical_queries, 1);
+        assert_eq!(
+            stats
+                .parser_artifact_cache
+                .reader_opens
+                .saturating_add(stats.structural_artifact_cache.reader_opens),
+            1,
+            "one shared reader open must be attributed exactly once"
+        );
+        match expected_owner {
+            ArtifactCacheFamily::Parser => {
+                assert_eq!(stats.parser_artifact_cache.reader_opens, 1);
+                assert_eq!(stats.structural_artifact_cache.reader_opens, 0);
+            }
+            ArtifactCacheFamily::Structural => {
+                assert_eq!(stats.parser_artifact_cache.reader_opens, 0);
+                assert_eq!(stats.structural_artifact_cache.reader_opens, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_full_refresh_attributes_reader_open_to_structural_when_scheduled_first() -> Result<()>
+    {
+        assert_mixed_full_refresh_reader_owner(
+            vec![PathBuf::from("config.json"), PathBuf::from("lib.rs")],
+            ArtifactCacheFamily::Structural,
+        )
+    }
+
+    #[test]
+    fn mixed_full_refresh_attributes_reader_open_to_parser_when_scheduled_first() -> Result<()> {
+        assert_mixed_full_refresh_reader_owner(
+            vec![PathBuf::from("lib.rs"), PathBuf::from("config.json")],
+            ArtifactCacheFamily::Parser,
+        )
     }
 
     #[test]
