@@ -21977,9 +21977,13 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 
         storage.get_connection().execute(
             "UPDATE structural_text_artifact_cache
-             SET artifact_blob = ?1
-             WHERE file_path = ?2",
-            (b"not-json".as_slice(), ".github/workflows/ci.yml"),
+             SET artifact_blob = ?1, artifact_digest = ?2
+             WHERE file_path = ?3",
+            (
+                b"not-json".as_slice(),
+                source_content_hash(b"not-json"),
+                ".github/workflows/ci.yml",
+            ),
         )?;
         let corrupt_stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
         assert_eq!(corrupt_stats.artifact_cache_invalid_entries, 1);
@@ -21992,14 +21996,60 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             [".github/workflows/ci.yml"],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut incompatible: serde_json::Value = serde_json::from_slice(&blob)?;
-        incompatible["descriptor_version"] = serde_json::json!(999);
+        let mut graph_corrupt: serde_json::Value = serde_json::from_slice(&blob)?;
+        let graph_nodes = graph_corrupt["nodes"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("structural cache nodes are missing"))?;
+        let build_node = graph_nodes
+            .iter_mut()
+            .find(|node| node["serialized_name"] == "build")
+            .ok_or_else(|| anyhow!("cached build node is missing"))?;
+        build_node["serialized_name"] = serde_json::json!("poisoned-build");
         storage.get_connection().execute(
             "UPDATE structural_text_artifact_cache
              SET artifact_blob = ?1
              WHERE file_path = ?2 AND cache_key = ?3",
             (
-                serde_json::to_vec(&incompatible)?,
+                serde_json::to_vec(&graph_corrupt)?,
+                ".github/workflows/ci.yml",
+                &cache_key,
+            ),
+        )?;
+        storage.get_connection().execute(
+            "UPDATE node SET serialized_name = 'stale-live-build'
+             WHERE serialized_name = 'build'",
+            [],
+        )?;
+        let graph_corrupt_stats = indexer.run(&mut storage, &plan, &EventBus::new(), None)?;
+        assert_eq!(graph_corrupt_stats.artifact_cache_hits, 0);
+        assert_eq!(graph_corrupt_stats.artifact_cache_invalid_entries, 0);
+        assert_eq!(graph_corrupt_stats.artifact_cache_misses, 1);
+        let graph_names = storage
+            .get_nodes()?
+            .into_iter()
+            .map(|node| node.serialized_name)
+            .collect::<HashSet<_>>();
+        assert!(graph_names.contains("build"));
+        assert!(!graph_names.contains("poisoned-build"));
+        assert!(!graph_names.contains("stale-live-build"));
+
+        let (cache_key, blob): (String, Vec<u8>) = storage.get_connection().query_row(
+            "SELECT cache_key, artifact_blob
+             FROM structural_text_artifact_cache
+             WHERE file_path = ?1",
+            [".github/workflows/ci.yml"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut incompatible: serde_json::Value = serde_json::from_slice(&blob)?;
+        incompatible["descriptor_version"] = serde_json::json!(999);
+        let incompatible = serde_json::to_vec(&incompatible)?;
+        storage.get_connection().execute(
+            "UPDATE structural_text_artifact_cache
+             SET artifact_blob = ?1, artifact_digest = ?2
+             WHERE file_path = ?3 AND cache_key = ?4",
+            (
+                &incompatible,
+                source_content_hash(&incompatible),
                 ".github/workflows/ci.yml",
                 cache_key,
             ),

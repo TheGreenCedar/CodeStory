@@ -1044,16 +1044,69 @@ fn rollback_prepared_promotion(
     }
 }
 
+fn read_journal_less_recovery_auxiliary_identities(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    schema_version: u32,
+    role: &str,
+) -> Result<
+    (
+        Option<SourcePolicyExclusionRollbackIdentity>,
+        Option<StructuralTextUnitRollbackIdentity>,
+    ),
+    StorageError,
+> {
+    let source_policy = if schema_version >= SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION {
+        read_source_policy_exclusion_rollback_identity(path, publication)?
+    } else {
+        None
+    };
+    if schema_version == SCHEMA_VERSION && source_policy.is_none() {
+        return Err(promotion_error(format!(
+            "Current-schema {role} {} has no complete source policy exclusion manifest",
+            path.display()
+        )));
+    }
+    let structural_text = if schema_version == SCHEMA_VERSION {
+        let identity = read_structural_text_unit_rollback_identity(path, publication)?;
+        if identity.is_none() {
+            return Err(promotion_error(format!(
+                "Current-schema {role} {} has no complete structural text unit manifest",
+                path.display()
+            )));
+        }
+        identity
+    } else {
+        None
+    };
+    Ok((source_policy, structural_text))
+}
+
 fn recover_legacy_promotion_backup(
     live_path: &Path,
     backup_path: &Path,
 ) -> Result<(), StorageError> {
     let recovery_contract = RecoveryDatabaseContract::LegacyBackup;
+    let backup_schema_version = inspect_promotion_database(backup_path)?
+        .map(|(_, schema_version)| schema_version)
+        .ok_or_else(|| {
+            promotion_error(format!(
+                "Legacy promotion backup {} is missing",
+                backup_path.display()
+            ))
+        })?;
     let backup_identity = require_recovery_database_identity(
         backup_path,
         "Legacy promotion backup",
         recovery_contract,
     )?;
+    let (backup_source_policy, backup_structural_text) =
+        read_journal_less_recovery_auxiliary_identities(
+            backup_path,
+            &backup_identity,
+            backup_schema_version,
+            "legacy promotion backup",
+        )?;
     let live_identity = read_recovery_database_identity(live_path, recovery_contract);
     let restore_backup = match live_identity {
         Ok(None) => true,
@@ -1063,8 +1116,47 @@ fn recover_legacy_promotion_backup(
                 live_path.display()
             )));
         }
-        Ok(Some(ref live)) if live == &backup_identity => false,
-        Ok(Some(ref live)) if live.generation > backup_identity.generation => false,
+        Ok(Some(ref live)) if live == &backup_identity => {
+            let live_schema_version = inspect_promotion_database(live_path)?
+                .map(|(_, schema_version)| schema_version)
+                .ok_or_else(|| {
+                    promotion_error(format!("Live database {} is missing", live_path.display()))
+                })?;
+            match read_journal_less_recovery_auxiliary_identities(
+                live_path,
+                live,
+                live_schema_version,
+                "live database",
+            ) {
+                Ok((live_source_policy, live_structural_text))
+                    if live_source_policy == backup_source_policy
+                        && live_structural_text == backup_structural_text =>
+                {
+                    false
+                }
+                Ok(_) | Err(_) => true,
+            }
+        }
+        Ok(Some(ref live)) if live.generation > backup_identity.generation => {
+            let live_schema_version = inspect_promotion_database(live_path)?
+                .map(|(_, schema_version)| schema_version)
+                .ok_or_else(|| {
+                    promotion_error(format!("Live database {} is missing", live_path.display()))
+                })?;
+            read_journal_less_recovery_auxiliary_identities(
+                live_path,
+                live,
+                live_schema_version,
+                "newer live database",
+            )
+            .map_err(|error| {
+                promotion_error(format!(
+                    "Cannot validate newer live database {} while a legacy promotion backup exists: {error}",
+                    live_path.display()
+                ))
+            })?;
+            false
+        }
         Ok(Some(_)) => {
             return Err(promotion_error(format!(
                 "Ambiguous legacy promotion backup for {}; refusing to overwrite the live database",
@@ -1085,6 +1177,18 @@ fn recover_legacy_promotion_backup(
                 live_path.display()
             )));
         }
+        require_recorded_source_policy_identity(
+            live_path,
+            &restored,
+            &backup_source_policy,
+            "Recovered live database",
+        )?;
+        require_recorded_structural_text_identity(
+            live_path,
+            &restored,
+            &backup_structural_text,
+            "Recovered live database",
+        )?;
     }
     cleanup_sqlite_sidecars(backup_path)
 }
@@ -1274,15 +1378,18 @@ fn get_structural_text_artifact_cache_from_connection(
     path: &Path,
     cache_key: &str,
 ) -> Result<Option<Vec<u8>>, StorageError> {
-    Ok(connection
+    let cached = connection
         .query_row(
-            "SELECT artifact_blob
+            "SELECT artifact_blob, artifact_digest
              FROM structural_text_artifact_cache
              WHERE file_path = ?1 AND cache_key = ?2",
             params![path.to_string_lossy().to_string(), cache_key],
-            |row| row.get(0),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
         )
-        .optional()?)
+        .optional()?;
+    Ok(cached.and_then(|(blob, digest)| {
+        (format!("{:x}", Sha256::digest(&blob)) == digest).then_some(blob)
+    }))
 }
 
 fn upsert_index_artifact_cache_row(

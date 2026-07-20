@@ -234,8 +234,8 @@ fn take_sql_ident(text: &str) -> Option<String> {
 }
 
 fn next_ident(line: &str) -> Option<LocatedSqlIdentifier> {
-    let trimmed = line.trim();
-    let upper = trimmed.to_ascii_uppercase();
+    let trimmed_start = line.trim_start();
+    let upper = trimmed_start.to_ascii_uppercase();
     for keyword in [
         "CREATE SCHEMA",
         "CREATE DATABASE",
@@ -243,7 +243,7 @@ fn next_ident(line: &str) -> Option<LocatedSqlIdentifier> {
         "SET SEARCH_PATH",
     ] {
         if upper.starts_with(keyword) {
-            let leading = line.len().saturating_sub(trimmed.len());
+            let leading = line.len().saturating_sub(trimmed_start.len());
             return located_sql_identifier(line, leading + keyword.len());
         }
     }
@@ -411,6 +411,40 @@ CREATE INDEX users_email_idx ON app.users (email);
                 .edges
                 .iter()
                 .any(|e| e.kind == EdgeKind::ANNOTATION_USAGE)
+        );
+    }
+
+    #[test]
+    fn indented_schema_database_and_search_path_identifiers_keep_exact_byte_spans() {
+        for (line, expected) in [
+            ("  CREATE SCHEMA app;  ", "app"),
+            ("\tCREATE DATABASE warehouse;   ", "warehouse"),
+            ("    SET SEARCH_PATH TO tenant, public;  ", "tenant"),
+            (" SET SEARCH_PATH analytics, public; ", "analytics"),
+        ] {
+            let identifier = next_ident(line).expect("located SQL identifier");
+            assert_eq!(identifier.value, expected);
+            assert_eq!(
+                &line.as_bytes()[identifier.start..identifier.start + identifier.len],
+                expected.as_bytes()
+            );
+        }
+
+        let source = "  CREATE SCHEMA app;  \nCREATE TABLE app.users (id INT);\n";
+        let mut storage = IntermediateStorage::default();
+        collect_sql_entities(Path::new("schema.sql"), source, NodeId(9), &mut storage);
+        let schema = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.canonical_id.as_deref() == Some("sql:schema:app") && node.start_col.is_some()
+            })
+            .expect("schema node");
+        let start = schema.start_col.expect("schema start column") as usize - 1;
+        let end = schema.end_col.expect("schema end column") as usize;
+        assert_eq!(
+            &source.lines().next().unwrap().as_bytes()[start..end],
+            b"app"
         );
     }
 }

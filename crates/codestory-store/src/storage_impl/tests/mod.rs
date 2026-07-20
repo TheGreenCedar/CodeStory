@@ -4423,6 +4423,264 @@ fn schema_21_legacy_backup_recovers_before_migration() {
 }
 
 #[test]
+fn schema_28_journal_less_backup_requires_complete_auxiliary_publications() {
+    let live_path = unique_temp_db_path("schema28-journal-less-valid-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
+    publish_bound_test_structural_cache(&backup_path).expect("bind schema 28 structural cache");
+
+    let recovered = Storage::open(&live_path).expect("recover valid schema 28 backup");
+    let publication = recovered
+        .get_complete_index_publication()
+        .expect("read recovered publication")
+        .expect("complete recovered publication");
+    recovered
+        .validate_source_policy_exclusion_publication(
+            &publication,
+            "test-project",
+            "test-workspace",
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+        )
+        .expect("validate recovered source policy publication");
+    recovered
+        .validate_structural_text_unit_publication(&publication)
+        .expect("validate recovered structural publication");
+    assert_eq!(
+        recovered
+            .get_structural_text_artifact_cache(Path::new("old.rs"), "v1:test")
+            .expect("read recovered structural cache"),
+        Some(b"verified structural cache".to_vec())
+    );
+    drop(recovered);
+    assert!(
+        !backup_path.exists(),
+        "valid recovery must consume its backup"
+    );
+    cleanup_sqlite_sidecars(&live_path).expect("clean recovered schema 28 fixture");
+}
+
+#[test]
+fn schema_28_journal_less_backup_protects_against_invalid_live_auxiliary_state() {
+    for live_state in ["same-corrupt", "newer-corrupt"] {
+        let live_path = unique_temp_db_path(&format!("schema28-journal-less-{live_state}-live"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        if live_state == "newer-corrupt" {
+            seed_promotion_file(&live_path, 2, "new.rs").expect("seed newer live publication");
+            publish_bound_test_structural_cache(&live_path)
+                .expect("bind newer live structural cache");
+        }
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed valid schema 28 backup");
+        publish_bound_test_structural_cache(&backup_path)
+            .expect("bind valid backup structural cache");
+        if live_state == "same-corrupt" {
+            copy_promotion_database_fixture(&backup_path, &live_path)
+                .expect("copy same-identity live fixture");
+        }
+        corrupt_test_structural_cache(&live_path, "blob").expect("corrupt live structural cache");
+
+        if live_state == "same-corrupt" {
+            let recovered = Storage::open(&live_path).expect("restore valid same-identity backup");
+            let publication = recovered
+                .get_complete_index_publication()
+                .expect("read restored publication")
+                .expect("complete restored publication");
+            recovered
+                .validate_structural_text_unit_publication(&publication)
+                .expect("restored structural publication");
+            assert_eq!(
+                recovered
+                    .get_structural_text_artifact_cache(Path::new("old.rs"), "v1:test")
+                    .expect("read restored cache"),
+                Some(b"verified structural cache".to_vec())
+            );
+            drop(recovered);
+            assert!(
+                !backup_path.exists(),
+                "successful same-identity restore retained its backup"
+            );
+        } else {
+            let error = match Storage::open(&live_path) {
+                Ok(_) => panic!("newer corrupt live publication passed journal-less recovery"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("structural artifact cache"),
+                "unexpected newer-live recovery error: {error}"
+            );
+            assert!(
+                backup_path.exists(),
+                "invalid newer live publication destroyed the valid backup"
+            );
+            let live = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open retained newer live fixture");
+            let generation: String = live
+                .query_row(
+                    "SELECT generation_id FROM index_publication WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read retained newer live generation");
+            assert_eq!(generation, "generation-2");
+        }
+
+        cleanup_sqlite_sidecars(&backup_path).expect("clean protected backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean protected live");
+    }
+}
+
+#[test]
+fn schema_28_journal_less_backup_rejects_missing_or_corrupt_auxiliary_state() {
+    for corruption in [
+        "source-policy-missing",
+        "source-policy-corrupt",
+        "structural-missing",
+        "structural-corrupt",
+        "cache-missing",
+        "cache-corrupt",
+    ] {
+        let live_path = unique_temp_db_path(&format!("schema28-journal-less-{corruption}-live"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
+        publish_bound_test_structural_cache(&backup_path).expect("bind schema 28 structural cache");
+        let connection = Connection::open(&backup_path).expect("open schema 28 backup");
+        match corruption {
+            "source-policy-missing" => connection
+                .execute("DELETE FROM source_policy_exclusion_publication", [])
+                .expect("remove source policy manifest"),
+            "source-policy-corrupt" => connection
+                .execute(
+                    "UPDATE source_policy_exclusion_publication
+                     SET exclusion_digest = ?1",
+                    ["0".repeat(64)],
+                )
+                .expect("corrupt source policy manifest"),
+            "structural-missing" => connection
+                .execute("DELETE FROM structural_text_unit_publication", [])
+                .expect("remove structural manifest"),
+            "structural-corrupt" => connection
+                .execute(
+                    "UPDATE structural_text_unit_publication SET unit_digest = ?1",
+                    ["0".repeat(64)],
+                )
+                .expect("corrupt structural manifest"),
+            "cache-missing" => connection
+                .execute("DROP TABLE structural_text_artifact_cache", [])
+                .expect("remove structural cache table"),
+            "cache-corrupt" => connection
+                .execute(
+                    "UPDATE structural_text_artifact_cache SET artifact_blob = ?1",
+                    [b"corrupt cache".as_slice()],
+                )
+                .expect("corrupt structural cache"),
+            _ => unreachable!(),
+        };
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint corrupt schema 28 backup");
+        drop(connection);
+
+        let error = match Storage::open(&live_path) {
+            Ok(_) => panic!("schema 28 recovery accepted {corruption}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().to_ascii_lowercase().contains(
+                if corruption.starts_with("source-policy") {
+                    "source policy"
+                } else if corruption.starts_with("cache") {
+                    "structural artifact cache"
+                } else {
+                    "structural text unit"
+                }
+            ),
+            "unexpected {corruption} recovery error: {error}"
+        );
+        assert!(
+            backup_path.exists(),
+            "{corruption} recovery consumed its backup"
+        );
+        assert!(
+            !live_path.exists(),
+            "{corruption} recovery installed an invalid backup"
+        );
+
+        cleanup_sqlite_sidecars(&backup_path).expect("clean rejected schema 28 backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean rejected schema 28 live");
+    }
+}
+
+#[test]
+fn schema_27_journal_less_backup_allows_absent_policy_but_rejects_corrupt_present_policy() {
+    for policy_state in ["absent", "corrupt"] {
+        let live_path = unique_temp_db_path(&format!("schema27-journal-less-{policy_state}-live"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 27 backup");
+        let connection = Connection::open(&backup_path).expect("open schema 27 backup");
+        if policy_state == "absent" {
+            connection
+                .execute("DELETE FROM source_policy_exclusion_publication", [])
+                .expect("remove optional schema 27 policy manifest");
+        } else {
+            connection
+                .execute(
+                    "UPDATE source_policy_exclusion_publication
+                     SET exclusion_digest = ?1",
+                    ["0".repeat(64)],
+                )
+                .expect("corrupt schema 27 policy manifest");
+        }
+        drop(connection);
+        restamp_complete_promotion_fixture(
+            &backup_path,
+            SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
+        )
+        .expect("restamp schema 27 backup");
+
+        if policy_state == "absent" {
+            let recovered =
+                Storage::open(&live_path).expect("recover schema 27 backup without policy");
+            assert_eq!(
+                recovered
+                    .get_complete_index_publication()
+                    .expect("read schema 27 publication")
+                    .expect("complete schema 27 publication")
+                    .generation,
+                1
+            );
+            assert!(
+                recovered
+                    .get_source_policy_exclusion_manifest()
+                    .expect("read optional schema 27 policy")
+                    .is_none()
+            );
+            drop(recovered);
+            assert!(!backup_path.exists());
+        } else {
+            let error = match Storage::open(&live_path) {
+                Ok(_) => panic!("schema 27 recovery accepted corrupt present policy"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("source policy"),
+                "unexpected schema 27 policy error: {error}"
+            );
+            assert!(backup_path.exists());
+            assert!(!live_path.exists());
+        }
+
+        cleanup_sqlite_sidecars(&backup_path).expect("clean schema 27 backup");
+        cleanup_sqlite_sidecars(&live_path).expect("clean schema 27 live");
+    }
+}
+
+#[test]
 fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
     for (label, journal_version, schema_version, expected_error) in [
         (
