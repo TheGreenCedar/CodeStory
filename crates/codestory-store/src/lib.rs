@@ -18,7 +18,8 @@ pub use snapshot_store::{
     StagedSnapshotPublishStats,
 };
 pub use storage_impl::{
-    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    BUILD_EDGE_SEED_BATCH_SIZE, BuildNodeLookup, CURRENT_SCHEMA_VERSION,
+    CallerProjectionRemovalSummary, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
     DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata,
     DenseAnchorPublicationManifest, DenseReasonCounts, FileContentHash, FileInfo,
     FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,

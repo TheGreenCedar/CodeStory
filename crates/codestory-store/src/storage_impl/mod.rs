@@ -1,5 +1,5 @@
 use codestory_contracts::graph::{
-    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeKind,
+    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeId, EdgeKind,
     EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
@@ -17,7 +17,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -54,7 +54,8 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
-const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
+pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
+const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
 const INDEX_ARTIFACT_CACHE_UPSERT_SQL: &str = "INSERT INTO index_artifact_cache (
@@ -106,6 +107,37 @@ fn canonical_search_symbol_batch_limit(
         return Err(StorageError::InvalidBatchLimit(operation));
     }
     Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
+fn build_node_batch_limit(operation: &'static str, limit: usize) -> Result<i64, StorageError> {
+    if limit == 0 {
+        return Err(StorageError::InvalidBatchLimit(operation));
+    }
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
+fn accepted_node_kind_values(accepted_kinds: &[NodeKind]) -> Vec<i64> {
+    let mut values = accepted_kinds
+        .iter()
+        .map(|kind| i64::from(*kind as i32))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn nodes_by_kinds_batch_sql(accepted_kind_count: usize, has_after_node_id: bool) -> String {
+    let kind_placeholders = question_placeholders(accepted_kind_count);
+    let mut sql = format!(
+        "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col
+         FROM node NOT INDEXED
+         WHERE kind IN ({kind_placeholders})"
+    );
+    if has_after_node_id {
+        sql.push_str(" AND id > ?");
+    }
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    sql
 }
 
 fn uniform_optional_string(
@@ -1435,6 +1467,14 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("{0} requires a non-zero batch limit")]
     InvalidBatchLimit(&'static str),
+    #[error("{0} requires build-mode storage")]
+    BuildModeRequired(&'static str),
+    #[error("{operation} accepts at most {maximum} seed nodes per query, but received {actual}")]
+    BuildEdgeSeedBatchTooLarge {
+        operation: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
     #[error("Resolution support snapshot exceeds the current SQLite value limit")]
     ResolutionSupportSnapshotTooBig,
     #[error("Invalid enum value: {0}")]
@@ -1449,6 +1489,13 @@ pub struct IndexArtifactCacheWrite<'a> {
     pub path: &'a Path,
     pub cache_key: &'a str,
     pub artifact_blob: &'a [u8],
+}
+
+/// Nodes loaded directly from a build store without consulting or populating its cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildNodeLookup {
+    pub nodes: HashMap<NodeId, Node>,
+    pub query_batches: usize,
 }
 
 /// SQLite-backed graph, search, file, and snapshot store.
@@ -2963,6 +3010,18 @@ enum NonmutatingOpenPolicy {
 }
 
 impl Storage {
+    /// Reports whether this handle owns a disposable staged build.
+    pub fn is_staged_build(&self) -> bool {
+        self.deferred_secondary_indexes
+    }
+
+    fn require_build_mode(&self, operation: &'static str) -> Result<(), StorageError> {
+        if !self.is_staged_build() {
+            return Err(StorageError::BuildModeRequired(operation));
+        }
+        Ok(())
+    }
+
     /// Open a live store, applying schema migrations and secondary indexes.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_with_mode(path, StorageOpenMode::Live)
@@ -5345,6 +5404,75 @@ impl Storage {
         Ok(nodes)
     }
 
+    /// Reads one deterministic page of accepted node kinds from a staged build.
+    ///
+    /// `NOT INDEXED` keeps the keyset traversal on the node table's integer
+    /// primary key even after deferred secondary indexes are created. This
+    /// method neither consults nor populates `StorageCache`.
+    pub fn get_nodes_by_kinds_batch_after_for_build(
+        &self,
+        accepted_kinds: &[NodeKind],
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<Node>, StorageError> {
+        const OPERATION: &str = "get_nodes_by_kinds_batch_after_for_build";
+        self.require_build_mode(OPERATION)?;
+        let limit = build_node_batch_limit(OPERATION, limit)?;
+        let accepted_kind_values = accepted_node_kind_values(accepted_kinds);
+        if accepted_kind_values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = nodes_by_kinds_batch_sql(accepted_kind_values.len(), after_node_id.is_some());
+        let mut query_params = accepted_kind_values
+            .into_iter()
+            .map(Value::Integer)
+            .collect::<Vec<_>>();
+        if let Some(after_node_id) = after_node_id {
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        query_params.push(Value::Integer(limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(Self::node_from_row(row)?);
+        }
+        Ok(nodes)
+    }
+
+    /// Returns the complete sorted file-node ID set for accepted staged-build nodes.
+    ///
+    /// The table scan projects only integer IDs and deduplicates them in a
+    /// bounded set rather than loading node payloads or touching `StorageCache`.
+    pub fn get_node_file_ids_by_kinds_for_build(
+        &self,
+        accepted_kinds: &[NodeKind],
+    ) -> Result<Vec<NodeId>, StorageError> {
+        const OPERATION: &str = "get_node_file_ids_by_kinds_for_build";
+        self.require_build_mode(OPERATION)?;
+        let accepted_kind_values = accepted_node_kind_values(accepted_kinds);
+        if accepted_kind_values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let kind_placeholders = question_placeholders(accepted_kind_values.len());
+        let sql = format!(
+            "SELECT file_node_id
+             FROM node NOT INDEXED
+             WHERE kind IN ({kind_placeholders})
+               AND file_node_id IS NOT NULL"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(accepted_kind_values))?;
+        let mut file_node_ids = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            file_node_ids.insert(NodeId(row.get(0)?));
+        }
+        Ok(file_node_ids.into_iter().collect())
+    }
+
     pub fn get_edges(&self) -> Result<Vec<Edge>, StorageError> {
         let mut stmt = self
             .conn
@@ -5435,6 +5563,89 @@ impl Storage {
         }
 
         Ok(edges_by_node)
+    }
+
+    /// Reads one edge-ID-ordered batch incident to at most 200 staged-build seed nodes.
+    ///
+    /// Runtime callers keyset through one seed chunk until it is exhausted, then
+    /// discard the edge and endpoint payload before advancing. CALL resolution
+    /// filtering is identical to [`Self::get_edges_for_node_ids`].
+    pub fn get_edges_for_node_ids_batch_after_for_build(
+        &self,
+        node_ids: &[NodeId],
+        after_edge_id: Option<EdgeId>,
+        limit: usize,
+    ) -> Result<Vec<Edge>, StorageError> {
+        const OPERATION: &str = "get_edges_for_node_ids_batch_after_for_build";
+        self.require_build_mode(OPERATION)?;
+        let limit = build_node_batch_limit(OPERATION, limit)?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|node_id| node_id.0);
+        unique_node_ids.dedup();
+        if unique_node_ids.len() > BUILD_EDGE_SEED_BATCH_SIZE {
+            return Err(StorageError::BuildEdgeSeedBatchTooLarge {
+                operation: OPERATION,
+                actual: unique_node_ids.len(),
+                maximum: BUILD_EDGE_SEED_BATCH_SIZE,
+            });
+        }
+
+        let seed_count = unique_node_ids.len();
+        let source_placeholders = numbered_placeholders(1, seed_count);
+        let target_placeholders = numbered_placeholders(1 + seed_count, seed_count);
+        let resolved_source_placeholders = numbered_placeholders(1 + seed_count * 2, seed_count);
+        let resolved_target_placeholders = numbered_placeholders(1 + seed_count * 3, seed_count);
+        let after_placeholder = seed_count * 4 + 1;
+        let limit_placeholder = after_placeholder + usize::from(after_edge_id.is_some());
+        let after_clause = if after_edge_id.is_some() {
+            format!("AND e.id > ?{after_placeholder}")
+        } else {
+            String::new()
+        };
+        let query = format!(
+            "{EDGE_SELECT_BASE}
+             WHERE (
+                    e.source_node_id IN ({source_placeholders})
+                 OR e.target_node_id IN ({target_placeholders})
+                 OR e.resolved_source_node_id IN ({resolved_source_placeholders})
+                 OR e.resolved_target_node_id IN ({resolved_target_placeholders})
+             )
+               {after_clause}
+             ORDER BY e.id
+             LIMIT ?{limit_placeholder}"
+        );
+        let mut params = unique_node_ids
+            .iter()
+            .map(|id| Value::from(id.0))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .collect::<Vec<_>>();
+        if let Some(after_edge_id) = after_edge_id {
+            params.push(Value::from(after_edge_id.0));
+        }
+        params.push(Value::from(limit));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut edge = Self::edge_from_row(row)?;
+            let target_symbol: String = row.get(12)?;
+            if edge.kind == EdgeKind::CALL
+                && edge.resolved_target.is_some()
+                && should_ignore_call_resolution(&target_symbol, edge.certainty, edge.confidence)
+            {
+                edge.resolved_target = None;
+                edge.confidence = None;
+                edge.certainty = None;
+            }
+            edges.push(edge);
+        }
+        Ok(edges)
     }
 
     pub fn get_present_node_kinds(&self) -> Result<Vec<NodeKind>, StorageError> {
@@ -8651,6 +8862,48 @@ impl Storage {
         }
 
         Ok(nodes_by_id)
+    }
+
+    /// Loads bounded endpoint nodes from a staged build without using `StorageCache`.
+    pub fn get_nodes_by_ids_no_cache_for_build(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<BuildNodeLookup, StorageError> {
+        const OPERATION: &str = "get_nodes_by_ids_no_cache_for_build";
+        self.require_build_mode(OPERATION)?;
+        if ids.is_empty() {
+            return Ok(BuildNodeLookup {
+                nodes: HashMap::new(),
+                query_batches: 0,
+            });
+        }
+
+        let mut unique_ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        let mut nodes = HashMap::with_capacity(unique_ids.len());
+        let mut query_batches = 0;
+        for chunk in unique_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            let placeholders = question_placeholders(chunk.len());
+            let query = format!(
+                "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col
+                 FROM node
+                 WHERE id IN ({placeholders})
+                 ORDER BY id ASC"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter().copied()))?;
+            query_batches += 1;
+            while let Some(row) = rows.next()? {
+                let node = Self::node_from_row(row)?;
+                nodes.insert(node.id, node);
+            }
+        }
+
+        Ok(BuildNodeLookup {
+            nodes,
+            query_batches,
+        })
     }
 
     pub fn get_occurrences_for_node_ids(

@@ -152,6 +152,14 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_node_load_rows: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_node_stream_batches: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_endpoint_load_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_endpoint_load_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_endpoint_load_batches: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_selected_nodes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_context_file_count: Option<u32>,
@@ -385,6 +393,10 @@ mod tests {
             semantic_context_index_ms: None,
             semantic_node_load_ms: None,
             semantic_node_load_rows: None,
+            semantic_node_stream_batches: None,
+            semantic_endpoint_load_ms: None,
+            semantic_endpoint_load_rows: None,
+            semantic_endpoint_load_batches: None,
             semantic_selected_nodes: None,
             semantic_context_file_count: None,
             semantic_context_path_bytes: None,
@@ -495,6 +507,10 @@ mod tests {
         assert!(value.get("semantic_doc_build_ms").is_none());
         assert!(value.get("semantic_node_load_ms").is_none());
         assert!(value.get("semantic_node_load_rows").is_none());
+        assert!(value.get("semantic_node_stream_batches").is_none());
+        assert!(value.get("semantic_endpoint_load_ms").is_none());
+        assert!(value.get("semantic_endpoint_load_rows").is_none());
+        assert!(value.get("semantic_endpoint_load_batches").is_none());
         assert!(value.get("semantic_selected_nodes").is_none());
         assert!(value.get("semantic_context_file_count").is_none());
         assert!(value.get("semantic_context_path_bytes").is_none());

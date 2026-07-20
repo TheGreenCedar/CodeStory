@@ -410,6 +410,19 @@ Semantic sync does these pieces of work:
 - publish selected anchor text, source provenance, source range, content hash, policy, and exact core generation/run identity without loading the embedding engine
 - prune stale symbol docs or dense inputs that no longer correspond to the refreshed graph and policy
 
+For a full staged refresh, runtime first collects only the distinct semantic
+file identities needed to preserve the existing lexicographic file-text cache
+budget. It then advances through accepted node kinds in 4,096-row integer-ID
+keyset pages. Each page loads component access and the existing 200-ID edge
+chunks, resolves only that page's effective endpoints through cache-isolated
+node reads, emits the existing bounded document windows, and drops the
+page-local node/context maps. The node query explicitly stays on the integer
+primary key so a deferred kind index cannot introduce a temporary ordering
+tree. Component reports retain only their exact symbol count, first twelve
+files, and top eight central nodes across pages. Full-refresh output remains in
+node-ID order. Incremental graph dependency discovery and repair scopes retain
+their existing whole-scope loader.
+
 Full refresh has an extra copy-forward path: if a previous live database exists, unchanged symbol docs, retrieval artifact nodes, and dense-anchor inputs are copied into the staged database before publish. The later sync can retain content-level reuse while rebinding every selected input to the candidate core publication.
 
 Incremental refresh scopes symbol-doc and dense-anchor invalidation to changed or removed files plus files connected to them through the graph before or after the refresh. Related-symbol text, edge digests, centrality, and component reports can change at either endpoint, so those graph-dependent files are rebuilt even when their source bytes did not change. Unrelated untouched files keep their existing inputs. Vector reuse and rebuild happen only when retrieval finalizes the next immutable generation.
@@ -498,8 +511,15 @@ The index summary reports graph and semantic work separately:
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
 - `projection_persistence`: transaction count and wall plus per-family row attempts, estimated bound-input bytes, statement executions, and wall; setup, commit, and family walls are nested in `projection_batch_wall_ms`
 - `semantic_ms.context_index`: creating the four staged edge endpoint indexes before semantic context reads; this is nested in `timings_ms.deferred_indexes`
-- `semantic_ms.node_load` and `node_rows`: loading the complete staged node set before semantic selection
-- `semantic_ms.context`: loading the graph context used by generated semantic documents
+- `semantic_ms.node_load`, `node_rows`, and `node_batches`: keyset-reading
+  accepted full-refresh semantic nodes; incremental dependency scopes retain
+  their legacy whole-scope load
+- `semantic_ms.endpoint_load`, `endpoint_rows`, and `endpoint_batches`:
+  cache-isolated page endpoint/file-fallback reads; these are nested in
+  semantic context work
+- `semantic_context.lookup_peak`: the largest semantic-page plus endpoint
+  lookup retained at once, not a total row count
+- `semantic_ms.context`: loading the page-local graph context used by generated semantic documents
 - `semantic_ms.doc_build`: generated semantic text and hashes
 - `semantic_ms.embedding`: always zero for core indexing; retained as a compatibility field
 - `semantic_ms.db_upsert`: SQLite writes for symbol docs and embedding-free dense inputs
