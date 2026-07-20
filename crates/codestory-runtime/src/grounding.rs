@@ -15,18 +15,33 @@ const FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES: usize = 40;
 const ROOT_CANDIDATE_MULTIPLIER: usize = 8;
 const ARCHITECTURE_ROOT_FILE_LIMIT: usize = 48;
 const ARCHITECTURE_ROOT_SYMBOL_SCAN_LIMIT: usize = 16;
-const ARCHITECTURE_NAMED_ROOT_LIMIT: usize = 192;
-const ARCHITECTURE_ROOT_NAME_PATTERNS: &[&str] = &[
+const ARCHITECTURE_NAMED_ROOTS_PER_FILE: usize = 8;
+const ARCHITECTURE_ROOT_EXACT_NAMES: &[&str] = &[
     "main",
-    "run%",
-    "start%",
+    "run",
+    "start",
     "bootstrap",
     "launch",
     "mount",
     "serve",
     "init",
     "initialize",
-    "create%",
+    "createapp",
+    "createapplication",
+    "createserver",
+    "createrouter",
+    "createruntime",
+    "runapp",
+    "runapplication",
+    "runserver",
+    "runruntime",
+    "runservice",
+    "runcli",
+    "startapp",
+    "startapplication",
+    "startserver",
+    "startruntime",
+    "startservice",
     "get",
     "post",
     "put",
@@ -34,9 +49,8 @@ const ARCHITECTURE_ROOT_NAME_PATTERNS: &[&str] = &[
     "delete",
     "head",
     "options",
-    "%page",
-    "%layout",
 ];
+const ARCHITECTURE_ROOT_UPPERCASE_GLOBS: &[&str] = &["[A-Z]*Page", "[A-Z]*Layout"];
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -1218,15 +1232,20 @@ impl AppController {
         let root_fetch_limit = max_root_symbols
             .saturating_mul(ROOT_CANDIDATE_MULTIPLIER)
             .max(max_root_symbols);
-        let architecture_name_patterns = ARCHITECTURE_ROOT_NAME_PATTERNS
+        let architecture_exact_names = ARCHITECTURE_ROOT_EXACT_NAMES
             .iter()
-            .map(|pattern| (*pattern).to_string())
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let architecture_uppercase_globs = ARCHITECTURE_ROOT_UPPERCASE_GLOBS
+            .iter()
+            .map(|glob| (*glob).to_string())
             .collect::<Vec<_>>();
         let mut root_records = storage
             .get_grounding_named_root_symbols_for_files(
                 &architecture_root_file_ids,
-                &architecture_name_patterns,
-                ARCHITECTURE_NAMED_ROOT_LIMIT,
+                &architecture_exact_names,
+                &architecture_uppercase_globs,
+                ARCHITECTURE_NAMED_ROOTS_PER_FILE,
             )
             .map_err(|e| {
                 ApiError::internal(format!(

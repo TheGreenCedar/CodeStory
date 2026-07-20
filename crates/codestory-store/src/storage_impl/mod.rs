@@ -9987,21 +9987,59 @@ impl Storage {
     pub fn get_grounding_named_root_symbols_for_files(
         &self,
         file_ids: &[i64],
-        lowercase_name_patterns: &[String],
-        limit: usize,
+        normalized_exact_names: &[String],
+        uppercase_name_globs: &[String],
+        per_file_limit: usize,
     ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
-        if file_ids.is_empty() || lowercase_name_patterns.is_empty() || limit == 0 {
+        if file_ids.is_empty()
+            || (normalized_exact_names.is_empty() && uppercase_name_globs.is_empty())
+            || per_file_limit == 0
+        {
             return Ok(Vec::new());
         }
 
         let file_placeholders = question_placeholders(file_ids.len());
-        let name_conditions = (0..lowercase_name_patterns.len())
-            .map(|_| "LOWER(serialized_name) LIKE ?")
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let mut name_conditions = Vec::new();
+        if !normalized_exact_names.is_empty() {
+            name_conditions.push(format!(
+                "LOWER(REPLACE(serialized_name, '_', '')) IN ({})",
+                question_placeholders(normalized_exact_names.len())
+            ));
+        }
+        name_conditions.extend(
+            uppercase_name_globs
+                .iter()
+                .map(|_| "serialized_name GLOB ?".to_string()),
+        );
+        let name_conditions = name_conditions.join(" OR ");
         if self.has_ready_grounding_summary_snapshots()? {
             let query = format!(
-                "SELECT
+                "WITH matched AS (
+                    SELECT
+                        node_id,
+                        kind,
+                        serialized_name,
+                        qualified_name,
+                        canonical_id,
+                        file_node_id,
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                        display_name,
+                        file_path,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY file_node_id
+                            ORDER BY file_symbol_rank, node_id
+                        ) AS named_rank
+                    FROM grounding_node_snapshot
+                         INDEXED BY idx_grounding_node_snapshot_file_rank
+                    WHERE file_node_id IN ({file_placeholders})
+                      AND is_root = 1
+                      AND kind IN ({function_kind}, {method_kind})
+                      AND ({name_conditions})
+                )
+                SELECT
                     node_id,
                     kind,
                     serialized_name,
@@ -10014,22 +10052,22 @@ impl Storage {
                     end_col,
                     display_name,
                     file_path
-                 FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
-                 WHERE file_node_id IN ({file_placeholders})
-                   AND is_root = 1
-                   AND ({name_conditions})
-                 ORDER BY file_node_id, file_symbol_rank, node_id
-                 LIMIT ?"
+                FROM matched
+                WHERE named_rank <= ?",
+                function_kind = NodeKind::FUNCTION as i32,
+                method_kind = NodeKind::METHOD as i32,
             );
             let mut values = Vec::with_capacity(
                 file_ids
                     .len()
-                    .saturating_add(lowercase_name_patterns.len())
+                    .saturating_add(normalized_exact_names.len())
+                    .saturating_add(uppercase_name_globs.len())
                     .saturating_add(1),
             );
             values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
-            values.extend(lowercase_name_patterns.iter().cloned().map(Value::Text));
-            values.push(Value::Integer(limit.min(i64::MAX as usize) as i64));
+            values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
+            values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
+            values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
             let mut stmt = self.conn.prepare(&query)?;
             let mut rows = stmt.query(params_from_iter(values))?;
             let mut nodes = Vec::new();
@@ -10046,57 +10084,89 @@ impl Storage {
         let rank_sql = grounding_node_rank_sql("n");
         let indexable = grounding_indexable_predicate("n");
         let display_name = grounding_display_name_expr("n");
-        let fallback_name_conditions = (0..lowercase_name_patterns.len())
-            .map(|_| "LOWER(n.serialized_name) LIKE ?")
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let mut fallback_name_conditions = Vec::new();
+        if !normalized_exact_names.is_empty() {
+            fallback_name_conditions.push(format!(
+                "LOWER(REPLACE(n.serialized_name, '_', '')) IN ({})",
+                question_placeholders(normalized_exact_names.len())
+            ));
+        }
+        fallback_name_conditions.extend(
+            uppercase_name_globs
+                .iter()
+                .map(|_| "n.serialized_name GLOB ?".to_string()),
+        );
+        let fallback_name_conditions = fallback_name_conditions.join(" OR ");
         let query = format!(
-            "SELECT
-                n.id,
-                n.kind,
-                n.serialized_name,
-                n.qualified_name,
-                n.canonical_id,
-                n.file_node_id,
-                n.start_line,
-                n.start_col,
-                n.end_line,
-                n.end_col,
-                {display_name} AS display_name,
-                COALESCE(f.path, file_node.serialized_name) AS file_path
-             FROM node n
-             LEFT JOIN file f ON f.id = n.file_node_id
-             LEFT JOIN node file_node
-                ON file_node.id = n.file_node_id
-               AND file_node.kind = {file_kind}
-             WHERE n.file_node_id IN ({file_placeholders})
-               AND {indexable}
-               AND ({fallback_name_conditions})
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM edge e
-                    WHERE e.kind = {member_kind}
-                      AND e.target_node_id = n.id
-                )
-             ORDER BY
-                n.file_node_id,
-                {rank_sql},
-                COALESCE(n.start_line, 2147483647),
-                {display_name},
-                n.id
-             LIMIT ?",
+            "WITH matched AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS named_rank
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE n.file_node_id IN ({file_placeholders})
+                  AND {indexable}
+                  AND n.kind IN ({function_kind}, {method_kind})
+                  AND ({fallback_name_conditions})
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM edge e
+                        WHERE e.kind = {member_kind}
+                          AND e.target_node_id = n.id
+                    )
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path
+            FROM matched
+            WHERE named_rank <= ?",
             file_kind = NodeKind::FILE as i32,
+            function_kind = NodeKind::FUNCTION as i32,
+            method_kind = NodeKind::METHOD as i32,
             member_kind = EdgeKind::MEMBER as i32,
         );
         let mut values = Vec::with_capacity(
             file_ids
                 .len()
-                .saturating_add(lowercase_name_patterns.len())
+                .saturating_add(normalized_exact_names.len())
+                .saturating_add(uppercase_name_globs.len())
                 .saturating_add(1),
         );
         values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
-        values.extend(lowercase_name_patterns.iter().cloned().map(Value::Text));
-        values.push(Value::Integer(limit.min(i64::MAX as usize) as i64));
+        values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
+        values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
+        values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
         let mut stmt = self.conn.prepare(&query)?;
         let mut rows = stmt.query(params_from_iter(values))?;
         let mut nodes = Vec::new();
@@ -11412,6 +11482,33 @@ mod grounding_snapshot_fast_path_tests {
             kind: EdgeKind::MEMBER,
             ..Default::default()
         }])?;
+        insert_grounding_test_file(&mut storage, 5, "src/noise/main.ts", &[])?;
+        storage.insert_nodes_batch(
+            &(0..12_i64)
+                .map(|offset| Node {
+                    id: NodeId(500 + offset),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "run_app".to_string(),
+                    file_node_id: Some(NodeId(5)),
+                    start_line: Some(1 + offset as u32),
+                    ..Default::default()
+                })
+                .chain((0..192_i64).map(|offset| Node {
+                    id: NodeId(600 + offset),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("create_noise_{offset}"),
+                    file_node_id: Some(NodeId(5)),
+                    start_line: Some(20 + offset as u32),
+                    ..Default::default()
+                }))
+                .collect::<Vec<_>>(),
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            20,
+            "src/second/main.ts",
+            &[(201, NodeKind::FUNCTION, "main", 1)],
+        )?;
 
         let fallback = storage
             .get_grounding_root_symbols_for_files(&[10], 1)?
@@ -11419,12 +11516,21 @@ mod grounding_snapshot_fast_path_tests {
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
         assert_eq!(fallback, vec!["AppConfig"]);
-        let named_fallback = storage
-            .get_grounding_named_root_symbols_for_files(&[10], &["start%".to_string()], 8)?
+        let named_exact = [
+            "runapp".to_string(),
+            "startapplication".to_string(),
+            "main".to_string(),
+        ];
+        let mut named_fallback = storage
+            .get_grounding_named_root_symbols_for_files(&[5, 10, 20], &named_exact, &[], 2)?
             .into_iter()
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
-        assert_eq!(named_fallback, vec!["start_application"]);
+        named_fallback.sort();
+        assert_eq!(
+            named_fallback,
+            vec!["main", "run_app", "run_app", "start_application"]
+        );
 
         storage.refresh_grounding_summary_snapshots()?;
 
@@ -11434,11 +11540,12 @@ mod grounding_snapshot_fast_path_tests {
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
         assert_eq!(snapshot, fallback);
-        let named_snapshot = storage
-            .get_grounding_named_root_symbols_for_files(&[10], &["start%".to_string()], 8)?
+        let mut named_snapshot = storage
+            .get_grounding_named_root_symbols_for_files(&[5, 10, 20], &named_exact, &[], 2)?
             .into_iter()
             .map(|record| record.display_name)
             .collect::<Vec<_>>();
+        named_snapshot.sort();
         assert_eq!(named_snapshot, named_fallback);
 
         let base_plan = storage
@@ -11497,18 +11604,35 @@ mod grounding_snapshot_fast_path_tests {
             .conn
             .prepare(
                 "EXPLAIN QUERY PLAN
+                 WITH matched AS (
+                    SELECT
+                        node_id,
+                        file_node_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY file_node_id
+                            ORDER BY file_symbol_rank, node_id
+                        ) AS named_rank
+                    FROM grounding_node_snapshot
+                         INDEXED BY idx_grounding_node_snapshot_file_rank
+                    WHERE file_node_id IN (?1)
+                      AND is_root = 1
+                      AND kind IN (?2, ?3)
+                      AND LOWER(REPLACE(serialized_name, '_', '')) IN (?4)
+                 )
                  SELECT node_id
-                 FROM grounding_node_snapshot
-                      INDEXED BY idx_grounding_node_snapshot_file_rank
-                 WHERE file_node_id IN (?1)
-                   AND is_root = 1
-                   AND LOWER(serialized_name) LIKE ?2
-                 ORDER BY file_node_id, file_symbol_rank, node_id
-                 LIMIT ?3",
+                 FROM matched
+                 WHERE named_rank <= ?5",
             )?
-            .query_map(params![10_i64, "start%", 8_i64], |row| {
-                row.get::<_, String>(3)
-            })?
+            .query_map(
+                params![
+                    10_i64,
+                    NodeKind::FUNCTION as i32,
+                    NodeKind::METHOD as i32,
+                    "startapplication",
+                    8_i64
+                ],
+                |row| row.get::<_, String>(3),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         assert!(
             named_plan
