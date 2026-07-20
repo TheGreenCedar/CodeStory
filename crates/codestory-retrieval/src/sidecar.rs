@@ -442,19 +442,21 @@ mod tests {
         )
         .expect("generation metadata");
 
-        assert_eq!(
-            strict_readiness_unavailable_reason_for_runtime(
-                project.path(),
-                &storage_path,
-                &storage,
-                &project_id,
-                &manifest,
-                &runtime,
-                producer_compatibility_identity,
-            )
-            .expect("strict readiness"),
-            None
-        );
+        manifest.graph_artifact_hash = Some("stale-graph-artifact-hash".into());
+        let reason = strict_readiness_unavailable_reason_for_runtime(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+            &runtime,
+            producer_compatibility_identity,
+        )
+        .expect("strict readiness")
+        .expect("stale sidecar input");
+        assert!(reason.starts_with("sidecar_input_hash_changed:"));
+        assert!(!reason.contains("indexable_file_added_or_changed"));
+        assert!(!reason.contains("meta.json"));
     }
 }
 
