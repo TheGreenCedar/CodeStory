@@ -128,6 +128,16 @@ old-or-new promotion journal. Its phase telemetry exposes the checkpoint
 budget, checkpoint time, and sync time. Generic build stores and incremental
 clones keep WAL/NORMAL throughout.
 
+Incremental clone telemetry records the successful live-to-staged SQLite
+backup wall and the logical source/target database bytes. Every successful
+core publication also reports nested promotion telemetry for lock/recovery,
+candidate and prior-live validation, the optional rollback-backup copy and
+validation, prepared-journal write/file sync/directory sync, staged-to-live
+restore, promoted-live validation, committed-journal transition, and cleanup.
+The promotion object retains candidate, prior-live, and rollback-backup logical
+bytes plus a saturating residual that reconciles its displayed total. These are
+diagnostics inside publication wall, not additional top-level phases.
+
 The indexer does not know whether the store is staged or live.
 
 ### 3. Workspace computes the refresh plan
@@ -362,9 +372,10 @@ That makes incremental indexing more than just "parse changed files." It also re
 The last step belongs to runtime plus store:
 
 - full refresh finalizes a staged build, creates deferred indexes, refreshes the summary snapshot, and publishes the staged database
-- incremental refresh stays on the live database and refreshes both summary and detail snapshots in place
+- incremental refresh mutates a durable clone, refreshes both summary and detail snapshots there, and publishes the completed replacement
 
-Full and incremental snapshot behavior are intentionally not symmetric.
+Full and incremental stage preparation remain intentionally different even
+though both finish through the same core-promotion journal.
 
 Staged finalization splits deferred indexes around summary materialization. It
 creates the four source, target, resolved-source, and resolved-target edge
@@ -469,9 +480,13 @@ projection state, structural text units, structural file projections, and
 structural cache writes are flushed before `ResolutionPass` runs. Resolution
 then updates unresolved edges using the stored graph state.
 
-### What full refresh publishes that incremental refresh does not
+### How full and incremental core publication differ
 
-Full refresh builds a staged database and publishes it only after staged finalization succeeds. Incremental refresh never publishes a staged build; it updates the live store and refreshes live snapshots in place.
+Full refresh builds a fresh disposable stage and publishes it only after staged
+finalization succeeds. Incremental refresh starts with a coherent SQLite backup
+of the live database, changes only that durable clone, and publishes the
+completed replacement. The previous live database remains usable until either
+candidate enters the shared promotion journal.
 
 Neither core path alone publishes the immutable retrieval generation.
 Retrieval finalization binds its candidate to the resulting core generation and
@@ -531,13 +546,19 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
 - `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v1`
+- `staged_snapshot_copy`: successful incremental live-to-staged SQLite backup wall and logical source/target database bytes; absent for full refresh
+- `core_promotion`: successful nested promotion wall, validation/copy/journal/restore/cleanup subphases, logical candidate/prior/rollback database bytes, and its saturating residual; rollback backup fields are absent for a first publication
 
 Only the sibling fields inside `full_refresh_wall_ms` are additive. Indexer
 children, semantic diagnostics, search stream/commit/reload timings, snapshot
-timings, SQLite checkpoint/sync timings, and runtime-cache publication are
-nested diagnostics and must not be added again. The repo-scale evidence
-artifact retains the complete first and repeat `phase_timings` objects so new
-diagnostics are not silently lost by a hand-maintained field list.
+timings, SQLite checkpoint/sync and snapshot-copy timings, core-promotion
+timings, and runtime-cache publication are nested diagnostics and must not be
+added again. Inside `core_promotion`, named millisecond fields plus
+`unattributed_ms` reconcile to `total_ms`; optional backup fields distinguish a
+first publication from a replacement instead of reporting fabricated zero-work
+phases. The repo-scale evidence artifact retains the complete first and repeat
+`phase_timings` objects so new diagnostics are not silently lost by a
+hand-maintained field list.
 
 Use these fields before changing parser, graph, or SQLite code for a slow
 `index` run.

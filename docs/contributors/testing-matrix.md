@@ -248,6 +248,10 @@ named fault and race cases for:
 - prepared versus committed journal recovery;
 - cleanup failure after a committed publication;
 - stale/invalid backup ambiguity;
+- successful first and replacement publication telemetry, including
+  incremental live-to-staged copy bytes, optional rollback-backup phases,
+  candidate/prior/backup logical bytes, and exact named-plus-residual
+  reconciliation inside the promotion wall;
 - structural-unit descriptor determinism across all twelve unit collectors,
   exact source spans, cross-file content-versus-placement identity, and
   zero-unit projection completeness;
@@ -276,6 +280,11 @@ Evidence must show that failure leaves the previous complete publication usable
 and never deletes an outside sentinel. Query drift must return typed
 `publication_changed`; runtime may retry the complete query-and-resolution
 operation once, never an internal fragment against a newly current generation.
+Telemetry-only promotion work must also keep candidate, previous, backup,
+promoted-live, manifest, quick-check, journal, fsync, restore, rollback, and
+cleanup ordering unchanged; the measurements are successful-path diagnostics
+and do not weaken failure behavior. Use a bounded generated SQLite image for
+copy/byte accounting and do not substitute a repo-scale or corpus run.
 Structural evidence tests must also show that grounding, search, details, and
 packet paths read persisted producer/tier/resolution metadata in batches where
 the surface is batched, never infer provenance from a filename, and retain

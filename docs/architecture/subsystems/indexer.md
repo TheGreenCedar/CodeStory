@@ -32,7 +32,7 @@
 The runtime owns orchestration and chooses the store shape for a run:
 
 - full refresh: runtime opens a staged store, passes a full refresh plan to `WorkspaceIndexer`, then asks the store to finalize and publish the staged snapshot
-- incremental refresh: runtime opens the live store, passes a diff-based refresh plan to `WorkspaceIndexer`, then asks the store to refresh live summary and detail snapshots
+- incremental refresh: runtime clones the live database into a durable staged store, passes a diff-based refresh plan to `WorkspaceIndexer`, refreshes summary and detail snapshots on the clone, then publishes the completed replacement
 
 The indexer does not choose staged versus live storage. It only consumes a refresh plan plus a mutable store.
 

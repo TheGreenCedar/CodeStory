@@ -89,6 +89,127 @@ const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Successful SQLite backup timing and logical database-image sizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatabaseSnapshotCopyStats {
+    pub copy_ms: u32,
+    pub source_bytes: u64,
+    pub target_bytes: u64,
+}
+
+/// Successful core promotion timing and logical database-image sizes.
+///
+/// These phases are nested within the caller's publication wall. Optional
+/// backup phases are present only when a previous live publication existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CorePromotionStats {
+    pub total_ms: u32,
+    pub lock_recovery_ms: u32,
+    pub candidate_validation_ms: u32,
+    pub previous_validation_ms: u32,
+    pub rollback_backup_copy_ms: Option<u32>,
+    pub backup_validation_ms: Option<u32>,
+    pub prepared_journal_write_ms: u32,
+    pub prepared_journal_file_sync_ms: u32,
+    pub prepared_journal_directory_sync_ms: u32,
+    pub staged_to_live_restore_ms: u32,
+    pub promoted_validation_ms: u32,
+    pub committed_journal_ms: u32,
+    pub cleanup_ms: u32,
+    pub unattributed_ms: u32,
+    pub candidate_bytes: u64,
+    pub previous_live_bytes: Option<u64>,
+    pub rollback_backup_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PromotionJournalWriteStats {
+    write: Duration,
+    file_sync: Duration,
+    directory_sync: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CorePromotionDurations {
+    lock_recovery: Duration,
+    candidate_validation: Duration,
+    previous_validation: Duration,
+    rollback_backup_copy: Option<Duration>,
+    backup_validation: Option<Duration>,
+    prepared_journal_write: Duration,
+    prepared_journal_file_sync: Duration,
+    prepared_journal_directory_sync: Duration,
+    staged_to_live_restore: Duration,
+    promoted_validation: Duration,
+    committed_journal: Duration,
+    cleanup: Duration,
+}
+
+impl CorePromotionDurations {
+    fn finish(
+        self,
+        total: Duration,
+        candidate_bytes: u64,
+        previous_live_bytes: Option<u64>,
+        rollback_backup_bytes: Option<u64>,
+    ) -> CorePromotionStats {
+        let total_ms = duration_ms(total);
+        let lock_recovery_ms = duration_ms(self.lock_recovery);
+        let candidate_validation_ms = duration_ms(self.candidate_validation);
+        let previous_validation_ms = duration_ms(self.previous_validation);
+        let rollback_backup_copy_ms = self.rollback_backup_copy.map(duration_ms);
+        let backup_validation_ms = self.backup_validation.map(duration_ms);
+        let prepared_journal_write_ms = duration_ms(self.prepared_journal_write);
+        let prepared_journal_file_sync_ms = duration_ms(self.prepared_journal_file_sync);
+        let prepared_journal_directory_sync_ms = duration_ms(self.prepared_journal_directory_sync);
+        let staged_to_live_restore_ms = duration_ms(self.staged_to_live_restore);
+        let promoted_validation_ms = duration_ms(self.promoted_validation);
+        let committed_journal_ms = duration_ms(self.committed_journal);
+        let cleanup_ms = duration_ms(self.cleanup);
+        let named_ms = lock_recovery_ms
+            .saturating_add(candidate_validation_ms)
+            .saturating_add(previous_validation_ms)
+            .saturating_add(rollback_backup_copy_ms.unwrap_or_default())
+            .saturating_add(backup_validation_ms.unwrap_or_default())
+            .saturating_add(prepared_journal_write_ms)
+            .saturating_add(prepared_journal_file_sync_ms)
+            .saturating_add(prepared_journal_directory_sync_ms)
+            .saturating_add(staged_to_live_restore_ms)
+            .saturating_add(promoted_validation_ms)
+            .saturating_add(committed_journal_ms)
+            .saturating_add(cleanup_ms);
+        CorePromotionStats {
+            total_ms,
+            lock_recovery_ms,
+            candidate_validation_ms,
+            previous_validation_ms,
+            rollback_backup_copy_ms,
+            backup_validation_ms,
+            prepared_journal_write_ms,
+            prepared_journal_file_sync_ms,
+            prepared_journal_directory_sync_ms,
+            staged_to_live_restore_ms,
+            promoted_validation_ms,
+            committed_journal_ms,
+            cleanup_ms,
+            unattributed_ms: total_ms.saturating_sub(named_ms),
+            candidate_bytes,
+            previous_live_bytes,
+            rollback_backup_bytes,
+        }
+    }
+}
+
+fn duration_ms(duration: Duration) -> u32 {
+    duration.as_millis().min(u32::MAX as u128) as u32
+}
+
+fn database_logical_bytes(path: &Path) -> Result<u64, StorageError> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| promotion_path_error("read database metadata for", path, error))
+}
+
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
         0
@@ -747,7 +868,11 @@ fn sync_promotion_parent(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn write_promotion_journal(path: &Path, journal: &PromotionJournal) -> Result<(), StorageError> {
+fn write_promotion_journal(
+    path: &Path,
+    journal: &PromotionJournal,
+) -> Result<PromotionJournalWriteStats, StorageError> {
+    let write_started = Instant::now();
     let bytes = serde_json::to_vec(journal)
         .map_err(|error| promotion_path_error("serialize", path, error))?;
     let mut file = OpenOptions::new()
@@ -755,19 +880,34 @@ fn write_promotion_journal(path: &Path, journal: &PromotionJournal) -> Result<()
         .write(true)
         .open(path)
         .map_err(|error| promotion_path_error("create", path, error))?;
-    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = write_result {
+    if let Err(error) = file.write_all(&bytes) {
+        drop(file);
         let _ = fs::remove_file(path);
         let _ = sync_promotion_parent(path);
         return Err(promotion_path_error("persist", path, error));
     }
+    let write = write_started.elapsed();
+    let file_sync_started = Instant::now();
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        let _ = sync_promotion_parent(path);
+        return Err(promotion_path_error("persist", path, error));
+    }
+    let file_sync = file_sync_started.elapsed();
+    drop(file);
+    let directory_sync_started = Instant::now();
     if let Err(error) = sync_promotion_parent(path) {
         let _ = fs::remove_file(path);
         let _ = sync_promotion_parent(path);
         return Err(error);
     }
-    Ok(())
+    let directory_sync = directory_sync_started.elapsed();
+    Ok(PromotionJournalWriteStats {
+        write,
+        file_sync,
+        directory_sync,
+    })
 }
 
 fn commit_promotion_journal(
@@ -3295,7 +3435,8 @@ impl Storage {
     pub fn copy_database_snapshot(
         source_path: &Path,
         target_path: &Path,
-    ) -> Result<(), StorageError> {
+    ) -> Result<DatabaseSnapshotCopyStats, StorageError> {
+        let copy_started = Instant::now();
         recover_interrupted_promotion(source_path)?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -3305,9 +3446,15 @@ impl Storage {
                 ))
             })?;
         }
+        let source_bytes = database_logical_bytes(source_path)?;
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         source.backup(MAIN_DB, target_path, None::<fn(rusqlite::backup::Progress)>)?;
-        Ok(())
+        let target_bytes = database_logical_bytes(target_path)?;
+        Ok(DatabaseSnapshotCopyStats {
+            copy_ms: duration_ms(copy_started.elapsed()),
+            source_bytes,
+            target_bytes,
+        })
     }
 
     /// Create an in-memory store for tests and short-lived callers.
@@ -4630,7 +4777,11 @@ impl Storage {
     pub fn promote_staged_snapshot(
         staged_path: &Path,
         live_path: &Path,
-    ) -> Result<(), StorageError> {
+    ) -> Result<CorePromotionStats, StorageError> {
+        let promotion_started = Instant::now();
+        let mut durations = CorePromotionDurations::default();
+
+        let lock_recovery_started = Instant::now();
         let _promotion_lock = PromotionLock::acquire(live_path)?;
         recover_interrupted_promotion_locked(live_path)?;
         if promotion_artifacts_exist(live_path) {
@@ -4642,6 +4793,9 @@ impl Storage {
         let backup_path = live_path.with_extension("sqlite.backup");
         let prepared_path = promotion_prepared_journal_path(live_path);
         let committed_path = promotion_committed_journal_path(live_path);
+        durations.lock_recovery = lock_recovery_started.elapsed();
+
+        let candidate_validation_started = Instant::now();
         let candidate = require_complete_promotion_database_identity(
             staged_path,
             "Staged promotion candidate",
@@ -4662,6 +4816,10 @@ impl Storage {
                 staged_path.display()
             )));
         }
+        let candidate_bytes = database_logical_bytes(staged_path)?;
+        durations.candidate_validation = candidate_validation_started.elapsed();
+
+        let previous_validation_started = Instant::now();
         let recovery_contract = RecoveryDatabaseContract::CurrentPromotion;
         let previous = read_recovery_database_identity(live_path, recovery_contract)?;
         let previous_source_policy = match previous.as_ref() {
@@ -4673,8 +4831,15 @@ impl Storage {
             None => None,
         };
         cleanup_sqlite_sidecars(&backup_path)?;
+        let previous_live_bytes = previous
+            .as_ref()
+            .map(|_| database_logical_bytes(live_path))
+            .transpose()?;
+        durations.previous_validation = previous_validation_started.elapsed();
 
+        let mut rollback_backup_bytes = None;
         if previous.is_some() {
+            let rollback_backup_copy_started = Instant::now();
             let live_conn = Connection::open(live_path)?;
             let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
             live_conn.backup(
@@ -4683,6 +4848,9 @@ impl Storage {
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
             drop(live_conn);
+            durations.rollback_backup_copy = Some(rollback_backup_copy_started.elapsed());
+
+            let backup_validation_started = Instant::now();
             let backup_identity = require_recovery_database_identity(
                 &backup_path,
                 "Promotion backup",
@@ -4706,6 +4874,8 @@ impl Storage {
                 &previous_structural_text,
                 "Promotion backup",
             )?;
+            rollback_backup_bytes = Some(database_logical_bytes(&backup_path)?);
+            durations.backup_validation = Some(backup_validation_started.elapsed());
         }
 
         let prepared = PromotionJournal {
@@ -4717,13 +4887,20 @@ impl Storage {
             previous_structural_text,
             candidate_structural_text: candidate_structural_text.clone(),
         };
-        if let Err(error) = write_promotion_journal(&prepared_path, &prepared) {
-            if !prepared_path.exists() {
-                let _ = cleanup_sqlite_sidecars(&backup_path);
+        let journal_write_stats = match write_promotion_journal(&prepared_path, &prepared) {
+            Ok(stats) => stats,
+            Err(error) => {
+                if !prepared_path.exists() {
+                    let _ = cleanup_sqlite_sidecars(&backup_path);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
+        durations.prepared_journal_write = journal_write_stats.write;
+        durations.prepared_journal_file_sync = journal_write_stats.file_sync;
+        durations.prepared_journal_directory_sync = journal_write_stats.directory_sync;
 
+        let staged_to_live_restore_started = Instant::now();
         let mut live_conn = Connection::open(live_path)?;
         let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
         live_conn.pragma_update(None, "synchronous", "FULL")?;
@@ -4762,7 +4939,9 @@ impl Storage {
             )));
         }
         drop(live_conn);
+        durations.staged_to_live_restore = staged_to_live_restore_started.elapsed();
 
+        let promoted_validation_started = Instant::now();
         let published =
             require_complete_promotion_database_identity(live_path, "Promoted live database")?;
         if published != candidate {
@@ -4790,14 +4969,18 @@ impl Storage {
             let _ = rollback_prepared_promotion(live_path, &prepared);
             return Err(error);
         }
+        durations.promoted_validation = promoted_validation_started.elapsed();
 
+        let committed_journal_started = Instant::now();
         if let Err(error) = commit_promotion_journal(&prepared_path, &committed_path) {
             if !committed_path.exists() {
                 let _ = rollback_prepared_promotion(live_path, &prepared);
             }
             return Err(error);
         }
+        durations.committed_journal = committed_journal_started.elapsed();
 
+        let cleanup_started = Instant::now();
         if let Err(error) = cleanup_sqlite_sidecars(staged_path) {
             tracing::warn!(
                 staged_path = %staged_path.display(),
@@ -4812,7 +4995,13 @@ impl Storage {
                 "committed promotion retained recovery artifacts"
             );
         }
-        Ok(())
+        durations.cleanup = cleanup_started.elapsed();
+        Ok(durations.finish(
+            promotion_started.elapsed(),
+            candidate_bytes,
+            previous_live_bytes,
+            rollback_backup_bytes,
+        ))
     }
 
     pub fn discard_staged_snapshot(staged_path: &Path) -> Result<(), StorageError> {

@@ -69,6 +69,26 @@ fn assert_no_sqlite_sidecars(path: &Path) {
     assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
 }
 
+fn assert_core_promotion_stats_reconcile(stats: &CorePromotionStats) {
+    let named_ms = stats
+        .lock_recovery_ms
+        .saturating_add(stats.candidate_validation_ms)
+        .saturating_add(stats.previous_validation_ms)
+        .saturating_add(stats.rollback_backup_copy_ms.unwrap_or_default())
+        .saturating_add(stats.backup_validation_ms.unwrap_or_default())
+        .saturating_add(stats.prepared_journal_write_ms)
+        .saturating_add(stats.prepared_journal_file_sync_ms)
+        .saturating_add(stats.prepared_journal_directory_sync_ms)
+        .saturating_add(stats.staged_to_live_restore_ms)
+        .saturating_add(stats.promoted_validation_ms)
+        .saturating_add(stats.committed_journal_ms)
+        .saturating_add(stats.cleanup_ms);
+    assert_eq!(
+        named_ms.saturating_add(stats.unattributed_ms),
+        stats.total_ms
+    );
+}
+
 fn durable_sqlite_state(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     [path.to_path_buf(), sqlite_sidecar_path(path, "-wal")]
         .into_iter()
@@ -6000,8 +6020,16 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
     assert!(!prepared_path.exists(), "rollback must consume its journal");
     assert!(!committed_path.exists(), "aborted promotion cannot commit");
 
-    Storage::promote_staged_snapshot(&staged_path, &live_path)
+    let retry_stats = Storage::promote_staged_snapshot(&staged_path, &live_path)
         .expect("retry promotion after abort");
+    assert_core_promotion_stats_reconcile(&retry_stats);
+    assert!(retry_stats.previous_live_bytes.is_some());
+    assert!(retry_stats.rollback_backup_copy_ms.is_some());
+    assert!(retry_stats.backup_validation_ms.is_some());
+    assert_eq!(
+        retry_stats.rollback_backup_bytes,
+        retry_stats.previous_live_bytes
+    );
     let live = Storage::open(&live_path).expect("open recovered live generation");
     assert_eq!(
         live.get_files().expect("read recovered generation")[0].path,
@@ -6051,8 +6079,16 @@ fn retained_committed_promotion_stays_live_and_blocks_the_next_writer() {
         .expect("publish second staged exclusion identity");
     std::fs::write(&cleanup_failure_path, b"blocked").expect("inject cleanup failure");
 
-    Storage::promote_staged_snapshot(&staged_path, &live_path)
+    let committed_stats = Storage::promote_staged_snapshot(&staged_path, &live_path)
         .expect("committed promotion tolerates deferred cleanup");
+    assert_core_promotion_stats_reconcile(&committed_stats);
+    assert!(committed_stats.previous_live_bytes.is_some());
+    assert!(committed_stats.rollback_backup_copy_ms.is_some());
+    assert!(committed_stats.backup_validation_ms.is_some());
+    assert_eq!(
+        committed_stats.rollback_backup_bytes,
+        committed_stats.previous_live_bytes
+    );
     let error = Storage::promote_staged_snapshot(&second_staged_path, &live_path)
         .expect_err("retained committed artifacts must block the next promotion");
     assert!(error.to_string().contains("prior artifacts remain"));

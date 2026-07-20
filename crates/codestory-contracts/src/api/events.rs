@@ -18,6 +18,38 @@ pub struct FullRefreshWallTimings {
     pub unattributed_ms: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct DatabaseSnapshotCopyTimings {
+    pub copy_ms: u32,
+    pub source_bytes: u64,
+    pub target_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct CorePromotionTimings {
+    pub total_ms: u32,
+    pub lock_recovery_ms: u32,
+    pub candidate_validation_ms: u32,
+    pub previous_validation_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_backup_copy_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_validation_ms: Option<u32>,
+    pub prepared_journal_write_ms: u32,
+    pub prepared_journal_file_sync_ms: u32,
+    pub prepared_journal_directory_sync_ms: u32,
+    pub staged_to_live_restore_ms: u32,
+    pub promoted_validation_ms: u32,
+    pub committed_journal_ms: u32,
+    pub cleanup_ms: u32,
+    pub unattributed_ms: u32,
+    pub candidate_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_live_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_backup_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactCachePolicyDto {
@@ -217,6 +249,10 @@ pub struct IndexingPhaseTimings {
     pub staged_sqlite_checkpoint_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_sqlite_sync_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_snapshot_copy: Option<DatabaseSnapshotCopyTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_promotion: Option<CorePromotionTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_existing_projection_ids_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,6 +462,8 @@ mod tests {
             staged_sqlite_wal_autocheckpoint_bytes: None,
             staged_sqlite_checkpoint_ms: None,
             staged_sqlite_sync_ms: None,
+            staged_snapshot_copy: None,
+            core_promotion: None,
             setup_existing_projection_ids_ms: None,
             setup_seed_symbol_table_ms: None,
             flush_files_ms: None,
@@ -585,6 +623,8 @@ mod tests {
         );
         assert!(value.get("staged_sqlite_checkpoint_ms").is_none());
         assert!(value.get("staged_sqlite_sync_ms").is_none());
+        assert!(value.get("staged_snapshot_copy").is_none());
+        assert!(value.get("core_promotion").is_none());
         assert!(value.get("setup_existing_projection_ids_ms").is_none());
         assert!(value.get("setup_seed_symbol_table_ms").is_none());
         assert!(value.get("flush_files_ms").is_none());
@@ -629,6 +669,8 @@ mod tests {
         assert!(timings.search_symbol_index_commit_ms.is_none());
         assert!(timings.parser_artifact_cache.is_none());
         assert!(timings.structural_artifact_cache.is_none());
+        assert!(timings.staged_snapshot_copy.is_none());
+        assert!(timings.core_promotion.is_none());
     }
 
     #[test]
@@ -734,5 +776,46 @@ mod tests {
         let decoded: IndexingPhaseTimings =
             serde_json::from_value(value).expect("deserialize timings");
         assert_eq!(decoded.full_refresh_wall, Some(wall));
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_round_trips_core_promotion_diagnostics() {
+        let snapshot_copy = DatabaseSnapshotCopyTimings {
+            copy_ms: 13,
+            source_bytes: 1_024,
+            target_bytes: 1_024,
+        };
+        let core_promotion = CorePromotionTimings {
+            total_ms: 89,
+            lock_recovery_ms: 1,
+            candidate_validation_ms: 11,
+            previous_validation_ms: 12,
+            rollback_backup_copy_ms: Some(13),
+            backup_validation_ms: Some(14),
+            prepared_journal_write_ms: 2,
+            prepared_journal_file_sync_ms: 3,
+            prepared_journal_directory_sync_ms: 4,
+            staged_to_live_restore_ms: 15,
+            promoted_validation_ms: 10,
+            committed_journal_ms: 2,
+            cleanup_ms: 1,
+            unattributed_ms: 1,
+            candidate_bytes: 2_048,
+            previous_live_bytes: Some(1_024),
+            rollback_backup_bytes: Some(1_024),
+        };
+        let timings = IndexingPhaseTimings {
+            staged_snapshot_copy: Some(snapshot_copy.clone()),
+            core_promotion: Some(core_promotion.clone()),
+            ..IndexingPhaseTimings::default()
+        };
+
+        let value = serde_json::to_value(&timings).expect("serialize timings");
+        assert_eq!(value["staged_snapshot_copy"]["copy_ms"], 13);
+        assert_eq!(value["core_promotion"]["staged_to_live_restore_ms"], 15);
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize timings");
+        assert_eq!(decoded.staged_snapshot_copy, Some(snapshot_copy));
+        assert_eq!(decoded.core_promotion, Some(core_promotion));
     }
 }

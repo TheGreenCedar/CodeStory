@@ -66,6 +66,13 @@
   Telemetry reports stream batches, endpoint rows/query batches and wall, and
   the peak page-local lookup size; incremental dependency scopes retain their
   existing loader.
+- Core publication telemetry now separates incremental live-to-staged SQLite
+  copy wall and bytes from successful promotion validation, rollback-backup
+  copy, journal sync, staged-to-live restore, validation, and cleanup wall.
+  Candidate, prior-live, and rollback-backup logical bytes plus a saturating
+  promotion residual make the existing copy and validation amplification
+  measurable without changing publication, recovery, journal, checkpoint, or
+  durability behavior.
 - Semantic document preparation now keeps normalized display/read paths once
   per owning file instead of cloning them for every symbol, derives display
   names inside the existing bounded document window, and avoids an

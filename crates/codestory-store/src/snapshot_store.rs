@@ -1,4 +1,7 @@
-use crate::{GroundingSnapshotMetadata, StorageError, StorageOpenMode, Store};
+use crate::{
+    CorePromotionStats, DatabaseSnapshotCopyStats, GroundingSnapshotMetadata, StorageError,
+    StorageOpenMode, Store,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +25,8 @@ pub struct StagedSnapshotPublishStats {
     pub sqlite_wal_autocheckpoint_bytes: Option<u64>,
     pub sqlite_checkpoint_ms: Option<u32>,
     pub sqlite_sync_ms: Option<u32>,
+    pub snapshot_copy: Option<DatabaseSnapshotCopyStats>,
+    pub core_promotion: CorePromotionStats,
 }
 
 /// Derived grounding snapshot facade.
@@ -38,6 +43,7 @@ pub struct SnapshotStore<'a> {
 pub struct StagedSnapshot {
     path: PathBuf,
     store: Store,
+    snapshot_copy: Option<DatabaseSnapshotCopyStats>,
 }
 
 impl<'a> SnapshotStore<'a> {
@@ -89,7 +95,10 @@ impl<'a> SnapshotStore<'a> {
     }
 
     /// Atomically promote a finalized staged database to the live path.
-    pub fn promote_staged(staged_path: &Path, live_path: &Path) -> Result<(), StorageError> {
+    pub fn promote_staged(
+        staged_path: &Path,
+        live_path: &Path,
+    ) -> Result<CorePromotionStats, StorageError> {
         Store::promote_staged_snapshot(staged_path, live_path)
     }
 
@@ -180,24 +189,39 @@ impl StagedSnapshot {
     fn open(live_path: &Path) -> Result<Self, StorageError> {
         let path = SnapshotStore::staged_path(live_path);
         let store = Store::open_build(&path)?;
-        Ok(Self { path, store })
+        Ok(Self {
+            path,
+            store,
+            snapshot_copy: None,
+        })
     }
 
     fn open_disposable_full_refresh(live_path: &Path) -> Result<Self, StorageError> {
         let path = SnapshotStore::staged_path(live_path);
         let store = Store::open_disposable_full_build(&path)?;
-        Ok(Self { path, store })
+        Ok(Self {
+            path,
+            store,
+            snapshot_copy: None,
+        })
     }
 
     fn clone_live(live_path: &Path) -> Result<Self, StorageError> {
         let path = SnapshotStore::staged_path(live_path);
         Store::discard_staged_snapshot(&path)?;
-        if let Err(error) = Store::copy_database_snapshot(live_path, &path) {
-            let _ = Store::discard_staged_snapshot(&path);
-            return Err(error);
-        }
+        let snapshot_copy = match Store::copy_database_snapshot(live_path, &path) {
+            Ok(stats) => stats,
+            Err(error) => {
+                let _ = Store::discard_staged_snapshot(&path);
+                return Err(error);
+            }
+        };
         match Store::open_with_mode(&path, StorageOpenMode::Build) {
-            Ok(store) => Ok(Self { path, store }),
+            Ok(store) => Ok(Self {
+                path,
+                store,
+                snapshot_copy: Some(snapshot_copy),
+            }),
             Err(error) => {
                 let _ = Store::discard_staged_snapshot(&path);
                 Err(error)
@@ -239,14 +263,17 @@ impl StagedSnapshot {
     ) -> Result<StagedSnapshotPublishStats, StorageError> {
         let seal_stats = self.store.seal_disposable_full_build()?;
         let path = self.path;
+        let snapshot_copy = self.snapshot_copy;
         drop(self.store);
-        SnapshotStore::promote_staged(&path, live_path)?;
+        let core_promotion = SnapshotStore::promote_staged(&path, live_path)?;
         Ok(StagedSnapshotPublishStats {
             sqlite_wal_autocheckpoint_bytes: seal_stats
                 .as_ref()
                 .map(|stats| stats.wal_autocheckpoint_bytes),
             sqlite_checkpoint_ms: seal_stats.as_ref().map(|stats| stats.checkpoint_ms),
             sqlite_sync_ms: seal_stats.as_ref().map(|stats| stats.sync_ms),
+            snapshot_copy,
+            core_promotion,
         })
     }
 }
@@ -316,6 +343,29 @@ mod tests {
                 &[],
             )
             .expect("publish empty source policy identity");
+    }
+
+    fn named_promotion_ms(stats: &CorePromotionStats) -> u32 {
+        stats
+            .lock_recovery_ms
+            .saturating_add(stats.candidate_validation_ms)
+            .saturating_add(stats.previous_validation_ms)
+            .saturating_add(stats.rollback_backup_copy_ms.unwrap_or_default())
+            .saturating_add(stats.backup_validation_ms.unwrap_or_default())
+            .saturating_add(stats.prepared_journal_write_ms)
+            .saturating_add(stats.prepared_journal_file_sync_ms)
+            .saturating_add(stats.prepared_journal_directory_sync_ms)
+            .saturating_add(stats.staged_to_live_restore_ms)
+            .saturating_add(stats.promoted_validation_ms)
+            .saturating_add(stats.committed_journal_ms)
+            .saturating_add(stats.cleanup_ms)
+    }
+
+    fn assert_promotion_reconciles(stats: &CorePromotionStats) {
+        assert_eq!(
+            named_promotion_ms(stats).saturating_add(stats.unattributed_ms),
+            stats.total_ms
+        );
     }
 
     #[test]
@@ -388,6 +438,92 @@ mod tests {
             .expect("metadata row");
         assert_eq!(metadata.summary_state, GroundingSnapshotState::Ready);
         assert_eq!(metadata.detail_state, GroundingSnapshotState::Dirty);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn full_replacement_reports_backup_and_restore_without_incremental_clone() {
+        let temp = fresh_temp_root("full-replacement-telemetry");
+        let live_path = temp.join("live.sqlite");
+        {
+            let mut live = Store::open(&live_path).expect("open previous live store");
+            live.insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("old.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed previous live file");
+            let publication = crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "old-generation".to_string(),
+                run_id: "old-run".to_string(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            live.put_index_publication(&publication)
+                .expect("identify previous live publication");
+            publish_empty_source_policy(&mut live, &publication);
+        }
+
+        let mut staged = SnapshotStore::open_staged(&live_path).expect("open replacement stage");
+        staged
+            .store_mut()
+            .insert_files_batch(&[crate::FileInfo {
+                id: 2,
+                path: PathBuf::from("new.rs"),
+                language: "rust".to_string(),
+                modification_time: 2,
+                indexed: true,
+                complete: true,
+                line_count: 2,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed replacement file");
+        let publication = crate::IndexPublicationRecord {
+            generation: 2,
+            generation_id: "new-generation".to_string(),
+            run_id: "new-run".to_string(),
+            mode: crate::IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        staged
+            .store_mut()
+            .put_index_publication(&publication)
+            .expect("identify replacement publication");
+        publish_empty_source_policy(staged.store_mut(), &publication);
+
+        let publish_stats = staged
+            .publish_with_stats(&live_path)
+            .expect("publish full replacement");
+        assert!(publish_stats.snapshot_copy.is_none());
+        assert!(
+            publish_stats
+                .core_promotion
+                .rollback_backup_copy_ms
+                .is_some()
+        );
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_some());
+        assert_eq!(
+            publish_stats.core_promotion.previous_live_bytes,
+            publish_stats.core_promotion.rollback_backup_bytes
+        );
+        assert!(
+            publish_stats.core_promotion.previous_live_bytes.is_some(),
+            "full replacement must report the previous live image"
+        );
+        assert_promotion_reconciles(&publish_stats.core_promotion);
+        assert_eq!(
+            publish_stats.core_promotion.candidate_bytes,
+            fs::metadata(&live_path)
+                .expect("read full replacement database size")
+                .len()
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -541,6 +677,23 @@ mod tests {
         );
         assert!(publish_stats.sqlite_checkpoint_ms.is_some());
         assert!(publish_stats.sqlite_sync_ms.is_some());
+        assert!(publish_stats.snapshot_copy.is_none());
+        assert!(publish_stats.core_promotion.previous_live_bytes.is_none());
+        assert!(
+            publish_stats
+                .core_promotion
+                .rollback_backup_copy_ms
+                .is_none()
+        );
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
+        assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
+        assert_promotion_reconciles(&publish_stats.core_promotion);
+        assert_eq!(
+            publish_stats.core_promotion.candidate_bytes,
+            fs::metadata(&live_path)
+                .expect("read promoted database size")
+                .len()
+        );
 
         let live = Store::open(&live_path).expect("open promoted live store");
         let quick_check: String = live
@@ -696,6 +849,53 @@ mod tests {
         assert!(!staged_path.exists());
         assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
         assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn snapshot_copy_reports_bounded_database_image_bytes() {
+        const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+        let temp = fresh_temp_root("copy-telemetry");
+        let source_path = temp.join("source.sqlite");
+        let target_path = temp.join("target.sqlite");
+        {
+            let source = Store::open(&source_path).expect("open copy source");
+            source
+                .get_connection()
+                .execute_batch(
+                    "CREATE TABLE bounded_copy_payload (payload BLOB NOT NULL);
+                     INSERT INTO bounded_copy_payload(payload) VALUES (zeroblob(2097152));",
+                )
+                .expect("seed bounded copy payload");
+        }
+        let source_bytes = fs::metadata(&source_path)
+            .expect("read source database size")
+            .len();
+        assert!(source_bytes >= PAYLOAD_BYTES as u64);
+
+        let stats =
+            Store::copy_database_snapshot(&source_path, &target_path).expect("copy database");
+
+        assert_eq!(stats.source_bytes, source_bytes);
+        assert_eq!(
+            stats.target_bytes,
+            fs::metadata(&target_path)
+                .expect("read target database size")
+                .len()
+        );
+        assert_eq!(stats.source_bytes, stats.target_bytes);
+        let copied = Store::open_read_only(&target_path).expect("open copied database");
+        let payload_bytes: i64 = copied
+            .get_connection()
+            .query_row(
+                "SELECT length(payload) FROM bounded_copy_payload",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read copied payload");
+        assert_eq!(payload_bytes, PAYLOAD_BYTES as i64);
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -880,8 +1080,36 @@ mod tests {
         old_observed_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("racing reader observed old generation");
-        staged.publish(&live_path).expect("publish new generation");
+        let publish_stats = staged
+            .publish_with_stats(&live_path)
+            .expect("publish new generation");
         racing_reader.join().expect("racing reader");
+        let snapshot_copy = publish_stats
+            .snapshot_copy
+            .expect("incremental clone telemetry");
+        assert_eq!(snapshot_copy.source_bytes, snapshot_copy.target_bytes);
+        assert_eq!(
+            publish_stats.core_promotion.previous_live_bytes,
+            Some(snapshot_copy.source_bytes)
+        );
+        assert_eq!(
+            publish_stats.core_promotion.rollback_backup_bytes,
+            publish_stats.core_promotion.previous_live_bytes
+        );
+        assert!(
+            publish_stats
+                .core_promotion
+                .rollback_backup_copy_ms
+                .is_some()
+        );
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_some());
+        assert_promotion_reconciles(&publish_stats.core_promotion);
+        assert_eq!(
+            publish_stats.core_promotion.candidate_bytes,
+            fs::metadata(&live_path)
+                .expect("read incremental promoted database size")
+                .len()
+        );
 
         let old_paths = old_reader
             .get_files()

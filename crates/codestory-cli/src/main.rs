@@ -7999,9 +7999,9 @@ mod tests {
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
-        AgentRetrievalTraceDto, EdgeId, EdgeKind, FullRefreshWallTimings, GraphEdgeDto,
-        GraphNodeDto, GraphResponse, IndexMode, IndexedFileDto,
-        IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto, IndexedFilesDto,
+        AgentRetrievalTraceDto, CorePromotionTimings, DatabaseSnapshotCopyTimings, EdgeId,
+        EdgeKind, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexMode,
+        IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto, IndexedFilesDto,
         IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId, PacketBudgetDto,
         PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanDto,
         PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, ProjectSummary,
@@ -8977,6 +8977,30 @@ mod tests {
             staged_sqlite_wal_autocheckpoint_bytes: Some(67_108_864),
             staged_sqlite_checkpoint_ms: Some(11),
             staged_sqlite_sync_ms: Some(12),
+            staged_snapshot_copy: Some(DatabaseSnapshotCopyTimings {
+                copy_ms: 13,
+                source_bytes: 1_024,
+                target_bytes: 1_024,
+            }),
+            core_promotion: Some(CorePromotionTimings {
+                total_ms: 89,
+                lock_recovery_ms: 1,
+                candidate_validation_ms: 11,
+                previous_validation_ms: 12,
+                rollback_backup_copy_ms: Some(13),
+                backup_validation_ms: Some(14),
+                prepared_journal_write_ms: 2,
+                prepared_journal_file_sync_ms: 3,
+                prepared_journal_directory_sync_ms: 4,
+                staged_to_live_restore_ms: 15,
+                promoted_validation_ms: 10,
+                committed_journal_ms: 2,
+                cleanup_ms: 1,
+                unattributed_ms: 1,
+                candidate_bytes: 2_048,
+                previous_live_bytes: Some(1_024),
+                rollback_backup_bytes: Some(1_024),
+            }),
             setup_existing_projection_ids_ms: Some(11),
             setup_seed_symbol_table_ms: Some(12),
             flush_files_ms: Some(13),
@@ -9223,6 +9247,16 @@ mod tests {
         ));
         assert!(markdown.contains(
             "staged_sqlite: wal_autocheckpoint_bytes=67108864 checkpoint_ms=11 sync_ms=12"
+        ));
+        assert!(
+            markdown
+                .contains("staged_snapshot_copy: copy_ms=13 source_bytes=1024 target_bytes=1024")
+        );
+        assert!(markdown.contains(
+            "core_promotion_ms: total=89 lock_recovery=1 candidate_validation=11 previous_validation=12 rollback_backup_copy=13 backup_validation=14 prepared_journal_write=2 prepared_journal_file_sync=3 prepared_journal_directory_sync=4 staged_to_live_restore=15 promoted_validation=10 committed_journal=2 cleanup=1 unattributed=1"
+        ));
+        assert!(markdown.contains(
+            "core_promotion_bytes: candidate=2048 previous_live=1024 rollback_backup=1024"
         ));
         assert!(markdown.contains("setup_ms: existing_projection_ids=11 seed_symbol_table=12"));
         assert!(
