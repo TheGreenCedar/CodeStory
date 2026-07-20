@@ -4,6 +4,14 @@
 
 ### Release
 
+- Structural JSON, YAML, TOML, Markdown, and other tooling sources that exceed
+  the 2,048-unit collector bound without exceeding the source-byte cap now
+  publish as verified source-policy exclusions instead of blocking the entire
+  replacement core. Each exclusion binds its path, content hash, observed byte
+  size and unit count, byte/unit policy caps, project/workspace identity, and
+  core generation/run. Excluded bytes retain no graph, structural-semantic,
+  typed-target, or packet-sufficiency claim, and source or policy changes force
+  reevaluation before atomic publication.
 - The local `CodeStoryDev` installer now binds one clean committed plugin
   package to one explicit staged CLI through a versioned receipt. The cached
   launcher verifies package, marketplace, platform, filename, byte count,

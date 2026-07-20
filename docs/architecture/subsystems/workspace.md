@@ -29,11 +29,12 @@ and schedule deletion. `workspace_relative_path` is the shared boundary for
 mapping existing candidates into a project without cross-root or
 case-folding mistakes.
 
-The shared oversized-source policy classifies stable, content-hashed bytes
-above the parser cap before indexer scheduling. Classification is based on
-verified content and the versioned policy, not path role. Partial discovery or
-a file that changes while being hashed cannot produce a deletion-capable
-exclusion set.
+The shared bounded-source policy classifies stable, content-hashed bytes above
+the parser cap before indexer scheduling. Structural collectors may add a
+candidate when verified content stays below that cap but exceeds the versioned
+unit bound. Classification is based on observed content and policy rather than
+one repository path. Partial discovery or a file that changes while being
+hashed cannot produce a deletion-capable exclusion set.
 
 ## Refresh planning
 

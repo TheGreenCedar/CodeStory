@@ -36,7 +36,8 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub const MAX_STRUCTURAL_SOURCE_BYTES: u64 = 1024 * 1024;
-pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize = 2048;
+pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize =
+    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP as usize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StructuralCollectionError {
@@ -49,9 +50,12 @@ pub enum StructuralCollectionError {
     )]
     SourceByteLimit(u64),
     #[error(
-        "structural source exceeds the {MAX_STRUCTURAL_UNITS_PER_FILE}-unit collector limit: {0} units"
+        "structural source exceeds the {structural_unit_cap}-unit collector limit: {observed_unit_count} units"
     )]
-    UnitLimit(usize),
+    UnitLimit {
+        observed_unit_count: u64,
+        structural_unit_cap: u64,
+    },
 }
 
 /// Return whether `path` is routed to a structural collector.
@@ -303,6 +307,18 @@ pub fn index_structural_source(
     path: &Path,
     source: &str,
 ) -> std::result::Result<IntermediateStorage, StructuralCollectionError> {
+    index_structural_source_with_unit_cap(
+        path,
+        source,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+    )
+}
+
+pub(crate) fn index_structural_source_with_unit_cap(
+    path: &Path,
+    source: &str,
+    structural_unit_cap: u64,
+) -> std::result::Result<IntermediateStorage, StructuralCollectionError> {
     if source.len() as u64 > MAX_STRUCTURAL_SOURCE_BYTES {
         return Err(StructuralCollectionError::SourceByteLimit(
             source.len() as u64
@@ -358,10 +374,12 @@ pub fn index_structural_source(
             _ => {}
         }
     }
-    if storage.structural_unit_node_ids.len() > MAX_STRUCTURAL_UNITS_PER_FILE {
-        return Err(StructuralCollectionError::UnitLimit(
-            storage.structural_unit_node_ids.len(),
-        ));
+    let observed_unit_count = storage.structural_unit_node_ids.len() as u64;
+    if observed_unit_count > structural_unit_cap {
+        return Err(StructuralCollectionError::UnitLimit {
+            observed_unit_count,
+            structural_unit_cap,
+        });
     }
 
     storage.callable_projection_states = crate::build_callable_projection_states(
@@ -786,7 +804,7 @@ mod tests {
         keys.push('}');
         assert!(matches!(
             index_structural_source(Path::new("many.json"), &keys),
-            Err(StructuralCollectionError::UnitLimit(_))
+            Err(StructuralCollectionError::UnitLimit { .. })
         ));
     }
 

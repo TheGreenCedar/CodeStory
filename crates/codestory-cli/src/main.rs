@@ -5532,12 +5532,14 @@ fn render_source_policy_exclusions(
     for exclusion in &output.policy_exclusions {
         let _ = writeln!(
             markdown,
-            "- {} ({:?}, {} bytes, policy={} cap={}, core={}/{})",
+            "- {} ({:?}, {} bytes, {} structural units, policy={} byte_cap={} unit_cap={}, core={}/{})",
             exclusion.path,
             exclusion.role,
             exclusion.observed_size,
+            exclusion.observed_unit_count,
             exclusion.policy_version,
             exclusion.byte_cap,
+            exclusion.structural_unit_cap,
             exclusion.core_generation_id,
             exclusion.core_run_id,
         );
@@ -8597,9 +8599,12 @@ mod tests {
                 path: "vendor/registers.h".into(),
                 role: IndexedFileRoleDto::Vendor,
                 content_hash: "a".repeat(64),
-                observed_size: 2_000_000,
-                policy_version: "oversized-source-v1".into(),
+                observed_size: 279_751,
+                observed_unit_count: 4_514,
+                policy_version: "bounded-source-exclusion-v2".into(),
                 byte_cap: 1_000_000,
+                structural_unit_cap:
+                    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
                 project_id: "project".into(),
                 workspace_id: "workspace".into(),
                 core_generation_id: "generation".into(),
@@ -8617,6 +8622,8 @@ mod tests {
             "{markdown}"
         );
         assert!(markdown.contains("vendor/registers.h"), "{markdown}");
+        assert!(markdown.contains("4514 structural units"), "{markdown}");
+        assert!(markdown.contains("unit_cap=2048"), "{markdown}");
     }
 
     #[test]

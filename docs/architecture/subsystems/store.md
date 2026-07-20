@@ -50,6 +50,9 @@ The source-policy exclusion manifest follows the same fail-closed rule. Rows
 and manifest replace together in one SQLite transaction, and staged promotion
 records their candidate and rollback identities. A schema migration creates no
 synthetic manifest; runtime must republish from a complete verified inventory.
+Each row binds observed bytes and structural-unit count plus both active caps.
+A unit-bound row has no file, graph, structural-text, typed-target, or semantic
+projection.
 
 The structural-unit manifest binds descriptor schema, migration state, complete
 unit and projection counts and digests, and exact core generation/run. Each

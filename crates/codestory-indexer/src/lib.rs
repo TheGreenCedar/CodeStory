@@ -16,7 +16,9 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
-use codestory_contracts::workspace::process_source_index_policy;
+use codestory_contracts::workspace::{
+    OversizedSourceExclusionCandidate, SourceIndexPolicy, process_source_index_policy,
+};
 use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
@@ -946,6 +948,13 @@ pub struct IncrementalIndexingStats {
     pub resolved_imports_semantic: usize,
 }
 
+/// Indexing statistics plus verified bounded-source exclusions discovered by collectors.
+#[derive(Debug, Clone)]
+pub struct WorkspaceIndexingOutcome {
+    pub stats: IncrementalIndexingStats,
+    pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+}
+
 #[derive(Debug)]
 struct PreparedIndexInput {
     full_path: PathBuf,
@@ -980,6 +989,12 @@ enum PreparedIndexJob {
 struct PreparedIndexJobResult {
     local_storage: IntermediateStorage,
     cache_write: Option<ArtifactCacheWrite>,
+    policy_exclusion: Option<PreparedPolicyExclusion>,
+}
+
+struct PreparedPolicyExclusion {
+    file_id: i64,
+    candidate: OversizedSourceExclusionCandidate,
 }
 
 struct ArtifactCacheWrite {
@@ -1112,6 +1127,7 @@ impl<'a> ArtifactCacheAccess<'a> {
 struct PreparedIndexChunk {
     cache_writes: Vec<ArtifactCacheWrite>,
     storages: Vec<IntermediateStorage>,
+    policy_exclusions: Vec<PreparedPolicyExclusion>,
     progress_already_emitted: usize,
     #[cfg(test)]
     before_persist: Option<(usize, FullRefreshChunkTestHook)>,
@@ -1157,6 +1173,7 @@ struct ProjectionWriterOutput {
     stats: IncrementalIndexingStats,
     all_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     had_edges: bool,
+    policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
 }
 
 struct ProjectionWriter<'a> {
@@ -1171,6 +1188,7 @@ struct ProjectionWriter<'a> {
     fallback_file_error_ids: HashSet<i64>,
     fallback_file_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     had_edges: bool,
+    policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     pipeline_telemetry: bool,
     stats: IncrementalIndexingStats,
 }
@@ -1195,6 +1213,7 @@ impl<'a> ProjectionWriter<'a> {
             fallback_file_error_ids: HashSet::new(),
             fallback_file_errors: Vec::new(),
             had_edges: false,
+            policy_exclusions: Vec::new(),
             pipeline_telemetry,
             stats: IncrementalIndexingStats::default(),
         }
@@ -1245,8 +1264,25 @@ impl<'a> ProjectionWriter<'a> {
                 .saturating_add(1);
         }
 
-        for _ in chunk.progress_already_emitted..chunk.storages.len() {
+        let completed_work = chunk
+            .storages
+            .len()
+            .saturating_add(chunk.policy_exclusions.len());
+        for _ in chunk.progress_already_emitted..completed_work {
             progress.emit();
+        }
+        for exclusion in chunk.policy_exclusions {
+            if self.mode == codestory_workspace::BuildMode::Incremental
+                && self
+                    .existing_projection_file_ids
+                    .contains(&exclusion.file_id)
+            {
+                self.storage
+                    .delete_files_batch(&[exclusion.file_id])
+                    .map_err(|error| anyhow!("Storage policy-exclusion cleanup error: {error}"))?;
+                self.replaced_projection_ids.insert(exclusion.file_id);
+            }
+            self.policy_exclusions.push(exclusion.candidate);
         }
         for local_storage in chunk.storages {
             self.accept_storage(local_storage)?;
@@ -1403,6 +1439,7 @@ impl<'a> ProjectionWriter<'a> {
             stats: self.stats,
             all_errors: self.all_errors,
             had_edges: self.had_edges,
+            policy_exclusions: self.policy_exclusions,
         })
     }
 }
@@ -1420,6 +1457,7 @@ pub struct WorkspaceIndexer {
     batch_config: IncrementalIndexingConfig,
     full_refresh_chunk_budget: FullRefreshChunkBudget,
     source_file_byte_cap: u64,
+    source_index_policy: Option<SourceIndexPolicy>,
     artifact_cache_policies: ArtifactCachePolicies,
     #[cfg(test)]
     pipeline_test_hooks: FullRefreshPipelineTestHooks,
@@ -1456,6 +1494,7 @@ impl WorkspaceIndexer {
             batch_config: IncrementalIndexingConfig::default(),
             full_refresh_chunk_budget: FullRefreshChunkBudget::default(),
             source_file_byte_cap: process_source_index_policy().byte_cap,
+            source_index_policy: None,
             artifact_cache_policies: ArtifactCachePolicies::default(),
             #[cfg(test)]
             pipeline_test_hooks: FullRefreshPipelineTestHooks::default(),
@@ -1481,6 +1520,13 @@ impl WorkspaceIndexer {
     /// Override the parser-backed source file byte cap.
     pub fn with_source_file_byte_cap(mut self, source_file_byte_cap: u64) -> Self {
         self.source_file_byte_cap = source_file_byte_cap.max(1);
+        self
+    }
+
+    /// Enable verified structural-unit exclusions under one caller-owned policy.
+    pub fn with_source_index_policy(mut self, policy: SourceIndexPolicy) -> Self {
+        self.source_file_byte_cap = policy.byte_cap;
+        self.source_index_policy = Some(policy);
         self
     }
 
@@ -1533,6 +1579,19 @@ impl WorkspaceIndexer {
         event_bus: &EventBus,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IncrementalIndexingStats> {
+        Ok(self
+            .run_with_policy_exclusions(storage, plan, event_bus, cancel_token)?
+            .stats)
+    }
+
+    /// Execute a refresh and return collector-discovered policy exclusions.
+    pub fn run_with_policy_exclusions(
+        &self,
+        storage: &mut Storage,
+        plan: &codestory_workspace::RefreshExecutionPlan,
+        event_bus: &EventBus,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<WorkspaceIndexingOutcome> {
         let plan = plan.clone();
         event_bus.publish(Event::IndexingStarted {
             file_count: plan.files_to_index.len(),
@@ -1555,7 +1614,10 @@ impl WorkspaceIndexer {
             Self::record_full_refresh_chunk_config(&mut stats, self.full_refresh_chunk_budget);
         }
         if Self::is_cancelled(cancel_token) {
-            return Ok(stats);
+            return Ok(WorkspaceIndexingOutcome {
+                stats,
+                policy_exclusions: Vec::new(),
+            });
         }
         let total_files = plan.files_to_index.len();
         let processed_count = Arc::new(AtomicUsize::new(0));
@@ -1572,7 +1634,10 @@ impl WorkspaceIndexer {
         stats.setup_existing_projection_ids_ms =
             duration_ms_u64(existing_projection_setup_started.elapsed());
         if Self::is_cancelled(cancel_token) {
-            return Ok(stats);
+            return Ok(WorkspaceIndexingOutcome {
+                stats,
+                policy_exclusions: Vec::new(),
+            });
         }
 
         let symbol_seed_started = Instant::now();
@@ -1586,7 +1651,10 @@ impl WorkspaceIndexer {
         stats.setup_seed_symbol_table_ms = duration_ms_u64(symbol_seed_started.elapsed());
 
         if Self::is_cancelled(cancel_token) {
-            return Ok(stats);
+            return Ok(WorkspaceIndexingOutcome {
+                stats,
+                policy_exclusions: Vec::new(),
+            });
         }
 
         // 1. Parallel Indexing (chunked and flushed)
@@ -1689,10 +1757,14 @@ impl WorkspaceIndexer {
         accumulate_projection_writer_stats(&mut stats, &writer_output.stats);
         let mut all_errors = writer_output.all_errors;
         let had_edges = writer_output.had_edges;
+        let policy_exclusions = writer_output.policy_exclusions;
 
         if cancelled.load(Ordering::Relaxed) {
             event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-            return Ok(stats);
+            return Ok(WorkspaceIndexingOutcome {
+                stats,
+                policy_exclusions,
+            });
         }
 
         if plan.mode == codestory_workspace::BuildMode::Incremental
@@ -1709,7 +1781,10 @@ impl WorkspaceIndexer {
 
         if Self::is_cancelled(cancel_token) {
             event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-            return Ok(stats);
+            return Ok(WorkspaceIndexingOutcome {
+                stats,
+                policy_exclusions,
+            });
         }
 
         // 3.5 Resolve call/import edges post-pass
@@ -1851,7 +1926,10 @@ impl WorkspaceIndexer {
         }
 
         event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
-        Ok(stats)
+        Ok(WorkspaceIndexingOutcome {
+            stats,
+            policy_exclusions,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1939,6 +2017,7 @@ impl WorkspaceIndexer {
                     return PreparedIndexJobResult {
                         local_storage: IntermediateStorage::default(),
                         cache_write: None,
+                        policy_exclusion: None,
                     };
                 }
                 match prepared_input {
@@ -1959,15 +2038,21 @@ impl WorkspaceIndexer {
         drop(parse_jobs);
 
         let mut cache_writes = Vec::with_capacity(parse_results.len());
+        let mut policy_exclusions = Vec::new();
         for parsed in parse_results {
             if let Some(cache_write) = parsed.cache_write {
                 cache_writes.push(cache_write);
             }
-            storages.push(parsed.local_storage);
+            if let Some(exclusion) = parsed.policy_exclusion {
+                policy_exclusions.push(exclusion);
+            } else {
+                storages.push(parsed.local_storage);
+            }
         }
         PreparedIndexChunk {
             cache_writes,
             storages,
+            policy_exclusions,
             progress_already_emitted,
             #[cfg(test)]
             before_persist: self
@@ -3156,17 +3241,20 @@ impl WorkspaceIndexer {
             stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         };
+        let structural_unit_cap = self
+            .source_index_policy
+            .as_ref()
+            .map(|policy| policy.structural_unit_cap)
+            .unwrap_or(codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP);
         if artifact.descriptor_version != codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
             || artifact.files.first().map(|file| file.id)
                 != Some(Self::canonical_file_node_id_for_path(&full_path))
-            || artifact.structural_unit_node_ids.len() > structural::MAX_STRUCTURAL_UNITS_PER_FILE
-            || artifact.structural_text_units.len() > structural::MAX_STRUCTURAL_UNITS_PER_FILE
+            || artifact.structural_unit_node_ids.len() as u64 > structural_unit_cap
+            || artifact.structural_text_units.len() as u64 > structural_unit_cap
             || artifact
                 .structural_text_projections
                 .iter()
-                .any(|projection| {
-                    projection.unit_count > structural::MAX_STRUCTURAL_UNITS_PER_FILE as u64
-                })
+                .any(|projection| projection.unit_count > structural_unit_cap)
         {
             stats.artifact_cache_invalid_entries += 1;
             stats.artifact_cache_misses += 1;
@@ -3399,6 +3487,7 @@ impl WorkspaceIndexer {
                             error,
                         ),
                         cache_write: None,
+                        policy_exclusion: None,
                     };
                 }
             };
@@ -3434,6 +3523,7 @@ impl WorkspaceIndexer {
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
+                    policy_exclusion: None,
                 }
             }
             Err(e) => {
@@ -3463,6 +3553,7 @@ impl WorkspaceIndexer {
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write: None,
+                    policy_exclusion: None,
                 }
             }
         }
@@ -3473,11 +3564,80 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedStructuralInput,
     ) -> PreparedIndexJobResult {
         let language = structural::structural_language_name(&prepared_input.full_path);
-        let collected = match structural::index_structural_source(
+        let structural_unit_cap = self
+            .source_index_policy
+            .as_ref()
+            .map(|policy| policy.structural_unit_cap)
+            .unwrap_or(codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP);
+        let collected = match structural::index_structural_source_with_unit_cap(
             &prepared_input.full_path,
             &prepared_input.source,
+            structural_unit_cap,
         ) {
             Ok(collected) => collected,
+            Err(structural::StructuralCollectionError::UnitLimit {
+                observed_unit_count,
+                structural_unit_cap: observed_cap,
+            }) if self.source_index_policy.is_some() => {
+                let policy = self
+                    .source_index_policy
+                    .as_ref()
+                    .expect("guarded source policy");
+                debug_assert_eq!(observed_cap, policy.structural_unit_cap);
+                let verified =
+                    verify_source_snapshot(&prepared_input.full_path, &prepared_input.content_hash);
+                if let Err(error) = verified {
+                    return PreparedIndexJobResult {
+                        local_storage: changed_source_storage(
+                            &prepared_input.full_path,
+                            language,
+                            error,
+                        ),
+                        cache_write: None,
+                        policy_exclusion: None,
+                    };
+                }
+                let Some(relative) = codestory_workspace::workspace_relative_path(
+                    &self.root,
+                    &prepared_input.full_path,
+                ) else {
+                    return PreparedIndexJobResult {
+                        local_storage: incomplete_file_storage(
+                            &prepared_input.full_path,
+                            Some(&prepared_input.source),
+                            language,
+                            codestory_contracts::graph::ErrorInfo {
+                                message: "Failed to bind structural policy exclusion to the workspace root".into(),
+                                file_id: None,
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                                coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                            },
+                        ),
+                        cache_write: None,
+                        policy_exclusion: None,
+                    };
+                };
+                let normalized_path = relative.to_string_lossy().replace('\\', "/");
+                return PreparedIndexJobResult {
+                    local_storage: IntermediateStorage::default(),
+                    cache_write: None,
+                    policy_exclusion: Some(PreparedPolicyExclusion {
+                        file_id: Self::canonical_file_node_id_for_path(&prepared_input.full_path),
+                        candidate: OversizedSourceExclusionCandidate {
+                            normalized_path,
+                            content_hash: prepared_input.content_hash.clone(),
+                            observed_size: prepared_input.source.len() as u64,
+                            observed_unit_count,
+                            policy_version: policy.policy_version.clone(),
+                            byte_cap: policy.byte_cap,
+                            structural_unit_cap: policy.structural_unit_cap,
+                        },
+                    }),
+                };
+            }
             Err(error) => {
                 let reason = match error {
                     structural::StructuralCollectionError::Malformed(_) => {
@@ -3485,7 +3645,7 @@ impl WorkspaceIndexer {
                     }
                     structural::StructuralCollectionError::Binary => FileCoverageReason::Binary,
                     structural::StructuralCollectionError::SourceByteLimit(_)
-                    | structural::StructuralCollectionError::UnitLimit(_) => {
+                    | structural::StructuralCollectionError::UnitLimit { .. } => {
                         FileCoverageReason::Oversized
                     }
                 };
@@ -3508,6 +3668,7 @@ impl WorkspaceIndexer {
                         },
                     ),
                     cache_write: None,
+                    policy_exclusion: None,
                 };
             }
         };
@@ -3522,6 +3683,7 @@ impl WorkspaceIndexer {
                             error,
                         ),
                         cache_write: None,
+                        policy_exclusion: None,
                     };
                 }
             };
@@ -3552,6 +3714,7 @@ impl WorkspaceIndexer {
                         },
                     ),
                     cache_write: None,
+                    policy_exclusion: None,
                 };
             }
         };
@@ -3584,6 +3747,7 @@ impl WorkspaceIndexer {
         PreparedIndexJobResult {
             local_storage,
             cache_write: None,
+            policy_exclusion: None,
         }
     }
 
@@ -23199,6 +23363,83 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             error.coverage_reason == Some(FileCoverageReason::Oversized)
                 && error.message.contains("unit collector limit")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn structural_unit_bound_can_become_a_verified_policy_exclusion() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("evidence-generated.json");
+        let mut source = String::from("{");
+        for index in 0..=structural::MAX_STRUCTURAL_UNITS_PER_FILE {
+            if index > 0 {
+                source.push(',');
+            }
+            source.push_str(&format!("\"key{index}\":{index}"));
+        }
+        source.push('}');
+        std::fs::write(&path, &source)?;
+        assert!(source.len() as u64 <= process_source_index_policy().byte_cap);
+
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![path],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let policy = process_source_index_policy().clone();
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_index_policy(policy.clone());
+        let mut storage = Storage::new_in_memory()?;
+        let outcome =
+            indexer.run_with_policy_exclusions(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert!(storage.get_files()?.is_empty());
+        assert!(storage.get_errors(None)?.is_empty());
+        assert!(
+            storage
+                .get_structural_text_projection_file_ids()?
+                .is_empty()
+        );
+        assert_eq!(outcome.policy_exclusions.len(), 1);
+        let exclusion = &outcome.policy_exclusions[0];
+        assert_eq!(exclusion.normalized_path, "evidence-generated.json");
+        assert_eq!(exclusion.observed_size, source.len() as u64);
+        assert_eq!(
+            exclusion.observed_unit_count,
+            structural::MAX_STRUCTURAL_UNITS_PER_FILE as u64 + 1
+        );
+        assert_eq!(exclusion.policy_version, policy.policy_version);
+        assert_eq!(exclusion.structural_unit_cap, policy.structural_unit_cap);
+        Ok(())
+    }
+
+    #[test]
+    fn structural_unit_exclusion_uses_the_caller_owned_policy_cap() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("evidence.json");
+        std::fs::write(&path, "{\"one\":1,\"two\":2,\"three\":3}")?;
+        let policy = SourceIndexPolicy {
+            policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+                .to_string(),
+            byte_cap: codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP,
+            structural_unit_cap: 2,
+        };
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode: codestory_workspace::BuildMode::FullRefresh,
+            files_to_index: vec![path],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let outcome = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_index_policy(policy.clone())
+            .run_with_policy_exclusions(&mut storage, &plan, &EventBus::new(), None)?;
+
+        assert_eq!(outcome.policy_exclusions.len(), 1);
+        assert_eq!(outcome.policy_exclusions[0].observed_unit_count, 3);
+        assert_eq!(outcome.policy_exclusions[0].structural_unit_cap, 2);
+        assert!(storage.get_files()?.is_empty());
         Ok(())
     }
 

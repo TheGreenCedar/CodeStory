@@ -951,6 +951,45 @@ static INDEXED_FILE_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static SOURCE_POLICY_EXCLUSION_SCHEMA: SchemaObject = SchemaObject::object(
+    "Verified source intentionally excluded from parser scheduling without graph or semantic coverage.",
+    &[
+        SchemaProperty::string("path", "Project-relative file path."),
+        SchemaProperty::string("role", "Inferred file role.").with_enum(INDEXED_FILE_ROLES),
+        SchemaProperty::string("content_hash", "Verified source content digest."),
+        SchemaProperty::integer("observed_size", "Observed source bytes."),
+        SchemaProperty::integer(
+            "observed_unit_count",
+            "Observed structural units, or zero for a byte-bound exclusion.",
+        ),
+        SchemaProperty::string("policy_version", "Bound exclusion policy version."),
+        SchemaProperty::integer("byte_cap", "Bound source byte cap."),
+        SchemaProperty::integer("structural_unit_cap", "Bound structural unit cap."),
+        SchemaProperty::string("project_id", "Bound logical project identity."),
+        SchemaProperty::string("workspace_id", "Bound workspace identity."),
+        SchemaProperty::string("core_generation_id", "Bound source publication generation."),
+        SchemaProperty::string("core_run_id", "Bound source publication run."),
+        SchemaProperty::boolean("graph_coverage", "Always false for policy exclusions."),
+        SchemaProperty::boolean("semantic_coverage", "Always false for policy exclusions."),
+    ],
+    &[
+        "path",
+        "role",
+        "content_hash",
+        "observed_size",
+        "observed_unit_count",
+        "policy_version",
+        "byte_cap",
+        "structural_unit_cap",
+        "project_id",
+        "workspace_id",
+        "core_generation_id",
+        "core_run_id",
+        "graph_coverage",
+        "semantic_coverage",
+    ],
+);
+
 static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Indexed file inventory and coverage summary.",
     &[
@@ -958,6 +997,11 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::boolean("usable", "Whether the index has usable files."),
         SchemaProperty::object("summary", "Indexed file summary DTO."),
         SchemaProperty::array("files", "Indexed file rows.", &INDEXED_FILE_SCHEMA),
+        SchemaProperty::array(
+            "policy_exclusions",
+            "Verified policy exclusions without graph or semantic coverage.",
+            &SOURCE_POLICY_EXCLUSION_SCHEMA,
+        ),
         SchemaProperty::string("code", "Typed API error code."),
         SchemaProperty::string("message", "Human-readable API error message."),
         SchemaProperty::object("details", "Structured API error repair guidance.").nullable(),
@@ -965,7 +1009,13 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 )
 .with_any_of_required(&[
-    &["project_root", "usable", "summary", "files"],
+    &[
+        "project_root",
+        "usable",
+        "summary",
+        "files",
+        "policy_exclusions",
+    ],
     &["code", "message"],
 ]);
 

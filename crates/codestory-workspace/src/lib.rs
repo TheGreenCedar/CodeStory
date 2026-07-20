@@ -520,10 +520,12 @@ impl WorkspaceManifest {
         &self,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyFileInventory> {
-        WorkspaceDiscovery.source_inventory_with_policy(
+        WorkspaceDiscovery.source_inventory_with_policy_inner(
             self,
             policy.byte_cap,
             &policy.policy_version,
+            policy.structural_unit_cap,
+            None,
         )
     }
 
@@ -584,12 +586,7 @@ impl WorkspaceManifest {
         inputs: &RefreshInputs,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        WorkspaceDiscovery.build_refresh_outcome_with_policy(
-            self,
-            inputs,
-            policy.byte_cap,
-            &policy.policy_version,
-        )
+        WorkspaceDiscovery.build_refresh_outcome_with_index_policy(self, inputs, policy)
     }
 
     /// Build a policy-aware refresh outcome with the ordinary current-file discovery bound.
@@ -612,12 +609,11 @@ impl WorkspaceManifest {
         max_current_files: usize,
         policy: &SourceIndexPolicy,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        WorkspaceDiscovery.build_refresh_outcome_bounded_with_policy(
+        WorkspaceDiscovery.build_refresh_outcome_bounded_with_index_policy(
             self,
             inputs,
             max_current_files,
-            policy.byte_cap,
-            &policy.policy_version,
+            policy,
         )
     }
 
@@ -699,7 +695,13 @@ impl WorkspaceDiscovery {
         byte_cap: u64,
         policy_version: &str,
     ) -> Result<WorkspacePolicyFileInventory> {
-        self.source_inventory_with_policy_inner(manifest, byte_cap, policy_version, None)
+        self.source_inventory_with_policy_inner(
+            manifest,
+            byte_cap,
+            policy_version,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            None,
+        )
     }
 
     /// Verify that classified exclusions still name the same stable bytes at publication time.
@@ -709,8 +711,11 @@ impl WorkspaceDiscovery {
         candidates: &[OversizedSourceExclusionCandidate],
         policy: &SourceIndexPolicy,
     ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
-        if policy.byte_cap == 0 || policy.policy_version.trim().is_empty() {
-            bail!("source index policy requires a non-zero cap and non-empty version");
+        if policy.byte_cap == 0
+            || policy.structural_unit_cap == 0
+            || policy.policy_version.trim().is_empty()
+        {
+            bail!("source index policy requires non-zero caps and a non-empty version");
         }
         let root = workspace_root(manifest);
         let mut verified = candidates.to_vec();
@@ -719,6 +724,7 @@ impl WorkspaceDiscovery {
         for candidate in &verified {
             if candidate.policy_version != policy.policy_version
                 || candidate.byte_cap != policy.byte_cap
+                || candidate.structural_unit_cap != policy.structural_unit_cap
                 || previous_path == Some(candidate.normalized_path.as_str())
             {
                 bail!(
@@ -736,9 +742,12 @@ impl WorkspaceDiscovery {
                 );
             }
             let (content_hash, observed_size) = current_content_identity(&path)?;
+            let byte_bound = observed_size > policy.byte_cap && candidate.observed_unit_count == 0;
+            let unit_bound = candidate.observed_unit_count > policy.structural_unit_cap
+                && observed_size <= policy.byte_cap;
             if content_hash != candidate.content_hash
                 || observed_size != candidate.observed_size
-                || observed_size <= policy.byte_cap
+                || !(byte_bound || unit_bound)
             {
                 bail!(
                     "source policy exclusion `{}` changed before publication",
@@ -754,10 +763,11 @@ impl WorkspaceDiscovery {
         manifest: &WorkspaceManifest,
         byte_cap: u64,
         policy_version: &str,
+        structural_unit_cap: u64,
         max_files: Option<usize>,
     ) -> Result<WorkspacePolicyFileInventory> {
-        if byte_cap == 0 || policy_version.trim().is_empty() {
-            bail!("oversized source policy requires a non-zero cap and non-empty version");
+        if byte_cap == 0 || structural_unit_cap == 0 || policy_version.trim().is_empty() {
+            bail!("bounded source policy requires non-zero caps and a non-empty version");
         }
         let inventory = self.source_inventory_inner(manifest, max_files)?;
         if !inventory.outcome.is_complete() {
@@ -819,8 +829,10 @@ impl WorkspaceDiscovery {
                 normalized_path,
                 content_hash,
                 observed_size,
+                observed_unit_count: 0,
                 policy_version: policy_version.to_string(),
                 byte_cap,
+                structural_unit_cap,
             });
         }
         policy_exclusions.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
@@ -1060,6 +1072,33 @@ impl WorkspaceDiscovery {
         })
     }
 
+    /// Build one refresh plan using the complete caller-owned byte/unit policy.
+    pub fn build_refresh_outcome_with_index_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let inventory = self.source_inventory_with_policy_inner(
+            manifest,
+            policy.byte_cap,
+            &policy.policy_version,
+            policy.structural_unit_cap,
+            None,
+        )?;
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
     /// Build a bounded policy-aware refresh outcome without losing completeness evidence.
     pub fn build_refresh_outcome_bounded_with_policy(
         &self,
@@ -1073,6 +1112,35 @@ impl WorkspaceDiscovery {
             manifest,
             byte_cap,
             policy_version,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            Some(max_current_files),
+        )?;
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
+    /// Build a bounded refresh using the complete caller-owned byte/unit policy.
+    pub fn build_refresh_outcome_bounded_with_index_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let inventory = self.source_inventory_with_policy_inner(
+            manifest,
+            policy.byte_cap,
+            &policy.policy_version,
+            policy.structural_unit_cap,
             Some(max_current_files),
         )?;
         let refresh = build_refresh_outcome_from_inventory(

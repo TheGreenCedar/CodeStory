@@ -26,9 +26,10 @@ a partial tree. Runtime treats it as `parser_partial` only when the indexed byte
 have a verified content hash, the file carries no file-level error, and storage
 does not require a retry. That row remains `complete=false` so diagnostics do
 not overstate parser coverage, but it does not block an otherwise atomic core
-publication. Malformed, binary/non-UTF-8, unreadable, oversized, changed,
-incompletely discovered, or collector-failed source remains a publication
-blocker.
+publication. Malformed, binary/non-UTF-8, unreadable, changed, incompletely
+discovered, or collector-failed source remains a publication blocker.
+Verified byte- or structural-unit-bound policy exclusions remain source
+inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 
 ## Current Runtime Claims
 

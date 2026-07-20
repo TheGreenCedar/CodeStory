@@ -31,10 +31,10 @@ pub use storage_impl::{
     SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
     STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
     SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
-    SourcePolicyExclusionRecord, Storage as Store, StorageError, StorageOpenMode, StorageStats,
-    StructuralTextArtifactCacheWrite, StructuralTextProjection, StructuralTextUnit,
-    StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
-    structural_text_unit_digest,
+    SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord, Storage as Store,
+    StorageError, StorageOpenMode, StorageStats, StructuralTextArtifactCacheWrite,
+    StructuralTextProjection, StructuralTextUnit, StructuralTextUnitPublicationManifest,
+    SymbolSearchDoc, SymbolSummaryRecord, structural_text_unit_digest,
 };
 
 impl Store {

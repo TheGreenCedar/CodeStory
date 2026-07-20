@@ -168,11 +168,15 @@ verified SHA-256 identity; structural files therefore cannot hide changed
 content behind a restored timestamp. Oversized candidates use the separate
 source-policy identity described below.
 
-Verified oversized candidates are removed from parser scheduling and published
-as a complete exclusion manifest bound to the project, workspace, candidate
-core generation/run, policy version, byte cap, row count, and digest. The rows
-remain source inventory only: they make no parser graph or semantic coverage
-claim. A content or policy change forces reclassification.
+Verified byte-bound candidates are removed before parser scheduling.
+Structural collectors may also return a verified exclusion when a source below
+the byte cap exceeds the structural-unit cap; that worker result writes no
+partial projection or cache. Runtime publishes the combined complete exclusion
+manifest bound to project, workspace, candidate core generation/run, policy
+version, observed byte/unit counts, both caps, row count, and digest. The rows
+remain source inventory only: they make no parser graph, structural semantic,
+typed-target, or sufficiency claim. A content or policy change forces
+reclassification.
 
 Files that disappeared from a complete discovery are collected into
 `files_to_remove`. Partial, unreadable, bounded, or concurrently changing

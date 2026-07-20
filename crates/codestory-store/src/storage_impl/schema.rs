@@ -216,8 +216,10 @@ const TABLE_STATEMENTS: &[&str] = &[
         workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
         content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
         observed_size INTEGER NOT NULL CHECK(observed_size > 0),
+        observed_unit_count INTEGER NOT NULL DEFAULT 0 CHECK(observed_unit_count >= 0),
         policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
         byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+        structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0),
         core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
         core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0)
     )",
@@ -233,6 +235,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         exclusion_digest TEXT NOT NULL CHECK(length(exclusion_digest) = 64),
         policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
         byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+        structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0),
         published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
     )",
     "CREATE TABLE IF NOT EXISTS symbol_search_doc (
@@ -687,6 +690,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v28_structural_text_units(&storage.conn)?;
     if stored_version < 28 {
         storage.set_schema_version(28)?;
+    }
+    migrate_v29_structural_policy_exclusions(&storage.conn)?;
+    if stored_version < 29 {
+        storage.set_schema_version(29)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -1147,6 +1154,27 @@ pub(super) fn migrate_v28_structural_text_units(conn: &Connection) -> Result<(),
             updated_at_epoch_ms INTEGER NOT NULL
         )",
         [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v29_structural_policy_exclusions(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "source_policy_exclusion",
+        "observed_unit_count INTEGER NOT NULL DEFAULT 0 CHECK(observed_unit_count >= 0)",
+    )?;
+    try_add_column(
+        conn,
+        "source_policy_exclusion",
+        "structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0)",
+    )?;
+    try_add_column(
+        conn,
+        "source_policy_exclusion_publication",
+        "structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0)",
     )?;
     Ok(())
 }
