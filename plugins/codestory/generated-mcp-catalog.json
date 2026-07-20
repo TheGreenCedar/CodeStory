@@ -26,7 +26,7 @@
       "name": "status",
       "outputSchema": {
         "additionalProperties": false,
-        "description": "Compact capability state. Read codestory://status only when full diagnostics are needed.",
+        "description": "Compact capability state. Read codestory://status{?project} with the same absolute project root when full diagnostics are needed.",
         "properties": {
           "capabilities": {
             "description": "Local navigation and broad-search states.",

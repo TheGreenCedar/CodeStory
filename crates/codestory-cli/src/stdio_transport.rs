@@ -4218,7 +4218,7 @@ fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_j
         },
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
-            "message": "The live CodeStory MCP child is serving a different workspace than the active plugin state. Restart/reload the host so MCP relaunches for the active workspace, then reread codestory://status."
+            "message": "The live CodeStory MCP child is serving a different workspace than the active plugin state. Restart/reload the host so MCP relaunches for the active workspace, then reread the project-bound status resource."
         },
         "degraded_reason": "workspace_mismatch",
         "project_root": diagnostic["served_root"].clone(),
@@ -4236,7 +4236,7 @@ fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_j
         "status_resource_auto_repair": null,
         "recommended_next_calls": [{
             "method": "host/restart",
-            "instruction": "Restart/reload the Codex host/app so CodeStory MCP relaunches for the active workspace; then read codestory://status."
+            "instruction": "Restart/reload the Codex host/app so CodeStory MCP relaunches for the active workspace; then read the project-bound status resource."
         }, {
             "method": "resources/read",
             "uri": stdio_resource_uri_for_project(
@@ -4409,7 +4409,7 @@ fn read_stdio_status_resource(
         "runtime_truth": surfaces.runtime_truth,
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
-            "message": "A running MCP server keeps using the CLI process it was launched with; install or explicit override changes require a host reload/restart and a fresh codestory://status readback."
+            "message": "A running MCP server keeps using the CLI process it was launched with; install or explicit override changes require a host reload/restart and a fresh project-bound status readback."
         },
         "warnings": server_warnings,
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
@@ -5923,7 +5923,7 @@ mod tests {
     #[test]
     fn stdio_recommended_next_calls_labels_restart_boundary_as_host_action() {
         let restart =
-            "Restart/reload the Codex host/app so MCP relaunches codestory-cli 0.11.11 from C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe; then open a fresh agent thread and read codestory://status."
+            "Restart/reload the Codex host/app so MCP relaunches codestory-cli 0.11.11 from C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe; then open a fresh agent thread and read the project-bound status resource."
                 .to_string();
         let calls = stdio_status_recommended_next_calls(
             &[ReadinessVerdictDto {

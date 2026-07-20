@@ -753,7 +753,7 @@ static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
 
 static STATUS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Compact capability state. Read codestory://status only when full diagnostics are needed.",
+    "Compact capability state. Read codestory://status{?project} with the same absolute project root when full diagnostics are needed.",
     &[
         SchemaProperty::string("project", "Requested repository root."),
         SchemaProperty::string("state", "Overall capability state.").with_enum(&[

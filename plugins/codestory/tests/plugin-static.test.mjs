@@ -3218,7 +3218,7 @@ test("fail-open status tool preserves primary runtime failures and no-project pr
     }],
     recommended_next_calls: [],
   }));
-  statuses.push(statuses[0]);
+  statuses.push(statuses[0], statuses[0]);
   const fixture = [
     `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
     `const statuses=${JSON.stringify(statuses)};`,
@@ -3242,6 +3242,15 @@ test("fail-open status tool preserves primary runtime failures and no-project pr
       method: "tools/call",
       params: { name: "status", arguments: {} },
     }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: failures.length + 2,
+      method: "tools/call",
+      params: {
+        name: "status",
+        arguments: { project: join(repoRoot, "missing-project-for-fail-open-proof") },
+      },
+    }),
     "",
   ].join("\n"));
   assert.equal((await completed)[0], 0);
@@ -3256,6 +3265,13 @@ test("fail-open status tool preserves primary runtime failures and no-project pr
   assert.equal(noProject.code, "project_required");
   assert.equal(noProject.state, "no_project");
   assert.equal(noProject.degraded_reason, undefined);
+  assert.equal(noProject.diagnostics_uri, undefined);
+  const unavailableProject = responses.find(
+    (response) => response.id === failures.length + 2,
+  )?.result.structuredContent;
+  assert.equal(unavailableProject.code, "project_unavailable");
+  assert.equal(unavailableProject.state, "unavailable");
+  assert.equal(unavailableProject.diagnostics_uri, undefined);
 });
 
 test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {

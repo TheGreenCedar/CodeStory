@@ -1965,7 +1965,15 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     allowed_surfaces: Object.fromEntries(surfaces.map((surface) => [surface, blockedSurface()])),
     recommended_next_calls: preparing
       ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', retry_after_ms: 1500 }]
-      : [{ method: 'resources/read', uri: 'codestory://status' }],
+      : projectRoot
+        ? [{
+            method: 'resources/read',
+            uri: projectBoundResourceUri('codestory://status', projectRoot),
+          }]
+        : [{
+            method: 'resources/read',
+            uri_template: 'codestory://status{?project}',
+          }],
   };
 }
 
@@ -2219,7 +2227,6 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       tool,
       project: selection.project,
       state: selection.code === 'project_required' ? 'no_project' : 'unavailable',
-      diagnostics_uri: 'codestory://status',
     };
     if (tool === 'status' && selection.code === 'project_required') {
       return {
@@ -2513,8 +2520,9 @@ function runFailOpenMcp(status, options = {}) {
           statusValue.diagnostics_uri = parsedResource.uri;
           if (Array.isArray(statusValue.recommended_next_calls)) {
             statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) =>
-              call?.method === 'resources/read' && call?.uri === 'codestory://status'
-                ? { ...call, uri: parsedResource.uri }
+              call?.method === 'resources/read'
+                && call?.uri_template === 'codestory://status{?project}'
+                ? { method: call.method, uri: parsedResource.uri }
                 : call);
           }
           response = jsonrpcResult(
