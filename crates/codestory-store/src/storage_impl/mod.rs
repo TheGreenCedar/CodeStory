@@ -2921,6 +2921,7 @@ impl GroundingSnapshotMetadata {
 #[derive(Debug, Clone)]
 pub struct GroundingFileSummary {
     pub file: FileInfo,
+    pub file_role: Option<FileRole>,
     pub symbol_count: u32,
     pub best_node_rank: u8,
 }
@@ -5283,6 +5284,9 @@ impl Storage {
     }
 
     fn grounding_file_summary_from_row(row: &Row) -> Result<GroundingFileSummary, StorageError> {
+        let file_role = row
+            .get::<_, Option<String>>(9)?
+            .map(|value| FileRole::from_db_value(&value));
         Ok(GroundingFileSummary {
             file: FileInfo {
                 id: row.get(0)?,
@@ -5292,8 +5296,9 @@ impl Storage {
                 indexed: row.get::<_, i32>(4)? != 0,
                 complete: row.get::<_, i32>(5)? != 0,
                 line_count: row.get(6)?,
-                file_role: FileRole::Source,
+                file_role: file_role.unwrap_or_default(),
             },
+            file_role,
             symbol_count: clamp_i64_to_u32(row.get::<_, i64>(7)?),
             best_node_rank: row.get::<_, i64>(8)?.min(u8::MAX as i64) as u8,
         })
@@ -9591,17 +9596,19 @@ impl Storage {
         if self.has_ready_grounding_summary_snapshots()? {
             let mut stmt = self.conn.prepare(
                 "SELECT
-                    file_id,
-                    path,
-                    language,
-                    modification_time,
-                    indexed,
-                    complete,
-                    line_count,
-                    symbol_count,
-                    best_node_rank
-                 FROM grounding_file_snapshot
-                 ORDER BY path",
+                    g.file_id,
+                    g.path,
+                    g.language,
+                    g.modification_time,
+                    g.indexed,
+                    g.complete,
+                    g.line_count,
+                    g.symbol_count,
+                    g.best_node_rank,
+                    f.file_role
+                 FROM grounding_file_snapshot g
+                 LEFT JOIN file f ON f.id = g.file_id
+                 ORDER BY g.path",
             )?;
             let mut rows = stmt.query([])?;
             let mut summaries = Vec::new();
@@ -9615,7 +9622,15 @@ impl Storage {
         let indexable = grounding_indexable_predicate("n");
         let query = format!(
             "WITH all_files AS (
-                SELECT id, path, language, modification_time, indexed, complete, line_count
+                SELECT
+                    id,
+                    path,
+                    language,
+                    modification_time,
+                    indexed,
+                    complete,
+                    line_count,
+                    file_role
                 FROM file
                 UNION ALL
                 SELECT
@@ -9625,7 +9640,8 @@ impl Storage {
                     0,
                     1,
                     1,
-                    0
+                    0,
+                    NULL
                 FROM node n
                 WHERE n.kind = {file_kind}
                     AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
@@ -9639,7 +9655,8 @@ impl Storage {
                 f.complete,
                 f.line_count,
                 COUNT(n.id) AS symbol_count,
-                MIN(CASE WHEN n.id IS NULL THEN 255 ELSE {rank_sql} END) AS best_node_rank
+                MIN(CASE WHEN n.id IS NULL THEN 255 ELSE {rank_sql} END) AS best_node_rank,
+                f.file_role
             FROM all_files f
             LEFT JOIN node n
                 ON n.file_node_id = f.id
@@ -9651,7 +9668,8 @@ impl Storage {
                 f.modification_time,
                 f.indexed,
                 f.complete,
-                f.line_count
+                f.line_count,
+                f.file_role
             ORDER BY f.path",
             file_kind = NodeKind::FILE as i32,
         );
@@ -9676,20 +9694,22 @@ impl Storage {
         if self.has_ready_grounding_summary_snapshots()? {
             let mut stmt = self.conn.prepare(
                 "SELECT
-                    file_id,
-                    path,
-                    language,
-                    modification_time,
-                    indexed,
-                    complete,
-                    line_count,
-                    symbol_count,
-                    best_node_rank
-                 FROM grounding_file_snapshot
+                    g.file_id,
+                    g.path,
+                    g.language,
+                    g.modification_time,
+                    g.indexed,
+                    g.complete,
+                    g.line_count,
+                    g.symbol_count,
+                    g.best_node_rank,
+                    f.file_role
+                 FROM grounding_file_snapshot g
+                 LEFT JOIN file f ON f.id = g.file_id
                  ORDER BY
-                    best_node_rank ASC,
-                    symbol_count DESC,
-                    path ASC
+                    g.best_node_rank ASC,
+                    g.symbol_count DESC,
+                    g.path ASC
                  LIMIT ?1 OFFSET ?2",
             )?;
             let mut rows = stmt.query(params![
@@ -9735,7 +9755,7 @@ impl Storage {
                     end_col,
                     display_name,
                     file_path
-                 FROM grounding_node_snapshot
+                 FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
                  WHERE file_symbol_rank <= ?1
                    AND file_node_id IN ({placeholders})
                  ORDER BY file_node_id, file_symbol_rank"
@@ -9814,6 +9834,341 @@ impl Storage {
         params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
         let mut stmt = self.conn.prepare(&query)?;
         let mut rows = stmt.query(params_from_iter(params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(GroundingNodeRecord {
+                node: Self::node_from_row(row)?,
+                display_name: row.get(10)?,
+                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Return root symbols from a bounded top-symbol window for exact files.
+    ///
+    /// The snapshot path stays on the persistent per-file rank index. The
+    /// caller selects a bounded architecture-relevant file set and performs
+    /// the final cross-file ranking, so this query never sorts every root in
+    /// the repository.
+    pub fn get_grounding_root_symbols_for_files(
+        &self,
+        file_ids: &[i64],
+        per_file_candidate_limit: usize,
+    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
+        if file_ids.is_empty() || per_file_candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        if self.has_ready_grounding_summary_snapshots()? {
+            let placeholders = numbered_placeholders(2, file_ids.len());
+            let query = format!(
+                "SELECT
+                    node_id,
+                    kind,
+                    serialized_name,
+                    qualified_name,
+                    canonical_id,
+                    file_node_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    display_name,
+                    file_path
+                 FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
+                 WHERE file_symbol_rank <= ?1
+                   AND is_root = 1
+                   AND file_node_id IN ({placeholders})
+                 ORDER BY file_node_id, file_symbol_rank, node_id"
+            );
+            let mut params = Vec::with_capacity(file_ids.len() + 1);
+            params.push(Value::Integer(
+                per_file_candidate_limit.min(i64::MAX as usize) as i64,
+            ));
+            params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            let mut nodes = Vec::new();
+            while let Some(row) = rows.next()? {
+                nodes.push(GroundingNodeRecord {
+                    node: Self::node_from_row(row)?,
+                    display_name: row.get(10)?,
+                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                });
+            }
+            return Ok(nodes);
+        }
+
+        let placeholders = numbered_placeholders(2, file_ids.len());
+        let rank_sql = grounding_node_rank_sql("n");
+        let indexable = grounding_indexable_predicate("n");
+        let display_name = grounding_display_name_expr("n");
+        let query = format!(
+            "WITH ranked AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS row_num
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE {indexable}
+                  AND n.file_node_id IN ({placeholders})
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path
+            FROM ranked
+            WHERE row_num <= ?1
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                      AND e.target_node_id = ranked.id
+                )
+            ORDER BY file_node_id, row_num, id",
+            file_kind = NodeKind::FILE as i32,
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let mut params = Vec::with_capacity(file_ids.len() + 1);
+        params.push(Value::Integer(
+            per_file_candidate_limit.min(i64::MAX as usize) as i64,
+        ));
+        params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(GroundingNodeRecord {
+                node: Self::node_from_row(row)?,
+                display_name: row.get(10)?,
+                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Return a bounded set of root symbols whose serialized names match
+    /// caller-owned architecture patterns inside exact files.
+    ///
+    /// This complements the per-file structural window when a leaf-heavy
+    /// entrypoint file ranks its executable root below that window. The
+    /// runtime remains responsible for validating the name and file evidence.
+    pub fn get_grounding_named_root_symbols_for_files(
+        &self,
+        file_ids: &[i64],
+        normalized_exact_names: &[String],
+        uppercase_name_globs: &[String],
+        per_file_limit: usize,
+    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
+        if file_ids.is_empty()
+            || (normalized_exact_names.is_empty() && uppercase_name_globs.is_empty())
+            || per_file_limit == 0
+        {
+            return Ok(Vec::new());
+        }
+
+        let file_placeholders = question_placeholders(file_ids.len());
+        let mut name_conditions = Vec::new();
+        if !normalized_exact_names.is_empty() {
+            name_conditions.push(format!(
+                "LOWER(REPLACE(serialized_name, '_', '')) IN ({})",
+                question_placeholders(normalized_exact_names.len())
+            ));
+        }
+        name_conditions.extend(
+            uppercase_name_globs
+                .iter()
+                .map(|_| "serialized_name GLOB ?".to_string()),
+        );
+        let name_conditions = name_conditions.join(" OR ");
+        if self.has_ready_grounding_summary_snapshots()? {
+            let query = format!(
+                "WITH matched AS (
+                    SELECT
+                        node_id,
+                        kind,
+                        serialized_name,
+                        qualified_name,
+                        canonical_id,
+                        file_node_id,
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                        display_name,
+                        file_path,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY file_node_id
+                            ORDER BY file_symbol_rank, node_id
+                        ) AS named_rank
+                    FROM grounding_node_snapshot
+                         INDEXED BY idx_grounding_node_snapshot_file_rank
+                    WHERE file_node_id IN ({file_placeholders})
+                      AND is_root = 1
+                      AND kind IN ({function_kind}, {method_kind})
+                      AND ({name_conditions})
+                )
+                SELECT
+                    node_id,
+                    kind,
+                    serialized_name,
+                    qualified_name,
+                    canonical_id,
+                    file_node_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    display_name,
+                    file_path
+                FROM matched
+                WHERE named_rank <= ?",
+                function_kind = NodeKind::FUNCTION as i32,
+                method_kind = NodeKind::METHOD as i32,
+            );
+            let mut values = Vec::with_capacity(
+                file_ids
+                    .len()
+                    .saturating_add(normalized_exact_names.len())
+                    .saturating_add(uppercase_name_globs.len())
+                    .saturating_add(1),
+            );
+            values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+            values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
+            values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
+            values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(values))?;
+            let mut nodes = Vec::new();
+            while let Some(row) = rows.next()? {
+                nodes.push(GroundingNodeRecord {
+                    node: Self::node_from_row(row)?,
+                    display_name: row.get(10)?,
+                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                });
+            }
+            return Ok(nodes);
+        }
+
+        let rank_sql = grounding_node_rank_sql("n");
+        let indexable = grounding_indexable_predicate("n");
+        let display_name = grounding_display_name_expr("n");
+        let mut fallback_name_conditions = Vec::new();
+        if !normalized_exact_names.is_empty() {
+            fallback_name_conditions.push(format!(
+                "LOWER(REPLACE(n.serialized_name, '_', '')) IN ({})",
+                question_placeholders(normalized_exact_names.len())
+            ));
+        }
+        fallback_name_conditions.extend(
+            uppercase_name_globs
+                .iter()
+                .map(|_| "n.serialized_name GLOB ?".to_string()),
+        );
+        let fallback_name_conditions = fallback_name_conditions.join(" OR ");
+        let query = format!(
+            "WITH matched AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS named_rank
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE n.file_node_id IN ({file_placeholders})
+                  AND {indexable}
+                  AND n.kind IN ({function_kind}, {method_kind})
+                  AND ({fallback_name_conditions})
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM edge e
+                        WHERE e.kind = {member_kind}
+                          AND e.target_node_id = n.id
+                    )
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path
+            FROM matched
+            WHERE named_rank <= ?",
+            file_kind = NodeKind::FILE as i32,
+            function_kind = NodeKind::FUNCTION as i32,
+            method_kind = NodeKind::METHOD as i32,
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let mut values = Vec::with_capacity(
+            file_ids
+                .len()
+                .saturating_add(normalized_exact_names.len())
+                .saturating_add(uppercase_name_globs.len())
+                .saturating_add(1),
+        );
+        values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+        values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
+        values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
+        values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(values))?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
             nodes.push(GroundingNodeRecord {
@@ -9925,6 +10280,35 @@ impl Storage {
             });
         }
         Ok(nodes)
+    }
+
+    pub fn get_grounding_root_symbol_candidate_count(&self) -> Result<usize, StorageError> {
+        if self.has_ready_grounding_summary_snapshots()? {
+            let count = self.conn.query_row(
+                "SELECT COUNT(*) FROM grounding_node_snapshot WHERE is_root = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            return Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX));
+        }
+
+        let indexable = grounding_indexable_predicate("n");
+        let query = format!(
+            "SELECT COUNT(*)
+             FROM node n
+             WHERE {indexable}
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                      AND e.target_node_id = n.id
+                )",
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let count = self
+            .conn
+            .query_row(&query, [], |row| row.get::<_, i64>(0))?;
+        Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
     }
 
     pub fn get_grounding_member_counts(
@@ -11029,6 +11413,7 @@ mod grounding_snapshot_fast_path_tests {
         assert_eq!(storage.get_grounding_file_summary_count()?, 1);
         assert_eq!(storage.get_stats()?.file_count, 1);
         assert_eq!(storage.get_grounding_file_summaries()?.len(), 1);
+        assert_eq!(storage.get_grounding_file_summaries()?[0].file_role, None);
         Ok(())
     }
 
@@ -11072,6 +11457,217 @@ mod grounding_snapshot_fast_path_tests {
             .map(|summary| summary.file.id)
             .collect::<Vec<_>>();
         assert_eq!(snapshot_ids, vec![30, 10]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_grounding_root_symbols_for_files_uses_bounded_file_rank_window()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::INTERFACE, "AppConfig", 1),
+                (102, NodeKind::FUNCTION, "start_application", 2),
+                (103, NodeKind::FIELD, "port", 3),
+            ],
+        )?;
+        storage.insert_edges_batch(&[Edge {
+            id: codestory_contracts::graph::EdgeId(1),
+            source: NodeId(101),
+            target: NodeId(103),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        }])?;
+        insert_grounding_test_file(&mut storage, 5, "src/noise/main.ts", &[])?;
+        storage.insert_nodes_batch(
+            &(0..12_i64)
+                .map(|offset| Node {
+                    id: NodeId(500 + offset),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "run_app".to_string(),
+                    file_node_id: Some(NodeId(5)),
+                    start_line: Some(1 + offset as u32),
+                    ..Default::default()
+                })
+                .chain((0..192_i64).map(|offset| Node {
+                    id: NodeId(600 + offset),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("create_noise_{offset}"),
+                    file_node_id: Some(NodeId(5)),
+                    start_line: Some(20 + offset as u32),
+                    ..Default::default()
+                }))
+                .collect::<Vec<_>>(),
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            20,
+            "src/second/main.ts",
+            &[(201, NodeKind::FUNCTION, "main", 1)],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            30,
+            "src/app/page.tsx",
+            &[(301, NodeKind::FUNCTION, "Page", 40)],
+        )?;
+
+        let fallback = storage
+            .get_grounding_root_symbols_for_files(&[10], 1)?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(fallback, vec!["AppConfig"]);
+        let named_exact = [
+            "runapp".to_string(),
+            "startapplication".to_string(),
+            "main".to_string(),
+        ];
+        let uppercase_globs = [
+            "Page".to_string(),
+            "Layout".to_string(),
+            "[A-Z]*Page".to_string(),
+            "[A-Z]*Layout".to_string(),
+        ];
+        let mut named_fallback = storage
+            .get_grounding_named_root_symbols_for_files(
+                &[5, 10, 20, 30],
+                &named_exact,
+                &uppercase_globs,
+                2,
+            )?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        named_fallback.sort();
+        assert_eq!(
+            named_fallback,
+            vec!["Page", "main", "run_app", "run_app", "start_application"]
+        );
+
+        storage.refresh_grounding_summary_snapshots()?;
+
+        let snapshot = storage
+            .get_grounding_root_symbols_for_files(&[10], 1)?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot, fallback);
+        let mut named_snapshot = storage
+            .get_grounding_named_root_symbols_for_files(
+                &[5, 10, 20, 30],
+                &named_exact,
+                &uppercase_globs,
+                2,
+            )?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        named_snapshot.sort();
+        assert_eq!(named_snapshot, named_fallback);
+
+        let base_plan = storage
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT node_id
+                 FROM grounding_node_snapshot
+                 WHERE is_root = 1
+                 ORDER BY node_rank, sort_start_line, display_name, node_id
+                 LIMIT ?1 OFFSET ?2",
+            )?
+            .query_map(params![16_i64, 0_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            base_plan
+                .iter()
+                .any(|line| line.contains("idx_grounding_node_snapshot_root_rank")),
+            "base root window lost the root-rank index: {base_plan:?}"
+        );
+        assert!(
+            base_plan
+                .iter()
+                .all(|line| !line.contains("USE TEMP B-TREE")),
+            "base root window sorted outside the root-rank index: {base_plan:?}"
+        );
+
+        let file_plan = storage
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT node_id
+                 FROM grounding_node_snapshot
+                      INDEXED BY idx_grounding_node_snapshot_file_rank
+                 WHERE file_symbol_rank <= ?1
+                   AND is_root = 1
+                   AND file_node_id IN (?2)
+                 ORDER BY file_node_id, file_symbol_rank, node_id",
+            )?
+            .query_map(params![16_i64, 10_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            file_plan
+                .iter()
+                .any(|line| line.contains("idx_grounding_node_snapshot_file_rank")),
+            "architecture root window lost the file-rank index: {file_plan:?}"
+        );
+        assert!(
+            file_plan
+                .iter()
+                .all(|line| !line.contains("USE TEMP B-TREE")),
+            "architecture root window sorted outside the file-rank index: {file_plan:?}"
+        );
+
+        let named_plan = storage
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 WITH matched AS (
+                    SELECT
+                        node_id,
+                        file_node_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY file_node_id
+                            ORDER BY file_symbol_rank, node_id
+                        ) AS named_rank
+                    FROM grounding_node_snapshot
+                         INDEXED BY idx_grounding_node_snapshot_file_rank
+                    WHERE file_node_id IN (?1)
+                      AND is_root = 1
+                      AND kind IN (?2, ?3)
+                      AND LOWER(REPLACE(serialized_name, '_', '')) IN (?4)
+                 )
+                 SELECT node_id
+                 FROM matched
+                 WHERE named_rank <= ?5",
+            )?
+            .query_map(
+                params![
+                    10_i64,
+                    NodeKind::FUNCTION as i32,
+                    NodeKind::METHOD as i32,
+                    "startapplication",
+                    8_i64
+                ],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            named_plan
+                .iter()
+                .any(|line| line.contains("idx_grounding_node_snapshot_file_rank")),
+            "named architecture root window lost the file-rank index: {named_plan:?}"
+        );
+        assert!(
+            named_plan
+                .iter()
+                .all(|line| !line.contains("USE TEMP B-TREE")),
+            "named architecture root window sorted outside the file-rank index: {named_plan:?}"
+        );
 
         Ok(())
     }

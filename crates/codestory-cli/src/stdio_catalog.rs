@@ -215,6 +215,7 @@ enum SchemaItems {
         schema_type: SchemaType,
         min_length: Option<u64>,
         max_length: Option<u64>,
+        enum_values: &'static [&'static str],
     },
 }
 
@@ -232,6 +233,7 @@ impl SchemaItems {
                 schema_type,
                 min_length,
                 max_length,
+                enum_values,
             } => {
                 let mut schema =
                     Map::from_iter([("type".to_string(), json!(schema_type.as_str()))]);
@@ -240,6 +242,9 @@ impl SchemaItems {
                 }
                 if let Some(max_length) = max_length {
                     schema.insert("maxLength".to_string(), json!(max_length));
+                }
+                if !enum_values.is_empty() {
+                    schema.insert("enum".to_string(), json!(enum_values));
                 }
                 Value::Object(schema)
             }
@@ -415,6 +420,7 @@ impl SchemaProperty {
                 schema_type: SchemaType::String,
                 min_length: None,
                 max_length: None,
+                enum_values: &[],
             }),
             object_schema: None,
             nullable: false,
@@ -458,11 +464,13 @@ impl SchemaProperty {
             Some(SchemaItems::Type {
                 schema_type,
                 max_length,
+                enum_values,
                 ..
             }) => Some(SchemaItems::Type {
                 schema_type,
                 min_length: Some(min_length),
                 max_length,
+                enum_values,
             }),
             items => items,
         };
@@ -474,11 +482,31 @@ impl SchemaProperty {
             Some(SchemaItems::Type {
                 schema_type,
                 min_length,
+                enum_values,
                 ..
             }) => Some(SchemaItems::Type {
                 schema_type,
                 min_length,
                 max_length: Some(max_length),
+                enum_values,
+            }),
+            items => items,
+        };
+        self
+    }
+
+    const fn with_item_enum(mut self, enum_values: &'static [&'static str]) -> Self {
+        self.items = match self.items {
+            Some(SchemaItems::Type {
+                schema_type,
+                min_length,
+                max_length,
+                ..
+            }) => Some(SchemaItems::Type {
+                schema_type,
+                min_length,
+                max_length,
+                enum_values,
             }),
             items => items,
         };
@@ -715,6 +743,14 @@ const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
 const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "unknown"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
+const GROUNDING_ORIENTATION_CONFIDENCE: &[&str] = &["strong", "partial", "weak"];
+const GROUNDING_ORIENTATION_UNCERTAINTY: &[&str] = &[
+    "bounded_candidate_window",
+    "no_entrypoint_evidence",
+    "entrypoint_evidence_omitted",
+    "limited_subsystem_breadth",
+    "compressed_presentation",
+];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
 const PACKET_PROBE_EXACT_PATH_KIND: &[&str] = &["exact_path"];
 const PACKET_PROBE_SYMBOL_ID_KIND: &[&str] = &["symbol_id"];
@@ -1250,6 +1286,56 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &["code", "message"],
 ]);
 
+static GROUNDING_ORIENTATION_SCHEMA: SchemaObject = SchemaObject::object(
+    "Typed confidence and uncertainty for the compact architecture orientation.",
+    &[
+        SchemaProperty::string(
+            "confidence",
+            "Confidence that selected roots orient an agent to the repository architecture.",
+        )
+        .with_enum(GROUNDING_ORIENTATION_CONFIDENCE),
+        SchemaProperty::integer(
+            "total_root_candidates",
+            "Total root symbols available in the published repository map.",
+        ),
+        SchemaProperty::integer(
+            "evaluated_root_candidates",
+            "Root symbols evaluated inside the bounded orientation candidate window.",
+        ),
+        SchemaProperty::integer(
+            "candidate_entrypoint_roots",
+            "Evaluated roots with entrypoint evidence.",
+        ),
+        SchemaProperty::integer(
+            "selected_entrypoint_roots",
+            "Entrypoint-evidenced roots retained in the snapshot.",
+        ),
+        SchemaProperty::integer(
+            "candidate_subsystems",
+            "Distinct architecture subsystems represented by evaluated roots.",
+        ),
+        SchemaProperty::integer(
+            "selected_subsystems",
+            "Distinct architecture subsystems retained in the snapshot.",
+        ),
+        SchemaProperty::string_array(
+            "uncertainty",
+            "Typed reasons the compact orientation is incomplete or compressed.",
+        )
+        .with_item_enum(GROUNDING_ORIENTATION_UNCERTAINTY),
+    ],
+    &[
+        "confidence",
+        "total_root_candidates",
+        "evaluated_root_candidates",
+        "candidate_entrypoint_roots",
+        "selected_entrypoint_roots",
+        "candidate_subsystems",
+        "selected_subsystems",
+        "uncertainty",
+    ],
+);
+
 static GROUNDING_SNAPSHOT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory grounding snapshot DTO for compact repository orientation.",
     &[
@@ -1258,6 +1344,11 @@ static GROUNDING_SNAPSHOT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("generated_at_epoch_ms", "Snapshot generation time."),
         SchemaProperty::object("stats", "Indexed project stats."),
         SchemaProperty::object("coverage", "Grounding coverage summary."),
+        SchemaProperty::object(
+            "orientation",
+            "Typed architecture-orientation confidence and uncertainty.",
+        )
+        .with_object_schema(&GROUNDING_ORIENTATION_SCHEMA),
         SchemaProperty::array(
             "root_symbols",
             "Root symbol digests.",
@@ -1278,6 +1369,7 @@ static GROUNDING_SNAPSHOT_SCHEMA: SchemaObject = SchemaObject::object(
         "generated_at_epoch_ms",
         "stats",
         "coverage",
+        "orientation",
         "root_symbols",
         "files",
     ],

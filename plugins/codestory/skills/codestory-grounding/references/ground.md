@@ -22,6 +22,7 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 root: `codestory`
 budget: `balanced`
 coverage: files 187/187 symbols 1200/4231 compressed_files=42
+orientation: confidence=partial entrypoints=1/2 subsystems=4/7 candidates=224/816 uncertainty=bounded_candidate_window,compressed_presentation
 stats: nodes=4231 edges=8452 files=187 errors=3
 recommended_queries: WorkspaceIndexer, AppController, TrailResult
 notes:
@@ -33,6 +34,14 @@ files:
 coverage_buckets:
 - `high_coverage` files=120 symbols=900 samples=src/lib.rs, src/main.rs
 ```
+
+`orientation` reports how well the selected root-symbol prefix represents
+entrypoints and architecture subsystems. Its confidence is specific to compact
+repository orientation; it does not upgrade source coverage or retrieval
+sufficiency. Typed uncertainty names bounded candidate evaluation, missing or
+omitted entrypoint evidence, limited subsystem breadth, and budget-driven
+presentation compression. `ground --why` includes the same limitations in its
+confidence and gap notes.
 
 ## Examples
 

@@ -1995,12 +1995,49 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "/properties/budget/enum",
                 &["strict", "balanced", "max"],
             );
-            for field in ["stats", "coverage", "root_symbols", "files"] {
+            for field in ["stats", "coverage", "orientation", "root_symbols", "files"] {
                 assert!(
                     required_fields(output_schema).contains(field),
                     "ground outputSchema should require grounding DTO field {field}: {tool}"
                 );
             }
+            let orientation = schema_property(output_schema, "orientation");
+            assert_eq!(
+                orientation["additionalProperties"],
+                json!(false),
+                "ground orientation outputSchema should reject fields outside the DTO: {tool}"
+            );
+            for field in [
+                "confidence",
+                "total_root_candidates",
+                "evaluated_root_candidates",
+                "candidate_entrypoint_roots",
+                "selected_entrypoint_roots",
+                "candidate_subsystems",
+                "selected_subsystems",
+                "uncertainty",
+            ] {
+                assert!(
+                    required_fields(orientation).contains(field),
+                    "ground orientation outputSchema should require DTO field {field}: {tool}"
+                );
+            }
+            assert_schema_enum_values(
+                orientation,
+                "/properties/confidence/enum",
+                &["strong", "partial", "weak"],
+            );
+            assert_schema_enum_values(
+                orientation,
+                "/properties/uncertainty/items/enum",
+                &[
+                    "bounded_candidate_window",
+                    "no_entrypoint_evidence",
+                    "entrypoint_evidence_omitted",
+                    "limited_subsystem_breadth",
+                    "compressed_presentation",
+                ],
+            );
         }
         if name == "files" {
             for field in [
@@ -2499,6 +2536,24 @@ fn ground_tool_returns_budgeted_grounding_snapshot() {
                 > Some(0),
         "ground tool should return a populated grounding snapshot: {snapshot}"
     );
+    let orientation = snapshot["orientation"]
+        .as_object()
+        .unwrap_or_else(|| panic!("ground should return typed orientation evidence: {snapshot}"));
+    for field in [
+        "confidence",
+        "total_root_candidates",
+        "evaluated_root_candidates",
+        "candidate_entrypoint_roots",
+        "selected_entrypoint_roots",
+        "candidate_subsystems",
+        "selected_subsystems",
+        "uncertainty",
+    ] {
+        assert!(
+            orientation.contains_key(field),
+            "ground orientation should emit DTO field {field}: {snapshot}"
+        );
+    }
 
     let default_response = send_json(
         &mut server,
