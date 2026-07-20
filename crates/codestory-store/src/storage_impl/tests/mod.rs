@@ -4027,6 +4027,92 @@ fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageEr
     seed_promotion_file_with_identity(path, id, name, true)
 }
 
+fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> {
+    let mut storage = Storage::open(path)?;
+    let file = storage
+        .get_files()?
+        .into_iter()
+        .next()
+        .expect("promotion fixture file");
+    let source_hash = format!("{:064x}", file.id);
+    let producer = "test_structural_collector".to_string();
+    let projection = StructuralTextProjection {
+        file_id: file.id,
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer,
+        language: file.language.clone(),
+        file_role: file.file_role,
+        unit_count: 0,
+        unit_digest: structural_text_unit_digest(&[]),
+    };
+    storage.flush_projection_batch(ProjectionBatch {
+        files: std::slice::from_ref(&file),
+        file_content_hashes: &[FileContentHash {
+            file_id: file.id,
+            content_hash: source_hash,
+        }],
+        nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: std::slice::from_ref(&projection),
+        structural_text_cache_writes: &[StructuralTextArtifactCacheWrite {
+            path: &file.path,
+            file_id: file.id,
+            cache_key: "v1:test",
+            artifact_blob: b"verified structural cache",
+        }],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+    let publication = storage
+        .get_complete_index_publication()?
+        .expect("promotion fixture publication");
+    storage.publish_structural_text_unit_generation(&publication)?;
+    storage.finalize_staged_snapshot()
+}
+
+fn corrupt_test_structural_cache(path: &Path, corruption: &str) -> Result<(), StorageError> {
+    let connection = Connection::open(path)?;
+    match corruption {
+        "blob" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET artifact_blob = ?1",
+            [b"corrupt blob".as_slice()],
+        )?,
+        "digest" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET artifact_digest = ?1",
+            ["0".repeat(64)],
+        )?,
+        "key" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET cache_key = 'unversioned'",
+            [],
+        )?,
+        "source" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET source_content_hash = ?1",
+            ["f".repeat(64)],
+        )?,
+        "producer" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET producer = 'wrong-producer'",
+            [],
+        )?,
+        "file" => connection.execute(
+            "UPDATE structural_text_artifact_cache SET file_id = file_id + 1000",
+            [],
+        )?,
+        _ => panic!("unknown structural cache corruption {corruption}"),
+    };
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+fn copy_promotion_database_fixture(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    cleanup_sqlite_sidecars(destination)?;
+    let source = Connection::open(source)?;
+    source.backup(MAIN_DB, destination, None::<fn(rusqlite::backup::Progress)>)?;
+    Ok(())
+}
+
 fn seed_disposable_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
     let mut storage = Storage::open_disposable_full_build(path)?;
     storage.insert_files_batch(&[FileInfo {
@@ -4574,6 +4660,184 @@ fn staged_promotion_rejects_missing_corrupt_or_drifted_structural_manifest() {
         cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
         cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
     }
+}
+
+#[test]
+fn staged_promotion_rejects_every_corrupt_structural_cache_binding() {
+    for corruption in ["blob", "digest", "key", "source", "producer", "file"] {
+        let live_path =
+            unique_temp_db_path(&format!("promotion-structural-cache-live-{corruption}"));
+        let staged_path =
+            unique_temp_db_path(&format!("promotion-structural-cache-staged-{corruption}"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        let prepared_path = promotion_prepared_journal_path(&live_path);
+        let committed_path = promotion_committed_journal_path(&live_path);
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed live publication");
+        publish_bound_test_structural_cache(&live_path).expect("bind live structural cache");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged publication");
+        publish_bound_test_structural_cache(&staged_path).expect("bind staged structural cache");
+        corrupt_test_structural_cache(&staged_path, corruption)
+            .expect("corrupt staged structural cache");
+
+        let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+            .expect_err("corrupt structural cache must block promotion");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("structural artifact cache"),
+            "unexpected {corruption} promotion error: {error}"
+        );
+        let live = Storage::open(&live_path).expect("reopen preserved live publication");
+        let publication = live
+            .get_complete_index_publication()
+            .expect("read live publication")
+            .expect("complete live publication");
+        assert_eq!(publication.generation_id, "generation-1");
+        live.validate_structural_text_unit_publication(&publication)
+            .expect("preserved live structural publication");
+        assert_eq!(
+            live.get_files().expect("live files")[0].path,
+            PathBuf::from("old.rs")
+        );
+        assert!(staged_path.exists(), "rejected candidate remains retryable");
+        assert!(
+            !backup_path.exists(),
+            "candidate rejection created a backup"
+        );
+        assert!(
+            !prepared_path.exists(),
+            "candidate rejection created a prepared journal"
+        );
+        assert!(
+            !committed_path.exists(),
+            "candidate rejection created a committed journal"
+        );
+        drop(live);
+
+        cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
+    }
+}
+
+#[test]
+fn prepared_recovery_rejects_corrupt_previous_and_backup_structural_caches() {
+    for corruption_role in ["previous-live", "backup"] {
+        let live_path = unique_temp_db_path(&format!("prepared-cache-{corruption_role}-live"));
+        let staged_path = unique_temp_db_path(&format!("prepared-cache-{corruption_role}-staged"));
+        let backup_path = live_path.with_extension("sqlite.backup");
+        let prepared_path = promotion_prepared_journal_path(&live_path);
+        seed_promotion_file(&live_path, 1, "old.rs").expect("seed previous publication");
+        publish_bound_test_structural_cache(&live_path).expect("bind previous structural cache");
+        seed_promotion_file(&staged_path, 2, "new.rs").expect("seed candidate publication");
+        publish_bound_test_structural_cache(&staged_path).expect("bind candidate structural cache");
+        copy_promotion_database_fixture(&live_path, &backup_path).expect("copy previous backup");
+        let journal =
+            promotion_journal(&backup_path, &staged_path).expect("build prepared journal");
+
+        if corruption_role == "previous-live" {
+            corrupt_test_structural_cache(&live_path, "blob").expect("corrupt previous live cache");
+        } else {
+            corrupt_test_structural_cache(&backup_path, "blob")
+                .expect("corrupt previous backup cache");
+            copy_promotion_database_fixture(&staged_path, &live_path)
+                .expect("install candidate before prepared recovery");
+        }
+        write_promotion_journal(&prepared_path, &journal).expect("write prepared journal");
+
+        let error = match Storage::open(&live_path) {
+            Ok(_) => panic!("prepared recovery accepted corrupt structural cache"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("structural artifact cache"),
+            "unexpected {corruption_role} recovery error: {error}"
+        );
+        assert!(
+            prepared_path.exists(),
+            "failed prepared recovery consumed its journal"
+        );
+        assert!(
+            backup_path.exists(),
+            "failed prepared recovery consumed its backup"
+        );
+        let live = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open failed-recovery live database");
+        let live_file: String = live
+            .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read failed-recovery live file");
+        assert_eq!(
+            live_file,
+            if corruption_role == "previous-live" {
+                "old.rs"
+            } else {
+                "new.rs"
+            }
+        );
+        drop(live);
+
+        std::fs::remove_file(&prepared_path).expect("remove prepared journal");
+        cleanup_sqlite_sidecars(&backup_path).expect("clean prepared backup");
+        cleanup_sqlite_sidecars(&staged_path).expect("clean prepared candidate");
+        cleanup_sqlite_sidecars(&live_path).expect("clean prepared live");
+    }
+}
+
+#[test]
+fn committed_recovery_rejects_corrupt_candidate_structural_cache() {
+    let live_path = unique_temp_db_path("committed-cache-live");
+    let staged_path = unique_temp_db_path("committed-cache-staged");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let committed_path = promotion_committed_journal_path(&live_path);
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed previous publication");
+    publish_bound_test_structural_cache(&live_path).expect("bind previous structural cache");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed candidate publication");
+    publish_bound_test_structural_cache(&staged_path).expect("bind candidate structural cache");
+    copy_promotion_database_fixture(&live_path, &backup_path).expect("copy previous backup");
+    let journal = promotion_journal(&backup_path, &staged_path).expect("build committed journal");
+    copy_promotion_database_fixture(&staged_path, &live_path)
+        .expect("install committed candidate fixture");
+    corrupt_test_structural_cache(&live_path, "blob").expect("corrupt committed candidate cache");
+    write_promotion_journal(&committed_path, &journal).expect("write committed journal");
+
+    let error = match Storage::open(&live_path) {
+        Ok(_) => panic!("committed recovery accepted corrupt structural cache"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("structural artifact cache"),
+        "unexpected committed recovery error: {error}"
+    );
+    assert!(
+        committed_path.exists(),
+        "failed committed recovery consumed its journal"
+    );
+    assert!(
+        backup_path.exists(),
+        "failed committed recovery consumed its backup"
+    );
+    let live = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open corrupt committed live database");
+    let live_file: String = live
+        .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read corrupt committed live file");
+    assert_eq!(live_file, "new.rs");
+    drop(live);
+
+    std::fs::remove_file(&committed_path).expect("remove committed journal");
+    cleanup_sqlite_sidecars(&backup_path).expect("clean committed backup");
+    cleanup_sqlite_sidecars(&staged_path).expect("clean committed candidate");
+    cleanup_sqlite_sidecars(&live_path).expect("clean committed live");
 }
 
 #[test]

@@ -462,6 +462,12 @@ fn read_structural_text_unit_rollback_identity(
     let (projection_count, projection_digest, projection_versions) =
         structural_text_projection_content_summary(&conn)?;
     validate_structural_text_projection_rows(&conn)?;
+    validate_structural_text_artifact_cache_rows(&conn).map_err(|error| {
+        promotion_error(format!(
+            "Structural artifact cache rollback identity does not match {}: {error}",
+            path.display()
+        ))
+    })?;
     let invalid_rows: i64 = conn.query_row(
         "SELECT
             (SELECT COUNT(*)
