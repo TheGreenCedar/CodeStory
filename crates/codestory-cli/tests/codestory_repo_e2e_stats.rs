@@ -303,6 +303,7 @@ const PHASE_STATS_HEADER: [&str; 6] = [
 fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
     let mut table = None;
     let mut headline_rows = Vec::new();
+    let mut phase_row_identities = Vec::new();
     let mut phase_rows = Vec::new();
     for line in log.lines() {
         let Some(fields) = stats_log_table_fields(line) else {
@@ -352,6 +353,7 @@ fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
                 let Some((date, commit)) = stats_log_row_identity(&fields) else {
                     continue;
                 };
+                phase_row_identities.push((date.to_string(), commit.to_string()));
                 let Some(scenario) = fields.get(2) else {
                     continue;
                 };
@@ -389,10 +391,16 @@ fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
             }
         }
     }
+    let (latest_phase_date, latest_phase_commit) = phase_row_identities.last()?;
     let latest_phase = phase_rows.pop()?;
-    if phase_rows
+    if latest_phase.date != *latest_phase_date || latest_phase.commit != *latest_phase_commit {
+        return None;
+    }
+    if phase_row_identities
         .iter()
-        .any(|row| row.date == latest_phase.date && row.commit == latest_phase.commit)
+        .filter(|(date, commit)| date == latest_phase_date && commit == latest_phase_commit)
+        .count()
+        != 1
     {
         return None;
     }
@@ -684,6 +692,18 @@ fn latest_phase_stats_baseline_fails_closed_without_one_valid_matching_headline(
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2026-07-20 | duplicate+wt | first phase; repeat full refresh 31.00s with 1 reused and 0 embedded | 84.00 | 16.00 | 54.00 | 1 | 0 | 0 |
 | 2026-07-20 | duplicate+wt | duplicate phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | duplicate+wt | matching headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | duplicate+wt | valid phase; repeat full refresh 31.00s with 1 reused and 0 embedded | 84.00 | 16.00 | 54.00 | 1 | 0 | 0 |
+| 2026-07-20 | duplicate+wt | malformed duplicate phase | invalid | 17.00 | 55.00 | 1 | 0 | 0 |
 "#,
     ] {
         assert_eq!(latest_phase_stats_baseline_from_str(log), None);
