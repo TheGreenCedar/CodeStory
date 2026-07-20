@@ -163,6 +163,7 @@ pub struct WorkspaceManifest {
     is_synthetic_default: Cell<bool>,
     trusted_source_paths: Cell<bool>,
     members: Vec<PathBuf>,
+    discovery_exclusion_roots: Vec<PathBuf>,
 }
 
 /// Multi-member workspace manifest.
@@ -255,6 +256,7 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(true),
             members: Vec::new(),
+            discovery_exclusion_roots: Vec::new(),
         }
     }
 
@@ -268,6 +270,7 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(false),
             members: Vec::new(),
+            discovery_exclusion_roots: Vec::new(),
         })
     }
 
@@ -294,6 +297,7 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(false),
             members: Vec::new(),
+            discovery_exclusion_roots: Vec::new(),
         }
     }
 
@@ -382,6 +386,14 @@ impl WorkspaceManifest {
     /// Return the effective manifest settings used by discovery.
     pub fn settings(&self) -> &WorkspaceSettings {
         &self.settings
+    }
+
+    /// Exclude caller-owned generated paths from source discovery.
+    ///
+    /// These exclusions are runtime-only and are never persisted into a
+    /// project manifest.
+    pub fn exclude_discovery_roots(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        self.discovery_exclusion_roots.extend(roots);
     }
 
     /// Return the manifest path that defines the workspace root.
@@ -751,6 +763,12 @@ impl WorkspaceDiscovery {
             let filter_by_language = manifest.should_filter_source_group_language();
             for source_path in &group.source_paths {
                 let full_path = resolve_manifest_source_path(manifest, source_path)?;
+                if path_is_within_discovery_exclusion(
+                    &full_path,
+                    &manifest.discovery_exclusion_roots,
+                ) {
+                    continue;
+                }
                 if workspace_structural_source_exclusion(&workspace_root, &full_path).is_some() {
                     continue;
                 }
@@ -784,6 +802,7 @@ impl WorkspaceDiscovery {
                         filter_by_language,
                         &group.language,
                         &exclude_patterns,
+                        &manifest.discovery_exclusion_roots,
                     ) {
                         continue;
                     }
@@ -810,6 +829,7 @@ impl WorkspaceDiscovery {
                     let workspace_root_for_filter = workspace_root.clone();
                     let source_root_for_filter = source_root.clone();
                     let exclude_patterns = exclude_patterns.clone();
+                    let discovery_exclusion_roots = manifest.discovery_exclusion_roots.clone();
                     let language = group.language.clone();
                     builder.filter_entry(move |entry| {
                         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
@@ -821,6 +841,7 @@ impl WorkspaceDiscovery {
                             filter_by_language,
                             &language,
                             &exclude_patterns,
+                            &discovery_exclusion_roots,
                         )
                     });
                     for entry in builder.build() {
@@ -1227,8 +1248,12 @@ fn should_include_discovered_path(
     filter_by_language: bool,
     language: &Language,
     exclude_patterns: &[CompiledExcludePattern],
+    discovery_exclusion_roots: &[PathBuf],
 ) -> bool {
     let normalized = normalize_lexical_path(path);
+    if path_is_within_discovery_exclusion(&normalized, discovery_exclusion_roots) {
+        return false;
+    }
     if !is_dir && workspace_structural_source_exclusion(workspace_root, &normalized).is_some() {
         return false;
     }
@@ -1244,6 +1269,14 @@ fn should_include_discovered_path(
         return true;
     }
     !filter_by_language || matches_source_group_language(&normalized, language)
+}
+
+fn path_is_within_discovery_exclusion(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = canonicalize_with_missing_tail(path);
+    roots
+        .iter()
+        .map(|root| canonicalize_with_missing_tail(root))
+        .any(|root| path == root || path.starts_with(&root))
 }
 
 fn workspace_structural_source_exclusion(
@@ -2102,6 +2135,24 @@ mod tests {
         assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
         assert!(inventory.files.iter().any(|path| path.ends_with("lib.rs")));
         assert!(!inventory.issues.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_generated_roots_are_excluded_without_hiding_siblings() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let generated = root.join("cache").join("search-generations");
+        fs::create_dir_all(&generated)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+        fs::write(generated.join("meta.json"), "{\"generated\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::open(root.clone())?;
+        manifest.exclude_discovery_roots([generated.clone()]);
+        let files = manifest.source_files()?;
+
+        assert!(files.contains(&root.join("config.json")));
+        assert!(!files.contains(&generated.join("meta.json")));
         Ok(())
     }
 

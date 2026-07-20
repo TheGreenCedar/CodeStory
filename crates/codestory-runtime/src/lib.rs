@@ -6115,6 +6115,21 @@ fn search_index_generation_root(storage_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.search-generations"))
 }
 
+fn runtime_workspace_manifest(
+    root: &Path,
+    storage_path: &Path,
+) -> anyhow::Result<WorkspaceManifest> {
+    let mut workspace = WorkspaceManifest::open(root.to_path_buf())?;
+    workspace.exclude_discovery_roots([
+        storage_path.to_path_buf(),
+        storage_path.with_extension("db-wal"),
+        storage_path.with_extension("db-shm"),
+        search_index_storage_path(storage_path),
+        search_index_generation_root(storage_path),
+    ]);
+    Ok(workspace)
+}
+
 fn search_index_path_for_publication(
     storage_path: &Path,
     publication: Option<&IndexPublicationRecord>,
@@ -10381,7 +10396,8 @@ impl AppController {
     fn index_freshness_uncached(&self) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
         let storage = self.open_storage_for_freshness()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
         Ok(index_freshness_from_storage_with_policy(
             &root,
@@ -11040,7 +11056,7 @@ impl AppController {
             error_count: clamp_i64_to_u32(stats.error_count),
             fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
-        let workspace = WorkspaceManifest::open(root.to_path_buf())
+        let workspace = runtime_workspace_manifest(root, storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
         let freshness =
@@ -11674,7 +11690,7 @@ impl AppController {
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let mut incomplete_incremental_run = false;
         let refresh_inputs = if storage_path.exists() {
@@ -12698,7 +12714,8 @@ impl AppController {
             }
         }
 
-        let workspace = WorkspaceManifest::open(root.clone())
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
         let mut path_identities = AffectedOperationIdentityIndex::native();
         let freshness_observation = index_freshness_observation_from_storage_with_identities(
@@ -13357,7 +13374,7 @@ impl AppController {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
         let storage = self.open_storage_for_freshness()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let freshness =
             self.cached_index_freshness_from_storage(&root, &storage_path, &workspace, &storage);
@@ -14575,7 +14592,7 @@ fn index_full_for_runtime(
         });
     wall_durations.live_inspection = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let workspace = WorkspaceManifest::open(root.to_path_buf())
+    let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let (execution_plan, policy_exclusions) =
         full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
@@ -15279,7 +15296,7 @@ fn run_incremental_indexing_common(
                 ))
             })?;
 
-        let workspace = WorkspaceManifest::open(root.to_path_buf())
+        let workspace = runtime_workspace_manifest(root, storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
         let policy_refresh = workspace
@@ -15547,7 +15564,7 @@ fn run_incremental_indexing_common(
     }
     #[cfg(test)]
     run_source_policy_before_revalidate_hook();
-    let workspace = WorkspaceManifest::open(root.to_path_buf())
+    let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|error| ApiError::internal(format!("Failed to reopen project: {error}")))?;
     let policy_exclusions = match revalidate_source_policy_exclusions(
         &workspace,
@@ -27126,8 +27143,8 @@ fn build_llm_symbol_doc_text() -> String {
             "pub fn first_value() -> i32 { 1 }\n",
         )
         .expect("write source");
-        let instructions = workspace.path().join("AGENTS.md");
-        fs::write(&instructions, "# Initial instructions\n").expect("write instructions");
+        let unsupported = workspace.path().join("notes.txt");
+        fs::write(&unsupported, "Initial notes\n").expect("write unsupported file");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
         controller
@@ -27145,7 +27162,7 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("read first publication")
             .expect("first publication identity");
 
-        fs::write(&instructions, "# Updated instructions\n").expect("update instructions");
+        fs::write(&unsupported, "Updated notes\n").expect("update unsupported file");
         let dry_run = controller
             .dry_run_index(IndexMode::Incremental)
             .expect("plan unsupported file refresh");
@@ -27153,7 +27170,7 @@ fn build_llm_symbol_doc_text() -> String {
             dry_run
                 .sample_files_to_index
                 .iter()
-                .any(|path| path == "AGENTS.md"),
+                .any(|path| path == "notes.txt"),
             "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
         );
         controller
@@ -27169,7 +27186,7 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             Storage::open(&storage_path)
                 .expect("open published storage")
-                .get_file_by_path(&instructions)
+                .get_file_by_path(&unsupported)
                 .expect("look up unsupported file")
                 .is_none(),
             "files without graph collectors should not be invented in semantic scope"
