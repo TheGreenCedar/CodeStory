@@ -39,6 +39,12 @@
 
 ### Performance
 
+- Fresh disposable full-refresh stages now declare the parser artifact cache
+  `known_empty` instead of issuing guaranteed-miss queries. Structural
+  read-through is enabled only when verified rows were copied from the prior
+  publication, so an entirely fresh stage opens no second SQLite reader.
+  Parser and structural telemetry now report policy, logical lookups, physical
+  queries, hits, misses, reader opens, and lookup wall time independently.
 - Staged builds now create the four edge endpoint indexes immediately before
   semantic context reads instead of issuing thousands of bounded endpoint
   queries against an unindexed edge table. The normal deferred schema still

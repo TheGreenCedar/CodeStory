@@ -40,6 +40,8 @@ before drawing conclusions:
 | Phase field | Use |
 | --- | --- |
 | Graph phase | File discovery, parse/extract, graph writes, and snapshot/store refresh. |
+| Parser artifact cache | Access policy, logical lookups, physical queries, hits, misses, reader opens, and query wall time for parser-backed files. A fresh disposable full stage should report `known_empty`, zero physical queries, and zero reader opens. |
+| Structural artifact cache | The same access fields for structural collectors. Repeat full refresh can use `read_through` only after verified structural rows were copied; incremental clones retain normal read-through. |
 | Search projection | Search projection rebuild and symbol-index write time. |
 | Semantic doc build | Semantic document text construction, file text cache, and graph-context shaping. |
 | Semantic embedding | Embedding backend wall time, batch/request shape, and request concurrency setting. |
@@ -51,8 +53,10 @@ engine saturation rather than graph/store contention, and do not promote a
 runtime tuning switch.
 
 Do not collapse these into one "index got faster/slower" claim unless the
-repo-scale e2e row shows the same project, cache state, semantic backend, and
-command flags before and after.
+repo-scale e2e row shows the same project, cache state, cache-family policies,
+semantic backend, and command flags before and after. Cache lookup wall time is
+physical-query time, not source preparation; a `known_empty` run can still
+spend time reading and hashing source files.
 
 Prefer existing gates before adding a new harness:
 

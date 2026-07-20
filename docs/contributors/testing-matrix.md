@@ -35,6 +35,17 @@ Do not serialize tests to hide leaked global state. CLI integration tests use
 their isolated test support, never the real user cache, and drain anything they
 start.
 
+Artifact-cache access-policy changes prove four separate boundaries with
+focused tests: a file-backed `known_empty` full refresh still uses the
+capacity-one pipeline without opening a reader; verified copied structural rows
+use structural read-through while parser reads stay disabled; repeat
+incremental work still reuses retained parser and structural rows; and an
+injected writer or collector failure preserves the previous publication. Check
+the parser and structural telemetry independently, including policy, logical
+lookups, physical queries, hits, misses, reader opens, and lookup wall time.
+Journal or checkpoint lanes are required only when those store contracts
+change.
+
 ## Exact-head source gate
 
 After independent review finds no blocker, run once on the unchanged head:

@@ -11,8 +11,9 @@ use codestory_contracts::api::IndexFreshnessStatusDto;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, GraphArtifactDto, GroundingSnapshotDto, IndexingPhaseTimings,
-    NodeDetailsDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, RepoTextScanStatsDto,
+    AgentRetrievalStepStatusDto, ArtifactCacheAccessTimings, ArtifactCachePolicyDto,
+    GraphArtifactDto, GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto,
+    PacketEvidenceResolutionDto, PacketEvidenceTierDto, RepoTextScanStatsDto,
     RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
@@ -371,6 +372,16 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             ("transactions", timings.artifact_cache_write_transactions),
         ],
     );
+    append_artifact_cache_access(
+        markdown,
+        "parser_artifact_cache",
+        timings.parser_artifact_cache.as_ref(),
+    );
+    append_artifact_cache_access(
+        markdown,
+        "structural_artifact_cache",
+        timings.structural_artifact_cache.as_ref(),
+    );
     append_optional_timings_line(
         markdown,
         "full_refresh_pipeline",
@@ -455,6 +466,30 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             ),
             ("seed_symbol_table", timings.setup_seed_symbol_table_ms),
         ],
+    );
+}
+
+fn append_artifact_cache_access(
+    markdown: &mut String,
+    label: &str,
+    timings: Option<&ArtifactCacheAccessTimings>,
+) {
+    let Some(timings) = timings else {
+        return;
+    };
+    let policy = match timings.policy {
+        ArtifactCachePolicyDto::KnownEmpty => "known_empty",
+        ArtifactCachePolicyDto::ReadThrough => "read_through",
+    };
+    let _ = writeln!(
+        markdown,
+        "{label}: policy={policy} logical_lookups={} physical_queries={} hits={} misses={} reader_opens={} lookup_wall_ms={}",
+        timings.logical_lookups,
+        timings.physical_queries,
+        timings.hits,
+        timings.misses,
+        timings.reader_opens,
+        timings.lookup_wall_ms,
     );
 }
 
@@ -3872,6 +3907,41 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn index_timings_render_separate_artifact_cache_access() {
+        let timings = IndexingPhaseTimings {
+            parser_artifact_cache: Some(ArtifactCacheAccessTimings {
+                policy: ArtifactCachePolicyDto::KnownEmpty,
+                logical_lookups: 4,
+                physical_queries: 0,
+                hits: 0,
+                misses: 4,
+                reader_opens: 0,
+                lookup_wall_ms: 0,
+            }),
+            structural_artifact_cache: Some(ArtifactCacheAccessTimings {
+                policy: ArtifactCachePolicyDto::ReadThrough,
+                logical_lookups: 3,
+                physical_queries: 3,
+                hits: 2,
+                misses: 1,
+                reader_opens: 1,
+                lookup_wall_ms: 7,
+            }),
+            ..IndexingPhaseTimings::default()
+        };
+        let mut markdown = String::new();
+
+        append_index_phase_timings(&mut markdown, &timings);
+
+        assert!(markdown.contains(
+            "parser_artifact_cache: policy=known_empty logical_lookups=4 physical_queries=0 hits=0 misses=4 reader_opens=0 lookup_wall_ms=0"
+        ));
+        assert!(markdown.contains(
+            "structural_artifact_cache: policy=read_through logical_lookups=3 physical_queries=3 hits=2 misses=1 reader_opens=1 lookup_wall_ms=7"
+        ));
+    }
 
     #[test]
     fn public_operation_metadata_is_json_only() {

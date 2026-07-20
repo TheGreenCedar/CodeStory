@@ -119,13 +119,14 @@ flowchart TD
 - `index_incremental` clones the current live database into a durable staged store, collects refresh inputs from stored inventory, builds a diff-based execution plan, runs the same indexer against the clone, and publishes the completed replacement
 
 Only the fresh full stage uses relaxed SQLite synchronization. It remains in
-WAL mode for the bounded parser-artifact reader and keeps a nonzero 64 MiB
-automatic-checkpoint budget. The consuming publish call restores NORMAL
-synchronization, completes a blocking TRUNCATE checkpoint, syncs the database
-and containing directory, and only then enters the store's old-or-new promotion
-journal. Its phase telemetry exposes the checkpoint budget, checkpoint time,
-and sync time. Generic build stores and incremental clones keep WAL/NORMAL
-throughout.
+WAL mode so a bounded cache reader is available when verified structural rows
+were copied forward, and keeps a nonzero 64 MiB automatic-checkpoint budget.
+An entirely fresh stage opens no second reader. The consuming publish call
+restores NORMAL synchronization, completes a blocking TRUNCATE checkpoint,
+syncs the database and containing directory, and only then enters the store's
+old-or-new promotion journal. Its phase telemetry exposes the checkpoint
+budget, checkpoint time, and sync time. Generic build stores and incremental
+clones keep WAL/NORMAL throughout.
 
 The indexer does not know whether the store is staged or live.
 
@@ -183,6 +184,14 @@ Compilation metadata matters mostly for native-language parsing and is part of t
 Structural collectors use a separate, versioned cache whose payload contains
 only collector-owned source units and their graph projection. Copy-forward
 never relabels parser artifacts as structural units.
+
+Runtime supplies an explicit access policy for each cache family. A fresh
+disposable full stage uses `known_empty` for parser artifacts because no parser
+rows are copied into it. Structural access remains `known_empty` unless the
+verified prior publication copied at least one structural row; only then does
+it use `read_through`. Incremental clones retain both cache families and use
+`read_through`. `known_empty` still records one logical miss per eligible file,
+but performs no SQLite query and cannot produce a hit.
 
 The parser cache key includes:
 
@@ -246,12 +255,22 @@ Cancellation is observed at the next chunk boundary: an in-flight transaction
 either commits completely or rolls back, and a staged full refresh still
 cannot become live before the runtime publication fence.
 
-File-backed full refreshes use a query-only artifact-cache connection while a
-single writer connection remains on a dedicated scoped thread. The producer
+File-backed full refreshes open one query-only artifact-cache connection only
+when a scheduled cache family uses `read_through`; the connection is attributed
+to the first scheduled enabled family in reader-open telemetry and can serve
+both families. A copied structural cache with no scheduled structural files
+does not cause a reader open. When both policies are `known_empty`, the same
+bounded producer/writer pipeline runs without a second connection. The producer
 prepares and parses the next chunk, then sends it through a capacity-one
-channel. This overlaps parser work with persistence while preserving one
-SQLite writer and applying backpressure instead of growing an unbounded result
-queue. Incremental indexing and in-memory fixtures retain the serial path.
+channel. This overlaps parser work with persistence while preserving one SQLite
+writer and applying backpressure instead of growing an unbounded result queue.
+Incremental indexing and in-memory fixtures retain the serial path.
+
+Index telemetry reports parser and structural policy, logical lookups, physical
+queries, hits, misses, reader opens, and physical-query wall time separately.
+Compare cache timings only when the cache state and selected policies match;
+aggregate artifact-cache writes and transactions remain separate writer
+telemetry.
 
 Full refresh chooses each chunk with an 8 MiB planned-source target and a
 120,000 projected-node target instead of a fixed small file count. The node

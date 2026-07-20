@@ -12,31 +12,32 @@ use codestory_contracts::api::{
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload,
-    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
-    EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, FileCoverageDiagnosticDto,
-    FrameworkRouteCoverageDto, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphRequest,
-    GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto,
-    GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto,
-    IndexFreshnessDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode,
-    IndexPublicationDto, IndexPublicationModeDto, IndexedFileDto,
-    IndexedFileIncompleteReasonCountDto, IndexedFileLanguageCountDto, IndexedFileRoleDto,
-    IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
-    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ReadFileTextRequest,
-    ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
-    RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto, RouteEndpointKindDto,
-    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
-    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
-    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
-    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
-    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
-    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, SourceOccurrenceDto,
-    SourcePolicyExclusionDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
+    ArtifactCacheAccessTimings, ArtifactCachePolicyDto, BookmarkCategoryDto, BookmarkDto,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind, EdgeOccurrencesRequest,
+    EmbeddingProfileContractDto, FileCoverageDiagnosticDto, FrameworkRouteCoverageDto,
+    FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
+    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
+    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
+    IndexPublicationModeDto, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
+    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
+    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
+    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
+    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
+    SourceOccurrenceDto, SourcePolicyExclusionDto, StartIndexingRequest, StorageStatsDto,
+    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{
@@ -47,7 +48,8 @@ use codestory_contracts::language_support::{
     language_support_profile_for_language_name,
 };
 use codestory_indexer::{
-    CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
+    ArtifactCacheFamilyStats, ArtifactCachePolicies, ArtifactCachePolicy, CancellationToken,
+    IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
 use codestory_store::{
     CURRENT_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata, FileInfo,
@@ -4288,6 +4290,21 @@ struct OptionalResolutionTelemetry {
     resolved_imports_global_unique: Option<u32>,
     resolved_imports_fuzzy: Option<u32>,
     resolved_imports_semantic: Option<u32>,
+}
+
+fn artifact_cache_access_timings(stats: &ArtifactCacheFamilyStats) -> ArtifactCacheAccessTimings {
+    ArtifactCacheAccessTimings {
+        policy: match stats.policy {
+            ArtifactCachePolicy::KnownEmpty => ArtifactCachePolicyDto::KnownEmpty,
+            ArtifactCachePolicy::ReadThrough => ArtifactCachePolicyDto::ReadThrough,
+        },
+        logical_lookups: clamp_usize_to_u32(stats.logical_lookups),
+        physical_queries: clamp_usize_to_u32(stats.physical_queries),
+        hits: clamp_usize_to_u32(stats.hits),
+        misses: clamp_usize_to_u32(stats.misses),
+        reader_opens: clamp_usize_to_u32(stats.reader_opens),
+        lookup_wall_ms: clamp_u64_to_u32(stats.lookup_wall_ns / 1_000_000),
+    }
 }
 
 impl OptionalResolutionTelemetry {
@@ -14600,7 +14617,7 @@ fn index_full_for_runtime(
     #[cfg(test)]
     run_full_refresh_staged_store_hook(staged.store_mut());
     let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
-    if has_verified_live_publication {
+    let copied_structural_artifacts = if has_verified_live_publication {
         match staged
             .store_mut()
             .copy_structural_text_artifact_cache_from(storage_path)
@@ -14609,20 +14626,32 @@ fn index_full_for_runtime(
                 tracing::debug!(
                     copied,
                     "Copied verified structural artifacts into staged storage"
-                )
+                );
+                copied
             }
             Err(error) => {
                 tracing::warn!(
                     "Failed to copy verified structural artifacts into staged storage; recollecting: {error}"
-                )
+                );
+                0
             }
         }
-    }
+    } else {
+        0
+    };
 
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
-        .with_source_file_byte_cap(source_index_policy.byte_cap);
+        .with_source_file_byte_cap(source_index_policy.byte_cap)
+        .with_artifact_cache_policies(ArtifactCachePolicies {
+            parser: ArtifactCachePolicy::KnownEmpty,
+            structural: if copied_structural_artifacts > 0 {
+                ArtifactCachePolicy::ReadThrough
+            } else {
+                ArtifactCachePolicy::KnownEmpty
+            },
+        });
     wall_durations.stage_open = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
     let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
@@ -14959,6 +14988,12 @@ fn index_full_for_runtime(
             artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
             artifact_cache_write_transactions: Some(clamp_usize_to_u32(
                 index_stats.artifact_cache_write_transactions,
+            )),
+            parser_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.parser_artifact_cache,
+            )),
+            structural_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.structural_artifact_cache,
             )),
             full_refresh_chunks_produced: full_refresh_pipeline_enabled
                 .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunks_produced)),
@@ -15701,6 +15736,12 @@ fn run_incremental_indexing_common(
             artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
             artifact_cache_write_transactions: Some(clamp_usize_to_u32(
                 index_stats.artifact_cache_write_transactions,
+            )),
+            parser_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.parser_artifact_cache,
+            )),
+            structural_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.structural_artifact_cache,
             )),
             full_refresh_chunks_produced: None,
             full_refresh_chunks_persisted: None,
@@ -26387,6 +26428,25 @@ fn build_llm_symbol_doc_text() -> String {
         let full_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("first full publication");
+        let parser_cache = full_timings
+            .parser_artifact_cache
+            .as_ref()
+            .expect("parser cache telemetry");
+        assert_eq!(parser_cache.policy, ArtifactCachePolicyDto::KnownEmpty);
+        assert_eq!(parser_cache.logical_lookups, 1);
+        assert_eq!(parser_cache.physical_queries, 0);
+        assert_eq!(parser_cache.hits, 0);
+        assert_eq!(parser_cache.misses, 1);
+        assert_eq!(parser_cache.reader_opens, 0);
+        assert_eq!(parser_cache.lookup_wall_ms, 0);
+        let structural_cache = full_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("structural cache telemetry");
+        assert_eq!(structural_cache.policy, ArtifactCachePolicyDto::KnownEmpty);
+        assert_eq!(structural_cache.logical_lookups, 0);
+        assert_eq!(structural_cache.physical_queries, 0);
+        assert_eq!(structural_cache.reader_opens, 0);
         assert_eq!(full_timings.full_refresh_queue_capacity, Some(1));
         assert_eq!(full_timings.full_refresh_queue_high_water, Some(1));
         assert_eq!(full_timings.full_refresh_chunks_produced, Some(1));
@@ -26476,6 +26536,19 @@ fn build_llm_symbol_doc_text() -> String {
         let incremental_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incremental publication");
+        let incremental_parser_cache = incremental_timings
+            .parser_artifact_cache
+            .as_ref()
+            .expect("incremental parser cache telemetry");
+        assert_eq!(
+            incremental_parser_cache.policy,
+            ArtifactCachePolicyDto::ReadThrough
+        );
+        assert_eq!(incremental_parser_cache.logical_lookups, 1);
+        assert_eq!(incremental_parser_cache.physical_queries, 1);
+        assert_eq!(incremental_parser_cache.hits, 0);
+        assert_eq!(incremental_parser_cache.misses, 1);
+        assert_eq!(incremental_parser_cache.reader_opens, 0);
         assert!(incremental_timings.full_refresh_queue_capacity.is_none());
         assert!(incremental_timings.full_refresh_chunks_produced.is_none());
         assert!(
@@ -26544,9 +26617,23 @@ fn build_llm_symbol_doc_text() -> String {
             )
             .expect("open project");
 
-        controller
+        let first_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish first structural generation");
+        let first_structural_cache = first_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("first structural cache telemetry");
+        assert_eq!(
+            first_structural_cache.policy,
+            ArtifactCachePolicyDto::KnownEmpty
+        );
+        assert_eq!(first_structural_cache.logical_lookups, 2);
+        assert_eq!(first_structural_cache.physical_queries, 0);
+        assert_eq!(first_structural_cache.hits, 0);
+        assert_eq!(first_structural_cache.misses, 2);
+        assert_eq!(first_structural_cache.reader_opens, 0);
+        assert_eq!(first_structural_cache.lookup_wall_ms, 0);
         let first = Store::database_index_publication(&storage_path)
             .expect("read first publication")
             .expect("first publication");
@@ -26575,9 +26662,22 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(first_cache.len(), 2);
 
         fs::write(&markdown_path, "# Replacement\n").expect("change markdown");
-        controller
+        let second_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish second structural generation");
+        let second_structural_cache = second_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("second structural cache telemetry");
+        assert_eq!(
+            second_structural_cache.policy,
+            ArtifactCachePolicyDto::ReadThrough
+        );
+        assert_eq!(second_structural_cache.logical_lookups, 2);
+        assert_eq!(second_structural_cache.physical_queries, 2);
+        assert_eq!(second_structural_cache.hits, 1);
+        assert_eq!(second_structural_cache.misses, 1);
+        assert_eq!(second_structural_cache.reader_opens, 1);
         let second = Store::database_index_publication(&storage_path)
             .expect("read second publication")
             .expect("second publication");
@@ -26620,9 +26720,22 @@ fn build_llm_symbol_doc_text() -> String {
                     .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
             )
             .expect("advance changed sql mtime");
-        controller
+        let incremental_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("publish structural incremental");
+        let incremental_structural_cache = incremental_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("incremental structural cache telemetry");
+        assert_eq!(
+            incremental_structural_cache.policy,
+            ArtifactCachePolicyDto::ReadThrough
+        );
+        assert_eq!(incremental_structural_cache.logical_lookups, 1);
+        assert_eq!(incremental_structural_cache.physical_queries, 1);
+        assert_eq!(incremental_structural_cache.hits, 0);
+        assert_eq!(incremental_structural_cache.misses, 1);
+        assert_eq!(incremental_structural_cache.reader_opens, 0);
         let third = Store::database_index_publication(&storage_path)
             .expect("read incremental publication")
             .expect("incremental publication");

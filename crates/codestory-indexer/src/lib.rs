@@ -803,6 +803,57 @@ pub enum IndexingEvent {
     Finished,
 }
 
+/// Storage access policy for one artifact-cache family.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ArtifactCachePolicy {
+    KnownEmpty,
+    #[default]
+    ReadThrough,
+}
+
+impl ArtifactCachePolicy {
+    fn reads_storage(self) -> bool {
+        matches!(self, Self::ReadThrough)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtifactCachePolicies {
+    pub parser: ArtifactCachePolicy,
+    pub structural: ArtifactCachePolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtifactCacheFamilyStats {
+    pub policy: ArtifactCachePolicy,
+    pub logical_lookups: usize,
+    pub physical_queries: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub reader_opens: usize,
+    pub lookup_wall_ns: u64,
+}
+
+impl ArtifactCacheFamilyStats {
+    fn new(policy: ArtifactCachePolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    fn record_lookup(&mut self) {
+        self.logical_lookups = self.logical_lookups.saturating_add(1);
+    }
+
+    fn record_query(&mut self, elapsed: Duration) {
+        self.physical_queries = self.physical_queries.saturating_add(1);
+        self.lookup_wall_ns = self
+            .lookup_wall_ns
+            .saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+    }
+}
+
 /// Timings and counters collected during a workspace indexing run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IncrementalIndexingStats {
@@ -816,6 +867,8 @@ pub struct IncrementalIndexingStats {
     pub artifact_cache_hits: usize,
     pub artifact_cache_misses: usize,
     pub artifact_cache_invalid_entries: usize,
+    pub parser_artifact_cache: ArtifactCacheFamilyStats,
+    pub structural_artifact_cache: ArtifactCacheFamilyStats,
     pub artifact_cache_writes: usize,
     pub artifact_cache_write_transactions: usize,
     pub full_refresh_chunks_produced: usize,
@@ -937,38 +990,107 @@ struct ArtifactCacheWrite {
 #[cfg(test)]
 type FullRefreshChunkTestHook = Arc<dyn Fn(usize) + Send + Sync>;
 
-enum ArtifactCacheAccess<'a> {
+enum ArtifactCacheBackend<'a> {
     Storage(&'a mut Storage),
     Reader(&'a IndexArtifactCacheReader),
+    None,
+    #[cfg(test)]
+    FailReads,
 }
 
-impl ArtifactCacheAccess<'_> {
-    fn get(
+struct ArtifactCacheAccess<'a> {
+    backend: ArtifactCacheBackend<'a>,
+    policies: ArtifactCachePolicies,
+}
+
+impl<'a> ArtifactCacheAccess<'a> {
+    fn storage(storage: &'a mut Storage, policies: ArtifactCachePolicies) -> Self {
+        Self {
+            backend: ArtifactCacheBackend::Storage(storage),
+            policies,
+        }
+    }
+
+    fn reader(
+        reader: Option<&'a IndexArtifactCacheReader>,
+        policies: ArtifactCachePolicies,
+    ) -> Self {
+        Self {
+            backend: reader
+                .map(ArtifactCacheBackend::Reader)
+                .unwrap_or(ArtifactCacheBackend::None),
+            policies,
+        }
+    }
+
+    #[cfg(test)]
+    fn failing(policies: ArtifactCachePolicies) -> Self {
+        Self {
+            backend: ArtifactCacheBackend::FailReads,
+            policies,
+        }
+    }
+
+    fn get_parser(
         &self,
         path: &Path,
         cache_key: &str,
+        stats: &mut ArtifactCacheFamilyStats,
     ) -> std::result::Result<Option<Vec<u8>>, StorageError> {
-        match self {
-            Self::Storage(storage) => storage.get_index_artifact_cache(path, cache_key),
-            Self::Reader(reader) => reader.get(path, cache_key),
+        if !self.policies.parser.reads_storage() {
+            return Ok(None);
         }
+        let started = Instant::now();
+        let result = match &self.backend {
+            ArtifactCacheBackend::Storage(storage) => {
+                storage.get_index_artifact_cache(path, cache_key)
+            }
+            ArtifactCacheBackend::Reader(reader) => reader.get(path, cache_key),
+            ArtifactCacheBackend::None => {
+                unreachable!("read-through parser cache access requires a storage connection")
+            }
+            #[cfg(test)]
+            ArtifactCacheBackend::FailReads => Err(StorageError::Other(
+                "injected parser cache read failure".into(),
+            )),
+        };
+        stats.record_query(started.elapsed());
+        result
     }
 
     fn get_structural(
         &self,
         path: &Path,
         cache_key: &str,
+        stats: &mut ArtifactCacheFamilyStats,
     ) -> std::result::Result<Option<Vec<u8>>, StorageError> {
-        match self {
-            Self::Storage(storage) => storage.get_structural_text_artifact_cache(path, cache_key),
-            Self::Reader(reader) => reader.get_structural(path, cache_key),
+        if !self.policies.structural.reads_storage() {
+            return Ok(None);
         }
+        let started = Instant::now();
+        let result = match &self.backend {
+            ArtifactCacheBackend::Storage(storage) => {
+                storage.get_structural_text_artifact_cache(path, cache_key)
+            }
+            ArtifactCacheBackend::Reader(reader) => reader.get_structural(path, cache_key),
+            ArtifactCacheBackend::None => {
+                unreachable!("read-through structural cache access requires a storage connection")
+            }
+            #[cfg(test)]
+            ArtifactCacheBackend::FailReads => Err(StorageError::Other(
+                "injected structural cache read failure".into(),
+            )),
+        };
+        stats.record_query(started.elapsed());
+        result
     }
 
     fn storage_mut(&mut self) -> Option<&mut Storage> {
-        match self {
-            Self::Storage(storage) => Some(*storage),
-            Self::Reader(_) => None,
+        match &mut self.backend {
+            ArtifactCacheBackend::Storage(storage) => Some(*storage),
+            ArtifactCacheBackend::Reader(_) | ArtifactCacheBackend::None => None,
+            #[cfg(test)]
+            ArtifactCacheBackend::FailReads => None,
         }
     }
 }
@@ -1269,6 +1391,7 @@ pub struct WorkspaceIndexer {
     batch_config: IncrementalIndexingConfig,
     full_refresh_chunk_budget: FullRefreshChunkBudget,
     source_file_byte_cap: u64,
+    artifact_cache_policies: ArtifactCachePolicies,
     #[cfg(test)]
     pipeline_test_hooks: FullRefreshPipelineTestHooks,
 }
@@ -1304,6 +1427,7 @@ impl WorkspaceIndexer {
             batch_config: IncrementalIndexingConfig::default(),
             full_refresh_chunk_budget: FullRefreshChunkBudget::default(),
             source_file_byte_cap: process_source_index_policy().byte_cap,
+            artifact_cache_policies: ArtifactCachePolicies::default(),
             #[cfg(test)]
             pipeline_test_hooks: FullRefreshPipelineTestHooks::default(),
         }
@@ -1328,6 +1452,12 @@ impl WorkspaceIndexer {
     /// Override the parser-backed source file byte cap.
     pub fn with_source_file_byte_cap(mut self, source_file_byte_cap: u64) -> Self {
         self.source_file_byte_cap = source_file_byte_cap.max(1);
+        self
+    }
+
+    /// Select cache access independently for parser-backed and structural artifacts.
+    pub fn with_artifact_cache_policies(mut self, policies: ArtifactCachePolicies) -> Self {
+        self.artifact_cache_policies = policies;
         self
     }
 
@@ -1383,7 +1513,15 @@ impl WorkspaceIndexer {
                 message: message.clone(),
             });
         }
-        let mut stats = IncrementalIndexingStats::default();
+        let mut stats = IncrementalIndexingStats {
+            parser_artifact_cache: ArtifactCacheFamilyStats::new(
+                self.artifact_cache_policies.parser,
+            ),
+            structural_artifact_cache: ArtifactCacheFamilyStats::new(
+                self.artifact_cache_policies.structural,
+            ),
+            ..IncrementalIndexingStats::default()
+        };
         if plan.mode == codestory_workspace::BuildMode::FullRefresh {
             Self::record_full_refresh_chunk_config(&mut stats, self.full_refresh_chunk_budget);
         }
@@ -1450,10 +1588,32 @@ impl WorkspaceIndexer {
         let writer_output = if plan.mode == codestory_workspace::BuildMode::FullRefresh
             && Self::full_refresh_pipeline_paths_are_unique(&root, &plan.files_to_index)
         {
-            if let Some(cache_reader) = storage.index_artifact_cache_reader()? {
+            let (has_parser_lookups, has_structural_lookups) =
+                self.full_refresh_cache_lookup_families(&root, &plan.files_to_index);
+            let needs_parser_reader =
+                self.artifact_cache_policies.parser.reads_storage() && has_parser_lookups;
+            let needs_structural_reader =
+                self.artifact_cache_policies.structural.reads_storage() && has_structural_lookups;
+            let needs_cache_reader = needs_parser_reader || needs_structural_reader;
+            let cache_reader = needs_cache_reader
+                .then(|| storage.index_artifact_cache_reader())
+                .transpose()?
+                .flatten();
+            if cache_reader.is_some() || !needs_cache_reader {
+                if cache_reader.is_some() {
+                    if needs_parser_reader {
+                        stats.parser_artifact_cache.reader_opens =
+                            stats.parser_artifact_cache.reader_opens.saturating_add(1);
+                    } else {
+                        stats.structural_artifact_cache.reader_opens = stats
+                            .structural_artifact_cache
+                            .reader_opens
+                            .saturating_add(1);
+                    }
+                }
                 self.run_full_refresh_pipeline(
                     storage,
-                    &cache_reader,
+                    cache_reader.as_ref(),
                     &plan.files_to_index,
                     &root,
                     batch_config,
@@ -1838,7 +1998,10 @@ impl WorkspaceIndexer {
                     break;
                 };
                 let chunk = {
-                    let mut cache_access = ArtifactCacheAccess::Storage(writer.storage_mut());
+                    let mut cache_access = ArtifactCacheAccess::storage(
+                        writer.storage_mut(),
+                        self.artifact_cache_policies,
+                    );
                     self.prepare_index_chunk(
                         &mut cache_access,
                         chunk_index,
@@ -1873,7 +2036,10 @@ impl WorkspaceIndexer {
                 .enumerate()
             {
                 let chunk = {
-                    let mut cache_access = ArtifactCacheAccess::Storage(writer.storage_mut());
+                    let mut cache_access = ArtifactCacheAccess::storage(
+                        writer.storage_mut(),
+                        self.artifact_cache_policies,
+                    );
                     self.prepare_index_chunk(
                         &mut cache_access,
                         chunk_index,
@@ -1901,7 +2067,7 @@ impl WorkspaceIndexer {
     fn run_full_refresh_pipeline(
         &self,
         storage: &mut Storage,
-        cache_reader: &IndexArtifactCacheReader,
+        cache_reader: Option<&IndexArtifactCacheReader>,
         files_to_index: &[PathBuf],
         root: &Path,
         batch_config: IncrementalIndexingConfig,
@@ -1955,7 +2121,8 @@ impl WorkspaceIndexer {
                         break;
                     };
                     let chunk = {
-                        let mut cache_access = ArtifactCacheAccess::Reader(cache_reader);
+                        let mut cache_access =
+                            ArtifactCacheAccess::reader(cache_reader, self.artifact_cache_policies);
                         self.prepare_index_chunk(
                             &mut cache_access,
                             chunk_index,
@@ -2136,6 +2303,30 @@ impl WorkspaceIndexer {
             // one filesystem canonicalization syscall per corpus file.
             identities.insert(Self::normalize_index_path(root, path))
         })
+    }
+
+    fn full_refresh_cache_lookup_families(&self, root: &Path, files: &[PathBuf]) -> (bool, bool) {
+        let mut parser = false;
+        let mut structural = false;
+        for path in files {
+            let full_path = Self::normalize_index_path(root, path);
+            if workspace_structural_source_exclusion(root, &full_path).is_some() {
+                continue;
+            }
+            let compilation_info = self
+                .compilation_db
+                .as_ref()
+                .and_then(|database| database.get_parsed_info(&full_path));
+            if get_language_config_for_path(&full_path, compilation_info.as_ref()).is_some() {
+                parser = true;
+            } else if structural::is_structural_candidate_path(&full_path) {
+                structural = true;
+            }
+            if parser && structural {
+                break;
+            }
+        }
+        (parser, structural)
     }
 
     fn seed_symbol_table(
@@ -2628,9 +2819,11 @@ impl WorkspaceIndexer {
                 flags.lazy_graph_execution,
             )
         });
+        stats.parser_artifact_cache.record_lookup();
 
         let Some(cache_path) = artifact_cache_path.as_ref() else {
             stats.artifact_cache_misses += 1;
+            stats.parser_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                 full_path,
                 artifact_cache_path,
@@ -2643,6 +2836,7 @@ impl WorkspaceIndexer {
         };
         let Some(cache_key) = artifact_cache_key.as_ref() else {
             stats.artifact_cache_misses += 1;
+            stats.parser_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                 full_path,
                 artifact_cache_path,
@@ -2654,7 +2848,7 @@ impl WorkspaceIndexer {
             }));
         };
 
-        match cache_access.get(cache_path, cache_key) {
+        match cache_access.get_parser(cache_path, cache_key, &mut stats.parser_artifact_cache) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
                 Ok(artifact) => {
                     let mut artifact = rebase_cached_index_artifact(
@@ -2671,6 +2865,7 @@ impl WorkspaceIndexer {
                         &content_hash,
                     )?;
                     stats.artifact_cache_hits += 1;
+                    stats.parser_artifact_cache.hits += 1;
                     if existing_projection_id.is_some() {
                         let Some(storage) = cache_access.storage_mut() else {
                             let mut local_storage = IntermediateStorage::default();
@@ -2744,6 +2939,7 @@ impl WorkspaceIndexer {
                 Err(_) => {
                     stats.artifact_cache_invalid_entries += 1;
                     stats.artifact_cache_misses += 1;
+                    stats.parser_artifact_cache.misses += 1;
                     Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                         full_path,
                         artifact_cache_path,
@@ -2757,6 +2953,7 @@ impl WorkspaceIndexer {
             },
             Ok(None) => {
                 stats.artifact_cache_misses += 1;
+                stats.parser_artifact_cache.misses += 1;
                 Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                     full_path,
                     artifact_cache_path,
@@ -2769,6 +2966,7 @@ impl WorkspaceIndexer {
             }
             Err(_) => {
                 stats.artifact_cache_misses += 1;
+                stats.parser_artifact_cache.misses += 1;
                 Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                     full_path,
                     artifact_cache_path,
@@ -2871,6 +3069,7 @@ impl WorkspaceIndexer {
         let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
             build_structural_artifact_cache_key(cache_path, source.as_bytes(), producer)
         });
+        stats.structural_artifact_cache.record_lookup();
         let prepared_input = || PreparedStructuralInput {
             full_path: full_path.clone(),
             artifact_cache_path: artifact_cache_path.clone(),
@@ -2880,21 +3079,29 @@ impl WorkspaceIndexer {
         };
         let Some(cache_path) = artifact_cache_path.as_ref() else {
             stats.artifact_cache_misses += 1;
+            stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         };
         let Some(cache_key) = artifact_cache_key.as_ref() else {
             stats.artifact_cache_misses += 1;
+            stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         };
 
-        let cached = cache_access.get_structural(cache_path, cache_key);
+        let cached = cache_access.get_structural(
+            cache_path,
+            cache_key,
+            &mut stats.structural_artifact_cache,
+        );
         let Ok(Some(blob)) = cached else {
             stats.artifact_cache_misses += 1;
+            stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         };
         let Ok(mut artifact) = serde_json::from_slice::<CachedStructuralArtifact>(&blob) else {
             stats.artifact_cache_invalid_entries += 1;
             stats.artifact_cache_misses += 1;
+            stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         };
         if artifact.descriptor_version != codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
@@ -2911,6 +3118,7 @@ impl WorkspaceIndexer {
         {
             stats.artifact_cache_invalid_entries += 1;
             stats.artifact_cache_misses += 1;
+            stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         }
         let modification_time = verify_source_snapshot(&full_path, &content_hash)
@@ -2953,9 +3161,11 @@ impl WorkspaceIndexer {
         {
             stats.artifact_cache_invalid_entries += 1;
             stats.artifact_cache_misses += 1;
+            stats.structural_artifact_cache.misses += 1;
             return Ok(PreparedIndexWork::Structural(prepared_input()));
         }
         stats.artifact_cache_hits += 1;
+        stats.structural_artifact_cache.hits += 1;
         if existing_projection_id.is_some() {
             let Some(storage) = cache_access.storage_mut() else {
                 return Err(incomplete_file_storage(
@@ -21725,15 +21935,26 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             existing_file_ids: std::collections::HashMap::new(),
         };
 
-        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+        let first_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+        let reused_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        assert_eq!(first_stats.parser_artifact_cache.misses, 1);
+        assert_eq!(
+            reused_stats.parser_artifact_cache.policy,
+            ArtifactCachePolicy::ReadThrough
+        );
+        assert_eq!(reused_stats.parser_artifact_cache.logical_lookups, 1);
+        assert_eq!(reused_stats.parser_artifact_cache.physical_queries, 1);
+        assert_eq!(reused_stats.parser_artifact_cache.hits, 1);
+        assert_eq!(reused_stats.parser_artifact_cache.misses, 0);
+        assert_eq!(reused_stats.parser_artifact_cache.reader_opens, 0);
 
         let file_id = WorkspaceIndexer::canonical_file_node_id_for_path(&f1);
         assert_eq!(
             storage.get_file_content_hash(file_id)?.as_deref(),
             Some(source_content_hash(source.as_bytes()).as_str())
         );
-        let cached_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
-        assert_eq!(cached_stats.artifact_cache_hits, 1);
+        assert_eq!(reused_stats.artifact_cache_hits, 1);
 
         // Check verification
         let nodes = storage.get_nodes().unwrap();
@@ -21963,15 +22184,18 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 
         let database_path = dir.path().join("staged.sqlite");
         let mut storage = Storage::open_build(&database_path)?;
-        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
-            IncrementalIndexingConfig {
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_artifact_cache_policies(ArtifactCachePolicies {
+                parser: ArtifactCachePolicy::KnownEmpty,
+                structural: ArtifactCachePolicy::ReadThrough,
+            })
+            .with_batch_config(IncrementalIndexingConfig {
                 file_batch_size: 3,
                 node_batch_size: 4,
                 edge_batch_size: 4,
                 occurrence_batch_size: 8,
                 error_batch_size: 128,
-            },
-        );
+            });
         let plan = codestory_workspace::RefreshExecutionPlan {
             mode: codestory_workspace::BuildMode::FullRefresh,
             files_to_index: files,
@@ -21987,6 +22211,23 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(stats.full_refresh_queue_high_water, 1);
         assert_eq!(stats.artifact_cache_writes, 12);
         assert_eq!(stats.artifact_cache_write_transactions, 4);
+        assert_eq!(
+            stats.parser_artifact_cache.policy,
+            ArtifactCachePolicy::KnownEmpty
+        );
+        assert_eq!(stats.parser_artifact_cache.logical_lookups, 12);
+        assert_eq!(stats.parser_artifact_cache.physical_queries, 0);
+        assert_eq!(stats.parser_artifact_cache.hits, 0);
+        assert_eq!(stats.parser_artifact_cache.misses, 12);
+        assert_eq!(stats.parser_artifact_cache.reader_opens, 0);
+        assert_eq!(stats.parser_artifact_cache.lookup_wall_ns, 0);
+        assert_eq!(
+            stats.structural_artifact_cache.policy,
+            ArtifactCachePolicy::ReadThrough
+        );
+        assert_eq!(stats.structural_artifact_cache.logical_lookups, 0);
+        assert_eq!(stats.structural_artifact_cache.physical_queries, 0);
+        assert_eq!(stats.structural_artifact_cache.reader_opens, 0);
         assert!(storage.get_nodes()?.len() >= 24);
         Ok(())
     }
@@ -22035,6 +22276,15 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         assert_eq!(cached_stats.artifact_cache_misses, 0);
         assert_eq!(cached_stats.artifact_cache_writes, 0);
         assert_eq!(cached_stats.artifact_cache_write_transactions, 0);
+        assert_eq!(
+            cached_stats.parser_artifact_cache.policy,
+            ArtifactCachePolicy::ReadThrough
+        );
+        assert_eq!(cached_stats.parser_artifact_cache.logical_lookups, 6);
+        assert_eq!(cached_stats.parser_artifact_cache.physical_queries, 6);
+        assert_eq!(cached_stats.parser_artifact_cache.hits, 6);
+        assert_eq!(cached_stats.parser_artifact_cache.misses, 0);
+        assert_eq!(cached_stats.parser_artifact_cache.reader_opens, 1);
         assert_eq!(cached_stats.full_refresh_chunks_produced, 3);
         assert_eq!(cached_stats.full_refresh_chunks_persisted, 3);
         assert!(target.get_nodes()?.len() >= 12);
@@ -22060,11 +22310,11 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             files_to_remove: vec![],
             existing_file_ids: HashMap::new(),
         };
-        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let source_indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
 
         let source_path = dir.path().join("structural-cache-source.sqlite");
         let mut source = Storage::open_build(&source_path)?;
-        let source_stats = indexer.run(&mut source, &plan, &EventBus::new(), None)?;
+        let source_stats = source_indexer.run(&mut source, &plan, &EventBus::new(), None)?;
         assert_eq!(source_stats.artifact_cache_misses, 1);
         assert!(
             !source
@@ -22085,10 +22335,32 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             target.copy_structural_text_artifact_cache_from(&source_path)?,
             1
         );
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_artifact_cache_policies(
+            ArtifactCachePolicies {
+                parser: ArtifactCachePolicy::KnownEmpty,
+                structural: ArtifactCachePolicy::ReadThrough,
+            },
+        );
         let cached_stats = indexer.run(&mut target, &plan, &EventBus::new(), None)?;
 
         assert_eq!(cached_stats.artifact_cache_hits, 1);
         assert_eq!(cached_stats.artifact_cache_misses, 0);
+        assert_eq!(
+            cached_stats.parser_artifact_cache.policy,
+            ArtifactCachePolicy::KnownEmpty
+        );
+        assert_eq!(cached_stats.parser_artifact_cache.logical_lookups, 0);
+        assert_eq!(cached_stats.parser_artifact_cache.physical_queries, 0);
+        assert_eq!(cached_stats.parser_artifact_cache.reader_opens, 0);
+        assert_eq!(
+            cached_stats.structural_artifact_cache.policy,
+            ArtifactCachePolicy::ReadThrough
+        );
+        assert_eq!(cached_stats.structural_artifact_cache.logical_lookups, 1);
+        assert_eq!(cached_stats.structural_artifact_cache.physical_queries, 1);
+        assert_eq!(cached_stats.structural_artifact_cache.hits, 1);
+        assert_eq!(cached_stats.structural_artifact_cache.misses, 0);
+        assert_eq!(cached_stats.structural_artifact_cache.reader_opens, 1);
         assert!(
             !target
                 .get_structural_text_units_for_nodes(
@@ -22100,6 +22372,77 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
                 )?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parser_and_structural_cache_read_failures_recollect_as_physical_misses() -> Result<()> {
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let parser_path = dir.path().join("lib.rs");
+        let structural_path = dir.path().join("config.json");
+        std::fs::write(&parser_path, "pub fn cached_value() -> i32 { 1 }\n")?;
+        std::fs::write(&structural_path, "{\"service\":{\"name\":\"api\"}}\n")?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        let mut parser_stats = IncrementalIndexingStats {
+            parser_artifact_cache: ArtifactCacheFamilyStats::new(ArtifactCachePolicy::ReadThrough),
+            structural_artifact_cache: ArtifactCacheFamilyStats::new(
+                ArtifactCachePolicy::ReadThrough,
+            ),
+            ..IncrementalIndexingStats::default()
+        };
+        let parser_work = {
+            let mut access = ArtifactCacheAccess::failing(ArtifactCachePolicies::default());
+            indexer.prepare_index_work(
+                &mut access,
+                &PathBuf::from("lib.rs"),
+                dir.path(),
+                None,
+                &symbol_table,
+                &mut parser_stats,
+            )
+        };
+        assert!(matches!(parser_work, Ok(PreparedIndexWork::Parse(_))));
+        assert_eq!(parser_stats.parser_artifact_cache.logical_lookups, 1);
+        assert_eq!(parser_stats.parser_artifact_cache.physical_queries, 1);
+        assert_eq!(parser_stats.parser_artifact_cache.hits, 0);
+        assert_eq!(parser_stats.parser_artifact_cache.misses, 1);
+
+        let mut structural_stats = IncrementalIndexingStats {
+            parser_artifact_cache: ArtifactCacheFamilyStats::new(ArtifactCachePolicy::ReadThrough),
+            structural_artifact_cache: ArtifactCacheFamilyStats::new(
+                ArtifactCachePolicy::ReadThrough,
+            ),
+            ..IncrementalIndexingStats::default()
+        };
+        let structural_work = {
+            let mut access = ArtifactCacheAccess::failing(ArtifactCachePolicies::default());
+            indexer.prepare_index_work(
+                &mut access,
+                &PathBuf::from("config.json"),
+                dir.path(),
+                None,
+                &symbol_table,
+                &mut structural_stats,
+            )
+        };
+        assert!(matches!(
+            structural_work,
+            Ok(PreparedIndexWork::Structural(_))
+        ));
+        assert_eq!(
+            structural_stats.structural_artifact_cache.logical_lookups,
+            1
+        );
+        assert_eq!(
+            structural_stats.structural_artifact_cache.physical_queries,
+            1
+        );
+        assert_eq!(structural_stats.structural_artifact_cache.hits, 0);
+        assert_eq!(structural_stats.structural_artifact_cache.misses, 1);
         Ok(())
     }
 
@@ -22275,7 +22618,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 
         for relative in ["vendor/unreadable.json", "secrets/missing.json"] {
             let work = {
-                let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+                let mut cache_access =
+                    ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
                 indexer.prepare_index_work(
                     &mut cache_access,
                     &PathBuf::from(relative),
@@ -22446,7 +22790,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 
         for (relative, _, expected_producer) in fixtures {
             let prepared = {
-                let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+                let mut cache_access =
+                    ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
                 indexer.prepare_index_work(
                     &mut cache_access,
                     &PathBuf::from(relative),
@@ -22471,7 +22816,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
 
         for relative in ["openapi.json", "openapi.yaml"] {
             let prepared = {
-                let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+                let mut cache_access =
+                    ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
                 indexer.prepare_index_work(
                     &mut cache_access,
                     &PathBuf::from(relative),
@@ -22506,7 +22852,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         }
 
         let bash = {
-            let mut cache_access = ArtifactCacheAccess::Storage(&mut storage);
+            let mut cache_access =
+                ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
             indexer.prepare_index_work(
                 &mut cache_access,
                 &PathBuf::from("scripts/run.sh"),
@@ -22647,7 +22994,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let symbol_table = Arc::new(SymbolTable::new());
         let mut legacy_stats = IncrementalIndexingStats::default();
         let legacy_prepared = {
-            let mut access = ArtifactCacheAccess::Storage(&mut legacy_cache);
+            let mut access =
+                ArtifactCacheAccess::storage(&mut legacy_cache, ArtifactCachePolicies::default());
             indexer.prepare_index_work(
                 &mut access,
                 &PathBuf::from("many.json"),
@@ -22670,7 +23018,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         )?;
         let mut over_limit_hit_stats = IncrementalIndexingStats::default();
         let over_limit_hit_prepared = {
-            let mut access = ArtifactCacheAccess::Storage(&mut legacy_cache);
+            let mut access =
+                ArtifactCacheAccess::storage(&mut legacy_cache, ArtifactCachePolicies::default());
             indexer.prepare_index_work(
                 &mut access,
                 &PathBuf::from("many.json"),
@@ -22692,7 +23041,8 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         let mut fresh_cache = Storage::new_in_memory()?;
         let mut fresh_stats = IncrementalIndexingStats::default();
         let fresh_prepared = {
-            let mut access = ArtifactCacheAccess::Storage(&mut fresh_cache);
+            let mut access =
+                ArtifactCacheAccess::storage(&mut fresh_cache, ArtifactCachePolicies::default());
             indexer.prepare_index_work(
                 &mut access,
                 &PathBuf::from("many.json"),
