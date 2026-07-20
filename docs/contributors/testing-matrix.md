@@ -61,8 +61,10 @@ bounded-pipeline parity, and atomic file-error plus dirty-state replacement.
 Deny each persisted row family and the final commit in turn; every failure must
 roll back graph rows, errors, and dirty markers together. Bound-input bytes are
 logical statement payload, so representative evidence records database and WAL
-bytes separately. Journal/checkpoint policy and multiple-writer changes remain
-separate lanes.
+bytes separately. Also inject cached metadata and cached-error-clear failures:
+their error-only file outcomes must use the fallback replacement path without
+discarding the previous projection. Journal/checkpoint policy and
+multiple-writer changes remain separate lanes.
 
 ## Exact-head source gate
 

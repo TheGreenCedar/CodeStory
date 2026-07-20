@@ -307,12 +307,14 @@ Projection flushes write more than the core graph:
 
 The store flush path writes the verified hash beside the file row and clears it
 when a refreshed row has no verified content identity. The source hash, graph
-rows, structural units and cache entry, file-scoped error replacement, and
-grounding/resolution dirty markers advance in the same SQLite transaction.
-Modification time is captured only after the verification read matches.
-Projection flush is both a write boundary and a derived-state invalidation
-boundary; it does not follow the graph commit with a second error transaction
-or snapshot autocommits.
+rows, structural units and cache entry, errors owned by refreshed file rows,
+and grounding/resolution dirty markers advance in the same SQLite transaction.
+Modification time is captured only after the verification read matches. A
+cache-maintenance failure can report a file-scoped outcome without a
+replacement file row; the writer retains the separate fallback transaction for
+that error-only case. Projection flush is both a write boundary and a
+derived-state invalidation boundary; ordinary owning batches do not follow the
+graph commit with a second error transaction or snapshot autocommits.
 
 Full-refresh timing output includes produced and persisted chunk counts, queue
 capacity and high-water mark, producer backpressure time, and writer idle time.
