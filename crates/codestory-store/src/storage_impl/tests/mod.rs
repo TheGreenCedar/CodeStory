@@ -21,10 +21,14 @@ fn file_role_classification_ignores_materialized_repo_cache_prefix() {
     );
 }
 use codestory_contracts::graph::{
-    AccessKind, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId, NodeKind, Occurrence,
-    OccurrenceKind, ResolutionCertainty, SourceLocation, TrailConfig, TrailDirection,
+    AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, ErrorInfo, FileCoverageReason,
+    IndexStep, Node, NodeId, NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty,
+    SourceLocation, TrailConfig, TrailDirection,
 };
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_db_path(label: &str) -> PathBuf {
@@ -1214,6 +1218,7 @@ fn projection_file_upsert_updates_language_across_structural_transitions()
                 occurrences: &[],
                 component_access: &[],
                 callable_projection_states: &[],
+                file_errors: &[],
             })
             .map(|_| ())
     }
@@ -1438,6 +1443,7 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
         occurrences: &[],
         component_access: &[],
         callable_projection_states: &[],
+        file_errors: &[],
     })?;
 
     assert_eq!(
@@ -1719,6 +1725,7 @@ fn structural_projection_cache_write_is_atomic_with_file_and_unit_rows() -> Resu
             occurrences: &[],
             component_access: &[],
             callable_projection_states: &[],
+            file_errors: &[],
         })
         .expect_err("trigger must abort the complete structural projection batch");
     assert!(
@@ -1818,6 +1825,7 @@ fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
         occurrences: &[],
         component_access: &[],
         callable_projection_states: &[],
+        file_errors: &[],
     })?;
 
     for (path, file_id, source_hash, producer, blob) in [
@@ -2063,6 +2071,7 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
         occurrences: &[],
         component_access: &[],
         callable_projection_states: &[],
+        file_errors: &[],
     })?;
     assert_eq!(
         storage.get_file_content_hash(17)?.as_deref(),
@@ -2080,8 +2089,267 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
         occurrences: &[],
         component_access: &[],
         callable_projection_states: &[],
+        file_errors: &[],
     })?;
     assert_eq!(storage.get_file_content_hash(17)?, None);
+    Ok(())
+}
+
+fn flush_projection_persistence_fixture(
+    storage: &mut Storage,
+) -> Result<ProjectionFlushBreakdown, StorageError> {
+    let source_hash = "a".repeat(64);
+    let files = [FileInfo {
+        id: 1,
+        path: PathBuf::from("src/a.rs"),
+        language: "rust".to_string(),
+        modification_time: 1,
+        indexed: true,
+        complete: true,
+        line_count: 3,
+        file_role: FileRole::Source,
+    }];
+    let file_content_hashes = [FileContentHash {
+        file_id: 1,
+        content_hash: source_hash.clone(),
+    }];
+    let nodes = [
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/a.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "a::run".to_string(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            start_col: Some(1),
+            end_line: Some(3),
+            end_col: Some(2),
+            ..Default::default()
+        },
+    ];
+    let structural_units = [StructuralTextUnit {
+        node_id: NodeId(2),
+        file_id: 1,
+        placement_id: "p".repeat(64),
+        content_hash: "b".repeat(64),
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "collector".to_string(),
+        evidence_tier: "structural_text".to_string(),
+        resolution: "source_range_only".to_string(),
+        language: "rust".to_string(),
+        kind: NodeKind::FUNCTION,
+        start_line: 2,
+        start_col: 1,
+        end_line: 3,
+        end_col: 2,
+        file_role: FileRole::Source,
+    }];
+    let structural_projections = [StructuralTextProjection {
+        file_id: 1,
+        source_content_hash: source_hash,
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "collector".to_string(),
+        language: "rust".to_string(),
+        file_role: FileRole::Source,
+        unit_count: 1,
+        unit_digest: structural_text_unit_digest(&structural_units),
+    }];
+    let structural_cache_writes = [StructuralTextArtifactCacheWrite {
+        path: &files[0].path,
+        file_id: 1,
+        cache_key: "v1:test",
+        artifact_blob: b"{}",
+    }];
+    let edges = [Edge {
+        id: EdgeId(10),
+        source: NodeId(1),
+        target: NodeId(2),
+        kind: EdgeKind::MEMBER,
+        file_node_id: Some(NodeId(1)),
+        line: Some(2),
+        resolved_source: None,
+        resolved_target: None,
+        confidence: None,
+        certainty: None,
+        callsite_identity: None,
+        candidate_targets: Vec::new(),
+    }];
+    let occurrences = [Occurrence {
+        element_id: 2,
+        kind: OccurrenceKind::DEFINITION,
+        location: SourceLocation {
+            file_node_id: NodeId(1),
+            start_line: 2,
+            start_col: 1,
+            end_line: 3,
+            end_col: 2,
+        },
+    }];
+    let component_access = [(NodeId(2), AccessKind::Public)];
+    let callable_projection_states = [CallableProjectionState {
+        file_id: 1,
+        symbol_key: "a::run".to_string(),
+        node_id: NodeId(2),
+        signature_hash: 11,
+        body_hash: 12,
+        start_line: 2,
+        end_line: 3,
+    }];
+    let file_errors = [ErrorInfo {
+        message: "warn".to_string(),
+        file_id: Some(NodeId(1)),
+        line: Some(2),
+        column: Some(1),
+        is_fatal: false,
+        index_step: IndexStep::Indexing,
+        coverage_reason: None,
+    }];
+
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &file_content_hashes,
+        nodes: &nodes,
+        structural_text_units: &structural_units,
+        structural_text_projections: &structural_projections,
+        structural_text_cache_writes: &structural_cache_writes,
+        edges: &edges,
+        occurrences: &occurrences,
+        component_access: &component_access,
+        callable_projection_states: &callable_projection_states,
+        file_errors: &file_errors,
+    })
+}
+
+#[test]
+fn projection_batch_reports_exact_shape_and_commits_once() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed_commits = Arc::clone(&commits);
+    storage.conn.commit_hook(Some(move || {
+        observed_commits.fetch_add(1, AtomicOrdering::SeqCst);
+        false
+    }))?;
+
+    let breakdown = flush_projection_persistence_fixture(&mut storage)?;
+    storage.conn.commit_hook(None::<fn() -> bool>)?;
+
+    assert_eq!(commits.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(breakdown.persistence.transactions, 1);
+    assert_eq!(breakdown.persistence.files.row_attempts, 1);
+    assert_eq!(breakdown.persistence.nodes.row_attempts, 2);
+    assert_eq!(breakdown.persistence.structural_text.row_attempts, 5);
+    assert_eq!(breakdown.persistence.edges.row_attempts, 1);
+    assert_eq!(breakdown.persistence.occurrences.row_attempts, 1);
+    assert_eq!(breakdown.persistence.component_access.row_attempts, 1);
+    assert_eq!(breakdown.persistence.callable_projection.row_attempts, 1);
+    assert_eq!(breakdown.persistence.file_errors.row_attempts, 2);
+    assert_eq!(breakdown.persistence.dirty_state.row_attempts, 4);
+    assert_eq!(breakdown.persistence.row_attempts(), 18);
+    assert_eq!(breakdown.persistence.statement_executions(), 18);
+    assert_eq!(breakdown.persistence.files.bound_bytes, 122);
+    assert_eq!(breakdown.persistence.file_errors.bound_bytes, 52);
+    assert_eq!(breakdown.persistence.dirty_state.bound_bytes, 48);
+    assert!(breakdown.persistence.bound_bytes() > 1_000);
+    assert!(breakdown.persistence.transaction_wall_ms >= breakdown.persistence.commit_ms);
+
+    let stored_errors = storage.get_errors(None)?;
+    assert_eq!(stored_errors.len(), 1);
+    assert_eq!(stored_errors[0].message, "warn");
+    assert_eq!(
+        storage
+            .get_grounding_snapshot_metadata()?
+            .expect("snapshot metadata")
+            .summary_state,
+        GroundingSnapshotState::Dirty
+    );
+    assert!(!storage.has_ready_resolution_support_snapshot(1)?);
+    Ok(())
+}
+
+fn seed_ready_projection_snapshots(storage: &Storage) -> Result<(), StorageError> {
+    storage.write_grounding_snapshot_states(
+        GroundingSnapshotState::Ready,
+        GroundingSnapshotState::Ready,
+        Some(1),
+        Some(1),
+    )?;
+    storage.put_resolution_support_snapshot(1, br#"{"ready":true}"#)
+}
+
+#[test]
+fn projection_batch_family_and_commit_failures_roll_back_everything() -> Result<(), StorageError> {
+    let denied_operations = [
+        ("file", false),
+        ("node", false),
+        ("structural_text_unit", false),
+        ("edge", false),
+        ("occurrence", false),
+        ("component_access", false),
+        ("callable_projection_state", false),
+        ("error", false),
+        ("grounding_snapshot_meta", true),
+        ("resolution_support_snapshot", false),
+    ];
+
+    for (table, deny_update) in denied_operations {
+        let mut storage = Storage::new_in_memory()?;
+        seed_ready_projection_snapshots(&storage)?;
+        let denied_table = table.to_string();
+        storage
+            .conn
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                let denied = match context.action {
+                    AuthAction::Insert { table_name } => !deny_update && table_name == denied_table,
+                    AuthAction::Update { table_name, .. } => {
+                        deny_update && table_name == denied_table
+                    }
+                    _ => false,
+                };
+                if denied {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))?;
+
+        assert!(
+            flush_projection_persistence_fixture(&mut storage).is_err(),
+            "{table} denial should reject the complete projection batch"
+        );
+        storage
+            .conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+        assert!(storage.get_files()?.is_empty(), "{table} left file rows");
+        assert!(storage.get_nodes()?.is_empty(), "{table} left node rows");
+        assert!(storage.get_edges()?.is_empty(), "{table} left edge rows");
+        assert!(storage.get_errors(None)?.is_empty(), "{table} left errors");
+        assert!(
+            storage.has_ready_grounding_snapshots()?,
+            "{table} dirtied grounding state outside the transaction"
+        );
+        assert!(
+            storage.has_ready_resolution_support_snapshot(1)?,
+            "{table} dirtied resolution state outside the transaction"
+        );
+    }
+
+    let mut storage = Storage::new_in_memory()?;
+    seed_ready_projection_snapshots(&storage)?;
+    storage.conn.commit_hook(Some(|| true))?;
+    assert!(flush_projection_persistence_fixture(&mut storage).is_err());
+    storage.conn.commit_hook(None::<fn() -> bool>)?;
+    assert!(storage.get_files()?.is_empty());
+    assert!(storage.get_nodes()?.is_empty());
+    assert!(storage.get_edges()?.is_empty());
+    assert!(storage.get_errors(None)?.is_empty());
+    assert!(storage.has_ready_grounding_snapshots()?);
+    assert!(storage.has_ready_resolution_support_snapshot(1)?);
     Ok(())
 }
 
@@ -4228,6 +4496,7 @@ fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> 
         occurrences: &[],
         component_access: &[],
         callable_projection_states: &[],
+        file_errors: &[],
     })?;
     let publication = storage
         .get_complete_index_publication()?

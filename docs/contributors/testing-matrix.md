@@ -55,6 +55,17 @@ lookups, physical queries, hits, misses, reader opens, and lookup wall time.
 Journal or checkpoint lanes are required only when those store contracts
 change.
 
+Projection-persistence changes prove one commit per nonempty owning batch with
+SQLite commit/authorizer hooks, exact row/byte/statement counters, serial versus
+bounded-pipeline parity, and atomic file-error plus dirty-state replacement.
+Deny each persisted row family and the final commit in turn; every failure must
+roll back graph rows, errors, and dirty markers together. Bound-input bytes are
+logical statement payload, so representative evidence records database and WAL
+bytes separately. Also inject cached metadata and cached-error-clear failures:
+their error-only file outcomes must use the fallback replacement path without
+discarding the previous projection. Journal/checkpoint policy and
+multiple-writer changes remain separate lanes.
+
 ## Exact-head source gate
 
 After independent review finds no blocker, run once on the unchanged head:

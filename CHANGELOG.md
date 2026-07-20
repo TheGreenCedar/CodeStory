@@ -58,6 +58,13 @@
 
 ### Performance
 
+- Projection batches now replace errors owned by their refreshed file rows and
+  mark grounding and resolution snapshots dirty inside the owning SQLite
+  transaction instead of following each flush with a second error transaction
+  and snapshot autocommits. Error-only cache-maintenance failures retain their
+  existing file-outcome fallback. Index telemetry reports transaction
+  setup/commit wall plus attempted rows, estimated bound-input bytes, statement
+  executions, and wall time by persisted family.
 - Fresh disposable full-refresh stages now declare the parser artifact cache
   `known_empty` instead of issuing guaranteed-miss queries. Structural
   read-through is enabled only when verified rows were copied from the prior

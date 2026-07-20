@@ -37,6 +37,34 @@ pub struct ArtifactCacheAccessTimings {
     pub lookup_wall_ms: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ProjectionPersistenceFamilyTimings {
+    pub row_attempts: u64,
+    pub bound_bytes: u64,
+    pub statement_executions: u64,
+    pub wall_ms: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ProjectionPersistenceTimings {
+    pub transactions: u32,
+    pub row_attempts: u64,
+    pub bound_bytes: u64,
+    pub statement_executions: u64,
+    pub transaction_wall_ms: u32,
+    pub transaction_setup_ms: u32,
+    pub commit_ms: u32,
+    pub files: ProjectionPersistenceFamilyTimings,
+    pub nodes: ProjectionPersistenceFamilyTimings,
+    pub structural_text: ProjectionPersistenceFamilyTimings,
+    pub edges: ProjectionPersistenceFamilyTimings,
+    pub occurrences: ProjectionPersistenceFamilyTimings,
+    pub component_access: ProjectionPersistenceFamilyTimings,
+    pub callable_projection: ProjectionPersistenceFamilyTimings,
+    pub file_errors: ProjectionPersistenceFamilyTimings,
+    pub dirty_state: ProjectionPersistenceFamilyTimings,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +118,8 @@ pub struct IndexingPhaseTimings {
     pub projection_batch_wall_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_batch_transactions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_persistence: Option<ProjectionPersistenceTimings>,
     pub cache_refresh_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_projection_rebuild_ms: Option<u32>,
@@ -330,6 +360,7 @@ mod tests {
             source_prepare_ms: None,
             projection_batch_wall_ms: None,
             projection_batch_transactions: None,
+            projection_persistence: None,
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
             search_symbol_stream_ms: None,
@@ -443,6 +474,7 @@ mod tests {
         assert!(value.get("source_prepare_ms").is_none());
         assert!(value.get("projection_batch_wall_ms").is_none());
         assert!(value.get("projection_batch_transactions").is_none());
+        assert!(value.get("projection_persistence").is_none());
         assert!(value.get("resolution_unresolved_counts_ms").is_none());
         assert!(value.get("resolution_calls_ms").is_none());
         assert!(value.get("resolution_imports_ms").is_none());
@@ -601,6 +633,46 @@ mod tests {
             decoded.structural_artifact_cache,
             timings.structural_artifact_cache
         );
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_round_trips_projection_persistence_shape() {
+        let persistence = ProjectionPersistenceTimings {
+            transactions: 2,
+            row_attempts: 20,
+            bound_bytes: 2_048,
+            statement_executions: 18,
+            transaction_wall_ms: 12,
+            transaction_setup_ms: 1,
+            commit_ms: 3,
+            files: ProjectionPersistenceFamilyTimings {
+                row_attempts: 2,
+                bound_bytes: 256,
+                statement_executions: 2,
+                wall_ms: 1,
+            },
+            dirty_state: ProjectionPersistenceFamilyTimings {
+                row_attempts: 8,
+                bound_bytes: 96,
+                statement_executions: 8,
+                wall_ms: 2,
+            },
+            ..ProjectionPersistenceTimings::default()
+        };
+        let timings = IndexingPhaseTimings {
+            projection_persistence: Some(persistence.clone()),
+            ..IndexingPhaseTimings::default()
+        };
+
+        let value = serde_json::to_value(&timings).expect("serialize timings");
+        assert_eq!(value["projection_persistence"]["transactions"], 2);
+        assert_eq!(
+            value["projection_persistence"]["dirty_state"]["statement_executions"],
+            8
+        );
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize timings");
+        assert_eq!(decoded.projection_persistence, Some(persistence));
     }
 
     #[test]

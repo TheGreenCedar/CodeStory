@@ -1578,6 +1578,127 @@ pub struct ProjectionFlushBreakdown {
     pub occurrences_ms: u32,
     pub component_access_ms: u32,
     pub callable_projection_ms: u32,
+    pub persistence: ProjectionPersistenceStats,
+}
+
+/// Deterministic shape and wall telemetry for one persisted row family.
+///
+/// `row_attempts` counts logical row targets supplied to SQLite. `bound_bytes`
+/// estimates the raw text, blob, and fixed-width scalar payload supplied as
+/// statement parameters; it is not a database, WAL, or physical-write byte
+/// count. `statement_executions` counts prepared statement executions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectionPersistenceFamilyStats {
+    pub row_attempts: u64,
+    pub bound_bytes: u64,
+    pub statement_executions: u64,
+    pub wall_ms: u32,
+}
+
+impl ProjectionPersistenceFamilyStats {
+    pub fn accumulate(&mut self, other: Self) {
+        self.row_attempts = self.row_attempts.saturating_add(other.row_attempts);
+        self.bound_bytes = self.bound_bytes.saturating_add(other.bound_bytes);
+        self.statement_executions = self
+            .statement_executions
+            .saturating_add(other.statement_executions);
+        self.wall_ms = self.wall_ms.saturating_add(other.wall_ms);
+    }
+}
+
+/// Non-double-counted projection transaction diagnostics.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectionPersistenceStats {
+    pub transactions: u64,
+    pub transaction_wall_ms: u32,
+    pub transaction_setup_ms: u32,
+    pub commit_ms: u32,
+    pub files: ProjectionPersistenceFamilyStats,
+    pub nodes: ProjectionPersistenceFamilyStats,
+    pub structural_text: ProjectionPersistenceFamilyStats,
+    pub edges: ProjectionPersistenceFamilyStats,
+    pub occurrences: ProjectionPersistenceFamilyStats,
+    pub component_access: ProjectionPersistenceFamilyStats,
+    pub callable_projection: ProjectionPersistenceFamilyStats,
+    pub file_errors: ProjectionPersistenceFamilyStats,
+    pub dirty_state: ProjectionPersistenceFamilyStats,
+}
+
+impl ProjectionPersistenceStats {
+    pub fn accumulate(&mut self, other: Self) {
+        self.transactions = self.transactions.saturating_add(other.transactions);
+        self.transaction_wall_ms = self
+            .transaction_wall_ms
+            .saturating_add(other.transaction_wall_ms);
+        self.transaction_setup_ms = self
+            .transaction_setup_ms
+            .saturating_add(other.transaction_setup_ms);
+        self.commit_ms = self.commit_ms.saturating_add(other.commit_ms);
+        self.files.accumulate(other.files);
+        self.nodes.accumulate(other.nodes);
+        self.structural_text.accumulate(other.structural_text);
+        self.edges.accumulate(other.edges);
+        self.occurrences.accumulate(other.occurrences);
+        self.component_access.accumulate(other.component_access);
+        self.callable_projection
+            .accumulate(other.callable_projection);
+        self.file_errors.accumulate(other.file_errors);
+        self.dirty_state.accumulate(other.dirty_state);
+    }
+
+    pub fn row_attempts(&self) -> u64 {
+        [
+            self.files,
+            self.nodes,
+            self.structural_text,
+            self.edges,
+            self.occurrences,
+            self.component_access,
+            self.callable_projection,
+            self.file_errors,
+            self.dirty_state,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, family| {
+            total.saturating_add(family.row_attempts)
+        })
+    }
+
+    pub fn bound_bytes(&self) -> u64 {
+        [
+            self.files,
+            self.nodes,
+            self.structural_text,
+            self.edges,
+            self.occurrences,
+            self.component_access,
+            self.callable_projection,
+            self.file_errors,
+            self.dirty_state,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, family| {
+            total.saturating_add(family.bound_bytes)
+        })
+    }
+
+    pub fn statement_executions(&self) -> u64 {
+        [
+            self.files,
+            self.nodes,
+            self.structural_text,
+            self.edges,
+            self.occurrences,
+            self.component_access,
+            self.callable_projection,
+            self.file_errors,
+            self.dirty_state,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, family| {
+            total.saturating_add(family.statement_executions)
+        })
+    }
 }
 
 pub struct ProjectionBatch<'a> {
@@ -1591,6 +1712,43 @@ pub struct ProjectionBatch<'a> {
     pub occurrences: &'a [Occurrence],
     pub component_access: &'a [(NodeId, AccessKind)],
     pub callable_projection_states: &'a [CallableProjectionState],
+    pub file_errors: &'a [codestory_contracts::graph::ErrorInfo],
+}
+
+const SQLITE_SCALAR_BIND_BYTES: u64 = 8;
+
+fn projection_text_bind_bytes(value: &str) -> u64 {
+    value.len().min(u64::MAX as usize) as u64
+}
+
+fn projection_path_bind_bytes(value: &Path) -> u64 {
+    projection_text_bind_bytes(value.to_string_lossy().as_ref())
+}
+
+fn projection_optional_text_bind_bytes(value: Option<&str>) -> u64 {
+    value.map(projection_text_bind_bytes).unwrap_or(0)
+}
+
+fn projection_optional_scalar_bind_bytes<T>(value: Option<T>) -> u64 {
+    if value.is_some() {
+        SQLITE_SCALAR_BIND_BYTES
+    } else {
+        0
+    }
+}
+
+fn projection_scalar_binds(count: usize) -> u64 {
+    (count.min(u64::MAX as usize) as u64).saturating_mul(SQLITE_SCALAR_BIND_BYTES)
+}
+
+fn record_projection_statement(
+    family: &mut ProjectionPersistenceFamilyStats,
+    row_attempts: u64,
+    bound_bytes: u64,
+) {
+    family.row_attempts = family.row_attempts.saturating_add(row_attempts);
+    family.bound_bytes = family.bound_bytes.saturating_add(bound_bytes);
+    family.statement_executions = family.statement_executions.saturating_add(1);
 }
 
 #[derive(Default)]
@@ -3383,8 +3541,10 @@ impl Storage {
         }
     }
 
-    pub fn invalidate_resolution_support_snapshot(&self) -> Result<(), StorageError> {
-        self.conn.execute(
+    fn invalidate_resolution_support_snapshot_on(
+        connection: &Connection,
+    ) -> Result<usize, StorageError> {
+        Ok(connection.execute(
             "INSERT INTO resolution_support_snapshot (
                 id,
                 snapshot_version,
@@ -3398,7 +3558,11 @@ impl Storage {
                 snapshot_blob = NULL,
                 built_at_epoch_ms = NULL",
             params![GroundingSnapshotState::Dirty.db_value()],
-        )?;
+        )?)
+    }
+
+    pub fn invalidate_resolution_support_snapshot(&self) -> Result<(), StorageError> {
+        Self::invalidate_resolution_support_snapshot_on(&self.conn)?;
         Ok(())
     }
 
@@ -3425,8 +3589,10 @@ impl Storage {
         self.grounding_snapshot_metadata()
     }
 
-    fn ensure_grounding_snapshot_meta_row(&self) -> Result<(), StorageError> {
-        self.conn.execute(
+    fn ensure_grounding_snapshot_meta_row_on(
+        connection: &Connection,
+    ) -> Result<usize, StorageError> {
+        Ok(connection.execute(
             "INSERT OR IGNORE INTO grounding_snapshot_meta (
                 id,
                 snapshot_version,
@@ -3440,19 +3606,23 @@ impl Storage {
                 GROUNDING_SNAPSHOT_VERSION,
                 GroundingSnapshotState::Dirty.db_value()
             ],
-        )?;
+        )?)
+    }
+
+    fn ensure_grounding_snapshot_meta_row(&self) -> Result<(), StorageError> {
+        Self::ensure_grounding_snapshot_meta_row_on(&self.conn)?;
         Ok(())
     }
 
-    fn write_grounding_snapshot_states(
-        &self,
+    fn write_grounding_snapshot_states_on(
+        connection: &Connection,
         summary_state: GroundingSnapshotState,
         detail_state: GroundingSnapshotState,
         summary_built_at_epoch_ms: Option<i64>,
         detail_built_at_epoch_ms: Option<i64>,
-    ) -> Result<(), StorageError> {
-        self.ensure_grounding_snapshot_meta_row()?;
-        self.conn.execute(
+    ) -> Result<usize, StorageError> {
+        let mut affected = Self::ensure_grounding_snapshot_meta_row_on(connection)?;
+        affected = affected.saturating_add(connection.execute(
             "UPDATE grounding_snapshot_meta
              SET snapshot_version = ?1,
                  summary_state = ?2,
@@ -3467,6 +3637,23 @@ impl Storage {
                 summary_built_at_epoch_ms,
                 detail_built_at_epoch_ms,
             ],
+        )?);
+        Ok(affected)
+    }
+
+    fn write_grounding_snapshot_states(
+        &self,
+        summary_state: GroundingSnapshotState,
+        detail_state: GroundingSnapshotState,
+        summary_built_at_epoch_ms: Option<i64>,
+        detail_built_at_epoch_ms: Option<i64>,
+    ) -> Result<(), StorageError> {
+        Self::write_grounding_snapshot_states_on(
+            &self.conn,
+            summary_state,
+            detail_state,
+            summary_built_at_epoch_ms,
+            detail_built_at_epoch_ms,
         )?;
         Ok(())
     }
@@ -3497,8 +3684,14 @@ impl Storage {
     }
 
     pub fn invalidate_grounding_snapshots(&self) -> Result<(), StorageError> {
-        self.mark_grounding_snapshots_dirty()?;
-        self.invalidate_resolution_support_snapshot()?;
+        Self::write_grounding_snapshot_states_on(
+            &self.conn,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        Self::invalidate_resolution_support_snapshot_on(&self.conn)?;
         Ok(())
     }
 
@@ -5387,8 +5580,25 @@ impl Storage {
             && batch.occurrences.is_empty()
             && batch.component_access.is_empty()
             && batch.callable_projection_states.is_empty()
+            && batch.file_errors.is_empty()
         {
             return Ok(breakdown);
+        }
+
+        let batch_file_ids = batch
+            .files
+            .iter()
+            .map(|file| file.id)
+            .collect::<HashSet<_>>();
+        if let Some(error) = batch.file_errors.iter().find(|error| {
+            error
+                .file_id
+                .is_none_or(|file_id| !batch_file_ids.contains(&file_id.0))
+        }) {
+            return Err(StorageError::Other(format!(
+                "projection file error {:?} does not belong to a file in its batch",
+                error.file_id.map(|file_id| file_id.0)
+            )));
         }
 
         let nodes_prepare_started = std::time::Instant::now();
@@ -5408,14 +5618,27 @@ impl Storage {
             .iter()
             .map(|identity| (identity.file_id, identity.content_hash.as_str()))
             .collect::<HashMap<_, _>>();
+        let transaction_started = std::time::Instant::now();
+        let transaction_setup_started = std::time::Instant::now();
         let tx = self.conn.transaction()?;
+        breakdown.persistence.transactions = 1;
+        breakdown.persistence.transaction_setup_ms =
+            clamp_i64_to_u32(transaction_setup_started.elapsed().as_millis() as i64);
 
         if !batch.files.is_empty() {
+            let file_errors_started = std::time::Instant::now();
             let placeholders = question_placeholders(batch.files.len());
             tx.execute(
                 &format!("DELETE FROM error WHERE file_id IN ({placeholders})"),
                 params_from_iter(batch.files.iter().map(|file| file.id)),
             )?;
+            record_projection_statement(
+                &mut breakdown.persistence.file_errors,
+                batch.files.len().min(u64::MAX as usize) as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
+            breakdown.persistence.file_errors.wall_ms =
+                clamp_i64_to_u32(file_errors_started.elapsed().as_millis() as i64);
 
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
@@ -5445,8 +5668,20 @@ impl Storage {
                     info.file_role.as_str(),
                     file_content_hashes.get(&info.id).copied(),
                 ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.files,
+                    1,
+                    projection_scalar_binds(5)
+                        .saturating_add(projection_path_bind_bytes(&info.path))
+                        .saturating_add(projection_text_bind_bytes(&info.language))
+                        .saturating_add(projection_text_bind_bytes(info.file_role.as_str()))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            file_content_hashes.get(&info.id).copied(),
+                        )),
+                );
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.files.wall_ms = breakdown.files_ms;
         }
 
         if !prepared_nodes.is_empty() {
@@ -5480,24 +5715,53 @@ impl Storage {
                         node.id.0, node.kind, node.serialized_name, node.file_node_id.map(|id| id.0)
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.nodes,
+                    1,
+                    projection_scalar_binds(2)
+                        .saturating_add(projection_text_bind_bytes(&node.serialized_name))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            node.qualified_name.as_deref(),
+                        ))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            node.canonical_id.as_deref(),
+                        ))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.file_node_id))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.start_line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.start_col))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.end_line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.end_col)),
+                );
             }
-            breakdown.nodes_ms = nodes_prepare_ms.saturating_add(clamp_i64_to_u32(
-                nodes_insert_started.elapsed().as_millis() as i64,
-            ));
+            let nodes_insert_ms =
+                clamp_i64_to_u32(nodes_insert_started.elapsed().as_millis() as i64);
+            breakdown.nodes_ms = nodes_prepare_ms.saturating_add(nodes_insert_ms);
+            breakdown.persistence.nodes.wall_ms = nodes_insert_ms;
         }
 
+        let structural_started = std::time::Instant::now();
         if !batch.files.is_empty() {
             let placeholders = question_placeholders(batch.files.len());
             tx.execute(
                 &format!("DELETE FROM structural_text_unit WHERE file_id IN ({placeholders})"),
                 params_from_iter(batch.files.iter().map(|file| file.id)),
             )?;
+            record_projection_statement(
+                &mut breakdown.persistence.structural_text,
+                batch.files.len().min(u64::MAX as usize) as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
             tx.execute(
                 &format!(
                     "DELETE FROM structural_text_projection WHERE file_id IN ({placeholders})"
                 ),
                 params_from_iter(batch.files.iter().map(|file| file.id)),
             )?;
+            record_projection_statement(
+                &mut breakdown.persistence.structural_text,
+                batch.files.len().min(u64::MAX as usize) as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
         }
         if !batch.structural_text_units.is_empty() {
             let started = std::time::Instant::now();
@@ -5541,6 +5805,19 @@ impl Storage {
                     unit.end_col,
                     unit.file_role.as_str(),
                 ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.structural_text,
+                    1,
+                    projection_scalar_binds(8)
+                        .saturating_add(projection_text_bind_bytes(&unit.placement_id))
+                        .saturating_add(projection_text_bind_bytes(&unit.content_hash))
+                        .saturating_add(projection_text_bind_bytes(&unit.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&unit.producer))
+                        .saturating_add(projection_text_bind_bytes(&unit.evidence_tier))
+                        .saturating_add(projection_text_bind_bytes(&unit.resolution))
+                        .saturating_add(projection_text_bind_bytes(&unit.language))
+                        .saturating_add(projection_text_bind_bytes(unit.file_role.as_str())),
+                );
             }
             breakdown.structural_text_units_ms =
                 clamp_i64_to_u32(started.elapsed().as_millis() as i64);
@@ -5580,6 +5857,16 @@ impl Storage {
                     projection.unit_count.min(i64::MAX as u64) as i64,
                     &projection.unit_digest,
                 ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.structural_text,
+                    1,
+                    projection_scalar_binds(3)
+                        .saturating_add(projection_text_bind_bytes(&projection.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&projection.producer))
+                        .saturating_add(projection_text_bind_bytes(&projection.language))
+                        .saturating_add(projection_text_bind_bytes(projection.file_role.as_str()))
+                        .saturating_add(projection_text_bind_bytes(&projection.unit_digest)),
+                );
             }
         }
         if !batch.structural_text_cache_writes.is_empty() {
@@ -5628,9 +5915,21 @@ impl Storage {
                     write.artifact_blob,
                     current_epoch_ms(),
                 ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.structural_text,
+                    1,
+                    projection_scalar_binds(3)
+                        .saturating_add(projection_path_bind_bytes(write.path))
+                        .saturating_add(projection_text_bind_bytes(write.cache_key))
+                        .saturating_add(projection_text_bind_bytes(&projection.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&projection.producer))
+                        .saturating_add(projection_text_bind_bytes(&artifact_digest))
+                        .saturating_add(write.artifact_blob.len().min(u64::MAX as usize) as u64),
+                );
             }
         }
-        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        breakdown.persistence.structural_text.wall_ms =
+            clamp_i64_to_u32(structural_started.elapsed().as_millis() as i64);
 
         if !batch.edges.is_empty() {
             let started = std::time::Instant::now();
@@ -5639,6 +5938,8 @@ impl Storage {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO NOTHING",
             )?;
             for edge in batch.edges {
+                let candidate_targets = serialize_candidate_targets(&edge.candidate_targets)?;
+                let certainty = row_mapping::certainty_db_value(edge.certainty);
                 stmt.execute(params![
                     edge.id.0,
                     edge.source.0,
@@ -5650,8 +5951,8 @@ impl Storage {
                     edge.resolved_target.map(|id| id.0),
                     edge.confidence,
                     edge.callsite_identity.as_deref(),
-                    row_mapping::certainty_db_value(edge.certainty),
-                    serialize_candidate_targets(&edge.candidate_targets)?
+                    certainty,
+                    &candidate_targets
                 ])
                 .map_err(|err| {
                     let source_label = pending_node_labels
@@ -5680,8 +5981,26 @@ impl Storage {
                         edge.resolved_target.map(|id| id.0)
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.edges,
+                    1,
+                    projection_scalar_binds(4)
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.file_node_id))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.resolved_source))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.resolved_target))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.confidence))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            edge.callsite_identity.as_deref(),
+                        ))
+                        .saturating_add(projection_optional_scalar_bind_bytes(certainty))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            candidate_targets.as_deref(),
+                        )),
+                );
             }
             breakdown.edges_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.edges.wall_ms = breakdown.edges_ms;
         }
 
         if !batch.occurrences.is_empty() {
@@ -5712,8 +6031,14 @@ impl Storage {
                         occ.location.end_col
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.occurrences,
+                    1,
+                    projection_scalar_binds(7),
+                );
             }
             breakdown.occurrences_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.occurrences.wall_ms = breakdown.occurrences_ms;
         }
 
         if !batch.component_access.is_empty() {
@@ -5734,8 +6059,14 @@ impl Storage {
                         node_id.0, access
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.component_access,
+                    1,
+                    projection_scalar_binds(2),
+                );
             }
             breakdown.component_access_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.component_access.wall_ms = breakdown.component_access_ms;
         }
 
         if !batch.callable_projection_states.is_empty() {
@@ -5771,12 +6102,89 @@ impl Storage {
                         state.end_line
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.callable_projection,
+                    1,
+                    projection_scalar_binds(6)
+                        .saturating_add(projection_text_bind_bytes(&state.symbol_key)),
+                );
             }
             breakdown.callable_projection_ms =
                 clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.callable_projection.wall_ms = breakdown.callable_projection_ms;
         }
 
+        if !batch.file_errors.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for error in batch.file_errors {
+                stmt.execute(params![
+                    error.message,
+                    error.file_id.map(|id| id.0),
+                    error.line,
+                    error.column,
+                    error.is_fatal as i32,
+                    (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                    error.coverage_reason.map(FileCoverageReason::as_str),
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.file_errors,
+                    1,
+                    projection_scalar_binds(2)
+                        .saturating_add(projection_text_bind_bytes(&error.message))
+                        .saturating_add(projection_optional_scalar_bind_bytes(error.file_id))
+                        .saturating_add(projection_optional_scalar_bind_bytes(error.line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(error.column))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            error.coverage_reason.map(FileCoverageReason::as_str),
+                        )),
+                );
+            }
+            breakdown.persistence.file_errors.wall_ms = breakdown
+                .persistence
+                .file_errors
+                .wall_ms
+                .saturating_add(clamp_i64_to_u32(started.elapsed().as_millis() as i64));
+        }
+
+        let dirty_started = std::time::Instant::now();
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        record_projection_statement(&mut breakdown.persistence.dirty_state, 1, 0);
+        Self::write_grounding_snapshot_states_on(
+            &tx,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        record_projection_statement(
+            &mut breakdown.persistence.dirty_state,
+            1,
+            projection_scalar_binds(2),
+        );
+        record_projection_statement(
+            &mut breakdown.persistence.dirty_state,
+            1,
+            projection_scalar_binds(3),
+        );
+        Self::invalidate_resolution_support_snapshot_on(&tx)?;
+        record_projection_statement(
+            &mut breakdown.persistence.dirty_state,
+            1,
+            projection_scalar_binds(1),
+        );
+        breakdown.persistence.dirty_state.wall_ms =
+            clamp_i64_to_u32(dirty_started.elapsed().as_millis() as i64);
+
+        let commit_started = std::time::Instant::now();
         tx.commit()?;
+        breakdown.persistence.commit_ms =
+            clamp_i64_to_u32(commit_started.elapsed().as_millis() as i64);
+        breakdown.persistence.transaction_wall_ms =
+            clamp_i64_to_u32(transaction_started.elapsed().as_millis() as i64);
 
         if !prepared_nodes.is_empty() {
             let mut cache = self.cache.nodes.write();
@@ -5785,7 +6193,6 @@ impl Storage {
             }
         }
 
-        self.invalidate_grounding_snapshots()?;
         Ok(breakdown)
     }
 
