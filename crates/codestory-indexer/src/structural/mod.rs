@@ -413,6 +413,7 @@ mod tests {
     use codestory_contracts::graph::{EdgeKind, NodeKind};
     use codestory_store::{ProjectionBatch, Store as Storage};
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn indexes_dedicated_sql_file() {
@@ -762,6 +763,144 @@ mod tests {
         assert!(is_structural_candidate_path(Path::new(
             r"docs\architecture\guide.md"
         )));
+    }
+
+    #[test]
+    fn generic_yaml_accepts_plain_quote_punctuation_and_block_scalar_tabs() {
+        let source = concat!(
+            "description: the controller's state remains plain text\n",
+            "title: 7.9\" display panel\n",
+            "quoted: 'it''s explicitly quoted'\n",
+            "example: |\n",
+            "  command\t--flag=\"value\"\n",
+        );
+        let storage = index_structural_source(Path::new("metadata.yaml"), source)
+            .expect("valid YAML scalar forms should collect");
+
+        for expected in ["description", "title", "quoted", "example"] {
+            assert!(
+                storage
+                    .nodes
+                    .iter()
+                    .any(|node| node.serialized_name == expected),
+                "missing YAML mapping-key anchor {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_json_accepts_complete_value_streams() {
+        let source = "{\"first\":1}\n{\"second\":2}\n";
+        let storage = index_structural_source(Path::new("events.json"), source)
+            .expect("complete JSON values should collect as one stream");
+
+        for expected in ["first", "second"] {
+            assert!(
+                storage
+                    .nodes
+                    .iter()
+                    .any(|node| node.serialized_name == expected),
+                "missing streamed JSON object-key anchor {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_yaml_and_json_keep_genuine_syntax_failures_closed() {
+        for (path, source) in [
+            ("unterminated-quote.yaml", "value: \"unterminated\n"),
+            ("unterminated-flow.yaml", "items: [one, two\n"),
+            ("unmatched-flow.yaml", "items: ]\n"),
+            ("tab-indentation.yaml", "root:\n\tchild: value\n"),
+            ("empty.json", "  \n"),
+            ("truncated.json", "{\"missing_value\":\n"),
+            ("trailing-invalid.json", "{\"valid\":true}\n{invalid}\n"),
+        ] {
+            assert!(
+                matches!(
+                    index_structural_source(Path::new(path), source),
+                    Err(StructuralCollectionError::Malformed(_))
+                ),
+                "{path} should remain malformed"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicit external root and structural-gap manifest"]
+    fn external_structural_path_sweep_is_collector_only() {
+        let root = std::env::var_os("CODESTORY_STRUCTURAL_SWEEP_ROOT")
+            .map(PathBuf::from)
+            .expect("CODESTORY_STRUCTURAL_SWEEP_ROOT");
+        let manifest = std::env::var_os("CODESTORY_STRUCTURAL_SWEEP_MANIFEST")
+            .map(PathBuf::from)
+            .expect("CODESTORY_STRUCTURAL_SWEEP_MANIFEST");
+        let root = root.canonicalize().expect("canonical external sweep root");
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest).expect("read structural sweep manifest"),
+        )
+        .expect("parse structural sweep manifest");
+        let gaps = document
+            .pointer("/error/details/coverage_gaps")
+            .or_else(|| document.pointer("/details/coverage_gaps"))
+            .and_then(serde_json::Value::as_array)
+            .expect("manifest coverage_gaps array");
+        assert!(!gaps.is_empty(), "external structural sweep is empty");
+
+        let mut failures = Vec::new();
+        for gap in gaps {
+            let relative = gap
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .expect("coverage gap path");
+            let path = root.join(relative);
+            let canonical = match path.canonicalize() {
+                Ok(canonical) if canonical.starts_with(&root) => canonical,
+                Ok(canonical) => {
+                    failures.push(format!(
+                        "{relative}: resolved outside {} as {}",
+                        root.display(),
+                        canonical.display()
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    failures.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            let bytes = match std::fs::read(&canonical) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    failures.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            let source = match decode_structural_source(bytes) {
+                Ok(source) => source,
+                Err(error) => {
+                    failures.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            if let Err(error) =
+                index_structural_source_with_unit_cap(&canonical, &source, usize::MAX as u64)
+            {
+                failures.push(format!("{relative}: {error}"));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} of {} external structural paths failed collector-only validation:\n{}",
+            failures.len(),
+            gaps.len(),
+            failures.join("\n")
+        );
+        eprintln!(
+            "collector-only structural sweep accepted {} read-only path(s)",
+            gaps.len()
+        );
     }
 
     #[test]

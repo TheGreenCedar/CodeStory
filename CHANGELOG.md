@@ -4,6 +4,11 @@
 
 ### Release
 
+- Generic YAML structural collection now distinguishes quoted scalars from
+  apostrophes and quotation marks inside plain text, and it permits tabs inside
+  literal or folded block content while retaining fail-closed indentation and
+  delimiter checks. Generic JSON collection accepts complete value streams and
+  still rejects empty, malformed, or truncated input.
 - Dense-anchor centrality now uses complete bounded graph relationship counts
   instead of the six-item member and related-symbol presentation lists. This
   admits genuinely high-degree callables without repository-specific steering,
