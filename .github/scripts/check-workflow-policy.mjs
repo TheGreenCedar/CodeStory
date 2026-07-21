@@ -1693,19 +1693,33 @@ function validatePackagedProof(workflows, violations, graph) {
     );
   }
   const packageRestore = namedStep(job, "Restore Cargo registry, git sources, and build output");
+  const shortWindowsTarget = namedStep(job, "Configure short Windows Cargo target");
   const installRustIndex = packageSteps.findIndex(step => step.name === "Install pinned Rust");
   const nativeIdentityIndex = packageSteps.findIndex(step => step.name === "Capture Rust cache key");
+  const shortWindowsTargetIndex = packageSteps.findIndex(step => step.name === "Configure short Windows Cargo target");
   const packageRestoreIndex = packageSteps.findIndex(step => step.name === "Restore Cargo registry, git sources, and build output");
   const packageBuildIndex = packageSteps.findIndex(step => step.name === "Build codestory-cli");
   const linuxBuildIndex = packageSteps.findIndex(step => step.name === "Build Linux x64 at the glibc 2.31 baseline");
   add(
     violations,
     nativeIdentityIndex === installRustIndex + 1
-      && packageRestoreIndex === nativeIdentityIndex + 1
+      && shortWindowsTargetIndex === nativeIdentityIndex + 1
+      && packageRestoreIndex === shortWindowsTargetIndex + 1
       && nativeIdentityIndex < packageBuildIndex
       && nativeIdentityIndex < linuxBuildIndex,
     `${file} native build identity must run immediately after Rust selection and before cache restore or any native build`,
   );
+  add(
+    violations,
+    shortWindowsTarget?.if === "runner.os == 'Windows'" && shortWindowsTarget?.shell === "pwsh",
+    `${file} short Cargo target must be Windows-only PowerShell setup`,
+  );
+  requireStepRun(violations, file, job, "Configure short Windows Cargo target", [
+    '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
+    'Join-Path $env:RUNNER_TEMP "ct"',
+    "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
+    '"CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV',
+  ]);
   const expectedPackageKey = [
     "${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-",
     "${{ matrix.rust_target }}-",
@@ -1753,6 +1767,16 @@ function validatePackagedProof(workflows, violations, graph) {
     packageBuild?.env === undefined,
     `${file} native package build must not override the selected generator`,
   );
+  requireStepRun(violations, file, job, "Smoke codestory-cli on Windows", [
+    "$env:CARGO_TARGET_DIR",
+    "${{ matrix.rust_target }}/release/codestory-cli",
+  ]);
+  requireStepRun(violations, file, job, "Package release asset on Windows", [
+    "$env:CARGO_TARGET_DIR",
+    "${{ matrix.rust_target }}/release/codestory-cli",
+    "package-codestory-release.py",
+    "--binary $bin",
+  ]);
   requireStepRun(violations, file, job, "Prepare checksum-pinned embedded model", [
     "node scripts/prepare-embedded-model.mjs",
   ]);
