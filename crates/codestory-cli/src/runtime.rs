@@ -255,7 +255,7 @@ impl RuntimeContext {
         })
     }
 
-    /// Open the project and run the resolved refresh request when needed.
+    /// Open project state and run the resolved refresh request when needed.
     ///
     /// `RefreshMode::None` is read-only with respect to indexing; commands that
     /// require cached graph data must call `ensure_index_ready` after this.
