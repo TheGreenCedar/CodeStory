@@ -1161,6 +1161,10 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     "Restore Cargo registry, git sources, and build output",
   );
   const packagedBuild = workflow => draftStep(workflow.jobs.build, "Build codestory-cli");
+  const packagedShortTarget = workflow => draftStep(
+    workflow.jobs.build,
+    "Configure short Windows Cargo target",
+  );
   const protectedSourceTools = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Capture source build tool evidence",
@@ -1183,6 +1187,21 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedIdentity(workflow).run = packagedIdentity(workflow).run
         .replace(/.*CMAKE_GENERATOR=Ninja.*\n/u, "");
     }, /native build identity must include CMAKE_GENERATOR=Ninja/u],
+    ["packaged short Windows target made cross-platform", packagedFile, workflow => {
+      packagedShortTarget(workflow).if = "runner.os != 'Windows'";
+    }, /short Cargo target must be Windows-only/u],
+    ["packaged short Windows target stops using a junction", packagedFile, workflow => {
+      packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
+        .replace("New-Item -ItemType Junction", "New-Item -ItemType Directory");
+    }, /Configure short Windows Cargo target/u],
+    ["packaged short Windows target points at wrong storage", packagedFile, workflow => {
+      packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
+        .replace("-Target $workspaceTarget", '-Target "wrong"');
+    }, /Configure short Windows Cargo target/u],
+    ["packaged short Windows target no longer exports Cargo output", packagedFile, workflow => {
+      packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
+        .replace("| Out-File -FilePath $env:GITHUB_ENV", "| Write-Output");
+    }, /Configure short Windows Cargo target/u],
     ["packaged identity made conditional", packagedFile, workflow => {
       packagedIdentity(workflow).if = "runner.os != 'Windows'";
     }, /native build identity must be unique, unconditional/u],
@@ -1214,6 +1233,18 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     ["packaged build overrides generator", packagedFile, workflow => {
       packagedBuild(workflow).env = { CMAKE_GENERATOR: "Visual Studio 18 2026" };
     }, /native package build must not override the selected generator/u],
+    ["packaged Windows smoke ignores short target", packagedFile, workflow => {
+      draftStep(workflow.jobs.build, "Smoke codestory-cli on Windows").run
+        = '$bin = "target/codestory-cli.exe"';
+    }, /Smoke codestory-cli on Windows/u],
+    ["packaged Windows asset ignores short target", packagedFile, workflow => {
+      draftStep(workflow.jobs.build, "Package release asset on Windows").run
+        = 'python .github/scripts/package-codestory-release.py --binary "target/codestory-cli.exe"';
+    }, /Package release asset on Windows/u],
+    ["packaged Windows asset reroutes the short-target binary", packagedFile, workflow => {
+      const step = draftStep(workflow.jobs.build, "Package release asset on Windows");
+      step.run = step.run.replace("--binary $bin", "--binary target/wrong.exe");
+    }, /Package release asset on Windows/u],
     ["protected generator removed", protectedFile, workflow => {
       delete protectedBuild(workflow).env.CMAKE_GENERATOR;
     }, /source package build must use the Ninja native generator/u],

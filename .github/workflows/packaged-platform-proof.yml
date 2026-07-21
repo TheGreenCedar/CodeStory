@@ -136,6 +136,19 @@ jobs:
             echo "ninja=not-applicable" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Configure short Windows Cargo target
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"
+          $shortTarget = Join-Path $env:RUNNER_TEMP "ct"
+          New-Item -ItemType Directory -Force -Path $workspaceTarget | Out-Null
+          if (Test-Path -LiteralPath $shortTarget) {
+            throw "short Cargo target already exists: $shortTarget"
+          }
+          New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget | Out-Null
+          "CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
         uses: actions/cache/restore@v5
@@ -433,7 +446,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
+          $bin = Join-Path $env:CARGO_TARGET_DIR "${{ matrix.rust_target }}/release/codestory-cli${{ matrix.exe_suffix }}"
           & $bin --version
           & $bin --help
 
@@ -734,7 +747,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
+          $bin = Join-Path $env:CARGO_TARGET_DIR "${{ matrix.rust_target }}/release/codestory-cli${{ matrix.exe_suffix }}"
           python .github/scripts/package-codestory-release.py `
             --version "${{ inputs.version }}" `
             --target "${{ matrix.asset_target }}" `

@@ -7,7 +7,9 @@
 - Windows-only pre-publish qualification now skips unavailable ARM64 release
   evidence and retains protected Vulkan and candidate-installed provenance under
   an explicit server-behavior-only non-claim. Full release qualification remains
-  strict and still requires exact-head quality evidence.
+  strict and still requires exact-head quality evidence. Hosted Windows packages
+  build in a short runner-temporary Cargo target so nested Vulkan CMake and PDB
+  paths remain inside the native toolchain limit.
 
 ## 0.16.0
 
