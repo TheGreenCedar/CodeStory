@@ -475,6 +475,26 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$dev_head"', 'test -n "$GITHUB_SHA"');
     }, /GITHUB_SHA.*dev_head/u],
+    ["hosted-only integration scope removed", packagedCoordinatorFile, workflow => {
+      workflow.on.workflow_dispatch.inputs.scope.options
+        = workflow.on.workflow_dispatch.inputs.scope.options.filter(scope => scope !== "none");
+    }, /dispatch scopes changed/u],
+    ["hosted-only release evidence guard removed", packagedCoordinatorFile, workflow => {
+      workflow.jobs["release-evidence"].if
+        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'none' &&", "");
+    }, /hosted-only integration must skip release evidence/u],
+    ["Linux release evidence guard removed", packagedCoordinatorFile, workflow => {
+      workflow.jobs["release-evidence"].if
+        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'linux' &&", "");
+    }, /Linux server-behavior proof must not require protected release evidence/u],
+    ["Linux package matrix scope removed", packagedProofFile, workflow => {
+      workflow.jobs.build.strategy.matrix
+        = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
+    }, /matrix must select structural JSON by scope/u],
+    ["Linux candidate install guard removed", packagedProofFile, workflow => {
+      const step = draftStep(workflow.jobs.build, "Stage isolated candidate-managed Linux install");
+      step.if = step.if.replace("inputs.scope == 'linux' || ", "");
+    }, /remain runnable in server and Linux scopes/u],
     ["source unversioned cache", sourceFile, workflow => {
       const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
       restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");

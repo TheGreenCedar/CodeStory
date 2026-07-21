@@ -29,6 +29,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 - Disposable full-refresh storage now opens the staged SQLite database with a
   writable handle before its durability flush, so Windows can seal and promote
   the candidate instead of failing `sync_all` with access denied.
+- The proof coordinator now supports explicit hosted-only integration and
+  Linux-only package scopes, so exact-head source, repo-scale, and Linux
+  candidate evidence do not schedule unrelated protected-platform runners.
 - A new explicit `retrieval republish-projections` writer can adopt the current
   semantic and dense-selection policy from one complete stored core without
   source discovery, parsing, or source-file reads. It validates the pinned

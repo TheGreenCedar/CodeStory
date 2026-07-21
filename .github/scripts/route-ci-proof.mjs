@@ -7,7 +7,7 @@ const scopeRank = new Map([
   ["macos", 1],
   ["full", 2],
 ]);
-const coordinatorScopes = new Set(["windows", ...scopeRank.keys()]);
+const coordinatorScopes = new Set(["linux", "windows", ...scopeRank.keys()]);
 
 const macosSurfaces = [
   /^\.github\/workflows\/macos-/u,
@@ -59,7 +59,7 @@ export function selectProofScope(paths, requested = "auto") {
   if (!coordinatorScopes.has(requested)) {
     throw new Error(`unsupported proof scope: ${requested}`);
   }
-  if (requested === "windows") return requested;
+  if (requested === "linux" || requested === "windows") return requested;
   return scopeRank.get(requested) > scopeRank.get(inferred) ? requested : inferred;
 }
 
@@ -120,6 +120,9 @@ function selfTest() {
   }
   if (selectProofScope(fixtures[2].paths, "windows") !== "windows") {
     throw new Error("coordinator Windows proof must select only Windows x64 packaging");
+  }
+  if (selectProofScope(fixtures[2].paths, "linux") !== "linux") {
+    throw new Error("coordinator Linux proof must select only Linux x64 packaging");
   }
 }
 

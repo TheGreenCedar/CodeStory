@@ -1510,7 +1510,7 @@ function expectedPackageRows(graph) {
 
 function validatePackageMatrixExpression(violations, expression, graph) {
   const match = typeof expression === "string" && expression.match(
-    /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'server' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
+    /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'server' && '([^']+)' \|\| inputs\.scope == 'linux' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
   );
   if (!match) {
     violations.push("packaged-platform-proof.yml matrix must select structural JSON by scope");
@@ -1524,6 +1524,7 @@ function validatePackageMatrixExpression(violations, expression, graph) {
         row => row.asset_target === "linux-x64" || row.asset_target === "macos-arm64",
       ),
     },
+    { include: full.filter(row => row.asset_target === "linux-x64") },
     { include: full.filter(row => row.asset_target === "windows-x64") },
     { include: full.filter(row => row.asset_target.startsWith("macos-")) },
     { include: full },
@@ -1772,7 +1773,7 @@ function validatePackagedProof(workflows, violations, graph) {
       '--calibration-bundle "$calibration_bundle"',
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
-      'if [ "$PROOF_SCOPE" = server ]',
+      'if [ "$PROOF_SCOPE" = server ] || [ "$PROOF_SCOPE" = linux ]',
       "--server-behavior-only",
       'test -f "$quality_path"',
       "--timeout-secs 1800",
@@ -1782,8 +1783,9 @@ function validatePackagedProof(workflows, violations, graph) {
   add(
     violations,
     String(candidateStage?.if ?? "").includes("inputs.candidate_installed_proof")
-      && String(candidateStage?.if ?? "").includes("inputs.scope == 'server'"),
-    `${file} candidate-managed Linux staging must require coordinator opt-in and remain runnable in server scope`,
+      && String(candidateStage?.if ?? "").includes("inputs.scope == 'server'")
+      && String(candidateStage?.if ?? "").includes("inputs.scope == 'linux'"),
+    `${file} candidate-managed Linux staging must require coordinator opt-in and remain runnable in server and Linux scopes`,
   );
   requireStepRun(violations, file, job, "Stage isolated candidate-managed Linux install", [
     "--prepare-candidate-installed-proof",
@@ -1800,8 +1802,9 @@ function validatePackagedProof(workflows, violations, graph) {
   add(
     violations,
     String(candidateProof?.if ?? "").includes("inputs.candidate_installed_proof")
-      && String(candidateProof?.if ?? "").includes("inputs.scope == 'server'"),
-    `${file} candidate-installed Linux proof must require coordinator opt-in and remain runnable in server scope`,
+      && String(candidateProof?.if ?? "").includes("inputs.scope == 'server'")
+      && String(candidateProof?.if ?? "").includes("inputs.scope == 'linux'"),
+    `${file} candidate-installed Linux proof must require coordinator opt-in and remain runnable in server and Linux scopes`,
   );
   requireStepRun(violations, file, job, "Prove two-host candidate-installed Linux runtime", [
     "--proof-tier installed_runtime",
@@ -2017,7 +2020,7 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     violations,
     sameMembers(
       at(workflow, "on", "workflow_dispatch", "inputs", "scope", "options"),
-      ["auto", "server", "windows", "macos", "full"],
+      ["auto", "none", "linux", "server", "windows", "macos", "full"],
     ),
     `${file} dispatch scopes changed`,
   );
@@ -2048,7 +2051,13 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     '.path == ".github/workflows/source-proof.yml"',
     '.name == "full-source-gate" and .conclusion == "success"',
   ]);
-  requireStepRun(violations, file, route, "Select change-aware proof scope", ["node .github/scripts/route-ci-proof.mjs --stdin"]);
+  requireStepRun(violations, file, route, "Select change-aware proof scope", [
+    'if [ "$REQUESTED_SCOPE" = none ]; then',
+    "scope=none",
+    "scope=full",
+    'elif [ "$REQUESTED_SCOPE" = "server" ]; then',
+    "node .github/scripts/route-ci-proof.mjs --stdin",
+  ]);
   requireStepRun(violations, file, route, "Read qualification constant-set state", [
     "base_frozen=false",
     "jq -r '.status == \"frozen\"'",
@@ -2193,7 +2202,22 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     `${file} must opt the accepted PR Windows package into candidate-installed proof`,
   );
   const closeout = requireJob(violations, file, workflow, "closeout");
-  requireStepRun(violations, file, closeout, "Require one coherent accepted proof", ["dev/codestory-next moved from proved head"]);
+  const evidence = requireJob(violations, file, workflow, "release-evidence");
+  add(
+    violations,
+    String(evidence.if ?? "").includes("needs.route.outputs.scope != 'none'"),
+    `${file} hosted-only integration must skip release evidence`,
+  );
+  add(
+    violations,
+    String(evidence.if ?? "").includes("needs.route.outputs.scope != 'linux'"),
+    `${file} Linux server-behavior proof must not require protected release evidence`,
+  );
+  requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
+    '[ "$SCOPE" != none ]',
+    '[ "$SCOPE" = linux ]',
+    "dev/codestory-next moved from proved head",
+  ]);
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
 }
 
