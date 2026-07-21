@@ -15803,33 +15803,42 @@ fn semantic_projection_republish_for_runtime(
                 "The selected project root does not own the cached core publication.",
             ));
         }
-        if semantic_projection_source_policy_compatibility(
+        let source_policy_compatibility = semantic_projection_source_policy_compatibility(
             recorded_source_policy,
             source_index_policy,
             expected_schema_version,
             structural_compatibility == StructuralTextPublicationCompatibility::LegacyEmpty,
         )
-        .is_none()
-        {
-            return Err(ApiError::new(
+        .ok_or_else(|| {
+            ApiError::new(
                 "semantic_projection_migration_required",
                 "Pinned source-policy identity differs from the current runtime policy; run a source refresh before republishing semantic projections.",
-            ));
-        }
-        staged
-            .store_mut()
-            .validate_source_policy_exclusion_publication(
-                &expected_publication,
-                &source_manifest.project_id,
-                &source_manifest.workspace_id,
-                recorded_source_policy,
             )
-            .map_err(|error| {
-                ApiError::new(
-                    "semantic_projection_migration_required",
-                    format!("Pinned source-policy publication is not complete: {error}"),
-                )
-            })?;
+        })?;
+        let source_policy_validation = match source_policy_compatibility {
+            SemanticProjectionSourcePolicyCompatibility::Exact => staged
+                .store_mut()
+                .validate_source_policy_exclusion_publication(
+                    &expected_publication,
+                    &source_manifest.project_id,
+                    &source_manifest.workspace_id,
+                    recorded_source_policy,
+                ),
+            SemanticProjectionSourcePolicyCompatibility::LegacyPredecessor => staged
+                .store_mut()
+                .validate_legacy_v1_source_policy_exclusion_publication(
+                    &expected_publication,
+                    &source_manifest.project_id,
+                    &source_manifest.workspace_id,
+                    recorded_source_policy,
+                ),
+        };
+        source_policy_validation.map_err(|error| {
+            ApiError::new(
+                "semantic_projection_migration_required",
+                format!("Pinned source-policy publication is not complete: {error}"),
+            )
+        })?;
         let source_exclusions =
             staged
                 .store_mut()
@@ -18047,6 +18056,7 @@ mod tests {
         ResolutionCertainty, SourceLocation,
     };
     use crossbeam_channel::unbounded;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::MutexGuard as StdMutexGuard;
@@ -18069,6 +18079,34 @@ mod tests {
             DEFAULT_SOURCE_FILE_BYTE_CAP,
             codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         )
+    }
+
+    fn legacy_source_policy_exclusion_digest_for_test(
+        records: &[SourcePolicyExclusionRecord],
+    ) -> String {
+        fn hash_part(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"codestory-source-policy-exclusion-publication-v1\0");
+        for record in records {
+            for value in [
+                record.normalized_path.as_bytes(),
+                record.project_id.as_bytes(),
+                record.workspace_id.as_bytes(),
+                record.content_hash.as_bytes(),
+                record.policy_version.as_bytes(),
+                record.core_generation_id.as_bytes(),
+                record.core_run_id.as_bytes(),
+            ] {
+                hash_part(&mut hasher, value);
+            }
+            hash_part(&mut hasher, &record.observed_size.to_le_bytes());
+            hash_part(&mut hasher, &record.byte_cap.to_le_bytes());
+        }
+        format!("{:x}", hasher.finalize())
     }
 
     #[test]
@@ -26117,6 +26155,11 @@ fn build_llm_symbol_doc_text() -> String {
                 &exclusions,
             )
             .expect("replace retained source-policy publication");
+        let legacy_source_policy_digest = legacy_source_policy_exclusion_digest_for_test(
+            &before_storage
+                .get_source_policy_exclusions()
+                .expect("read retained source-policy exclusions"),
+        );
         let dense_before = before_storage
             .validate_dense_anchor_publication(&before)
             .expect("retained dense publication");
@@ -26140,6 +26183,13 @@ fn build_llm_symbol_doc_text() -> String {
         drop(before_storage);
 
         let legacy = rusqlite::Connection::open(&storage_path).expect("open retained v1 core");
+        legacy
+            .execute(
+                "UPDATE source_policy_exclusion_publication
+                 SET schema_version = 1, exclusion_digest = ?1",
+                rusqlite::params![legacy_source_policy_digest],
+            )
+            .expect("restore authentic retained v1 publication identity");
         legacy
             .execute_batch(
                 "DELETE FROM structural_text_unit_publication;

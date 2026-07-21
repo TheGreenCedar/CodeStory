@@ -33,9 +33,10 @@
   previous complete core, retrieval identity, and search rollback; retrieval
   stays unavailable until its existing builder publishes a generation bound
   to the replacement core. The same writer can rebind the exact retained
-  `oversized-source-v1` predecessor to `bounded-source-exclusion-v2` only for
-  the schema-29 empty-structural case with byte and structural-unit caps
-  unchanged; every other policy or cap transition remains fail closed. A
+  schema-1 `oversized-source-v1` publication to
+  `bounded-source-exclusion-v2` only for the schema-29 empty-structural case
+  with its v1 digest valid and byte and structural-unit caps unchanged; every
+  other policy or cap transition remains fail closed. A
   runtime-cache failure or late cancellation after
   durable commit completes the prepared search publication, clears controller
   indexing state, and still leaves retrieval bound to the prior core.

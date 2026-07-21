@@ -524,15 +524,42 @@ fn read_source_policy_exclusion_rollback_identity(
         && publication_columns
             .iter()
             .any(|column| column == "structural_unit_cap");
+    let manifest_schema_version = conn
+        .query_row(
+            "SELECT schema_version
+             FROM source_policy_exclusion_publication
+             WHERE id = 1 AND complete = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(manifest_schema_version) = manifest_schema_version else {
+        return Ok(None);
+    };
+    let manifest_schema_version = u32::try_from(manifest_schema_version)
+        .map_err(|_| promotion_error("Source policy exclusion rollback schema is invalid"))?;
+    let format = match manifest_schema_version {
+        LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION => {
+            SourcePolicyExclusionPublicationFormat::LegacyV1
+        }
+        SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION => {
+            if !has_structural_policy_identity {
+                return Err(promotion_error(
+                    "Current source policy exclusion rollback schema is missing structural identity",
+                ));
+            }
+            SourcePolicyExclusionPublicationFormat::Current
+        }
+        _ => {
+            return Err(promotion_error(
+                "Source policy exclusion rollback schema is unsupported",
+            ));
+        }
+    };
     let structural_unit_cap_expression = if has_structural_policy_identity {
         "structural_unit_cap"
     } else {
         "2048"
-    };
-    let manifest_schema_version = if has_structural_policy_identity {
-        SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION
-    } else {
-        1
     };
     let identity_query = format!(
         "SELECT project_id, workspace_id, core_generation_id, core_run_id,
@@ -597,11 +624,7 @@ fn read_source_policy_exclusion_rollback_identity(
     } else {
         read_legacy_source_policy_exclusions(&conn)?
     };
-    let records_digest = if has_structural_policy_identity {
-        source_policy_exclusion_digest(&records)
-    } else {
-        legacy_source_policy_exclusion_digest(&records)
-    };
+    let records_digest = format.digest(&records);
     if identity.core_generation_id != publication.generation_id
         || identity.core_run_id != publication.run_id
         || identity.core_published_at_epoch_ms != publication.published_at_epoch_ms
@@ -615,6 +638,7 @@ fn read_source_policy_exclusion_rollback_identity(
                 || record.policy_version != identity.policy_version
                 || record.byte_cap != identity.byte_cap
                 || record.structural_unit_cap != identity.structural_unit_cap
+                || !format.qualifies(record)
         })
     {
         return Err(promotion_error(format!(
@@ -3189,6 +3213,7 @@ fn dense_anchor_content_summary(
 }
 
 pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 1;
 const SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
     b"codestory-source-policy-exclusion-publication-v2\0";
 const LEGACY_SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
@@ -3287,6 +3312,41 @@ fn legacy_source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]
         hash_dense_anchor_part(&mut hasher, &record.byte_cap.to_le_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcePolicyExclusionPublicationFormat {
+    Current,
+    LegacyV1,
+}
+
+impl SourcePolicyExclusionPublicationFormat {
+    fn schema_version(self) -> u32 {
+        match self {
+            Self::Current => SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+            Self::LegacyV1 => LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+        }
+    }
+
+    fn digest(self, records: &[SourcePolicyExclusionRecord]) -> String {
+        match self {
+            Self::Current => source_policy_exclusion_digest(records),
+            Self::LegacyV1 => legacy_source_policy_exclusion_digest(records),
+        }
+    }
+
+    fn qualifies(self, record: &SourcePolicyExclusionRecord) -> bool {
+        match self {
+            Self::Current => {
+                (record.observed_size > record.byte_cap && record.observed_unit_count == 0)
+                    || (record.observed_size <= record.byte_cap
+                        && record.observed_unit_count > record.structural_unit_cap)
+            }
+            Self::LegacyV1 => {
+                record.observed_size > record.byte_cap && record.observed_unit_count == 0
+            }
+        }
+    }
 }
 
 fn read_legacy_source_policy_exclusions(
@@ -7866,12 +7926,47 @@ impl Storage {
         workspace_id: &str,
         policy: SourcePolicyExclusionPolicyIdentity<'_>,
     ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        self.validate_source_policy_exclusion_publication_format(
+            publication,
+            project_id,
+            workspace_id,
+            policy,
+            SourcePolicyExclusionPublicationFormat::Current,
+        )
+    }
+
+    /// Validate an authentic schema-v1 oversized-source publication after its
+    /// database has been structurally migrated, without rewriting its identity.
+    pub fn validate_legacy_v1_source_policy_exclusion_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        self.validate_source_policy_exclusion_publication_format(
+            publication,
+            project_id,
+            workspace_id,
+            policy,
+            SourcePolicyExclusionPublicationFormat::LegacyV1,
+        )
+    }
+
+    fn validate_source_policy_exclusion_publication_format(
+        &self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
+        format: SourcePolicyExclusionPublicationFormat,
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
         let manifest = self
             .get_source_policy_exclusion_manifest()?
             .ok_or_else(|| {
                 StorageError::Other("source policy exclusion manifest is missing".into())
             })?;
-        if manifest.schema_version != SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION
+        if manifest.schema_version != format.schema_version()
             || !manifest.complete
             || manifest.project_id != project_id
             || manifest.workspace_id != workspace_id
@@ -7889,7 +7984,7 @@ impl Storage {
         }
         let records = read_source_policy_exclusions(&self.conn)?;
         if manifest.exclusion_count != records.len() as u64
-            || manifest.exclusion_digest != source_policy_exclusion_digest(&records)
+            || manifest.exclusion_digest != format.digest(&records)
             || records.iter().any(|record| {
                 record.project_id != manifest.project_id
                     || record.workspace_id != manifest.workspace_id
@@ -7898,10 +7993,7 @@ impl Storage {
                     || record.policy_version != manifest.policy_version
                     || record.byte_cap != manifest.byte_cap
                     || record.structural_unit_cap != manifest.structural_unit_cap
-                    || !((record.observed_size > record.byte_cap
-                        && record.observed_unit_count == 0)
-                        || (record.observed_size <= record.byte_cap
-                            && record.observed_unit_count > record.structural_unit_cap))
+                    || !format.qualifies(record)
             })
         {
             return Err(StorageError::Other(

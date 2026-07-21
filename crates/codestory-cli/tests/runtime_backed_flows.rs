@@ -1,8 +1,15 @@
 use fs4::fs_std::FileExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+
+fn empty_legacy_source_policy_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-source-policy-exclusion-publication-v1\0");
+    format!("{:x}", hasher.finalize())
+}
 
 fn copy_tictactoe_workspace() -> tempfile::TempDir {
     let temp = tempdir().expect("create temp dir");
@@ -84,11 +91,24 @@ fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> P
         )
         .expect("read structural fixture counts");
     assert_eq!(structural_counts, (0, 0, 0));
+    let source_exclusion_count = connection
+        .query_row("SELECT COUNT(*) FROM source_policy_exclusion", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("read source exclusion count");
+    assert_eq!(source_exclusion_count, 0);
+    connection
+        .execute(
+            "UPDATE source_policy_exclusion_publication
+             SET schema_version = 1,
+                 exclusion_digest = ?1,
+                 policy_version = 'oversized-source-v1'",
+            rusqlite::params![empty_legacy_source_policy_digest()],
+        )
+        .expect("restore authentic retained v1 source-policy publication");
     connection
         .execute_batch(
-            "UPDATE source_policy_exclusion_publication
-                SET policy_version = 'oversized-source-v1';
-             DELETE FROM structural_text_unit_publication;
+            "DELETE FROM structural_text_unit_publication;
              ALTER TABLE index_publication RENAME TO index_publication_v30;
              CREATE TABLE index_publication (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
