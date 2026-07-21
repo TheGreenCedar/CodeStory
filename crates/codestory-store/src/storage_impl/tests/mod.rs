@@ -5047,7 +5047,9 @@ fn disposable_full_build_abort_child() {
         }])
         .expect("write disposable child stage");
     fs::write(&sentinel_path, b"disposable-stage-written\n").expect("write abort sentinel");
-    File::open(&sentinel_path)
+    OpenOptions::new()
+        .write(true)
+        .open(&sentinel_path)
         .and_then(|file| file.sync_all())
         .expect("sync abort sentinel");
     std::process::abort();
@@ -6138,6 +6140,7 @@ fn staged_promotion_rejects_missing_corrupt_or_timestamp_drifted_candidate_manif
             live.get_files().expect("live files")[0].path,
             PathBuf::from("old.rs")
         );
+        drop(live);
 
         cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
         cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
@@ -6203,6 +6206,7 @@ fn staged_promotion_rejects_missing_corrupt_or_drifted_structural_manifest() {
             live.get_files().expect("live files")[0].path,
             PathBuf::from("old.rs")
         );
+        drop(live);
 
         cleanup_sqlite_sidecars(&live_path).expect("clean live fixture");
         cleanup_sqlite_sidecars(&staged_path).expect("clean staged fixture");
@@ -6433,6 +6437,7 @@ fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_
         "store recovery must not synthesize policy evidence"
     );
     assert!(!committed_path.exists());
+    drop(recovered);
 
     cleanup_sqlite_sidecars(&live_path).expect("clean legacy fixture");
 }

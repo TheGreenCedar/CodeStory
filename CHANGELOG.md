@@ -26,6 +26,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 - Retrieval indexing now binds the selected project runtime after compatibility
   preflight and before executing an automatic incremental refresh, preventing
   exact-head repo-scale evidence runs from failing with an unopened project.
+- Disposable full-refresh storage now opens the staged SQLite database with a
+  writable handle before its durability flush, so Windows can seal and promote
+  the candidate instead of failing `sync_all` with access denied.
 - A new explicit `retrieval republish-projections` writer can adopt the current
   semantic and dense-selection policy from one complete stored core without
   source discovery, parsing, or source-file reads. It validates the pinned
