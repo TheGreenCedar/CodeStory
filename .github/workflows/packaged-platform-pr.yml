@@ -230,8 +230,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ steps.resolve.outputs.mode }}" = "integration" ]; then
-            if [ "$REQUESTED_SCOPE" = none ]; then
-              scope=none
+            if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then
+              scope="$REQUESTED_SCOPE"
             else
               scope=full
             fi
