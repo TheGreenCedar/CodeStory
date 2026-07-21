@@ -1238,7 +1238,7 @@ mod tests {
             projection_count: Some(1),
             symbol_doc_count: Some(1),
             dense_projection_count: Some(1),
-            semantic_policy_version: Some("graph_first_v1".into()),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
             graph_artifact_hash: Some("graph".into()),
             dense_reason_counts_json: Some("{}".into()),
             precise_semantic_import_status: None,

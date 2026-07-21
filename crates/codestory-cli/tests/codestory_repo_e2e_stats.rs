@@ -1551,10 +1551,10 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
     assert_eq!(
         stats.retrieval_manifest.dense_projection_count, stats.retrieval_manifest.projection_count,
-        "legacy projection_count should mirror dense_projection_count under graph_first_v1"
+        "legacy projection_count should mirror dense_projection_count under graph_first_v2"
     );
     assert_eq!(
-        stats.retrieval_manifest.semantic_policy_version, "graph_first_v1",
+        stats.retrieval_manifest.semantic_policy_version, "graph_first_v2",
         "full retrieval manifest should record the active dense policy"
     );
     assert!(

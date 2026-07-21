@@ -424,7 +424,7 @@ Semantic sync does these pieces of work:
 
 - build deterministic generated text for durable AST symbols and store it in `symbol_search_doc`
 - build deterministic component/community report docs with extracted provenance
-- classify each symbol under `graph_first_v1`
+- classify each symbol under `graph_first_v2`
 - reuse unchanged dense-anchor input metadata when generated text hash, selection reason, and policy version still match
 - publish selected anchor text, source provenance, source range, content hash, policy, and exact core generation/run identity without loading the embedding engine
 - prune stale symbol docs or dense inputs that no longer correspond to the refreshed graph and policy
@@ -448,7 +448,7 @@ Incremental refresh scopes symbol-doc and dense-anchor invalidation to changed o
 
 The default symbol-doc scope is durable symbols: classes, structs, interfaces, annotations, unions, enums, typedefs, functions, methods, macros, global variables, constants, and enum constants. Lower-signal module, namespace, package, field, local variable, and type-parameter docs stay out of dense retrieval by default while remaining present in graph and lexical search. Set `CODESTORY_SEMANTIC_DOC_SCOPE=all` only for investigations.
 
-The dense-anchor policy version is `graph_first_v1`. Dense reasons are `public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `component_report`, and `unstructured_doc`. Private trivial helpers, generated/vendor code, and test-only implementation details are skipped for dense embedding unless they are structurally central; they remain discoverable through exact lookup, `symbol_search_doc`, source lexical search, and graph expansion.
+The dense-anchor policy version is `graph_first_v2`. Dense reasons are `public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `component_report`, and `unstructured_doc`. Centrality uses complete bounded graph relationship counts, while generated symbol documents retain their six-item member and related-symbol presentation caps. Private trivial helpers, generated/vendor code, and test-only implementation details are skipped for dense embedding unless they are structurally central; they remain discoverable through exact lookup, `symbol_search_doc`, source lexical search, and graph expansion.
 
 The default semantic text alias policy is `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`. It keeps compact language, terminal-name, owner-name, and symbol-role hints, but leaves out the noisier full name-alias and path-alias lists from the earlier `current_alias` research variant. Use `no_alias` for baseline research rows and `current_alias` only when reproducing older alias-enriched runs.
 
@@ -553,7 +553,7 @@ The index summary reports graph and semantic work separately:
 - `semantic_docs.embedded`: always zero for core indexing; vector production is retrieval-owned
 - `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
 - `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
-- `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v1`
+- `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v2`
 - `staged_snapshot_copy`: successful incremental live-to-staged SQLite backup-call wall and logical source/target database bytes (`page_count * page_size`); this clone happens before incremental indexing, is outside `publish_ms`, and is absent for full refresh
 - `core_promotion`: successful nested promotion wall, validation/copy/journal/restore/cleanup subphases, logical candidate/prior/rollback database bytes, and its saturating residual; rollback backup fields are absent for a first publication
 

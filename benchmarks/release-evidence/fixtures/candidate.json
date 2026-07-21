@@ -14,7 +14,7 @@
   "artifacts": {
     "stats": {
       "path": "candidate-stats.json",
-      "sha256": "921d7d9c31040b0e437f0971474ca6cb994c5efd38c0f3ace29548d8678e6e8e",
+      "sha256": "e30621e112169f65eaae05e1f5b3720f90399a8399f6cf457108645ac47b1e8a",
       "bytes": 1088
     },
     "packet": {
@@ -63,8 +63,8 @@
   "release_claims": {
     "graph_schema": "codestory.release-claims/v1",
     "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-    "observed_at": "2026-07-16T11:00:00.000Z",
-    "expires_at": "2026-07-17T11:00:00.000Z",
+    "observed_at": "2026-07-21T02:13:20.738Z",
+    "expires_at": "2026-07-22T02:13:20.738Z",
     "requested_claims": [
       {
         "id": "retrieval_readiness",
@@ -92,8 +92,8 @@
         "tier": "live_behavior",
         "status": "pass",
         "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-        "observed_at": "2026-07-16T11:00:00.000Z",
-        "expires_at": "2026-07-17T11:00:00.000Z",
+        "observed_at": "2026-07-21T02:13:20.738Z",
+        "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {
           "repository": "TheGreenCedar/CodeStory",
           "commit": "2222222222222222222222222222222222222222",
@@ -111,8 +111,8 @@
         "tier": "live_behavior",
         "status": "measured",
         "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-        "observed_at": "2026-07-16T11:00:00.000Z",
-        "expires_at": "2026-07-17T11:00:00.000Z",
+        "observed_at": "2026-07-21T02:13:20.738Z",
+        "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {
           "repository": "TheGreenCedar/CodeStory",
           "commit": "2222222222222222222222222222222222222222",
@@ -132,8 +132,8 @@
         "tier": "answer_quality",
         "status": "pass",
         "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-        "observed_at": "2026-07-16T11:00:00.000Z",
-        "expires_at": "2026-07-17T11:00:00.000Z",
+        "observed_at": "2026-07-21T02:13:20.738Z",
+        "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {
           "repository": "TheGreenCedar/CodeStory",
           "commit": "2222222222222222222222222222222222222222",

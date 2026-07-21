@@ -3079,7 +3079,7 @@ mod tests {
                 projection_count: Some(0),
                 symbol_doc_count: Some(0),
                 dense_projection_count: Some(0),
-                semantic_policy_version: Some("graph_first_v1".into()),
+                semantic_policy_version: Some(codestory_retrieval::SEMANTIC_POLICY_VERSION.into()),
                 graph_artifact_hash: Some("graph-test-hash".into()),
                 dense_reason_counts_json: Some("{}".into()),
                 precise_semantic_import_status: None,

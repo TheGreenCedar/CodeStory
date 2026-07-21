@@ -74,7 +74,9 @@ pub use executor::{
     QueryExecutor, QueryResult, QueryTrace, RetrievalPublicationIdentity, StageCompletionStatus,
     StageTrace, cancellation_flag,
 };
-pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
+pub use generation::{
+    SEMANTIC_POLICY_VERSION, SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+};
 pub use health::{
     ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,
     RetrievalManifestLaneProvenance, RetrievalStatusReport, probe_infrastructure_health,

@@ -2562,7 +2562,7 @@ fn component_access_lookup_rejects_zero_bind_limit() -> Result<(), StorageError>
 }
 
 #[test]
-fn test_symbol_search_doc_version_mismatch_detection() -> Result<(), StorageError> {
+fn test_symbol_search_doc_contract_mismatch_detection() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[Node {
         id: NodeId(500),
@@ -2586,8 +2586,9 @@ fn test_symbol_search_doc_version_mismatch_detection() -> Result<(), StorageErro
         updated_at_epoch_ms: 123,
     }])?;
 
-    assert!(!storage.has_symbol_search_doc_version_mismatch(6)?);
-    assert!(storage.has_symbol_search_doc_version_mismatch(5)?);
+    assert!(!storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v1")?);
+    assert!(storage.has_symbol_search_doc_contract_mismatch(5, "graph_first_v1")?);
+    assert!(storage.has_symbol_search_doc_contract_mismatch(6, "graph_first_v2")?);
     Ok(())
 }
 

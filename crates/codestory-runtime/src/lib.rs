@@ -6130,9 +6130,9 @@ const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
 #[cfg(test)]
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
-const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
+const SEMANTIC_POLICY_VERSION: &str = codestory_retrieval::SEMANTIC_POLICY_VERSION;
 const SYMBOL_SEARCH_DOC_PROVENANCE: &str = "extracted";
-const DENSE_CENTRAL_LABEL_THRESHOLD: usize = 12;
+const DENSE_CENTRAL_RELATIONSHIP_THRESHOLD: usize = 12;
 const DENSE_CENTRAL_SCORE_THRESHOLD: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7443,6 +7443,7 @@ struct SemanticDocGraphContext {
     child_labels: HashMap<GraphNodeId, Vec<String>>,
     referenced_labels: HashMap<GraphNodeId, Vec<String>>,
     edge_digests: HashMap<GraphNodeId, Vec<String>>,
+    centrality: HashMap<GraphNodeId, DenseAnchorCentrality>,
     file_paths: HashMap<GraphNodeId, String>,
     file_read_paths: HashMap<GraphNodeId, String>,
 }
@@ -7460,6 +7461,14 @@ struct SemanticNodeGraphSummary {
     child_labels: Vec<String>,
     referenced_labels: Vec<String>,
     edge_kind_counts: HashMap<String, usize>,
+    centrality: DenseAnchorCentrality,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DenseAnchorCentrality {
+    child_count: usize,
+    related_count: usize,
+    edge_count: usize,
 }
 
 impl SemanticNodeGraphSummary {
@@ -7473,22 +7482,22 @@ impl SemanticNodeGraphSummary {
     ) {
         let kind = format!("{:?}", edge.kind);
         *self.edge_kind_counts.entry(kind).or_insert(0) += 1;
+        self.centrality.edge_count = self.centrality.edge_count.saturating_add(1);
 
-        if self.child_labels.len() < 6
-            && edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+        if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
             && edge.source == node.id
             && let Some(child) = semantic_graph_node(edge.target, page_nodes, endpoint_nodes)
             && llm_indexable_kind_for_scope(child.kind, scope)
         {
             let label = node_display_name(child);
             if !label.is_empty() {
-                self.child_labels.push(label);
+                self.centrality.child_count = self.centrality.child_count.saturating_add(1);
+                if self.child_labels.len() < 6 {
+                    self.child_labels.push(label);
+                }
             }
         }
 
-        if self.referenced_labels.len() >= 6 {
-            return;
-        }
         let (source, target) = edge.effective_endpoints();
         let other = if source == node.id {
             target
@@ -7504,12 +7513,19 @@ impl SemanticNodeGraphSummary {
             return;
         }
         let label = node_display_name(other_node);
-        if !label.is_empty() && !self.referenced_labels.contains(&label) {
+        if label.is_empty() {
+            return;
+        }
+        self.centrality.related_count = self.centrality.related_count.saturating_add(1);
+        if self.referenced_labels.len() < 6 && !self.referenced_labels.contains(&label) {
             self.referenced_labels.push(label);
         }
     }
 
-    fn edge_digest(self, limit: usize) -> (Vec<String>, Vec<String>, Vec<String>) {
+    fn finish(
+        self,
+        limit: usize,
+    ) -> (Vec<String>, Vec<String>, Vec<String>, DenseAnchorCentrality) {
         let mut counts = self.edge_kind_counts.into_iter().collect::<Vec<_>>();
         counts.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
         let edge_digest = counts
@@ -7517,7 +7533,12 @@ impl SemanticNodeGraphSummary {
             .take(limit)
             .map(|(kind, count)| format!("{kind}={count}"))
             .collect();
-        (self.child_labels, self.referenced_labels, edge_digest)
+        (
+            self.child_labels,
+            self.referenced_labels,
+            edge_digest,
+            self.centrality,
+        )
     }
 }
 
@@ -7594,22 +7615,21 @@ impl SemanticDocGraphContext {
             file_read_paths,
             ..Default::default()
         };
+        let endpoint_nodes = HashMap::new();
         for node in semantic_nodes {
             let edges = edges_by_node
                 .get(&node.id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            context.child_labels.insert(
-                node.id,
-                child_symbol_labels_from_edges(node, edges, &nodes_by_id, 6, scope),
-            );
-            context.referenced_labels.insert(
-                node.id,
-                referenced_symbol_labels_from_edges(node, edges, &nodes_by_id, 6, scope),
-            );
-            context
-                .edge_digests
-                .insert(node.id, edge_digest_for_edges(edges, 6));
+            let mut summary = SemanticNodeGraphSummary::default();
+            for edge in edges {
+                summary.observe_edge(node, edge, &nodes_by_id, &endpoint_nodes, scope);
+            }
+            let (child_labels, referenced_labels, edge_digest, centrality) = summary.finish(6);
+            context.child_labels.insert(node.id, child_labels);
+            context.referenced_labels.insert(node.id, referenced_labels);
+            context.edge_digests.insert(node.id, edge_digest);
+            context.centrality.insert(node.id, centrality);
         }
 
         Ok(context)
@@ -7803,10 +7823,11 @@ impl SemanticDocGraphContext {
         };
         for node in semantic_nodes {
             let summary = summaries.remove(&node.id).unwrap_or_default();
-            let (child_labels, referenced_labels, edge_digest) = summary.edge_digest(6);
+            let (child_labels, referenced_labels, edge_digest, centrality) = summary.finish(6);
             context.child_labels.insert(node.id, child_labels);
             context.referenced_labels.insert(node.id, referenced_labels);
             context.edge_digests.insert(node.id, edge_digest);
+            context.centrality.insert(node.id, centrality);
         }
 
         Ok((context, stats))
@@ -8005,62 +8026,6 @@ fn edge_digest_for_node(storage: &Storage, node_id: GraphNodeId, limit: usize) -
         .and_then(|edges_by_node| edges_by_node.get(&node_id).cloned())
         .map(|edges| edge_digest_for_edges(&edges, limit))
         .unwrap_or_default()
-}
-
-fn referenced_symbol_labels_from_edges(
-    node: &GraphNode,
-    edges: &[GraphEdge],
-    nodes_by_id: &HashMap<GraphNodeId, &GraphNode>,
-    limit: usize,
-    scope: SemanticDocScope,
-) -> Vec<String> {
-    let mut labels = Vec::new();
-
-    for edge in edges {
-        let (source, target) = edge.effective_endpoints();
-        let other = if source == node.id {
-            target
-        } else if target == node.id {
-            source
-        } else {
-            continue;
-        };
-        let Some(other_node) = nodes_by_id.get(&other) else {
-            continue;
-        };
-        if !llm_indexable_kind_for_scope(other_node.kind, scope) {
-            continue;
-        }
-        let label = node_display_name(other_node);
-        if label.is_empty() || labels.contains(&label) {
-            continue;
-        }
-        labels.push(label);
-        if labels.len() >= limit {
-            break;
-        }
-    }
-
-    labels
-}
-
-fn child_symbol_labels_from_edges(
-    node: &GraphNode,
-    edges: &[GraphEdge],
-    nodes_by_id: &HashMap<GraphNodeId, &GraphNode>,
-    limit: usize,
-    scope: SemanticDocScope,
-) -> Vec<String> {
-    edges
-        .iter()
-        .filter(|edge| edge.kind == codestory_contracts::graph::EdgeKind::MEMBER)
-        .filter(|edge| edge.source == node.id)
-        .filter_map(|edge| nodes_by_id.get(&edge.target).copied())
-        .filter(|child| llm_indexable_kind_for_scope(child.kind, scope))
-        .map(node_display_name)
-        .filter(|label| !label.is_empty())
-        .take(limit)
-        .collect()
 }
 
 fn compact_doc_lines(lines: impl Iterator<Item = String>, limit: usize) -> Vec<String> {
@@ -8394,49 +8359,28 @@ fn observe_dense_anchor_reason(stats: &mut SemanticProjectionStats, reason: Dens
     }
 }
 
-fn semantic_edge_count(edge_digests: &[String]) -> usize {
-    edge_digests
-        .iter()
-        .filter_map(|digest| digest.rsplit_once('='))
-        .filter_map(|(_, raw)| raw.parse::<usize>().ok())
-        .sum()
-}
-
 fn dense_anchor_score(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> usize {
-    let child_count = graph_context
-        .child_labels
+    let centrality = graph_context
+        .centrality
         .get(&node_id)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let related_count = graph_context
-        .referenced_labels
-        .get(&node_id)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let edge_count = graph_context
-        .edge_digests
-        .get(&node_id)
-        .map(|digests| semantic_edge_count(digests))
-        .unwrap_or(0);
-    child_count
-        .saturating_add(related_count)
-        .saturating_add(edge_count)
+        .copied()
+        .unwrap_or_default();
+    centrality
+        .child_count
+        .saturating_add(centrality.related_count)
+        .saturating_add(centrality.edge_count)
 }
 
 fn dense_anchor_is_central(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> bool {
-    let label_count = graph_context
-        .child_labels
+    let centrality = graph_context
+        .centrality
         .get(&node_id)
-        .map(Vec::len)
-        .unwrap_or(0)
-        .saturating_add(
-            graph_context
-                .referenced_labels
-                .get(&node_id)
-                .map(Vec::len)
-                .unwrap_or(0),
-        );
-    label_count >= DENSE_CENTRAL_LABEL_THRESHOLD
+        .copied()
+        .unwrap_or_default();
+    centrality
+        .child_count
+        .saturating_add(centrality.related_count)
+        >= DENSE_CENTRAL_RELATIONSHIP_THRESHOLD
         && dense_anchor_score(graph_context, node_id) >= DENSE_CENTRAL_SCORE_THRESHOLD
 }
 
@@ -9239,12 +9183,15 @@ fn sync_llm_symbol_projection_for_runtime(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    let graph_doc_schema_mismatch = refresh_scope.file_ids.is_some()
+    let graph_doc_contract_mismatch = refresh_scope.file_ids.is_some()
         && storage
-            .has_symbol_search_doc_version_mismatch(LLM_SYMBOL_DOC_SCHEMA_VERSION)
+            .has_symbol_search_doc_contract_mismatch(
+                LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                SEMANTIC_POLICY_VERSION,
+            )
             .map_err(|e| {
                 ApiError::internal(format!(
-                    "Failed to inspect graph-native semantic doc versions: {e}"
+                    "Failed to inspect graph-native semantic doc contract: {e}"
                 ))
             })?;
     let dense_doc_contract_mismatch = refresh_scope.file_ids.is_some()
@@ -9252,10 +9199,10 @@ fn sync_llm_symbol_projection_for_runtime(
             .values()
             .any(|existing_doc| existing_doc.policy_version != SEMANTIC_POLICY_VERSION);
     let expand_semantic_scope_for_contract_repair =
-        graph_doc_schema_mismatch || dense_doc_contract_mismatch;
+        graph_doc_contract_mismatch || dense_doc_contract_mismatch;
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
-            graph_doc_schema_mismatch,
+            graph_doc_contract_mismatch,
             dense_doc_contract_mismatch,
             "Stored semantic-doc contract differs from the current schema or embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
         );
@@ -20376,22 +20323,30 @@ mod tests {
         let ordinary = semantic_policy_node(15, NodeKind::FUNCTION, "ordinary", 1);
         let central = semantic_policy_node(16, NodeKind::FUNCTION, "central", 1);
         let mut context = semantic_policy_context("src/internal/graph.rs", &ordinary);
-        context.child_labels.insert(
+        context.centrality.insert(
             ordinary.id,
-            ["a", "b", "c", "d"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            DenseAnchorCentrality {
+                child_count: 2,
+                related_count: 2,
+                edge_count: 4,
+            },
+        );
+        context.child_labels.insert(
+            central.id,
+            (0..6).map(|index| format!("child_{index}")).collect(),
         );
         context.referenced_labels.insert(
             central.id,
-            (0..DENSE_CENTRAL_LABEL_THRESHOLD)
-                .map(|index| format!("ref_{index}"))
-                .collect(),
+            (0..6).map(|index| format!("ref_{index}")).collect(),
         );
-        context
-            .edge_digests
-            .insert(central.id, vec!["CALL=24".to_string()]);
+        context.centrality.insert(
+            central.id,
+            DenseAnchorCentrality {
+                child_count: 0,
+                related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+                edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+            },
+        );
 
         assert_eq!(
             dense_anchor_reason_for_node(
@@ -20415,6 +20370,53 @@ mod tests {
             ),
             Some(DenseAnchorReason::CentralGraphNode)
         );
+        assert_eq!(
+            context
+                .child_labels
+                .get(&central.id)
+                .expect("bounded child labels")
+                .len(),
+            6
+        );
+        assert_eq!(
+            context
+                .referenced_labels
+                .get(&central.id)
+                .expect("bounded related labels")
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn dense_policy_keeps_low_degree_local_functions_and_variables_sparse() {
+        let function = semantic_policy_node(17, NodeKind::FUNCTION, "local_fn", 1);
+        let variable = semantic_policy_node(18, NodeKind::VARIABLE, "local_value", 1);
+        let mut context = semantic_policy_context("src/internal/local.rs", &function);
+        for node_id in [function.id, variable.id] {
+            context.centrality.insert(
+                node_id,
+                DenseAnchorCentrality {
+                    child_count: 0,
+                    related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD - 1,
+                    edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+                },
+            );
+        }
+
+        for node in [&function, &variable] {
+            assert_eq!(
+                dense_anchor_reason_for_node(
+                    &context,
+                    node,
+                    &node.serialized_name,
+                    Some("src/internal/local.rs"),
+                    "semantic_doc_version: 6\nkind: local\n",
+                    Some(AccessKind::Private),
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -25448,6 +25450,98 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn unchanged_incremental_refresh_repairs_zero_dense_previous_policy() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let mut storage = Storage::open(&storage_path).expect("open current semantic publication");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("load core publication")
+            .expect("complete core publication");
+        assert!(
+            storage
+                .clear_dense_anchor_inputs()
+                .expect("remove current dense anchors")
+                > 0,
+            "fixture must begin with current dense anchors"
+        );
+        let legacy_manifest = storage
+            .publish_dense_anchor_generation(&publication, "graph_first_v1")
+            .expect("publish valid zero-dense previous policy");
+        assert_eq!(legacy_manifest.anchor_count, 0);
+        assert_eq!(legacy_manifest.policy_version, "graph_first_v1");
+
+        let mut symbol_docs = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load graph-native docs");
+        assert!(!symbol_docs.is_empty(), "fixture must contain symbol docs");
+        for doc in &mut symbol_docs {
+            doc.policy_version = "graph_first_v1".to_string();
+        }
+        let symbol_count = symbol_docs.len();
+        storage
+            .upsert_symbol_search_docs_batch(&symbol_docs)
+            .expect("persist previous-policy symbol docs");
+        drop(storage);
+
+        let repair_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental refresh repairs previous policy");
+        assert!(
+            repair_timings.symbol_search_docs_written.unwrap_or(0)
+                >= clamp_usize_to_u32(symbol_count),
+            "symbol-doc policy drift must expand an empty incremental scope"
+        );
+        assert!(
+            repair_timings.semantic_docs_pending.unwrap_or(0) > 0,
+            "the repaired policy must be able to publish newly eligible dense anchors"
+        );
+
+        let repaired = Storage::open(&storage_path).expect("open repaired semantic publication");
+        let repaired_anchors = repaired
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("load repaired dense anchors");
+        assert!(!repaired_anchors.is_empty());
+        assert!(
+            repaired_anchors
+                .iter()
+                .all(|doc| doc.policy_version == SEMANTIC_POLICY_VERSION)
+        );
+        assert!(
+            repaired
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("load repaired symbol docs")
+                .iter()
+                .all(|doc| doc.policy_version == SEMANTIC_POLICY_VERSION)
+        );
+        let repaired_publication = repaired
+            .get_complete_index_publication()
+            .expect("load repaired core publication")
+            .expect("complete repaired publication");
+        let repaired_manifest = repaired
+            .validate_dense_anchor_publication(&repaired_publication)
+            .expect("validate repaired dense publication");
+        assert_eq!(repaired_manifest.policy_version, SEMANTIC_POLICY_VERSION);
+        assert_eq!(
+            repaired_manifest.anchor_count as usize,
+            repaired_anchors.len()
+        );
+    }
+
+    #[test]
     fn full_refresh_repairs_reused_dense_anchors_missing_contract_metadata() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -26638,7 +26732,6 @@ fn build_llm_symbol_doc_text() -> String {
     #[test]
     fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
         const INCIDENT_EDGE_COUNT: i64 = SEMANTIC_EDGE_STREAM_BATCH_SIZE as i64 * 2 + 17;
-        const RESOLVED_MEMBER_TARGET: CoreNodeId = CoreNodeId(10_000 + INCIDENT_EDGE_COUNT - 1);
         const IGNORED_CALL_RAW_TARGET: CoreNodeId = CoreNodeId(90_000);
         const IGNORED_CALL_RESOLVED_TARGET: CoreNodeId = CoreNodeId(90_001);
 
@@ -26647,7 +26740,7 @@ fn build_llm_symbol_doc_text() -> String {
         let mut storage = Storage::open_build(&storage_path).expect("open staged build");
         let hub = Node {
             id: CoreNodeId(1),
-            kind: NodeKind::CLASS,
+            kind: NodeKind::FUNCTION,
             serialized_name: "hub".to_string(),
             ..Default::default()
         };
@@ -26691,8 +26784,7 @@ fn build_llm_symbol_doc_text() -> String {
                     id: EdgeId(offset + 1),
                     source: hub.id,
                     target: CoreNodeId(10_000 + offset),
-                    kind: EdgeKind::MEMBER,
-                    resolved_target: (offset == 0).then_some(RESOLVED_MEMBER_TARGET),
+                    kind: EdgeKind::CALL,
                     ..Default::default()
                 })
                 .collect::<Vec<_>>(),
@@ -26726,21 +26818,34 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(streamed.child_labels, legacy.child_labels);
         assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
         assert_eq!(streamed.edge_digests, legacy.edge_digests);
+        assert_eq!(streamed.centrality, legacy.centrality);
+        assert!(
+            streamed
+                .child_labels
+                .get(&hub.id)
+                .is_some_and(Vec::is_empty)
+        );
         assert_eq!(
-            streamed.child_labels.get(&hub.id),
-            Some(
-                &(0..6)
-                    .map(|offset| format!("child_{offset:05}"))
-                    .collect::<Vec<_>>()
-            )
+            streamed
+                .referenced_labels
+                .get(&hub.id)
+                .expect("bounded related labels")
+                .len(),
+            6
         );
         assert_eq!(
             streamed.edge_digests.get(&hub.id),
-            Some(&vec![
-                format!("MEMBER={INCIDENT_EDGE_COUNT}"),
-                "CALL=1".to_string(),
-            ])
+            Some(&vec![format!("CALL={}", INCIDENT_EDGE_COUNT + 1)])
         );
+        assert_eq!(
+            streamed.centrality.get(&hub.id),
+            Some(&DenseAnchorCentrality {
+                child_count: 0,
+                related_count: INCIDENT_EDGE_COUNT as usize,
+                edge_count: INCIDENT_EDGE_COUNT as usize + 1,
+            })
+        );
+        assert!(dense_anchor_is_central(&streamed, hub.id));
         assert!(
             !streamed
                 .referenced_labels

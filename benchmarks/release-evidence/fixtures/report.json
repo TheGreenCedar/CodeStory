@@ -7,11 +7,11 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "89a62d4bb007d2f8968e7370bfbdc95025d0f416c4d98393fb104529fd1debb1",
+  "candidate_sha256": "6315250e372d3fde81f99166349054b924f2b2b254f25b91f3c308684755dd81",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
-      "sha256": "921d7d9c31040b0e437f0971474ca6cb994c5efd38c0f3ace29548d8678e6e8e",
+      "sha256": "e30621e112169f65eaae05e1f5b3720f90399a8399f6cf457108645ac47b1e8a",
       "bytes": 1088
     },
     {
@@ -27,8 +27,8 @@
       "tier": "live_behavior",
       "status": "pass",
       "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-      "observed_at": "2026-07-16T11:00:00.000Z",
-      "expires_at": "2026-07-17T11:00:00.000Z",
+      "observed_at": "2026-07-21T02:13:20.738Z",
+      "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
         "repository": "TheGreenCedar/CodeStory",
         "commit": "2222222222222222222222222222222222222222",
@@ -46,8 +46,8 @@
       "tier": "live_behavior",
       "status": "pass",
       "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-      "observed_at": "2026-07-16T11:00:00.000Z",
-      "expires_at": "2026-07-17T11:00:00.000Z",
+      "observed_at": "2026-07-21T02:13:20.738Z",
+      "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
         "repository": "TheGreenCedar/CodeStory",
         "commit": "2222222222222222222222222222222222222222",
@@ -67,8 +67,8 @@
       "tier": "answer_quality",
       "status": "pass",
       "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
-      "observed_at": "2026-07-16T11:00:00.000Z",
-      "expires_at": "2026-07-17T11:00:00.000Z",
+      "observed_at": "2026-07-21T02:13:20.738Z",
+      "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
         "repository": "TheGreenCedar/CodeStory",
         "commit": "2222222222222222222222222222222222222222",
@@ -91,7 +91,7 @@
     "graph_sha256": "ed95d9c4e2723d7911a2d00a97a1453fe77972511f7c74ca8e1f51727783f6dd",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
-    "evaluated_at": "2026-07-16T11:00:00.000Z",
+    "evaluated_at": "2026-07-21T02:13:20.738Z",
     "claims": [
       {
         "id": "answer_quality",

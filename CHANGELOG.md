@@ -4,6 +4,11 @@
 
 ### Release
 
+- Dense-anchor centrality now uses complete bounded graph relationship counts
+  instead of the six-item member and related-symbol presentation lists. This
+  admits genuinely high-degree callables without repository-specific steering,
+  keeps low-degree locals sparse, and advances the policy identity so existing
+  vector generations rebuild rather than reusing selections from the old rule.
 - Compact grounding now ranks roots with architecture evidence and reports a
   typed orientation confidence with bounded-candidate, entrypoint, subsystem,
   and presentation uncertainty. The stdio schema and `ground --why` render the
