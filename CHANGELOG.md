@@ -23,6 +23,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   full refresh. Drill reports omit unavailable pre-refresh metrics and carry
   the compatibility reason instead of copying post-refresh counts into the
   before fields.
+- Retrieval indexing now binds the selected project runtime after compatibility
+  preflight and before executing an automatic incremental refresh, preventing
+  exact-head repo-scale evidence runs from failing with an unopened project.
 - A new explicit `retrieval republish-projections` writer can adopt the current
   semantic and dense-selection policy from one complete stored core without
   source discovery, parsing, or source-file reads. It validates the pinned
