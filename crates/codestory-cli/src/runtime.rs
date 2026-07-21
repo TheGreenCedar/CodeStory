@@ -21,9 +21,6 @@ use std::sync::atomic::AtomicBool;
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, quote_command_path};
 
-const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
-    "previous_incremental_run_incomplete_full_refresh_required";
-
 #[derive(Debug)]
 /// Project state after a command has opened or refreshed the repository.
 ///
@@ -32,7 +29,14 @@ const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
 pub(crate) struct OpenedProject {
     pub(crate) summary: ProjectSummary,
     pub(crate) refresh_mode: Option<IndexMode>,
+    pub(crate) refresh_reason: Option<String>,
     pub(crate) phase_timings: Option<IndexingPhaseTimings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshDecision {
+    pub(crate) effective_mode: Option<IndexMode>,
+    pub(crate) reason: Option<String>,
 }
 
 /// Shared service handles and filesystem roots for a CLI command.
@@ -251,38 +255,90 @@ impl RuntimeContext {
         })
     }
 
-    /// Open the project and run the resolved refresh request when needed.
+    /// Open project state and run the resolved refresh request when needed.
     ///
     /// `RefreshMode::None` is read-only with respect to indexing; commands that
     /// require cached graph data must call `ensure_index_ready` after this.
     pub(crate) fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
-        let summary = self.open_project_summary()?;
-        self.ensure_open_from_summary(refresh, summary)
+        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
+        self.ensure_open_from_decision(refresh, None, decision)
     }
 
-    /// Open project state from an already-read summary.
-    ///
-    /// This keeps commands such as drill from reading the same summary twice
-    /// before deciding whether a refresh is necessary.
-    pub(crate) fn ensure_open_from_summary(
+    /// Open an agent surface while retaining a safe before/after summary for
+    /// report telemetry. Compatibility is decided before any mutable project
+    /// open. When that decision requires full recovery, no trustworthy
+    /// pre-recovery summary exists, so the before-summary remains unavailable.
+    pub(crate) fn ensure_open_with_before(
         &self,
         refresh: RefreshMode,
-        mut summary: ProjectSummary,
+    ) -> Result<(Option<ProjectSummary>, OpenedProject)> {
+        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
+        let before = if decision.reason.is_none() {
+            Some(self.open_project_summary()?)
+        } else {
+            None
+        };
+        let opened = self.ensure_open_from_decision(refresh, before.clone(), decision)?;
+        Ok((before, opened))
+    }
+
+    pub(crate) fn resolve_refresh_decision_with_preflight(
+        &self,
+        refresh: RefreshMode,
+    ) -> Result<RefreshDecision> {
+        match refresh {
+            RefreshMode::Auto | RefreshMode::Incremental => self
+                .index
+                .ensure_incremental_refresh_compatible_at(&self.project_root, &self.storage_path)
+                .map(|()| RefreshDecision {
+                    effective_mode: Some(IndexMode::Incremental),
+                    reason: None,
+                })
+                .or_else(|error| refresh_decision_from_compatibility_error(refresh, error))
+                .map_err(|error| map_api_error_for_project(error, &self.project_root)),
+            RefreshMode::Full => Ok(RefreshDecision {
+                effective_mode: Some(IndexMode::Full),
+                reason: None,
+            }),
+            RefreshMode::None => Ok(RefreshDecision {
+                effective_mode: None,
+                reason: None,
+            }),
+        }
+    }
+
+    fn ensure_open_from_decision(
+        &self,
+        refresh: RefreshMode,
+        mut summary: Option<ProjectSummary>,
+        decision: RefreshDecision,
     ) -> Result<OpenedProject> {
-        let refresh_mode = resolve_refresh_request(refresh, &summary);
         let mut phase_timings = None;
-        if let Some(mode) = refresh_mode {
+        if let Some(mode) = decision.effective_mode {
+            if summary.is_none() {
+                self.open_project_summary()?;
+            }
             phase_timings = Some(
                 self.index
                     .run_indexing_blocking_without_runtime_refresh(mode)
-                    .map_err(map_api_error)?,
+                    .map_err(|error| {
+                        map_api_error_for_project(
+                            annotate_refresh_error(error, refresh, mode),
+                            &self.project_root,
+                        )
+                    })?,
             );
-            summary = self.open_project_summary()?;
+            summary = Some(self.open_project_summary()?);
         }
+        let summary = match summary {
+            Some(summary) => summary,
+            None => self.open_project_summary()?,
+        };
 
         Ok(OpenedProject {
             summary,
-            refresh_mode,
+            refresh_mode: decision.effective_mode,
+            refresh_reason: decision.reason,
             phase_timings,
         })
     }
@@ -741,29 +797,54 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Convert a requested refresh mode into the indexing action to run.
-pub(crate) fn resolve_refresh_request(
-    refresh: RefreshMode,
-    summary: &ProjectSummary,
-) -> Option<IndexMode> {
-    let requires_full_recovery = summary
-        .freshness
+fn refresh_compatibility_reason(error: &ApiError) -> String {
+    error
+        .details
         .as_ref()
-        .and_then(|freshness| freshness.reason.as_deref())
-        == Some(INCOMPLETE_INDEX_RECOVERY_REASON);
-    match refresh {
-        RefreshMode::Auto => Some(if summary.stats.node_count == 0 || requires_full_recovery {
-            IndexMode::Full
-        } else {
-            IndexMode::Incremental
-        }),
-        RefreshMode::Full => Some(IndexMode::Full),
-        RefreshMode::Incremental => Some(if requires_full_recovery {
-            IndexMode::Full
-        } else {
-            IndexMode::Incremental
-        }),
-        RefreshMode::None => None,
+        .and_then(|details| details.cause_code.clone())
+        .unwrap_or_else(|| "full_refresh_required".to_string())
+}
+
+fn refresh_decision_from_compatibility_error(
+    refresh: RefreshMode,
+    error: ApiError,
+) -> Result<RefreshDecision, ApiError> {
+    if refresh == RefreshMode::Auto && error.code == "full_refresh_required" {
+        return Ok(RefreshDecision {
+            effective_mode: Some(IndexMode::Full),
+            reason: Some(refresh_compatibility_reason(&error)),
+        });
+    }
+    Err(error)
+}
+
+pub(crate) fn annotate_refresh_error(
+    mut error: ApiError,
+    requested: RefreshMode,
+    effective: IndexMode,
+) -> ApiError {
+    error.message = format!(
+        "requested={} effective={}: {}",
+        refresh_mode_name(requested),
+        index_mode_name(effective),
+        error.message
+    );
+    error
+}
+
+pub(crate) fn refresh_mode_name(mode: RefreshMode) -> &'static str {
+    match mode {
+        RefreshMode::Auto => "auto",
+        RefreshMode::Full => "full",
+        RefreshMode::Incremental => "incremental",
+        RefreshMode::None => "none",
+    }
+}
+
+pub(crate) fn index_mode_name(mode: IndexMode) -> &'static str {
+    match mode {
+        IndexMode::Full => "full",
+        IndexMode::Incremental => "incremental",
     }
 }
 
@@ -774,7 +855,7 @@ pub(crate) fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>)
         (RefreshMode::Auto, Some(IndexMode::Incremental)) => "auto(incremental)".to_string(),
         (RefreshMode::Full, Some(_)) => "full".to_string(),
         (RefreshMode::Incremental, Some(IndexMode::Full)) => {
-            "incremental(recovery-full)".to_string()
+            "requested-incremental(effective-full)".to_string()
         }
         (RefreshMode::Incremental, Some(IndexMode::Incremental)) => "incremental".to_string(),
         (RefreshMode::None, None) => "none".to_string(),
@@ -906,6 +987,7 @@ fn cache_busy_message(project: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::ApiErrorDetails;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
@@ -922,6 +1004,65 @@ mod tests {
 
     struct EnvSnapshot {
         values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    fn full_refresh_required_error(reason: &str) -> ApiError {
+        ApiError::with_details(
+            "full_refresh_required",
+            format!("requested=incremental effective=none required=full reason={reason}"),
+            ApiErrorDetails {
+                cause_code: Some(reason.to_string()),
+                failed_layer: Some("core_publication_compatibility".to_string()),
+                project: Some("/tmp/project".to_string()),
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+                embedding_capacity: None,
+                embedding_retry: None,
+                coverage_gaps: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn precurrent_schema_selects_full_for_auto_and_rejects_incremental() {
+        for reason in [
+            "complete_core_publication_missing",
+            "incomplete_incremental_publication",
+            "structural_publication_incompatible",
+            "core_schema_upgrade_required",
+        ] {
+            let auto = refresh_decision_from_compatibility_error(
+                RefreshMode::Auto,
+                full_refresh_required_error(reason),
+            )
+            .expect("auto may select explicit full recovery");
+            assert_eq!(auto.effective_mode, Some(IndexMode::Full));
+            assert_eq!(auto.reason.as_deref(), Some(reason));
+
+            let incremental = refresh_decision_from_compatibility_error(
+                RefreshMode::Incremental,
+                full_refresh_required_error(reason),
+            )
+            .expect_err("explicit incremental must not escalate");
+            assert_eq!(incremental.code, "full_refresh_required");
+            assert_eq!(
+                incremental
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some(reason)
+            );
+        }
+
+        let unsafe_state = ApiError::internal("future or corrupt schema state");
+        assert_eq!(
+            refresh_decision_from_compatibility_error(RefreshMode::Auto, unsafe_state)
+                .expect_err("auto must not widen unsafe state")
+                .code,
+            "internal"
+        );
     }
 
     #[test]

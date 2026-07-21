@@ -3419,6 +3419,7 @@ pub struct SymbolSummaryRecord {
 enum NonmutatingOpenPolicy {
     StrictCurrentSchema,
     FreshnessFence,
+    SchemaVersion,
 }
 
 impl Storage {
@@ -3480,6 +3481,13 @@ impl Storage {
     /// observational entry points remain current-schema-only.
     pub fn open_freshness_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::FreshnessFence)
+    }
+
+    /// Read the durable SQLite schema version without migrations, promotion
+    /// recovery, or sidecar creation.
+    pub fn database_schema_version_observational(path: &Path) -> Result<u32, StorageError> {
+        let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::SchemaVersion)?;
+        storage.schema_version()
     }
 
     fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
@@ -3554,6 +3562,7 @@ impl Storage {
                     "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
                 )));
             }
+            NonmutatingOpenPolicy::SchemaVersion => {}
             _ => {}
         }
         Ok(Self {

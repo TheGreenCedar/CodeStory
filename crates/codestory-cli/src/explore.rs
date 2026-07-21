@@ -103,6 +103,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
         let pinned_opened = runtime::OpenedProject {
             summary: runtime.active_project_summary()?,
             refresh_mode: opened.refresh_mode,
+            refresh_reason: opened.refresh_reason.clone(),
             phase_timings: opened.phase_timings.clone(),
         };
         let status = build_explore_status_output(

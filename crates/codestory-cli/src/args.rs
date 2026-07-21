@@ -20,13 +20,12 @@ use codestory_contracts::api::{
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
-const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
-cache already has indexed files.";
+const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty, pre-current, or structurally incompatible cache and `incremental` for a compatible existing publication. An explicit `incremental` request never escalates to `full`; incompatible state returns `full_refresh_required` before workspace reads or writes.";
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
-failure.";
+failure. Explicit `incremental` fails with `full_refresh_required` instead of escalating.";
 const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
-fresh index, or `incremental` to refresh an existing cache in place.";
+fresh index, or `incremental` to refresh a compatible existing cache without allowing full-refresh escalation.";
 const CLI_LONG_ABOUT: &str = "\
 CodeStory turns a local repository into auditable grounding evidence.
 
@@ -1484,6 +1483,8 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) project: &'a str,
     pub(crate) storage_path: &'a str,
     pub(crate) refresh: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh_reason: Option<&'a str>,
     pub(crate) summary: &'a ProjectSummary,
     pub(crate) retrieval: &'a RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1568,6 +1569,10 @@ pub(crate) struct AgentPreflightOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexDryRunOutput<'a> {
+    pub(crate) requested_refresh: &'a str,
+    pub(crate) effective_refresh: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compatibility_reason: Option<&'a str>,
     pub(crate) dry_run: &'a IndexDryRunDto,
 }
 
@@ -1720,10 +1725,16 @@ pub(crate) struct DrillRuntimeTimingsOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillMechanicalOutput {
-    pub(crate) before_files: u32,
-    pub(crate) before_nodes: u32,
-    pub(crate) before_edges: u32,
-    pub(crate) before_errors: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_nodes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_edges: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_errors: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after_files: u32,
     pub(crate) after_nodes: u32,
     pub(crate) after_edges: u32,
@@ -1877,10 +1888,14 @@ pub(crate) struct DrillSummaryStatsOutput {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryMechanicalOutput {
     pub(crate) refresh: String,
-    pub(crate) before: DrillSummaryStatsOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before: Option<DrillSummaryStatsOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after: DrillSummaryStatsOutput,
     pub(crate) index_ready: bool,
-    pub(crate) error_delta: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_delta: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -13,7 +13,7 @@ use crate::args::{
     RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
-use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error, resolve_refresh_request};
+use crate::runtime::{RuntimeContext, annotate_refresh_error, ensure_index_ready, map_api_error};
 
 pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
     match cmd.action {
@@ -98,8 +98,8 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
-    let summary = runtime.open_project_summary()?;
-    let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
+    let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
+    let refresh_mode = decision.effective_mode;
     ensure_retrieval_index_embedding_policy(&sidecar)?;
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
     let outcome =
@@ -133,7 +133,7 @@ fn run_retrieval_index_refresh(
     runtime
         .index
         .run_indexing_blocking(mode)
-        .map_err(map_api_error)
+        .map_err(|error| map_api_error(annotate_refresh_error(error, requested_refresh, mode)))
         .map(|_| ())
         .or_else(|error| {
             if !retrieval_index_should_retry_full_refresh(requested_refresh, &error) {
@@ -142,7 +142,13 @@ fn run_retrieval_index_refresh(
             runtime
                 .index
                 .run_indexing_blocking(IndexMode::Full)
-                .map_err(map_api_error)
+                .map_err(|error| {
+                    map_api_error(annotate_refresh_error(
+                        error,
+                        requested_refresh,
+                        IndexMode::Full,
+                    ))
+                })
                 .map(|_| ())
                 .context("retrieval index full refresh after semantic-doc contract repair")
         })

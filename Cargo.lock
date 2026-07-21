@@ -534,6 +534,7 @@ dependencies = [
  "libc",
  "notify",
  "ratatui",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

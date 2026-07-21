@@ -103,8 +103,9 @@ use output::{
     validate_output_file_parent,
 };
 use runtime::{
-    AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
-    resolve_refresh_request, resolve_source_target, resolve_target,
+    AmbiguousTargetError, RuntimeContext, annotate_refresh_error, ensure_index_ready,
+    index_mode_name, map_api_error, map_api_error_for_project, refresh_label, refresh_mode_name,
+    resolve_source_target, resolve_target,
 };
 use serde::Deserialize;
 #[cfg(test)]
@@ -398,7 +399,7 @@ fn new_agent_surface_runtime(
 
 struct OpenedAgentSurface {
     runtime: RuntimeContext,
-    before: ProjectSummary,
+    before: Option<ProjectSummary>,
     opened: runtime::OpenedProject,
 }
 
@@ -410,8 +411,7 @@ fn open_agent_surface(
     surface: &'static str,
 ) -> Result<OpenedAgentSurface> {
     let runtime = new_agent_surface_runtime(project, profile, run_id)?;
-    let before = runtime.open_project_summary()?;
-    let opened = runtime.ensure_open_from_summary(refresh, before.clone())?;
+    let (before, opened) = runtime.ensure_open_with_before(refresh)?;
     ensure_index_ready(&opened, surface)?;
     codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
         .map_err(map_embedding_preflight_error)
@@ -681,14 +681,20 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         RuntimeContext::new(&cmd.project)?
     };
     if cmd.dry_run {
-        let summary = runtime.open_project_summary()?;
-        let refresh_mode =
-            resolve_refresh_request(cmd.refresh, &summary).unwrap_or(IndexMode::Incremental);
-        let dry_run = runtime
-            .index
-            .dry_run_index(refresh_mode)
-            .map_err(map_api_error)?;
-        let output = IndexDryRunOutput { dry_run: &dry_run };
+        let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
+        let refresh_mode = decision.effective_mode.unwrap_or(IndexMode::Incremental);
+        let dry_run = runtime.index.dry_run_index(refresh_mode).map_err(|error| {
+            map_api_error_for_project(
+                annotate_refresh_error(error, cmd.refresh, refresh_mode),
+                &runtime.project_root,
+            )
+        })?;
+        let output = IndexDryRunOutput {
+            requested_refresh: refresh_mode_name(cmd.refresh),
+            effective_refresh: index_mode_name(refresh_mode),
+            compatibility_reason: decision.reason.as_deref(),
+            dry_run: &dry_run,
+        };
         let markdown = render_index_dry_run_markdown(&output);
         return emit(cmd.format, &output, markdown, cmd.output_file.as_deref());
     }
@@ -731,6 +737,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         project: &opened.summary.root,
         storage_path: &storage_path,
         refresh: &refresh_label,
+        refresh_reason: opened.refresh_reason.as_deref(),
         summary: &opened.summary,
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
@@ -2792,6 +2799,13 @@ fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperatio
             .context("drill retrieval index finalize")?;
     }
     let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
+    let before_stats = before.as_ref().map(|summary| &summary.stats);
+    let before_unavailable_reason = before.is_none().then(|| {
+        opened
+            .refresh_reason
+            .clone()
+            .unwrap_or_else(|| "pre_refresh_summary_unavailable".to_string())
+    });
     let setup_ms = elapsed_ms(setup_timer);
 
     let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
@@ -2856,10 +2870,11 @@ fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperatio
             question: cmd.question.clone(),
             output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
             mechanical: DrillMechanicalOutput {
-                before_files: before.stats.file_count,
-                before_nodes: before.stats.node_count,
-                before_edges: before.stats.edge_count,
-                before_errors: before.stats.error_count,
+                before_files: before_stats.map(|stats| stats.file_count),
+                before_nodes: before_stats.map(|stats| stats.node_count),
+                before_edges: before_stats.map(|stats| stats.edge_count),
+                before_errors: before_stats.map(|stats| stats.error_count),
+                before_unavailable_reason: before_unavailable_reason.clone(),
                 after_files: pinned_summary.stats.file_count,
                 after_nodes: pinned_summary.stats.node_count,
                 after_edges: pinned_summary.stats.edge_count,
@@ -3627,10 +3642,11 @@ fn blocked_drill_suite_repo_output(
             full_report_markdown: String::new(),
             mechanical: DrillSummaryMechanicalOutput {
                 refresh: refresh_label(refresh, None),
-                before: drill_summary_stats(0, 0, 0, 0),
+                before: Some(drill_summary_stats(0, 0, 0, 0)),
+                before_unavailable_reason: None,
                 after: drill_summary_stats(0, 0, 0, 1),
                 index_ready: false,
-                error_delta: 1,
+                error_delta: Some(1),
                 retrieval_status: None,
                 freshness_status: Some("unknown".to_string()),
                 stale_file_count: 0,
@@ -3984,6 +4000,17 @@ fn write_drill_report_file(path: &std::path::Path, content: &str) -> Result<()> 
 
 fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     let sufficiency = &output.evidence_packet.sufficiency;
+    let before_stats = match (
+        output.mechanical.before_files,
+        output.mechanical.before_nodes,
+        output.mechanical.before_edges,
+        output.mechanical.before_errors,
+    ) {
+        (Some(files), Some(nodes), Some(edges), Some(errors)) => {
+            Some(drill_summary_stats(files, nodes, edges, errors))
+        }
+        _ => None,
+    };
     let anchor_statuses: Vec<_> = output
         .anchors
         .iter()
@@ -4122,12 +4149,8 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         full_report_markdown: "drill-report.md".to_string(),
         mechanical: DrillSummaryMechanicalOutput {
             refresh: output.mechanical.refresh.clone(),
-            before: drill_summary_stats(
-                output.mechanical.before_files,
-                output.mechanical.before_nodes,
-                output.mechanical.before_edges,
-                output.mechanical.before_errors,
-            ),
+            before: before_stats,
+            before_unavailable_reason: output.mechanical.before_unavailable_reason.clone(),
             after: drill_summary_stats(
                 output.mechanical.after_files,
                 output.mechanical.after_nodes,
@@ -4135,8 +4158,9 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
                 output.mechanical.after_errors,
             ),
             index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
-            error_delta: i64::from(output.mechanical.after_errors)
-                - i64::from(output.mechanical.before_errors),
+            error_delta: output.mechanical.before_errors.map(|before_errors| {
+                i64::from(output.mechanical.after_errors) - i64::from(before_errors)
+            }),
             retrieval_status: output
                 .mechanical
                 .retrieval
@@ -7996,20 +8020,20 @@ fn compact_excerpt(line: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::RefreshMode;
     use crate::display::{clean_path_string, relative_path};
-    use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
+    use crate::runtime::{cache_root_for_project, fnv1a_hex};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
         AgentRetrievalTraceDto, CorePromotionTimings, DatabaseSnapshotCopyTimings, EdgeId,
-        EdgeKind, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexMode,
-        IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto, IndexedFilesDto,
-        IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId, PacketBudgetDto,
-        PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanDto,
-        PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, ProjectSummary,
-        ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings, RetrievalModeDto,
-        RetrievalStateDto, SearchHit, SearchHitOrigin, SemanticModeDto, SourcePolicyExclusionDto,
-        StorageStatsDto, TrailContextDto,
+        EdgeKind, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphResponse,
+        IndexDryRunDto, IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+        IndexedFileRoleDto, IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings,
+        NodeDetailsDto, NodeId, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
+        PacketClaimDto, PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto,
+        PacketSufficiencyDto, ProjectSummary, ProjectionPersistenceFamilyTimings,
+        ProjectionPersistenceTimings, RetrievalModeDto, RetrievalStateDto, SearchHit,
+        SearchHitOrigin, SemanticModeDto, SourcePolicyExclusionDto, StorageStatsDto,
+        TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8045,6 +8069,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn agent_surface_refresh_fixture() -> (tempfile::TempDir, ProjectArgs, PathBuf, u32) {
+        let temp = tempdir().expect("create temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(project.join("src")).expect("create source directory");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"agent-surface-refresh-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        fs::write(
+            project.join("src/lib.rs"),
+            "pub fn agent_surface_refresh_fixture() -> u32 { 1 }\n",
+        )
+        .expect("write source");
+        let project_args = ProjectArgs {
+            project,
+            cache_dir: Some(cache),
+        };
+        let runtime = RuntimeContext::new_inspect_only(&project_args).expect("create runtime");
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish current core generation");
+        let storage_path = runtime.storage_path.clone();
+        let schema_version = sqlite_schema_version(&storage_path);
+        (temp, project_args, storage_path, schema_version)
+    }
+
+    fn sqlite_schema_version(path: &Path) -> u32 {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open database read-only");
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("read schema version")
+    }
+
+    fn stamp_sqlite_schema_version(path: &Path, version: u32) {
+        let connection = rusqlite::Connection::open(path).expect("open database");
+        connection
+            .pragma_update(None, "user_version", version)
+            .expect("stamp schema version");
+    }
+
+    fn durable_database_and_wal(path: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+        (
+            fs::read(path).expect("read database"),
+            fs::read(path.with_extension("db-wal")).ok(),
+        )
+    }
+
+    #[test]
+    fn agent_surface_preflights_precurrent_schema_before_summary_open() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvVarSnapshot::clear(&[
+            "CODESTORY_RETRIEVAL_PROFILE",
+            "CODESTORY_RETRIEVAL_RUN_ID",
+            "CI",
+            "GITHUB_ACTIONS",
+        ]);
+        let (_temp, project_args, storage_path, current_schema) = agent_surface_refresh_fixture();
+        assert!(current_schema > 1, "fixture needs a pre-current schema");
+        let old_schema = current_schema - 1;
+        stamp_sqlite_schema_version(&storage_path, old_schema);
+        let durable_before = durable_database_and_wal(&storage_path);
+
+        let error = match open_agent_surface(
+            &project_args,
+            None,
+            None,
+            args::RefreshMode::Incremental,
+            "packet",
+        ) {
+            Ok(_) => panic!("explicit incremental must reject the old schema"),
+            Err(error) => error,
+        };
+        let api = runtime::api_error_in_chain(&error).expect("typed compatibility error");
+        assert_eq!(api.code, "full_refresh_required");
+        assert_eq!(
+            api.details
+                .as_deref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("core_schema_upgrade_required")
+        );
+        assert_eq!(durable_database_and_wal(&storage_path), durable_before);
+        assert_eq!(sqlite_schema_version(&storage_path), old_schema);
+
+        let opened =
+            open_agent_surface(&project_args, None, None, args::RefreshMode::Auto, "packet")
+                .expect("auto may select full recovery");
+        assert!(
+            opened.before.is_none(),
+            "compatibility recovery has no safe pre-refresh summary"
+        );
+        assert_eq!(opened.opened.refresh_mode, Some(IndexMode::Full));
+        assert_eq!(
+            opened.opened.refresh_reason.as_deref(),
+            Some("core_schema_upgrade_required")
+        );
+        assert_eq!(sqlite_schema_version(&storage_path), current_schema);
+    }
+
+    #[test]
+    fn agent_surface_preflight_preserves_pending_promotion_without_recovery() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvVarSnapshot::clear(&[
+            "CODESTORY_RETRIEVAL_PROFILE",
+            "CODESTORY_RETRIEVAL_RUN_ID",
+            "CI",
+            "GITHUB_ACTIONS",
+        ]);
+        let (_temp, project_args, storage_path, _current_schema) = agent_surface_refresh_fixture();
+        let prepared_path = PathBuf::from(format!(
+            "{}.promotion.prepared.json",
+            storage_path.display()
+        ));
+        let prepared = b"pending promotion evidence";
+        fs::write(&prepared_path, prepared).expect("write pending promotion marker");
+        let durable_before = durable_database_and_wal(&storage_path);
+
+        for refresh in [args::RefreshMode::Auto, args::RefreshMode::Incremental] {
+            let error = match open_agent_surface(&project_args, None, None, refresh, "packet") {
+                Ok(_) => panic!("pending promotion must fail closed for {refresh:?}"),
+                Err(error) => error,
+            };
+            let api = runtime::api_error_in_chain(&error).expect("typed fail-closed error");
+            assert_eq!(api.code, "internal");
+            assert!(
+                api.message.contains("promotion recovery is pending"),
+                "{api:?}"
+            );
+        }
+
+        assert_eq!(durable_database_and_wal(&storage_path), durable_before);
+        assert_eq!(
+            fs::read(&prepared_path).expect("pending promotion marker remains"),
+            prepared
+        );
     }
 
     fn assert_order(markdown: &str, first: &str, second: &str) {
@@ -9151,48 +9315,35 @@ mod tests {
     }
 
     #[test]
-    fn auto_refresh_uses_full_for_empty_index() {
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(0)),
-            Some(IndexMode::Full)
-        );
-    }
+    fn dry_run_reports_requested_effective_and_compatibility_reason() {
+        let dry_run = IndexDryRunDto {
+            root: "/tmp/project".to_string(),
+            storage_path: "/tmp/cache/codestory.db".to_string(),
+            refresh: IndexMode::Full,
+            files_to_index: 4,
+            files_to_remove: 0,
+            sample_files_to_index: Vec::new(),
+            sample_file_ids_to_remove: Vec::new(),
+            members: Vec::new(),
+        };
+        let output = IndexDryRunOutput {
+            requested_refresh: "auto",
+            effective_refresh: "full",
+            compatibility_reason: Some("structural_publication_incompatible"),
+            dry_run: &dry_run,
+        };
 
-    #[test]
-    fn auto_refresh_uses_incremental_for_existing_index() {
+        let json = serde_json::to_value(&output).expect("serialize dry-run decision");
+        assert_eq!(json["requested_refresh"], "auto");
+        assert_eq!(json["effective_refresh"], "full");
         assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
-            Some(IndexMode::Incremental)
+            json["compatibility_reason"],
+            "structural_publication_incompatible"
         );
-    }
-
-    #[test]
-    fn interrupted_incremental_resolves_and_labels_staged_full_recovery() {
-        let mut summary = summary_with_files(3);
-        summary.freshness = Some(IndexFreshnessDto {
-            status: IndexFreshnessStatusDto::Stale,
-            changed_file_count: 0,
-            new_file_count: 0,
-            removed_file_count: 0,
-            checked_file_count: 0,
-            indexed_file_count: 3,
-            duration_ms: 0,
-            reason: Some("previous_incremental_run_incomplete_full_refresh_required".to_string()),
-            samples: Vec::new(),
-        });
-
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary),
-            Some(IndexMode::Full)
-        );
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Incremental, &summary),
-            Some(IndexMode::Full)
-        );
-        assert_eq!(
-            refresh_label(RefreshMode::Incremental, Some(IndexMode::Full)),
-            "incremental(recovery-full)"
-        );
+        let markdown = render_index_dry_run_markdown(&output);
+        assert!(markdown.contains("requested_refresh: `auto`"));
+        assert!(markdown.contains("effective_refresh: `full`"));
+        assert!(markdown.contains("compatibility_reason: `structural_publication_incompatible`"));
     }
 
     #[test]
@@ -9203,7 +9354,8 @@ mod tests {
         let output = IndexOutput {
             project: &summary.root,
             storage_path: "C:/repo/.cache/index.sqlite",
-            refresh: "full",
+            refresh: "auto(full)",
+            refresh_reason: Some("structural_publication_incompatible"),
             summary: &summary,
             retrieval: &retrieval,
             phase_timings: Some(&timings),
@@ -9213,6 +9365,9 @@ mod tests {
         };
 
         let markdown = render_index_markdown(&output);
+
+        assert!(markdown.contains("refresh: `auto(full)`"));
+        assert!(markdown.contains("refresh_reason: `structural_publication_incompatible`"));
 
         assert!(markdown.contains(
             "cache_ms: artifact_write=6 search_projection=61 search_index=62 runtime_publish=63"
@@ -10348,10 +10503,11 @@ mod tests {
             question: Some(packet.question.clone()),
             output_dir: "artifacts/drill".to_string(),
             mechanical: DrillMechanicalOutput {
-                before_files: 2,
-                before_nodes: 4,
-                before_edges: 2,
-                before_errors: 0,
+                before_files: Some(2),
+                before_nodes: Some(4),
+                before_edges: Some(2),
+                before_errors: Some(0),
+                before_unavailable_reason: None,
                 after_files: 2,
                 after_nodes: 4,
                 after_edges: 2,
@@ -10385,7 +10541,7 @@ mod tests {
             evidence_packet: packet,
         };
         let output_dir = tempdir().expect("output dir");
-        let operation = codestory_runtime::PublicOperation {
+        let mut operation = codestory_runtime::PublicOperation {
             value: output,
             core_publication: None,
             retrieval_publication: None,
@@ -10452,6 +10608,54 @@ mod tests {
                 .map(|value| value.as_str().expect("artifact name").to_string())
                 .collect::<Vec<_>>()
         );
+
+        operation.value.mechanical.before_files = None;
+        operation.value.mechanical.before_nodes = None;
+        operation.value.mechanical.before_edges = None;
+        operation.value.mechanical.before_errors = None;
+        operation.value.mechanical.before_unavailable_reason =
+            Some("core_schema_upgrade_required".to_string());
+        operation.value.mechanical.refresh = "auto->full".to_string();
+        let unavailable_dir = tempdir().expect("unavailable output dir");
+        write_drill_outputs(args::OutputFormat::Json, unavailable_dir.path(), &operation)
+            .expect("write unavailable-before drill fixtures");
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(unavailable_dir.path().join("drill-report.json"))
+                .expect("read unavailable-before report"),
+        )
+        .expect("parse unavailable-before report");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(unavailable_dir.path().join("drill-summary.json"))
+                .expect("read unavailable-before summary"),
+        )
+        .expect("parse unavailable-before summary");
+        let markdown = fs::read_to_string(unavailable_dir.path().join("drill-report.md"))
+            .expect("read unavailable-before markdown");
+
+        for field in [
+            "/mechanical/before_files",
+            "/mechanical/before_nodes",
+            "/mechanical/before_edges",
+            "/mechanical/before_errors",
+        ] {
+            assert!(report.pointer(field).is_none(), "unexpected {field}");
+        }
+        assert_eq!(
+            report.pointer("/mechanical/before_unavailable_reason"),
+            Some(&serde_json::json!("core_schema_upgrade_required"))
+        );
+        assert!(summary.pointer("/mechanical/before").is_none());
+        assert!(summary.pointer("/mechanical/error_delta").is_none());
+        assert_eq!(
+            summary.pointer("/mechanical/before_unavailable_reason"),
+            Some(&serde_json::json!("core_schema_upgrade_required"))
+        );
+        assert!(
+            markdown.contains("index_before: unavailable reason=core_schema_upgrade_required"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("index_before: files="), "{markdown}");
     }
 
     #[test]

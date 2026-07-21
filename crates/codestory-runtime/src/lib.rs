@@ -11,9 +11,9 @@ use codestory_contracts::api::{
     AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
     AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
-    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload,
-    ArtifactCacheAccessTimings, ArtifactCachePolicyDto, BookmarkCategoryDto, BookmarkDto,
-    CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ApiErrorDetails,
+    AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, BookmarkCategoryDto,
+    BookmarkDto, CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     DatabaseSnapshotCopyTimings, EdgeId, EdgeKind, EdgeOccurrencesRequest,
     EmbeddingProfileContractDto, FileCoverageDiagnosticDto, FrameworkRouteCoverageDto,
     FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
@@ -5218,7 +5218,7 @@ fn full_refresh_execution_plan_with_coverage(
                 _ => "source_discovery_incomplete",
             },
             format!(
-                "Full refresh requires a complete source inventory; discovery was {:?}.",
+                "Effective refresh mode `full` requires a complete source inventory; discovery was {:?}.",
                 inventory.outcome
             ),
             coverage_gaps,
@@ -12148,7 +12148,7 @@ impl AppController {
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
         let (root, storage_path) = {
-            let mut s = self.state.lock();
+            let s = self.state.lock();
             if s.is_indexing {
                 return Err(ApiError::invalid_argument(
                     "Indexing already in progress for this controller.",
@@ -12161,10 +12161,21 @@ impl AppController {
                 .storage_path
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
-            s.is_indexing = true;
-            s.index_freshness_cache = None;
             (root, storage_path)
         };
+        if req.mode == IndexMode::Incremental {
+            ensure_incremental_refresh_compatible(&root, &storage_path)?;
+        }
+        {
+            let mut s = self.state.lock();
+            if s.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            s.is_indexing = true;
+            s.index_freshness_cache = None;
+        }
 
         let events_tx = self.events_tx.clone();
         let controller = self.clone();
@@ -12224,7 +12235,7 @@ impl AppController {
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         let (root, storage_path) = {
-            let mut s = self.state.lock();
+            let s = self.state.lock();
             if s.is_indexing {
                 return Err(ApiError::invalid_argument(
                     "Indexing already in progress for this controller.",
@@ -12235,10 +12246,21 @@ impl AppController {
                 .storage_path
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
-            s.is_indexing = true;
-            s.index_freshness_cache = None;
             (root, storage_path)
         };
+        if mode == IndexMode::Incremental {
+            ensure_incremental_refresh_compatible(&root, &storage_path)?;
+        }
+        {
+            let mut s = self.state.lock();
+            if s.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            s.is_indexing = true;
+            s.index_freshness_cache = None;
+        }
 
         let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
             Ok(guard) => guard,
@@ -12512,6 +12534,21 @@ impl AppController {
         .is_err())
     }
 
+    pub fn ensure_incremental_refresh_compatible(&self) -> Result<(), ApiError> {
+        let state = self.state.lock();
+        let root = state.project_root.as_deref().ok_or_else(no_project_error)?;
+        let storage_path = state.storage_path.as_deref().ok_or_else(no_project_error)?;
+        ensure_incremental_refresh_compatible(root, storage_path)
+    }
+
+    pub fn ensure_incremental_refresh_compatible_at(
+        &self,
+        root: &Path,
+        storage_path: &Path,
+    ) -> Result<(), ApiError> {
+        ensure_incremental_refresh_compatible(root, storage_path)
+    }
+
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, true, None)
     }
@@ -12542,25 +12579,33 @@ impl AppController {
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
+        if mode == IndexMode::Incremental {
+            ensure_incremental_refresh_compatible(&root, &storage_path)?;
+        }
         let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let mut incomplete_incremental_run = false;
         let refresh_inputs = if storage_path.exists() {
-            let store = Store::open(&storage_path)
-                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-            incomplete_incremental_run = store.has_incomplete_incremental_run().map_err(|e| {
-                ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
-            })?;
-            workspace_refresh_inputs(&store)?
+            let schema_version = Store::database_schema_version_observational(&storage_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to inspect dry-run storage without recovery: {error}"
+                    ))
+                })?;
+            if schema_version < CURRENT_SCHEMA_VERSION {
+                RefreshInputs::default()
+            } else {
+                let store =
+                    Store::open_freshness_observational(&storage_path).map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to inspect dry-run storage without mutation: {error}"
+                        ))
+                    })?;
+                workspace_refresh_inputs(&store)?
+            }
         } else {
             RefreshInputs::default()
         };
-        let effective_mode = if mode == IndexMode::Incremental && incomplete_incremental_run {
-            IndexMode::Full
-        } else {
-            mode
-        };
-        let execution_plan = match effective_mode {
+        let execution_plan = match mode {
             IndexMode::Full => {
                 full_refresh_execution_plan_with_coverage(
                     &root,
@@ -12586,7 +12631,7 @@ impl AppController {
         Ok(IndexDryRunDto {
             root: root.to_string_lossy().to_string(),
             storage_path: storage_path.to_string_lossy().to_string(),
-            refresh: effective_mode,
+            refresh: mode,
             files_to_index: execution_plan.files_to_index.len().min(u32::MAX as usize) as u32,
             files_to_remove: execution_plan.files_to_remove.len().min(u32::MAX as usize) as u32,
             sample_files_to_index: execution_plan
@@ -15569,7 +15614,7 @@ fn index_full_for_runtime(
         return Err(ApiError::source_coverage_failure(
             code,
             format!(
-                "Full refresh could not verify {count} scheduled file(s): {sample}. {preserved_state}."
+                "Effective refresh mode `full` could not verify {count} scheduled file(s): {sample}. {preserved_state}."
             ),
             blocking_gaps,
         ));
@@ -16074,6 +16119,118 @@ fn spawn_progress_forwarder(
     })
 }
 
+const FULL_REFRESH_REQUIRED_ERROR_CODE: &str = "full_refresh_required";
+
+fn full_refresh_required_error(
+    root: &Path,
+    reason_code: &str,
+    reason: impl AsRef<str>,
+) -> ApiError {
+    let project = root.to_string_lossy().to_string();
+    let next_command = format!(
+        "codestory-cli index --project {} --refresh full",
+        quote_refresh_command_argument(&project)
+    );
+    ApiError::with_details(
+        FULL_REFRESH_REQUIRED_ERROR_CODE,
+        format!(
+            "Refresh compatibility rejected the request before workspace reads: requested=incremental effective=none required=full reason={}",
+            reason.as_ref()
+        ),
+        ApiErrorDetails {
+            cause_code: Some(reason_code.to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![next_command.clone()],
+            minimum_next: vec![next_command.clone()],
+            full_repair: vec![next_command],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
+        },
+    )
+}
+
+#[cfg(windows)]
+fn quote_refresh_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_refresh_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn ensure_incremental_refresh_compatible(root: &Path, storage_path: &Path) -> Result<(), ApiError> {
+    if !storage_path.is_file() {
+        return Err(full_refresh_required_error(
+            root,
+            "complete_core_publication_missing",
+            "complete_core_publication_missing",
+        ));
+    }
+    let schema_version = Store::database_schema_version_observational(storage_path).map_err(
+        |error| {
+            ApiError::internal(format!(
+                "Failed to inspect incremental refresh schema compatibility without recovery: {error}"
+            ))
+        },
+    )?;
+    if schema_version < CURRENT_SCHEMA_VERSION {
+        let (reason_code, reason) = if schema_version == 0 {
+            (
+                "complete_core_publication_missing",
+                "complete_core_publication_missing".to_string(),
+            )
+        } else {
+            (
+                "core_schema_upgrade_required",
+                format!(
+                    "core_schema_upgrade_required:observed={schema_version}:required={CURRENT_SCHEMA_VERSION}"
+                ),
+            )
+        };
+        return Err(full_refresh_required_error(root, reason_code, reason));
+    }
+    let storage = Store::open_freshness_observational(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect incremental refresh compatibility: {error}"
+        ))
+    })?;
+    if storage.has_incomplete_incremental_run().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect incomplete incremental marker: {error}"
+        ))
+    })? {
+        return Err(full_refresh_required_error(
+            root,
+            "incomplete_incremental_publication",
+            "incomplete_incremental_publication",
+        ));
+    }
+    let Some(publication) = storage.get_complete_index_publication().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect complete core publication: {error}"
+        ))
+    })?
+    else {
+        return Err(full_refresh_required_error(
+            root,
+            "complete_core_publication_missing",
+            "complete_core_publication_missing",
+        ));
+    };
+    if let Err(error) = storage.validate_structural_text_unit_publication(&publication) {
+        return Err(full_refresh_required_error(
+            root,
+            "structural_publication_incompatible",
+            format!("structural_publication_incompatible:{error}"),
+        ));
+    }
+    Ok(())
+}
+
 fn run_incremental_indexing_common(
     root: &Path,
     storage_path: &Path,
@@ -16082,70 +16239,16 @@ fn run_incremental_indexing_common(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
-    let live_exists = storage_path.exists();
-    let live_is_incomplete = live_exists
-        && Store::database_has_incomplete_incremental_run(storage_path).map_err(|e| {
-            ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
-        })?;
-    if live_is_incomplete {
-        let _ = events_tx.send(AppEventPayload::StatusUpdate {
-            message: "A prior incremental index run was interrupted; rebuilding through staged full recovery."
-                .to_string(),
-        });
-        return index_full_for_runtime(
-            root,
-            storage_path,
-            events_tx,
-            cancel_token,
-            runtime,
-            source_index_policy,
-        );
-    }
+    ensure_incremental_refresh_compatible(root, storage_path)?;
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    if live_exists {
-        let structural_live_is_verified = Store::open_read_only(storage_path)
-            .ok()
-            .and_then(|storage| {
-                storage
-                    .get_complete_index_publication()
-                    .ok()
-                    .flatten()
-                    .map(|publication| {
-                        storage
-                            .validate_structural_text_unit_publication(&publication)
-                            .is_ok()
-                    })
-            })
-            .unwrap_or(false);
-        if !structural_live_is_verified {
-            let _ = events_tx.send(AppEventPayload::StatusUpdate {
-                message: "The live index predates verified structural unit publication; rebuilding through staged full recollection."
-                    .to_string(),
-            });
-            return index_full_for_runtime(
-                root,
-                storage_path,
-                events_tx,
-                cancel_token,
-                runtime,
-                source_index_policy,
-            );
-        }
-    }
 
-    let mut staged = if live_exists {
-        SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to clone live storage for incremental build: {e}"
-            ))
-        })?
-    } else {
-        SnapshotStore::open_staged(storage_path).map_err(|e| {
-            ApiError::internal(format!("Failed to open staged incremental storage: {e}"))
-        })?
-    };
+    let mut staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
+        ApiError::internal(format!(
+            "Failed to clone live storage for incremental build: {e}"
+        ))
+    })?;
     let previous_publication = match staged.store_mut().get_index_publication() {
         Ok(publication) => publication,
         Err(error) => {
@@ -28383,6 +28486,14 @@ fn build_llm_symbol_doc_text() -> String {
                 storage_path.clone(),
             )
             .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish compatible baseline");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn value() -> i32 { 2 }\n",
+        )
+        .expect("modify source");
         let events = controller.events();
 
         controller
@@ -29338,7 +29449,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn incremental_request_recollects_legacy_structural_graph_without_unit_manifest() {
+    fn explicit_incremental_rejects_incompatible_structural_publication_before_source_reads() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("Cargo.toml"),
@@ -29365,22 +29476,194 @@ fn build_llm_symbol_doc_text() -> String {
             .execute("DELETE FROM structural_text_unit_publication", [])
             .expect("remove structural manifest");
         drop(storage);
+        fs::write(
+            workspace.path().join("malformed.json"),
+            "{\"missing_value\":",
+        )
+        .expect("write source that would fail a full parse");
+        let database_before = fs::read(&storage_path).expect("read incompatible database");
+        let wal_path = storage_path.with_extension("db-wal");
+        let wal_before = fs::read(&wal_path).ok();
+
+        for error in [
+            controller
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject incompatible incremental"),
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect_err("execution must reject incompatible incremental"),
+        ] {
+            assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            assert!(error.message.contains("requested=incremental"));
+            assert!(error.message.contains("effective=none"));
+            assert!(error.message.contains("required=full"));
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("structural_publication_incompatible")
+            );
+        }
+        assert_eq!(
+            fs::read(&storage_path).expect("read database after rejected requests"),
+            database_before,
+            "compatibility rejection must not mutate the live database"
+        );
+        assert_eq!(
+            fs::read(&wal_path).ok(),
+            wal_before,
+            "compatibility rejection must not mutate the live WAL"
+        );
+        assert_eq!(
+            Store::database_index_publication(&storage_path)
+                .expect("read preserved publication")
+                .expect("preserved publication"),
+            previous
+        );
+        assert!(!controller.state.lock().is_indexing);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        let full_error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("explicit full refresh must reach malformed source verification");
+        assert_eq!(full_error.code, "source_malformed");
+        assert!(
+            full_error
+                .message
+                .contains("Effective refresh mode `full` could not verify"),
+            "unexpected full-refresh error: {full_error:?}"
+        );
+    }
+
+    #[test]
+    fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn legacy_value() -> i32 { 28 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish current baseline");
+        {
+            let storage = Storage::open(&storage_path).expect("open schema fixture");
+            storage
+                .get_connection()
+                .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
+                .expect("stamp supported pre-current schema");
+        }
+        let database_before = fs::read(&storage_path).expect("read old-schema database");
+        let wal_path = storage_path.with_extension("db-wal");
+        let wal_before = fs::read(&wal_path).ok();
+        let cache_path = storage_path.parent().expect("cache path");
+        let cache_entries_before = {
+            let mut entries = fs::read_dir(cache_path)
+                .expect("list cache before compatibility checks")
+                .map(|entry| {
+                    entry
+                        .expect("read cache entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+
+        for error in [
+            controller
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject the old schema"),
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect_err("execution must reject the old schema"),
+        ] {
+            assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("core_schema_upgrade_required")
+            );
+        }
+        let auto_effective_dry_run = controller
+            .dry_run_index(IndexMode::Full)
+            .expect("auto-selected full dry-run must inspect old schema without migrating it");
+        assert_eq!(auto_effective_dry_run.refresh, IndexMode::Full);
+        assert_eq!(
+            fs::read(&storage_path).expect("read database after rejected requests"),
+            database_before,
+            "old-schema compatibility checks must preserve database bytes"
+        );
+        assert_eq!(
+            fs::read(&wal_path).ok(),
+            wal_before,
+            "old-schema compatibility checks must preserve WAL bytes"
+        );
+        let cache_entries_after = {
+            let mut entries = fs::read_dir(cache_path)
+                .expect("list cache after compatibility checks")
+                .map(|entry| {
+                    entry
+                        .expect("read cache entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        assert_eq!(cache_entries_after, cache_entries_before);
+        assert!(!controller.state.lock().is_indexing);
+        assert_no_staged_publication_artifacts(&storage_path);
 
         controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("repair legacy structural state");
-        let repaired = Store::database_index_publication(&storage_path)
-            .expect("read repaired publication")
-            .expect("repaired publication");
-        assert_eq!(repaired.generation, previous.generation + 1);
-        assert_eq!(repaired.mode, IndexPublicationMode::Full);
-        let repaired_store =
-            Store::open_read_only(&storage_path).expect("open repaired publication");
-        let manifest = repaired_store
-            .validate_structural_text_unit_publication(&repaired)
-            .expect("validate repaired structural manifest");
-        assert!(manifest.unit_count > 0);
-        assert_eq!(manifest.projection_count, 1);
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("explicit full refresh upgrades the supported old schema");
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("read upgraded schema"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn full_refresh_required_command_quotes_shell_metacharacters() {
+        let error = full_refresh_required_error(
+            Path::new("repo/$hidden/quoted'path"),
+            "core_schema_upgrade_required",
+            "core_schema_upgrade_required",
+        );
+        let command = error
+            .details
+            .expect("typed compatibility details")
+            .next_commands
+            .into_iter()
+            .next()
+            .expect("full-refresh repair command");
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            command,
+            "codestory-cli index --project 'repo/$hidden/quoted'\\''path' --refresh full"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            command,
+            "codestory-cli index --project 'repo/$hidden/quoted''path' --refresh full"
+        );
     }
 
     #[test]
@@ -29646,7 +29929,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn legacy_schema_18_incomplete_marker_recovers_to_first_publication() {
+    fn legacy_schema_18_incomplete_marker_requires_explicit_full_recovery() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -29681,9 +29964,26 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("read legacy publication")
                 .is_none()
         );
-        controller
+        let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("recover legacy marker");
+            .expect_err("explicit incremental must reject the legacy incomplete marker");
+        assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("incomplete_incremental_publication")
+        );
+        assert!(
+            Storage::database_index_publication(&storage_path)
+                .expect("read rejected legacy publication")
+                .is_none()
+        );
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("recover legacy marker with an explicit full refresh");
 
         assert_eq!(
             Storage::database_schema_version(&storage_path).expect("recovered schema"),
@@ -30437,16 +30737,24 @@ fn build_llm_symbol_doc_text() -> String {
                 summary.publication.is_none(),
                 "fenced generation was served"
             );
+            let dry_run_error = restarted
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject implicit recovery escalation");
+            assert_eq!(dry_run_error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
             assert_eq!(
-                restarted
-                    .dry_run_index(IndexMode::Incremental)
-                    .expect("plan fenced recovery")
-                    .refresh,
-                IndexMode::Full
+                dry_run_error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("incomplete_incremental_publication")
             );
-            restarted
+            let execution_error = restarted
                 .run_indexing_blocking(IndexMode::Incremental)
-                .expect("restart publication recovery");
+                .expect_err("execution must reject implicit recovery escalation");
+            assert_eq!(execution_error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            restarted
+                .run_indexing_blocking(IndexMode::Full)
+                .expect("explicit full publication recovery");
             let storage = Storage::open(storage_path).expect("open recovered storage");
             let recovered = storage
                 .get_complete_index_publication()
@@ -30874,7 +31182,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn cancelled_first_incremental_does_not_create_a_live_database() {
+    fn first_incremental_requires_full_before_cancellation_or_storage_creation() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -30893,13 +31201,20 @@ fn build_llm_symbol_doc_text() -> String {
             Some(&cancel_token),
         ) {
             Err(error) => error,
-            Ok(_) => panic!("pre-cancelled first incremental must fail visibly"),
+            Ok(_) => panic!("first incremental must fail visibly"),
         };
 
-        assert_eq!(error.code, "cancelled");
+        assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("complete_core_publication_missing")
+        );
         assert!(
             !storage_path.exists(),
-            "a cancelled first run must not manufacture a live generation"
+            "a rejected first incremental must not manufacture a live generation"
         );
         let cache_dir = storage_path.parent().expect("cache parent");
         if cache_dir.exists() {
@@ -30909,7 +31224,7 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("read cache entries");
             assert!(
                 staged_artifacts.is_empty(),
-                "cancelled first run left staged debris: {staged_artifacts:?}"
+                "rejected first incremental left staged debris: {staged_artifacts:?}"
             );
         }
     }

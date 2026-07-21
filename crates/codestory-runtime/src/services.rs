@@ -1539,6 +1539,19 @@ impl IndexService {
         self.controller.complete_index_publication()
     }
 
+    pub fn ensure_incremental_refresh_compatible(&self) -> Result<(), ApiError> {
+        self.controller.ensure_incremental_refresh_compatible()
+    }
+
+    pub fn ensure_incremental_refresh_compatible_at(
+        &self,
+        root: &std::path::Path,
+        storage_path: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        self.controller
+            .ensure_incremental_refresh_compatible_at(root, storage_path)
+    }
+
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         self.controller.dry_run_index(mode)
     }
