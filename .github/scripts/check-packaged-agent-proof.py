@@ -87,6 +87,23 @@ MEASUREMENT_PROTOCOL = (
     / "testing"
     / "per-user-embedding-server-measurement-protocol.json"
 )
+CANDIDATE_QUALIFICATION_MATRIX_ALIASES = {
+    "candidate_installed_windows_x64_cpu": {
+        "source_cell_id": "installed_windows_x64_cpu",
+        "source_host_class": "post_publish_windows_x64",
+        "installation_source": "candidate",
+        "cell": {
+            "asset_target": "windows-x64",
+            "proof_tier": "installed_runtime",
+            "host_class": "premerge_candidate_windows_x64",
+            "policy": "cpu_explicit",
+            "backend": "cpu",
+            "cache_state": "reused",
+            "residency_state": "resident",
+            "accelerator_claim": "none",
+        },
+    }
+}
 SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-protocol.json")
 SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-constant-set.json")
 HOLDOUT_TASK_ROOT = (
@@ -6893,8 +6910,21 @@ def selected_qualification_matrix_cell(
         if proof_tier == "calibration"
         else protocol["host_package_matrix"]
     )
-    require(cell_id in matrix, f"unknown qualification matrix cell {cell_id!r}")
-    cell = matrix[cell_id]
+    if cell_id in matrix:
+        cell = matrix[cell_id]
+    else:
+        alias = CANDIDATE_QUALIFICATION_MATRIX_ALIASES.get(cell_id)
+        require(alias is not None, f"unknown qualification matrix cell {cell_id!r}")
+        cell = alias["cell"]
+        source_cell = matrix.get(alias["source_cell_id"])
+        require(
+            source_cell
+            == {
+                **cell,
+                "host_class": alias["source_host_class"],
+            },
+            "candidate qualification matrix alias no longer matches its frozen installed-runtime source cell",
+        )
     require(
         cell["asset_target"] == target
         and cell["policy"] == expected_policy
@@ -6906,6 +6936,18 @@ def selected_qualification_matrix_cell(
         "qualification matrix cell does not match the requested proof tier",
     )
     return cell
+
+
+def require_candidate_matrix_installation_source(
+    cell_id: str | None,
+    installation_source: str,
+) -> None:
+    alias = CANDIDATE_QUALIFICATION_MATRIX_ALIASES.get(cell_id)
+    if alias is not None:
+        require(
+            installation_source == alias["installation_source"],
+            "candidate qualification matrix alias requires candidate-installed provenance",
+        )
 
 
 def qualification_measurement_artifact(
@@ -10087,6 +10129,73 @@ def self_test() -> None:
             self_measurement_protocol,
             require_frozen=False,
         )
+        windows_candidate_cell_id = "candidate_installed_windows_x64_cpu"
+        windows_candidate_cell = selected_qualification_matrix_cell(
+            measurement_contract["measurement_protocol"],
+            cell_id=windows_candidate_cell_id,
+            target="windows-x64",
+            proof_tier="installed_runtime",
+            expected_policy="cpu_explicit",
+            expected_backend="CPU",
+        )
+        require(
+            windows_candidate_cell
+            == {
+                "asset_target": "windows-x64",
+                "proof_tier": "installed_runtime",
+                "host_class": "premerge_candidate_windows_x64",
+                "policy": "cpu_explicit",
+                "backend": "cpu",
+                "cache_state": "reused",
+                "residency_state": "resident",
+                "accelerator_claim": "none",
+            },
+            "Windows candidate-installed alias changed its exact identity",
+        )
+        require_candidate_matrix_installation_source(
+            windows_candidate_cell_id,
+            "candidate",
+        )
+        try:
+            require_candidate_matrix_installation_source(
+                windows_candidate_cell_id,
+                "marketplace",
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                "Windows candidate-installed alias accepted marketplace provenance"
+            )
+        hostile_windows_alias_values = {
+            "asset_target": "linux-x64",
+            "proof_tier": "protected_hardware",
+            "policy": "accelerated",
+            "backend": "vulkan",
+            "accelerator_claim": "vulkan",
+        }
+        for field, hostile_value in hostile_windows_alias_values.items():
+            hostile_protocol = json.loads(
+                json.dumps(measurement_contract["measurement_protocol"])
+            )
+            hostile_protocol["host_package_matrix"][
+                "installed_windows_x64_cpu"
+            ][field] = hostile_value
+            try:
+                selected_qualification_matrix_cell(
+                    hostile_protocol,
+                    cell_id=windows_candidate_cell_id,
+                    target="windows-x64",
+                    proof_tier="installed_runtime",
+                    expected_policy="cpu_explicit",
+                    expected_backend="CPU",
+                )
+            except ProofFailure:
+                pass
+            else:
+                raise ProofFailure(
+                    f"Windows candidate-installed alias accepted changed {field}"
+                )
         (
             calibration_bundle_path,
             frozen_measurement_contract,
@@ -11003,6 +11112,10 @@ def main() -> int:
         result = prepare_candidate_installed_proof(args)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
+    require_candidate_matrix_installation_source(
+        args.qualification_matrix_cell,
+        args.installed_plugin_source,
+    )
     require(args.archive and args.checksum_file and args.expected_version, "archive, checksum, and expected version are required")
     args.archive = args.archive.resolve()
     args.checksum_file = args.checksum_file.resolve()

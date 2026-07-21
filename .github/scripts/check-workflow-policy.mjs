@@ -1403,6 +1403,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, sameMembers(needs(vulkan), releaseChain.dependencies["windows-vulkan-proof"]), `${releaseFile} Vulkan proof dependencies must match the release claim graph`);
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${releaseFile} Vulkan proof must use the packaged CLI`);
   add(violations, object(vulkan.with).emit_release_cells === true, `${releaseFile} Vulkan proof must emit its authenticated release cell`);
+  add(
+    violations,
+    object(vulkan.with).candidate_installed_proof === undefined,
+    `${releaseFile} must leave pre-merge Windows candidate-installed proof to the PR coordinator`,
+  );
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
@@ -2182,6 +2187,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     `${file} Vulkan proof must wait for package and exact-head release evidence`,
   );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
+  add(
+    violations,
+    object(vulkan.with).candidate_installed_proof === true,
+    `${file} must opt the accepted PR Windows package into candidate-installed proof`,
+  );
   const closeout = requireJob(violations, file, workflow, "closeout");
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", ["dev/codestory-next moved from proved head"]);
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
@@ -2366,6 +2376,20 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${vulkanFile} must exist`);
   } else {
     add(violations, trigger(vulkan, "workflow_call") !== undefined && trigger(vulkan, "workflow_dispatch") !== undefined, `${vulkanFile} must support reusable and manual proof`);
+    const candidateInput = object(at(
+      vulkan,
+      "on",
+      "workflow_call",
+      "inputs",
+      "candidate_installed_proof",
+    ));
+    add(
+      violations,
+      candidateInput.required === false
+        && candidateInput.type === "boolean"
+        && candidateInput.default === false,
+      `${vulkanFile} candidate-installed proof must be an explicit opt-in`,
+    );
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
@@ -2404,6 +2428,65 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-artifact",
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
+    const candidateStage = namedStep(job, "Stage isolated candidate-managed Windows install");
+    add(
+      violations,
+      String(candidateStage?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateStage?.if ?? "").includes("inputs.quality_evidence_artifact"),
+      `${vulkanFile} candidate-managed staging must require coordinator opt-in and exact-head quality evidence`,
+    );
+    requireStepRun(violations, vulkanFile, job, "Stage isolated candidate-managed Windows install", [
+      "--prepare-candidate-installed-proof",
+      "--candidate-plugin-root-output",
+      "--candidate-plugin-data-output",
+      "--installed-plugin-provenance-output",
+      "--candidate-producer-workflow-path",
+      "$env:RUNNER_TEMP",
+      "codestory-candidate-installed-windows.",
+      "[IO.Path]::GetFullPath",
+      "$env:GITHUB_WORKSPACE",
+      "CODESTORY_CANDIDATE_WINDOWS_ROOT=",
+    ]);
+    const candidateProof = namedStep(job, "Prove two-host candidate-installed Windows runtime");
+    add(
+      violations,
+      String(candidateProof?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateProof?.if ?? "").includes("inputs.quality_evidence_artifact"),
+      `${vulkanFile} candidate-installed proof must require coordinator opt-in and exact-head quality evidence`,
+    );
+    requireStepRun(violations, vulkanFile, job, "Prove two-host candidate-installed Windows runtime", [
+      "--proof-tier installed_runtime",
+      "--qualification-matrix-cell candidate_installed_windows_x64_cpu",
+      "--engine-policy cpu_explicit",
+      "--expected-backend CPU",
+      "--installed-plugin-source candidate",
+      "--installed-plugin-provenance",
+      "--installed-plugin-data",
+      "--candidate-producer-workflow-path",
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+      "--retrieval-quality-evidence",
+      "--expected-source-sha",
+      "--expected-source-tree",
+      "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
+    ]);
+    add(
+      violations,
+      object(candidateProof?.env).CODESTORY_EMBED_ALLOW_CPU === "1",
+      `${vulkanFile} candidate-installed proof must opt into explicit CPU execution`,
+    );
+    const candidateUpload = namedStep(job, "Upload candidate-installed Windows proof");
+    add(
+      violations,
+      candidateUpload?.uses === "actions/upload-artifact@v7.0.1"
+        && String(candidateUpload?.if ?? "").includes("always()")
+        && String(candidateUpload?.if ?? "").includes("inputs.candidate_installed_proof")
+        && object(candidateUpload?.with).name
+          === "candidate-installed-windows-${{ inputs.version }}-attempt-${{ github.run_attempt }}"
+        && object(candidateUpload?.with).path === "target/candidate-installed-windows"
+        && object(candidateUpload?.with)["if-no-files-found"] === "error",
+      `${vulkanFile} candidate-installed proof must retain one attempt-scoped artifact`,
+    );
     requireStepRun(violations, vulkanFile, job, "Emit authenticated Vulkan release cell", [
       "codestory-release-cell-manifest.mjs produce",
       "accelerator_execution:windows-x64-vulkan",

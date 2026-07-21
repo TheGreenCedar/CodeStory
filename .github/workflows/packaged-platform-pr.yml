@@ -541,6 +541,7 @@ jobs:
       quality_evidence_artifact: ${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
+      candidate_installed_proof: true
 
   closeout:
     if: >-
