@@ -217,9 +217,18 @@ pub(crate) fn collect_json_entities(
     file_id: NodeId,
     storage: &mut IntermediateStorage,
 ) -> Result<(), StructuralCollectionError> {
-    serde_json::from_str::<serde_json::Value>(source).map_err(|error| {
-        StructuralCollectionError::Malformed(format!("invalid JSON syntax: {error}"))
-    })?;
+    let mut value_count = 0usize;
+    for value in serde_json::Deserializer::from_str(source).into_iter::<serde_json::Value>() {
+        value.map_err(|error| {
+            StructuralCollectionError::Malformed(format!("invalid JSON syntax: {error}"))
+        })?;
+        value_count += 1;
+    }
+    if value_count == 0 {
+        return Err(StructuralCollectionError::Malformed(
+            "invalid JSON syntax: expected at least one JSON value".to_string(),
+        ));
+    }
 
     let bytes = source.as_bytes();
     let mut cursor = 0usize;
@@ -467,6 +476,18 @@ fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
     let mut escaped = false;
     let mut block_scalar_parent_indent = None;
     for (line_index, line) in source.lines().enumerate() {
+        let leading_spaces = line
+            .as_bytes()
+            .iter()
+            .take_while(|byte| **byte == b' ')
+            .count();
+        let trimmed = line[leading_spaces..].trim_end();
+        if let Some(parent_indent) = block_scalar_parent_indent {
+            if trimmed.is_empty() || leading_spaces > parent_indent {
+                continue;
+            }
+            block_scalar_parent_indent = None;
+        }
         let indentation = line
             .as_bytes()
             .iter()
@@ -478,15 +499,9 @@ fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
                 line_index + 1
             )));
         }
-        let trimmed = line[indentation..].trim_end();
-        if let Some(parent_indent) = block_scalar_parent_indent {
-            if trimmed.is_empty() || indentation > parent_indent {
-                continue;
-            }
-            block_scalar_parent_indent = None;
-        }
         let code = strip_yaml_comment(line);
-        for ch in code.chars() {
+        let mut chars = code.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
             if let Some(active) = quote {
                 if escaped {
                     escaped = false;
@@ -497,12 +512,19 @@ fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
                     continue;
                 }
                 if ch == active {
+                    if active == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                        chars.next();
+                        continue;
+                    }
                     quote = None;
                 }
                 continue;
             }
+            if ch == '#' && yaml_comment_starts_at(code, index) {
+                break;
+            }
             match ch {
-                '\'' | '"' => quote = Some(ch),
+                '\'' | '"' if yaml_quote_can_open_at(code, index) => quote = Some(ch),
                 '[' | '{' => flow.push(ch),
                 ']' if flow.pop() != Some('[') => {
                     return Err(StructuralCollectionError::Malformed(format!(
@@ -537,7 +559,63 @@ fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
-    strip_comment(line, '#')
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if active == '"' && ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                if active == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    continue;
+                }
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '#' && yaml_comment_starts_at(line, index) {
+            return &line[..index];
+        }
+        if matches!(ch, '\'' | '"') && yaml_quote_can_open_at(line, index) {
+            quote = Some(ch);
+        }
+    }
+    line
+}
+
+fn yaml_comment_starts_at(value: &str, index: usize) -> bool {
+    index == 0
+        || value[..index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+}
+
+fn yaml_quote_can_open_at(value: &str, index: usize) -> bool {
+    let prefix = value[..index].trim_end();
+    let Some(previous) = prefix.chars().next_back() else {
+        return true;
+    };
+    if matches!(previous, ':' | '[' | '{' | ',') {
+        return true;
+    }
+    if !matches!(previous, '-' | '?') {
+        return false;
+    }
+    let marker_index = prefix.len().saturating_sub(previous.len_utf8());
+    marker_index == 0
+        || prefix[..marker_index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -576,12 +654,42 @@ fn strip_comment(line: &str, comment: char) -> &str {
 }
 
 fn yaml_mapping_delimiter(value: &str) -> Option<usize> {
-    let delimiter = assignment_delimiter(value, ':')?;
-    value
-        .as_bytes()
-        .get(delimiter + 1)
-        .is_none_or(u8::is_ascii_whitespace)
-        .then_some(delimiter)
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if active == '"' && ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                if active == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    continue;
+                }
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') && yaml_quote_can_open_at(value, index) {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == ':'
+            && value
+                .as_bytes()
+                .get(index + 1)
+                .is_none_or(u8::is_ascii_whitespace)
+        {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn yaml_block_scalar_header(value: &str) -> bool {
