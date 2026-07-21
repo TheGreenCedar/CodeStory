@@ -927,6 +927,149 @@ fn source_policy_exclusion_publication_binds_complete_rows_to_core_identity()
 }
 
 #[test]
+fn legacy_v1_source_policy_publication_validates_after_structural_column_migration()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("legacy-v1-source-policy-validation");
+    let publication = IndexPublicationRecord {
+        generation: 4,
+        generation_id: "generation-4".into(),
+        run_id: "run-4".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 44,
+    };
+    let policy = source_policy_identity(
+        "oversized-source-v1",
+        1_000_000,
+        codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+    );
+    let candidates = vec![
+        OversizedSourceExclusionCandidate {
+            normalized_path: "src/generated/registers.h".into(),
+            content_hash: "a".repeat(64),
+            observed_size: 4_000_000,
+            observed_unit_count: 0,
+            policy_version: "oversized-source-v1".into(),
+            byte_cap: 1_000_000,
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        },
+        OversizedSourceExclusionCandidate {
+            normalized_path: "vendor/ordinary.rs".into(),
+            content_hash: "b".repeat(64),
+            observed_size: 1_000_001,
+            observed_unit_count: 0,
+            policy_version: "oversized-source-v1".into(),
+            byte_cap: 1_000_000,
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        },
+    ];
+    {
+        let mut storage = Storage::open(&path)?;
+        storage.publish_source_policy_exclusion_generation(
+            &publication,
+            "project-4",
+            "workspace-4",
+            policy,
+            &candidates,
+        )?;
+        let records = storage.get_source_policy_exclusions()?;
+        let legacy_digest = legacy_source_policy_exclusion_digest(&records);
+        storage.conn.execute(
+            "UPDATE source_policy_exclusion_publication
+             SET schema_version = 1, exclusion_digest = ?1",
+            params![legacy_digest],
+        )?;
+        let manifest = storage.validate_legacy_v1_source_policy_exclusion_publication(
+            &publication,
+            "project-4",
+            "workspace-4",
+            policy,
+        )?;
+        assert_eq!(manifest.schema_version, 1);
+        assert!(
+            storage
+                .validate_source_policy_exclusion_publication(
+                    &publication,
+                    "project-4",
+                    "workspace-4",
+                    policy,
+                )
+                .is_err(),
+            "current validator accepted a schema-v1 publication"
+        );
+    }
+    assert!(read_source_policy_exclusion_rollback_identity(&path, &publication)?.is_some());
+
+    {
+        let storage = Storage::open(&path)?;
+        let authentic_digest = storage
+            .get_source_policy_exclusion_manifest()?
+            .expect("legacy manifest")
+            .exclusion_digest;
+        storage.conn.execute(
+            "UPDATE source_policy_exclusion_publication SET exclusion_digest = ?1",
+            params!["0".repeat(64)],
+        )?;
+        assert!(
+            storage
+                .validate_legacy_v1_source_policy_exclusion_publication(
+                    &publication,
+                    "project-4",
+                    "workspace-4",
+                    policy,
+                )
+                .is_err(),
+            "legacy validator accepted digest corruption"
+        );
+        storage.conn.execute(
+            "UPDATE source_policy_exclusion_publication SET exclusion_digest = ?1",
+            params![authentic_digest],
+        )?;
+        storage.conn.execute(
+            "UPDATE source_policy_exclusion SET observed_unit_count = 1
+             WHERE normalized_path = 'vendor/ordinary.rs'",
+            [],
+        )?;
+        assert!(
+            storage
+                .validate_legacy_v1_source_policy_exclusion_publication(
+                    &publication,
+                    "project-4",
+                    "workspace-4",
+                    policy,
+                )
+                .is_err(),
+            "legacy validator accepted a nonzero migrated unit count"
+        );
+        storage.conn.execute(
+            "UPDATE source_policy_exclusion
+             SET observed_unit_count = 0, observed_size = byte_cap
+             WHERE normalized_path = 'vendor/ordinary.rs'",
+            [],
+        )?;
+        let invalid_digest =
+            legacy_source_policy_exclusion_digest(&storage.get_source_policy_exclusions()?);
+        storage.conn.execute(
+            "UPDATE source_policy_exclusion_publication SET exclusion_digest = ?1",
+            params![invalid_digest],
+        )?;
+        assert!(
+            storage
+                .validate_legacy_v1_source_policy_exclusion_publication(
+                    &publication,
+                    "project-4",
+                    "workspace-4",
+                    policy,
+                )
+                .is_err(),
+            "legacy validator accepted a non-oversized row with a valid v1 digest"
+        );
+    }
+
+    cleanup_sqlite_sidecars(&path)?;
+    Ok(())
+}
+
+#[test]
 fn source_policy_exclusion_transaction_failure_preserves_previous_manifest()
 -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;

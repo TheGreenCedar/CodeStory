@@ -1,8 +1,15 @@
 use fs4::fs_std::FileExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+
+fn empty_legacy_source_policy_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-source-policy-exclusion-publication-v1\0");
+    format!("{:x}", hasher.finalize())
+}
 
 fn copy_tictactoe_workspace() -> tempfile::TempDir {
     let temp = tempdir().expect("create temp dir");
@@ -84,6 +91,21 @@ fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> P
         )
         .expect("read structural fixture counts");
     assert_eq!(structural_counts, (0, 0, 0));
+    let source_exclusion_count = connection
+        .query_row("SELECT COUNT(*) FROM source_policy_exclusion", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("read source exclusion count");
+    assert_eq!(source_exclusion_count, 0);
+    connection
+        .execute(
+            "UPDATE source_policy_exclusion_publication
+             SET schema_version = 1,
+                 exclusion_digest = ?1,
+                 policy_version = 'oversized-source-v1'",
+            rusqlite::params![empty_legacy_source_policy_digest()],
+        )
+        .expect("restore authentic retained v1 source-policy publication");
     connection
         .execute_batch(
             "DELETE FROM structural_text_unit_publication;
@@ -614,6 +636,47 @@ fn republish_projections_cli_acquires_writer_lock_before_schema_migration() {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("read retained schema"),
         29
+    );
+}
+
+#[test]
+#[ignore = "builds a schema-29 indexed fixture and verifies retained policy cap drift fails closed"]
+fn republish_projections_cli_rejects_legacy_policy_cap_drift_without_mutation() {
+    let workspace = copy_tictactoe_workspace();
+    let cache = tempdir().expect("explicit cache");
+    let storage_path = publish_schema_29_projection_fixture(workspace.path(), cache.path());
+    let connection = rusqlite::Connection::open(&storage_path).expect("open retained fixture");
+    connection
+        .execute(
+            "UPDATE source_policy_exclusion_publication SET byte_cap = byte_cap + 1",
+            [],
+        )
+        .expect("drift retained byte cap");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint retained fixture");
+    drop(connection);
+    remove_workspace_source(workspace.path());
+    let bytes_before = fs::read(&storage_path).expect("read retained bytes");
+
+    let output = run_cli_with_cache(
+        workspace.path(),
+        cache.path(),
+        &["retrieval", "republish-projections", "--format", "json"],
+    );
+
+    assert!(!output.status.success(), "cap-drifted republish succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("semantic_projection_migration_required")
+            || stdout.contains("semantic_projection_migration_required"),
+        "unexpected CLI error: stderr={stderr} stdout={stdout}"
+    );
+    assert_eq!(
+        fs::read(&storage_path).expect("read retained bytes after rejection"),
+        bytes_before,
+        "CLI mutated the retained core before rejecting cap drift"
     );
 }
 
