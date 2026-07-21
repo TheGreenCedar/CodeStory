@@ -3022,7 +3022,7 @@ mod tests {
         let strict_names = strict
             .root_symbols
             .iter()
-            .map(|symbol| grounding_symbol_name(symbol))
+            .map(grounding_symbol_name)
             .collect::<Vec<_>>();
         assert_eq!(
             strict_names.first().map(String::as_str),

@@ -8123,7 +8123,6 @@ fn grounding_node_snapshot_preserves_columns_rank_and_member_root_direction()
             start_col: Some(3),
             end_line: Some(8),
             end_col: Some(1),
-            ..Default::default()
         },
         Node {
             id: NodeId(102),
