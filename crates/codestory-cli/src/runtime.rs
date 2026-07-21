@@ -260,30 +260,28 @@ impl RuntimeContext {
     /// `RefreshMode::None` is read-only with respect to indexing; commands that
     /// require cached graph data must call `ensure_index_ready` after this.
     pub(crate) fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
-        let (summary, decision) = self.resolve_refresh_with_preflight(refresh)?;
-        self.ensure_open_from_decision(refresh, summary, decision)
+        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
+        self.ensure_open_from_decision(refresh, None, decision)
     }
 
-    /// Open project state from an already-read summary.
-    ///
-    /// This keeps commands such as drill from reading the same summary twice
-    /// before deciding whether a refresh is necessary.
-    pub(crate) fn ensure_open_from_summary(
+    /// Open an agent surface while retaining a safe before/after summary for
+    /// report telemetry. Compatibility is decided before any mutable project
+    /// open. When that decision requires full recovery, no trustworthy
+    /// pre-recovery summary exists, so the published after-summary is also used
+    /// as the bounded telemetry baseline.
+    pub(crate) fn ensure_open_with_before(
         &self,
         refresh: RefreshMode,
-        summary: ProjectSummary,
-    ) -> Result<OpenedProject> {
+    ) -> Result<(ProjectSummary, OpenedProject)> {
         let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
-        self.ensure_open_from_decision(refresh, summary, decision)
-    }
-
-    pub(crate) fn resolve_refresh_with_preflight(
-        &self,
-        refresh: RefreshMode,
-    ) -> Result<(ProjectSummary, RefreshDecision)> {
-        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
-        let summary = self.open_project_summary()?;
-        Ok((summary, decision))
+        let before = if decision.reason.is_none() {
+            Some(self.open_project_summary()?)
+        } else {
+            None
+        };
+        let opened = self.ensure_open_from_decision(refresh, before.clone(), decision)?;
+        let before = before.unwrap_or_else(|| opened.summary.clone());
+        Ok((before, opened))
     }
 
     pub(crate) fn resolve_refresh_decision_with_preflight(
@@ -314,11 +312,14 @@ impl RuntimeContext {
     fn ensure_open_from_decision(
         &self,
         refresh: RefreshMode,
-        mut summary: ProjectSummary,
+        mut summary: Option<ProjectSummary>,
         decision: RefreshDecision,
     ) -> Result<OpenedProject> {
         let mut phase_timings = None;
         if let Some(mode) = decision.effective_mode {
+            if summary.is_none() {
+                self.open_project_summary()?;
+            }
             phase_timings = Some(
                 self.index
                     .run_indexing_blocking_without_runtime_refresh(mode)
@@ -329,8 +330,12 @@ impl RuntimeContext {
                         )
                     })?,
             );
-            summary = self.open_project_summary()?;
+            summary = Some(self.open_project_summary()?);
         }
+        let summary = match summary {
+            Some(summary) => summary,
+            None => self.open_project_summary()?,
+        };
 
         Ok(OpenedProject {
             summary,
