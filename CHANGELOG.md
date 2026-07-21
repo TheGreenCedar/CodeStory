@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.16.0
+
+CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.
+
 ### Release
 
 - Generic YAML structural collection now distinguishes quoted scalars from
@@ -244,10 +248,6 @@
   promotion. Live, generic build, and incremental-clone profiles remain
   WAL/NORMAL. Full-refresh telemetry reports the configured checkpoint window,
   final checkpoint time, and explicit sync time.
-
-## 0.16.0
-
-CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.
 
 ### Highlights
 
