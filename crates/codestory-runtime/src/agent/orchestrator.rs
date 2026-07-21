@@ -40,8 +40,8 @@ use crate::agent::packet_plan::{
     build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
 };
 use crate::agent::packet_probe::{
-    exact_packet_probe_citations, normalize_packet_probe_request, resolve_packet_probes,
-    resolved_packet_probe_queries,
+    exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
+    resolve_packet_probes, resolved_packet_probe_queries,
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
@@ -56,16 +56,16 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
 };
 use crate::agent::packet_source_patterns::packet_sql_identifier_after;
-use crate::agent::packet_sufficiency::build_packet_sufficiency_with_extra;
+use crate::agent::packet_sufficiency::build_packet_sufficiency_with_probe_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value,
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    build_packet_sufficiency, packet_budget_exceeded_hard_output_cap,
-    packet_claim_can_satisfy_sufficiency, packet_claim_family, packet_supported_claim_family_count,
-    packet_targeted_follow_up_queries,
+    build_packet_sufficiency, build_packet_sufficiency_with_extra,
+    packet_budget_exceeded_hard_output_cap, packet_claim_can_satisfy_sufficiency,
+    packet_claim_family, packet_supported_claim_family_count, packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
@@ -491,6 +491,7 @@ pub(crate) fn agent_packet(
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
+    let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
     let phase_started = Instant::now();
     let budget = apply_packet_budget_with_extra(
         &project_root,
@@ -506,13 +507,14 @@ pub(crate) fn agent_packet(
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
     let phase_started = Instant::now();
-    let sufficiency = build_packet_sufficiency_with_extra(
+    let sufficiency = build_packet_sufficiency_with_probe_context(
         &project_root,
         &question,
         plan.task_class,
         &answer,
         &budget,
         &sufficiency_extra_probes,
+        &exact_probe_paths,
     );
     append_packet_non_trace_phase(&mut answer, "sufficiency", phase_started);
     let phase_started = Instant::now();
