@@ -11,6 +11,8 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - complete source-inventory classification and publication of verified
   source-policy exclusions before parser scheduling;
 - graph-native symbol-document and dense-anchor synchronization;
+- explicit semantic-projection republish from one pinned complete stored core,
+  without source discovery, parsing, or source reads;
 - grounding, trails, symbol workflows, target context, search, and packet
   assembly;
 - one packet-probe normalization and resolution path for exact paths, stable
@@ -53,6 +55,13 @@ second owned display-name map per symbol. The current all-node load and graph
 lookup remain a separate bounded-streaming concern. Index telemetry exposes
 selected symbols, retained context files and path bytes, and lookup entries so
 that boundary stays visible.
+
+Projection-only republish is a writer, never an activation or observational
+repair path. Runtime accepts only current stored document contracts, rebuilds
+graph-derived context and dense selection, and delegates atomic old-or-new core
+promotion to store. Retrieval generation construction remains retrieval-owned;
+the core replacement therefore makes broad retrieval stale until the existing
+retrieval index command publishes a matching generation.
 
 ## Extension rules
 

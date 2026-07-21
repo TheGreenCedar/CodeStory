@@ -31,6 +31,75 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn test_publication() -> IndexPublicationRecord {
+    IndexPublicationRecord {
+        generation: 1,
+        generation_id: "test-generation".to_string(),
+        run_id: "test-run".to_string(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    }
+}
+
+#[test]
+fn semantic_projection_compatibility_accepts_only_manifestless_empty_structural_state() {
+    let storage = Storage::new_in_memory().expect("create storage");
+
+    assert_eq!(
+        storage
+            .validate_structural_text_unit_publication_or_legacy_empty(&test_publication())
+            .expect("empty legacy state is compatible"),
+        StructuralTextPublicationCompatibility::LegacyEmpty
+    );
+}
+
+#[test]
+fn semantic_projection_compatibility_rejects_each_manifestless_nonempty_structural_store() {
+    for table in ["unit", "projection", "artifact_cache"] {
+        let storage = Storage::new_in_memory().expect("create storage");
+        storage
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .expect("disable fixture foreign keys");
+        match table {
+            "unit" => storage.conn.execute(
+                "INSERT INTO structural_text_unit (
+                    node_id, file_id, placement_id, content_hash, source_content_hash,
+                    descriptor_version, producer, evidence_tier, resolution, language,
+                    kind, start_line, start_col, end_line, end_col, file_role
+                 ) VALUES (1, 1, ?1, ?1, ?1, 1, 'test', 'structural_text',
+                    'source_range_only', 'text', 1, 1, 1, 1, 1, 'source')",
+                ["1".repeat(64)],
+            ),
+            "projection" => storage.conn.execute(
+                "INSERT INTO structural_text_projection (
+                    file_id, source_content_hash, descriptor_version, producer,
+                    language, file_role, unit_count, unit_digest
+                 ) VALUES (1, ?1, 1, 'test', 'text', 'source', 0, ?1)",
+                ["2".repeat(64)],
+            ),
+            "artifact_cache" => storage.conn.execute(
+                "INSERT INTO structural_text_artifact_cache (
+                    file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
+                 ) VALUES ('legacy.txt', 1, 'v1:test', ?1, 1, 'test', ?1, X'01', 1)",
+                ["3".repeat(64)],
+            ),
+            _ => unreachable!(),
+        }
+        .expect("insert manifestless structural fixture");
+
+        let error = storage
+            .validate_structural_text_unit_publication_or_legacy_empty(&test_publication())
+            .expect_err("nonempty manifestless structural state must fail closed");
+        assert!(
+            error.to_string().contains("missing for nonempty state"),
+            "unexpected {table} error: {error}"
+        );
+    }
+}
+
 fn unique_temp_db_path(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4483,6 +4552,55 @@ fn schema_28_adds_structural_unit_tables_without_synthesizing_publication()
 }
 
 #[test]
+fn schema_30_preserves_publication_and_adds_semantic_projection_mode() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v30-semantic-projection-publication-mode");
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    let previous = IndexPublicationRecord {
+        generation: 9,
+        generation_id: "generation-nine".into(),
+        run_id: "run-nine".into(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 9,
+    };
+    {
+        let storage = Storage::open(&db_path)?;
+        storage.put_index_publication(&previous)?;
+        storage.conn.execute_batch(
+            "ALTER TABLE index_publication RENAME TO index_publication_v30;
+             CREATE TABLE index_publication (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+                run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+                mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+                published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+             );
+             INSERT INTO index_publication
+             SELECT * FROM index_publication_v30;
+             DROP TABLE index_publication_v30;",
+        )?;
+        storage.set_schema_version(29)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert_eq!(storage.get_index_publication()?, Some(previous));
+    let republished = IndexPublicationRecord {
+        generation: 10,
+        generation_id: "generation-ten".into(),
+        run_id: "run-ten".into(),
+        mode: IndexPublicationMode::SemanticProjection,
+        published_at_epoch_ms: 10,
+    };
+    storage.put_index_publication(&republished)?;
+    assert_eq!(storage.get_index_publication()?, Some(republished));
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
+    Ok(())
+}
+
+#[test]
 fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_column()
 -> Result<(), StorageError> {
     for source_version in [19, 20] {
@@ -5193,7 +5311,9 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         RecoveryDatabaseContract::Journal(SOURCE_POLICY_PROMOTION_JOURNAL_VERSION);
     let structural_journal =
         RecoveryDatabaseContract::Journal(STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION);
-    let structural_policy_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
+    let structural_policy_journal =
+        RecoveryDatabaseContract::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION);
+    let semantic_projection_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
     let legacy_backup = RecoveryDatabaseContract::LegacyBackup;
 
     for schema_version in
@@ -5210,7 +5330,16 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
     assert!(
         structural_journal.supports_complete_schema(STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION)
     );
-    assert!(structural_policy_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(
+        structural_policy_journal
+            .supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(
+        semantic_projection_journal
+            .supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(semantic_projection_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(current.supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
     assert!(current.supports_complete_schema(SCHEMA_VERSION));
     assert!(legacy_journal.supports_complete_schema(SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
     assert!(!legacy_journal.supports_complete_schema(SCHEMA_VERSION));
@@ -5230,8 +5359,12 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
             structural_policy_journal,
             STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
         ),
+        (
+            semantic_projection_journal,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
         (legacy_backup, LEGACY_PROMOTION_MIN_SCHEMA_VERSION - 1),
-        (current, SCHEMA_VERSION - 1),
+        (current, STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1),
     ] {
         assert!(!contract.supports_complete_schema(rejected));
         assert!(!contract.supports_complete_schema(SCHEMA_VERSION + 1));
@@ -5291,6 +5424,20 @@ fn legacy_journal_recovery_runs_before_supported_schema_migration() {
             "v3-schema28-committed",
             STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION,
             STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION,
+            true,
+            2,
+        ),
+        (
+            "v4-schema29-prepared",
+            STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
+            false,
+            1,
+        ),
+        (
+            "v4-schema29-committed",
+            STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION,
             true,
             2,
         ),

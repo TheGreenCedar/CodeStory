@@ -62,7 +62,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         generation INTEGER NOT NULL CHECK (generation > 0),
         generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
         run_id TEXT NOT NULL CHECK (length(run_id) > 0),
-        mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+        mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental', 'semantic_projection')),
         published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
     )",
     "CREATE TABLE IF NOT EXISTS structural_text_unit (
@@ -695,6 +695,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 29 {
         storage.set_schema_version(29)?;
     }
+    migrate_v30_semantic_projection_publication_mode(&storage.conn)?;
+    if stored_version < 30 {
+        storage.set_schema_version(30)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -1176,6 +1180,52 @@ pub(super) fn migrate_v29_structural_policy_exclusions(
         "source_policy_exclusion_publication",
         "structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0)",
     )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v30_semantic_projection_publication_mode(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'index_publication'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if table_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("semantic_projection"))
+    {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "ALTER TABLE index_publication RENAME TO index_publication_v29",
+        [],
+    )?;
+    tx.execute(
+        "CREATE TABLE index_publication (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+            run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+            mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental', 'semantic_projection')),
+            published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO index_publication (
+            id, generation, generation_id, run_id, mode, published_at_epoch_ms
+         )
+         SELECT id, generation, generation_id, run_id, mode, published_at_epoch_ms
+         FROM index_publication_v29",
+        [],
+    )?;
+    tx.execute("DROP TABLE index_publication_v29", [])?;
+    tx.commit()?;
     Ok(())
 }
 

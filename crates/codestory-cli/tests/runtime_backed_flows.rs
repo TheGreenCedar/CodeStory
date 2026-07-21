@@ -1,3 +1,4 @@
+use fs4::fs_std::FileExt;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,82 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.args(args);
     command.arg("--project").arg(workspace);
     command.output().expect("run codestory-cli")
+}
+
+fn run_cli_with_cache(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = test_support::cli_command();
+    command.args(args);
+    command
+        .arg("--project")
+        .arg(workspace)
+        .arg("--cache-dir")
+        .arg(cache_dir);
+    command.output().expect("run codestory-cli")
+}
+
+fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> PathBuf {
+    fs::create_dir_all(cache_dir).expect("create explicit cache");
+    let index = run_cli_with_cache(
+        workspace,
+        cache_dir,
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "fixture index failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&index.stderr),
+        String::from_utf8_lossy(&index.stdout)
+    );
+    let storage_path = cache_dir.join("codestory.db");
+    let connection = rusqlite::Connection::open(&storage_path).expect("open indexed fixture");
+    let structural_counts = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM structural_text_unit),
+                (SELECT COUNT(*) FROM structural_text_projection),
+                (SELECT COUNT(*) FROM structural_text_artifact_cache)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .expect("read structural fixture counts");
+    assert_eq!(structural_counts, (0, 0, 0));
+    connection
+        .execute_batch(
+            "DELETE FROM structural_text_unit_publication;
+             ALTER TABLE index_publication RENAME TO index_publication_v30;
+             CREATE TABLE index_publication (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+                run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+                mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+                published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+             );
+             INSERT INTO index_publication SELECT * FROM index_publication_v30;
+             DROP TABLE index_publication_v30;
+             PRAGMA user_version = 29;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("downgrade projection fixture");
+    drop(connection);
+    storage_path
+}
+
+fn remove_workspace_source(workspace: &Path) {
+    for entry in fs::read_dir(workspace).expect("list workspace source") {
+        let path = entry.expect("workspace entry").path();
+        if path.is_dir() {
+            fs::remove_dir_all(path).expect("remove source directory");
+        } else {
+            fs::remove_file(path).expect("remove source file");
+        }
+    }
 }
 
 fn index_workspace(workspace: &Path) {
@@ -436,4 +513,108 @@ fn broad_cli_json_surfaces_share_core_and_retrieval_publications() {
     .expect("parse drill summary JSON");
     assert_publication_metadata(&summary, "drill summary", true);
 }
+
+#[test]
+#[ignore = "builds a schema-29 indexed fixture and executes the projection-only CLI writer"]
+fn republish_projections_cli_uses_stored_core_after_all_source_is_removed() {
+    let workspace = copy_tictactoe_workspace();
+    let cache = tempdir().expect("explicit cache");
+    let storage_path = publish_schema_29_projection_fixture(workspace.path(), cache.path());
+    remove_workspace_source(workspace.path());
+
+    let output = run_cli_with_cache(
+        workspace.path(),
+        cache.path(),
+        &["retrieval", "republish-projections", "--format", "json"],
+    );
+
+    assert!(
+        output.status.success(),
+        "projection republish failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse republish output");
+    assert_eq!(json["publication"]["mode"], "semantic_projection");
+    assert!(
+        json["symbol_document_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    let connection = rusqlite::Connection::open(&storage_path).expect("open republished core");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("read migrated schema"),
+        30
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT unit_count, projection_count
+                 FROM structural_text_unit_publication WHERE id = 1 AND complete = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("read explicit empty structural publication"),
+        (0, 0)
+    );
+}
+
+#[test]
+#[ignore = "builds a schema-29 indexed fixture and verifies CLI writer-lock ordering"]
+fn republish_projections_cli_acquires_writer_lock_before_schema_migration() {
+    let workspace = copy_tictactoe_workspace();
+    let cache = tempdir().expect("explicit cache");
+    let storage_path = publish_schema_29_projection_fixture(workspace.path(), cache.path());
+    remove_workspace_source(workspace.path());
+    let bytes_before = fs::read(&storage_path).expect("read schema-29 bytes");
+    let lock_path = storage_path.with_extension("index-writer.lock");
+    let writer_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open writer lock");
+    assert!(
+        writer_lock
+            .try_lock_exclusive()
+            .expect("acquire writer lock"),
+        "test must own the writer lock"
+    );
+
+    let output = run_cli_with_cache(
+        workspace.path(),
+        cache.path(),
+        &["retrieval", "republish-projections", "--format", "json"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "locked writer unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("cache_busy")
+            || stderr.contains("writer lock")
+            || stdout.contains("cache_busy")
+            || stdout.contains("writer lock"),
+        "unexpected CLI error: stderr={stderr} stdout={stdout}"
+    );
+    assert_eq!(
+        fs::read(&storage_path).expect("read unchanged schema-29 bytes"),
+        bytes_before,
+        "CLI touched the database before acquiring the writer lock"
+    );
+    let connection = rusqlite::Connection::open(&storage_path).expect("inspect locked fixture");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("read retained schema"),
+        29
+    );
+}
+
 mod test_support;

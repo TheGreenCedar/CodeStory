@@ -1468,6 +1468,20 @@ impl ProjectService {
             .run_indexing_blocking_without_runtime_refresh(mode)
     }
 
+    pub fn republish_semantic_projections_blocking(
+        &self,
+    ) -> Result<crate::SemanticProjectionRepublishOutcome, ApiError> {
+        self.controller.republish_semantic_projections_blocking()
+    }
+
+    pub fn republish_semantic_projections_blocking_with_cancel(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<crate::SemanticProjectionRepublishOutcome, ApiError> {
+        self.controller
+            .republish_semantic_projections_blocking_with_cancel(cancel_token)
+    }
+
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         self.controller.dry_run_index(mode)
     }
@@ -1533,6 +1547,31 @@ impl IndexService {
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.controller
             .run_indexing_blocking_without_runtime_refresh_with_cancel(mode, cancel_token)
+    }
+
+    pub fn republish_semantic_projections_blocking(
+        &self,
+    ) -> Result<crate::SemanticProjectionRepublishOutcome, ApiError> {
+        self.controller.republish_semantic_projections_blocking()
+    }
+
+    pub fn republish_semantic_projections_blocking_with_cancel(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<crate::SemanticProjectionRepublishOutcome, ApiError> {
+        self.controller
+            .republish_semantic_projections_blocking_with_cancel(cancel_token)
+    }
+
+    /// Bind one explicit project/cache pair and acquire its writer lock before
+    /// opening or migrating the stored core.
+    pub fn republish_semantic_projections_at_blocking(
+        &self,
+        root: std::path::PathBuf,
+        storage_path: std::path::PathBuf,
+    ) -> Result<crate::SemanticProjectionRepublishOutcome, ApiError> {
+        self.controller
+            .republish_semantic_projections_at_blocking(root, storage_path)
     }
 
     pub fn complete_index_publication(&self) -> Result<Option<IndexPublicationRecord>, ApiError> {

@@ -100,6 +100,20 @@ cross-page shared endpoints, exact component-report accumulation, and
 old-or-new publication survival on cancellation or injected node/edge reads.
 Incremental dependency-scope streaming remains a separate change.
 
+Semantic projection-only publication additionally proves the v29-to-v30
+publication-mode migration preserves the prior row, an explicit CLI writer is
+the only entry point, and a complete core can republish after its source file is
+removed. Missing or incompatible stored symbol documents must fail closed;
+cancellation and a competing writer must preserve the previous complete
+publication and leave no staged artifact. The proof must also show that the new
+core uses `semantic_projection`, its dense and structural manifests bind the
+new generation, and no retrieval generation is synthesized. Do not substitute
+a corpus rerun for these focused identity and fault tests. The post-commit
+`RuntimeCache` failure/cancellation lane must use the public controller path and
+show that the committed core and prepared search generation converge, indexing
+state clears, retrieval remains bound to the prior core, and no incomplete
+search or staged database artifacts remain.
+
 ## Retrieval engine
 
 The supported product path is one packaged executable whose hidden mode owns

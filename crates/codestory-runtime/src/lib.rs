@@ -54,12 +54,15 @@ use codestory_indexer::{
     ArtifactCacheFamilyStats, ArtifactCachePolicies, ArtifactCachePolicy, CancellationToken,
     IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
+#[cfg(test)]
+use codestory_store::RetrievalIndexManifest;
 use codestory_store::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
     DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
     GroundingNodeRecord, IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc,
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, SourcePolicyExclusionPolicyIdentity,
-    SourcePolicyExclusionRecord, Store, SymbolSearchDoc, SymbolSummaryRecord,
+    SourcePolicyExclusionRecord, Store, StructuralTextPublicationCompatibility, SymbolSearchDoc,
+    SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 #[cfg(test)]
@@ -88,6 +91,17 @@ use uuid::Uuid;
 
 mod agent;
 pub use agent::{packet_step_trace_json, plan_packet};
+
+/// Result of explicitly republishing semantic projections from one pinned core.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticProjectionRepublishOutcome {
+    pub previous_publication: IndexPublicationRecord,
+    pub publication: IndexPublicationRecord,
+    pub semantic_policy_version: String,
+    pub symbol_document_count: u32,
+    pub dense_anchor_count: u64,
+    pub phase_timings: IndexingPhaseTimings,
+}
 mod browser;
 mod cache_rehydrate;
 pub mod graph_analysis;
@@ -5459,6 +5473,8 @@ const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 #[cfg(test)]
 type ActivationSearchRevalidateHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
+type SemanticProjectionRevalidateHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
 type FullRefreshStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
 #[cfg(test)]
 type IncrementalStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
@@ -6131,6 +6147,7 @@ const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
 #[cfg(test)]
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
 const SEMANTIC_POLICY_VERSION: &str = codestory_retrieval::SEMANTIC_POLICY_VERSION;
+const LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION: u32 = 29;
 const SYMBOL_SEARCH_DOC_PROVENANCE: &str = "extracted";
 const DENSE_CENTRAL_RELATIONSHIP_THRESHOLD: usize = 12;
 const DENSE_CENTRAL_SCORE_THRESHOLD: usize = 24;
@@ -6385,7 +6402,11 @@ struct SearchGenerationCatalogGuard {
 enum PublicationTestBoundary {
     SemanticContextIndexes,
     SemanticNodePage,
+    SemanticStoredDocumentPage,
     SemanticEndpointRead,
+    ProjectionSnapshotFinalize,
+    ProjectionSnapshotDetail,
+    ProjectionManifestIdentity,
     Identity,
     SearchBuild,
     SearchSymbolPage,
@@ -6410,6 +6431,8 @@ thread_local! {
     static PUBLICATION_TEST_FAULT: std::cell::RefCell<Option<(PublicationTestBoundary, PublicationTestAction)>> =
         const { std::cell::RefCell::new(None) };
     static ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<ActivationSearchRevalidateHook>> =
+        const { std::cell::RefCell::new(None) };
+    static SEMANTIC_PROJECTION_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<SemanticProjectionRevalidateHook>> =
         const { std::cell::RefCell::new(None) };
     static SOURCE_POLICY_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -6437,6 +6460,23 @@ fn arm_activation_search_before_revalidate_hook(hook: impl FnOnce(&Path) + 'stat
 fn run_activation_search_before_revalidate_hook(storage_path: &Path) {
     ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage_path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_semantic_projection_before_revalidate_hook(hook: impl FnOnce(&Path) + 'static) {
+    SEMANTIC_PROJECTION_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_semantic_projection_before_revalidate_hook(storage_path: &Path) {
+    SEMANTIC_PROJECTION_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook {
             hook(storage_path);
         }
     });
@@ -6696,6 +6736,16 @@ fn prune_search_generations(
         )
     });
 
+    // During staged publication the prepared search identity is newer than
+    // the still-live core. Keep the search generation bound to that live core
+    // as the rollback; a concurrent prepared generation must not consume the
+    // sole rollback slot merely because its completion marker was written.
+    let pinned_rollback_generation_id = Store::database_complete_index_publication(storage_path)
+        .ok()
+        .flatten()
+        .map(|publication| publication.generation_id)
+        .filter(|generation_id| generation_id != active_generation_id);
+
     let mut rollback_retained = false;
     for entry in generations {
         let path = entry.path();
@@ -6710,7 +6760,14 @@ fn prune_search_generations(
             Some(false)
         };
         match inspection {
-            Some(true) if !rollback_retained => rollback_retained = true,
+            Some(true)
+                if !rollback_retained
+                    && pinned_rollback_generation_id
+                        .as_ref()
+                        .is_none_or(|generation_id| generation_id == &name) =>
+            {
+                rollback_retained = true
+            }
             Some(_) => {
                 let relative = Path::new(relative_root).join(&name);
                 let _ = try_remove_search_generation(&deletion, &relative, &path)?;
@@ -8915,6 +8972,7 @@ fn process_semantic_symbol_nodes(
     semantic_nodes: &[&GraphNode],
     graph_context: &SemanticDocGraphContext,
     file_text_cache: &HashMap<String, Option<String>>,
+    stored_docs: Option<&HashMap<GraphNodeId, SymbolSearchDoc>>,
     component_access: &HashMap<GraphNodeId, AccessKind>,
     existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
     updated_at_epoch_ms: i64,
@@ -8942,15 +9000,51 @@ fn process_semantic_symbol_nodes(
                 let file_path = graph_context
                     .file_path_for_node(node)
                     .map(ToString::to_string);
-                let doc_text = build_llm_symbol_doc_text_with_policy(
-                    graph_context,
-                    node,
-                    &display_name,
-                    file_path.as_deref(),
-                    file_text_cache,
-                    semantic_alias_mode,
-                    semantic_max_tokens,
-                );
+                let doc_text = if let Some(stored_docs) = stored_docs {
+                    let stored = stored_docs.get(&node.id).ok_or_else(|| {
+                        ApiError::new(
+                            "semantic_projection_migration_required",
+                            format!(
+                                "Stored semantic document {} is missing from the pinned core",
+                                node.id.0
+                            ),
+                        )
+                    })?;
+                    if stored.file_node_id != node.file_node_id
+                        || stored.kind != node.kind
+                        || stored.display_name != display_name
+                        || stored.qualified_name != node.qualified_name
+                        || stored.file_path != file_path
+                        || stored.start_line != node.start_line
+                        || stored.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
+                        || stored.source_provenance != SYMBOL_SEARCH_DOC_PROVENANCE
+                        || stored.doc_text.trim().is_empty()
+                        || stored.doc_hash
+                            != llm_symbol_doc_hash_with_alias(
+                                &stored.doc_text,
+                                semantic_alias_mode,
+                            )
+                    {
+                        return Err(ApiError::new(
+                            "semantic_projection_migration_required",
+                            format!(
+                                "Stored semantic document {} does not match the pinned graph and current document contract",
+                                node.id.0
+                            ),
+                        ));
+                    }
+                    stored.doc_text.clone()
+                } else {
+                    build_llm_symbol_doc_text_with_policy(
+                        graph_context,
+                        node,
+                        &display_name,
+                        file_path.as_deref(),
+                        file_text_cache,
+                        semantic_alias_mode,
+                        semantic_max_tokens,
+                    )
+                };
                 let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, semantic_alias_mode);
                 let dense_reason = dense_anchor_reason_for_node(
                     graph_context,
@@ -9002,13 +9096,13 @@ fn process_semantic_symbol_nodes(
                     .map(|(pending, reusable)| (Some(pending), reusable))
                     .unwrap_or((None, false));
 
-                BuiltLlmSymbolDoc {
+                Ok(BuiltLlmSymbolDoc {
                     symbol_doc,
                     pending,
                     reusable,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ApiError>>()?;
         *doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
@@ -9356,6 +9450,7 @@ fn sync_llm_symbol_projection_for_runtime(
         &semantic_nodes,
         &graph_context,
         &file_text_cache,
+        None,
         &component_access,
         &existing_docs,
         updated_at_epoch_ms,
@@ -9470,11 +9565,18 @@ fn sync_llm_symbol_projection_for_runtime(
     Ok(stats)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticProjectionDocumentSource {
+    SourceFiles,
+    StoredCore,
+}
+
 fn sync_full_llm_symbol_projection_streaming_for_runtime(
     storage: &mut Storage,
     source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    document_source: SemanticProjectionDocumentSource,
 ) -> Result<SemanticProjectionStats, ApiError> {
     let mut stats = SemanticProjectionStats {
         reported: true,
@@ -9555,18 +9657,23 @@ fn sync_full_llm_symbol_projection_streaming_for_runtime(
             .map(String::len)
             .sum(),
     );
-    let mut file_text_paths = HashMap::new();
-    for file_id in &semantic_file_ids {
-        let Some(display_path) = file_paths.get(file_id) else {
-            continue;
-        };
-        let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
-        file_text_paths.insert(display_path.clone(), read_path);
-    }
     let mut doc_build_ns = 0_u128;
-    let file_cache_started = Instant::now();
-    let file_text_cache = build_semantic_file_text_cache_from_paths(&file_text_paths);
-    doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
+    let file_text_cache = if document_source == SemanticProjectionDocumentSource::SourceFiles {
+        let mut file_text_paths = HashMap::new();
+        for file_id in &semantic_file_ids {
+            let Some(display_path) = file_paths.get(file_id) else {
+                continue;
+            };
+            let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
+            file_text_paths.insert(display_path.clone(), read_path);
+        }
+        let file_cache_started = Instant::now();
+        let cache = build_semantic_file_text_cache_from_paths(&file_text_paths);
+        doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
+        cache
+    } else {
+        HashMap::new()
+    };
 
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_symbol_node_ids = Vec::<GraphNodeId>::new();
@@ -9612,6 +9719,40 @@ fn sync_full_llm_symbol_projection_streaming_for_runtime(
             .iter()
             .map(|node| node.id)
             .collect::<Vec<_>>();
+        let stored_docs = if document_source == SemanticProjectionDocumentSource::StoredCore {
+            let docs = storage
+                .get_symbol_search_docs_for_node_ids(&semantic_node_ids)
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load pinned semantic documents: {error}"))
+                })?;
+            if docs.len() != semantic_node_ids.len() {
+                return Err(ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!(
+                        "Pinned core contains {} semantic nodes but only {} stored documents in this page",
+                        semantic_node_ids.len(),
+                        docs.len()
+                    ),
+                ));
+            }
+            Some(
+                docs.into_iter()
+                    .map(|doc| (doc.node_id, doc))
+                    .collect::<HashMap<_, _>>(),
+            )
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if document_source == SemanticProjectionDocumentSource::StoredCore {
+            publication_test_checkpoint(
+                PublicationTestBoundary::SemanticStoredDocumentPage,
+                cancel_token,
+            )?;
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
+        }
         let component_access = storage
             .get_component_access_map_for_nodes(&semantic_node_ids)
             .map_err(|e| {
@@ -9649,6 +9790,7 @@ fn sync_full_llm_symbol_projection_streaming_for_runtime(
             &semantic_node_refs,
             &graph_context,
             &file_text_cache,
+            stored_docs.as_ref(),
             &component_access,
             &existing_docs,
             updated_at_epoch_ms,
@@ -9751,6 +9893,7 @@ fn finalize_staged_semantic_docs(
         "core:test-publication",
         cancel_token,
         &test_sidecar_runtime_from_env(),
+        SemanticProjectionDocumentSource::SourceFiles,
     )
 }
 
@@ -9761,6 +9904,7 @@ fn finalize_staged_semantic_docs_for_runtime(
     source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    document_source: SemanticProjectionDocumentSource,
 ) -> Result<SemanticProjectionStats, ApiError> {
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
@@ -9792,6 +9936,7 @@ fn finalize_staged_semantic_docs_for_runtime(
             source_identity,
             cancel_token,
             runtime,
+            document_source,
         )?
     } else {
         let node_load_started = Instant::now();
@@ -12576,6 +12721,119 @@ impl AppController {
         self.run_indexing_blocking_inner(mode, false, Some(cancel_token))
     }
 
+    pub fn republish_semantic_projections_blocking(
+        &self,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_blocking_inner(None)
+    }
+
+    pub fn republish_semantic_projections_blocking_with_cancel(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_blocking_inner(Some(cancel_token))
+    }
+
+    fn republish_semantic_projections_blocking_inner(
+        &self,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        let (root, storage_path) = {
+            let state = self.state.lock();
+            let root = state.project_root.clone().ok_or_else(no_project_error)?;
+            let storage_path = state
+                .storage_path
+                .clone()
+                .unwrap_or_else(|| root.join("codestory.db"));
+            (root, storage_path)
+        };
+        self.republish_semantic_projections_at_blocking_inner(root, storage_path, cancel_token)
+    }
+
+    pub fn republish_semantic_projections_at_blocking(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_at_blocking_inner(root, storage_path, None)
+    }
+
+    fn republish_semantic_projections_at_blocking_inner(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        if !root.is_dir() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist or is not a directory: {}",
+                root.display()
+            )));
+        }
+        {
+            let mut state = self.state.lock();
+            if state.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+            }
+            state.project_root = Some(root.clone());
+            state.storage_path = Some(storage_path.clone());
+            state.is_indexing = true;
+            state.index_freshness_cache = None;
+        }
+        let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.state.lock().is_indexing = false;
+                return Err(error);
+            }
+        };
+        let result = semantic_projection_republish_for_runtime(
+            &root,
+            &storage_path,
+            cancel_token,
+            &self.runtime_config,
+            &self.source_index_policy,
+        );
+        match result {
+            Ok((
+                summary,
+                previous_publication,
+                publication,
+                symbol_document_count,
+                dense_anchor_count,
+            )) => {
+                let phase_timings =
+                    self.finish_successful_indexing(summary, &storage_path, true, cancel_token)?;
+                Ok(SemanticProjectionRepublishOutcome {
+                    previous_publication,
+                    publication,
+                    semantic_policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                    symbol_document_count,
+                    dense_anchor_count,
+                    phase_timings,
+                })
+            }
+            Err(error) => {
+                let mut state = self.state.lock();
+                state.is_indexing = false;
+                state.index_freshness_cache = None;
+                Err(error)
+            }
+        }
+    }
+
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
@@ -15324,6 +15582,7 @@ fn index_publication_dto(publication: IndexPublicationRecord) -> IndexPublicatio
         mode: match publication.mode {
             IndexPublicationMode::Full => IndexPublicationModeDto::Full,
             IndexPublicationMode::Incremental => IndexPublicationModeDto::Incremental,
+            IndexPublicationMode::SemanticProjection => IndexPublicationModeDto::SemanticProjection,
         },
         published_at_epoch_ms: publication.published_at_epoch_ms,
     }
@@ -15385,6 +15644,441 @@ impl Drop for IndexWriterGuard {
                 path = %self.path.display(),
                 "Failed to unlock index writer lock: {error}"
             );
+        }
+    }
+}
+
+fn semantic_projection_republish_for_runtime(
+    root: &Path,
+    storage_path: &Path,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<
+    (
+        IndexingRunSummary,
+        IndexPublicationRecord,
+        IndexPublicationRecord,
+        u32,
+        u64,
+    ),
+    ApiError,
+> {
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    if !storage_path.is_file() {
+        return Err(ApiError::new(
+            "semantic_projection_core_missing",
+            "Semantic projection republish requires an existing complete core publication.",
+        ));
+    }
+
+    let expected_schema_version =
+        Store::database_schema_version(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to pin the stored core schema version: {error}"
+            ))
+        })?;
+
+    let expected_publication = Store::database_complete_index_publication(storage_path)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to pin the complete core publication: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                "semantic_projection_core_incomplete",
+                "Semantic projection republish requires a complete core publication.",
+            )
+        })?;
+    let mut staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to clone the pinned core for semantic projection republish: {error}"
+        ))
+    })?;
+    let cleanup_staged_path = staged.path().to_path_buf();
+    let result = (|| {
+        let staged_publication = staged
+            .store_mut()
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to validate the staged core publication: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "semantic_projection_core_incomplete",
+                    "The staged core publication is incomplete.",
+                )
+            })?;
+        if staged_publication != expected_publication {
+            return Err(ApiError::new(
+                "publication_changed",
+                "The cloned core does not match the pinned live publication.",
+            ));
+        }
+        staged
+            .store_mut()
+            .validate_dense_anchor_publication(&expected_publication)
+            .map_err(|error| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!("Pinned dense-anchor publication is not complete: {error}"),
+                )
+            })?;
+        let structural_compatibility = staged
+            .store_mut()
+            .validate_structural_text_unit_publication_or_legacy_empty(&expected_publication)
+            .map_err(|error| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!("Pinned structural state is not compatible: {error}"),
+                )
+            })?;
+        if structural_compatibility == StructuralTextPublicationCompatibility::LegacyEmpty
+            && expected_schema_version != LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(ApiError::new(
+                "semantic_projection_migration_required",
+                "A missing structural publication is compatible only with a schema-29 retained core whose structural stores are empty.",
+            ));
+        }
+        let source_manifest = staged
+            .store_mut()
+            .get_source_policy_exclusion_manifest()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to load the pinned source-policy manifest: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    "Pinned source-policy publication is missing.",
+                )
+            })?;
+        let source_policy = SourcePolicyExclusionPolicyIdentity::new(
+            &source_manifest.policy_version,
+            source_manifest.byte_cap,
+            source_manifest.structural_unit_cap,
+        );
+        let selected_identity = project_identity_v3(root);
+        if source_manifest.project_id != selected_identity.project_id
+            || source_manifest.workspace_id != selected_identity.workspace_id
+        {
+            return Err(ApiError::new(
+                "semantic_projection_project_mismatch",
+                "The selected project root does not own the cached core publication.",
+            ));
+        }
+        if source_manifest.policy_version != source_index_policy.policy_version
+            || source_manifest.byte_cap != source_index_policy.byte_cap
+            || source_manifest.structural_unit_cap != source_index_policy.structural_unit_cap
+        {
+            return Err(ApiError::new(
+                "semantic_projection_migration_required",
+                "Pinned source-policy identity differs from the current runtime policy; run a source refresh before republishing semantic projections.",
+            ));
+        }
+        staged
+            .store_mut()
+            .validate_source_policy_exclusion_publication(
+                &expected_publication,
+                &source_manifest.project_id,
+                &source_manifest.workspace_id,
+                source_policy,
+            )
+            .map_err(|error| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!("Pinned source-policy publication is not complete: {error}"),
+                )
+            })?;
+        let source_exclusions =
+            staged
+                .store_mut()
+                .get_source_policy_exclusions()
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to load pinned source-policy exclusions: {error}"
+                    ))
+                })?;
+
+        let publication = next_index_publication(
+            Some(&expected_publication),
+            IndexPublicationMode::SemanticProjection,
+            &Uuid::new_v4().to_string(),
+        )?;
+        let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        staged
+            .store_mut()
+            .begin_incremental_run()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to fence the staged semantic projection writer: {error}"
+                ))
+            })?;
+        staged
+            .store_mut()
+            .invalidate_grounding_snapshots()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to invalidate staged derived snapshots: {error}"
+                ))
+            })?;
+
+        let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
+            staged.store_mut(),
+            None,
+            None,
+            &source_identity,
+            cancel_token,
+            runtime,
+            SemanticProjectionDocumentSource::StoredCore,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finalize staged semantic projection snapshots: {error}"
+            ))
+        })?;
+        #[cfg(test)]
+        publication_test_checkpoint(
+            PublicationTestBoundary::ProjectionSnapshotFinalize,
+            cancel_token,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let detail_started = Instant::now();
+        staged.snapshots().refresh_detail().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to refresh staged grounding detail snapshot: {error}"
+            ))
+        })?;
+        #[cfg(test)]
+        publication_test_checkpoint(
+            PublicationTestBoundary::ProjectionSnapshotDetail,
+            cancel_token,
+        )?;
+        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+
+        #[cfg(test)]
+        publication_test_checkpoint(
+            PublicationTestBoundary::ProjectionManifestIdentity,
+            cancel_token,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let dense_manifest = staged
+            .store_mut()
+            .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to publish semantic dense-anchor inputs: {error}"
+                ))
+            })?;
+        let source_candidates = source_exclusions
+            .iter()
+            .map(source_policy_exclusion_candidate)
+            .collect::<Vec<_>>();
+        staged
+            .store_mut()
+            .publish_source_policy_exclusion_generation(
+                &publication,
+                &selected_identity.project_id,
+                &selected_identity.workspace_id,
+                source_policy,
+                &source_candidates,
+            )
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind pinned source-policy exclusions: {error}"
+                ))
+            })?;
+        staged
+            .store_mut()
+            .publish_structural_text_unit_generation(&publication)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind pinned structural publication: {error}"
+                ))
+            })?;
+        staged
+            .store_mut()
+            .put_index_publication(&publication)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to persist staged semantic projection identity: {error}"
+                ))
+            })?;
+
+        let prepared_search_state = match rebuild_search_state_from_storage_for_runtime(
+            staged.store_mut(),
+            storage_path,
+            None,
+            false,
+            runtime,
+            cancel_token,
+            None,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(error);
+            }
+        };
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        let staged_path = staged.path().to_path_buf();
+        #[cfg(test)]
+        if let Err(error) =
+            publication_test_checkpoint(PublicationTestBoundary::CatalogLock, cancel_token)
+        {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        #[cfg(test)]
+        run_semantic_projection_before_revalidate_hook(storage_path);
+        let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
+            Ok(guard) => guard,
+            Err(error) => {
+                drop(prepared_search_state);
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(error);
+            }
+        };
+        let live_publication = match Store::database_complete_index_publication(storage_path) {
+            Ok(publication) => publication,
+            Err(error) => {
+                drop(prepared_search_state);
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(ApiError::internal(format!(
+                    "Failed to revalidate the pinned core before promotion: {error}"
+                )));
+            }
+        };
+        if live_publication.as_ref() != Some(&expected_publication) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(ApiError::new(
+                "publication_changed",
+                "The live core changed while semantic projections were being rebuilt.",
+            ));
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        #[cfg(test)]
+        if let Err(error) =
+            publication_test_checkpoint(PublicationTestBoundary::MarkerCompletion, cancel_token)
+        {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        staged
+            .store_mut()
+            .finish_incremental_run()
+            .map_err(|error| {
+                discard_unpublished_search_generation(storage_path, &publication);
+                ApiError::internal(format!(
+                    "Failed to complete the staged semantic projection marker: {error}"
+                ))
+            })?;
+
+        let publish_started = Instant::now();
+        #[cfg(test)]
+        if let Err(error) =
+            publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)
+        {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        let staged_publish_stats = staged.publish_with_stats(storage_path).map_err(|error| {
+            discard_unpublished_search_generation(storage_path, &publication);
+            ApiError::internal(format!(
+                "Failed to publish staged semantic projections: {error}. Preserved staged snapshot at {}",
+                staged_path.display()
+            ))
+        })?;
+        let mut phase_timings = IndexingPhaseTimings {
+            deferred_indexes_ms: Some(
+                staged_finalize_stats
+                    .deferred_indexes_ms
+                    .saturating_add(staged_semantic_stats.semantic_context_index_ms),
+            ),
+            summary_snapshot_ms: Some(staged_finalize_stats.summary_snapshot_ms),
+            detail_snapshot_ms: Some(detail_snapshot_ms),
+            publish_ms: Some(clamp_u128_to_u32(publish_started.elapsed().as_millis())),
+            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
+                .sqlite_wal_autocheckpoint_bytes,
+            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
+            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
+            staged_snapshot_copy: staged_publish_stats
+                .snapshot_copy
+                .map(database_snapshot_copy_timings),
+            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
+            ..Default::default()
+        };
+        apply_semantic_projection_stats(&mut phase_timings, staged_semantic_stats);
+        Ok((
+            IndexingRunSummary {
+                phase_timings,
+                staged_semantic_stats,
+                llm_refresh_scope: None,
+                #[cfg(test)]
+                publication: publication.clone(),
+                prepared_search_state: Some(prepared_search_state),
+            },
+            publication,
+            staged_semantic_stats.symbol_search_docs_written,
+            dense_manifest.anchor_count,
+        ))
+    })();
+
+    match result {
+        Ok((summary, publication, symbol_document_count, dense_anchor_count)) => Ok((
+            summary,
+            expected_publication,
+            publication,
+            symbol_document_count,
+            dense_anchor_count,
+        )),
+        Err(error) => {
+            let _ = SnapshotStore::discard_staged(&cleanup_staged_path);
+            Err(error)
         }
     }
 }
@@ -15666,6 +16360,7 @@ fn index_full_for_runtime(
         &dense_anchor_source_identity,
         cancel_token,
         runtime,
+        SemanticProjectionDocumentSource::SourceFiles,
     ) {
         Ok(stats) => stats,
         Err(error) => {
@@ -16524,6 +17219,7 @@ fn run_incremental_indexing_common(
             &dense_anchor_source_identity,
             cancel_token,
             runtime,
+            SemanticProjectionDocumentSource::SourceFiles,
         )?;
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
@@ -17321,6 +18017,37 @@ mod tests {
             DEFAULT_SOURCE_FILE_BYTE_CAP,
             codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         )
+    }
+
+    fn test_retrieval_manifest(
+        project_id: &str,
+        symbol_doc_count: i64,
+        dense_projection_count: i64,
+    ) -> RetrievalIndexManifest {
+        RetrievalIndexManifest {
+            project_id: project_id.to_string(),
+            lexical_version: "retained-v1".to_string(),
+            semantic_generation: "retained-v1".to_string(),
+            scip_revision: None,
+            built_at_epoch_ms: 1,
+            disk_bytes: Some(1),
+            degraded_modes_json: "[]".to_string(),
+            embedding_backend: Some("retained-v1".to_string()),
+            embedding_dim: Some(1),
+            sidecar_schema_version: Some(1),
+            sidecar_input_hash: Some("1".repeat(64)),
+            sidecar_generation: Some("retained-v1".to_string()),
+            projection_count: Some(1),
+            symbol_doc_count: Some(symbol_doc_count),
+            dense_projection_count: Some(dense_projection_count),
+            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.to_string()),
+            graph_artifact_hash: Some("2".repeat(64)),
+            dense_reason_counts_json: Some("{}".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        }
     }
 
     #[test]
@@ -25213,6 +25940,707 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("changed Rust exclusion");
         assert_ne!(changed.content_hash, first_exclusion.content_hash);
         assert!(changed.observed_size > first_exclusion.observed_size);
+    }
+
+    #[test]
+    fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let identity = project_identity_v3(workspace.path());
+        let mut before_storage = Storage::open(&storage_path).expect("open complete core");
+        let before = before_storage
+            .get_complete_index_publication()
+            .expect("read complete core")
+            .expect("complete publication");
+        let exclusions = (0_u64..112)
+            .map(|index| OversizedSourceExclusionCandidate {
+                normalized_path: format!("legacy/excluded-{index}.rs"),
+                content_hash: format!("{index:064x}"),
+                observed_size: DEFAULT_SOURCE_FILE_BYTE_CAP + 1 + index,
+                observed_unit_count: 0,
+                policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+                byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            })
+            .collect::<Vec<_>>();
+        before_storage
+            .publish_source_policy_exclusion_generation(
+                &before,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+                &exclusions,
+            )
+            .expect("replace retained source-policy publication");
+        let dense_before = before_storage
+            .validate_dense_anchor_publication(&before)
+            .expect("retained dense publication");
+        assert!(dense_before.anchor_count > 0);
+        let symbol_doc_count = before_storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("retained symbol documents")
+            .len();
+        assert!(symbol_doc_count > 0);
+        before_storage
+            .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                &identity.project_id,
+                symbol_doc_count as i64,
+                dense_before.anchor_count as i64,
+            ))
+            .expect("publish retained retrieval manifest");
+        let before_retrieval = before_storage
+            .get_retrieval_index_publication(&identity.project_id)
+            .expect("read retrieval publication")
+            .expect("retained retrieval publication");
+        drop(before_storage);
+
+        let legacy = rusqlite::Connection::open(&storage_path).expect("open retained v1 core");
+        legacy
+            .execute_batch(
+                "DELETE FROM structural_text_unit_publication;
+                 ALTER TABLE index_publication RENAME TO index_publication_v30;
+                 CREATE TABLE index_publication (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL CHECK (generation > 0),
+                    generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+                    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+                    mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+                    published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+                 );
+                 INSERT INTO index_publication
+                 SELECT * FROM index_publication_v30;
+                 DROP TABLE index_publication_v30;
+                 PRAGMA user_version = 29;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("downgrade retained core to schema 29");
+        drop(legacy);
+        for entry in fs::read_dir(workspace.path()).expect("list fixture root") {
+            let path = entry.expect("fixture entry").path();
+            if path.file_name().is_some_and(|name| name == ".cache") {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).expect("remove source directory");
+            } else {
+                fs::remove_file(&path).expect("remove source file");
+            }
+        }
+
+        let outcome = controller
+            .republish_semantic_projections_at_blocking(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("republish from stored core");
+
+        assert_eq!(outcome.previous_publication, before);
+        assert_eq!(outcome.publication.generation, before.generation + 1);
+        assert_eq!(
+            outcome.publication.mode,
+            IndexPublicationMode::SemanticProjection
+        );
+        assert!(
+            outcome
+                .phase_timings
+                .symbol_search_docs_written
+                .is_some_and(|count| count > 0)
+        );
+        let storage = Storage::open(&storage_path).expect("open republished core");
+        assert_eq!(
+            storage
+                .get_connection()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            30
+        );
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read republished core"),
+            Some(outcome.publication.clone())
+        );
+        storage
+            .validate_dense_anchor_publication(&outcome.publication)
+            .expect("dense publication is coherent");
+        storage
+            .validate_structural_text_unit_publication(&outcome.publication)
+            .expect("structural publication is rebound");
+        let structural = storage
+            .get_structural_text_unit_publication_manifest()
+            .expect("read structural manifest")
+            .expect("explicit empty structural manifest");
+        assert_eq!(structural.unit_count, 0);
+        assert_eq!(structural.projection_count, 0);
+        let source_manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &outcome.publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("source policy is rebound");
+        assert_eq!(source_manifest.exclusion_count, 112);
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication(&identity.project_id)
+                .expect("read unchanged retrieval publication")
+                .as_ref(),
+            Some(&before_retrieval),
+            "projection-only core publication must not synthesize retrieval artifacts"
+        );
+        drop(storage);
+        let incompatible = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            SourceIndexPolicy::oversized(DEFAULT_SOURCE_FILE_BYTE_CAP + 1),
+        );
+        incompatible
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open core with incompatible source policy");
+        let error = incompatible
+            .republish_semantic_projections_blocking()
+            .expect_err("source policy drift must fail closed");
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read publication after rejected source policy"),
+            Some(outcome.publication)
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = {
+            let mut storage = Storage::open(&storage_path).expect("open complete core");
+            let publication = storage
+                .get_complete_index_publication()
+                .expect("read complete core")
+                .expect("complete publication");
+            assert!(
+                storage
+                    .clear_symbol_search_docs()
+                    .expect("remove stored semantic documents")
+                    > 0
+            );
+            publication
+        };
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("missing stored document must fail closed");
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved publication"),
+            Some(before)
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_rejects_a_cache_owned_by_another_project() {
+        let _env = hybrid_test_env();
+        let selected = copy_tictactoe_workspace();
+        let owner = copy_tictactoe_workspace();
+        let storage_path = owner.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                owner.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open cache owner");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish owned core");
+        let before = Storage::database_complete_index_publication(&storage_path)
+            .expect("read owned publication");
+        let search_before = persisted_search_generation_names(&storage_path);
+
+        let error = controller
+            .republish_semantic_projections_at_blocking(
+                selected.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect_err("foreign cache must fail closed");
+
+        assert_eq!(error.code, "semantic_projection_project_mismatch");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved owned publication"),
+            before
+        );
+        assert_eq!(
+            persisted_search_generation_names(&storage_path),
+            search_before
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_rejects_manifestless_nonempty_structural_state() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = Storage::database_complete_index_publication(&storage_path)
+            .expect("read complete publication");
+        {
+            let storage = Storage::open(&storage_path).expect("open structural fixture");
+            storage
+                .get_connection()
+                .execute_batch(
+                    "DELETE FROM structural_text_unit_publication;
+                     INSERT INTO structural_text_artifact_cache (
+                        file_path, file_id, cache_key, source_content_hash,
+                        descriptor_version, producer, artifact_digest, artifact_blob,
+                        updated_at_epoch_ms
+                     ) VALUES ('legacy.txt', -1, 'v1:test',
+                        '1111111111111111111111111111111111111111111111111111111111111111',
+                        1, 'test',
+                        '2222222222222222222222222222222222222222222222222222222222222222',
+                        X'01', 1);",
+                )
+                .expect("seed nonempty unmanifested structural state");
+        }
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("unmanifested structural rows must fail closed");
+
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert!(error.message.contains("nonempty state"));
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved publication"),
+            before
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_rejects_manifestless_current_schema() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = Storage::database_complete_index_publication(&storage_path)
+            .expect("read complete publication");
+        Storage::open(&storage_path)
+            .expect("open current core")
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove current structural manifest");
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("current schema cannot use legacy compatibility");
+
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert!(error.message.contains("schema-29 retained core"));
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved publication"),
+            before
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_respects_the_shared_writer_lock() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let publication = Storage::database_complete_index_publication(&storage_path)
+            .expect("read complete publication");
+        let _guard = IndexWriterGuard::try_acquire(&storage_path).expect("hold writer lock");
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("second writer must be rejected");
+        assert_eq!(error.code, "cache_busy");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read unchanged publication"),
+            publication
+        );
+    }
+
+    #[test]
+    fn semantic_projection_republish_fail_and_cancel_matrix_preserves_complete_core_and_search() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let runtime = test_sidecar_runtime_from_env();
+        let controller = AppController::new_with_config(runtime.clone());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let identity = project_identity_v3(workspace.path());
+        let (publication, retrieval_publication) = {
+            let mut storage = Storage::open(&storage_path).expect("open baseline core");
+            let publication = storage
+                .get_complete_index_publication()
+                .expect("read baseline publication")
+                .expect("complete baseline publication");
+            let symbol_doc_count = storage
+                .get_symbol_search_doc_count()
+                .expect("count baseline symbol documents");
+            let dense_count = storage
+                .validate_dense_anchor_publication(&publication)
+                .expect("validate baseline dense publication")
+                .anchor_count;
+            storage
+                .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                    &identity.project_id,
+                    symbol_doc_count as i64,
+                    dense_count as i64,
+                ))
+                .expect("publish baseline retrieval identity");
+            let retrieval = storage
+                .get_retrieval_index_publication(&identity.project_id)
+                .expect("read baseline retrieval identity")
+                .expect("baseline retrieval publication");
+            (publication, retrieval)
+        };
+        let search_generations = persisted_search_generation_names(&storage_path);
+        for boundary in [
+            PublicationTestBoundary::SemanticContextIndexes,
+            PublicationTestBoundary::SemanticNodePage,
+            PublicationTestBoundary::SemanticStoredDocumentPage,
+            PublicationTestBoundary::SemanticEndpointRead,
+            PublicationTestBoundary::ProjectionSnapshotFinalize,
+            PublicationTestBoundary::ProjectionSnapshotDetail,
+            PublicationTestBoundary::ProjectionManifestIdentity,
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestBoundary::SearchSymbolPage,
+            PublicationTestBoundary::SearchIndexWrite,
+            PublicationTestBoundary::SearchValidation,
+            PublicationTestBoundary::SearchCompletion,
+            PublicationTestBoundary::CatalogLock,
+            PublicationTestBoundary::MarkerCompletion,
+            PublicationTestBoundary::DatabaseReplacement,
+        ] {
+            for action in [PublicationTestAction::Fail, PublicationTestAction::Cancel] {
+                let cancel = CancellationToken::new();
+                arm_publication_test_fault(boundary, action);
+                let error = match semantic_projection_republish_for_runtime(
+                    workspace.path(),
+                    &storage_path,
+                    Some(&cancel),
+                    &runtime,
+                    controller.source_index_policy.as_ref(),
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("faulted projection republish must not publish"),
+                };
+                assert_eq!(
+                    error.code,
+                    if action == PublicationTestAction::Cancel {
+                        "cancelled"
+                    } else {
+                        "internal"
+                    },
+                    "boundary={boundary:?} action={action:?}: {error:?}"
+                );
+                assert_eq!(
+                    cancel.is_cancelled(),
+                    action == PublicationTestAction::Cancel
+                );
+                assert_eq!(
+                    Storage::database_complete_index_publication(&storage_path)
+                        .expect("read preserved publication"),
+                    Some(publication.clone()),
+                    "boundary={boundary:?} action={action:?}"
+                );
+                assert_eq!(
+                    persisted_search_generation_names(&storage_path),
+                    search_generations,
+                    "boundary={boundary:?} action={action:?}"
+                );
+                assert_eq!(
+                    Storage::open(&storage_path)
+                        .expect("open preserved retrieval state")
+                        .get_retrieval_index_publication(&identity.project_id)
+                        .expect("read preserved retrieval state"),
+                    Some(retrieval_publication.clone()),
+                    "boundary={boundary:?} action={action:?}"
+                );
+                assert_no_staged_publication_artifacts(&storage_path);
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_projection_republish_runtime_cache_fault_completes_committed_generation() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let identity = project_identity_v3(workspace.path());
+        let (mut previous_publication, retrieval_publication) = {
+            let mut storage = Storage::open(&storage_path).expect("open baseline core");
+            let publication = storage
+                .get_complete_index_publication()
+                .expect("read baseline publication")
+                .expect("complete baseline publication");
+            let symbol_doc_count = storage
+                .get_symbol_search_doc_count()
+                .expect("count baseline symbol documents");
+            let dense_count = storage
+                .validate_dense_anchor_publication(&publication)
+                .expect("validate baseline dense publication")
+                .anchor_count;
+            storage
+                .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                    &identity.project_id,
+                    symbol_doc_count as i64,
+                    dense_count as i64,
+                ))
+                .expect("publish baseline retrieval identity");
+            let retrieval = storage
+                .get_retrieval_index_publication(&identity.project_id)
+                .expect("read baseline retrieval identity")
+                .expect("baseline retrieval publication");
+            (publication, retrieval)
+        };
+
+        for action in [PublicationTestAction::Fail, PublicationTestAction::Cancel] {
+            let cancel_token = CancellationToken::new();
+            arm_publication_test_fault(PublicationTestBoundary::RuntimeCache, action);
+            let outcome = controller
+                .republish_semantic_projections_blocking_with_cancel(&cancel_token)
+                .expect("post-commit runtime-cache fault must complete publication");
+            PUBLICATION_TEST_FAULT.with(|fault| {
+                assert!(
+                    fault.borrow().is_none(),
+                    "runtime-cache fault was not reached: {action:?}"
+                );
+            });
+
+            assert_eq!(outcome.previous_publication, previous_publication);
+            assert_eq!(
+                outcome.publication.generation,
+                previous_publication.generation + 1
+            );
+            assert_eq!(
+                outcome.publication.mode,
+                IndexPublicationMode::SemanticProjection
+            );
+            assert_eq!(
+                cancel_token.is_cancelled(),
+                action == PublicationTestAction::Cancel
+            );
+            assert_eq!(
+                Storage::database_complete_index_publication(&storage_path)
+                    .expect("read committed semantic publication"),
+                Some(outcome.publication.clone())
+            );
+
+            let state = controller.state.lock();
+            assert!(!state.is_indexing);
+            assert!(state.search_engine.is_some());
+            assert_eq!(
+                state.search_publication.as_ref(),
+                Some(&outcome.publication),
+                "prepared search state must become the committed runtime generation"
+            );
+            drop(state);
+
+            let search_generations = persisted_search_generation_names(&storage_path);
+            assert!(
+                search_generations.contains(&outcome.publication.generation_id),
+                "committed search generation must remain current: {search_generations:?}"
+            );
+            assert!(
+                search_generations.len() <= 2,
+                "only the current and one complete rollback generation may remain: {search_generations:?}"
+            );
+            for generation in &search_generations {
+                assert!(
+                    read_search_generation_completion(
+                        &search_index_generation_root(&storage_path).join(generation),
+                        generation,
+                    )
+                    .is_some(),
+                    "persisted search generation must be complete: {generation}"
+                );
+            }
+            assert_eq!(
+                Storage::open(&storage_path)
+                    .expect("open retained retrieval state")
+                    .get_retrieval_index_publication(&identity.project_id)
+                    .expect("read retained retrieval state"),
+                Some(retrieval_publication.clone()),
+                "semantic projection publication must leave retrieval intentionally stale"
+            );
+            assert_no_staged_publication_artifacts(&storage_path);
+            previous_publication = outcome.publication;
+        }
+    }
+
+    #[test]
+    fn semantic_projection_republish_detects_generation_drift_and_keeps_competing_publication() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let runtime = test_sidecar_runtime_from_env();
+        let controller = AppController::new_with_config(runtime.clone());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline core");
+        let baseline = Storage::database_complete_index_publication(&storage_path)
+            .expect("read baseline")
+            .expect("baseline publication");
+        let baseline_search = persisted_search_generation_names(&storage_path);
+        let baseline_search_generation =
+            search_index_path_for_publication(&storage_path, Some(&baseline))
+                .expect("baseline search path")
+                .file_name()
+                .expect("baseline search generation")
+                .to_string_lossy()
+                .to_string();
+        assert!(baseline_search.contains(&baseline_search_generation));
+        let competing_publication = Arc::new(std::sync::Mutex::new(None));
+        let captured_publication = Arc::clone(&competing_publication);
+        let competing_root = workspace.path().to_path_buf();
+        let competing_runtime = runtime.clone();
+        arm_semantic_projection_before_revalidate_hook(move |path| {
+            let competing = AppController::new_with_config(competing_runtime)
+                .republish_semantic_projections_at_blocking(competing_root, path.to_path_buf())
+                .expect("publish competing generation");
+            *captured_publication
+                .lock()
+                .expect("capture competing publication") = Some(competing.publication);
+        });
+
+        let error = match semantic_projection_republish_for_runtime(
+            workspace.path(),
+            &storage_path,
+            None,
+            &runtime,
+            controller.source_index_policy.as_ref(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("outer writer must detect competing generation"),
+        };
+
+        assert_eq!(error.code, "publication_changed");
+        let competing = competing_publication
+            .lock()
+            .expect("read competing publication")
+            .clone()
+            .expect("competing publication captured");
+        assert_eq!(competing.generation, baseline.generation + 1);
+        let storage = Storage::open(&storage_path).expect("open competing core");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read competing core"),
+            Some(competing.clone())
+        );
+        storage
+            .validate_dense_anchor_publication(&competing)
+            .expect("competing dense publication");
+        storage
+            .validate_structural_text_unit_publication(&competing)
+            .expect("competing structural publication");
+        let identity = project_identity_v3(workspace.path());
+        storage
+            .validate_source_policy_exclusion_publication(
+                &competing,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("competing source-policy publication");
+        let current_search = persisted_search_generation_names(&storage_path);
+        assert!(
+            current_search.contains(&baseline_search_generation),
+            "the complete rollback search generation must remain usable: baseline={baseline_search:?} current={current_search:?}"
+        );
+        assert!(
+            current_search.contains(&competing.generation_id),
+            "the competing complete search generation must remain usable: {current_search:?}"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]
