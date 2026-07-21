@@ -1143,6 +1143,73 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
   }
 });
 
+test("Windows candidate-installed proof remains distinct and provenance-bound", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const coordinatorFile = "packaged-platform-pr.yml";
+  const protectedFile = "windows-vulkan-proof.yml";
+  const releaseFile = "release.yml";
+  const candidateStage = workflow => draftStep(
+    workflow.jobs["packaged-vulkan"],
+    "Stage isolated candidate-managed Windows install",
+  );
+  const candidateProof = workflow => draftStep(
+    workflow.jobs["packaged-vulkan"],
+    "Prove two-host candidate-installed Windows runtime",
+  );
+  const candidateUpload = workflow => draftStep(
+    workflow.jobs["packaged-vulkan"],
+    "Upload candidate-installed Windows proof",
+  );
+
+  const mutations = [
+    ["coordinator opt-in removed", coordinatorFile, workflow => {
+      delete workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof;
+    }, /accepted PR Windows package into candidate-installed proof/u],
+    ["release enables pre-merge proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = true;
+    }, /leave pre-merge Windows candidate-installed proof/u],
+    ["explicit opt-in removed", protectedFile, workflow => {
+      delete workflow.on.workflow_call.inputs.candidate_installed_proof;
+    }, /candidate-installed proof must be an explicit opt-in/u],
+    ["candidate staging bypassed", protectedFile, workflow => {
+      candidateStage(workflow).run = candidateStage(workflow).run
+        .replace("--prepare-candidate-installed-proof", "--version-only");
+    }, /Stage isolated candidate-managed Windows install/u],
+    ["candidate tier weakened", protectedFile, workflow => {
+      candidateProof(workflow).run = candidateProof(workflow).run
+        .replace("--proof-tier installed_runtime", "--proof-tier protected_hardware");
+    }, /Prove two-host candidate-installed Windows runtime/u],
+    ["candidate cell relabeled", protectedFile, workflow => {
+      candidateProof(workflow).run = candidateProof(workflow).run
+        .replace(
+          "candidate_installed_windows_x64_cpu",
+          "protected_windows_x64_vulkan",
+        );
+    }, /Prove two-host candidate-installed Windows runtime/u],
+    ["candidate CPU opt-in removed", protectedFile, workflow => {
+      candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
+    }, /explicit CPU execution/u],
+    ["candidate provenance removed", protectedFile, workflow => {
+      candidateProof(workflow).run = candidateProof(workflow).run
+        .replace("--installed-plugin-provenance", "--untrusted-plugin-provenance");
+    }, /Prove two-host candidate-installed Windows runtime/u],
+    ["candidate artifact loses attempt identity", protectedFile, workflow => {
+      candidateUpload(workflow).with.name = "candidate-installed-windows-${{ inputs.version }}";
+    }, /attempt-scoped artifact/u],
+  ];
+
+  for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+    });
+  }
+});
+
 test("draft source workflow freezes its complete top-level contract", async (t) => {
   assert.deepEqual(draftWorkflowPolicyViolations(draftSourceWorkflow()), []);
   const reordered = draftSourceWorkflow();

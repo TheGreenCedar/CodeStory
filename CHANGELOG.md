@@ -9,6 +9,12 @@
   admits genuinely high-degree callables without repository-specific steering,
   keeps low-degree locals sparse, and advances the policy identity so existing
   vector generations rebuild rather than reusing selections from the old rule.
+- The protected Windows proof workflow now keeps physical Vulkan qualification
+  separate while also staging the exact x64 archive through an isolated
+  candidate-managed plugin root. The installed-runtime lane launches two fresh
+  plugin hosts, requires explicit CPU execution and authenticated candidate
+  provenance, and retains attempt-scoped ownership, admission, lifecycle,
+  identity, memory, and quality evidence for release review.
 - Compact grounding now ranks roots with architecture evidence and reports a
   typed orientation confidence with bounded-candidate, entrypoint, subsystem,
   and presentation uncertainty. The stdio schema and `ground --why` render the
