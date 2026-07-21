@@ -157,7 +157,11 @@ managed-release path.
 
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache. Reserve full refresh for an empty cache,
-schema change, diagnosed corruption, or an explicit proof lane.
+schema change, diagnosed corruption, or an explicit proof lane. An explicit
+incremental request never widens into a full refresh: when the live core lacks
+the required structural publication, CodeStory returns `full_refresh_required`
+before workspace discovery or parsing. Use `--refresh auto` when that bounded
+compatibility decision may select full recovery.
 
 ## Full retrieval development
 
@@ -208,7 +212,9 @@ Cache rules:
 
 - `--cache-dir` is an exact override; otherwise CodeStory uses the user cache
   root plus a project identity.
-- `index --refresh auto` builds an empty cache and is incremental thereafter.
+- `index --refresh auto` builds an empty or structurally incompatible cache and
+  is incremental thereafter. Dry-run output names the requested mode, effective
+  mode, and compatibility reason.
 - Cleanup acts only on current CodeStory-owned generations and tokens.
 - Tests use isolated cache and plugin roots; never clean the real user cache to
   make a test pass.

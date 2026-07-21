@@ -241,6 +241,9 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         clean_path_string(output.storage_path)
     );
     let _ = writeln!(markdown, "refresh: `{}`", output.refresh);
+    if let Some(reason) = output.refresh_reason {
+        let _ = writeln!(markdown, "refresh_reason: `{reason}`");
+    }
     let _ = writeln!(
         markdown,
         "stats: nodes={} edges={} files={} errors={}",
@@ -841,7 +844,19 @@ pub(crate) fn render_index_dry_run_markdown(output: &IndexDryRunOutput<'_>) -> S
         "storage: `{}`",
         clean_path_string(&dry_run.storage_path)
     );
-    let _ = writeln!(markdown, "refresh: `{:?}`", dry_run.refresh);
+    let _ = writeln!(
+        markdown,
+        "requested_refresh: `{}`",
+        output.requested_refresh
+    );
+    let _ = writeln!(
+        markdown,
+        "effective_refresh: `{}`",
+        output.effective_refresh
+    );
+    if let Some(reason) = output.compatibility_reason {
+        let _ = writeln!(markdown, "compatibility_reason: `{reason}`");
+    }
     let _ = writeln!(
         markdown,
         "plan: would index {} files, remove {} files",

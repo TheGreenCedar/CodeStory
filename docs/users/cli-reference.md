@@ -78,7 +78,12 @@ codestory-cli index --project <repo> --refresh auto --format json
 ```
 
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
-read should refresh an existing cache first.
+read should refresh a compatible existing cache first. Explicit incremental
+refresh never escalates to full: incompatible structural publication returns
+the typed `full_refresh_required` error before workspace discovery or parsing.
+Use `--refresh auto` when CodeStory may choose full recovery for an empty or
+incompatible cache. Index dry-run output reports the requested mode, effective
+mode, and compatibility reason.
 
 Reserve `index --refresh full` or moving a cache aside for maintainer-directed
 recovery after status or `doctor` identifies that exact cache and coordinated

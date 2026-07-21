@@ -103,8 +103,9 @@ use output::{
     validate_output_file_parent,
 };
 use runtime::{
-    AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
-    resolve_refresh_request, resolve_source_target, resolve_target,
+    AmbiguousTargetError, RuntimeContext, annotate_refresh_error, ensure_index_ready,
+    index_mode_name, map_api_error, map_api_error_for_project, refresh_label, refresh_mode_name,
+    resolve_source_target, resolve_target,
 };
 use serde::Deserialize;
 #[cfg(test)]
@@ -681,14 +682,20 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         RuntimeContext::new(&cmd.project)?
     };
     if cmd.dry_run {
-        let summary = runtime.open_project_summary()?;
-        let refresh_mode =
-            resolve_refresh_request(cmd.refresh, &summary).unwrap_or(IndexMode::Incremental);
-        let dry_run = runtime
-            .index
-            .dry_run_index(refresh_mode)
-            .map_err(map_api_error)?;
-        let output = IndexDryRunOutput { dry_run: &dry_run };
+        let (_, decision) = runtime.resolve_refresh_with_preflight(cmd.refresh)?;
+        let refresh_mode = decision.effective_mode.unwrap_or(IndexMode::Incremental);
+        let dry_run = runtime.index.dry_run_index(refresh_mode).map_err(|error| {
+            map_api_error_for_project(
+                annotate_refresh_error(error, cmd.refresh, refresh_mode),
+                &runtime.project_root,
+            )
+        })?;
+        let output = IndexDryRunOutput {
+            requested_refresh: refresh_mode_name(cmd.refresh),
+            effective_refresh: index_mode_name(refresh_mode),
+            compatibility_reason: decision.reason.as_deref(),
+            dry_run: &dry_run,
+        };
         let markdown = render_index_dry_run_markdown(&output);
         return emit(cmd.format, &output, markdown, cmd.output_file.as_deref());
     }
@@ -731,6 +738,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         project: &opened.summary.root,
         storage_path: &storage_path,
         refresh: &refresh_label,
+        refresh_reason: opened.refresh_reason.as_deref(),
         summary: &opened.summary,
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
@@ -8002,14 +8010,15 @@ mod tests {
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
         AgentRetrievalTraceDto, CorePromotionTimings, DatabaseSnapshotCopyTimings, EdgeId,
-        EdgeKind, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphResponse, IndexMode,
-        IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto, IndexedFilesDto,
-        IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId, PacketBudgetDto,
-        PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto, PacketPlanDto,
-        PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, ProjectSummary,
-        ProjectionPersistenceFamilyTimings, ProjectionPersistenceTimings, RetrievalModeDto,
-        RetrievalStateDto, SearchHit, SearchHitOrigin, SemanticModeDto, SourcePolicyExclusionDto,
-        StorageStatsDto, TrailContextDto,
+        EdgeKind, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphResponse,
+        IndexDryRunDto, IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+        IndexedFileRoleDto, IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings,
+        NodeDetailsDto, NodeId, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
+        PacketClaimDto, PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto,
+        PacketSufficiencyDto, ProjectSummary, ProjectionPersistenceFamilyTimings,
+        ProjectionPersistenceTimings, RetrievalModeDto, RetrievalStateDto, SearchHit,
+        SearchHitOrigin, SemanticModeDto, SourcePolicyExclusionDto, StorageStatsDto,
+        TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -9154,7 +9163,10 @@ mod tests {
     fn auto_refresh_uses_full_for_empty_index() {
         assert_eq!(
             resolve_refresh_request(RefreshMode::Auto, &summary_with_files(0)),
-            Some(IndexMode::Full)
+            Ok(runtime::RefreshDecision {
+                effective_mode: Some(IndexMode::Full),
+                reason: Some("complete_core_publication_missing".to_string()),
+            })
         );
     }
 
@@ -9162,12 +9174,15 @@ mod tests {
     fn auto_refresh_uses_incremental_for_existing_index() {
         assert_eq!(
             resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
-            Some(IndexMode::Incremental)
+            Ok(runtime::RefreshDecision {
+                effective_mode: Some(IndexMode::Incremental),
+                reason: None,
+            })
         );
     }
 
     #[test]
-    fn interrupted_incremental_resolves_and_labels_staged_full_recovery() {
+    fn explicit_incremental_rejects_full_recovery_while_auto_reports_it() {
         let mut summary = summary_with_files(3);
         summary.freshness = Some(IndexFreshnessDto {
             status: IndexFreshnessStatusDto::Stale,
@@ -9181,18 +9196,94 @@ mod tests {
             samples: Vec::new(),
         });
 
+        let auto = resolve_refresh_request(RefreshMode::Auto, &summary).expect("auto decision");
+        assert_eq!(auto.effective_mode, Some(IndexMode::Full));
         assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary),
-            Some(IndexMode::Full)
+            auto.reason.as_deref(),
+            Some("incomplete_incremental_publication")
         );
+
+        let error = resolve_refresh_request(RefreshMode::Incremental, &summary)
+            .expect_err("explicit incremental must not escalate");
+        assert_eq!(error.code, "full_refresh_required");
+        assert!(error.message.contains("requested=incremental"));
+        assert!(error.message.contains("effective=none"));
+        assert!(error.message.contains("required=full"));
         assert_eq!(
-            resolve_refresh_request(RefreshMode::Incremental, &summary),
-            Some(IndexMode::Full)
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("incomplete_incremental_publication")
         );
+    }
+
+    #[test]
+    fn structural_publication_incompatibility_has_auto_and_incremental_parity() {
+        let mut summary = summary_with_files(3);
+        summary.freshness = Some(IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::NotChecked,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 3,
+            duration_ms: 0,
+            reason: Some(
+                "structural text unit publication is incomplete: publication is missing"
+                    .to_string(),
+            ),
+            samples: Vec::new(),
+        });
+
+        let auto = resolve_refresh_request(RefreshMode::Auto, &summary).expect("auto decision");
+        assert_eq!(auto.effective_mode, Some(IndexMode::Full));
         assert_eq!(
-            refresh_label(RefreshMode::Incremental, Some(IndexMode::Full)),
-            "incremental(recovery-full)"
+            auto.reason.as_deref(),
+            Some("structural_publication_incompatible")
         );
+        let incremental = resolve_refresh_request(RefreshMode::Incremental, &summary)
+            .expect_err("incremental incompatibility");
+        assert_eq!(incremental.code, "full_refresh_required");
+        assert_eq!(
+            incremental
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("structural_publication_incompatible")
+        );
+    }
+
+    #[test]
+    fn dry_run_reports_requested_effective_and_compatibility_reason() {
+        let dry_run = IndexDryRunDto {
+            root: "/tmp/project".to_string(),
+            storage_path: "/tmp/cache/codestory.db".to_string(),
+            refresh: IndexMode::Full,
+            files_to_index: 4,
+            files_to_remove: 0,
+            sample_files_to_index: Vec::new(),
+            sample_file_ids_to_remove: Vec::new(),
+            members: Vec::new(),
+        };
+        let output = IndexDryRunOutput {
+            requested_refresh: "auto",
+            effective_refresh: "full",
+            compatibility_reason: Some("structural_publication_incompatible"),
+            dry_run: &dry_run,
+        };
+
+        let json = serde_json::to_value(&output).expect("serialize dry-run decision");
+        assert_eq!(json["requested_refresh"], "auto");
+        assert_eq!(json["effective_refresh"], "full");
+        assert_eq!(
+            json["compatibility_reason"],
+            "structural_publication_incompatible"
+        );
+        let markdown = render_index_dry_run_markdown(&output);
+        assert!(markdown.contains("requested_refresh: `auto`"));
+        assert!(markdown.contains("effective_refresh: `full`"));
+        assert!(markdown.contains("compatibility_reason: `structural_publication_incompatible`"));
     }
 
     #[test]
@@ -9203,7 +9294,8 @@ mod tests {
         let output = IndexOutput {
             project: &summary.root,
             storage_path: "C:/repo/.cache/index.sqlite",
-            refresh: "full",
+            refresh: "auto(full)",
+            refresh_reason: Some("structural_publication_incompatible"),
             summary: &summary,
             retrieval: &retrieval,
             phase_timings: Some(&timings),
@@ -9213,6 +9305,9 @@ mod tests {
         };
 
         let markdown = render_index_markdown(&output);
+
+        assert!(markdown.contains("refresh: `auto(full)`"));
+        assert!(markdown.contains("refresh_reason: `structural_publication_incompatible`"));
 
         assert!(markdown.contains(
             "cache_ms: artifact_write=6 search_projection=61 search_index=62 runtime_publish=63"

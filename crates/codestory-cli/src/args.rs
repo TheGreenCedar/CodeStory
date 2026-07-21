@@ -20,13 +20,12 @@ use codestory_contracts::api::{
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
-const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
-cache already has indexed files.";
+const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty or structurally incompatible cache and `incremental` for a compatible existing publication. An explicit `incremental` request never escalates to `full`; incompatible state returns `full_refresh_required` before workspace reads or writes.";
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
-failure.";
+failure. Explicit `incremental` fails with `full_refresh_required` instead of escalating.";
 const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
-fresh index, or `incremental` to refresh an existing cache in place.";
+fresh index, or `incremental` to refresh a compatible existing cache without allowing full-refresh escalation.";
 const CLI_LONG_ABOUT: &str = "\
 CodeStory turns a local repository into auditable grounding evidence.
 
@@ -1484,6 +1483,8 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) project: &'a str,
     pub(crate) storage_path: &'a str,
     pub(crate) refresh: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh_reason: Option<&'a str>,
     pub(crate) summary: &'a ProjectSummary,
     pub(crate) retrieval: &'a RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1568,6 +1569,10 @@ pub(crate) struct AgentPreflightOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexDryRunOutput<'a> {
+    pub(crate) requested_refresh: &'a str,
+    pub(crate) effective_refresh: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compatibility_reason: Option<&'a str>,
     pub(crate) dry_run: &'a IndexDryRunDto,
 }
 

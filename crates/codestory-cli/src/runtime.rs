@@ -32,7 +32,14 @@ const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
 pub(crate) struct OpenedProject {
     pub(crate) summary: ProjectSummary,
     pub(crate) refresh_mode: Option<IndexMode>,
+    pub(crate) refresh_reason: Option<String>,
     pub(crate) phase_timings: Option<IndexingPhaseTimings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshDecision {
+    pub(crate) effective_mode: Option<IndexMode>,
+    pub(crate) reason: Option<String>,
 }
 
 /// Shared service handles and filesystem roots for a CLI command.
@@ -256,8 +263,8 @@ impl RuntimeContext {
     /// `RefreshMode::None` is read-only with respect to indexing; commands that
     /// require cached graph data must call `ensure_index_ready` after this.
     pub(crate) fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
-        let summary = self.open_project_summary()?;
-        self.ensure_open_from_summary(refresh, summary)
+        let (summary, decision) = self.resolve_refresh_with_preflight(refresh)?;
+        self.ensure_open_from_decision(refresh, summary, decision)
     }
 
     /// Open project state from an already-read summary.
@@ -267,22 +274,91 @@ impl RuntimeContext {
     pub(crate) fn ensure_open_from_summary(
         &self,
         refresh: RefreshMode,
-        mut summary: ProjectSummary,
+        summary: ProjectSummary,
     ) -> Result<OpenedProject> {
-        let refresh_mode = resolve_refresh_request(refresh, &summary);
+        let decision = self.resolve_refresh_from_summary_with_preflight(refresh, &summary)?;
+        self.ensure_open_from_decision(refresh, summary, decision)
+    }
+
+    pub(crate) fn resolve_refresh_with_preflight(
+        &self,
+        refresh: RefreshMode,
+    ) -> Result<(ProjectSummary, RefreshDecision)> {
+        let compatibility = match refresh {
+            RefreshMode::Auto | RefreshMode::Incremental => self
+                .index
+                .ensure_incremental_refresh_compatible_at(&self.project_root, &self.storage_path)
+                .err(),
+            RefreshMode::Full | RefreshMode::None => None,
+        };
+        if refresh == RefreshMode::Incremental
+            && let Some(error) = compatibility.as_ref()
+        {
+            return Err(map_api_error_for_project(error.clone(), &self.project_root));
+        }
+        let summary = self.open_project_summary()?;
+        let decision = if let Some(error) = compatibility {
+            if error.code != "full_refresh_required" {
+                return Err(map_api_error_for_project(error, &self.project_root));
+            }
+            RefreshDecision {
+                effective_mode: Some(IndexMode::Full),
+                reason: Some(refresh_compatibility_reason(&error)),
+            }
+        } else {
+            resolve_refresh_request(refresh, &summary)
+                .map_err(|error| map_api_error_for_project(error, &self.project_root))?
+        };
+        Ok((summary, decision))
+    }
+
+    fn resolve_refresh_from_summary_with_preflight(
+        &self,
+        refresh: RefreshMode,
+        summary: &ProjectSummary,
+    ) -> Result<RefreshDecision> {
+        if matches!(refresh, RefreshMode::Auto | RefreshMode::Incremental)
+            && let Err(error) = self
+                .index
+                .ensure_incremental_refresh_compatible_at(&self.project_root, &self.storage_path)
+        {
+            if refresh == RefreshMode::Incremental || error.code != "full_refresh_required" {
+                return Err(map_api_error_for_project(error, &self.project_root));
+            }
+            return Ok(RefreshDecision {
+                effective_mode: Some(IndexMode::Full),
+                reason: Some(refresh_compatibility_reason(&error)),
+            });
+        }
+        resolve_refresh_request(refresh, summary)
+            .map_err(|error| map_api_error_for_project(error, &self.project_root))
+    }
+
+    fn ensure_open_from_decision(
+        &self,
+        refresh: RefreshMode,
+        mut summary: ProjectSummary,
+        decision: RefreshDecision,
+    ) -> Result<OpenedProject> {
         let mut phase_timings = None;
-        if let Some(mode) = refresh_mode {
+        if let Some(mode) = decision.effective_mode {
             phase_timings = Some(
                 self.index
                     .run_indexing_blocking_without_runtime_refresh(mode)
-                    .map_err(map_api_error)?,
+                    .map_err(|error| {
+                        map_api_error_for_project(
+                            annotate_refresh_error(error, refresh, mode),
+                            &self.project_root,
+                        )
+                    })?,
             );
             summary = self.open_project_summary()?;
         }
 
         Ok(OpenedProject {
             summary,
-            refresh_mode,
+            refresh_mode: decision.effective_mode,
+            refresh_reason: decision.reason,
             phase_timings,
         })
     }
@@ -745,25 +821,123 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
 pub(crate) fn resolve_refresh_request(
     refresh: RefreshMode,
     summary: &ProjectSummary,
-) -> Option<IndexMode> {
-    let requires_full_recovery = summary
+) -> Result<RefreshDecision, ApiError> {
+    let full_refresh_reason = summary_full_refresh_reason(summary);
+    match refresh {
+        RefreshMode::Auto => Ok(RefreshDecision {
+            effective_mode: Some(
+                if summary.stats.node_count == 0 || full_refresh_reason.is_some() {
+                    IndexMode::Full
+                } else {
+                    IndexMode::Incremental
+                },
+            ),
+            reason: full_refresh_reason.map(str::to_string).or_else(|| {
+                (summary.stats.node_count == 0)
+                    .then(|| "complete_core_publication_missing".to_string())
+            }),
+        }),
+        RefreshMode::Full => Ok(RefreshDecision {
+            effective_mode: Some(IndexMode::Full),
+            reason: None,
+        }),
+        RefreshMode::Incremental => {
+            if let Some(reason) = full_refresh_reason {
+                return Err(full_refresh_required_from_summary(summary, reason));
+            }
+            if summary.stats.node_count == 0 {
+                return Err(full_refresh_required_from_summary(
+                    summary,
+                    "complete_core_publication_missing",
+                ));
+            }
+            Ok(RefreshDecision {
+                effective_mode: Some(IndexMode::Incremental),
+                reason: None,
+            })
+        }
+        RefreshMode::None => Ok(RefreshDecision {
+            effective_mode: None,
+            reason: None,
+        }),
+    }
+}
+
+fn summary_full_refresh_reason(summary: &ProjectSummary) -> Option<&str> {
+    let reason = summary
         .freshness
         .as_ref()
-        .and_then(|freshness| freshness.reason.as_deref())
-        == Some(INCOMPLETE_INDEX_RECOVERY_REASON);
-    match refresh {
-        RefreshMode::Auto => Some(if summary.stats.node_count == 0 || requires_full_recovery {
-            IndexMode::Full
-        } else {
-            IndexMode::Incremental
-        }),
-        RefreshMode::Full => Some(IndexMode::Full),
-        RefreshMode::Incremental => Some(if requires_full_recovery {
-            IndexMode::Full
-        } else {
-            IndexMode::Incremental
-        }),
-        RefreshMode::None => None,
+        .and_then(|freshness| freshness.reason.as_deref())?;
+    if reason == INCOMPLETE_INDEX_RECOVERY_REASON {
+        Some("incomplete_incremental_publication")
+    } else if reason.starts_with("structural text unit publication is incomplete:") {
+        Some("structural_publication_incompatible")
+    } else {
+        None
+    }
+}
+
+fn full_refresh_required_from_summary(summary: &ProjectSummary, reason: &str) -> ApiError {
+    let project = summary.root.clone();
+    let command = format!(
+        "codestory-cli index --project {} --refresh full",
+        quote_command_path(Path::new(&project))
+    );
+    ApiError::with_details(
+        "full_refresh_required",
+        format!(
+            "Refresh compatibility rejected the request before workspace reads: requested=incremental effective=none required=full reason={reason}"
+        ),
+        codestory_contracts::api::ApiErrorDetails {
+            cause_code: Some(reason.to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![command.clone()],
+            minimum_next: vec![command.clone()],
+            full_repair: vec![command],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
+        },
+    )
+}
+
+fn refresh_compatibility_reason(error: &ApiError) -> String {
+    error
+        .details
+        .as_ref()
+        .and_then(|details| details.cause_code.clone())
+        .unwrap_or_else(|| "full_refresh_required".to_string())
+}
+
+pub(crate) fn annotate_refresh_error(
+    mut error: ApiError,
+    requested: RefreshMode,
+    effective: IndexMode,
+) -> ApiError {
+    error.message = format!(
+        "requested={} effective={}: {}",
+        refresh_mode_name(requested),
+        index_mode_name(effective),
+        error.message
+    );
+    error
+}
+
+pub(crate) fn refresh_mode_name(mode: RefreshMode) -> &'static str {
+    match mode {
+        RefreshMode::Auto => "auto",
+        RefreshMode::Full => "full",
+        RefreshMode::Incremental => "incremental",
+        RefreshMode::None => "none",
+    }
+}
+
+pub(crate) fn index_mode_name(mode: IndexMode) -> &'static str {
+    match mode {
+        IndexMode::Full => "full",
+        IndexMode::Incremental => "incremental",
     }
 }
 
@@ -774,7 +948,7 @@ pub(crate) fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>)
         (RefreshMode::Auto, Some(IndexMode::Incremental)) => "auto(incremental)".to_string(),
         (RefreshMode::Full, Some(_)) => "full".to_string(),
         (RefreshMode::Incremental, Some(IndexMode::Full)) => {
-            "incremental(recovery-full)".to_string()
+            "requested-incremental(effective-full)".to_string()
         }
         (RefreshMode::Incremental, Some(IndexMode::Incremental)) => "incremental".to_string(),
         (RefreshMode::None, None) => "none".to_string(),
