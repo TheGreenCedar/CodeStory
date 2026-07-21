@@ -34,6 +34,11 @@ on:
         required: false
         default: false
         type: boolean
+      server_behavior_only:
+        description: Prove bounded server behavior without making packet-quality or release-readiness claims.
+        required: false
+        default: false
+        type: boolean
       emit_release_cells:
         required: false
         default: false
@@ -60,6 +65,11 @@ on:
         type: string
       candidate_installed_proof:
         description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
+        required: false
+        default: false
+        type: boolean
+      server_behavior_only:
+        description: Prove bounded server behavior without making packet-quality or release-readiness claims.
         required: false
         default: false
         type: boolean
@@ -184,7 +194,9 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
         run: |
+          $ErrorActionPreference = "Stop"
           $version = $env:VERSION.TrimStart('v')
           $sourceSha = (git rev-parse HEAD).Trim()
           $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
@@ -194,10 +206,19 @@ jobs:
           if ($calibrationBundles.Count -ne 1) {
             throw "expected exactly one frozen calibration-bundle.json"
           }
-          $qualityArgs = @()
+          $claimArgs = @()
           $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
-          if (Test-Path $qualityPath) {
-            $qualityArgs = @("--retrieval-quality-evidence", $qualityPath)
+          if ($env:SERVER_BEHAVIOR_ONLY -eq "true") {
+            $claimArgs = @("--server-behavior-only")
+          } else {
+            if (-not (Test-Path $qualityPath)) {
+              throw "protected Windows proof requires exact-head quality evidence"
+            }
+            $claimArgs = @(
+              "--produce-qualification-evidence",
+              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
+              "--retrieval-quality-evidence", $qualityPath
+            )
           }
           python .github/scripts/check-packaged-agent-proof.py `
             --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
@@ -211,19 +232,17 @@ jobs:
             --offline `
             --proof-tier protected_hardware `
             --qualification-matrix-cell protected_windows_x64_vulkan `
-            --produce-qualification-evidence `
-            --qualification-evidence target/windows-vulkan-proof/qualification.json `
+            @claimArgs `
             --calibration-bundle $calibrationBundles[0].FullName `
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
             --expected-source-sha $sourceSha `
             --expected-source-tree $sourceTree `
-            @qualityArgs `
             --timeout-secs 1800 `
             --out-dir target/windows-vulkan-proof/packaged-agent
 
       - name: Stage isolated candidate-managed Windows install
-        if: ${{ inputs.candidate_installed_proof && inputs.quality_evidence_artifact != '' }}
+        if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
         shell: pwsh
         env:
           VERSION: ${{ inputs.version }}
@@ -262,7 +281,7 @@ jobs:
             --candidate-artifact-name (Split-Path -Leaf $archive)
 
       - name: Prove two-host candidate-installed Windows runtime
-        if: ${{ inputs.candidate_installed_proof && inputs.quality_evidence_artifact != '' }}
+        if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
         shell: pwsh
         env:
           VERSION: ${{ inputs.version }}
@@ -280,8 +299,18 @@ jobs:
             throw "expected exactly one frozen calibration-bundle.json"
           }
           $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
-          if (-not (Test-Path $qualityPath)) {
-            throw "candidate-installed Windows proof requires exact-head quality evidence"
+          $claimArgs = @()
+          if ("${{ inputs.server_behavior_only }}" -eq "true") {
+            $claimArgs = @("--server-behavior-only")
+          } else {
+            if (-not (Test-Path $qualityPath)) {
+              throw "candidate-installed Windows proof requires exact-head quality evidence"
+            }
+            $claimArgs = @(
+              "--produce-qualification-evidence",
+              "--qualification-evidence", "target/candidate-installed-windows/qualification.json",
+              "--retrieval-quality-evidence", $qualityPath
+            )
           }
           $pluginRoot = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "plugin"
           $pluginData = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "data"
@@ -297,12 +326,10 @@ jobs:
             --offline `
             --proof-tier installed_runtime `
             --qualification-matrix-cell candidate_installed_windows_x64_cpu `
-            --produce-qualification-evidence `
-            --qualification-evidence target/candidate-installed-windows/qualification.json `
+            @claimArgs `
             --calibration-bundle $calibrationBundles[0].FullName `
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
-            --retrieval-quality-evidence $qualityPath `
             --installed-plugin-source candidate `
             --installed-plugin-provenance target/candidate-installed-windows/provenance.json `
             --installed-plugin-data $pluginData `
@@ -317,7 +344,7 @@ jobs:
             --out-dir target/candidate-installed-windows/proof
 
       - name: Upload candidate-installed Windows proof
-        if: always() && inputs.candidate_installed_proof && inputs.quality_evidence_artifact != ''
+        if: always() && inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '')
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-windows-${{ inputs.version }}-attempt-${{ github.run_attempt }}
@@ -326,7 +353,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Vulkan release cell
-        if: inputs.emit_release_cells
+        if: inputs.emit_release_cells && !inputs.server_behavior_only
         shell: bash
         run: |
           set -euo pipefail
@@ -354,7 +381,7 @@ jobs:
             --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
 
       - name: Upload authenticated Vulkan release cell
-        if: success() && inputs.emit_release_cells
+        if: success() && inputs.emit_release_cells && !inputs.server_behavior_only
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}

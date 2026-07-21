@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Release
+
+- Windows-only pre-publish qualification now skips unavailable ARM64 release
+  evidence and retains protected Vulkan and candidate-installed provenance under
+  an explicit server-behavior-only non-claim. Full release qualification remains
+  strict and still requires exact-head quality evidence.
+
 ## 0.16.0
 
 CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.

@@ -1451,7 +1451,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, object(vulkan.with).emit_release_cells === true, `${releaseFile} Vulkan proof must emit its authenticated release cell`);
   add(
     violations,
-    object(vulkan.with).candidate_installed_proof === undefined,
+    object(vulkan.with).candidate_installed_proof === undefined
+      && object(vulkan.with).server_behavior_only === undefined,
     `${releaseFile} must leave pre-merge Windows candidate-installed proof to the PR coordinator`,
   );
 
@@ -2244,6 +2245,11 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     object(packaged.with).candidate_installed_proof === true,
     `${file} must opt the accepted PR package into candidate-installed proof`,
   );
+  add(
+    violations,
+    String(packaged.if ?? "").includes("needs.route.outputs.scope == 'windows'"),
+    `${file} Windows server-behavior package proof must accept skipped protected release evidence`,
+  );
   violations.push(...packagedPrSigningViolations(workflow));
   const metal = requireJob(violations, file, workflow, "macos-metal-proof");
   add(
@@ -2275,6 +2281,18 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     object(vulkan.with).candidate_installed_proof === true,
     `${file} must opt the accepted PR Windows package into candidate-installed proof`,
   );
+  add(
+    violations,
+    object(vulkan.with).quality_evidence_artifact
+      === "${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}",
+    `${file} Windows quality evidence must come only from the successful protected producer`,
+  );
+  add(
+    violations,
+    object(vulkan.with).server_behavior_only
+      === "${{ needs.route.outputs.scope == 'windows' }}",
+    `${file} must select the non-quality Windows claim only for Windows scope`,
+  );
   const closeout = requireJob(violations, file, workflow, "closeout");
   const evidence = requireJob(violations, file, workflow, "release-evidence");
   add(
@@ -2287,9 +2305,15 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     String(evidence.if ?? "").includes("needs.route.outputs.scope != 'linux'"),
     `${file} Linux server-behavior proof must not require protected release evidence`,
   );
+  add(
+    violations,
+    String(evidence.if ?? "").includes("needs.route.outputs.scope != 'windows'"),
+    `${file} Windows server-behavior proof must not require protected release evidence`,
+  );
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
     '[ "$SCOPE" != none ]',
     '[ "$SCOPE" = linux ]',
+    '[ "$SCOPE" != windows ]',
     "dev/codestory-next moved from proved head",
   ]);
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
@@ -2489,6 +2513,20 @@ function validateRemainingWorkflows(workflows, violations) {
         && candidateInput.default === false,
       `${vulkanFile} candidate-installed proof must be an explicit opt-in`,
     );
+    const serverBehaviorInput = object(at(
+      vulkan,
+      "on",
+      "workflow_call",
+      "inputs",
+      "server_behavior_only",
+    ));
+    add(
+      violations,
+      serverBehaviorInput.required === false
+        && serverBehaviorInput.type === "boolean"
+        && serverBehaviorInput.default === false,
+      `${vulkanFile} server-behavior-only claim scope must be an explicit opt-in`,
+    );
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
@@ -2525,14 +2563,17 @@ function validateRemainingWorkflows(workflows, violations) {
       "--offline",
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
+      "--server-behavior-only",
+      "Test-Path $qualityPath",
     ]);
     add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
     const candidateStage = namedStep(job, "Stage isolated candidate-managed Windows install");
     add(
       violations,
       String(candidateStage?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateStage?.if ?? "").includes("inputs.server_behavior_only")
         && String(candidateStage?.if ?? "").includes("inputs.quality_evidence_artifact"),
-      `${vulkanFile} candidate-managed staging must require coordinator opt-in and exact-head quality evidence`,
+      `${vulkanFile} candidate-managed staging must require coordinator opt-in and remain runnable in Windows server scope`,
     );
     requireStepRun(violations, vulkanFile, job, "Stage isolated candidate-managed Windows install", [
       "--prepare-candidate-installed-proof",
@@ -2550,8 +2591,9 @@ function validateRemainingWorkflows(workflows, violations) {
     add(
       violations,
       String(candidateProof?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateProof?.if ?? "").includes("inputs.server_behavior_only")
         && String(candidateProof?.if ?? "").includes("inputs.quality_evidence_artifact"),
-      `${vulkanFile} candidate-installed proof must require coordinator opt-in and exact-head quality evidence`,
+      `${vulkanFile} candidate-installed proof must require coordinator opt-in and remain runnable in Windows server scope`,
     );
     requireStepRun(violations, vulkanFile, job, "Prove two-host candidate-installed Windows runtime", [
       "--proof-tier installed_runtime",
@@ -2565,6 +2607,8 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "--retrieval-quality-evidence",
+      "--server-behavior-only",
+      "Test-Path $qualityPath",
       "--expected-source-sha",
       "--expected-source-tree",
       "$env:CODESTORY_CANDIDATE_WINDOWS_ROOT",
@@ -2580,6 +2624,7 @@ function validateRemainingWorkflows(workflows, violations) {
       candidateUpload?.uses === "actions/upload-artifact@v7.0.1"
         && String(candidateUpload?.if ?? "").includes("always()")
         && String(candidateUpload?.if ?? "").includes("inputs.candidate_installed_proof")
+        && String(candidateUpload?.if ?? "").includes("inputs.server_behavior_only")
         && object(candidateUpload?.with).name
           === "candidate-installed-windows-${{ inputs.version }}-attempt-${{ github.run_attempt }}"
         && object(candidateUpload?.with).path === "target/candidate-installed-windows"
@@ -2591,12 +2636,19 @@ function validateRemainingWorkflows(workflows, violations) {
       "accelerator_execution:windows-x64-vulkan",
       "--producer-job packaged-vulkan",
     ]);
+    const releaseCell = namedStep(job, "Emit authenticated Vulkan release cell");
+    add(
+      violations,
+      releaseCell?.if === "inputs.emit_release_cells && !inputs.server_behavior_only",
+      `${vulkanFile} server-behavior-only proof must never emit a release cell`,
+    );
     const vulkanCellUpload = namedStep(job, "Upload authenticated Vulkan release cell");
     add(
       violations,
       vulkanCellUpload?.uses === "actions/upload-artifact@v7.0.1"
         && String(vulkanCellUpload?.if ?? "").includes("success()")
-        && String(vulkanCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
+        && String(vulkanCellUpload?.if ?? "").includes("inputs.emit_release_cells")
+        && String(vulkanCellUpload?.if ?? "").includes("!inputs.server_behavior_only"),
       `${vulkanFile} Vulkan release cell must be a success-only retained artifact`,
     );
   }

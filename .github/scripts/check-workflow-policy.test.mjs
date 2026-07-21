@@ -569,6 +569,18 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       workflow.jobs["release-evidence"].if
         = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'linux' &&", "");
     }, /Linux server-behavior proof must not require protected release evidence/u],
+    ["Windows release evidence guard removed", packagedCoordinatorFile, workflow => {
+      workflow.jobs["release-evidence"].if
+        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'windows' &&", "");
+    }, /Windows server-behavior proof must not require protected release evidence/u],
+    ["Windows package remains blocked on release evidence", packagedCoordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].if
+        = workflow.jobs["packaged-proof"].if.replace("needs.route.outputs.scope == 'windows'", "needs.route.outputs.scope == 'full'");
+    }, /Windows server-behavior package proof must accept skipped protected release evidence/u],
+    ["Windows closeout still requires release evidence", packagedCoordinatorFile, workflow => {
+      const step = draftStep(workflow.jobs.closeout, "Require one coherent accepted proof");
+      step.run = step.run.replace(' && [ "$SCOPE" != windows ]', "");
+    }, /Require one coherent accepted proof/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
@@ -1268,12 +1280,29 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     ["coordinator opt-in removed", coordinatorFile, workflow => {
       delete workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof;
     }, /accepted PR Windows package into candidate-installed proof/u],
+    ["coordinator server-only scope removed", coordinatorFile, workflow => {
+      delete workflow.jobs["windows-vulkan-proof"].with.server_behavior_only;
+    }, /non-quality Windows claim only for Windows scope/u],
+    ["coordinator quality artifact bypasses producer result", coordinatorFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact
+        = "${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}";
+    }, /Windows quality evidence must come only from the successful protected producer/u],
     ["release enables pre-merge proof", releaseFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = true;
+    }, /leave pre-merge Windows candidate-installed proof/u],
+    ["release enables server-only proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
     }, /leave pre-merge Windows candidate-installed proof/u],
     ["explicit opt-in removed", protectedFile, workflow => {
       delete workflow.on.workflow_call.inputs.candidate_installed_proof;
     }, /candidate-installed proof must be an explicit opt-in/u],
+    ["server-only opt-in removed", protectedFile, workflow => {
+      delete workflow.on.workflow_call.inputs.server_behavior_only;
+    }, /server-behavior-only claim scope must be an explicit opt-in/u],
+    ["candidate staging loses server-only route", protectedFile, workflow => {
+      candidateStage(workflow).if = candidateStage(workflow).if
+        .replace("inputs.server_behavior_only || ", "");
+    }, /candidate-managed staging must require coordinator opt-in and remain runnable in Windows server scope/u],
     ["candidate staging bypassed", protectedFile, workflow => {
       candidateStage(workflow).run = candidateStage(workflow).run
         .replace("--prepare-candidate-installed-proof", "--version-only");
@@ -1281,6 +1310,14 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     ["candidate tier weakened", protectedFile, workflow => {
       candidateProof(workflow).run = candidateProof(workflow).run
         .replace("--proof-tier installed_runtime", "--proof-tier protected_hardware");
+    }, /Prove two-host candidate-installed Windows runtime/u],
+    ["candidate proof loses server-only route", protectedFile, workflow => {
+      candidateProof(workflow).if = candidateProof(workflow).if
+        .replace("inputs.server_behavior_only || ", "");
+    }, /candidate-installed proof must require coordinator opt-in and remain runnable in Windows server scope/u],
+    ["candidate server-only claim removed", protectedFile, workflow => {
+      candidateProof(workflow).run = candidateProof(workflow).run
+        .replace("--server-behavior-only", "--version-only");
     }, /Prove two-host candidate-installed Windows runtime/u],
     ["candidate cell relabeled", protectedFile, workflow => {
       candidateProof(workflow).run = candidateProof(workflow).run
@@ -1299,6 +1336,10 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     ["candidate artifact loses attempt identity", protectedFile, workflow => {
       candidateUpload(workflow).with.name = "candidate-installed-windows-${{ inputs.version }}";
     }, /attempt-scoped artifact/u],
+    ["server-only proof emits release cell", protectedFile, workflow => {
+      draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
+        = "inputs.emit_release_cells";
+    }, /server-behavior-only proof must never emit a release cell/u],
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {
