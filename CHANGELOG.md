@@ -32,6 +32,10 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 - The proof coordinator now supports explicit hosted-only integration and
   Linux-only package scopes, so exact-head source, repo-scale, and Linux
   candidate evidence do not schedule unrelated protected-platform runners.
+- Candidate-installed package qualification now has a bounded 120-minute job
+  budget, preventing exact Linux and Windows proof from being cancelled by the
+  generic 60-minute package timeout after their expensive build and lifecycle
+  checks have already passed.
 - The release workflow can now authenticate the complete pre-publish ledger on
   an exact manually selected `dev/codestory-next` head without granting publish
   authority. Only the trusted automatic `main` caller can opt into publication.

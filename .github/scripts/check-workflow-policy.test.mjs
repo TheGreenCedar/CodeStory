@@ -1312,6 +1312,19 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
   }
 });
 
+test("candidate-installed package qualification retains enough bounded job time", () => {
+  const workflows = loadWorkflows();
+  assert.deepEqual(validateWorkflows(workflows), []);
+
+  workflows.get("packaged-platform-proof.yml").jobs.build["timeout-minutes"] =
+    "${{ inputs.calibration_mode && 180 || (inputs.candidate_installed_proof && (matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64') && 60 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60)) }}";
+
+  assert.match(
+    validateWorkflows(workflows).join("\n"),
+    /x64 candidate-installed package qualification must retain a bounded 120-minute timeout/u,
+  );
+});
+
 test("draft source workflow freezes its complete top-level contract", async (t) => {
   assert.deepEqual(draftWorkflowPolicyViolations(draftSourceWorkflow()), []);
   const reordered = draftSourceWorkflow();
