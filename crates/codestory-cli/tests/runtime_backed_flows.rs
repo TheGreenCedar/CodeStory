@@ -86,7 +86,9 @@ fn publish_schema_29_projection_fixture(workspace: &Path, cache_dir: &Path) -> P
     assert_eq!(structural_counts, (0, 0, 0));
     connection
         .execute_batch(
-            "DELETE FROM structural_text_unit_publication;
+            "UPDATE source_policy_exclusion_publication
+                SET policy_version = 'oversized-source-v1';
+             DELETE FROM structural_text_unit_publication;
              ALTER TABLE index_publication RENAME TO index_publication_v30;
              CREATE TABLE index_publication (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -614,6 +616,47 @@ fn republish_projections_cli_acquires_writer_lock_before_schema_migration() {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("read retained schema"),
         29
+    );
+}
+
+#[test]
+#[ignore = "builds a schema-29 indexed fixture and verifies retained policy cap drift fails closed"]
+fn republish_projections_cli_rejects_legacy_policy_cap_drift_without_mutation() {
+    let workspace = copy_tictactoe_workspace();
+    let cache = tempdir().expect("explicit cache");
+    let storage_path = publish_schema_29_projection_fixture(workspace.path(), cache.path());
+    let connection = rusqlite::Connection::open(&storage_path).expect("open retained fixture");
+    connection
+        .execute(
+            "UPDATE source_policy_exclusion_publication SET byte_cap = byte_cap + 1",
+            [],
+        )
+        .expect("drift retained byte cap");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint retained fixture");
+    drop(connection);
+    remove_workspace_source(workspace.path());
+    let bytes_before = fs::read(&storage_path).expect("read retained bytes");
+
+    let output = run_cli_with_cache(
+        workspace.path(),
+        cache.path(),
+        &["retrieval", "republish-projections", "--format", "json"],
+    );
+
+    assert!(!output.status.success(), "cap-drifted republish succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("semantic_projection_migration_required")
+            || stdout.contains("semantic_projection_migration_required"),
+        "unexpected CLI error: stderr={stderr} stdout={stdout}"
+    );
+    assert_eq!(
+        fs::read(&storage_path).expect("read retained bytes after rejection"),
+        bytes_before,
+        "CLI mutated the retained core before rejecting cap drift"
     );
 }
 
