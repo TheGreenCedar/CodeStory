@@ -5006,7 +5006,9 @@ impl Storage {
             )
         })?;
         let sync_started = Instant::now();
-        File::open(path)
+        OpenOptions::new()
+            .write(true)
+            .open(path)
             .and_then(|file| file.sync_all())
             .map_err(|error| {
                 promotion_path_error("sync staged database", Path::new(path), error)
