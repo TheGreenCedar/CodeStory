@@ -399,7 +399,7 @@ fn new_agent_surface_runtime(
 
 struct OpenedAgentSurface {
     runtime: RuntimeContext,
-    before: ProjectSummary,
+    before: Option<ProjectSummary>,
     opened: runtime::OpenedProject,
 }
 
@@ -2799,6 +2799,13 @@ fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperatio
             .context("drill retrieval index finalize")?;
     }
     let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
+    let before_stats = before.as_ref().map(|summary| &summary.stats);
+    let before_unavailable_reason = before.is_none().then(|| {
+        opened
+            .refresh_reason
+            .clone()
+            .unwrap_or_else(|| "pre_refresh_summary_unavailable".to_string())
+    });
     let setup_ms = elapsed_ms(setup_timer);
 
     let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
@@ -2863,10 +2870,11 @@ fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperatio
             question: cmd.question.clone(),
             output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
             mechanical: DrillMechanicalOutput {
-                before_files: before.stats.file_count,
-                before_nodes: before.stats.node_count,
-                before_edges: before.stats.edge_count,
-                before_errors: before.stats.error_count,
+                before_files: before_stats.map(|stats| stats.file_count),
+                before_nodes: before_stats.map(|stats| stats.node_count),
+                before_edges: before_stats.map(|stats| stats.edge_count),
+                before_errors: before_stats.map(|stats| stats.error_count),
+                before_unavailable_reason: before_unavailable_reason.clone(),
                 after_files: pinned_summary.stats.file_count,
                 after_nodes: pinned_summary.stats.node_count,
                 after_edges: pinned_summary.stats.edge_count,
@@ -3634,10 +3642,11 @@ fn blocked_drill_suite_repo_output(
             full_report_markdown: String::new(),
             mechanical: DrillSummaryMechanicalOutput {
                 refresh: refresh_label(refresh, None),
-                before: drill_summary_stats(0, 0, 0, 0),
+                before: Some(drill_summary_stats(0, 0, 0, 0)),
+                before_unavailable_reason: None,
                 after: drill_summary_stats(0, 0, 0, 1),
                 index_ready: false,
-                error_delta: 1,
+                error_delta: Some(1),
                 retrieval_status: None,
                 freshness_status: Some("unknown".to_string()),
                 stale_file_count: 0,
@@ -3991,6 +4000,17 @@ fn write_drill_report_file(path: &std::path::Path, content: &str) -> Result<()> 
 
 fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     let sufficiency = &output.evidence_packet.sufficiency;
+    let before_stats = match (
+        output.mechanical.before_files,
+        output.mechanical.before_nodes,
+        output.mechanical.before_edges,
+        output.mechanical.before_errors,
+    ) {
+        (Some(files), Some(nodes), Some(edges), Some(errors)) => {
+            Some(drill_summary_stats(files, nodes, edges, errors))
+        }
+        _ => None,
+    };
     let anchor_statuses: Vec<_> = output
         .anchors
         .iter()
@@ -4129,12 +4149,8 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         full_report_markdown: "drill-report.md".to_string(),
         mechanical: DrillSummaryMechanicalOutput {
             refresh: output.mechanical.refresh.clone(),
-            before: drill_summary_stats(
-                output.mechanical.before_files,
-                output.mechanical.before_nodes,
-                output.mechanical.before_edges,
-                output.mechanical.before_errors,
-            ),
+            before: before_stats,
+            before_unavailable_reason: output.mechanical.before_unavailable_reason.clone(),
             after: drill_summary_stats(
                 output.mechanical.after_files,
                 output.mechanical.after_nodes,
@@ -4142,8 +4158,9 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
                 output.mechanical.after_errors,
             ),
             index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
-            error_delta: i64::from(output.mechanical.after_errors)
-                - i64::from(output.mechanical.before_errors),
+            error_delta: output.mechanical.before_errors.map(|before_errors| {
+                i64::from(output.mechanical.after_errors) - i64::from(before_errors)
+            }),
             retrieval_status: output
                 .mechanical
                 .retrieval
@@ -8144,6 +8161,10 @@ mod tests {
         let opened =
             open_agent_surface(&project_args, None, None, args::RefreshMode::Auto, "packet")
                 .expect("auto may select full recovery");
+        assert!(
+            opened.before.is_none(),
+            "compatibility recovery has no safe pre-refresh summary"
+        );
         assert_eq!(opened.opened.refresh_mode, Some(IndexMode::Full));
         assert_eq!(
             opened.opened.refresh_reason.as_deref(),
@@ -10482,10 +10503,11 @@ mod tests {
             question: Some(packet.question.clone()),
             output_dir: "artifacts/drill".to_string(),
             mechanical: DrillMechanicalOutput {
-                before_files: 2,
-                before_nodes: 4,
-                before_edges: 2,
-                before_errors: 0,
+                before_files: Some(2),
+                before_nodes: Some(4),
+                before_edges: Some(2),
+                before_errors: Some(0),
+                before_unavailable_reason: None,
                 after_files: 2,
                 after_nodes: 4,
                 after_edges: 2,
@@ -10519,7 +10541,7 @@ mod tests {
             evidence_packet: packet,
         };
         let output_dir = tempdir().expect("output dir");
-        let operation = codestory_runtime::PublicOperation {
+        let mut operation = codestory_runtime::PublicOperation {
             value: output,
             core_publication: None,
             retrieval_publication: None,
@@ -10586,6 +10608,54 @@ mod tests {
                 .map(|value| value.as_str().expect("artifact name").to_string())
                 .collect::<Vec<_>>()
         );
+
+        operation.value.mechanical.before_files = None;
+        operation.value.mechanical.before_nodes = None;
+        operation.value.mechanical.before_edges = None;
+        operation.value.mechanical.before_errors = None;
+        operation.value.mechanical.before_unavailable_reason =
+            Some("core_schema_upgrade_required".to_string());
+        operation.value.mechanical.refresh = "auto->full".to_string();
+        let unavailable_dir = tempdir().expect("unavailable output dir");
+        write_drill_outputs(args::OutputFormat::Json, unavailable_dir.path(), &operation)
+            .expect("write unavailable-before drill fixtures");
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(unavailable_dir.path().join("drill-report.json"))
+                .expect("read unavailable-before report"),
+        )
+        .expect("parse unavailable-before report");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(unavailable_dir.path().join("drill-summary.json"))
+                .expect("read unavailable-before summary"),
+        )
+        .expect("parse unavailable-before summary");
+        let markdown = fs::read_to_string(unavailable_dir.path().join("drill-report.md"))
+            .expect("read unavailable-before markdown");
+
+        for field in [
+            "/mechanical/before_files",
+            "/mechanical/before_nodes",
+            "/mechanical/before_edges",
+            "/mechanical/before_errors",
+        ] {
+            assert!(report.pointer(field).is_none(), "unexpected {field}");
+        }
+        assert_eq!(
+            report.pointer("/mechanical/before_unavailable_reason"),
+            Some(&serde_json::json!("core_schema_upgrade_required"))
+        );
+        assert!(summary.pointer("/mechanical/before").is_none());
+        assert!(summary.pointer("/mechanical/error_delta").is_none());
+        assert_eq!(
+            summary.pointer("/mechanical/before_unavailable_reason"),
+            Some(&serde_json::json!("core_schema_upgrade_required"))
+        );
+        assert!(
+            markdown.contains("index_before: unavailable reason=core_schema_upgrade_required"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("index_before: files="), "{markdown}");
     }
 
     #[test]

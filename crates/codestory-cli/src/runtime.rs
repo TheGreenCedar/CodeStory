@@ -267,12 +267,11 @@ impl RuntimeContext {
     /// Open an agent surface while retaining a safe before/after summary for
     /// report telemetry. Compatibility is decided before any mutable project
     /// open. When that decision requires full recovery, no trustworthy
-    /// pre-recovery summary exists, so the published after-summary is also used
-    /// as the bounded telemetry baseline.
+    /// pre-recovery summary exists, so the before-summary remains unavailable.
     pub(crate) fn ensure_open_with_before(
         &self,
         refresh: RefreshMode,
-    ) -> Result<(ProjectSummary, OpenedProject)> {
+    ) -> Result<(Option<ProjectSummary>, OpenedProject)> {
         let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
         let before = if decision.reason.is_none() {
             Some(self.open_project_summary()?)
@@ -280,7 +279,6 @@ impl RuntimeContext {
             None
         };
         let opened = self.ensure_open_from_decision(refresh, before.clone(), decision)?;
-        let before = before.unwrap_or_else(|| opened.summary.clone());
         Ok((before, opened))
     }
 

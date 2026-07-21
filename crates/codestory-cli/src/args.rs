@@ -1725,10 +1725,16 @@ pub(crate) struct DrillRuntimeTimingsOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillMechanicalOutput {
-    pub(crate) before_files: u32,
-    pub(crate) before_nodes: u32,
-    pub(crate) before_edges: u32,
-    pub(crate) before_errors: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_nodes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_edges: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_errors: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after_files: u32,
     pub(crate) after_nodes: u32,
     pub(crate) after_edges: u32,
@@ -1882,10 +1888,14 @@ pub(crate) struct DrillSummaryStatsOutput {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryMechanicalOutput {
     pub(crate) refresh: String,
-    pub(crate) before: DrillSummaryStatsOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before: Option<DrillSummaryStatsOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after: DrillSummaryStatsOutput,
     pub(crate) index_ready: bool,
-    pub(crate) error_delta: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_delta: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

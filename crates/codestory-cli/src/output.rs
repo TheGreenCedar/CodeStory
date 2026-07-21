@@ -2794,14 +2794,27 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
         let _ = writeln!(markdown, "question: {question}");
     }
     let _ = writeln!(markdown, "output_dir: `{}`", output.output_dir);
-    let _ = writeln!(
-        markdown,
-        "index_before: files={} nodes={} edges={} errors={}",
+    match (
         output.mechanical.before_files,
         output.mechanical.before_nodes,
         output.mechanical.before_edges,
-        output.mechanical.before_errors
-    );
+        output.mechanical.before_errors,
+    ) {
+        (Some(files), Some(nodes), Some(edges), Some(errors)) => {
+            let _ = writeln!(
+                markdown,
+                "index_before: files={files} nodes={nodes} edges={edges} errors={errors}"
+            );
+        }
+        _ => {
+            let reason = output
+                .mechanical
+                .before_unavailable_reason
+                .as_deref()
+                .unwrap_or("pre_refresh_summary_unavailable");
+            let _ = writeln!(markdown, "index_before: unavailable reason={reason}");
+        }
+    }
     let _ = writeln!(
         markdown,
         "index_after: files={} nodes={} edges={} errors={} refresh={}",
