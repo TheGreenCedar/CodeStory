@@ -8,7 +8,8 @@
   typed orientation confidence with bounded-candidate, entrypoint, subsystem,
   and presentation uncertainty. The stdio schema and `ground --why` render the
   same contract, so weak orientation cannot be reported as high-confidence
-  coverage.
+  coverage. Root ranking derives its path, name, subsystem, and graph evidence
+  once per candidate instead of recomputing it inside every sort comparison.
 - The native sqlite-vec/USearch evidence harness now uses 75,000 as its largest
   nested real-anchor workload while retaining 100 incremental anchors, two
   clean roots, six paired counterbalanced blocks, and the existing identity,
