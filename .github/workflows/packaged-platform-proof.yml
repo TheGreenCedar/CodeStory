@@ -97,7 +97,7 @@ jobs:
     # The six APPLE_* credentials are an environment-scoped release contract;
     # repository-only secrets are not the supported signing configuration.
     environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}
-    timeout-minutes: ${{ inputs.calibration_mode && 180 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60) }}
+    timeout-minutes: ${{ inputs.calibration_mode && 180 || (inputs.candidate_installed_proof && (matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64') && 120 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60)) }}
     strategy:
       fail-fast: false
       # GitHub applies matrix exclusions before includes, so an include-only

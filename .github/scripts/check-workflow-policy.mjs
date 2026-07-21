@@ -1654,6 +1654,11 @@ function validatePackagedProof(workflows, violations, graph) {
   const job = requireJob(violations, file, workflow, "build");
   add(
     violations,
+    job["timeout-minutes"] === "${{ inputs.calibration_mode && 180 || (inputs.candidate_installed_proof && (matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64') && 120 || (inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60)) }}",
+    `${file} x64 candidate-installed package qualification must retain a bounded 120-minute timeout`,
+  );
+  add(
+    violations,
     at(workflow, "concurrency", "group") === "packaged-platform-proof-${{ github.sha }}-${{ inputs.ref }}-${{ inputs.proof_key || github.ref }}",
     `${file} concurrency must bind caller SHA, exact package SHA, and proof identity`,
   );
