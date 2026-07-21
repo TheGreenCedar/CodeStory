@@ -12585,9 +12585,23 @@ impl AppController {
         let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let refresh_inputs = if storage_path.exists() {
-            let store = Store::open(&storage_path)
-                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-            workspace_refresh_inputs(&store)?
+            let schema_version = Store::database_schema_version_observational(&storage_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to inspect dry-run storage without recovery: {error}"
+                    ))
+                })?;
+            if schema_version < CURRENT_SCHEMA_VERSION {
+                RefreshInputs::default()
+            } else {
+                let store =
+                    Store::open_freshness_observational(&storage_path).map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to inspect dry-run storage without mutation: {error}"
+                        ))
+                    })?;
+                workspace_refresh_inputs(&store)?
+            }
         } else {
             RefreshInputs::default()
         };
@@ -16113,7 +16127,10 @@ fn full_refresh_required_error(
     reason: impl AsRef<str>,
 ) -> ApiError {
     let project = root.to_string_lossy().to_string();
-    let next_command = format!("codestory-cli index --project {:?} --refresh full", project);
+    let next_command = format!(
+        "codestory-cli index --project {} --refresh full",
+        quote_refresh_command_argument(&project)
+    );
     ApiError::with_details(
         FULL_REFRESH_REQUIRED_ERROR_CODE,
         format!(
@@ -16135,6 +16152,16 @@ fn full_refresh_required_error(
     )
 }
 
+#[cfg(windows)]
+fn quote_refresh_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_refresh_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn ensure_incremental_refresh_compatible(root: &Path, storage_path: &Path) -> Result<(), ApiError> {
     if !storage_path.is_file() {
         return Err(full_refresh_required_error(
@@ -16142,6 +16169,29 @@ fn ensure_incremental_refresh_compatible(root: &Path, storage_path: &Path) -> Re
             "complete_core_publication_missing",
             "complete_core_publication_missing",
         ));
+    }
+    let schema_version = Store::database_schema_version_observational(storage_path).map_err(
+        |error| {
+            ApiError::internal(format!(
+                "Failed to inspect incremental refresh schema compatibility without recovery: {error}"
+            ))
+        },
+    )?;
+    if schema_version < CURRENT_SCHEMA_VERSION {
+        let (reason_code, reason) = if schema_version == 0 {
+            (
+                "complete_core_publication_missing",
+                "complete_core_publication_missing".to_string(),
+            )
+        } else {
+            (
+                "core_schema_upgrade_required",
+                format!(
+                    "core_schema_upgrade_required:observed={schema_version}:required={CURRENT_SCHEMA_VERSION}"
+                ),
+            )
+        };
+        return Err(full_refresh_required_error(root, reason_code, reason));
     }
     let storage = Store::open_freshness_observational(storage_path).map_err(|error| {
         ApiError::internal(format!(
@@ -29483,6 +29533,136 @@ fn build_llm_symbol_doc_text() -> String {
                 .message
                 .contains("Effective refresh mode `full` could not verify"),
             "unexpected full-refresh error: {full_error:?}"
+        );
+    }
+
+    #[test]
+    fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn legacy_value() -> i32 { 28 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish current baseline");
+        {
+            let storage = Storage::open(&storage_path).expect("open schema fixture");
+            storage
+                .get_connection()
+                .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
+                .expect("stamp supported pre-current schema");
+        }
+        let database_before = fs::read(&storage_path).expect("read old-schema database");
+        let wal_path = storage_path.with_extension("db-wal");
+        let wal_before = fs::read(&wal_path).ok();
+        let cache_path = storage_path.parent().expect("cache path");
+        let cache_entries_before = {
+            let mut entries = fs::read_dir(cache_path)
+                .expect("list cache before compatibility checks")
+                .map(|entry| {
+                    entry
+                        .expect("read cache entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+
+        for error in [
+            controller
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject the old schema"),
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect_err("execution must reject the old schema"),
+        ] {
+            assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("core_schema_upgrade_required")
+            );
+        }
+        let auto_effective_dry_run = controller
+            .dry_run_index(IndexMode::Full)
+            .expect("auto-selected full dry-run must inspect old schema without migrating it");
+        assert_eq!(auto_effective_dry_run.refresh, IndexMode::Full);
+        assert_eq!(
+            fs::read(&storage_path).expect("read database after rejected requests"),
+            database_before,
+            "old-schema compatibility checks must preserve database bytes"
+        );
+        assert_eq!(
+            fs::read(&wal_path).ok(),
+            wal_before,
+            "old-schema compatibility checks must preserve WAL bytes"
+        );
+        let cache_entries_after = {
+            let mut entries = fs::read_dir(cache_path)
+                .expect("list cache after compatibility checks")
+                .map(|entry| {
+                    entry
+                        .expect("read cache entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        assert_eq!(cache_entries_after, cache_entries_before);
+        assert!(!controller.state.lock().is_indexing);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("explicit full refresh upgrades the supported old schema");
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("read upgraded schema"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn full_refresh_required_command_quotes_shell_metacharacters() {
+        let error = full_refresh_required_error(
+            Path::new("repo/$hidden/quoted'path"),
+            "core_schema_upgrade_required",
+            "core_schema_upgrade_required",
+        );
+        let command = error
+            .details
+            .expect("typed compatibility details")
+            .next_commands
+            .into_iter()
+            .next()
+            .expect("full-refresh repair command");
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            command,
+            "codestory-cli index --project 'repo/$hidden/quoted'\\''path' --refresh full"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            command,
+            "codestory-cli index --project 'repo/$hidden/quoted''path' --refresh full"
         );
     }
 

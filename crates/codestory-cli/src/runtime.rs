@@ -21,9 +21,6 @@ use std::sync::atomic::AtomicBool;
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, quote_command_path};
 
-const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
-    "previous_incremental_run_incomplete_full_refresh_required";
-
 #[derive(Debug)]
 /// Project state after a command has opened or refreshed the repository.
 ///
@@ -276,7 +273,7 @@ impl RuntimeContext {
         refresh: RefreshMode,
         summary: ProjectSummary,
     ) -> Result<OpenedProject> {
-        let decision = self.resolve_refresh_from_summary_with_preflight(refresh, &summary)?;
+        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
         self.ensure_open_from_decision(refresh, summary, decision)
     }
 
@@ -284,54 +281,34 @@ impl RuntimeContext {
         &self,
         refresh: RefreshMode,
     ) -> Result<(ProjectSummary, RefreshDecision)> {
-        let compatibility = match refresh {
-            RefreshMode::Auto | RefreshMode::Incremental => self
-                .index
-                .ensure_incremental_refresh_compatible_at(&self.project_root, &self.storage_path)
-                .err(),
-            RefreshMode::Full | RefreshMode::None => None,
-        };
-        if refresh == RefreshMode::Incremental
-            && let Some(error) = compatibility.as_ref()
-        {
-            return Err(map_api_error_for_project(error.clone(), &self.project_root));
-        }
+        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
         let summary = self.open_project_summary()?;
-        let decision = if let Some(error) = compatibility {
-            if error.code != "full_refresh_required" {
-                return Err(map_api_error_for_project(error, &self.project_root));
-            }
-            RefreshDecision {
-                effective_mode: Some(IndexMode::Full),
-                reason: Some(refresh_compatibility_reason(&error)),
-            }
-        } else {
-            resolve_refresh_request(refresh, &summary)
-                .map_err(|error| map_api_error_for_project(error, &self.project_root))?
-        };
         Ok((summary, decision))
     }
 
-    fn resolve_refresh_from_summary_with_preflight(
+    pub(crate) fn resolve_refresh_decision_with_preflight(
         &self,
         refresh: RefreshMode,
-        summary: &ProjectSummary,
     ) -> Result<RefreshDecision> {
-        if matches!(refresh, RefreshMode::Auto | RefreshMode::Incremental)
-            && let Err(error) = self
+        match refresh {
+            RefreshMode::Auto | RefreshMode::Incremental => self
                 .index
                 .ensure_incremental_refresh_compatible_at(&self.project_root, &self.storage_path)
-        {
-            if refresh == RefreshMode::Incremental || error.code != "full_refresh_required" {
-                return Err(map_api_error_for_project(error, &self.project_root));
-            }
-            return Ok(RefreshDecision {
+                .map(|()| RefreshDecision {
+                    effective_mode: Some(IndexMode::Incremental),
+                    reason: None,
+                })
+                .or_else(|error| refresh_decision_from_compatibility_error(refresh, error))
+                .map_err(|error| map_api_error_for_project(error, &self.project_root)),
+            RefreshMode::Full => Ok(RefreshDecision {
                 effective_mode: Some(IndexMode::Full),
-                reason: Some(refresh_compatibility_reason(&error)),
-            });
+                reason: None,
+            }),
+            RefreshMode::None => Ok(RefreshDecision {
+                effective_mode: None,
+                reason: None,
+            }),
         }
-        resolve_refresh_request(refresh, summary)
-            .map_err(|error| map_api_error_for_project(error, &self.project_root))
     }
 
     fn ensure_open_from_decision(
@@ -817,98 +794,25 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Convert a requested refresh mode into the indexing action to run.
-pub(crate) fn resolve_refresh_request(
-    refresh: RefreshMode,
-    summary: &ProjectSummary,
-) -> Result<RefreshDecision, ApiError> {
-    let full_refresh_reason = summary_full_refresh_reason(summary);
-    match refresh {
-        RefreshMode::Auto => Ok(RefreshDecision {
-            effective_mode: Some(
-                if summary.stats.node_count == 0 || full_refresh_reason.is_some() {
-                    IndexMode::Full
-                } else {
-                    IndexMode::Incremental
-                },
-            ),
-            reason: full_refresh_reason.map(str::to_string).or_else(|| {
-                (summary.stats.node_count == 0)
-                    .then(|| "complete_core_publication_missing".to_string())
-            }),
-        }),
-        RefreshMode::Full => Ok(RefreshDecision {
-            effective_mode: Some(IndexMode::Full),
-            reason: None,
-        }),
-        RefreshMode::Incremental => {
-            if let Some(reason) = full_refresh_reason {
-                return Err(full_refresh_required_from_summary(summary, reason));
-            }
-            if summary.stats.node_count == 0 {
-                return Err(full_refresh_required_from_summary(
-                    summary,
-                    "complete_core_publication_missing",
-                ));
-            }
-            Ok(RefreshDecision {
-                effective_mode: Some(IndexMode::Incremental),
-                reason: None,
-            })
-        }
-        RefreshMode::None => Ok(RefreshDecision {
-            effective_mode: None,
-            reason: None,
-        }),
-    }
-}
-
-fn summary_full_refresh_reason(summary: &ProjectSummary) -> Option<&str> {
-    let reason = summary
-        .freshness
-        .as_ref()
-        .and_then(|freshness| freshness.reason.as_deref())?;
-    if reason == INCOMPLETE_INDEX_RECOVERY_REASON {
-        Some("incomplete_incremental_publication")
-    } else if reason.starts_with("structural text unit publication is incomplete:") {
-        Some("structural_publication_incompatible")
-    } else {
-        None
-    }
-}
-
-fn full_refresh_required_from_summary(summary: &ProjectSummary, reason: &str) -> ApiError {
-    let project = summary.root.clone();
-    let command = format!(
-        "codestory-cli index --project {} --refresh full",
-        quote_command_path(Path::new(&project))
-    );
-    ApiError::with_details(
-        "full_refresh_required",
-        format!(
-            "Refresh compatibility rejected the request before workspace reads: requested=incremental effective=none required=full reason={reason}"
-        ),
-        codestory_contracts::api::ApiErrorDetails {
-            cause_code: Some(reason.to_string()),
-            failed_layer: Some("core_publication_compatibility".to_string()),
-            project: Some(project),
-            next_commands: vec![command.clone()],
-            minimum_next: vec![command.clone()],
-            full_repair: vec![command],
-            readiness: None,
-            embedding_capacity: None,
-            embedding_retry: None,
-            coverage_gaps: Vec::new(),
-        },
-    )
-}
-
 fn refresh_compatibility_reason(error: &ApiError) -> String {
     error
         .details
         .as_ref()
         .and_then(|details| details.cause_code.clone())
         .unwrap_or_else(|| "full_refresh_required".to_string())
+}
+
+fn refresh_decision_from_compatibility_error(
+    refresh: RefreshMode,
+    error: ApiError,
+) -> Result<RefreshDecision, ApiError> {
+    if refresh == RefreshMode::Auto && error.code == "full_refresh_required" {
+        return Ok(RefreshDecision {
+            effective_mode: Some(IndexMode::Full),
+            reason: Some(refresh_compatibility_reason(&error)),
+        });
+    }
+    Err(error)
 }
 
 pub(crate) fn annotate_refresh_error(
@@ -1080,6 +984,7 @@ fn cache_busy_message(project: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::ApiErrorDetails;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
@@ -1096,6 +1001,65 @@ mod tests {
 
     struct EnvSnapshot {
         values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    fn full_refresh_required_error(reason: &str) -> ApiError {
+        ApiError::with_details(
+            "full_refresh_required",
+            format!("requested=incremental effective=none required=full reason={reason}"),
+            ApiErrorDetails {
+                cause_code: Some(reason.to_string()),
+                failed_layer: Some("core_publication_compatibility".to_string()),
+                project: Some("/tmp/project".to_string()),
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+                embedding_capacity: None,
+                embedding_retry: None,
+                coverage_gaps: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn precurrent_schema_selects_full_for_auto_and_rejects_incremental() {
+        for reason in [
+            "complete_core_publication_missing",
+            "incomplete_incremental_publication",
+            "structural_publication_incompatible",
+            "core_schema_upgrade_required",
+        ] {
+            let auto = refresh_decision_from_compatibility_error(
+                RefreshMode::Auto,
+                full_refresh_required_error(reason),
+            )
+            .expect("auto may select explicit full recovery");
+            assert_eq!(auto.effective_mode, Some(IndexMode::Full));
+            assert_eq!(auto.reason.as_deref(), Some(reason));
+
+            let incremental = refresh_decision_from_compatibility_error(
+                RefreshMode::Incremental,
+                full_refresh_required_error(reason),
+            )
+            .expect_err("explicit incremental must not escalate");
+            assert_eq!(incremental.code, "full_refresh_required");
+            assert_eq!(
+                incremental
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some(reason)
+            );
+        }
+
+        let unsafe_state = ApiError::internal("future or corrupt schema state");
+        assert_eq!(
+            refresh_decision_from_compatibility_error(RefreshMode::Auto, unsafe_state)
+                .expect_err("auto must not widen unsafe state")
+                .code,
+            "internal"
+        );
     }
 
     #[test]

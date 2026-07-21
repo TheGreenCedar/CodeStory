@@ -98,7 +98,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
-    let (_, decision) = runtime.resolve_refresh_with_preflight(cmd.refresh)?;
+    let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
     let refresh_mode = decision.effective_mode;
     ensure_retrieval_index_embedding_policy(&sidecar)?;
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;

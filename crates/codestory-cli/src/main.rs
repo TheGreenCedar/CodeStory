@@ -682,7 +682,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         RuntimeContext::new(&cmd.project)?
     };
     if cmd.dry_run {
-        let (_, decision) = runtime.resolve_refresh_with_preflight(cmd.refresh)?;
+        let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
         let refresh_mode = decision.effective_mode.unwrap_or(IndexMode::Incremental);
         let dry_run = runtime.index.dry_run_index(refresh_mode).map_err(|error| {
             map_api_error_for_project(
@@ -8004,9 +8004,8 @@ fn compact_excerpt(line: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::RefreshMode;
     use crate::display::{clean_path_string, relative_path};
-    use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
+    use crate::runtime::{cache_root_for_project, fnv1a_hex};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
         AgentRetrievalTraceDto, CorePromotionTimings, DatabaseSnapshotCopyTimings, EdgeId,
@@ -9157,101 +9156,6 @@ mod tests {
     #[test]
     fn fnv1a_hash_is_stable() {
         assert_eq!(fnv1a_hex(b"abc"), "e71fa2190541574b");
-    }
-
-    #[test]
-    fn auto_refresh_uses_full_for_empty_index() {
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(0)),
-            Ok(runtime::RefreshDecision {
-                effective_mode: Some(IndexMode::Full),
-                reason: Some("complete_core_publication_missing".to_string()),
-            })
-        );
-    }
-
-    #[test]
-    fn auto_refresh_uses_incremental_for_existing_index() {
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
-            Ok(runtime::RefreshDecision {
-                effective_mode: Some(IndexMode::Incremental),
-                reason: None,
-            })
-        );
-    }
-
-    #[test]
-    fn explicit_incremental_rejects_full_recovery_while_auto_reports_it() {
-        let mut summary = summary_with_files(3);
-        summary.freshness = Some(IndexFreshnessDto {
-            status: IndexFreshnessStatusDto::Stale,
-            changed_file_count: 0,
-            new_file_count: 0,
-            removed_file_count: 0,
-            checked_file_count: 0,
-            indexed_file_count: 3,
-            duration_ms: 0,
-            reason: Some("previous_incremental_run_incomplete_full_refresh_required".to_string()),
-            samples: Vec::new(),
-        });
-
-        let auto = resolve_refresh_request(RefreshMode::Auto, &summary).expect("auto decision");
-        assert_eq!(auto.effective_mode, Some(IndexMode::Full));
-        assert_eq!(
-            auto.reason.as_deref(),
-            Some("incomplete_incremental_publication")
-        );
-
-        let error = resolve_refresh_request(RefreshMode::Incremental, &summary)
-            .expect_err("explicit incremental must not escalate");
-        assert_eq!(error.code, "full_refresh_required");
-        assert!(error.message.contains("requested=incremental"));
-        assert!(error.message.contains("effective=none"));
-        assert!(error.message.contains("required=full"));
-        assert_eq!(
-            error
-                .details
-                .as_ref()
-                .and_then(|details| details.cause_code.as_deref()),
-            Some("incomplete_incremental_publication")
-        );
-    }
-
-    #[test]
-    fn structural_publication_incompatibility_has_auto_and_incremental_parity() {
-        let mut summary = summary_with_files(3);
-        summary.freshness = Some(IndexFreshnessDto {
-            status: IndexFreshnessStatusDto::NotChecked,
-            changed_file_count: 0,
-            new_file_count: 0,
-            removed_file_count: 0,
-            checked_file_count: 0,
-            indexed_file_count: 3,
-            duration_ms: 0,
-            reason: Some(
-                "structural text unit publication is incomplete: publication is missing"
-                    .to_string(),
-            ),
-            samples: Vec::new(),
-        });
-
-        let auto = resolve_refresh_request(RefreshMode::Auto, &summary).expect("auto decision");
-        assert_eq!(auto.effective_mode, Some(IndexMode::Full));
-        assert_eq!(
-            auto.reason.as_deref(),
-            Some("structural_publication_incompatible")
-        );
-        let incremental = resolve_refresh_request(RefreshMode::Incremental, &summary)
-            .expect_err("incremental incompatibility");
-        assert_eq!(incremental.code, "full_refresh_required");
-        assert_eq!(
-            incremental
-                .details
-                .as_ref()
-                .and_then(|details| details.cause_code.as_deref()),
-            Some("structural_publication_incompatible")
-        );
     }
 
     #[test]

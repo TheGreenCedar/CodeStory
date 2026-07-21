@@ -606,6 +606,17 @@ fn observational_open_reports_old_schema_without_migration_or_sidecars() {
     let before = fs::read(&path).expect("read old-schema fixture before observation");
     assert_no_sqlite_sidecars(&path);
 
+    assert_eq!(
+        Storage::database_schema_version_observational(&path)
+            .expect("inspect old schema without migration"),
+        SCHEMA_VERSION - 1
+    );
+    assert_eq!(
+        fs::read(&path).expect("read old-schema fixture after version observation"),
+        before
+    );
+    assert_no_sqlite_sidecars(&path);
+
     let error = Storage::open_observational(&path)
         .err()
         .expect("old schema must fail closed");

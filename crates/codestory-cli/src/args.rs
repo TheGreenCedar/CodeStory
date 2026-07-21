@@ -20,7 +20,7 @@ use codestory_contracts::api::{
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
-const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty or structurally incompatible cache and `incremental` for a compatible existing publication. An explicit `incremental` request never escalates to `full`; incompatible state returns `full_refresh_required` before workspace reads or writes.";
+const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty, pre-current, or structurally incompatible cache and `incremental` for a compatible existing publication. An explicit `incremental` request never escalates to `full`; incompatible state returns `full_refresh_required` before workspace reads or writes.";
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
 failure. Explicit `incremental` fails with `full_refresh_required` instead of escalating.";

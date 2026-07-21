@@ -159,9 +159,10 @@ Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache. Reserve full refresh for an empty cache,
 schema change, diagnosed corruption, or an explicit proof lane. An explicit
 incremental request never widens into a full refresh: when the live core lacks
-the required structural publication, CodeStory returns `full_refresh_required`
-before workspace discovery or parsing. Use `--refresh auto` when that bounded
-compatibility decision may select full recovery.
+the required structural publication or needs a supported schema upgrade,
+CodeStory returns `full_refresh_required` before workspace discovery or
+parsing. Use `--refresh auto` when that bounded compatibility decision may
+select full recovery.
 
 ## Full retrieval development
 

@@ -11,11 +11,12 @@
   still rejects empty, malformed, or truncated input.
 - Explicit incremental refresh now fails closed with typed
   `full_refresh_required` compatibility evidence when the live core lacks its
-  required structural publication. The decision occurs before workspace reads,
-  writer acquisition, or publication changes; `auto` retains deliberate full
-  recovery, and dry-run reports the same requested mode, effective mode, and
-  reason. Full-mode source failures now name the effective mode instead of
-  implying that every caller requested a full refresh.
+  required structural publication or needs a supported schema upgrade. The
+  decision occurs before workspace reads, writer acquisition, or publication
+  changes; `auto` retains deliberate full recovery, and dry-run reports the
+  same requested mode, effective mode, and reason. Full-mode source failures
+  now name the effective mode instead of implying that every caller requested a
+  full refresh.
 - Dense-anchor centrality now uses complete bounded graph relationship counts
   instead of the six-item member and related-symbol presentation lists. This
   admits genuinely high-degree callables without repository-specific steering,
