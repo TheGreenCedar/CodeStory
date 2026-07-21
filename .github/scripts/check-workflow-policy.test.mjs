@@ -109,6 +109,29 @@ esac
   });
 }
 
+function runReleaseAuthority(environment, liveSha = fullSha) {
+  const workflow = loadWorkflows().get("release.yml");
+  const run = draftStep(workflow.jobs.preflight, "Validate release authority").run;
+  const quote = value => `'${String(value).replaceAll("'", `'"'"'`)}'`;
+  const exports = Object.entries({
+    GH_TOKEN: "test-token",
+    GITHUB_REPOSITORY: "TheGreenCedar/CodeStory",
+    ...environment,
+  })
+    .map(([key, value]) => `export ${key}=${quote(value)}`)
+    .join("\n");
+  const command = `gh() { printf '%s\\n' ${quote(liveSha)}; }
+${exports}
+${run}`;
+  const executable = process.platform === "win32" ? "wsl.exe" : "bash";
+  const args = process.platform === "win32"
+    ? ["--exec", "/bin/bash", "-c", command]
+    : ["-c", command];
+  return spawnSync(executable, args, {
+    encoding: "utf8",
+  });
+}
+
 function windowsManifestJob(workflow) {
   return workflow.jobs["windows-manifest-missing"];
 }
@@ -239,6 +262,61 @@ jobs:
   const invalid = structuredClone(valid);
   invalid.jobs.check.steps[0].uses = "vendor/action@main";
   assert.match(basicWorkflowViolations("fixture.yml", invalid).join("\n"), /full-length SHA/u);
+});
+
+test("release authority accepts only exact live auto-main or manual-dev routes", async (t) => {
+  const auto = {
+    EXPECTED_HEAD_SHA: "",
+    GITHUB_EVENT_NAME: "push",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_SHA: fullSha,
+    GITHUB_WORKFLOW_REF: "TheGreenCedar/CodeStory/.github/workflows/auto-release.yml@refs/heads/main",
+    PUBLISH_RELEASE: "true",
+  };
+  const manual = {
+    EXPECTED_HEAD_SHA: fullSha,
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/dev/codestory-next",
+    GITHUB_SHA: fullSha,
+    GITHUB_WORKFLOW_REF: "TheGreenCedar/CodeStory/.github/workflows/release.yml@refs/heads/dev/codestory-next",
+    PUBLISH_RELEASE: "",
+  };
+
+  await t.test("trusted auto push on live main", () => {
+    const result = runReleaseAuthority(auto);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  });
+  await t.test("manual proof on exact live dev", () => {
+    const result = runReleaseAuthority(manual);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  });
+  await t.test("manual event cannot claim publication", () => {
+    const result = runReleaseAuthority({ ...manual, PUBLISH_RELEASE: "true" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /Publication authority requires the trusted reusable-workflow caller/u);
+  });
+  await t.test("wrong automatic caller is rejected", () => {
+    const result = runReleaseAuthority({
+      ...auto,
+      GITHUB_WORKFLOW_REF: "TheGreenCedar/CodeStory/.github/workflows/rogue.yml@refs/heads/main",
+    });
+    assert.notEqual(result.status, 0);
+  });
+  await t.test("stale main is rejected", () => {
+    const result = runReleaseAuthority(auto, "2".repeat(40));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /main moved from release head/u);
+  });
+  await t.test("wrong manual SHA is rejected", () => {
+    const result = runReleaseAuthority({ ...manual, EXPECTED_HEAD_SHA: "2".repeat(40) });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /does not match workflow head/u);
+  });
+  await t.test("stale dev is rejected", () => {
+    const result = runReleaseAuthority(manual, "2".repeat(40));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /dev\/codestory-next moved from proved head/u);
+  });
 });
 
 test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before proof work", async (t) => {
@@ -479,6 +557,10 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       workflow.on.workflow_dispatch.inputs.scope.options
         = workflow.on.workflow_dispatch.inputs.scope.options.filter(scope => scope !== "none");
     }, /dispatch scopes changed/u],
+    ["exact integration Linux scope removed", packagedCoordinatorFile, workflow => {
+      const step = draftStep(workflow.jobs.route, "Select change-aware proof scope");
+      step.run = step.run.replace(' || [ "$REQUESTED_SCOPE" = linux ]', "");
+    }, /integration must preserve explicit hosted and Linux scopes/u],
     ["hosted-only release evidence guard removed", packagedCoordinatorFile, workflow => {
       workflow.jobs["release-evidence"].if
         = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'none' &&", "");
@@ -1510,6 +1592,45 @@ test("controlled semantic workflow fixtures emit class-prefixed diagnostics", as
 
 test("release policy rejects manifest producer, trusted-map, and publication bypasses", () => {
   const mutations = [
+    ["call expected head", workflows => { delete workflows.get("release.yml").on.workflow_call.inputs.expected_head_sha; }],
+    ["call publication default", workflows => { workflows.get("release.yml").on.workflow_call.inputs.publish_release.default = true; }],
+    ["manual expected head", workflows => { workflows.get("release.yml").on.workflow_dispatch.inputs.expected_head_sha.required = false; }],
+    ["manual publication authority", workflows => {
+      workflows.get("release.yml").on.workflow_dispatch.inputs.publish_release = {
+        required: false,
+        type: "boolean",
+        default: false,
+      };
+    }],
+    ["release authority guard", workflows => {
+      const step = workflows.get("release.yml").jobs.preflight.steps
+        .find(({ name }) => name === "Validate release authority");
+      step.run = step.run.replace("dev/codestory-next moved from proved head", "dev head changed");
+    }],
+    ["automatic caller event", workflows => {
+      const step = workflows.get("release.yml").jobs.preflight.steps
+        .find(({ name }) => name === "Validate release authority");
+      step.run = step.run.replace('"$GITHUB_EVENT_NAME" != "push"', '"$GITHUB_EVENT_NAME" != "workflow_call"');
+    }],
+    ["accepted dev ledger revalidation", workflows => {
+      workflows.get("release.yml").jobs["pre-publish-closeout"].steps = workflows
+        .get("release.yml").jobs["pre-publish-closeout"].steps
+        .filter(({ name }) => name !== "Revalidate proof-only dev head");
+    }],
+    ["publish-time main revalidation", workflows => {
+      const step = workflows.get("release.yml").jobs.publish.steps
+        .find(({ name }) => name === "Create GitHub release");
+      step.run = step.run.replace("main moved from publishable head", "main changed");
+    }],
+    ["publish authority", workflows => { delete workflows.get("release.yml").jobs.publish.if; }],
+    ["post-publish smoke authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-smoke"].if; }],
+    ["post-publish closeout authority", workflows => { delete workflows.get("release.yml").jobs["post-publish-closeout"].if; }],
+    ["trusted caller opt-in", workflows => { delete workflows.get("auto-release.yml").jobs.release.with.publish_release; }],
+    ["rogue release caller", workflows => {
+      workflows.get("plugin-static.yml").jobs["rogue-release"] = {
+        uses: "./.github/workflows/release.yml",
+      };
+    }],
     ["source emission", workflows => { delete workflows.get("release.yml").jobs["source-proof"].with.emit_release_cells; }],
     ["full rerun preflight guard", workflows => {
       workflows.get("release.yml").jobs.preflight.steps = workflows

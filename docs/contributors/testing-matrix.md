@@ -91,6 +91,9 @@ behavior changed. Intermediate commits do not append telemetry.
 Use the coordinator's explicit `none` scope for that final integration when
 only the hosted source and repo-scale gates are required; it deliberately skips
 package, release-evidence, and protected-hardware jobs.
+Use the explicit `linux` scope when the same exact final-dev integration should
+also build and exercise the Linux x64 candidate on its server-behavior-only
+boundary without scheduling Mac or Windows protected runners.
 
 Semantic document allocation changes use focused runtime proof before the
 broad gate. Cover shared-file path cardinality, byte-identical and
@@ -525,6 +528,23 @@ Release signing, notarization, post-publish quarantine/Gatekeeper checks,
 installed plugin readback, and live full retrieval run only from the main
 release workflow. No version bump, tag, signing, notarization, or release is
 part of ordinary remediation or embedding-engine PRs.
+
+Maintainers may manually dispatch `release.yml` from an exact
+`dev/codestory-next` SHA to authenticate the 12-cell pre-publish ledger without
+publishing. The required `expected_head_sha` must equal both the workflow SHA
+and the live dev branch head. Manual dispatch exposes no publication input;
+only the automatic reusable-workflow caller on the live `main` head passes the
+fail-closed publication authority used by publish and post-publish jobs.
+
+```text
+gh workflow run release.yml --ref dev/codestory-next \
+  -f version=<version> \
+  -f expected_head_sha=<exact-full-dev-sha> \
+  -f calibration_bundle_artifact=<artifact-name> \
+  -f calibration_bundle_run_id=<run-id>
+```
+
+There is intentionally no `publish_release` field on this manual command.
 
 ## Evidence reporting
 

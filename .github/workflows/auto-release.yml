@@ -101,3 +101,4 @@ jobs:
       version: ${{ needs.detect-version.outputs.version }}
       calibration_bundle_artifact: ${{ vars.CODESTORY_CALIBRATION_BUNDLE_ARTIFACT }}
       calibration_bundle_run_id: ${{ vars.CODESTORY_CALIBRATION_BUNDLE_RUN_ID }}
+      publish_release: true

@@ -20,10 +20,24 @@ on:
         description: "Workflow run that produced the frozen calibration bundle artifact"
         required: true
         type: string
+      expected_head_sha:
+        description: "Optional exact head required by proof-only callers"
+        required: false
+        type: string
+        default: ""
+      publish_release:
+        description: "Trusted caller authority to publish after pre-publish closeout"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       version:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
+        required: true
+        type: string
+      expected_head_sha:
+        description: "Exact dev/codestory-next head to authenticate without publishing"
         required: true
         type: string
       source_run_id:
@@ -92,11 +106,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Refuse non-main release
+      - name: Validate release authority
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF_NAME" != "main" ]; then
-            echo "::error::Run releases from main, not $GITHUB_REF_NAME."
+
+          if [ "$PUBLISH_RELEASE" = "true" ]; then
+            expected_caller="$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main"
+            if [ "$GITHUB_EVENT_NAME" != "push" ] || [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_WORKFLOW_REF" != "$expected_caller" ]; then
+              echo "::error::Publication authority requires the trusted reusable-workflow caller on main."
+              exit 1
+            fi
+            live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+            if [ "$live_head" != "$GITHUB_SHA" ]; then
+              echo "::error::main moved from release head $GITHUB_SHA to $live_head."
+              exit 1
+            fi
+            exit 0
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || [ "$GITHUB_REF" != "refs/heads/dev/codestory-next" ]; then
+            echo "::error::Proof-only release runs require a manual dev/codestory-next dispatch."
+            exit 1
+          fi
+          if [ -z "$EXPECTED_HEAD_SHA" ] || [ "$EXPECTED_HEAD_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::Expected dev head $EXPECTED_HEAD_SHA does not match workflow head $GITHUB_SHA."
+            exit 1
+          fi
+          live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next" --jq .object.sha)"
+          if [ "$live_head" != "$GITHUB_SHA" ]; then
+            echo "::error::dev/codestory-next moved from proved head $GITHUB_SHA to $live_head."
             exit 1
           fi
 
@@ -294,6 +336,18 @@ jobs:
             --manifest-dir target/release-cell-manifests \
             --out-dir target/release-closeout/pre_publish
 
+      - name: Revalidate proof-only dev head
+        if: ${{ !inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next" --jq .object.sha)"
+          if [ "$live_head" != "$GITHUB_SHA" ]; then
+            echo "::error::dev/codestory-next moved from accepted ledger head $GITHUB_SHA to $live_head."
+            exit 1
+          fi
+
       - name: Upload accepted pre-publish closeout
         if: success()
         uses: actions/upload-artifact@v7.0.1
@@ -308,6 +362,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
+    if: inputs.publish_release
     needs:
       - preflight
       - pre-publish-closeout
@@ -392,6 +447,11 @@ jobs:
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
+          live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          if [ "$live_head" != "$GITHUB_SHA" ]; then
+            echo "::error::main moved from publishable head $GITHUB_SHA to $live_head."
+            exit 1
+          fi
           gh release create "$TAG" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
@@ -400,6 +460,7 @@ jobs:
 
   post-publish-smoke:
     name: Post-publish release asset smoke
+    if: inputs.publish_release
     needs:
       - preflight
       - publish
@@ -417,6 +478,7 @@ jobs:
 
   post-publish-closeout:
     name: Authenticate post-publish release cells
+    if: inputs.publish_release
     needs:
       - preflight
       - pre-publish-closeout

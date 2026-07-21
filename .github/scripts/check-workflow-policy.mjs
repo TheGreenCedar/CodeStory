@@ -1299,7 +1299,40 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     violations.push(`${releaseFile} must exist`);
     return;
   }
+  const releaseCallers = [...workflows.entries()]
+    .filter(([file, workflow]) => file !== releaseFile
+      && scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"))
+    .map(([file]) => file)
+    .sort();
+  add(
+    violations,
+    JSON.stringify(releaseCallers) === JSON.stringify(["auto-release.yml"]),
+    `${releaseFile} publication authority must have only the trusted auto-release.yml caller`,
+  );
   add(violations, object(release.permissions).actions === "read", `${releaseFile} must read prior-run evidence`);
+  const callExpectedHead = object(at(release, "on", "workflow_call", "inputs", "expected_head_sha"));
+  add(
+    violations,
+    callExpectedHead.required === false && callExpectedHead.type === "string" && callExpectedHead.default === "",
+    `${releaseFile} workflow_call expected_head_sha must be an optional empty string`,
+  );
+  const callPublish = object(at(release, "on", "workflow_call", "inputs", "publish_release"));
+  add(
+    violations,
+    callPublish.required === false && callPublish.type === "boolean" && callPublish.default === false,
+    `${releaseFile} workflow_call publish_release must be a fail-closed boolean`,
+  );
+  const dispatchExpectedHead = object(at(release, "on", "workflow_dispatch", "inputs", "expected_head_sha"));
+  add(
+    violations,
+    dispatchExpectedHead.required === true && dispatchExpectedHead.type === "string",
+    `${releaseFile} workflow_dispatch expected_head_sha must be a required string`,
+  );
+  add(
+    violations,
+    at(release, "on", "workflow_dispatch", "inputs", "publish_release") === undefined,
+    `${releaseFile} workflow_dispatch must not expose publication authority`,
+  );
   for (const event of ["workflow_call", "workflow_dispatch"]) {
     const input = object(at(release, "on", event, "inputs", "source_run_id"));
     add(violations, input.required === false && input.type === "string" && input.default === "", `${releaseFile} ${event} source_run_id must be an optional empty string`);
@@ -1328,6 +1361,19 @@ function validateReleaseCoordinator(workflows, violations, graph) {
 
   const preflight = requireJob(violations, releaseFile, release, "preflight");
   add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
+  requireStepRun(violations, releaseFile, preflight, "Validate release authority", [
+    'if [ "$PUBLISH_RELEASE" = "true" ]; then',
+    '"$GITHUB_EVENT_NAME" != "push"',
+    '"$GITHUB_REF" != "refs/heads/main"',
+    '$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main',
+    '"$GITHUB_WORKFLOW_REF" != "$expected_caller"',
+    'repos/$GITHUB_REPOSITORY/git/ref/heads/main',
+    '"$GITHUB_EVENT_NAME" != "workflow_dispatch"',
+    '"$GITHUB_REF" != "refs/heads/dev/codestory-next"',
+    '"$EXPECTED_HEAD_SHA" != "$GITHUB_SHA"',
+    'repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next',
+    "dev/codestory-next moved from proved head",
+  ]);
   requireStepRun(violations, releaseFile, preflight, "Validate versioned changelog notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     '--version "$VERSION"',
@@ -1434,9 +1480,21 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     "--trusted-exceptions",
     "codestory-release-closeout.mjs evaluate",
   ]);
+  const devRevalidation = namedStep(preCloseout, "Revalidate proof-only dev head");
+  add(
+    violations,
+    devRevalidation?.if === "${{ !inputs.publish_release }}",
+    `${releaseFile} proof-only ledger upload must revalidate only the dev head`,
+  );
+  requireStepRun(violations, releaseFile, preCloseout, "Revalidate proof-only dev head", [
+    "repos/$GITHUB_REPOSITORY/git/ref/heads/dev/codestory-next",
+    '"$live_head" != "$GITHUB_SHA"',
+    "dev/codestory-next moved from accepted ledger head",
+  ]);
   requireStepUses(violations, releaseFile, preCloseout, "Upload accepted pre-publish closeout", "actions/upload-artifact@v7.0.1");
 
   const publish = requireJob(violations, releaseFile, release, "publish");
+  add(violations, publish.if === "inputs.publish_release", `${releaseFile} publish must require trusted publication authority`);
   add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
@@ -1450,10 +1508,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, releaseFile, publish, "Create GitHub release", [
     "--notes-file target/release-assets/release-notes.md",
     'if [ "${#assets[@]}" -ne 7 ]; then',
+    "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
+    '"$live_head" != "$GITHUB_SHA"',
+    "main moved from publishable head",
   ]);
   add(violations, !scalarStrings(release).some(value => value.includes("--generate-notes")), `${releaseFile} must use curated release notes`);
 
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
+  add(violations, post.if === "inputs.publish_release", `${releaseFile} post-publish smoke must require trusted publication authority`);
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
   add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
   add(
@@ -1463,6 +1525,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} post-publish smoke must consume the accepted pre-publish ledger and emit authenticated cells`,
   );
   const postCloseout = requireJob(violations, releaseFile, release, "post-publish-closeout");
+  add(violations, postCloseout.if === "inputs.publish_release", `${releaseFile} post-publish closeout must require trusted publication authority`);
   add(violations, sameMembers(needs(postCloseout), releaseChain.dependencies["post-publish-closeout"]), `${releaseFile} post-publish closeout dependencies must match the release claim graph`);
   requireStepRun(violations, releaseFile, postCloseout, "Authenticate post-publish Actions provenance", [
     "producer-map",
@@ -2052,12 +2115,18 @@ function validatePackagedCoordinator(workflows, violations, graph) {
     '.name == "full-source-gate" and .conclusion == "success"',
   ]);
   requireStepRun(violations, file, route, "Select change-aware proof scope", [
-    'if [ "$REQUESTED_SCOPE" = none ]; then',
-    "scope=none",
+    'if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then',
+    'scope="$REQUESTED_SCOPE"',
     "scope=full",
     'elif [ "$REQUESTED_SCOPE" = "server" ]; then',
     "node .github/scripts/route-ci-proof.mjs --stdin",
   ]);
+  add(
+    violations,
+    String(namedStep(route, "Select change-aware proof scope")?.run ?? "")
+      .includes('if [ "$REQUESTED_SCOPE" = none ] || [ "$REQUESTED_SCOPE" = linux ]; then'),
+    `${file} integration must preserve explicit hosted and Linux scopes`,
+  );
   requireStepRun(violations, file, route, "Read qualification constant-set state", [
     "base_frozen=false",
     "jq -r '.status == \"frozen\"'",
@@ -2255,6 +2324,7 @@ function validateRemainingWorkflows(workflows, violations) {
     add(violations, sameMembers(needs(release), ["detect-version"]), `${autoFile} release must need version detection`);
     add(violations, object(release.permissions).contents === "write", `${autoFile} release caller must grant contents write`);
     add(violations, object(release.permissions).actions === "read", `${autoFile} release caller must grant actions read`);
+    add(violations, object(release.with).publish_release === true, `${autoFile} trusted main caller must explicitly authorize publication`);
   }
 
   const evidenceFile = "release-candidate-evidence.yml";

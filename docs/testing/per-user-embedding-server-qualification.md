@@ -174,6 +174,8 @@ The explicit `linux` coordinator scope runs the existing Linux x64 package and
 candidate-installed proof without scheduling Mac or Windows protected jobs. It
 uses the same server-behavior-only claim boundary as `server`; it does not
 assert retrieval quality or satisfy separate protected-platform cells.
+It is valid for either an accepted platform-proof PR or an exact live
+`dev/codestory-next` integration dispatch.
 
 Frozen calibration bundles are accepted only from a successful
 `workflow_dispatch` run of `packaged-platform-pr.yml` in this repository. Every

@@ -32,6 +32,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
 - The proof coordinator now supports explicit hosted-only integration and
   Linux-only package scopes, so exact-head source, repo-scale, and Linux
   candidate evidence do not schedule unrelated protected-platform runners.
+- The release workflow can now authenticate the complete pre-publish ledger on
+  an exact manually selected `dev/codestory-next` head without granting publish
+  authority. Only the trusted automatic `main` caller can opt into publication.
 - A new explicit `retrieval republish-projections` writer can adopt the current
   semantic and dense-selection policy from one complete stored core without
   source discovery, parsing, or source-file reads. It validates the pinned
