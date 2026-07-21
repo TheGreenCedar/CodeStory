@@ -742,7 +742,10 @@ fn zero_dense_semantic_health(
             name: "semantic".into(),
             status: ComponentStatus::Degraded,
             latency_ms: None,
-            detail: "graph_first_v1 selected zero dense anchors, but embedding device policy is not verified".into(),
+            detail: format!(
+                "{} selected zero dense anchors, but embedding device policy is not verified",
+                crate::generation::SEMANTIC_POLICY_VERSION
+            ),
             degraded_reason: embedding_device.degraded_reason.clone(),
             capabilities: SidecarCapabilities::NONE,
         };
@@ -752,8 +755,10 @@ fn zero_dense_semantic_health(
         name: "semantic".into(),
         status: ComponentStatus::Healthy,
         latency_ms: None,
-        detail: "graph_first_v1 selected zero dense anchors; semantic retrieval skipped by policy"
-            .into(),
+        detail: format!(
+            "{} selected zero dense anchors; semantic retrieval skipped by policy",
+            crate::generation::SEMANTIC_POLICY_VERSION
+        ),
         degraded_reason: None,
         capabilities: SidecarCapabilities {
             lexical: false,
@@ -1009,7 +1014,7 @@ mod tests {
             projection_count: Some(12),
             symbol_doc_count: Some(9),
             dense_projection_count: Some(3),
-            semantic_policy_version: Some("graph_first_v1".into()),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
             graph_artifact_hash: Some("graph-hash".into()),
             dense_reason_counts_json: Some(r#"{"public_api":3}"#.into()),
             precise_semantic_import_status: Some("fresh".into()),

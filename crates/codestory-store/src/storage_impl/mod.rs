@@ -8213,18 +8213,19 @@ impl Storage {
         Ok(clamp_i64_to_u32(count))
     }
 
-    pub fn has_symbol_search_doc_version_mismatch(
+    pub fn has_symbol_search_doc_contract_mismatch(
         &self,
         expected_version: u32,
+        expected_policy_version: &str,
     ) -> Result<bool, StorageError> {
         let mismatch = self.conn.query_row(
             "SELECT EXISTS(
                 SELECT 1
                 FROM symbol_search_doc
-                WHERE doc_version <> ?1
+                WHERE doc_version <> ?1 OR policy_version <> ?2
                 LIMIT 1
             )",
-            params![expected_version as i64],
+            params![expected_version as i64, expected_policy_version],
             |row| row.get::<_, bool>(0),
         )?;
         Ok(mismatch)

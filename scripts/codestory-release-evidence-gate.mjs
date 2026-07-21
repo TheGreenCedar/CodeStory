@@ -542,7 +542,7 @@ function validateRawProvenance(
       || !(stats.retrieval_manifest?.symbol_doc_count > 0)
       || !(stats.retrieval_manifest?.dense_projection_count > 0)
       || stats.retrieval_manifest?.dense_projection_count !== stats.retrieval_manifest?.projection_count
-      || stats.retrieval_manifest?.semantic_policy_version !== "graph_first_v1"
+      || stats.retrieval_manifest?.semantic_policy_version !== "graph_first_v2"
       || stats.retrieval_manifest?.graph_artifact_hash_present !== true
       || stats.retrieval_manifest?.dense_reason_count_total !== stats.retrieval_manifest?.dense_projection_count
       || stats.repeat_semantic_docs_embedded !== 0) {

@@ -33,7 +33,7 @@
     "symbol_doc_count": 10,
     "dense_projection_count": 4,
     "projection_count": 4,
-    "semantic_policy_version": "graph_first_v1",
+    "semantic_policy_version": "graph_first_v2",
     "graph_artifact_hash_present": true,
     "dense_reason_count_total": 4
   }
