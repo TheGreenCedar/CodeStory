@@ -155,6 +155,7 @@ fn run_retrieval_index_refresh(
     let Some(mode) = refresh_mode else {
         return Ok(());
     };
+    runtime.open_project_summary()?;
     runtime
         .index
         .run_indexing_blocking(mode)
@@ -417,7 +418,46 @@ fn emit_retrieval_gc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    use crate::args::ProjectArgs;
     use anyhow::anyhow;
+    #[cfg(not(windows))]
+    use std::fs;
+    #[cfg(not(windows))]
+    use tempfile::tempdir;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn compatible_auto_refresh_opens_the_project_before_indexing() {
+        let temp = tempdir().expect("temporary test root");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(project.join("src")).expect("create source directory");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"retrieval-refresh-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        let source = project.join("src/lib.rs");
+        fs::write(&source, "pub fn before() {}\n").expect("write source");
+        let args = ProjectArgs {
+            project: project.clone(),
+            cache_dir: Some(cache),
+        };
+
+        let seed = RuntimeContext::new_inspect_only(&args).expect("seed runtime");
+        seed.ensure_open(RefreshMode::Full)
+            .expect("publish compatible core");
+        fs::write(&source, "pub fn after() {}\n").expect("change source");
+
+        let runtime = RuntimeContext::new_inspect_only(&args).expect("retrieval runtime");
+        let decision = runtime
+            .resolve_refresh_decision_with_preflight(RefreshMode::Auto)
+            .expect("resolve compatible auto refresh");
+        assert_eq!(decision.effective_mode, Some(IndexMode::Incremental));
+        run_retrieval_index_refresh(&runtime, RefreshMode::Auto, decision.effective_mode)
+            .expect("run compatible incremental refresh");
+    }
 
     #[test]
     fn auto_refresh_retries_full_for_semantic_doc_contract_drift() {
