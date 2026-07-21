@@ -170,6 +170,11 @@ quality, answer quality, release readiness, or any retained qualification-tier
 claim. Every other frozen package, hardware, installed-runtime, and release
 scope still requires authenticated exact-head packet-quality evidence.
 
+The explicit `linux` coordinator scope runs the existing Linux x64 package and
+candidate-installed proof without scheduling Mac or Windows protected jobs. It
+uses the same server-behavior-only claim boundary as `server`; it does not
+assert retrieval quality or satisfy separate protected-platform cells.
+
 Frozen calibration bundles are accepted only from a successful
 `workflow_dispatch` run of `packaged-platform-pr.yml` in this repository. Every
 consumer binds the run ID, exact `embedding-calibration-bundle-<source-sha>`

@@ -88,6 +88,9 @@ cargo test --locked -p codestory-indexer --test tictactoe_language_coverage
 The repo-scale stats lane runs once on the final merge-ready head only when
 default indexing, symbol/dense persistence, embedding reuse, or cold-start
 behavior changed. Intermediate commits do not append telemetry.
+Use the coordinator's explicit `none` scope for that final integration when
+only the hosted source and repo-scale gates are required; it deliberately skips
+package, release-evidence, and protected-hardware jobs.
 
 Semantic document allocation changes use focused runtime proof before the
 broad gate. Cover shared-file path cardinality, byte-identical and
