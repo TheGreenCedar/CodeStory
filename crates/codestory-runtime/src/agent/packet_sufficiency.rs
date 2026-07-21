@@ -1475,22 +1475,91 @@ fn packet_missing_exact_path_claims(
         return Vec::new();
     }
 
+    let exact_probe_paths =
+        exact_probe_paths
+            .iter()
+            .fold(Vec::<&String>::new(), |mut unique_paths, path| {
+                if !unique_paths.iter().any(|existing| {
+                    packet_paths_match_exact_probe(project_root, existing.as_str(), path)
+                }) {
+                    unique_paths.push(path);
+                }
+                unique_paths
+            });
+    let candidate_claims = exact_probe_paths
+        .iter()
+        .map(|path| {
+            sufficiency_claims
+                .iter()
+                .enumerate()
+                .filter_map(|(claim_index, claim)| {
+                    claim
+                        .citations
+                        .iter()
+                        .any(|citation| {
+                            citation_sufficiency_eligible(citation)
+                                && citation.file_path.as_deref().is_some_and(|citation_path| {
+                                    packet_paths_match_exact_probe(
+                                        project_root,
+                                        citation_path,
+                                        path.as_str(),
+                                    )
+                                })
+                        })
+                        .then_some(claim_index)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut assigned_path_by_claim = vec![None; sufficiency_claims.len()];
+    let covered_paths = (0..exact_probe_paths.len())
+        .map(|path_index| {
+            let mut visited_claims = vec![false; sufficiency_claims.len()];
+            packet_assign_exact_path_claim(
+                path_index,
+                &candidate_claims,
+                &mut visited_claims,
+                &mut assigned_path_by_claim,
+            )
+        })
+        .collect::<Vec<_>>();
+
     exact_probe_paths
         .iter()
-        .filter(|path| {
-            !sufficiency_claims.iter().any(|claim| {
-                claim.citations.iter().any(|citation| {
-                    citation_sufficiency_eligible(citation)
-                        && citation.file_path.as_deref().is_some_and(|citation_path| {
-                            packet_paths_match_exact_probe(project_root, citation_path, path)
-                        })
-                })
-            })
-        })
-        .map(|path| packet_display_path(path))
+        .enumerate()
+        .filter(|(path_index, _)| !covered_paths[*path_index])
+        .map(|(_, path)| path)
+        .map(|path| packet_display_path(path.as_str()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn packet_assign_exact_path_claim(
+    path_index: usize,
+    candidate_claims: &[Vec<usize>],
+    visited_claims: &mut [bool],
+    assigned_path_by_claim: &mut [Option<usize>],
+) -> bool {
+    for &claim_index in &candidate_claims[path_index] {
+        if visited_claims[claim_index] {
+            continue;
+        }
+        visited_claims[claim_index] = true;
+        let can_assign = assigned_path_by_claim[claim_index].is_none_or(|assigned_path| {
+            packet_assign_exact_path_claim(
+                assigned_path,
+                candidate_claims,
+                visited_claims,
+                assigned_path_by_claim,
+            )
+        });
+        if can_assign {
+            assigned_path_by_claim[claim_index] = Some(path_index);
+            return true;
+        }
+    }
+    false
 }
 
 fn packet_paths_match_exact_probe(
@@ -4314,6 +4383,76 @@ mod tests {
         assert!(
             !packet_paths_match_exact_probe(project_root, "src/lib.rs", "crates/foo/src/lib.rs"),
             "a shorter same-suffix citation must not satisfy a different exact path"
+        );
+    }
+
+    #[test]
+    fn architecture_exact_paths_use_distinct_claims_with_overlapping_citations() {
+        let project_root = Path::new("C:/workspace/project");
+        let paths = [
+            "plugins/codestory/scripts/launcher.mjs",
+            "crates/codestory-cli/src/stdio_transport.rs",
+        ];
+        let citations = paths.map(|path| {
+            cited_anchor_with_tier(path, path, PacketEvidenceTierDto::ResolvedGraph, Some(true))
+        });
+        let mut overlapping_claim = cited_claim(
+            "The request crosses the launcher and stdio transport boundary.",
+            Some("transport adapter"),
+            citations[0].clone(),
+            Some(true),
+        );
+        overlapping_claim.citations = citations.to_vec();
+        let launcher_claim = cited_claim(
+            "The launcher delegates the packaged request.",
+            Some("package entrypoint"),
+            citations[0].clone(),
+            Some(true),
+        );
+
+        let missing = packet_missing_exact_path_claims(
+            project_root,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &paths.map(str::to_string),
+            &[overlapping_claim, launcher_claim],
+        );
+
+        assert!(
+            missing.is_empty(),
+            "matching should reassign the overlapping claim to the only path it can uniquely cover: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_exact_paths_reject_one_broad_claim_for_multiple_paths() {
+        let project_root = Path::new("C:/workspace/project");
+        let paths = [
+            "plugins/codestory/scripts/launcher.mjs",
+            "crates/codestory-cli/src/stdio_transport.rs",
+            "crates/codestory-runtime/src/agent/orchestrator.rs",
+        ];
+        let citations = paths.map(|path| {
+            cited_anchor_with_tier(path, path, PacketEvidenceTierDto::ResolvedGraph, Some(true))
+        });
+        let mut broad_claim = cited_claim(
+            "The request crosses the packaged plugin, stdio, and runtime boundaries.",
+            Some("runtime orchestration"),
+            citations[0].clone(),
+            Some(true),
+        );
+        broad_claim.citations = citations.to_vec();
+
+        let missing = packet_missing_exact_path_claims(
+            project_root,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &paths.map(str::to_string),
+            &[broad_claim],
+        );
+
+        assert_eq!(
+            missing.len(),
+            2,
+            "one proof-bearing claim may bind at most one requested exact path: {missing:?}"
         );
     }
 
