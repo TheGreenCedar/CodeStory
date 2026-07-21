@@ -78,6 +78,56 @@ Local graph navigation can use a current core publication while retrieval is
 still preparing. Packet/search requires both publications plus a live
 policy-compliant engine. See [retrieval design](retrieval-design.md).
 
+## Semantic projection-only republish
+
+`codestory-cli retrieval republish-projections` is an explicit writer for a
+complete, verified core whose graph and source identity remain authoritative
+but whose semantic or dense-selection policy needs a new publication. It does
+not run workspace discovery, schedule files, invoke parsers or structural
+collectors, or reopen source files.
+
+The runtime pins the live core publication, clones it with SQLite backup, and
+validates its dense-anchor, structural-unit, and source-policy manifests. It
+also binds the selected native project identity to the stored source-policy
+project/workspace identity, so an arbitrary cache override cannot adopt another
+repository's core. The CLI binds the explicit root and cache in memory and
+acquires the common exclusive writer lock before any database open or schema
+migration.
+Schema 29 is accepted only when its structural manifest is absent and all three
+structural stores (units, projections, and artifact cache) are empty; the new
+generation then carries an explicit complete empty structural manifest. Any
+nonempty unmanifested structural state fails closed. The runtime then streams
+canonical graph nodes in bounded pages, requires an exact stored
+symbol document for every eligible node, recomputes graph context, component
+reports, dense-anchor selection, and policy metadata, and builds the ordinary
+persisted search generation. Stored document text is reusable only when its
+node metadata, document schema, provenance, and current alias-bound hash match;
+otherwise the command fails with `semantic_projection_migration_required`.
+There is no source-reading fallback.
+
+The replacement receives the `semantic_projection` core publication mode and
+uses the same incomplete marker, catalog lock, live-publication revalidation,
+snapshot seal, promotion journal, rollback validation, and cache publication
+as full and incremental indexing. A missing contract, cancellation, concurrent
+writer, or changed live publication leaves the previous complete core usable.
+Failure and cancellation coverage includes semantic-context index creation,
+stored-node/document pages, endpoint graph reads, snapshot summary/detail
+publication, manifest rebinding, search build/symbol pages/index write/
+validation/completion/catalog, marker completion, and database replacement.
+Every pre-promotion case preserves the prior core, retrieval identity, and
+search generations while removing staged database and search artifacts. A
+generation change after the initial pin is revalidated before promotion; the
+competing complete core/search and the prior complete search rollback are
+retained while the unpublished candidate is removed.
+The runtime-cache checkpoint is after the durable point of no return. Failure
+or cancellation there does not roll back the committed core: the prepared
+search generation becomes the controller's current generation, indexing state
+clears, and only complete current/rollback search directories remain. The
+retrieval manifest is not rebound by this convergence path.
+The prior retrieval manifest intentionally remains bound to the old core, so
+packet/search fail closed until `retrieval index --refresh none` builds and
+publishes retrieval artifacts for the new core.
+
 ## Indexer Phases
 
 ```mermaid

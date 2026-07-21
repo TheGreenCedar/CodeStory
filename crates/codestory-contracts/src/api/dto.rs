@@ -68,6 +68,7 @@ pub struct IndexPublicationDto {
 pub enum IndexPublicationModeDto {
     Full,
     Incremental,
+    SemanticProjection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

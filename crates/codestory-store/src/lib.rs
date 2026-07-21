@@ -33,8 +33,9 @@ pub use storage_impl::{
     SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
     SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord, Storage as Store,
     StorageError, StorageOpenMode, StorageStats, StructuralTextArtifactCacheWrite,
-    StructuralTextProjection, StructuralTextUnit, StructuralTextUnitPublicationManifest,
-    SymbolSearchDoc, SymbolSummaryRecord, structural_text_unit_digest,
+    StructuralTextProjection, StructuralTextPublicationCompatibility, StructuralTextUnit,
+    StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
+    structural_text_unit_digest,
 };
 
 impl Store {

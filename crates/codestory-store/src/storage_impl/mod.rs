@@ -37,7 +37,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 29;
+const SCHEMA_VERSION: u32 = 30;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -80,16 +80,19 @@ const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
 const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
 const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
-const PROMOTION_JOURNAL_VERSION: u32 = 4;
+const STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 4;
+const PROMOTION_JOURNAL_VERSION: u32 = 5;
 // Snapshot promotion first shipped with schema 21. Journal v2 added the
 // source-policy identity at schema 27, and journal v3 added structural-text
 // identity at schema 28. Journal v4 binds the structural-unit source-policy
-// identity added at schema 29. Recovery runs before schema migration, so these
+// identity added at schema 29. Journal v5 admits the semantic-projection
+// publication mode added at schema 30. Recovery runs before schema migration, so these
 // boundaries are part of the durable journal contract.
 const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
 const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
 const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
+const SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 30;
 const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Successful SQLite backup timing and logical database-image sizes.
@@ -408,7 +411,9 @@ enum RecoveryDatabaseContract {
 impl RecoveryDatabaseContract {
     fn supports_complete_schema(self, schema_version: u32) -> bool {
         match self {
-            Self::CurrentPromotion => schema_version == SCHEMA_VERSION,
+            Self::CurrentPromotion => (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+                ..=SCHEMA_VERSION)
+                .contains(&schema_version),
             Self::Journal(LEGACY_PROMOTION_JOURNAL_VERSION) => (LEGACY_PROMOTION_MIN_SCHEMA_VERSION
                 ..=SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
                 .contains(&schema_version),
@@ -418,8 +423,13 @@ impl RecoveryDatabaseContract {
             Self::Journal(STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION) => {
                 schema_version == STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION
             }
-            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+            Self::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION) => {
                 schema_version == STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+                    ..=SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
+                    .contains(&schema_version)
             }
             Self::Journal(_) => false,
             Self::LegacyBackup => {
@@ -928,6 +938,7 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
         LEGACY_PROMOTION_JOURNAL_VERSION
             | SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
+            | STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION
             | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
@@ -2187,6 +2198,14 @@ pub struct StructuralTextUnitPublicationManifest {
     pub published_at_epoch_ms: i64,
 }
 
+/// Structural publication state accepted by an explicit projection-only writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuralTextPublicationCompatibility {
+    Published(StructuralTextUnitPublicationManifest),
+    /// A pre-manifest core with no structural units, projections, or cache rows.
+    LegacyEmpty,
+}
+
 fn hash_structural_text_unit_part(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value);
@@ -2595,6 +2614,7 @@ pub struct StorageStats {
 pub enum IndexPublicationMode {
     Full,
     Incremental,
+    SemanticProjection,
 }
 
 impl IndexPublicationMode {
@@ -2602,6 +2622,7 @@ impl IndexPublicationMode {
         match self {
             Self::Full => "full",
             Self::Incremental => "incremental",
+            Self::SemanticProjection => "semantic_projection",
         }
     }
 
@@ -2609,6 +2630,7 @@ impl IndexPublicationMode {
         match value {
             "full" => Ok(Self::Full),
             "incremental" => Ok(Self::Incremental),
+            "semantic_projection" => Ok(Self::SemanticProjection),
             _ => Err(StorageError::Other(format!(
                 "Unsupported index publication mode: {value}"
             ))),
@@ -7573,6 +7595,47 @@ impl Storage {
         Ok(manifest)
     }
 
+    /// Validate the structural state admitted by semantic projection republish.
+    ///
+    /// A missing manifest is compatible only for a legacy core that has no
+    /// structural rows of any kind. This proves absence of structural coverage;
+    /// it does not infer or carry forward any structural evidence.
+    pub fn validate_structural_text_unit_publication_or_legacy_empty(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextPublicationCompatibility, StorageError> {
+        if self
+            .get_structural_text_unit_publication_manifest()?
+            .is_some()
+        {
+            return self
+                .validate_structural_text_unit_publication(publication)
+                .map(StructuralTextPublicationCompatibility::Published);
+        }
+
+        let (unit_count, projection_count, artifact_cache_count) = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM structural_text_unit),
+                (SELECT COUNT(*) FROM structural_text_projection),
+                (SELECT COUNT(*) FROM structural_text_artifact_cache)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        if unit_count == 0 && projection_count == 0 && artifact_cache_count == 0 {
+            return Ok(StructuralTextPublicationCompatibility::LegacyEmpty);
+        }
+
+        Err(StorageError::Other(format!(
+            "structural text unit publication is missing for nonempty state: units={unit_count}, projections={projection_count}, artifact_cache={artifact_cache_count}"
+        )))
+    }
+
     pub fn get_source_policy_exclusions(
         &self,
     ) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
@@ -8210,6 +8273,56 @@ impl Storage {
                 updated_at_epoch_ms: row.get(12)?,
             });
         }
+        Ok(docs)
+    }
+
+    /// Load the persisted semantic documents for one bounded node page.
+    ///
+    /// Projection-only publication uses this to pin document text to the verified
+    /// core database instead of reopening source files while policy metadata and
+    /// dense-anchor selection are recomputed.
+    pub fn get_symbol_search_docs_for_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<SymbolSearchDoc>, StorageError> {
+        let mut docs = Vec::with_capacity(node_ids.len());
+        for batch in node_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = question_placeholders(batch.len());
+            let sql = format!(
+                "SELECT
+                    node_id, file_node_id, kind, display_name, qualified_name,
+                    file_path, start_line, doc_text, doc_version, doc_hash,
+                    policy_version, source_provenance, updated_at_epoch_ms
+                 FROM symbol_search_doc
+                 WHERE node_id IN ({placeholders})
+                 ORDER BY node_id ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let kind: i32 = row.get(2)?;
+                let doc_version: i64 = row.get(8)?;
+                docs.push(SymbolSearchDoc {
+                    node_id: NodeId(row.get(0)?),
+                    file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                    kind: NodeKind::try_from(kind)?,
+                    display_name: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    file_path: row.get(5)?,
+                    start_line: row.get(6)?,
+                    doc_text: row.get(7)?,
+                    doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
+                    doc_hash: row.get(9)?,
+                    policy_version: row.get(10)?,
+                    source_provenance: row.get(11)?,
+                    updated_at_epoch_ms: row.get(12)?,
+                });
+            }
+        }
+        docs.sort_unstable_by_key(|doc| doc.node_id.0);
         Ok(docs)
     }
 

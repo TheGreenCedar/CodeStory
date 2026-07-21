@@ -768,6 +768,8 @@ pub(crate) enum RetrievalAction {
     Inventory(RetrievalInventoryCommand),
     /// Run workspace index then publish a retrieval manifest.
     Index(RetrievalIndexCommand),
+    /// Republish semantic projections from the complete stored core without reading source files.
+    RepublishProjections(RetrievalRepublishProjectionsCommand),
     /// Execute a standalone query against published retrieval artifacts.
     Query(RetrievalQueryCommand),
 }
@@ -852,6 +854,16 @@ pub(crate) struct RetrievalIndexCommand {
     pub(crate) run_id: Option<String>,
     #[arg(long, value_enum, default_value_t = RefreshMode::Auto, help = INDEX_REFRESH_HELP)]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalRepublishProjectionsCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -2884,6 +2896,31 @@ mod tests {
             }) => assert!(cmd.apply),
             _ => panic!("expected retrieval inventory command"),
         }
+    }
+
+    #[test]
+    fn semantic_projection_republish_is_an_explicit_retrieval_writer() {
+        let parsed = Cli::try_parse_from([
+            "codestory-cli",
+            "retrieval",
+            "republish-projections",
+            "--project",
+            "/tmp/project",
+        ])
+        .expect("semantic projection writer should parse");
+        match parsed.command {
+            Command::Retrieval(RetrievalCommand {
+                action: RetrievalAction::RepublishProjections(cmd),
+            }) => {
+                assert_eq!(cmd.project.project, PathBuf::from("/tmp/project"));
+                assert_eq!(cmd.format, OutputFormat::Json);
+            }
+            _ => panic!("expected explicit semantic projection writer"),
+        }
+
+        let help = render_subcommand_help("retrieval");
+        assert!(help.contains("republish-projections"));
+        assert!(help.contains("without reading source files"));
     }
 
     #[test]

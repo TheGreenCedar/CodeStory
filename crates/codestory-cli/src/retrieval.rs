@@ -10,7 +10,7 @@ use codestory_retrieval::{
 use crate::args::{
     CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalCommand,
     RetrievalIndexCommand, RetrievalInventoryCommand, RetrievalQueryCommand,
-    RetrievalStatusCommand,
+    RetrievalRepublishProjectionsCommand, RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
 use crate::runtime::{RuntimeContext, annotate_refresh_error, ensure_index_ready, map_api_error};
@@ -20,8 +20,33 @@ pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
         RetrievalAction::Status(status_cmd) => run_retrieval_status(status_cmd),
         RetrievalAction::Inventory(inventory_cmd) => run_retrieval_inventory(inventory_cmd),
         RetrievalAction::Index(index_cmd) => run_retrieval_index(index_cmd),
+        RetrievalAction::RepublishProjections(republish_cmd) => {
+            run_retrieval_republish_projections(republish_cmd)
+        }
         RetrievalAction::Query(query_cmd) => run_retrieval_query(query_cmd),
     }
+}
+
+fn run_retrieval_republish_projections(cmd: RetrievalRepublishProjectionsCommand) -> Result<()> {
+    preflight_output(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let outcome = runtime
+        .index
+        .republish_semantic_projections_at_blocking(
+            runtime.project_root.clone(),
+            runtime.storage_path.clone(),
+        )
+        .map_err(map_api_error)?;
+    let markdown = format!(
+        "# Semantic projection republish\n\n- previous_generation: `{}`\n- generation: `{}`\n- generation_id: `{}`\n- semantic_policy_version: `{}`\n- symbol_documents: {}\n- dense_anchors: {}\n",
+        outcome.previous_publication.generation,
+        outcome.publication.generation,
+        outcome.publication.generation_id,
+        outcome.semantic_policy_version,
+        outcome.symbol_document_count,
+        outcome.dense_anchor_count,
+    );
+    emit(cmd.format, &outcome, markdown, cmd.output_file.as_deref())
 }
 
 pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {

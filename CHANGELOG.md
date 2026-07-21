@@ -19,6 +19,22 @@
   full refresh. Drill reports omit unavailable pre-refresh metrics and carry
   the compatibility reason instead of copying post-refresh counts into the
   before fields.
+- A new explicit `retrieval republish-projections` writer can adopt the current
+  semantic and dense-selection policy from one complete stored core without
+  source discovery, parsing, or source-file reads. It validates the pinned
+  graph and projection contracts, selected-root cache identity, and the one
+  retained schema-29 compatibility case: no structural manifest and no
+  structural units, projections, or cache rows. It acquires the writer lock
+  before opening or migrating that stored core, rebuilds bounded semantic
+  pages, and publishes an explicit empty structural manifest when adopting the
+  legacy case. Fail/cancel coverage spans every live semantic and search-build
+  checkpoint before promotion. Missing or incompatible stored documents,
+  cancellation, concurrent writers, and publication drift preserve the
+  previous complete core, retrieval identity, and search rollback; retrieval
+  stays unavailable until its existing builder publishes a generation bound
+  to the replacement core. A runtime-cache failure or late cancellation after
+  durable commit completes the prepared search publication, clears controller
+  indexing state, and still leaves retrieval bound to the prior core.
 - Dense-anchor centrality now uses complete bounded graph relationship counts
   instead of the six-item member and related-symbol presentation lists. This
   admits genuinely high-degree callables without repository-specific steering,
