@@ -331,6 +331,17 @@ impl NativeEmbeddingStream {
     fn peer_is_alive(&self) -> std::io::Result<bool> {
         self.inner.peer_is_alive()
     }
+
+    fn peer_exit_code(&self) -> std::io::Result<Option<u32>> {
+        #[cfg(windows)]
+        {
+            return self.inner.peer_exit_code();
+        }
+        #[cfg(unix)]
+        {
+            Ok(None)
+        }
+    }
 }
 
 impl Read for NativeEmbeddingStream {
@@ -459,6 +470,10 @@ impl codestory_retrieval::EmbeddingServerStream for NativeEmbeddingStream {
 
     fn peer_is_alive(&self) -> std::io::Result<bool> {
         NativeEmbeddingStream::peer_is_alive(self)
+    }
+
+    fn peer_exit_code(&self) -> std::io::Result<Option<u32>> {
+        NativeEmbeddingStream::peer_exit_code(self)
     }
 }
 
@@ -2526,9 +2541,9 @@ mod platform {
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA,
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_SEM_TIMEOUT, FILETIME,
-        GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-        STILL_ACTIVE,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED,
+        ERROR_SEM_TIMEOUT, FILETIME, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -2704,11 +2719,15 @@ mod platform {
         }
 
         pub(super) fn peer_is_alive(&self) -> std::io::Result<bool> {
+            Ok(self.peer_exit_code()?.is_none())
+        }
+
+        pub(super) fn peer_exit_code(&self) -> std::io::Result<Option<u32>> {
             let mut exit_code = 0_u32;
             if unsafe { GetExitCodeProcess(raw(&self.peer_process), &mut exit_code) } == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            Ok(exit_code == STILL_ACTIVE as u32)
+            Ok((exit_code != STILL_ACTIVE as u32).then_some(exit_code))
         }
     }
 
@@ -2740,7 +2759,7 @@ mod platform {
                             || code == ERROR_PIPE_LISTENING
                     })
                 {
-                    return Err(error);
+                    return Err(normalize_windows_pipe_io_error(error));
                 }
                 wait_pipe_io(
                     started,
@@ -2775,7 +2794,7 @@ mod platform {
                     .map(|code| code as u32)
                     .is_some_and(|code| code == ERROR_NO_DATA || code == ERROR_PIPE_BUSY)
                 {
-                    return Err(error);
+                    return Err(normalize_windows_pipe_io_error(error));
                 }
                 wait_pipe_io(
                     started,
@@ -3442,6 +3461,17 @@ mod platform {
         Ok(())
     }
 
+    fn normalize_windows_pipe_io_error(error: std::io::Error) -> std::io::Error {
+        if error.raw_os_error().map(|code| code as u32) == Some(ERROR_PIPE_NOT_CONNECTED) {
+            // DisconnectNamedPipe reports ERROR_PIPE_NOT_CONNECTED to the
+            // remote reader. Rust does not currently assign that Win32 code a
+            // portable ErrorKind, so retain the raw error as the source while
+            // exposing the precise cross-platform disconnect class.
+            return std::io::Error::new(std::io::ErrorKind::NotConnected, error);
+        }
+        error
+    }
+
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -3453,6 +3483,98 @@ mod platform {
             if !self.0.is_null() {
                 let _ = unsafe { LocalFree(self.0) };
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn disconnected_named_pipe_retains_raw_code_and_normalizes_the_kind() {
+            let current_sid = current_process_sid().expect("current process SID");
+            let sid_string = sid_string(&current_sid).expect("current SID string");
+            let security_sddl = wide(&format!(
+                "O:{sid_string}D:P(A;;GA;;;{sid_string})(A;;GA;;;SY)"
+            ));
+            let pipe_name = wide(&format!(
+                r"\\.\pipe\codestory-disconnect-test-{}-{}",
+                unsafe { GetCurrentProcessId() },
+                awake_now_ns()
+            ));
+            let server = create_pipe_instance(&pipe_name, &security_sddl, true, true)
+                .expect("create named-pipe server");
+            let client = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE, "connect named-pipe client");
+            let client = unsafe { OwnedHandle::from_raw_handle(client.cast()) };
+            let nonblocking = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+            assert_ne!(
+                unsafe { SetNamedPipeHandleState(raw(&client), &nonblocking, null(), null()) },
+                0,
+                "set named-pipe client nonblocking"
+            );
+            if unsafe { ConnectNamedPipe(raw(&server), null_mut()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_PIPE_CONNECTED),
+                    "client connection must be the only failed accept state"
+                );
+            }
+
+            let peer_pid = unsafe { GetCurrentProcessId() };
+            let peer_process_start_id =
+                canonical_process_start_identity(peer_pid).expect("current process start identity");
+            let mut stream = Stream::new(
+                client,
+                false,
+                TransportIdentity {
+                    endpoint_namespace_id: "test-endpoint".into(),
+                    lifetime_authority_id: "test-authority".into(),
+                    listener_id: "test-listener".into(),
+                    peer_verified: true,
+                    peer_pid: Some(peer_pid),
+                    peer_process_start_id: Some(peer_process_start_id),
+                },
+            )
+            .expect("retain named-pipe client stream");
+            assert_ne!(
+                unsafe { DisconnectNamedPipe(raw(&server)) },
+                0,
+                "disconnect named-pipe server"
+            );
+
+            let error = stream
+                .read(&mut [0_u8; 4])
+                .expect_err("disconnected named pipe must fail");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<std::io::Error>())
+                    .and_then(std::io::Error::raw_os_error)
+                    .map(|code| code as u32),
+                Some(ERROR_PIPE_NOT_CONNECTED)
+            );
+            assert!(stream.peer_is_alive().expect("probe retained peer"));
+            assert_eq!(stream.peer_exit_code().expect("probe peer exit code"), None);
+            eprintln!(
+                "named-pipe disconnect evidence: raw_os_error={} normalized_kind={:?} \
+                 peer_state=running peer_exit_code=none",
+                ERROR_PIPE_NOT_CONNECTED,
+                error.kind()
+            );
         }
     }
 }

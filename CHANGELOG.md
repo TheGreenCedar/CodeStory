@@ -17,6 +17,9 @@
   keeping package and archive-smoke inspection identical across processes.
   Windows package proof now pins the final exact candidate server process and
   requires its bounded clean idle exit before removing the unpacked archive.
+  Windows named-pipe disconnects now retain their exact Win32 error and
+  authenticated peer-process state while entering the existing exactly-once
+  pure-RPC recovery path.
 
 ## 0.16.0
 

@@ -149,6 +149,12 @@ pub trait EmbeddingServerStream: Read + Write + Send {
     /// Returns false once the authenticated peer process has exited. This is
     /// deliberately process-liveness only; it never inspects project state.
     fn peer_is_alive(&self) -> io::Result<bool>;
+    /// Returns the authenticated peer process exit code when the platform can
+    /// prove that the retained process identity has exited. A live peer and a
+    /// platform without exit-code support both return `None`.
+    fn peer_exit_code(&self) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
     fn shutdown(&self) -> io::Result<()>;
 }
 
@@ -705,18 +711,16 @@ pub struct EmbeddingRetryStateWire {
 }
 
 pub fn embedding_retry_state(error: &anyhow::Error) -> Option<EmbeddingRetryStateWire> {
-    error.chain().find_map(|cause| {
-        cause
-            .downcast_ref::<PerUserEmbeddingError>()
-            .map(|error| EmbeddingRetryStateWire {
-                code: error.code.clone(),
-                message: error.message.clone(),
-                retry_class: error.retry_class.clone(),
-                retry_after_ms: error.retry_after_ms,
-                retry_condition: error.retry_condition.clone(),
-                capacity: error.capacity.clone(),
-            })
-    })
+    error
+        .downcast_ref::<PerUserEmbeddingError>()
+        .map(|error| EmbeddingRetryStateWire {
+            code: error.code.clone(),
+            message: error.message.clone(),
+            retry_class: error.retry_class.clone(),
+            retry_after_ms: error.retry_after_ms,
+            retry_condition: error.retry_condition.clone(),
+            capacity: error.capacity.clone(),
+        })
 }
 
 pub fn embedding_capacity_pressure(error: &anyhow::Error) -> Option<EmbeddingCapacityPressureWire> {
@@ -4722,9 +4726,10 @@ fn exchange(
     request: EmbeddingProtocolRequest,
 ) -> Result<(EmbeddingProtocolResponse, Vec<u8>)> {
     let request_id = request.request_id.clone();
-    write_frame(stream, &request, &[]).map_err(map_bounded_exchange_error)?;
+    write_frame(stream, &request, &[])
+        .map_err(|error| map_bounded_exchange_error(error, stream))?;
     let (response, payload): (EmbeddingProtocolResponse, Vec<u8>) =
-        read_frame(stream).map_err(map_bounded_exchange_error)?;
+        read_frame(stream).map_err(|error| map_bounded_exchange_error(error, stream))?;
     if response.request_id != request_id {
         bail!("embedding_server_response_request_id_mismatch");
     }
@@ -4736,7 +4741,10 @@ fn exchange(
     Ok((response, payload))
 }
 
-fn map_bounded_exchange_error(error: anyhow::Error) -> anyhow::Error {
+fn map_bounded_exchange_error(
+    error: anyhow::Error,
+    stream: &dyn EmbeddingServerStream,
+) -> anyhow::Error {
     let io_kind = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<io::Error>().map(io::Error::kind));
@@ -4744,15 +4752,14 @@ fn map_bounded_exchange_error(error: anyhow::Error) -> anyhow::Error {
         io_kind,
         Some(io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
     ) {
-        return PerUserEmbeddingError {
+        return error.context(PerUserEmbeddingError {
             code: "embedding_server_owner_unresponsive".into(),
             message: "the embedding server did not complete a bounded exchange".into(),
             retry_class: "after_server_change".into(),
             retry_after_ms: duration_ms(EmbeddingClientBudgets::current().retry_after),
             retry_condition: "the lifetime authority or server instance changes".into(),
             capacity: None,
-        }
-        .into();
+        });
     }
     if matches!(
         io_kind,
@@ -4764,17 +4771,59 @@ fn map_bounded_exchange_error(error: anyhow::Error) -> anyhow::Error {
                 | io::ErrorKind::UnexpectedEof
         )
     ) {
-        return PerUserEmbeddingError {
+        let raw_os_error = exchange_raw_os_error(&error);
+        let identity = stream.transport_identity();
+        let (peer_state, peer_exit_code) = match stream.peer_exit_code() {
+            Ok(Some(exit_code)) => ("exited".to_string(), Some(exit_code)),
+            Ok(None) => match stream.peer_is_alive() {
+                Ok(true) => ("running".to_string(), None),
+                Ok(false) => ("exited".to_string(), None),
+                Err(probe_error) => (format!("unknown ({probe_error})"), None),
+            },
+            Err(probe_error) => (format!("unknown ({probe_error})"), None),
+        };
+        let source_chain = format!("{error:#}");
+        let message = format!(
+            "the authenticated embedding server connection was lost; raw_os_error={}; \
+             peer_pid={}; peer_process_start_id={}; peer_state={peer_state}; \
+             peer_exit_code={}; source={source_chain}",
+            raw_os_error.map_or_else(|| "none".into(), |code| code.to_string()),
+            identity
+                .peer_pid
+                .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+            identity
+                .peer_process_start_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            peer_exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
+        );
+        return error.context(PerUserEmbeddingError {
             code: "embedding_server_connection_lost".into(),
-            message: "the authenticated embedding server connection was lost".into(),
+            message,
             retry_class: "same_rpc_once".into(),
             retry_after_ms: 0,
             retry_condition: "the server instance changes".into(),
             capacity: None,
-        }
-        .into();
+        });
     }
     error
+}
+
+fn exchange_raw_os_error(error: &anyhow::Error) -> Option<i32> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(nested_io_raw_os_error)
+    })
+}
+
+fn nested_io_raw_os_error(error: &io::Error) -> Option<i32> {
+    error.raw_os_error().or_else(|| {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .and_then(nested_io_raw_os_error)
+    })
 }
 
 fn response_result(response: EmbeddingProtocolResponse) -> Result<EmbeddingResult> {
@@ -5077,16 +5126,14 @@ fn elapsed_since(clock: &dyn AwakeMonotonicClock, started_ns: u64) -> Duration {
 }
 
 fn is_server_loss(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<PerUserEmbeddingError>()
-            .is_some_and(|error| {
-                matches!(
-                    error.code.as_str(),
-                    "embedding_server_owner_unresponsive" | "embedding_server_connection_lost"
-                )
-            })
-    })
+    error
+        .downcast_ref::<PerUserEmbeddingError>()
+        .is_some_and(|error| {
+            matches!(
+                error.code.as_str(),
+                "embedding_server_owner_unresponsive" | "embedding_server_connection_lost"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -6371,6 +6418,46 @@ mod tests {
                 .to_string()
                 .contains("embedding_server_frame_too_large")
         );
+    }
+
+    #[test]
+    fn bounded_exchange_maps_normalized_disconnect_and_retains_peer_evidence() {
+        let raw_error = io::Error::from_raw_os_error(233);
+        let normalized = io::Error::new(io::ErrorKind::NotConnected, raw_error);
+        let source = anyhow::Error::new(normalized).context("read embedding control length");
+        let (stream, _) = MemoryStream::new(Vec::new(), true);
+
+        let error = map_bounded_exchange_error(source, &stream);
+        let retry = embedding_retry_state(&error).expect("typed connection loss");
+
+        assert_eq!(retry.code, "embedding_server_connection_lost");
+        assert_eq!(retry.retry_class, "same_rpc_once");
+        assert!(retry.message.contains("raw_os_error=233"));
+        assert!(retry.message.contains("peer_pid=42"));
+        assert!(retry.message.contains("peer_process_start_id=server-start"));
+        assert!(retry.message.contains("peer_state=running"));
+        assert!(retry.message.contains("peer_exit_code=none"));
+        assert!(
+            retry
+                .message
+                .contains("source=read embedding control length")
+        );
+        assert_eq!(exchange_raw_os_error(&error), Some(233));
+    }
+
+    #[test]
+    fn bounded_exchange_does_not_type_unrelated_io_errors() {
+        let source = anyhow::Error::new(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unrelated denial",
+        ))
+        .context("read embedding control length");
+        let (stream, _) = MemoryStream::new(Vec::new(), false);
+
+        let error = map_bounded_exchange_error(source, &stream);
+
+        assert!(embedding_retry_state(&error).is_none());
+        assert_eq!(error.to_string(), "read embedding control length");
     }
 
     #[test]
