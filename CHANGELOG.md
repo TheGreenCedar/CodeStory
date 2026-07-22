@@ -25,6 +25,9 @@
   and chunks nonblocking writes to the pipe buffer while keeping zero-progress
   polling inside the frozen server-owned query budget even when a peer supplies
   a longer wire deadline.
+  Cross-platform managed plugin handoff proof now uses the same explicit,
+  bounded 1,800-second checker deadline as the other two-host qualification
+  lanes instead of silently falling back to 900 seconds.
 
 ## 0.16.0
 

@@ -823,6 +823,7 @@ jobs:
           --expected-backend CPU
           --offline
           --proof-tier calibration
+          --timeout-secs 1800
           --out-dir target/packaged-managed-proof
 
       - name: Upload managed plugin proof

@@ -154,7 +154,8 @@ function managedJob() {
           "--engine-policy cpu_explicit",
           "--expected-backend CPU",
           "--offline",
-        ].join("\n"),
+          "--timeout-secs 1800",
+        ].join(" "),
       },
     ],
   };
@@ -1555,6 +1556,13 @@ test("managed proof rejects structural bypasses and decoy commands", () => {
     job => { job.steps[0].run = job.steps[0].run.replace("--engine-policy cpu_explicit", ""); },
     job => { job.steps[0].run = job.steps[0].run.replace("--expected-backend CPU", ""); },
     job => { job.steps[0].run = job.steps[0].run.replace("--offline", ""); },
+    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "--timeout-secs 900"); },
+    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "--timeout-secs 18000"); },
+    job => { job.steps[0].run += "\n--timeout-secs 900"; },
+    job => { job.steps[0].run += "\n--timeout-secs=900"; },
+    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "# --timeout-secs 1800"); },
+    job => { job.steps[0].run = job.steps[0].run.replace("--timeout-secs 1800", "; echo --timeout-secs 1800"); },
+    job => { job.steps[0].run += "\necho --timeout-secs 1800"; },
     job => {
       job.steps[0].run = "python .github/scripts/check-packaged-agent-proof.py\n--archive package.tar.gz\n# --plugin-handoff";
       job.steps.push({ name: "Decoy", run: "--plugin-handoff" });
