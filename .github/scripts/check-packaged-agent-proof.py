@@ -29,8 +29,8 @@ import tempfile
 import threading
 import time
 import zipfile
-from pathlib import Path
-from urllib.parse import quote
+from pathlib import Path, PureWindowsPath
+from urllib.parse import quote, unquote
 
 from native_binary_contract import (
     NativeBinaryError,
@@ -76,6 +76,46 @@ def project_node_resource_uri(base_uri: str, node_id: str, project: Path) -> str
         f"{base_uri}/{quote(node_id, safe='-._~')}",
         project,
     )
+
+
+def project_resource_uri_parts(uri: str) -> tuple[str, str] | None:
+    base_uri, marker, encoded_project = uri.partition("?project=")
+    if marker == "" or base_uri == "" or encoded_project == "":
+        return None
+    try:
+        project = unquote(encoded_project, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if quote(project, safe="-._~") != encoded_project:
+        return None
+    return base_uri, project
+
+
+def resource_uri_matches(
+    expected_uri: str,
+    actual_uri: str,
+    *,
+    platform_name: str | None = None,
+    samefile=None,
+) -> bool:
+    if actual_uri == expected_uri:
+        return True
+    if (os.name if platform_name is None else platform_name) != "nt":
+        return False
+    expected = project_resource_uri_parts(expected_uri)
+    actual = project_resource_uri_parts(actual_uri)
+    if expected is None or actual is None or expected[0] != actual[0]:
+        return False
+    if not (
+        PureWindowsPath(expected[1]).is_absolute()
+        and PureWindowsPath(actual[1]).is_absolute()
+    ):
+        return False
+    identity_probe = os.path.samefile if samefile is None else samefile
+    try:
+        return identity_probe(Path(expected[1]), Path(actual[1]))
+    except (OSError, ValueError):
+        return False
 
 
 EXTERNAL_QUALIFICATION_METRICS = {
@@ -2927,11 +2967,26 @@ def assert_public_status(status: dict) -> None:
     require(not leaked, "public status leaked maintainer-only retrieval fields: " + ", ".join(leaked))
 
 
-def extract_resource(response: dict, uri: str) -> dict:
+def extract_resource(
+    response: dict,
+    uri: str,
+    *,
+    platform_name: str | None = None,
+    samefile=None,
+) -> dict:
     require("error" not in response, f"resource read failed: {response.get('error')}")
     contents = response.get("result", {}).get("contents", [])
     for item in contents:
-        if isinstance(item, dict) and item.get("uri") == uri:
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("uri"), str)
+            and resource_uri_matches(
+                uri,
+                item["uri"],
+                platform_name=platform_name,
+                samefile=samefile,
+            )
+        ):
             payload = json.loads(item.get("text", "{}"))
             require(isinstance(payload, dict), "resource emitted non-object JSON")
             return payload
@@ -9603,6 +9658,106 @@ def self_test() -> None:
         == {"node": {"id": "node/id %1"}},
         "project-bound named resource extraction failed",
     )
+    short_windows_resource = (
+        "codestory://diagnostics/retrieval-engine"
+        "?project=C%3A%2FUsers%2FRUNNER~1%2FAppData%2FLocal%2FTemp%2Fproof"
+    )
+    long_windows_resource = (
+        "codestory://diagnostics/retrieval-engine"
+        "?project=C%3A%2FUsers%2Frunneradmin%2FAppData%2FLocal%2FTemp%2Fproof"
+    )
+    identity_probes: list[tuple[Path, Path]] = []
+
+    def same_windows_resource(left: Path, right: Path) -> bool:
+        identity_probes.append((left, right))
+        return True
+
+    require(
+        extract_resource(
+            {
+                "result": {
+                    "contents": [
+                        {
+                            "uri": long_windows_resource,
+                            "text": json.dumps({"native_alias": True}),
+                        }
+                    ]
+                }
+            },
+            short_windows_resource,
+            platform_name="nt",
+            samefile=same_windows_resource,
+        )
+        == {"native_alias": True}
+        and len(identity_probes) == 1,
+        "native-identical Windows project resource URI was rejected",
+    )
+    require(
+        not resource_uri_matches(
+            short_windows_resource,
+            long_windows_resource,
+            platform_name="posix",
+            samefile=same_windows_resource,
+        )
+        and len(identity_probes) == 1,
+        "Unix project resource matching accepted a different path spelling",
+    )
+    require(
+        not resource_uri_matches(
+            short_windows_resource,
+            long_windows_resource.replace(
+                "codestory://diagnostics/retrieval-engine",
+                "codestory://status",
+            ),
+            platform_name="nt",
+            samefile=same_windows_resource,
+        )
+        and len(identity_probes) == 1,
+        "Windows project resource matching accepted a different resource base",
+    )
+    require(
+        not resource_uri_matches(
+            short_windows_resource,
+            long_windows_resource.replace("%3A", "%3a"),
+            platform_name="nt",
+            samefile=same_windows_resource,
+        )
+        and len(identity_probes) == 1,
+        "Windows project resource matching accepted noncanonical URI encoding",
+    )
+    require(
+        not resource_uri_matches(
+            short_windows_resource,
+            long_windows_resource.replace("C%3A%2F", "relative%2F"),
+            platform_name="nt",
+            samefile=same_windows_resource,
+        )
+        and len(identity_probes) == 1,
+        "Windows project resource matching accepted a relative project selector",
+    )
+    require(
+        not resource_uri_matches(
+            short_windows_resource,
+            long_windows_resource,
+            platform_name="nt",
+            samefile=lambda _left, _right: False,
+        ),
+        "Windows project resource matching accepted a different native identity",
+    )
+
+    def missing_windows_resource(_left: Path, _right: Path) -> bool:
+        raise FileNotFoundError("missing project resource")
+
+    require(
+        not resource_uri_matches(
+            short_windows_resource,
+            long_windows_resource,
+            platform_name="nt",
+            samefile=missing_windows_resource,
+        ),
+        "Windows project resource matching ignored an identity probe failure",
+    )
+
     def fail_parallel(message: str) -> None:
         raise ProofFailure(message)
 

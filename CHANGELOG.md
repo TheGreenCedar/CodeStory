@@ -28,6 +28,9 @@
   Cross-platform managed plugin handoff proof now uses the same explicit,
   bounded 1,800-second checker deadline as the other two-host qualification
   lanes instead of silently falling back to 900 seconds.
+  Windows package proof now accepts a canonical project URI returned for a
+  native-identical existing project path, while resource bases, URI encoding,
+  missing paths, and Unix project URI matching remain strict.
 
 ## 0.16.0
 
