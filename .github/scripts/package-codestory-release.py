@@ -5,10 +5,12 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -16,6 +18,7 @@ from pathlib import Path
 
 from native_binary_contract import (
     NativeBinaryError,
+    inspect_binary,
     inspect_runtime_layout,
     runtime_artifact_role,
 )
@@ -891,6 +894,44 @@ def write_synthetic_runtime(
 def run_self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-package-self-test-") as temp_dir:
         temp_root = Path(temp_dir)
+        dependency_names = ("kernel32.dll", "KERNEL32.dll", "User32.dll")
+        expected_dependencies = ["KERNEL32.dll", "kernel32.dll", "User32.dll"]
+        inspector_dir = str(Path(__file__).resolve().parent)
+        inspect_command = (
+            "import json, sys; "
+            "from pathlib import Path; "
+            "sys.path.insert(0, sys.argv[2]); "
+            "from native_binary_contract import inspect_binary; "
+            "print(json.dumps(inspect_binary(Path(sys.argv[1]))['needed']))"
+        )
+        for binary_format, arch in [
+            ("elf", "x86_64"),
+            ("pe", "x86_64"),
+            ("mach-o", "aarch64"),
+        ]:
+            dependency_binary = temp_root / f"dependency-order-{binary_format}"
+            dependency_binary.write_bytes(
+                synthetic_binary(binary_format, arch, "", dependency_names)
+            )
+            if inspect_binary(dependency_binary)["needed"] != expected_dependencies:
+                raise AssertionError(
+                    f"{binary_format} dependency spelling or total ordering is unstable"
+                )
+            seeded_results = []
+            for hash_seed in ("0", "1", "42"):
+                seeded = subprocess.run(
+                    [sys.executable, "-c", inspect_command, str(dependency_binary), inspector_dir],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PYTHONHASHSEED": hash_seed},
+                )
+                seeded_results.append(json.loads(seeded.stdout))
+            if any(result != expected_dependencies for result in seeded_results):
+                raise AssertionError(
+                    f"{binary_format} dependency ordering changes across Python hash seeds"
+                )
+
         repo_root = temp_root / "repo"
         (repo_root / "docs/users").mkdir(parents=True)
         (repo_root / "plugins/codestory/skills/codestory-grounding").mkdir(parents=True)

@@ -10,6 +10,9 @@
   strict and still requires exact-head quality evidence. Hosted Windows packages
   build through a Cargo target junction at the runner volume root so nested
   Vulkan CMake, object, and PDB paths remain inside the native toolchain limit.
+  Native dependency manifests now use a deterministic case-sensitive tie-break
+  after case-insensitive ordering, preserving exact import spellings while
+  keeping package and archive-smoke inspection identical across processes.
 
 ## 0.16.0
 
