@@ -16,7 +16,9 @@ use anyhow::Result;
 
 /// Install the native same-user embedding client transport for this executable.
 pub fn install_native_embedding_client_transport() -> Result<()> {
-    embedding_server_transport::install_client_transport()
+    embedding_server_transport::install_client_transport(
+        embedding_server_transport::ClientTransportMode::SpawnCapable,
+    )
 }
 
 /// Run the native embedding server entrypoint for this exact executable.

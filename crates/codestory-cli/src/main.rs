@@ -229,9 +229,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
-    if embedding_client_transport_startup(&cli.command) == EmbeddingClientTransportStartup::Install
-    {
-        embedding_server_transport::install_client_transport()
+    if let Some(mode) = embedding_client_transport_mode(&cli.command) {
+        embedding_server_transport::install_client_transport(mode)
             .context("install native embedding server transport")?;
     }
     match cli.command {
@@ -284,23 +283,18 @@ async fn run_cli(cli: Cli) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingClientTransportStartup {
-    Install,
-    SkipObservational,
-    RunInternalServer,
-}
-
-fn embedding_client_transport_startup(command: &Command) -> EmbeddingClientTransportStartup {
+fn embedding_client_transport_mode(
+    command: &Command,
+) -> Option<embedding_server_transport::ClientTransportMode> {
     match command {
-        Command::Ground(_) => EmbeddingClientTransportStartup::SkipObservational,
+        Command::Ground(_) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
         Command::Retrieval(args::RetrievalCommand {
             action: args::RetrievalAction::Status(_),
-        }) => EmbeddingClientTransportStartup::SkipObservational,
-        Command::InternalEmbeddingServer => EmbeddingClientTransportStartup::RunInternalServer,
-        // This is deliberately an allowlist for skipping capture. New commands retain exact
-        // executable identity unless their observational boundary is reviewed explicitly.
-        _ => EmbeddingClientTransportStartup::Install,
+        }) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
+        Command::InternalEmbeddingServer => None,
+        // This is deliberately an allowlist for attested observe-only capture. New commands retain
+        // fresh exact executable identity unless their transport behavior is reviewed explicitly.
+        _ => Some(embedding_server_transport::ClientTransportMode::SpawnCapable),
     }
 }
 
@@ -8067,14 +8061,38 @@ mod tests {
     }
 
     #[test]
-    fn observational_commands_skip_embedding_client_transport_startup() {
+    fn ground_and_retrieval_status_install_observe_only_live_transport() {
         for args in [&["ground"][..], &["retrieval", "status"][..]] {
             assert_eq!(
-                embedding_client_transport_startup(&parsed_command(args)),
-                EmbeddingClientTransportStartup::SkipObservational,
-                "{args:?} should not capture or hash the executable"
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
+                "{args:?} should retain a live observe transport without spawn authority"
             );
         }
+    }
+
+    #[test]
+    fn ground_and_retrieval_status_retain_the_native_live_probe() -> Result<()> {
+        for args in [&["ground"][..], &["retrieval", "status"][..]] {
+            assert_eq!(
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::ObserveOnly)
+            );
+        }
+        embedding_server_transport::install_client_transport(
+            embedding_server_transport::ClientTransportMode::ObserveOnly,
+        )?;
+        let runtime = sidecar_runtime::local();
+        let client = codestory_retrieval::PerUserEmbeddingClient::for_runtime(&runtime)?;
+        if let Err(error) = client.observe() {
+            let message = format!("{error:#}");
+            assert!(
+                !message.contains("embedding_server_transport_unavailable")
+                    && !message.contains("embedding_server_spawn_forbidden"),
+                "an observational command must execute the native live probe: {message}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -8095,8 +8113,8 @@ mod tests {
             ][..],
         ] {
             assert_eq!(
-                embedding_client_transport_startup(&parsed_command(args)),
-                EmbeddingClientTransportStartup::Install,
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::SpawnCapable),
                 "{args:?} should retain exact executable identity capture"
             );
         }
@@ -8109,14 +8127,14 @@ mod tests {
             &["retrieval", "republish-projections"][..],
         ] {
             assert_eq!(
-                embedding_client_transport_startup(&parsed_command(args)),
-                EmbeddingClientTransportStartup::Install,
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::SpawnCapable),
                 "{args:?} should not widen the observational exemption"
             );
         }
         assert_eq!(
-            embedding_client_transport_startup(&parsed_command(&["internal-embedding-server"])),
-            EmbeddingClientTransportStartup::RunInternalServer
+            embedding_client_transport_mode(&parsed_command(&["internal-embedding-server"])),
+            None
         );
     }
 
