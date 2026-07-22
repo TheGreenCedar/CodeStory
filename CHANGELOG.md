@@ -34,6 +34,9 @@
   The dedicated Linux release-evidence service now provisions and verifies a
   private per-user runtime authority before measuring the shared embedding
   server, instead of failing closed when `XDG_RUNTIME_DIR` is absent.
+- Observational `ground` and `retrieval status` commands no longer capture and
+  hash the embedded CLI executable at startup. Commands that can prepare,
+  query, or serve embeddings retain the exact-executable transport boundary.
 
 ## 0.16.0
 

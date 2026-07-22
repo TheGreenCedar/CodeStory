@@ -229,7 +229,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
-    if !matches!(&cli.command, Command::InternalEmbeddingServer) {
+    if embedding_client_transport_startup(&cli.command) == EmbeddingClientTransportStartup::Install
+    {
         embedding_server_transport::install_client_transport()
             .context("install native embedding server transport")?;
     }
@@ -280,6 +281,26 @@ async fn run_cli(cli: Cli) -> Result<()> {
             embedding_qualification::run_internal_embedding_qualification_worker(cmd)
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingClientTransportStartup {
+    Install,
+    SkipObservational,
+    RunInternalServer,
+}
+
+fn embedding_client_transport_startup(command: &Command) -> EmbeddingClientTransportStartup {
+    match command {
+        Command::Ground(_) => EmbeddingClientTransportStartup::SkipObservational,
+        Command::Retrieval(args::RetrievalCommand {
+            action: args::RetrievalAction::Status(_),
+        }) => EmbeddingClientTransportStartup::SkipObservational,
+        Command::InternalEmbeddingServer => EmbeddingClientTransportStartup::RunInternalServer,
+        // This is deliberately an allowlist for skipping capture. New commands retain exact
+        // executable identity unless their observational boundary is reviewed explicitly.
+        _ => EmbeddingClientTransportStartup::Install,
     }
 }
 
@@ -8038,6 +8059,66 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn parsed_command(args: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("codestory-cli").chain(args.iter().copied()))
+            .expect("command should parse")
+            .command
+    }
+
+    #[test]
+    fn observational_commands_skip_embedding_client_transport_startup() {
+        for args in [&["ground"][..], &["retrieval", "status"][..]] {
+            assert_eq!(
+                embedding_client_transport_startup(&parsed_command(args)),
+                EmbeddingClientTransportStartup::SkipObservational,
+                "{args:?} should not capture or hash the executable"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_client_transport_startup_keeps_embedding_capable_commands() {
+        for args in [
+            &["index"][..],
+            &["packet", "--question", "explain the runtime"][..],
+            &["search", "--query", "RuntimeContext"][..],
+            &["retrieval", "index"][..],
+            &["retrieval", "query", "RuntimeContext"][..],
+            &["serve"][..],
+            &[
+                "internal-embedding-qualification",
+                "--request",
+                "/private/request.json",
+                "--output",
+                "/private/output.json",
+            ][..],
+        ] {
+            assert_eq!(
+                embedding_client_transport_startup(&parsed_command(args)),
+                EmbeddingClientTransportStartup::Install,
+                "{args:?} should retain exact executable identity capture"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_client_transport_startup_keeps_non_status_and_server_boundaries() {
+        for args in [
+            &["retrieval", "inventory"][..],
+            &["retrieval", "republish-projections"][..],
+        ] {
+            assert_eq!(
+                embedding_client_transport_startup(&parsed_command(args)),
+                EmbeddingClientTransportStartup::Install,
+                "{args:?} should not widen the observational exemption"
+            );
+        }
+        assert_eq!(
+            embedding_client_transport_startup(&parsed_command(&["internal-embedding-server"])),
+            EmbeddingClientTransportStartup::RunInternalServer
+        );
+    }
 
     struct EnvVarSnapshot<'a> {
         values: Vec<(&'a str, Option<std::ffi::OsString>)>,
