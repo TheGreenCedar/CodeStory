@@ -19,7 +19,12 @@
   requires its bounded clean idle exit before removing the unpacked archive.
   Windows named-pipe disconnects now retain their exact Win32 error and
   authenticated peer-process state while entering the existing exactly-once
-  pure-RPC recovery path.
+  pure-RPC recovery path. Successful Windows handlers now keep the one-shot
+  pipe connected for a server-capped final-response drain, preventing teardown
+  from discarding unread vector bytes while the shared server remains healthy,
+  and chunks nonblocking writes to the pipe buffer while keeping zero-progress
+  polling inside the frozen server-owned query budget even when a peer supplies
+  a longer wire deadline.
 
 ## 0.16.0
 
