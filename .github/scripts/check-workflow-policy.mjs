@@ -75,6 +75,19 @@ function executableRunText(run) {
     .join("\n");
 }
 
+function argumentValues(run, flag) {
+  const tokens = run.split(/\s+/u).filter(Boolean);
+  const values = [];
+  for (const [index, token] of tokens.entries()) {
+    if (token === flag) {
+      values.push(tokens[index + 1]);
+    } else if (token.startsWith(`${flag}=`)) {
+      values.push(token.slice(flag.length + 1));
+    }
+  }
+  return values;
+}
+
 function add(violations, condition, message) {
   if (!condition) violations.push(message);
 }
@@ -965,10 +978,15 @@ export function managedPluginViolations(job, archiveFragment) {
     "--engine-policy cpu_explicit",
     "--expected-backend CPU",
     "--offline",
-    "--timeout-secs 1800",
   ]) {
     add(violations, run.includes(fragment), `managed plugin proof step must run ${fragment}`);
   }
+  const timeoutValues = argumentValues(run, "--timeout-secs");
+  add(
+    violations,
+    timeoutValues.length === 1 && timeoutValues[0] === "1800",
+    "managed plugin proof step must run exactly one --timeout-secs 1800",
+  );
   return violations;
 }
 
