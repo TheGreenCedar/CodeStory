@@ -1581,6 +1581,43 @@ mod tests {
     }
 
     #[test]
+    fn source_proven_adapter_file_survives_a_helper_in_the_same_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let adapter_path = temp.path().join("adapters.js");
+        std::fs::write(
+            &adapter_path,
+            "const knownAdapters = { http, xhr }; function getAdapter(name) { const adapter = knownAdapters[name]; return adapter; }",
+        )
+        .expect("write adapter source");
+        let adapter_path = adapter_path.to_string_lossy();
+
+        let mut helper = citation("isResolvedHandle", &adapter_path, 100.0);
+        helper.kind = NodeKind::FUNCTION;
+        let mut file = citation(&adapter_path, &adapter_path, 1.0);
+        file.kind = NodeKind::FILE;
+        let mut answer = answer_fixture(vec![helper, file]);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_packet_citations(
+            &mut answer,
+            &limits,
+            &["adapters".to_string()]
+        ));
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].kind, NodeKind::FILE);
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some(&*adapter_path)
+        );
+    }
+
+    #[test]
     fn packet_citation_capping_large_probe_set_stays_bounded() {
         const CITATION_COUNT: usize = 1_024;
         const MULTI_MATCH_CITATION_COUNT: usize = 256;
