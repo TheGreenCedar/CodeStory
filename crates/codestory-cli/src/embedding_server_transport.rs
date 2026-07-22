@@ -328,6 +328,10 @@ impl NativeEmbeddingStream {
         self.inner.shutdown()
     }
 
+    fn finish_response_delivery(&self) -> std::io::Result<()> {
+        self.inner.finish_response_delivery()
+    }
+
     fn peer_is_alive(&self) -> std::io::Result<bool> {
         self.inner.peer_is_alive()
     }
@@ -466,6 +470,10 @@ impl codestory_retrieval::EmbeddingServerStream for NativeEmbeddingStream {
 
     fn shutdown(&self) -> std::io::Result<()> {
         NativeEmbeddingStream::shutdown(self)
+    }
+
+    fn finish_response_delivery(&self) -> std::io::Result<()> {
+        NativeEmbeddingStream::finish_response_delivery(self)
     }
 
     fn peer_is_alive(&self) -> std::io::Result<bool> {
@@ -928,6 +936,10 @@ mod platform {
 
         pub(super) fn shutdown(&self) -> std::io::Result<()> {
             self.stream.shutdown(std::net::Shutdown::Both)
+        }
+
+        pub(super) fn finish_response_delivery(&self) -> std::io::Result<()> {
+            Ok(())
         }
 
         pub(super) fn peer_is_alive(&self) -> std::io::Result<bool> {
@@ -2540,10 +2552,10 @@ mod platform {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA,
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED,
-        ERROR_SEM_TIMEOUT, FILETIME, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE,
-        INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
+        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+        ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, FILETIME, GENERIC_ALL, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -2573,6 +2585,7 @@ mod platform {
     use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise;
 
     const NO_TIMEOUT: u64 = u64::MAX;
+    const PIPE_BUFFER_BYTES: usize = 1024 * 1024;
     const PIPE_IO_POLL: Duration = Duration::from_millis(1);
     const PIPE_CONNECT_POLL: Duration = Duration::from_millis(25);
     const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -2718,6 +2731,47 @@ mod platform {
             Ok(())
         }
 
+        pub(super) fn finish_response_delivery(&self) -> std::io::Result<()> {
+            if !self.server_side {
+                return Ok(());
+            }
+            let started = awake_now_ns();
+            loop {
+                let mut unexpected = 0_u8;
+                let mut read = 0_u32;
+                if unsafe {
+                    ReadFile(
+                        raw(&self.handle),
+                        (&mut unexpected as *mut u8).cast(),
+                        1,
+                        &mut read,
+                        null_mut(),
+                    )
+                } != 0
+                {
+                    if read == 0 {
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "embedding client wrote data after the final response",
+                    ));
+                }
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => return Ok(()),
+                    Some(ERROR_NO_DATA) | Some(ERROR_PIPE_BUSY) | Some(ERROR_PIPE_LISTENING) => {
+                        wait_pipe_io(
+                            started,
+                            self.read_timeout_ns.load(Ordering::Acquire),
+                            "finish response delivery",
+                        )?;
+                    }
+                    _ => return Err(normalize_windows_pipe_io_error(error)),
+                }
+            }
+        }
+
         pub(super) fn peer_is_alive(&self) -> std::io::Result<bool> {
             Ok(self.peer_exit_code()?.is_none())
         }
@@ -2772,7 +2826,14 @@ mod platform {
 
     impl Write for Stream {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            let amount = buffer.len().min(u32::MAX as usize) as u32;
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            // PIPE_NOWAIT does not promise a partial write when the request is
+            // larger than the configured pipe buffer. Bound each WriteFile
+            // call to one buffer so write_all can make progress on protocol
+            // payloads up to the larger frame limit.
+            let amount = buffer.len().min(PIPE_BUFFER_BYTES) as u32;
             let started = awake_now_ns();
             loop {
                 let mut written = 0_u32;
@@ -2786,7 +2847,19 @@ mod platform {
                     )
                 } != 0
                 {
-                    return Ok(written as usize);
+                    if written != 0 {
+                        return Ok(written as usize);
+                    }
+                    // A nonblocking byte pipe can report a successful
+                    // zero-byte write while its kernel buffer is full. Keep
+                    // the response inside the already configured finite write
+                    // deadline instead of surfacing WriteZero to write_all.
+                    wait_pipe_io(
+                        started,
+                        self.write_timeout_ns.load(Ordering::Acquire),
+                        "write",
+                    )?;
+                    continue;
                 }
                 let error = std::io::Error::last_os_error();
                 if !error
@@ -3093,8 +3166,8 @@ mod platform {
                 open_mode,
                 pipe_mode,
                 PIPE_UNLIMITED_INSTANCES,
-                1024 * 1024,
-                1024 * 1024,
+                PIPE_BUFFER_BYTES as u32,
+                PIPE_BUFFER_BYTES as u32,
                 0,
                 &security,
             )
@@ -3575,6 +3648,190 @@ mod platform {
                 ERROR_PIPE_NOT_CONNECTED,
                 error.kind()
             );
+        }
+
+        #[test]
+        fn final_response_delivery_waits_for_the_client_to_drain_before_disconnect() {
+            let current_sid = current_process_sid().expect("current process SID");
+            let sid_string = sid_string(&current_sid).expect("current SID string");
+            let security_sddl = wide(&format!(
+                "O:{sid_string}D:P(A;;GA;;;{sid_string})(A;;GA;;;SY)"
+            ));
+            let pipe_name = wide(&format!(
+                r"\\.\pipe\codestory-response-delivery-test-{}-{}",
+                unsafe { GetCurrentProcessId() },
+                awake_now_ns()
+            ));
+            let server = create_pipe_instance(&pipe_name, &security_sddl, true, true)
+                .expect("create named-pipe server");
+            let client = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE, "connect named-pipe client");
+            let client = unsafe { OwnedHandle::from_raw_handle(client.cast()) };
+            let nonblocking = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+            assert_ne!(
+                unsafe { SetNamedPipeHandleState(raw(&client), &nonblocking, null(), null()) },
+                0,
+                "set named-pipe client nonblocking"
+            );
+            if unsafe { ConnectNamedPipe(raw(&server), null_mut()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_PIPE_CONNECTED),
+                    "client connection must be the only failed accept state"
+                );
+            }
+
+            let peer_pid = unsafe { GetCurrentProcessId() };
+            let peer_process_start_id =
+                canonical_process_start_identity(peer_pid).expect("current process start identity");
+            let identity = || TransportIdentity {
+                endpoint_namespace_id: "test-endpoint".into(),
+                lifetime_authority_id: "test-authority".into(),
+                listener_id: "test-listener".into(),
+                peer_verified: true,
+                peer_pid: Some(peer_pid),
+                peer_process_start_id: Some(peer_process_start_id.clone()),
+            };
+            let mut server_stream =
+                Stream::new(server, true, identity()).expect("retain named-pipe server stream");
+            let mut client_stream =
+                Stream::new(client, false, identity()).expect("retain named-pipe client stream");
+            let timeout = codestory_retrieval::EmbeddingClientBudgets::current().query_request;
+            server_stream
+                .set_read_timeout(Some(timeout))
+                .expect("bound response delivery wait");
+            server_stream
+                .set_write_timeout(Some(timeout))
+                .expect("bound response write");
+            client_stream
+                .set_read_timeout(Some(timeout))
+                .expect("bound response read");
+
+            let expected = (0..(2 * 1024 * 1024))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let server_expected = expected.clone();
+            let (written_tx, written_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let server_thread = std::thread::spawn(move || {
+                server_stream
+                    .write_all(&server_expected)
+                    .expect("write response larger than the pipe buffer");
+                written_tx
+                    .send(())
+                    .expect("signal completed response write");
+                server_stream
+                    .finish_response_delivery()
+                    .expect("wait for client response drain");
+                finished_tx
+                    .send(())
+                    .expect("signal completed response delivery");
+            });
+
+            std::thread::sleep(Duration::from_millis(25));
+            let mut observed = vec![0_u8; expected.len()];
+            client_stream
+                .read_exact(&mut observed)
+                .expect("read the complete response before server teardown");
+            assert_eq!(observed, expected);
+            written_rx
+                .recv_timeout(timeout)
+                .expect("server completed response write");
+            assert!(
+                finished_rx.try_recv().is_err(),
+                "server must retain the pipe while the drained client handle remains open"
+            );
+
+            drop(client_stream);
+            finished_rx
+                .recv_timeout(timeout)
+                .expect("client close releases the bounded delivery wait");
+            server_thread.join().expect("join named-pipe server");
+        }
+
+        #[test]
+        fn large_response_write_times_out_when_the_client_does_not_drain() {
+            let current_sid = current_process_sid().expect("current process SID");
+            let sid_string = sid_string(&current_sid).expect("current SID string");
+            let security_sddl = wide(&format!(
+                "O:{sid_string}D:P(A;;GA;;;{sid_string})(A;;GA;;;SY)"
+            ));
+            let pipe_name = wide(&format!(
+                r"\\.\pipe\codestory-response-write-timeout-test-{}-{}",
+                unsafe { GetCurrentProcessId() },
+                awake_now_ns()
+            ));
+            let server = create_pipe_instance(&pipe_name, &security_sddl, true, true)
+                .expect("create named-pipe server");
+            let client = unsafe {
+                CreateFileW(
+                    pipe_name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE, "connect named-pipe client");
+            let client = unsafe { OwnedHandle::from_raw_handle(client.cast()) };
+            let nonblocking = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+            assert_ne!(
+                unsafe { SetNamedPipeHandleState(raw(&client), &nonblocking, null(), null()) },
+                0,
+                "set named-pipe client nonblocking"
+            );
+            if unsafe { ConnectNamedPipe(raw(&server), null_mut()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_PIPE_CONNECTED),
+                    "client connection must be the only failed accept state"
+                );
+            }
+
+            let peer_pid = unsafe { GetCurrentProcessId() };
+            let peer_process_start_id =
+                canonical_process_start_identity(peer_pid).expect("current process start identity");
+            let identity = TransportIdentity {
+                endpoint_namespace_id: "test-endpoint".into(),
+                lifetime_authority_id: "test-authority".into(),
+                listener_id: "test-listener".into(),
+                peer_verified: true,
+                peer_pid: Some(peer_pid),
+                peer_process_start_id: Some(peer_process_start_id),
+            };
+            let mut server_stream =
+                Stream::new(server, true, identity).expect("retain named-pipe server stream");
+            let timeout = Duration::from_millis(50);
+            server_stream
+                .set_write_timeout(Some(timeout))
+                .expect("bound response write");
+
+            let response = vec![7_u8; PIPE_BUFFER_BYTES + 1];
+            let started = std::time::Instant::now();
+            let error = server_stream
+                .write_all(&response)
+                .expect_err("a non-reading client must not retain a large response writer");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the server-owned response write cap must release the handler promptly"
+            );
+
+            drop(client);
         }
     }
 }

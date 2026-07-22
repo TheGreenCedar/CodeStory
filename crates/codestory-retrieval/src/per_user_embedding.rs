@@ -155,6 +155,12 @@ pub trait EmbeddingServerStream: Read + Write + Send {
     fn peer_exit_code(&self) -> io::Result<Option<u32>> {
         Ok(None)
     }
+    /// Completes transport-specific delivery of the final response before the
+    /// server tears the connection down. Transports whose close preserves
+    /// unread bytes need no additional work.
+    fn finish_response_delivery(&self) -> io::Result<()> {
+        Ok(())
+    }
     fn shutdown(&self) -> io::Result<()>;
 }
 
@@ -3364,21 +3370,41 @@ fn sync_qualification_directory(_path: &Path) -> Result<()> {
 
 fn serve_embedding_connection(
     state: Arc<PerUserEmbeddingServerState>,
-    stream: Box<dyn EmbeddingServerStream>,
+    mut stream: Box<dyn EmbeddingServerStream>,
 ) -> Result<()> {
-    serve_embedding_connection_inner(state, stream, false)
+    let result = serve_embedding_connection_inner(state, &mut *stream, false);
+    finish_embedding_response_delivery(&*stream, result)
 }
 
 fn serve_embedding_connection_at_handler_capacity(
     state: Arc<PerUserEmbeddingServerState>,
-    stream: Box<dyn EmbeddingServerStream>,
+    mut stream: Box<dyn EmbeddingServerStream>,
 ) -> Result<()> {
-    serve_embedding_connection_inner(state, stream, true)
+    let result = serve_embedding_connection_inner(state, &mut *stream, true);
+    finish_embedding_response_delivery(&*stream, result)
+}
+
+fn finish_embedding_response_delivery(
+    stream: &dyn EmbeddingServerStream,
+    result: Result<()>,
+) -> Result<()> {
+    result?;
+    // Do not inherit the wire deadline here: an authenticated same-user client
+    // may choose any positive value and could otherwise retain every bounded
+    // handler after receiving its response. The frozen query request deadline
+    // is the smallest server-owned product budget and physically covers a
+    // response larger than the Windows pipe buffer.
+    stream
+        .set_read_timeout(Some(EmbeddingClientBudgets::current().query_request))
+        .context("bound embedding final response delivery")?;
+    stream
+        .finish_response_delivery()
+        .context("finish embedding final response delivery")
 }
 
 fn serve_embedding_connection_inner(
     state: Arc<PerUserEmbeddingServerState>,
-    mut stream: Box<dyn EmbeddingServerStream>,
+    stream: &mut dyn EmbeddingServerStream,
     handler_capacity_limited: bool,
 ) -> Result<()> {
     let pre_request_guard = (!handler_capacity_limited)
@@ -3406,8 +3432,7 @@ fn serve_embedding_connection_inner(
         .set_write_timeout(Some(EmbeddingClientBudgets::current().connect))
         .context("bound embedding server handshake write")?;
     let connection_id = Uuid::new_v4().to_string();
-    let (hello_request, hello_payload): (EmbeddingProtocolRequest, Vec<u8>) =
-        read_frame(&mut *stream)?;
+    let (hello_request, hello_payload): (EmbeddingProtocolRequest, Vec<u8>) = read_frame(stream)?;
     if !hello_payload.is_empty() {
         bail!("embedding_server_protocol_hello_required");
     }
@@ -4492,10 +4517,17 @@ fn configure_server_operation_timeout(
     stream: &dyn EmbeddingServerStream,
     deadline_ms: u64,
 ) -> Result<()> {
-    let timeout = Duration::from_millis(deadline_ms);
-    if timeout.is_zero() {
+    let wire_timeout = Duration::from_millis(deadline_ms);
+    if wire_timeout.is_zero() {
         bail!("embedding_server_deadline_invalid");
     }
+    // The wire deadline can shorten an exchange, but it cannot lengthen a
+    // response write. In particular, Windows PIPE_NOWAIT writes must retry
+    // zero progress while the kernel buffer is full. A peer-selected timeout
+    // there would let a non-reading same-user client retain every bounded
+    // connection handler. The smallest frozen request budget is already
+    // qualified for responses larger than the Windows pipe buffer.
+    let timeout = wire_timeout.min(EmbeddingClientBudgets::current().query_request);
     stream
         .set_read_timeout(Some(timeout))
         .context("bound embedding server request read")?;
@@ -5207,22 +5239,48 @@ mod tests {
         identity: EmbeddingTransportIdentity,
         input: Cursor<Vec<u8>>,
         output: Arc<Mutex<Vec<u8>>>,
+        finished_deliveries: Arc<AtomicUsize>,
+        read_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+        write_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
         alive: bool,
         exit_codes: Mutex<Vec<Option<u32>>>,
     }
 
     impl MemoryStream {
         fn new(input: Vec<u8>, alive: bool) -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let (stream, output, _, _, _) = Self::with_delivery_tracking(input, alive);
+            (stream, output)
+        }
+
+        fn with_delivery_tracking(
+            input: Vec<u8>,
+            alive: bool,
+        ) -> (
+            Self,
+            Arc<Mutex<Vec<u8>>>,
+            Arc<AtomicUsize>,
+            Arc<Mutex<Vec<Option<Duration>>>>,
+            Arc<Mutex<Vec<Option<Duration>>>>,
+        ) {
             let output = Arc::new(Mutex::new(Vec::new()));
+            let finished_deliveries = Arc::new(AtomicUsize::new(0));
+            let read_timeouts = Arc::new(Mutex::new(Vec::new()));
+            let write_timeouts = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     identity: test_transport_identity(),
                     input: Cursor::new(input),
                     output: Arc::clone(&output),
+                    finished_deliveries: Arc::clone(&finished_deliveries),
+                    read_timeouts: Arc::clone(&read_timeouts),
+                    write_timeouts: Arc::clone(&write_timeouts),
                     alive,
                     exit_codes: Mutex::new(vec![None]),
                 },
                 output,
+                finished_deliveries,
+                read_timeouts,
+                write_timeouts,
             )
         }
     }
@@ -5252,11 +5310,19 @@ mod tests {
             &self.identity
         }
 
-        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.read_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(timeout);
             Ok(())
         }
 
-        fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.write_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(timeout);
             Ok(())
         }
 
@@ -5273,6 +5339,11 @@ mod tests {
                 return Ok(exit_codes.remove(0));
             }
             Ok(exit_codes.first().copied().flatten())
+        }
+
+        fn finish_response_delivery(&self) -> io::Result<()> {
+            self.finished_deliveries.fetch_add(1, Ordering::AcqRel);
+            Ok(())
         }
 
         fn shutdown(&self) -> io::Result<()> {
@@ -6414,13 +6485,19 @@ mod tests {
             EmbeddingCompatibility::current(true),
             operation,
         );
-        let (stream, _) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
+        let (stream, _, finished_deliveries, _, _) =
+            MemoryStream::with_delivery_tracking(encode_test_frame(&hello, &[]), true);
         let error = serve_embedding_connection(test_server_state(), Box::new(stream))
             .expect_err("stale client identity must fail");
         assert!(
             error
                 .to_string()
                 .contains("embedding_server_peer_identity_mismatch")
+        );
+        assert_eq!(
+            finished_deliveries.load(Ordering::Acquire),
+            0,
+            "an uncorrelated protocol failure must not pretend response delivery completed"
         );
     }
 
@@ -6436,6 +6513,37 @@ mod tests {
             error
                 .to_string()
                 .contains("embedding_server_frame_too_large")
+        );
+    }
+
+    #[test]
+    fn server_response_write_timeout_cannot_exceed_the_frozen_query_budget() {
+        let (stream, _, _, read_timeouts, write_timeouts) =
+            MemoryStream::with_delivery_tracking(Vec::new(), true);
+
+        configure_server_operation_timeout(&stream, 24 * 60 * 60 * 1_000)
+            .expect("configure peer-selected exchange deadline");
+
+        let expected = Some(EmbeddingClientBudgets::current().query_request);
+        assert_eq!(
+            read_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .copied()
+                .flatten(),
+            expected,
+            "a peer-selected deadline must not retain a server read beyond the frozen cap"
+        );
+        assert_eq!(
+            write_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .copied()
+                .flatten(),
+            expected,
+            "a non-reading peer must not retain a response writer beyond the frozen cap"
         );
     }
 
@@ -6669,11 +6777,27 @@ mod tests {
         );
         let mut input = encode_test_frame(&hello, &[]);
         input.extend_from_slice(&encode_test_frame(&activate, &[]));
-        let (stream, output) = MemoryStream::new(input, true);
+        let (stream, output, finished_deliveries, read_timeouts, _) =
+            MemoryStream::with_delivery_tracking(input, true);
         let state = test_server_state();
         let idle_before = state.last_work_ended_ns.load(Ordering::Acquire);
         serve_embedding_connection(Arc::clone(&state), Box::new(stream))
             .expect("observe rejection is correlated");
+        assert_eq!(
+            finished_deliveries.load(Ordering::Acquire),
+            1,
+            "a correlated final response must finish transport delivery before teardown"
+        );
+        assert_eq!(
+            read_timeouts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .copied()
+                .flatten(),
+            Some(EmbeddingClientBudgets::current().query_request),
+            "final delivery must replace the peer-selected timeout with the server-owned cap"
+        );
         assert!(state.engine.lock().expect("engine state").is_none());
         assert_eq!(
             state.last_work_ended_ns.load(Ordering::Acquire),
