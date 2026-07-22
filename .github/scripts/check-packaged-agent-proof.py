@@ -43,7 +43,7 @@ STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
 SERVER_PROOF_SCHEMA_VERSION = 1
 QUALIFICATION_SCHEMA_VERSION = 1
-SERVER_IDLE_EXIT_GRACE_MS = 2_500
+NATIVE_SERVER_TEARDOWN_GRACE_MS = 60_000
 PUBLICATION_FAULT_EVIDENCE_CONTRACT = "codestory-publication-lease-fault/v1"
 FAULT_RECOVERY_CONSISTENCY_CONTRACT = "codestory-fault-recovery-search-consistency/v1"
 RETRIEVAL_QUALITY_EVIDENCE_CONTRACT = "publishable-three-repeat-packet/v1"
@@ -3570,7 +3570,7 @@ def pin_temporary_package_server(
         require(isinstance(entry, dict), "temporary package cleanup waiter is malformed")
         if entry.get("identity") == (pid, process_start_id):
             return entry
-    verified_live_executable(
+    verified_process = verified_live_executable(
         pid=pid,
         process_start_id=process_start_id,
         reported_sha256=server_process["executable_sha256"],
@@ -3584,10 +3584,90 @@ def pin_temporary_package_server(
             server_process.get("server_instance_id"),
             f"{label} server instance",
         ),
+        "executable_sha256": verified_process["executable_sha256"],
         "waiter": ExactProcessExitWaiter(pid, process_start_id, target_os),
     }
     waiters.append(entry)
     return entry
+
+
+def native_server_exit_wait_required(target_os: str, proof_tier: str) -> bool:
+    return target_os == "windows" and proof_tier in {
+        "calibration",
+        "hosted_package",
+        "protected_hardware",
+        "installed_runtime",
+    }
+
+
+def native_server_exit_wait_budget(manifest: dict) -> dict:
+    product_idle_timeout_ms = require_positive_int(
+        manifest["server_proof"].get("idle_timeout_ms"),
+        "native server product idle timeout",
+    )
+    return {
+        "product_idle_timeout_ms": product_idle_timeout_ms,
+        "native_teardown_grace_ms": NATIVE_SERVER_TEARDOWN_GRACE_MS,
+        "timeout_ms": product_idle_timeout_ms + NATIVE_SERVER_TEARDOWN_GRACE_MS,
+    }
+
+
+def remaining_native_server_exit_wait_ms(
+    deadline: float,
+    timeout_ms: int,
+    *,
+    now: float | None = None,
+) -> int:
+    current = time.monotonic() if now is None else now
+    remaining_ms = math.ceil((deadline - current) * 1000)
+    require(
+        remaining_ms > 0,
+        f"native server cleanup exceeded shared {timeout_ms}ms exit-wait bound",
+    )
+    return min(timeout_ms, remaining_ms)
+
+
+def retained_final_native_server_exit_evidence(
+    evidence: dict,
+    final_entry: dict,
+    wait_budget: dict,
+    *,
+    authenticated_process_count: int,
+    superseded_process_count: int,
+) -> dict:
+    require(
+        evidence.get("status") == "normal_idle_exit"
+        and evidence.get("exit_code") == 0
+        and evidence.get("clean_exit_required") is True,
+        "final authenticated server did not prove its clean idle exit",
+    )
+    require(
+        (evidence.get("pid"), evidence.get("process_start_id"))
+        == final_entry.get("identity"),
+        "final server cleanup evidence changed exact process identity",
+    )
+    executable_sha256 = require_sha256(
+        final_entry.get("executable_sha256"),
+        "final server cleanup executable sha256",
+    )
+    process_wait_timeout_ms = require_positive_int(
+        evidence.get("timeout_ms"),
+        "final server cleanup process wait timeout",
+    )
+    require(
+        process_wait_timeout_ms <= wait_budget.get("timeout_ms"),
+        "final server cleanup process wait exceeded its shared bound",
+    )
+    return {
+        **evidence,
+        "observation": "final_temporary_directory_boundary",
+        "server_instance_id": final_entry["server_instance_id"],
+        "executable_sha256": executable_sha256,
+        "process_wait_timeout_ms": process_wait_timeout_ms,
+        **wait_budget,
+        "authenticated_process_count": authenticated_process_count,
+        "superseded_process_count": superseded_process_count,
+    }
 
 
 def wait_for_final_temporary_package_server(
@@ -3599,7 +3679,7 @@ def wait_for_final_temporary_package_server(
     require_final_server: bool,
 ) -> dict | None:
     target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
-    if target_os != "windows" or args.proof_tier == "installed_runtime":
+    if not native_server_exit_wait_required(target_os, args.proof_tier):
         return None
     waiters = control.setdefault("_waiters", [])
     require(isinstance(waiters, list), "temporary package cleanup waiter state is invalid")
@@ -3704,11 +3784,17 @@ def wait_for_final_temporary_package_server(
     waiter_errors = []
     entries = list(waiters)
     control["_waiters"] = []
-    timeout_ms = (
-        manifest["server_proof"]["idle_timeout_ms"]
-        + SERVER_IDLE_EXIT_GRACE_MS
-    )
+    wait_budget = native_server_exit_wait_budget(manifest)
+    timeout_ms = wait_budget["timeout_ms"]
     final_identity = final_entry.get("identity") if final_entry is not None else None
+    entries.sort(
+        key=lambda entry: (
+            0
+            if isinstance(entry, dict) and entry.get("identity") == final_identity
+            else 1
+        )
+    )
+    shared_deadline = time.monotonic() + (timeout_ms / 1000)
     superseded_process_count = 0
     for entry in entries:
         waiter = entry.get("waiter") if isinstance(entry, dict) else None
@@ -3720,8 +3806,12 @@ def wait_for_final_temporary_package_server(
             superseded_process_count += 1
         require_clean_exit = require_final_server and not superseded
         try:
-            exit_evidence[entry["identity"]] = waiter.wait(
+            process_timeout_ms = remaining_native_server_exit_wait_ms(
+                shared_deadline,
                 timeout_ms,
+            )
+            exit_evidence[entry["identity"]] = waiter.wait(
+                process_timeout_ms,
                 require_clean_exit=require_clean_exit,
             )
         except BaseException as error:
@@ -3745,17 +3835,13 @@ def wait_for_final_temporary_package_server(
         return None
     evidence = exit_evidence.get(final_entry["identity"])
     require(isinstance(evidence, dict), "final server cleanup lost its exit evidence")
-    require(
-        evidence.get("status") == "normal_idle_exit"
-        and evidence.get("exit_code") == 0
-        and evidence.get("clean_exit_required") is True,
-        "final authenticated server did not prove its clean idle exit",
+    return retained_final_native_server_exit_evidence(
+        evidence,
+        final_entry,
+        wait_budget,
+        authenticated_process_count=len(entries),
+        superseded_process_count=superseded_process_count,
     )
-    evidence["observation"] = "final_temporary_directory_boundary"
-    evidence["server_instance_id"] = final_entry["server_instance_id"]
-    evidence["authenticated_process_count"] = len(entries)
-    evidence["superseded_process_count"] = superseded_process_count
-    return evidence
 
 
 def current_account_identity() -> str:
@@ -4340,7 +4426,7 @@ def prove_runtime(
         snapshot_a = server_snapshot(diagnostics_a, manifest, require_resident=True)
         snapshot_b = server_snapshot(diagnostics_b, manifest, require_resident=True)
         shared_identity = shared_server_identity(snapshot_a, snapshot_b)
-        if target_os == "windows" and args.proof_tier != "installed_runtime":
+        if target_os == "windows":
             pin_temporary_package_server(
                 server_cleanup_control,
                 snapshot_a["process"],
@@ -9918,6 +10004,90 @@ def self_test() -> None:
         and exit_evidence["process_start_id"] == exit_process_start,
         "exact process normal-exit wait self-test failed",
     )
+    require(
+        native_server_exit_wait_required("windows", "installed_runtime")
+        and native_server_exit_wait_required("windows", "protected_hardware")
+        and not native_server_exit_wait_required("linux", "installed_runtime")
+        and not native_server_exit_wait_required("macos", "installed_runtime"),
+        "native server exit-wait tier selection self-test failed",
+    )
+    exit_wait_budget = native_server_exit_wait_budget(
+        {"server_proof": {"idle_timeout_ms": 60_000}}
+    )
+    require(
+        exit_wait_budget
+        == {
+            "product_idle_timeout_ms": 60_000,
+            "native_teardown_grace_ms": 60_000,
+            "timeout_ms": 120_000,
+        },
+        "native server exit-wait budget self-test failed",
+    )
+    require(
+        remaining_native_server_exit_wait_ms(120.0, 120_000, now=0.0)
+        == 120_000
+        and remaining_native_server_exit_wait_ms(120.0, 120_000, now=60.0)
+        == 60_000,
+        "native server shared exit-wait deadline self-test failed",
+    )
+    try:
+        remaining_native_server_exit_wait_ms(120.0, 120_000, now=120.0)
+    except ProofFailure as error:
+        require(
+            "shared 120000ms exit-wait bound" in str(error),
+            "native server shared exit-wait timeout reported the wrong failure",
+        )
+    else:
+        raise ProofFailure("expired native server shared exit-wait deadline passed")
+    retained_exit = retained_final_native_server_exit_evidence(
+        {
+            "status": "normal_idle_exit",
+            "pid": 123,
+            "process_start_id": "windows:504911232000000010",
+            "exit_code": 0,
+            "clean_exit_required": True,
+            "timeout_ms": 120_000,
+        },
+        {
+            "identity": (123, "windows:504911232000000010"),
+            "server_instance_id": "self-test-server",
+            "executable_sha256": "a" * 64,
+        },
+        exit_wait_budget,
+        authenticated_process_count=2,
+        superseded_process_count=1,
+    )
+    require(
+        retained_exit["pid"] == 123
+        and retained_exit["process_start_id"] == "windows:504911232000000010"
+        and retained_exit["executable_sha256"] == "a" * 64
+        and retained_exit["exit_code"] == 0
+        and retained_exit["product_idle_timeout_ms"] == 60_000
+        and retained_exit["native_teardown_grace_ms"] == 60_000
+        and retained_exit["process_wait_timeout_ms"] == 120_000
+        and retained_exit["timeout_ms"] == 120_000
+        and retained_exit["authenticated_process_count"] == 2
+        and retained_exit["superseded_process_count"] == 1,
+        "retained final native server exit evidence self-test failed",
+    )
+    hostile_exit = dict(retained_exit)
+    hostile_exit["exit_code"] = 1
+    try:
+        retained_final_native_server_exit_evidence(
+            hostile_exit,
+            {
+                "identity": (123, "windows:504911232000000010"),
+                "server_instance_id": "self-test-server",
+                "executable_sha256": "a" * 64,
+            },
+            exit_wait_budget,
+            authenticated_process_count=2,
+            superseded_process_count=1,
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise ProofFailure("abnormal final server exit passed cleanup self-test")
     if os.name == "nt":
         with tempfile.TemporaryDirectory(
             prefix="codestory-executable-cleanup-self-test-"
