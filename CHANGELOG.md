@@ -31,6 +31,9 @@
   Windows package proof now accepts a canonical project URI returned for a
   native-identical existing project path, while resource bases, URI encoding,
   missing paths, and Unix project URI matching remain strict.
+  The dedicated Linux release-evidence service now provisions and verifies a
+  private per-user runtime authority before measuring the shared embedding
+  server, instead of failing closed when `XDG_RUNTIME_DIR` is absent.
 
 ## 0.16.0
 

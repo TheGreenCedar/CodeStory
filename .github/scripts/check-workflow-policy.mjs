@@ -1177,7 +1177,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "crates/codestory-llama-sys/model_staging.rs",
       "crates/codestory-llama-sys/Cargo.toml",
       "crates/codestory-llama-sys/tests/model_staging.rs",
+      "scripts/release-evidence/**",
       "scripts/release-evidence/serde-json-codestory-project.json",
+      "scripts/tests/release-evidence-runner-contract.test.mjs",
     ];
     for (const event of ["pull_request", "push"]) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
@@ -1191,6 +1193,9 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
+    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
+      "scripts/tests/release-evidence-runner-contract.test.mjs",
+    ]);
     requireStepRun(violations, pluginFile, job, "Check workflow syntax", [
       "node --test .github/scripts/run-actionlint.test.mjs",
       "node .github/scripts/run-actionlint.mjs",

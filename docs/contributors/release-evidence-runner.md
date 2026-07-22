@@ -88,7 +88,9 @@ Provisioning is idempotent. It:
   compiler UI fixtures from the valid-source corpus;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
 - keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
-  under the proof-owned volume.
+  under the proof-owned volume. The Actions service receives a dedicated
+  runner-owned `XDG_RUNTIME_DIR` with mode `0700`; verification rejects a
+  missing, linked, broadly accessible, or differently owned runtime authority.
 
 The runner workspace is mounted by the owned host lifecycle instead of guest
 `fstab`; this avoids boot-order races between the root disk and Colima's data
