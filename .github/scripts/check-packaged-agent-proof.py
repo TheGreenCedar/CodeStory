@@ -9672,6 +9672,10 @@ def self_test() -> None:
         identity_probes.append((left, right))
         return True
 
+    expected_identity_probe = (
+        Path("C:/Users/RUNNER~1/AppData/Local/Temp/proof"),
+        Path("C:/Users/runneradmin/AppData/Local/Temp/proof"),
+    )
     require(
         extract_resource(
             {
@@ -9689,7 +9693,8 @@ def self_test() -> None:
             samefile=same_windows_resource,
         )
         == {"native_alias": True}
-        and len(identity_probes) == 1,
+        and identity_probes == [expected_identity_probe]
+        and expected_identity_probe[0] != expected_identity_probe[1],
         "native-identical Windows project resource URI was rejected",
     )
     require(
