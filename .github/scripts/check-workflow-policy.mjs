@@ -75,8 +75,19 @@ function executableRunText(run) {
     .join("\n");
 }
 
-function argumentValues(run, flag) {
-  const tokens = run.split(/\s+/u).filter(Boolean);
+function simpleCommandTokens(run) {
+  const command = run.trim();
+  if (
+    command.length === 0
+    || /[\r\n#;&|`<>]/u.test(command)
+    || command.includes("$(")
+  ) {
+    return undefined;
+  }
+  return command.split(/\s+/u);
+}
+
+function argumentValues(tokens, flag) {
   const values = [];
   for (const [index, token] of tokens.entries()) {
     if (token === flag) {
@@ -981,7 +992,16 @@ export function managedPluginViolations(job, archiveFragment) {
   ]) {
     add(violations, run.includes(fragment), `managed plugin proof step must run ${fragment}`);
   }
-  const timeoutValues = argumentValues(run, "--timeout-secs");
+  const commandTokens = simpleCommandTokens(run);
+  add(
+    violations,
+    commandTokens?.[0] === "python"
+      && commandTokens?.[1] === ".github/scripts/check-packaged-agent-proof.py",
+    "managed plugin proof step must contain one simple checker command without comment or command-control syntax",
+  );
+  const timeoutValues = commandTokens === undefined
+    ? []
+    : argumentValues(commandTokens, "--timeout-secs");
   add(
     violations,
     timeoutValues.length === 1 && timeoutValues[0] === "1800",
