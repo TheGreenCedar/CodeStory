@@ -3275,6 +3275,11 @@ class ExactProcessExitWaiter:
             kernel = ctypes.windll.kernel32
             kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             kernel.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel.GetExitCodeProcess.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            kernel.GetExitCodeProcess.restype = ctypes.c_int
             result = kernel.WaitForSingleObject(self.handle, timeout_ms)
             require(
                 result == 0,
@@ -3284,7 +3289,17 @@ class ExactProcessExitWaiter:
                     else f"exact process {self.pid} exit wait failed with result {result}"
                 ),
             )
+            exit_code = ctypes.c_uint32()
+            require(
+                bool(kernel.GetExitCodeProcess(self.handle, ctypes.byref(exit_code))),
+                f"could not read exact process {self.pid} exit code",
+            )
+            require(
+                exit_code.value == 0,
+                f"exact process {self.pid} exited abnormally with code {exit_code.value}",
+            )
         else:
+            exit_code = None
             deadline = time.monotonic() + (timeout_ms / 1000)
             while True:
                 try:
@@ -3307,9 +3322,14 @@ class ExactProcessExitWaiter:
                 )
                 time.sleep(0.01)
         return {
-            "status": "normal_idle_exit",
+            "status": (
+                "normal_idle_exit"
+                if self.target_os == "windows"
+                else "observed_exit"
+            ),
             "pid": self.pid,
             "process_start_id": self.expected_start_id,
+            "exit_code": exit_code.value if exit_code is not None else None,
             "timeout_ms": timeout_ms,
         }
 
@@ -3439,6 +3459,111 @@ def verified_live_executable(
         "process_start_id": process_start_id,
         "executable_sha256": live_sha256,
     }
+
+
+def wait_for_final_temporary_package_server(
+    args: argparse.Namespace,
+    qualification_cli: Path,
+    env: dict[str, str],
+    runtime: dict,
+    manifest: dict,
+) -> dict | None:
+    target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
+    if target_os != "windows" or args.proof_tier == "installed_runtime":
+        return None
+    control = runtime.get("_server_cleanup_control")
+    projects = runtime.get("_qualification_projects")
+    require(
+        isinstance(control, dict)
+        and isinstance(projects, list)
+        and len(projects) == 2,
+        "runtime proof omitted final server cleanup context",
+    )
+    qualification_directory = require_nonempty_string(
+        control.get("qualification_directory"),
+        "final server cleanup qualification directory",
+    )
+    qualification_nonce = require_nonempty_string(
+        control.get("qualification_nonce"),
+        "final server cleanup qualification nonce",
+    )
+    project = Path(projects[0]).resolve()
+    cleanup_env = dict(env)
+    cleanup_env.update(
+        {
+            "CODESTORY_EMBED_QUALIFICATION_DIR": qualification_directory,
+            "CODESTORY_EMBED_QUALIFICATION_NONCE": qualification_nonce,
+        }
+    )
+    cleanup_env.pop("CODESTORY_CLI", None)
+    archive_sha256 = control.get("plugin_cli_archive_sha256")
+    if archive_sha256 is not None:
+        cleanup_env["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] = require_sha256(
+            archive_sha256,
+            "final server cleanup archive sha256",
+        )
+    else:
+        cleanup_env.pop("CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256", None)
+    host = McpProcess(
+        [
+            str(qualification_cli),
+            "serve",
+            "--stdio",
+            "--multi-project",
+            "--refresh",
+            "none",
+        ],
+        env=cleanup_env,
+        cwd=project,
+        timeout=args.timeout_secs,
+    )
+    waiter = None
+    snapshot = None
+    try:
+        host.initialize()
+        diagnostics = host.engine_diagnostics(project, "final-cleanup-diagnostics")
+        raw_snapshot = find_value(diagnostics, "embedding_server")
+        if raw_snapshot is not None:
+            require(
+                isinstance(raw_snapshot, dict),
+                "final cleanup diagnostics returned a malformed server snapshot",
+            )
+            snapshot = server_snapshot(diagnostics, manifest, require_resident=False)
+            server_process = snapshot["process"]
+            verified_live_executable(
+                pid=server_process["pid"],
+                process_start_id=server_process["process_start_id"],
+                reported_sha256=server_process["executable_sha256"],
+                expected_sha256=manifest["binary"]["sha256"],
+                target_os=target_os,
+                label="final temporary package embedding server",
+            )
+            waiter = ExactProcessExitWaiter(
+                server_process["pid"],
+                server_process["process_start_id"],
+                target_os,
+            )
+    finally:
+        host.close()
+    if waiter is None:
+        return {
+            "status": "already_absent",
+            "observation": "final_temporary_directory_boundary",
+        }
+    try:
+        evidence = waiter.wait(
+            manifest["server_proof"]["idle_timeout_ms"]
+            + SERVER_IDLE_EXIT_GRACE_MS
+        )
+    finally:
+        waiter.close()
+    require(
+        snapshot is not None,
+        "final server cleanup lost its authenticated snapshot",
+    )
+    evidence["observation"] = "final_temporary_directory_boundary"
+    evidence["server_instance_id"] = snapshot["process"]["server_instance_id"]
+    return evidence
 
 
 def current_account_identity() -> str:
@@ -3931,7 +4056,6 @@ def prove_runtime(
     require(project_a != project_b, "two-host proof requires different repositories")
 
     plugin_root = args.plugin_root.resolve()
-    target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
     provenance = (
         installed_plugin_provenance(args, plugin_root, manifest)
         if args.proof_tier == "installed_runtime"
@@ -3974,8 +4098,6 @@ def prove_runtime(
     host_b = McpProcess(command, env=qualified_env, cwd=project_b, timeout=args.timeout_secs)
     host_a_start = process_start_identity(host_a.process.pid)
     host_b_start = process_start_identity(host_b.process.pid)
-    server_exit_waiter = None
-    server_exit_evidence = None
     require(
         (host_a.process.pid, host_a_start) != (host_b.process.pid, host_b_start),
         "plugin hosts are not independent processes",
@@ -4011,21 +4133,6 @@ def prove_runtime(
         snapshot_a = server_snapshot(diagnostics_a, manifest, require_resident=True)
         snapshot_b = server_snapshot(diagnostics_b, manifest, require_resident=True)
         shared_identity = shared_server_identity(snapshot_a, snapshot_b)
-        if target_os == "windows" and args.proof_tier != "installed_runtime":
-            server_process = snapshot_a["process"]
-            verified_live_executable(
-                pid=server_process["pid"],
-                process_start_id=server_process["process_start_id"],
-                reported_sha256=server_process["executable_sha256"],
-                expected_sha256=manifest["binary"]["sha256"],
-                target_os=target_os,
-                label="temporary package embedding server",
-            )
-            server_exit_waiter = ExactProcessExitWaiter(
-                server_process["pid"],
-                server_process["process_start_id"],
-                target_os,
-            )
         require(
             identity_a["embedding_engine_instance_id"]
             == identity_b["embedding_engine_instance_id"],
@@ -4339,6 +4446,15 @@ def prove_runtime(
                 else str(cli.resolve())
             ),
             "_qualification_projects": [str(project_a), str(project_b)],
+            "_server_cleanup_control": {
+                "qualification_directory": qualified_env[
+                    "CODESTORY_EMBED_QUALIFICATION_DIR"
+                ],
+                "qualification_nonce": qualified_env[
+                    "CODESTORY_EMBED_QUALIFICATION_NONCE"
+                ],
+                "plugin_cli_archive_sha256": None,
+            },
             "_memory_observations": memory_observations,
             "_qualification_forbidden_values": [
                 str(project_a),
@@ -4376,16 +4492,6 @@ def prove_runtime(
         )
         host_a.close()
         host_b.close()
-        if server_exit_waiter is not None:
-            try:
-                server_exit_evidence = server_exit_waiter.wait(
-                    manifest["server_proof"]["idle_timeout_ms"]
-                    + SERVER_IDLE_EXIT_GRACE_MS
-                )
-            finally:
-                server_exit_waiter.close()
-    if server_exit_evidence is not None:
-        result["temporary_package_cleanup"] = server_exit_evidence
     assert_no_legacy_state(Path(qualified_env["CODESTORY_CACHE_ROOT"]))
     public_runtime_evidence = out_dir / "two-host-server-proof.json"
     write_json(public_runtime_evidence, retained_runtime_evidence(result))
@@ -8511,6 +8617,11 @@ def produce_qualification_evidence(
     qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(private_root.resolve())
     qualification_env["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
     qualification_env["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] = archive_sha256
+    runtime["_server_cleanup_control"] = {
+        "qualification_directory": str(private_root.resolve()),
+        "qualification_nonce": nonce,
+        "plugin_cli_archive_sha256": archive_sha256,
+    }
     fault_recovery_consistency_evidence = None
     if args.publication_fault_evidence is None:
         (
@@ -8593,6 +8704,9 @@ def produce_qualification_evidence(
         "output_directory": str(artifact_root.resolve()),
     }
     qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(
+        artifact_root.resolve()
+    )
+    runtime["_server_cleanup_control"]["qualification_directory"] = str(
         artifact_root.resolve()
     )
     request_path = artifact_root / "request.json"
@@ -9482,7 +9596,8 @@ def self_test() -> None:
     finally:
         exit_waiter.close()
     require(
-        exit_evidence["status"] == "normal_idle_exit"
+        exit_evidence["status"]
+        == ("normal_idle_exit" if os.name == "nt" else "observed_exit")
         and exit_evidence["pid"] == exit_process.pid
         and exit_evidence["process_start_id"] == exit_process_start,
         "exact process normal-exit wait self-test failed",
@@ -9518,6 +9633,40 @@ def self_test() -> None:
             not cleanup_root.exists(),
             "exact process exit wait left its Windows executable locked",
         )
+        abnormal_process = subprocess.Popen(
+            [
+                str(Path(os.environ["SystemRoot"]) / "System32" / "ping.exe"),
+                "-n",
+                "30",
+                "127.0.0.1",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        abnormal_start = process_start_identity(abnormal_process.pid)
+        abnormal_waiter = ExactProcessExitWaiter(
+            abnormal_process.pid,
+            abnormal_start,
+            self_target_os,
+        )
+        try:
+            abnormal_process.terminate()
+            abnormal_process.wait(timeout=5)
+            try:
+                abnormal_waiter.wait(5_000)
+            except ProofFailure as error:
+                require(
+                    "exited abnormally with code" in str(error),
+                    f"abnormal process exit returned the wrong failure: {error}",
+                )
+            else:
+                raise ProofFailure("abnormal process exit passed the exact exit wait")
+        finally:
+            abnormal_waiter.close()
+            if abnormal_process.poll() is None:
+                abnormal_process.kill()
+                abnormal_process.wait(timeout=5)
     timeout_waiter = ExactProcessExitWaiter(
         self_pid,
         self_start_id,
@@ -11433,8 +11582,18 @@ def main() -> int:
                     sha256(args.archive),
                     measurement_contract,
                 )
+            temporary_package_cleanup = wait_for_final_temporary_package_server(
+                args,
+                qualification_cli,
+                env,
+                runtime,
+                manifest,
+            )
+            if temporary_package_cleanup is not None:
+                runtime["temporary_package_cleanup"] = temporary_package_cleanup
             runtime.pop("_qualification_cli_path", None)
             runtime.pop("_qualification_projects", None)
+            runtime.pop("_server_cleanup_control", None)
             runtime.pop("_memory_observations", None)
             summary["runtime"] = runtime
             summary["package_contract"]["runtime_evidence"] = verify_runtime_against_manifest(

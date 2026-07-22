@@ -15,8 +15,8 @@
   Native dependency manifests now use a deterministic case-sensitive tie-break
   after case-insensitive ordering, preserving exact import spellings while
   keeping package and archive-smoke inspection identical across processes.
-  Windows package proof now pins the exact candidate server process identity and
-  waits for its normal bounded idle exit before removing the unpacked archive.
+  Windows package proof now pins the final exact candidate server process and
+  requires its bounded clean idle exit before removing the unpacked archive.
 
 ## 0.16.0
 
