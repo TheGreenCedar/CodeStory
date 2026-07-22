@@ -965,6 +965,7 @@ export function managedPluginViolations(job, archiveFragment) {
     "--engine-policy cpu_explicit",
     "--expected-backend CPU",
     "--offline",
+    "--timeout-secs 1800",
   ]) {
     add(violations, run.includes(fragment), `managed plugin proof step must run ${fragment}`);
   }
