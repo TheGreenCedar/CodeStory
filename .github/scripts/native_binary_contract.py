@@ -27,6 +27,11 @@ def _cstring(data: bytes, offset: int, limit: int | None = None) -> str:
         raise NativeBinaryError("native dependency name is not UTF-8") from exc
 
 
+def _sorted_unique_dependencies(names: list[str]) -> list[str]:
+    """Return exact dependency spellings in a deterministic total order."""
+    return sorted(set(names), key=lambda name: (name.lower(), name))
+
+
 def inspect_binary(path: Path) -> dict[str, object]:
     data = path.read_bytes()
     if data.startswith(b"\x7fELF"):
@@ -194,7 +199,7 @@ def _inspect_elf(data: bytes) -> dict[str, object]:
         end = strtab_offset + (strtab_size or len(data) - strtab_offset)
         _require(end <= len(data), "ELF string table is truncated")
         needed = [_cstring(data, strtab_offset + value, end) for value in needed_offsets]
-    return {"format": "elf", "arch": arch, "needed": sorted(set(needed), key=str.lower)}
+    return {"format": "elf", "arch": arch, "needed": _sorted_unique_dependencies(needed)}
 
 
 def _inspect_pe(data: bytes) -> dict[str, object]:
@@ -269,7 +274,7 @@ def _inspect_pe(data: bytes) -> dict[str, object]:
                 name_rva -= image_base
             needed.append(_cstring(data, rva_to_offset(name_rva)))
             cursor += 32
-    return {"format": "pe", "arch": arch, "needed": sorted(set(needed), key=str.lower)}
+    return {"format": "pe", "arch": arch, "needed": _sorted_unique_dependencies(needed)}
 
 
 def _inspect_macho(data: bytes) -> dict[str, object]:
@@ -292,4 +297,4 @@ def _inspect_macho(data: bytes) -> dict[str, object]:
             _require(0 < name_offset < size, "Mach-O dylib name offset is invalid")
             needed.append(_cstring(data, cursor + name_offset, cursor + size))
         cursor += size
-    return {"format": "mach-o", "arch": arch, "needed": sorted(set(needed), key=str.lower)}
+    return {"format": "mach-o", "arch": arch, "needed": _sorted_unique_dependencies(needed)}
