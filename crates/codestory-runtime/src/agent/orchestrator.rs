@@ -14317,6 +14317,77 @@ mod tests {
     }
 
     #[test]
+    fn indexed_primary_file_survives_hit_merge_and_compact_packet_capping() {
+        let root = packet_temp_root("indexed-primary-file-capping");
+        let _ = std::fs::remove_dir_all(&root);
+        let adapter_path = write_packet_fixture_file(
+            &root,
+            "src/runtime/adapters.js",
+            r#"
+            const transportDrivers = { native: nativeDriver, socket: socketDriver };
+            export function chooseTransport(name) {
+              const transport = transportDrivers[name];
+              return typeof transport === 'function' ? transport : null;
+            }
+            "#,
+        );
+        let path = adapter_path.to_string_lossy().to_string();
+
+        let mut helper = test_search_hit("helper", 100.0);
+        helper.display_name = "resolveHandle".to_string();
+        helper.kind = NodeKind::FUNCTION;
+        helper.file_path = Some(path.clone());
+        helper.line = Some(3);
+
+        let mut indexed_file = test_search_hit("file", 1.0);
+        indexed_file.display_name = "adapters.js".to_string();
+        indexed_file.kind = NodeKind::FILE;
+        indexed_file.file_path = Some(path.clone());
+        indexed_file.line = Some(1);
+
+        let mut hits = vec![helper];
+        merge_search_hits(&mut hits, vec![indexed_file], 8);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].display_name, "resolveHandle");
+
+        let citations = hits
+            .iter()
+            .map(|hit| to_citation_from_hit(hit, None, None, true))
+            .collect::<Vec<_>>();
+        let prompt = "Explain how the client chooses adapters for request transport.";
+        let mut answer = packet_answer_fixture(prompt, citations);
+        rank_packet_evidence(prompt, &mut answer);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 8 * 1024,
+        };
+        let _budget = apply_packet_budget_with_extra(
+            &root,
+            prompt,
+            PacketTaskClassDto::ArchitectureExplanation,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+            &["adapters".to_string()],
+        );
+
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].kind, NodeKind::FILE);
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some(path.as_str())
+        );
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_probe_citations promoted=1")
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn evidence_edge_ids_are_sorted_and_filtered() {
         let graph = GraphResponse {
             center_id: codestory_contracts::api::NodeId("1".to_string()),

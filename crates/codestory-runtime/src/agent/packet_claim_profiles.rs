@@ -4,7 +4,6 @@ use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management,
     packet_citation_owns_request_pipeline, packet_evidence_role,
-    packet_source_proves_transport_adapter_selection,
 };
 use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
@@ -354,9 +353,7 @@ impl<'a> SourceClaimContext<'a> {
             symbol,
             kind: citation.kind,
             evidence_role: packet_evidence_role(citation),
-            owns_request_pipeline: packet_citation_owns_request_pipeline(citation)
-                || (matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-                    && crate::terminal_symbol_segment(&citation.display_name) == "_request"),
+            owns_request_pipeline: packet_citation_owns_request_pipeline(citation),
             owns_interceptor_management: packet_citation_owns_interceptor_management(citation),
             path,
             file_name,
@@ -659,7 +656,16 @@ fn interceptor_management_claim(ctx: &SourceClaimContext<'_>) -> Option<String> 
 }
 
 fn transport_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    if packet_source_proves_transport_adapter_selection(ctx.source) {
+    if packet_source_has_all(
+        ctx.source,
+        &[
+            "knownadapters",
+            "getadapter",
+            "return adapter",
+            "xhr",
+            "http",
+        ],
+    ) {
         return Some(format!(
             "`{}` selects xhr or http transport based on environment capabilities.",
             ctx.file_name
@@ -2675,6 +2681,28 @@ mod tests {
             "a request-suffixed method must not inherit the request declaration: {retry_claims:?}"
         );
 
+        let mut private_request_method =
+            test_packet_citation("Client.prototype._request", "src/client.js");
+        private_request_method.kind = NodeKind::METHOD;
+        let private_request_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &private_request_method,
+            r#"
+            class Client {
+              _request(config) { return config }
+              request(config) {
+                config = merge(defaults, config)
+                this.interceptors.request.forEach(run)
+                return dispatchTransport(config)
+              }
+            }
+            "#,
+        );
+        assert!(
+            private_request_claims.is_empty(),
+            "_request must not inherit a co-located request pipeline: {private_request_claims:?}"
+        );
+
         let mut request_method = test_packet_citation("Client.prototype.request", "src/client.js");
         request_method.kind = NodeKind::METHOD;
         let request_claims =
@@ -2684,41 +2712,6 @@ mod tests {
                 .iter()
                 .any(|claim| claim.contains("runs request interceptors")),
             "the behavior-owning request method should retain its pipeline claim: {request_claims:?}"
-        );
-
-        let mut private_request_method =
-            test_packet_citation("Client.prototype._request", "src/client.js");
-        private_request_method.kind = NodeKind::METHOD;
-        assert!(
-            !packet_citation_owns_request_pipeline(&private_request_method),
-            "_request must not become a source-blind request probe owner"
-        );
-        let private_request_claims =
-            packet_source_derived_claims_for_citation(prompt, &private_request_method, source);
-        assert!(
-            private_request_claims
-                .iter()
-                .any(|claim| claim.contains("runs request interceptors")),
-            "the behavior-owning _request method should retain its pipeline claim: {private_request_claims:?}"
-        );
-        let unproven_private_request_claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &private_request_method,
-            "function _request(config) { return config; }",
-        );
-        assert!(
-            unproven_private_request_claims.is_empty(),
-            "_request must still prove the request pipeline from source: {unproven_private_request_claims:?}"
-        );
-
-        let mut request_suffix_method =
-            test_packet_citation("Client.prototype.send_request", "src/client.js");
-        request_suffix_method.kind = NodeKind::METHOD;
-        let request_suffix_claims =
-            packet_source_derived_claims_for_citation(prompt, &request_suffix_method, source);
-        assert!(
-            request_suffix_claims.is_empty(),
-            "an unrelated request-suffixed method must not inherit the request declaration: {request_suffix_claims:?}"
         );
 
         let mut interceptor_owner = test_packet_citation(

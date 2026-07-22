@@ -4,9 +4,9 @@
 
 ### Release
 
-- Request packet evidence recognizes exact `request` and `_request` behavior
-  owners, and exact primary-source `adapter` or `adapters` files outrank helper
-  symbols for generic transport probes without granting those helpers ownership.
+- Exact indexed primary-source files outrank helper symbols when their file stem
+  directly matches a required packet probe, without granting the helpers
+  behavior ownership.
 - Windows-only pre-publish qualification now skips unavailable ARM64 release
   evidence and retains protected Vulkan and candidate-installed provenance under
   an explicit server-behavior-only non-claim. Full release qualification remains

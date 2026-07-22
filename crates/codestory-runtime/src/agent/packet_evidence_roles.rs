@@ -1,8 +1,6 @@
-use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_display_name_is_test_like, packet_display_path,
 };
-use crate::agent::packet_source_patterns::packet_source_has_all;
 use crate::retrieval_file_role_from_path;
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
 
@@ -81,36 +79,6 @@ pub(crate) fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto
     ]
     .iter()
     .any(|operation| terminal.starts_with(operation))
-}
-
-pub(crate) fn packet_citation_owns_transport_adapter_file(citation: &AgentCitationDto) -> bool {
-    if citation.kind != NodeKind::FILE {
-        return false;
-    }
-    let Some(path) = citation.file_path.as_deref().map(packet_display_path) else {
-        return false;
-    };
-    if retrieval_file_role_from_path(&path) != crate::RetrievalFileRole::Source
-        || !matches!(packet_file_stem(&path).as_str(), "adapter" | "adapters")
-    {
-        return false;
-    }
-    packet_citation_source_text(citation)
-        .as_deref()
-        .is_some_and(packet_source_proves_transport_adapter_selection)
-}
-
-pub(crate) fn packet_source_proves_transport_adapter_selection(source: &str) -> bool {
-    packet_source_has_all(
-        source,
-        &[
-            "knownadapters",
-            "getadapter",
-            "return adapter",
-            "xhr",
-            "http",
-        ],
-    )
 }
 
 impl PacketEvidenceRole {
@@ -574,50 +542,5 @@ mod tests {
                 "configuration type must not own transport behavior: {display_name}"
             );
         }
-    }
-
-    #[test]
-    fn exact_primary_adapter_files_are_probe_owners_without_promoting_helpers() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let adapter_source = "const knownAdapters = { http, xhr }; function getAdapter(name) { const adapter = knownAdapters[name]; return adapter; }";
-        for file_name in ["adapter.ts", "adapters.js"] {
-            let path = temp.path().join(file_name);
-            std::fs::write(&path, adapter_source).expect("write adapter source");
-            let path = path.to_string_lossy();
-            let mut file = citation(&path, &path);
-            file.kind = NodeKind::FILE;
-            assert!(packet_citation_owns_transport_adapter_file(&file));
-        }
-
-        let adapter_path = temp.path().join("adapters.js");
-        assert!(!packet_citation_owns_transport_adapter_file(&citation(
-            "isResolvedHandle",
-            &adapter_path.to_string_lossy()
-        )));
-
-        let generated_dir = temp.path().join("generated");
-        std::fs::create_dir(&generated_dir).expect("create generated dir");
-        let generated_path = generated_dir.join("adapters.js");
-        std::fs::write(&generated_path, adapter_source).expect("write generated adapter source");
-        let mut generated_file = citation("adapters.js", &generated_path.to_string_lossy());
-        generated_file.kind = NodeKind::FILE;
-        assert!(!packet_citation_owns_transport_adapter_file(
-            &generated_file
-        ));
-
-        let unrelated_path = temp.path().join("adapter_factory.ts");
-        std::fs::write(&unrelated_path, adapter_source).expect("write unrelated adapter source");
-        let mut unrelated_file = citation("adapter_factory.ts", &unrelated_path.to_string_lossy());
-        unrelated_file.kind = NodeKind::FILE;
-        assert!(!packet_citation_owns_transport_adapter_file(
-            &unrelated_file
-        ));
-
-        let unproven_path = temp.path().join("adapter.js");
-        std::fs::write(&unproven_path, "export const helper = true;")
-            .expect("write unproven adapter source");
-        let mut unproven_file = citation("adapter.js", &unproven_path.to_string_lossy());
-        unproven_file.kind = NodeKind::FILE;
-        assert!(!packet_citation_owns_transport_adapter_file(&unproven_file));
     }
 }
