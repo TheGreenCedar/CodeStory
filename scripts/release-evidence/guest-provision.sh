@@ -27,6 +27,7 @@ sudo apt-get install -y --no-install-recommends \
 
 get() { jq -er "$1" "$contract"; }
 runner_root=$(get '.runner.root')
+runtime_dir="$runner_root/runtime"
 data_root=$(get '.runner.data_root')
 runner_version=$(get '.runner.version')
 runner_sha=$(get '.runner.sha256')
@@ -66,6 +67,7 @@ fi
 sudo usermod -d "$runner_root/home" codestory-runner
 sudo install -d -m 0750 -o root -g codestory-runner "$data_root"
 sudo install -d -m 0755 "$runner_root"
+test "$runtime_dir" = "$runner_root/runtime"
 if ! mountpoint -q "$runner_root"; then
   sudo mount --bind "$data_root" "$runner_root"
 fi
@@ -74,6 +76,7 @@ sudo install -d -o codestory-runner -g codestory-runner -m 0750 \
   "$runner_root/cargo" "$runner_root/rustup" "$runner_root/sccache" \
   "$runner_root/home" "$runner_root/tmp" \
   "$runner_root/drills" "$runner_root/artifacts" "$runner_root/validation"
+sudo install -d -o codestory-runner -g codestory-runner -m 0700 "$runtime_dir"
 sudo rm -rf "$runner_root/validation/codestory"
 sudo install -d -o codestory-runner -g codestory-runner -m 0750 \
   "$runner_root/validation/codestory"

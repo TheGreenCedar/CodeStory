@@ -10,6 +10,7 @@ repository=$(get '.repository')
 runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
+runtime_dir="$runner_root/runtime"
 data_root=$(get '.runner.data_root')
 drill_commit=$(get '.drill.commit')
 drill_project_manifest_sha=$(get '.drill.project_manifest_sha256')
@@ -129,6 +130,16 @@ jq -e '.cases[0].anchors == ["from_reader", "Deserializer::from_reader", "Value"
   "$runner_root/drills/real-repo-drill-cases.json" >/dev/null
 test -f "$runner_root/validation/source-sha"
 test ! -e "$runner_root/validation/codestory/.git"
+test "$runtime_dir" = "$runner_root/runtime"
+test -d "$runtime_dir"
+test ! -L "$runtime_dir"
+test "$(stat -c '%u:%g:%a' "$runtime_dir")" = \
+  "$(id -u codestory-runner):$(id -g codestory-runner):700"
+test -f "$runner_root/actions-runner/.service"
+service=$(sed -n '1p' "$runner_root/actions-runner/.service")
+test -n "$service"
+systemctl show "$service" --property=Environment --value \
+  | tr ' ' '\n' | grep -qxF "XDG_RUNTIME_DIR=$runtime_dir"
 source_sha=$(sed -n '1p' "$runner_root/validation/source-sha")
 printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{40}$'
 
@@ -166,13 +177,15 @@ jq -n --slurpfile observed "$observed_identity" \
   --arg drill_commit "$drill_commit" --arg manifest_sha "$manifest_sha" \
   --arg project_manifest_sha "$project_manifest_sha" \
   --arg source_sha "$source_sha" --argjson memory_bytes "$memory_bytes" \
-  --argjson workspace_free_bytes "$workspace_free_bytes" '
+  --argjson workspace_free_bytes "$workspace_free_bytes" \
+  --arg xdg_runtime_dir "$runtime_dir" '
   {
     schema_version:2, verified_at:$verified_at, profile_id:$profile_id,
     contract_sha256:$contract_sha, fingerprint:$fingerprint,
     observed_identity:$observed[0], observed_identity_sha256:$observed_identity_sha,
     runner:{repository:$repository,name:$runner_name,id:$runner_id,version:$runner_version,
       labels:["self-hosted","Linux","ARM64","codestory-release-evidence"],automatic_updates:false},
+    runtime:{xdg_runtime_dir:$xdg_runtime_dir,owner:"codestory-runner",mode:"0700"},
     capacity:{observed_memory_bytes:$memory_bytes,observed_workspace_free_bytes:$workspace_free_bytes},
     drill:{repository:"https://github.com/serde-rs/json.git",commit:$drill_commit,
       manifest:"/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",

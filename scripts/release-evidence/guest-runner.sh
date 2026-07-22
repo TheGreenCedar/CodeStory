@@ -10,6 +10,7 @@ runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 profile_id=$(get '.profile_id')
 runner_root=$(get '.runner.root')
+runtime_dir="$runner_root/runtime"
 runner="$runner_root/actions-runner"
 registration="$runner/.runner"
 
@@ -62,6 +63,11 @@ inspect() {
 
 install_service() {
   test "$binary_version" = "$runner_version"
+  test "$runtime_dir" = "$runner_root/runtime"
+  test -d "$runtime_dir"
+  test ! -L "$runtime_dir"
+  test "$(stat -c '%u:%g:%a' "$runtime_dir")" = \
+    "$(id -u codestory-runner):$(id -g codestory-runner):700"
   if test "$configured" != true; then
     IFS= read -r token
     test -n "$token"
@@ -92,6 +98,7 @@ install_service() {
     "Environment=RUSTUP_HOME=$runner_root/rustup" \
     "Environment=SCCACHE_DIR=$runner_root/sccache" \
     "Environment=TMPDIR=$runner_root/tmp" \
+    "Environment=XDG_RUNTIME_DIR=$runtime_dir" \
     "Environment=XDG_CACHE_HOME=$runner_root/cache/xdg" \
     "Environment=CODESTORY_CACHE_DIR=$runner_root/cache/codestory" \
     "Environment=CODESTORY_EMBED_ALLOW_CPU=1" \

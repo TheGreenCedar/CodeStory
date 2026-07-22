@@ -52,8 +52,9 @@ on:
       - crates/codestory-llama-sys/model_staging.rs
       - crates/codestory-llama-sys/Cargo.toml
       - crates/codestory-llama-sys/tests/model_staging.rs
-      - scripts/release-evidence/machine-contract.json
+      - scripts/release-evidence/**
       - scripts/release-evidence/serde-json-codestory-project.json
+      - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - .codex/environments/environment.toml
@@ -111,8 +112,9 @@ on:
       - crates/codestory-llama-sys/model_staging.rs
       - crates/codestory-llama-sys/Cargo.toml
       - crates/codestory-llama-sys/tests/model_staging.rs
-      - scripts/release-evidence/machine-contract.json
+      - scripts/release-evidence/**
       - scripts/release-evidence/serde-json-codestory-project.json
+      - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - .codex/environments/environment.toml
@@ -153,6 +155,7 @@ jobs:
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
+          scripts/tests/release-evidence-runner-contract.test.mjs
 
       - name: Check workflow policy
         run: |
