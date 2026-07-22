@@ -43,6 +43,7 @@ STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
 SERVER_PROOF_SCHEMA_VERSION = 1
 QUALIFICATION_SCHEMA_VERSION = 1
+SERVER_IDLE_EXIT_GRACE_MS = 2_500
 PUBLICATION_FAULT_EVIDENCE_CONTRACT = "codestory-publication-lease-fault/v1"
 FAULT_RECOVERY_CONSISTENCY_CONTRACT = "codestory-fault-recovery-search-consistency/v1"
 RETRIEVAL_QUALITY_EVIDENCE_CONTRACT = "publishable-three-repeat-packet/v1"
@@ -3234,6 +3235,92 @@ def process_start_identity(pid: int) -> str:
     )
 
 
+class ExactProcessExitWaiter:
+    def __init__(self, pid: int, expected_start_id: str, target_os: str):
+        self.pid = pid
+        self.expected_start_id = require_native_process_start_identity(
+            expected_start_id,
+            target_os,
+            f"process {pid} expected exit-wait identity",
+        )
+        self.target_os = target_os
+        self.handle = None
+        host_os = (
+            "windows"
+            if os.name == "nt"
+            else ("macos" if sys.platform == "darwin" else "linux")
+        )
+        require(
+            target_os == host_os,
+            f"cannot wait for a {target_os} process on a {host_os} host",
+        )
+        if target_os == "windows":
+            kernel = ctypes.windll.kernel32
+            kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel.OpenProcess.restype = ctypes.c_void_p
+            self.handle = kernel.OpenProcess(0x00100000 | 0x1000, 0, pid)
+            require(bool(self.handle), f"could not open exact process {pid} for exit wait")
+        try:
+            require(
+                process_start_identity(pid) == self.expected_start_id,
+                f"process {pid} changed identity before exit wait",
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def wait(self, timeout_ms: int) -> dict:
+        require(timeout_ms > 0, "exact process exit wait requires a positive timeout")
+        if self.target_os == "windows":
+            kernel = ctypes.windll.kernel32
+            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel.WaitForSingleObject.restype = ctypes.c_uint32
+            result = kernel.WaitForSingleObject(self.handle, timeout_ms)
+            require(
+                result == 0,
+                (
+                    f"exact process {self.pid} did not exit within {timeout_ms}ms"
+                    if result == 258
+                    else f"exact process {self.pid} exit wait failed with result {result}"
+                ),
+            )
+        else:
+            deadline = time.monotonic() + (timeout_ms / 1000)
+            while True:
+                try:
+                    current_identity = process_start_identity(self.pid)
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                except ProofFailure:
+                    try:
+                        os.kill(self.pid, 0)
+                    except ProcessLookupError:
+                        break
+                    raise
+                require(
+                    current_identity == self.expected_start_id,
+                    f"process {self.pid} changed identity during exit wait",
+                )
+                require(
+                    time.monotonic() < deadline,
+                    f"exact process {self.pid} did not exit within {timeout_ms}ms",
+                )
+                time.sleep(0.01)
+        return {
+            "status": "normal_idle_exit",
+            "pid": self.pid,
+            "process_start_id": self.expected_start_id,
+            "timeout_ms": timeout_ms,
+        }
+
+    def close(self) -> None:
+        if self.handle is not None:
+            kernel = ctypes.windll.kernel32
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
 def require_native_process_start_identity(
     identity: object,
     target_os: str,
@@ -3844,6 +3931,7 @@ def prove_runtime(
     require(project_a != project_b, "two-host proof requires different repositories")
 
     plugin_root = args.plugin_root.resolve()
+    target_os = TARGET_CONTRACTS[manifest["asset_target"]]["target_os"]
     provenance = (
         installed_plugin_provenance(args, plugin_root, manifest)
         if args.proof_tier == "installed_runtime"
@@ -3886,6 +3974,8 @@ def prove_runtime(
     host_b = McpProcess(command, env=qualified_env, cwd=project_b, timeout=args.timeout_secs)
     host_a_start = process_start_identity(host_a.process.pid)
     host_b_start = process_start_identity(host_b.process.pid)
+    server_exit_waiter = None
+    server_exit_evidence = None
     require(
         (host_a.process.pid, host_a_start) != (host_b.process.pid, host_b_start),
         "plugin hosts are not independent processes",
@@ -3921,6 +4011,21 @@ def prove_runtime(
         snapshot_a = server_snapshot(diagnostics_a, manifest, require_resident=True)
         snapshot_b = server_snapshot(diagnostics_b, manifest, require_resident=True)
         shared_identity = shared_server_identity(snapshot_a, snapshot_b)
+        if target_os == "windows" and args.proof_tier != "installed_runtime":
+            server_process = snapshot_a["process"]
+            verified_live_executable(
+                pid=server_process["pid"],
+                process_start_id=server_process["process_start_id"],
+                reported_sha256=server_process["executable_sha256"],
+                expected_sha256=manifest["binary"]["sha256"],
+                target_os=target_os,
+                label="temporary package embedding server",
+            )
+            server_exit_waiter = ExactProcessExitWaiter(
+                server_process["pid"],
+                server_process["process_start_id"],
+                target_os,
+            )
         require(
             identity_a["embedding_engine_instance_id"]
             == identity_b["embedding_engine_instance_id"],
@@ -4271,6 +4376,16 @@ def prove_runtime(
         )
         host_a.close()
         host_b.close()
+        if server_exit_waiter is not None:
+            try:
+                server_exit_evidence = server_exit_waiter.wait(
+                    manifest["server_proof"]["idle_timeout_ms"]
+                    + SERVER_IDLE_EXIT_GRACE_MS
+                )
+            finally:
+                server_exit_waiter.close()
+    if server_exit_evidence is not None:
+        result["temporary_package_cleanup"] = server_exit_evidence
     assert_no_legacy_state(Path(qualified_env["CODESTORY_CACHE_ROOT"]))
     public_runtime_evidence = out_dir / "two-host-server-proof.json"
     write_json(public_runtime_evidence, retained_runtime_evidence(result))
@@ -9351,6 +9466,44 @@ def self_test() -> None:
         pass
     else:
         raise ProofFailure("stale process start identity bypassed live image hashing")
+
+    exit_process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.05)"],
+    )
+    exit_process_start = process_start_identity(exit_process.pid)
+    exit_waiter = ExactProcessExitWaiter(
+        exit_process.pid,
+        exit_process_start,
+        self_target_os,
+    )
+    try:
+        exit_process.wait(timeout=5)
+        exit_evidence = exit_waiter.wait(5_000)
+    finally:
+        exit_waiter.close()
+    require(
+        exit_evidence["status"] == "normal_idle_exit"
+        and exit_evidence["pid"] == exit_process.pid
+        and exit_evidence["process_start_id"] == exit_process_start,
+        "exact process normal-exit wait self-test failed",
+    )
+    timeout_waiter = ExactProcessExitWaiter(
+        self_pid,
+        self_start_id,
+        self_target_os,
+    )
+    try:
+        try:
+            timeout_waiter.wait(1)
+        except ProofFailure as error:
+            require(
+                "did not exit within 1ms" in str(error),
+                "exact process exit timeout reported the wrong failure",
+            )
+        else:
+            raise ProofFailure("live process bypassed the bounded exit wait")
+    finally:
+        timeout_waiter.close()
 
     class ScriptedMcpProcess(McpProcess):
         def __init__(self, responses: list[dict]):
