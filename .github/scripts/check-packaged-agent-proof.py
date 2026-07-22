@@ -3269,7 +3269,7 @@ class ExactProcessExitWaiter:
             self.close()
             raise
 
-    def wait(self, timeout_ms: int) -> dict:
+    def wait(self, timeout_ms: int, *, require_clean_exit: bool = True) -> dict:
         require(timeout_ms > 0, "exact process exit wait requires a positive timeout")
         if self.target_os == "windows":
             kernel = ctypes.windll.kernel32
@@ -3294,10 +3294,11 @@ class ExactProcessExitWaiter:
                 bool(kernel.GetExitCodeProcess(self.handle, ctypes.byref(exit_code))),
                 f"could not read exact process {self.pid} exit code",
             )
-            require(
-                exit_code.value == 0,
-                f"exact process {self.pid} exited abnormally with code {exit_code.value}",
-            )
+            if require_clean_exit:
+                require(
+                    exit_code.value == 0,
+                    f"exact process {self.pid} exited abnormally with code {exit_code.value}",
+                )
         else:
             exit_code = None
             deadline = time.monotonic() + (timeout_ms / 1000)
@@ -3323,13 +3324,18 @@ class ExactProcessExitWaiter:
                 time.sleep(0.01)
         return {
             "status": (
-                "normal_idle_exit"
+                (
+                    "normal_idle_exit"
+                    if exit_code.value == 0
+                    else "superseded_process_exit"
+                )
                 if self.target_os == "windows"
                 else "observed_exit"
             ),
             "pid": self.pid,
             "process_start_id": self.expected_start_id,
             "exit_code": exit_code.value if exit_code is not None else None,
+            "clean_exit_required": require_clean_exit,
             "timeout_ms": timeout_ms,
         }
 
@@ -3647,13 +3653,22 @@ def wait_for_final_temporary_package_server(
         manifest["server_proof"]["idle_timeout_ms"]
         + SERVER_IDLE_EXIT_GRACE_MS
     )
+    final_identity = final_entry.get("identity") if final_entry is not None else None
+    superseded_process_count = 0
     for entry in entries:
         waiter = entry.get("waiter") if isinstance(entry, dict) else None
         if not isinstance(waiter, ExactProcessExitWaiter):
             waiter_errors.append("temporary package cleanup waiter was malformed")
             continue
+        superseded = final_identity is not None and entry.get("identity") != final_identity
+        if superseded:
+            superseded_process_count += 1
+        require_clean_exit = require_final_server and not superseded
         try:
-            exit_evidence[entry["identity"]] = waiter.wait(timeout_ms)
+            exit_evidence[entry["identity"]] = waiter.wait(
+                timeout_ms,
+                require_clean_exit=require_clean_exit,
+            )
         except BaseException as error:
             waiter_errors.append(str(error))
         finally:
@@ -3669,13 +3684,22 @@ def wait_for_final_temporary_package_server(
         failures.append(f"final observational client close failed: {host_close_error}")
     failures.extend(waiter_errors)
     require(not failures, "; ".join(failures))
+    if not require_final_server:
+        return None
     if final_entry is None:
         return None
     evidence = exit_evidence.get(final_entry["identity"])
     require(isinstance(evidence, dict), "final server cleanup lost its exit evidence")
+    require(
+        evidence.get("status") == "normal_idle_exit"
+        and evidence.get("exit_code") == 0
+        and evidence.get("clean_exit_required") is True,
+        "final authenticated server did not prove its clean idle exit",
+    )
     evidence["observation"] = "final_temporary_directory_boundary"
     evidence["server_instance_id"] = final_entry["server_instance_id"]
     evidence["authenticated_process_count"] = len(entries)
+    evidence["superseded_process_count"] = superseded_process_count
     return evidence
 
 
@@ -9791,6 +9815,16 @@ def self_test() -> None:
                 require(
                     "exited abnormally with code" in str(error),
                     f"abnormal process exit returned the wrong failure: {error}",
+                )
+                superseded_evidence = abnormal_waiter.wait(
+                    5_000,
+                    require_clean_exit=False,
+                )
+                require(
+                    superseded_evidence["status"] == "superseded_process_exit"
+                    and superseded_evidence["exit_code"] != 0
+                    and superseded_evidence["clean_exit_required"] is False,
+                    "superseded process exit lost its explicit non-clean status",
                 )
             else:
                 raise ProofFailure("abnormal process exit passed the exact exit wait")
