@@ -8,8 +8,8 @@
   evidence and retains protected Vulkan and candidate-installed provenance under
   an explicit server-behavior-only non-claim. Full release qualification remains
   strict and still requires exact-head quality evidence. Hosted Windows packages
-  build in a short runner-temporary Cargo target so nested Vulkan CMake and PDB
-  paths remain inside the native toolchain limit.
+  build through a Cargo target junction at the runner volume root so nested
+  Vulkan CMake, object, and PDB paths remain inside the native toolchain limit.
 
 ## 0.16.0
 

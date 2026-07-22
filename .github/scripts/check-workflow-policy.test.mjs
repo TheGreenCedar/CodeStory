@@ -1194,6 +1194,10 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
         .replace("New-Item -ItemType Junction", "New-Item -ItemType Directory");
     }, /Configure short Windows Cargo target/u],
+    ["packaged short Windows target stops using the runner volume root", packagedFile, workflow => {
+      packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
+        .replace("$runnerRoot = [System.IO.Path]::GetPathRoot($workspaceTarget)", "$runnerRoot = $env:RUNNER_TEMP");
+    }, /Configure short Windows Cargo target/u],
     ["packaged short Windows target points at wrong storage", packagedFile, workflow => {
       packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
         .replace("-Target $workspaceTarget", '-Target "wrong"');

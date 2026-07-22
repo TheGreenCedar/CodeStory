@@ -1716,7 +1716,9 @@ function validatePackagedProof(workflows, violations, graph) {
   );
   requireStepRun(violations, file, job, "Configure short Windows Cargo target", [
     '$workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"',
-    'Join-Path $env:RUNNER_TEMP "ct"',
+    '$runnerRoot = [System.IO.Path]::GetPathRoot($workspaceTarget)',
+    '[string]::IsNullOrWhiteSpace($runnerRoot)',
+    'Join-Path $runnerRoot "t"',
     "New-Item -ItemType Junction -Path $shortTarget -Target $workspaceTarget",
     '"CARGO_TARGET_DIR=$shortTarget" | Out-File -FilePath $env:GITHUB_ENV',
   ]);
