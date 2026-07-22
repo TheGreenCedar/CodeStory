@@ -4777,7 +4777,13 @@ fn map_bounded_exchange_error(
             Ok(Some(exit_code)) => ("exited".to_string(), Some(exit_code)),
             Ok(None) => match stream.peer_is_alive() {
                 Ok(true) => ("running".to_string(), None),
-                Ok(false) => ("exited".to_string(), None),
+                Ok(false) => match stream.peer_exit_code() {
+                    Ok(exit_code) => ("exited".to_string(), exit_code),
+                    Err(probe_error) => (
+                        format!("exited (exit-code probe failed: {probe_error})"),
+                        None,
+                    ),
+                },
                 Err(probe_error) => (format!("unknown ({probe_error})"), None),
             },
             Err(probe_error) => (format!("unknown ({probe_error})"), None),
@@ -5202,6 +5208,7 @@ mod tests {
         input: Cursor<Vec<u8>>,
         output: Arc<Mutex<Vec<u8>>>,
         alive: bool,
+        exit_codes: Mutex<Vec<Option<u32>>>,
     }
 
     impl MemoryStream {
@@ -5213,6 +5220,7 @@ mod tests {
                     input: Cursor::new(input),
                     output: Arc::clone(&output),
                     alive,
+                    exit_codes: Mutex::new(vec![None]),
                 },
                 output,
             )
@@ -5254,6 +5262,17 @@ mod tests {
 
         fn peer_is_alive(&self) -> io::Result<bool> {
             Ok(self.alive)
+        }
+
+        fn peer_exit_code(&self) -> io::Result<Option<u32>> {
+            let mut exit_codes = self
+                .exit_codes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if exit_codes.len() > 1 {
+                return Ok(exit_codes.remove(0));
+            }
+            Ok(exit_codes.first().copied().flatten())
         }
 
         fn shutdown(&self) -> io::Result<()> {
@@ -6458,6 +6477,21 @@ mod tests {
 
         assert!(embedding_retry_state(&error).is_none());
         assert_eq!(error.to_string(), "read embedding control length");
+    }
+
+    #[test]
+    fn bounded_exchange_reprobes_exit_code_after_liveness_observes_exit() {
+        let raw_error = io::Error::from_raw_os_error(233);
+        let normalized = io::Error::new(io::ErrorKind::NotConnected, raw_error);
+        let source = anyhow::Error::new(normalized).context("read embedding control length");
+        let (mut stream, _) = MemoryStream::new(Vec::new(), false);
+        stream.exit_codes = Mutex::new(vec![None, Some(0xc000_0005)]);
+
+        let error = map_bounded_exchange_error(source, &stream);
+        let retry = embedding_retry_state(&error).expect("typed connection loss");
+
+        assert!(retry.message.contains("peer_state=exited"));
+        assert!(retry.message.contains("peer_exit_code=3221225477"));
     }
 
     #[test]
