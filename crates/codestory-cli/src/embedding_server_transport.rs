@@ -5,6 +5,7 @@
 //! that prove one local OS user is talking to one lifetime authority.
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -23,7 +24,36 @@ const QUALIFICATION_DIR_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_DIR";
 const QUALIFICATION_NONCE_ENV: &str = "CODESTORY_EMBED_QUALIFICATION_NONCE";
 const ENDPOINT_NAMESPACE: &str = "codestory-per-user-embedding-v1";
 const CHILD_STDERR_TAIL_BYTES: usize = 8 * 1024;
+const EXECUTABLE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
 type TransportIdentity = codestory_retrieval::EmbeddingTransportIdentity;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientTransportMode {
+    SpawnCapable,
+    ObserveOnly,
+}
+
+trait ExecutableAttestationStore {
+    fn endpoint_namespace_id(&self) -> &str;
+    fn read(&self) -> Result<Option<Vec<u8>>>;
+    fn publish(&self, content: &[u8]) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutableDigestAttestation {
+    schema_version: u32,
+    endpoint_namespace_id: String,
+    platform: String,
+    architecture: String,
+    executable_version: String,
+    native_file_identity: String,
+    file_size: u64,
+    write_stamp: String,
+    change_stamp: String,
+    executable_sha256: String,
+    record_sha256: String,
+}
 
 #[derive(Debug)]
 pub(crate) enum NativeConnectOutcome {
@@ -50,11 +80,42 @@ pub(crate) struct ExactExecutable {
 impl ExactExecutable {
     pub(crate) fn capture() -> Result<Self> {
         let path = std::env::current_exe().context("resolve current CodeStory executable")?;
+        let mut digest = sha256_reader;
+        Self::capture_path(path, ClientTransportMode::SpawnCapable, None, &mut digest)
+    }
+
+    fn capture_for_client(mode: ClientTransportMode) -> Result<Self> {
+        let path = std::env::current_exe().context("resolve current CodeStory executable")?;
+        let store = matches!(mode, ClientTransportMode::ObserveOnly)
+            .then(platform::executable_attestation_store)
+            .and_then(Result::ok)
+            .flatten();
+        let mut digest = sha256_reader;
+        Self::capture_path(
+            path,
+            mode,
+            store.as_ref().map(|store| store as _),
+            &mut digest,
+        )
+    }
+
+    fn capture_path(
+        path: PathBuf,
+        mode: ClientTransportMode,
+        store: Option<&dyn ExecutableAttestationStore>,
+        digest: &mut dyn FnMut(&File, &Path) -> Result<String>,
+    ) -> Result<Self> {
         let file = File::open(&path)
             .with_context(|| format!("open current executable {}", path.display()))?;
         let before = executable_file_identity(&file)
             .with_context(|| format!("inspect current executable {}", path.display()))?;
-        let sha256 = sha256_reader(&file, &path)?;
+        let attested_sha256 = matches!(mode, ClientTransportMode::ObserveOnly)
+            .then(|| store.and_then(|store| read_matching_attestation(store, &before)))
+            .flatten();
+        let sha256 = match attested_sha256 {
+            Some(sha256) => sha256,
+            None => digest(&file, &path)?,
+        };
         let after = executable_file_identity(&file)
             .with_context(|| format!("reinspect current executable {}", path.display()))?;
         if before != after {
@@ -102,17 +163,23 @@ impl ExactExecutable {
 pub(crate) struct NativeEmbeddingClientTransport {
     executable: ExactExecutable,
     executable_identity: codestory_retrieval::EmbeddingExecutableIdentity,
+    mode: ClientTransportMode,
     clock: Arc<NativeAwakeClock>,
     next_spawn_generation: Arc<AtomicU64>,
 }
 
 impl NativeEmbeddingClientTransport {
     pub(crate) fn capture() -> Result<Self> {
-        let executable = ExactExecutable::capture()?;
+        Self::capture_with_mode(ClientTransportMode::SpawnCapable)
+    }
+
+    pub(crate) fn capture_with_mode(mode: ClientTransportMode) -> Result<Self> {
+        let executable = ExactExecutable::capture_for_client(mode)?;
         let executable_identity = executable_identity(&executable)?;
         Ok(Self {
             executable,
             executable_identity,
+            mode,
             clock: Arc::new(NativeAwakeClock::capture()?),
             next_spawn_generation: Arc::new(AtomicU64::new(1)),
         })
@@ -145,6 +212,9 @@ impl NativeEmbeddingClientTransport {
     pub(crate) fn spawn_exact_current_exe(
         &self,
     ) -> Result<codestory_retrieval::EmbeddingSpawnAttempt> {
+        if self.mode == ClientTransportMode::ObserveOnly {
+            bail!("embedding_server_spawn_forbidden: observe-only transport cannot spawn");
+        }
         // Keep the verified candidate open until spawn so replacement cannot
         // silently turn metadata validation into validation of one file and
         // execution of another on platforms that deny replacement of open
@@ -176,6 +246,10 @@ impl NativeEmbeddingClientTransport {
             bail!(
                 "embedding_executable_changed: current executable no longer matches the captured exact executable"
             );
+        }
+
+        if let Ok(Some(store)) = platform::executable_attestation_store() {
+            let _ = publish_attestation(&store, &self.executable);
         }
 
         let generation = self
@@ -397,9 +471,9 @@ fn run_retrieval_server(
     )
 }
 
-pub(crate) fn install_client_transport() -> Result<()> {
+pub(crate) fn install_client_transport(mode: ClientTransportMode) -> Result<()> {
     codestory_retrieval::install_embedding_client_transport(Arc::new(
-        NativeEmbeddingClientTransport::capture()?,
+        NativeEmbeddingClientTransport::capture_with_mode(mode)?,
     ))
 }
 
@@ -631,6 +705,73 @@ fn executable_identity(
     })
 }
 
+fn read_matching_attestation(
+    store: &dyn ExecutableAttestationStore,
+    identity: &ExecutableFileIdentity,
+) -> Option<String> {
+    let content = store.read().ok().flatten()?;
+    let attestation = serde_json::from_slice::<ExecutableDigestAttestation>(&content).ok()?;
+    let expected = executable_attestation(
+        store.endpoint_namespace_id(),
+        identity,
+        &attestation.executable_sha256,
+    );
+    (attestation == expected && is_sha256(&attestation.executable_sha256))
+        .then_some(attestation.executable_sha256)
+}
+
+fn publish_attestation(
+    store: &dyn ExecutableAttestationStore,
+    executable: &ExactExecutable,
+) -> Result<()> {
+    let attestation = executable_attestation(
+        store.endpoint_namespace_id(),
+        &executable.file_identity,
+        executable.sha256(),
+    );
+    let content =
+        serde_json::to_vec(&attestation).context("encode executable digest attestation")?;
+    store.publish(&content)
+}
+
+fn executable_attestation(
+    endpoint_namespace_id: &str,
+    identity: &ExecutableFileIdentity,
+    executable_sha256: &str,
+) -> ExecutableDigestAttestation {
+    let mut attestation = ExecutableDigestAttestation {
+        schema_version: EXECUTABLE_ATTESTATION_SCHEMA_VERSION,
+        endpoint_namespace_id: endpoint_namespace_id.into(),
+        platform: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        executable_version: env!("CARGO_PKG_VERSION").into(),
+        native_file_identity: identity.attestation_native_file_identity(),
+        file_size: identity.file_size,
+        write_stamp: identity.write_stamp.to_string(),
+        change_stamp: identity.change_stamp.to_string(),
+        executable_sha256: executable_sha256.into(),
+        record_sha256: String::new(),
+    };
+    attestation.record_sha256 = executable_attestation_record_sha256(&attestation);
+    attestation
+}
+
+fn executable_attestation_record_sha256(attestation: &ExecutableDigestAttestation) -> String {
+    sha256_fields(&[
+        b"codestory-executable-digest-attestation-record-v1",
+        attestation.schema_version.to_string().as_bytes(),
+        attestation.endpoint_namespace_id.as_bytes(),
+        attestation.platform.as_bytes(),
+        attestation.architecture.as_bytes(),
+        attestation.executable_version.as_bytes(),
+        attestation.native_file_identity.as_bytes(),
+        attestation.file_size.to_string().as_bytes(),
+        attestation.write_stamp.as_bytes(),
+        attestation.change_stamp.as_bytes(),
+        attestation.executable_sha256.as_bytes(),
+    ])
+}
+
 fn transport_failure(
     fallback_code: &str,
     error: anyhow::Error,
@@ -701,9 +842,32 @@ fn classify_windows_data_pipe_open_error(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableFileIdentity {
     native_identity: codestory_workspace::WorkspacePathIdentity,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
     file_size: u64,
     write_stamp: i128,
     change_stamp: i128,
+}
+
+impl ExecutableFileIdentity {
+    #[cfg(unix)]
+    fn attestation_native_file_identity(&self) -> String {
+        sha256_fields(&[
+            b"codestory-unix-executable-file-identity-v1",
+            self.device.to_string().as_bytes(),
+            self.inode.to_string().as_bytes(),
+        ])
+    }
+
+    #[cfg(windows)]
+    fn attestation_native_file_identity(&self) -> String {
+        // Windows does not consume cached executable attestations. Keep the
+        // serialized shape complete for exact-capture diagnostics without
+        // pretending last-write metadata is a strong change token.
+        "windows-fresh-hash-required".into()
+    }
 }
 
 #[cfg(unix)]
@@ -716,6 +880,8 @@ fn executable_file_identity(file: &File) -> Result<ExecutableFileIdentity> {
     }
     Ok(ExecutableFileIdentity {
         native_identity: codestory_workspace::workspace_file_identity(file)?,
+        device: metadata.dev(),
+        inode: metadata.ino(),
         file_size: metadata.len(),
         write_stamp: (i128::from(metadata.mtime()) << 64)
             | i128::from(metadata.mtime_nsec() as u64),
@@ -743,8 +909,8 @@ fn executable_file_identity(file: &File) -> Result<ExecutableFileIdentity> {
 #[cfg(unix)]
 mod platform {
     use super::{
-        ENDPOINT_NAMESPACE, NativeConnectOutcome, QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV,
-        TransportIdentity, sha256_fields,
+        ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
+        QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, TransportIdentity, sha256_fields,
     };
     use anyhow::{Context, Result, bail};
     use std::ffi::CString as UnixCString;
@@ -769,6 +935,7 @@ mod platform {
     const LOCK_NAME: &str = "codestory-embedding-v1.authority.lock";
     const PRIVATE_DIR_MODE: u32 = 0o700;
     const PRIVATE_FILE_MODE: u32 = 0o600;
+    const EXECUTABLE_ATTESTATION_MAX_BYTES: u64 = 4 * 1024;
     const ACCEPT_POLL: Duration = Duration::from_millis(10);
     const STREAM_IO_POLL: Duration = Duration::from_millis(25);
     const NO_TIMEOUT: u64 = u64::MAX;
@@ -789,6 +956,132 @@ mod platform {
         uid: u32,
         forbidden_mode_bits: u32,
         endpoint_namespace_id: String,
+    }
+
+    pub(super) struct NativeExecutableAttestationStore {
+        authority: RuntimeDirectory,
+        endpoint_namespace_id: String,
+        file_name: String,
+    }
+
+    impl ExecutableAttestationStore for NativeExecutableAttestationStore {
+        fn endpoint_namespace_id(&self) -> &str {
+            &self.endpoint_namespace_id
+        }
+
+        fn read(&self) -> Result<Option<Vec<u8>>> {
+            ensure_runtime_directory_matches(&self.authority)?;
+            let name = UnixCString::new(self.file_name.as_str())
+                .context("executable attestation name contains NUL")?;
+            let fd = unsafe {
+                libc::openat(
+                    self.authority.handle.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                return Err(error).context("open executable digest attestation");
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            validate_attestation_file(&file)?;
+            let mut content = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(EXECUTABLE_ATTESTATION_MAX_BYTES + 1)
+                .read_to_end(&mut content)
+                .context("read executable digest attestation")?;
+            if content.len() as u64 > EXECUTABLE_ATTESTATION_MAX_BYTES {
+                bail!("embedding_executable_attestation_untrusted: file exceeds size limit");
+            }
+            validate_attestation_file(&file)?;
+            ensure_runtime_directory_matches(&self.authority)?;
+            Ok(Some(content))
+        }
+
+        fn publish(&self, content: &[u8]) -> Result<()> {
+            if content.len() as u64 > EXECUTABLE_ATTESTATION_MAX_BYTES {
+                bail!("embedding_executable_attestation_too_large");
+            }
+            ensure_runtime_directory_matches(&self.authority)?;
+            static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let temp_name = format!(
+                ".{}.{}.{}.tmp",
+                self.file_name,
+                std::process::id(),
+                sequence
+            );
+            let temp = UnixCString::new(temp_name.as_str())
+                .context("temporary executable attestation name contains NUL")?;
+            let destination = UnixCString::new(self.file_name.as_str())
+                .context("executable attestation name contains NUL")?;
+            let fd = unsafe {
+                libc::openat(
+                    self.authority.handle.as_raw_fd(),
+                    temp.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    PRIVATE_FILE_MODE,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("create temporary executable digest attestation");
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let result = (|| {
+                file.write_all(content)
+                    .context("write executable digest attestation")?;
+                file.sync_all()
+                    .context("sync executable digest attestation")?;
+                validate_attestation_file(&file)?;
+                ensure_runtime_directory_matches(&self.authority)?;
+                if unsafe {
+                    libc::renameat(
+                        self.authority.handle.as_raw_fd(),
+                        temp.as_ptr(),
+                        self.authority.handle.as_raw_fd(),
+                        destination.as_ptr(),
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error())
+                        .context("publish executable digest attestation");
+                }
+                self.authority
+                    .handle
+                    .sync_all()
+                    .context("sync executable attestation authority")?;
+                ensure_runtime_directory_matches(&self.authority)
+            })();
+            if result.is_err() {
+                let _ =
+                    unsafe { libc::unlinkat(self.authority.handle.as_raw_fd(), temp.as_ptr(), 0) };
+            }
+            result
+        }
+    }
+
+    fn validate_attestation_file(file: &File) -> Result<()> {
+        let metadata = file
+            .metadata()
+            .context("inspect executable digest attestation")?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > EXECUTABLE_ATTESTATION_MAX_BYTES
+        {
+            bail!("embedding_executable_attestation_untrusted");
+        }
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -1545,6 +1838,53 @@ mod platform {
             _ => bail!(
                 "embedding_qualification_gate_incomplete: both {QUALIFICATION_DIR_ENV} and {QUALIFICATION_NONCE_ENV} are required"
             ),
+        }
+    }
+
+    pub(super) fn executable_attestation_store() -> Result<Option<NativeExecutableAttestationStore>>
+    {
+        let paths = runtime_paths()?;
+        let authority = authority_directory(&paths)?;
+        let endpoint_namespace_id = sha256_fields(&[
+            b"codestory-executable-attestation-authority-v1",
+            ENDPOINT_NAMESPACE.as_bytes(),
+            paths.namespace_salt.as_bytes(),
+            authority.dev.to_string().as_bytes(),
+            authority.ino.to_string().as_bytes(),
+            authority.uid.to_string().as_bytes(),
+        ]);
+        let file_name = format!(
+            "executable-attestation-{}.json",
+            &endpoint_namespace_id[..32]
+        );
+        Ok(Some(NativeExecutableAttestationStore {
+            authority,
+            endpoint_namespace_id,
+            file_name,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_executable_attestation_store(
+        authority_path: &Path,
+        endpoint_namespace_id: &str,
+    ) -> Result<NativeExecutableAttestationStore> {
+        let authority = validate_private_directory(authority_path, false)?
+            .context("test executable attestation authority does not exist")?;
+        Ok(NativeExecutableAttestationStore {
+            authority,
+            endpoint_namespace_id: endpoint_namespace_id.into(),
+            file_name: format!(
+                "executable-attestation-{}.json",
+                &sha256_fields(&[endpoint_namespace_id.as_bytes()])[..32]
+            ),
+        })
+    }
+
+    #[cfg(test)]
+    impl NativeExecutableAttestationStore {
+        pub(super) fn test_path(&self) -> PathBuf {
+            self.authority.path.join(&self.file_name)
         }
     }
 
@@ -2538,9 +2878,9 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::{
-        ENDPOINT_NAMESPACE, NativeConnectOutcome, QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV,
-        RetainedWindowsAuthorityState, TransportIdentity, awake_deadline_ns,
-        classify_windows_data_pipe_open_error, sha256_fields,
+        ENDPOINT_NAMESPACE, ExecutableAttestationStore, NativeConnectOutcome,
+        QUALIFICATION_DIR_ENV, QUALIFICATION_NONCE_ENV, RetainedWindowsAuthorityState,
+        TransportIdentity, awake_deadline_ns, classify_windows_data_pipe_open_error, sha256_fields,
     };
     use anyhow::{Context, Result, bail};
     use std::ffi::c_void;
@@ -2589,6 +2929,27 @@ mod platform {
     const PIPE_IO_POLL: Duration = Duration::from_millis(1);
     const PIPE_CONNECT_POLL: Duration = Duration::from_millis(25);
     const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+
+    pub(super) struct NativeExecutableAttestationStore;
+
+    impl ExecutableAttestationStore for NativeExecutableAttestationStore {
+        fn endpoint_namespace_id(&self) -> &str {
+            unreachable!("Windows executable attestations are never cached")
+        }
+
+        fn read(&self) -> Result<Option<Vec<u8>>> {
+            unreachable!("Windows executable attestations are never cached")
+        }
+
+        fn publish(&self, _content: &[u8]) -> Result<()> {
+            unreachable!("Windows executable attestations are never cached")
+        }
+    }
+
+    pub(super) fn executable_attestation_store() -> Result<Option<NativeExecutableAttestationStore>>
+    {
+        Ok(None)
+    }
 
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
@@ -3840,6 +4201,56 @@ mod platform {
 mod tests {
     use super::*;
 
+    struct TestAttestationStore {
+        endpoint_namespace_id: String,
+        content: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    impl TestAttestationStore {
+        fn new(endpoint_namespace_id: &str) -> Self {
+            Self {
+                endpoint_namespace_id: endpoint_namespace_id.into(),
+                content: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn replace(&self, content: Option<Vec<u8>>) {
+            *self.content.lock().expect("test attestation content") = content;
+        }
+    }
+
+    impl ExecutableAttestationStore for TestAttestationStore {
+        fn endpoint_namespace_id(&self) -> &str {
+            &self.endpoint_namespace_id
+        }
+
+        fn read(&self) -> Result<Option<Vec<u8>>> {
+            Ok(self
+                .content
+                .lock()
+                .expect("test attestation content")
+                .clone())
+        }
+
+        fn publish(&self, content: &[u8]) -> Result<()> {
+            self.replace(Some(content.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn capture_test_file(
+        path: &Path,
+        mode: ClientTransportMode,
+        store: Option<&dyn ExecutableAttestationStore>,
+        digest_calls: &mut usize,
+    ) -> Result<ExactExecutable> {
+        let mut digest = |file: &File, path: &Path| {
+            *digest_calls += 1;
+            sha256_reader(file, path)
+        };
+        ExactExecutable::capture_path(path.to_path_buf(), mode, store, &mut digest)
+    }
+
     #[cfg(unix)]
     #[test]
     fn fail_stop_does_not_depend_on_a_live_stderr_reader() {
@@ -3875,6 +4286,230 @@ mod tests {
     #[test]
     fn structured_hash_separates_fields() {
         assert_ne!(sha256_fields(&[b"ab", b"c"]), sha256_fields(&[b"a", b"bc"]));
+    }
+
+    #[test]
+    fn observe_capture_reuses_only_an_exact_matching_attestation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("codestory-cli");
+        std::fs::write(&executable_path, b"exact candidate bytes")?;
+        let store = TestAttestationStore::new("normal-authority");
+
+        let mut fresh_calls = 0;
+        let fresh = capture_test_file(
+            &executable_path,
+            ClientTransportMode::SpawnCapable,
+            None,
+            &mut fresh_calls,
+        )?;
+        assert_eq!(fresh_calls, 1);
+        publish_attestation(&store, &fresh)?;
+
+        let mut warm_calls = 0;
+        let warm = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut warm_calls,
+        )?;
+        assert_eq!(
+            warm_calls, 0,
+            "a native-identity match should reuse the digest"
+        );
+        assert_eq!(warm.sha256(), fresh.sha256());
+
+        let mut substituted = serde_json::from_slice::<ExecutableDigestAttestation>(
+            &store.read()?.expect("published attestation"),
+        )?;
+        substituted.executable_sha256 = "f".repeat(64);
+        store.replace(Some(serde_json::to_vec(&substituted)?));
+        let mut substituted_calls = 0;
+        capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut substituted_calls,
+        )?;
+        assert_eq!(
+            substituted_calls, 1,
+            "a valid-shape digest substitution without a matching record checksum must fresh-hash"
+        );
+
+        store.replace(Some(br#"{"schema_version":1,"tampered":true}"#.to_vec()));
+        let mut tampered_calls = 0;
+        capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut tampered_calls,
+        )?;
+        assert_eq!(tampered_calls, 1, "tampered evidence must fresh-hash");
+
+        store.replace(None);
+        let mut missing_calls = 0;
+        capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut missing_calls,
+        )?;
+        assert_eq!(missing_calls, 1, "missing evidence must fresh-hash");
+        Ok(())
+    }
+
+    #[test]
+    fn observe_capture_invalidates_attestation_after_file_identity_change() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("codestory-cli");
+        std::fs::write(&executable_path, b"first exact candidate")?;
+        let store = TestAttestationStore::new("normal-authority");
+        let mut fresh_calls = 0;
+        let fresh = capture_test_file(
+            &executable_path,
+            ClientTransportMode::SpawnCapable,
+            None,
+            &mut fresh_calls,
+        )?;
+        publish_attestation(&store, &fresh)?;
+
+        std::fs::write(
+            &executable_path,
+            b"changed exact candidate with another size",
+        )?;
+        let mut changed_calls = 0;
+        let changed = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut changed_calls,
+        )?;
+
+        assert_eq!(changed_calls, 1);
+        assert_ne!(changed.sha256(), fresh.sha256());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observe_capture_invalidates_same_size_rewrite_with_restored_mtime() -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir()?;
+        let executable_path = directory.path().join("codestory-cli");
+        let original = b"first exact candidate";
+        let changed = b"other exact candidate";
+        assert_eq!(original.len(), changed.len());
+        std::fs::write(&executable_path, original)?;
+        let original_metadata = std::fs::metadata(&executable_path)?;
+        let store = TestAttestationStore::new("normal-authority");
+        let mut fresh_calls = 0;
+        let fresh = capture_test_file(
+            &executable_path,
+            ClientTransportMode::SpawnCapable,
+            None,
+            &mut fresh_calls,
+        )?;
+        publish_attestation(&store, &fresh)?;
+
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(&executable_path, changed)?;
+        let path = CString::new(executable_path.as_os_str().as_bytes())?;
+        let times = [
+            libc::timespec {
+                tv_sec: original_metadata.atime(),
+                tv_nsec: original_metadata.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: original_metadata.mtime(),
+                tv_nsec: original_metadata.mtime_nsec(),
+            },
+        ];
+        if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("restore test executable mtime");
+        }
+        let changed_metadata = std::fs::metadata(&executable_path)?;
+        assert_eq!(changed_metadata.len(), original_metadata.len());
+        assert_eq!(changed_metadata.mtime(), original_metadata.mtime());
+        assert_eq!(
+            changed_metadata.mtime_nsec(),
+            original_metadata.mtime_nsec()
+        );
+        assert_ne!(
+            (changed_metadata.ctime(), changed_metadata.ctime_nsec()),
+            (original_metadata.ctime(), original_metadata.ctime_nsec()),
+            "the test requires Unix change-time evidence"
+        );
+
+        let mut changed_calls = 0;
+        let observed = capture_test_file(
+            &executable_path,
+            ClientTransportMode::ObserveOnly,
+            Some(&store),
+            &mut changed_calls,
+        )?;
+        assert_eq!(changed_calls, 1, "ctime drift must force a fresh hash");
+        assert_ne!(observed.sha256(), fresh.sha256());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_attestation_store_is_private_atomic_and_namespace_isolated() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let normal = platform::test_executable_attestation_store(directory.path(), "normal")?;
+        let qualification =
+            platform::test_executable_attestation_store(directory.path(), "qualification")?;
+
+        normal.publish(b"first")?;
+        normal.publish(b"second")?;
+        assert_eq!(normal.read()?.as_deref(), Some(b"second".as_slice()));
+        assert_eq!(qualification.read()?, None);
+        assert_ne!(normal.test_path(), qualification.test_path());
+        let metadata = std::fs::symlink_metadata(normal.test_path())?;
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o077, 0);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(
+            std::fs::read_dir(directory.path())?.all(|entry| !entry
+                .expect("attestation entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "atomic publication must not leave temporary evidence"
+        );
+
+        std::fs::set_permissions(normal.test_path(), std::fs::Permissions::from_mode(0o644))?;
+        let error = normal
+            .read()
+            .expect_err("broadly readable attestation must be rejected");
+        assert!(format!("{error:#}").contains("embedding_executable_attestation_untrusted"));
+        std::fs::set_permissions(normal.test_path(), std::fs::Permissions::from_mode(0o600))?;
+        std::fs::hard_link(
+            normal.test_path(),
+            directory.path().join("attestation-link"),
+        )?;
+        let error = normal
+            .read()
+            .expect_err("multiply linked attestation must be rejected");
+        assert!(format!("{error:#}").contains("embedding_executable_attestation_untrusted"));
+        Ok(())
+    }
+
+    #[test]
+    fn observe_only_transport_cannot_authorize_server_spawn() -> Result<()> {
+        let transport =
+            NativeEmbeddingClientTransport::capture_with_mode(ClientTransportMode::ObserveOnly)?;
+        let error = transport
+            .spawn_exact_current_exe()
+            .expect_err("cached observe evidence must never authorize spawn");
+        assert!(format!("{error:#}").contains("embedding_server_spawn_forbidden"));
+        Ok(())
     }
 
     #[test]
