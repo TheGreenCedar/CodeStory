@@ -10,6 +10,8 @@
   strict and still requires exact-head quality evidence. Hosted Windows packages
   build through a Cargo target junction at the runner volume root so nested
   Vulkan CMake, object, and PDB paths remain inside the native toolchain limit.
+  Private Windows qualification directories accept ordinary and canonical path
+  spellings only when both resolve to the same native volume and file identity.
   Native dependency manifests now use a deterministic case-sensitive tie-break
   after case-insensitive ordering, preserving exact import spellings while
   keeping package and archive-smoke inspection identical across processes.

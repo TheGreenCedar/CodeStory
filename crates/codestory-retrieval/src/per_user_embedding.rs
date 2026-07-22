@@ -2502,6 +2502,7 @@ impl PinnedQualificationDirectory {
                 path.display()
             )
         })?;
+        #[cfg(not(windows))]
         if canonical != path {
             bail!("embedding_qualification_directory_untrusted");
         }
@@ -2509,6 +2510,15 @@ impl PinnedQualificationDirectory {
             .context("reinspect canonical embedding qualification directory")?;
         validate_private_qualification_directory_metadata(&metadata)?;
         let identity = native_path_identity(&canonical)?;
+        #[cfg(windows)]
+        {
+            let caller = fs::symlink_metadata(path)
+                .context("reinspect caller embedding qualification directory")?;
+            validate_private_qualification_directory_metadata(&caller)?;
+            if native_path_identity(path)? != identity {
+                bail!("embedding_qualification_directory_untrusted");
+            }
+        }
         #[cfg(unix)]
         let handle = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -7058,6 +7068,36 @@ mod tests {
                 .to_string()
                 .contains("embedding_qualification_event_log_replaced")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn qualification_gate_accepts_native_identical_windows_path_spellings() {
+        let temporary = tempfile::tempdir().expect("temporary qualification root");
+        let directory = temporary.path().join("qualification");
+        fs::create_dir(&directory).expect("qualification directory");
+        let canonical = fs::canonicalize(&directory).expect("canonical qualification directory");
+        assert_ne!(
+            directory, canonical,
+            "Windows canonicalization should expose the verbatim spelling mismatch"
+        );
+        assert_eq!(
+            native_path_identity(&directory).expect("caller directory identity"),
+            native_path_identity(&canonical).expect("canonical directory identity")
+        );
+
+        let control = server_qualification_control_from_values(
+            Some(directory.into_os_string()),
+            Some("test-nonce".into()),
+        )
+        .expect("native-identical Windows spellings are trusted")
+        .expect("qualification control is enabled");
+
+        assert_eq!(control.directory.path, canonical);
+        control
+            .directory
+            .revalidate()
+            .expect("canonical directory remains pinned");
     }
 
     #[cfg(unix)]
