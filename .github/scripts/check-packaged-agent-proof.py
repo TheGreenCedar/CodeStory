@@ -9487,6 +9487,37 @@ def self_test() -> None:
         and exit_evidence["process_start_id"] == exit_process_start,
         "exact process normal-exit wait self-test failed",
     )
+    if os.name == "nt":
+        with tempfile.TemporaryDirectory(
+            prefix="codestory-executable-cleanup-self-test-"
+        ) as cleanup_raw:
+            cleanup_root = Path(cleanup_raw)
+            cleanup_executable = cleanup_root / "proof-process.exe"
+            shutil.copy2(
+                Path(os.environ["SystemRoot"]) / "System32" / "ping.exe",
+                cleanup_executable,
+            )
+            cleanup_process = subprocess.Popen(
+                [str(cleanup_executable), "-n", "2", "127.0.0.1"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            cleanup_start = process_start_identity(cleanup_process.pid)
+            cleanup_waiter = ExactProcessExitWaiter(
+                cleanup_process.pid,
+                cleanup_start,
+                self_target_os,
+            )
+            try:
+                cleanup_waiter.wait(5_000)
+            finally:
+                cleanup_waiter.close()
+                cleanup_process.wait(timeout=5)
+        require(
+            not cleanup_root.exists(),
+            "exact process exit wait left its Windows executable locked",
+        )
     timeout_waiter = ExactProcessExitWaiter(
         self_pid,
         self_start_id,
