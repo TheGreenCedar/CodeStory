@@ -141,7 +141,11 @@ jobs:
         shell: pwsh
         run: |
           $workspaceTarget = Join-Path $env:GITHUB_WORKSPACE "target"
-          $shortTarget = Join-Path $env:RUNNER_TEMP "ct"
+          $runnerRoot = [System.IO.Path]::GetPathRoot($workspaceTarget)
+          if ([string]::IsNullOrWhiteSpace($runnerRoot)) {
+            throw "workspace target has no volume root: $workspaceTarget"
+          }
+          $shortTarget = Join-Path $runnerRoot "t"
           New-Item -ItemType Directory -Force -Path $workspaceTarget | Out-Null
           if (Test-Path -LiteralPath $shortTarget) {
             throw "short Cargo target already exists: $shortTarget"
