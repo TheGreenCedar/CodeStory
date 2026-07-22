@@ -2443,7 +2443,32 @@ function validateRemainingWorkflows(workflows, violations) {
       ],
       evidence,
     ));
+    const repoEvidence = namedStep(job, "Produce full-retrieval repo evidence");
     requireStepRun(violations, evidenceFile, job, "Produce full-retrieval repo evidence", ["--test-threads=1"]);
+    add(
+      violations,
+      object(repoEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
+        === "codestory-release-corpus-v0.16-axios-js-ts-v2",
+      `${evidenceFile} repo evidence must bind the v0.16 Axios v2 corpus`,
+    );
+    const packetEvidence = namedStep(job, "Produce publishable packet evidence");
+    add(
+      violations,
+      object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
+        === "codestory-release-corpus-v0.16-axios-js-ts-v2"
+        && object(packetEvidence?.env).CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
+          === "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json",
+      `${evidenceFile} packet evidence must bind the v0.16 Axios v2 corpus contract`,
+    );
+    const packetRun = String(packetEvidence?.run ?? "");
+    add(
+      violations,
+      packetRun.includes("--task-manifest ")
+        && packetRun.match(/--task-manifest/gu)?.length === 1
+        && !packetRun.includes("--task-suite")
+        && !packetRun.includes("--task-ids"),
+      `${evidenceFile} packet evidence must select only the corpus-bound release task manifest`,
+    );
     requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
     requireStepRun(violations, evidenceFile, job, "Emit authenticated release-evidence cells", [
       "codestory-release-cell-manifest.mjs release-evidence",

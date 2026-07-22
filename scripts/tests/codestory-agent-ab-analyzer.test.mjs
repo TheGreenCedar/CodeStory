@@ -19,6 +19,7 @@ import {
   isTrustedPublishableRepoUrl,
   isPathInside,
   loadTaskForResult,
+  loadReleaseEvidenceCorpusContract,
   loadTasks,
   manifestRepoMaterializationBlockers,
   materializeRepos,
@@ -473,6 +474,80 @@ test("rejects manifest repo and workspace paths outside the cache", async () => 
       );
     },
   );
+});
+
+test("Axios v2 release task preserves v1 evidence while binding its exact project and corpus", async () => {
+  const v1Path = path.resolve("benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json");
+  const v2Path = path.resolve("benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json");
+  const projectPath = path.resolve("benchmarks/tasks/release-evidence/axios-js-ts-codestory-project-v2.json");
+  const v1 = JSON.parse(await readFile(v1Path, "utf8"));
+  const v2 = JSON.parse(await readFile(v2Path, "utf8"));
+  for (const field of [
+    "prompt",
+    "expected_files",
+    "expected_symbols",
+    "expected_claims",
+    "forbidden_claims",
+    "quality_thresholds",
+  ]) {
+    assert.deepEqual(v2[field], v1[field], `${field} must remain identical to the retained v1 task`);
+  }
+  assert.equal(v2.id, "axios-request-dispatch-v2");
+  assert.equal(v2.suite, "release-evidence");
+  assert.equal(v2.repo.ref, "ab3f0f9a94853c821cb00f1112788ecdd3ae7ed1");
+  assert.equal(
+    createHash("sha256").update(await readFile(projectPath)).digest("hex"),
+    v2.repo.codestory_project_manifest.sha256,
+  );
+  const project = JSON.parse(await readFile(projectPath, "utf8"));
+  assert.deepEqual(
+    project.source_groups.map(({ language, source_paths: sourcePaths }) => ({ language, sourcePaths })),
+    [
+      { language: "JavaScript", sourcePaths: ["index.js", "lib"] },
+      { language: "TypeScript", sourcePaths: ["index.d.ts", "index.d.cts"] },
+    ],
+  );
+
+  const opts = {
+    taskManifest: v2Path,
+    taskSuite: null,
+    taskIds: null,
+    repoCacheDir: path.resolve("target/agent-benchmark/test-axios-v2"),
+    materializeRepos: true,
+    publishable: true,
+    packetRuntimeMode: "cold-cli",
+    repeats: 3,
+  };
+  const tasks = await loadTasks(opts);
+  const previous = {
+    commit: process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT,
+    corpusId: process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID,
+    corpusContract: process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT,
+  };
+  try {
+    process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT = "1".repeat(40);
+    process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID
+      = "codestory-release-corpus-v0.16-axios-js-ts-v2";
+    process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
+      = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json";
+    const corpus = await loadReleaseEvidenceCorpusContract(tasks, opts);
+    assert.deepEqual(corpus.task_ids, ["axios-request-dispatch-v2"]);
+    assert.deepEqual(corpus.project_manifests, {
+      "axios-request-dispatch-v2": {
+        path: "benchmarks/tasks/release-evidence/axios-js-ts-codestory-project-v2.json",
+        sha256: v2.repo.codestory_project_manifest.sha256,
+      },
+    });
+  } finally {
+    for (const [key, value] of Object.entries({
+      CODESTORY_RELEASE_EVIDENCE_COMMIT: previous.commit,
+      CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: previous.corpusId,
+      CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT: previous.corpusContract,
+    })) {
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("materialization scrubs reusable checkouts before installing the bound project manifest", async () => {

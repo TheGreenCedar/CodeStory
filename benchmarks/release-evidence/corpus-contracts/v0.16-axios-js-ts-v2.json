@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "corpus_id": "codestory-release-corpus-v0.16-axios-js-ts-v2",
+  "task_ids": [
+    "axios-request-dispatch-v2"
+  ],
+  "runtime_modes": [
+    "cold_cli_packet"
+  ],
+  "repeats": 3,
+  "task_manifests": {
+    "axios-request-dispatch-v2": {
+      "path": "benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json",
+      "sha256": "de6469568d6f21f697c4684e44ecedc39cac539c6152d31a7b3f1e415b20e058"
+    }
+  },
+  "project_manifests": {
+    "axios-request-dispatch-v2": {
+      "path": "benchmarks/tasks/release-evidence/axios-js-ts-codestory-project-v2.json",
+      "sha256": "25f426ab13a552be0b4b785c5733832d99ba99f01e215b11f9169c267a518e2e"
+    }
+  }
+}

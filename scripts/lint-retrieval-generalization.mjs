@@ -76,12 +76,14 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "prove-drill-packet-parity.mjs"),
   path.join(repoRoot, "scripts", "score-drill-ledger.mjs"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
+  path.join(repoRoot, ".github", "scripts", "check-workflow-policy.test.mjs"),
   path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
   path.join(repoRoot, ".github", "workflows", "retrieval-engine-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
 const corpusSupportNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "lint-retrieval-generalization.mjs"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
+  path.join(repoRoot, ".github", "scripts", "check-workflow-policy.test.mjs"),
 ].map((filePath) => path.resolve(filePath)));
 const allowedHarnessReferences = [
   [
