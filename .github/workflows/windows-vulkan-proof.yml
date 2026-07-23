@@ -115,7 +115,7 @@ jobs:
           fetch-depth: 0
 
       - name: Capture host evidence
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           New-Item -ItemType Directory -Force target/windows-vulkan-proof | Out-Null
           Get-ComputerInfo | Out-File target/windows-vulkan-proof/host.txt
@@ -125,7 +125,7 @@ jobs:
 
       - name: Validate candidate-installed-only mode
         if: inputs.candidate_installed_only
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           if (
             "${{ inputs.candidate_installed_proof }}" -ne "true" -or
@@ -136,7 +136,7 @@ jobs:
 
       - name: Capture source build tool evidence
         if: ${{ !inputs.use_packaged_cli_artifact }}
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           "CMAKE_GENERATOR=Ninja" | Out-File -Append target/windows-vulkan-proof/host.txt
           cmake --version | Out-File -Append target/windows-vulkan-proof/host.txt
@@ -144,7 +144,7 @@ jobs:
 
       - name: Install pinned Rust
         if: ${{ !inputs.use_packaged_cli_artifact }}
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
@@ -155,7 +155,7 @@ jobs:
 
       - name: Build and package native CLI
         if: ${{ !inputs.use_packaged_cli_artifact }}
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
           CMAKE_GENERATOR: Ninja
@@ -183,7 +183,7 @@ jobs:
           path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
           CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
@@ -222,7 +222,7 @@ jobs:
 
       - name: Prove offline Vulkan and multi-repository reuse
         if: ${{ !inputs.candidate_installed_only }}
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "0"
@@ -275,7 +275,7 @@ jobs:
 
       - name: Stage isolated candidate-managed Windows install
         if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
@@ -329,7 +329,7 @@ jobs:
 
       - name: Prove two-host candidate-installed Windows runtime
         if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           VERSION: ${{ inputs.version }}
           CODESTORY_EMBED_ALLOW_CPU: "1"

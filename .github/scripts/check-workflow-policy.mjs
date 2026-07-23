@@ -2735,6 +2735,7 @@ function validateRemainingWorkflows(workflows, violations) {
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
+    const windowsPowerShellShell = `powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"`;
     for (const stepName of [
       "Capture host evidence",
       "Validate candidate-installed-only mode",
@@ -2748,8 +2749,8 @@ function validateRemainingWorkflows(workflows, violations) {
     ]) {
       add(
         violations,
-        namedStep(job, stepName)?.shell === "powershell",
-        `${vulkanFile} ${stepName} must use built-in Windows PowerShell`,
+        namedStep(job, stepName)?.shell === windowsPowerShellShell,
+        `${vulkanFile} ${stepName} must use built-in Windows PowerShell with process-scoped execution-policy bypass`,
       );
     }
     const sourceBuildTools = namedStep(job, "Capture source build tool evidence");
@@ -2757,7 +2758,7 @@ function validateRemainingWorkflows(workflows, violations) {
       violations,
       hasExactKeys(object(sourceBuildTools), ["name", "if", "shell", "run"])
         && sourceBuildTools?.if === "${{ !inputs.use_packaged_cli_artifact }}"
-        && sourceBuildTools?.shell === "powershell",
+        && sourceBuildTools?.shell === windowsPowerShellShell,
       `${vulkanFile} source build tool evidence must remain source-only and fail closed`,
     );
     requireStepRun(violations, vulkanFile, job, "Capture source build tool evidence", [
