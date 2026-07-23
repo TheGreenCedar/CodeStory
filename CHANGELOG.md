@@ -68,9 +68,9 @@ Linux, Intel Mac, and Windows ARM are not part of this release.
 
 ### Upgrade
 
-Update the CodeStory plugin and start a fresh Codex session. The first broad
-question may take a little longer while CodeStory updates the repository's
-local index. No manual migration or cleanup is required.
+Update the CodeStory plugin and start a fresh session in your agent host. The
+first broad question may take a little longer while CodeStory updates the
+repository's local index. No manual migration or cleanup is required.
 
 ## 0.15.0
 
