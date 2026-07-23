@@ -823,6 +823,7 @@ jobs:
           --expected-backend CPU
           --offline
           --proof-tier calibration
+          --ground-only
           --timeout-secs 1800
           --out-dir target/packaged-managed-proof
 

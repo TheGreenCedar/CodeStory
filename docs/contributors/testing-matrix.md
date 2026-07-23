@@ -485,6 +485,12 @@ because a marketplace-catalog-resolved package cannot exist before publication. 
 must come from isolated installs of the exact candidate archive, initialize
 MCP, start the bundled local runtime, and complete one real `ground` request.
 They do not replace the two marketplace-catalog-resolved post-publish receipts.
+For v0.16, `check-packaged-agent-proof.py --ground-only` is the fail-closed
+receipt mode for that claim. It retains exact archive, source, plugin, managed
+binary, isolated data-root, and project-bound MCP evidence while deliberately
+skipping search, snippet, packet, shared-server, lifecycle, accelerator,
+accuracy, and performance claims. Omit `--ground-only` to run the broader
+qualification contract.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply

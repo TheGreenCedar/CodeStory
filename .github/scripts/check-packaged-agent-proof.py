@@ -4310,6 +4310,178 @@ def create_second_repository(root: Path) -> Path:
     return repo
 
 
+def prove_ground_only_runtime(
+    args: argparse.Namespace,
+    cli: Path,
+    env: dict[str, str],
+    root: Path,
+    out_dir: Path,
+    manifest: dict,
+) -> dict:
+    require(args.plugin_handoff, "ground-only proof requires the ordinary packaged plugin handoff")
+    require(args.plugin_root is not None, "--plugin-handoff requires --plugin-root")
+    require(args.project is not None, "--project is required for ground-only proof")
+    require(
+        not args.additional_project and not args.additional_query,
+        "ground-only proof accepts exactly one project",
+    )
+    project = args.project.resolve()
+    require(project.is_dir(), f"ground-only proof repository does not exist: {project}")
+
+    plugin_root = args.plugin_root.resolve()
+    provenance = (
+        installed_plugin_provenance(args, plugin_root, manifest)
+        if args.proof_tier == "installed_runtime"
+        else None
+    )
+    launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
+    require(launcher.is_file(), f"plugin launcher is missing: {launcher}")
+    node = shutil.which("node")
+    require(node is not None, "packaged plugin proof requires Node.js for the host launcher")
+    qualified_env, _qualification_control = qualification_environment(root, env)
+    qualified_env.pop("CODESTORY_CLI", None)
+    if args.proof_tier == "installed_runtime":
+        require(
+            args.installed_plugin_data is not None,
+            "installed ground-only proof requires --installed-plugin-data",
+        )
+        qualified_env["CODESTORY_PLUGIN_DATA"] = str(args.installed_plugin_data.resolve())
+        if args.installed_plugin_source == "candidate":
+            candidate_archive_sha256 = sha256(args.archive)
+            qualified_env[
+                "CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256"
+            ] = candidate_archive_sha256
+            write_private_json(
+                Path(qualified_env["CODESTORY_EMBED_QUALIFICATION_DIR"])
+                / "candidate-managed-install.json",
+                {
+                    "schema_version": 1,
+                    "purpose": "codestory-candidate-managed-install",
+                    "archive_sha256": candidate_archive_sha256,
+                    "qualification_nonce_sha256": hashlib.sha256(
+                        qualified_env[
+                            "CODESTORY_EMBED_QUALIFICATION_NONCE"
+                        ].encode("ascii")
+                    ).hexdigest(),
+                },
+            )
+    else:
+        qualified_env["CODESTORY_CLI"] = str(cli)
+
+    host = McpProcess(
+        [node, str(launcher)],
+        env=qualified_env,
+        cwd=project,
+        timeout=args.timeout_secs,
+    )
+    managed_runtime = None
+    managed_binary_path = None
+    try:
+        host.initialize()
+        ground_response, ground_attempts = host.tool_until_ready(
+            "ground",
+            {
+                "project": str(project),
+                "budget": "strict",
+            },
+            "installed-ground",
+        )
+        ground = ground_response["result"]["structuredContent"]
+        require(
+            isinstance(ground, dict) and ground,
+            f"installed runtime ground returned no structured result: {ground!r}",
+        )
+        if args.proof_tier == "installed_runtime":
+            status = host.status(project, "installed-ground-status")
+            managed_runtime = verify_managed_runtime_status(
+                status,
+                plugin_root=plugin_root,
+                manifest=manifest,
+                archive_sha256=sha256(args.archive),
+            )
+            if args.installed_plugin_source == "candidate":
+                require(
+                    managed_runtime["build_source"] == "candidate_archive"
+                    and managed_runtime["repo_ref"] == manifest["source"]["commit"],
+                    "candidate installed ground did not launch the staged candidate archive",
+                )
+            else:
+                require(
+                    managed_runtime["build_source"] == "github_release"
+                    and managed_runtime["repo_ref"]
+                    == f"v{manifest['release_version']}",
+                    "marketplace installed ground did not launch the published release archive",
+                )
+            managed_binary_path = Path(
+                require_nonempty_string(
+                    status["plugin_runtime"].get("managed_binary_path"),
+                    "installed plugin_runtime.managed_binary_path",
+                )
+            ).resolve()
+            require(
+                managed_binary_path.is_relative_to(args.installed_plugin_data.resolve()),
+                "installed managed executable is outside the installed plugin data root",
+            )
+            require(
+                managed_binary_path != cli.resolve(),
+                "installed ground proof used the unpacked package executable as its managed runtime",
+            )
+
+        result = {
+            "ground": {
+                "status": "pass",
+                "attempts": ground_attempts,
+                "project_bound": True,
+                "response_nonempty": True,
+            },
+            "installed_plugin": provenance,
+            "managed_runtime": managed_runtime,
+            "_qualification_cli_path": (
+                str(managed_binary_path)
+                if managed_binary_path is not None
+                else str(cli.resolve())
+            ),
+            "_qualification_projects": [str(project)],
+            "_qualification_forbidden_values": [
+                str(project),
+                str(plugin_root),
+                str(cli.resolve()),
+                str(root.resolve()),
+                qualified_env["CODESTORY_EMBED_QUALIFICATION_DIR"],
+                qualified_env["CODESTORY_EMBED_QUALIFICATION_NONCE"],
+                *(
+                    [str(managed_binary_path)]
+                    if managed_binary_path is not None
+                    else []
+                ),
+            ],
+            "nonclaims": {
+                claim: {
+                    "claimed": False,
+                    "reason": "installed ground proof does not establish this claim",
+                }
+                for claim in sorted(LOWER_TIER_NONCLAIMS)
+            },
+        }
+    finally:
+        write_json(
+            out_dir / "plugin-ground-mcp.json",
+            retained_mcp_transcript(host.transcript),
+        )
+        host.close()
+
+    assert_no_legacy_state(Path(qualified_env["CODESTORY_CACHE_ROOT"]))
+    public_runtime_evidence = out_dir / "installed-ground-proof.json"
+    write_json(public_runtime_evidence, retained_runtime_evidence(result))
+    forbidden_runtime_values = result.get("_qualification_forbidden_values", [])
+    for public_artifact in (
+        out_dir / "plugin-ground-mcp.json",
+        public_runtime_evidence,
+    ):
+        assert_retained_json_privacy(public_artifact, forbidden_runtime_values)
+    return result
+
+
 def prove_runtime(
     args: argparse.Namespace,
     cli: Path,
@@ -9739,6 +9911,38 @@ def build_calibration_self_test_bundle(
 
 def self_test() -> None:
     require(parse_byte_quantity("24.1M") == 25_270_682, "memory quantity parser failed")
+    valid_ground_scope = argparse.Namespace(
+        ground_only=True,
+        server_behavior_only=False,
+        version_only=False,
+        plugin_handoff=True,
+        project=Path("."),
+        produce_qualification_evidence=False,
+        qualification_evidence=None,
+        retrieval_quality_evidence=None,
+        publication_fault_evidence=None,
+        proof_tier="installed_runtime",
+    )
+    validate_runtime_claim_scope(valid_ground_scope)
+    for field, value in (
+        ("plugin_handoff", False),
+        ("project", None),
+        ("server_behavior_only", True),
+        ("produce_qualification_evidence", True),
+        ("qualification_evidence", Path("qualification.json")),
+        ("retrieval_quality_evidence", Path("quality.json")),
+        ("publication_fault_evidence", Path("fault.json")),
+    ):
+        hostile_scope = argparse.Namespace(**vars(valid_ground_scope))
+        setattr(hostile_scope, field, value)
+        try:
+            validate_runtime_claim_scope(hostile_scope)
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure(
+                f"ground-only scope accepted incompatible {field}={value!r}"
+            )
     uri_project = Path("proof root")
     node_uri = project_node_resource_uri(
         "codestory://snippet",
@@ -11941,6 +12145,34 @@ def self_test() -> None:
     print("packaged per-user embedding server proof self-test passed")
 
 
+def validate_runtime_claim_scope(args: argparse.Namespace) -> None:
+    if args.server_behavior_only:
+        require(
+            not args.version_only and args.proof_tier != "calibration",
+            "server-behavior-only proof requires a frozen non-calibration runtime tier",
+        )
+        require(
+            not args.produce_qualification_evidence
+            and args.qualification_evidence is None
+            and args.retrieval_quality_evidence is None
+            and args.publication_fault_evidence is None,
+            "server-behavior-only proof rejects qualification and retrieval-quality inputs",
+        )
+    if args.ground_only:
+        require(
+            not args.version_only and args.plugin_handoff and args.project is not None,
+            "ground-only proof requires plugin handoff and one project",
+        )
+        require(
+            not args.server_behavior_only
+            and not args.produce_qualification_evidence
+            and args.qualification_evidence is None
+            and args.retrieval_quality_evidence is None
+            and args.publication_fault_evidence is None,
+            "ground-only proof rejects server, qualification, and retrieval-quality inputs",
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", type=Path)
@@ -11968,6 +12200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qualification-evidence", type=Path)
     parser.add_argument("--produce-qualification-evidence", action="store_true")
     parser.add_argument("--server-behavior-only", action="store_true")
+    parser.add_argument("--ground-only", action="store_true")
     parser.add_argument("--publication-fault-evidence", type=Path)
     parser.add_argument("--retrieval-quality-evidence", type=Path)
     parser.add_argument("--calibration-bundle", type=Path)
@@ -12052,18 +12285,7 @@ def main() -> int:
         args.installed_plugin_provenance = args.installed_plugin_provenance.resolve()
     if args.installed_plugin_data is not None:
         args.installed_plugin_data = args.installed_plugin_data.resolve()
-    if args.server_behavior_only:
-        require(
-            not args.version_only and args.proof_tier != "calibration",
-            "server-behavior-only proof requires a frozen non-calibration runtime tier",
-        )
-        require(
-            not args.produce_qualification_evidence
-            and args.qualification_evidence is None
-            and args.retrieval_quality_evidence is None
-            and args.publication_fault_evidence is None,
-            "server-behavior-only proof rejects qualification and retrieval-quality inputs",
-        )
+    validate_runtime_claim_scope(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     require(sha256(args.archive) == expected_archive_digest(args.checksum_file, args.archive), "archive checksum mismatch")
     with FailurePreservingTemporaryDirectory(
@@ -12132,9 +12354,17 @@ def main() -> int:
                 "measurement_contract": measurement_contract,
                 "calibration_bundle": calibration_bundle,
                 "claim_scope": (
-                    "server_behavior_only"
-                    if args.server_behavior_only
-                    else "qualification"
+                    (
+                        "installed_ground"
+                        if args.proof_tier == "installed_runtime"
+                        else "packaged_ground"
+                    )
+                    if args.ground_only
+                    else (
+                        "server_behavior_only"
+                        if args.server_behavior_only
+                        else "qualification"
+                    )
                 ),
                 "highest_proof_tier": "package_structure",
             },
@@ -12148,15 +12378,25 @@ def main() -> int:
             runtime_traceback = None
             temporary_package_cleanup = None
             try:
-                runtime = prove_runtime(
-                    args,
-                    cli,
-                    env,
-                    root,
-                    args.out_dir,
-                    manifest,
-                    server_cleanup_control,
-                )
+                if args.ground_only:
+                    runtime = prove_ground_only_runtime(
+                        args,
+                        cli,
+                        env,
+                        root,
+                        args.out_dir,
+                        manifest,
+                    )
+                else:
+                    runtime = prove_runtime(
+                        args,
+                        cli,
+                        env,
+                        root,
+                        args.out_dir,
+                        manifest,
+                        server_cleanup_control,
+                    )
                 qualification_cli = Path(
                     require_nonempty_string(
                         runtime.get("_qualification_cli_path"),
@@ -12185,7 +12425,7 @@ def main() -> int:
                     env,
                     server_cleanup_control,
                     manifest,
-                    require_final_server=runtime_error is None,
+                    require_final_server=runtime_error is None and not args.ground_only,
                 )
             except BaseException as error:
                 cleanup_error = error
@@ -12204,14 +12444,44 @@ def main() -> int:
             runtime.pop("_qualification_cli_path", None)
             runtime.pop("_qualification_projects", None)
             runtime.pop("_memory_observations", None)
+            runtime.pop("_qualification_forbidden_values", None)
             summary["runtime"] = runtime
-            summary["package_contract"]["runtime_evidence"] = verify_runtime_against_manifest(
-                manifest, runtime, args.engine_policy
-            )
-            summary["package_contract"]["highest_proof_tier"] = (
-                "calibration" if args.proof_tier == "calibration" else "hosted_package"
-            )
-            if args.server_behavior_only:
+            if args.ground_only:
+                installed_runtime_provenance_proven = (
+                    args.proof_tier == "installed_runtime"
+                    and isinstance(runtime.get("installed_plugin"), dict)
+                    and isinstance(runtime.get("managed_runtime"), dict)
+                )
+                if args.proof_tier == "installed_runtime":
+                    require(
+                        installed_runtime_provenance_proven,
+                        "installed ground proof omitted exact plugin or managed runtime provenance",
+                    )
+                summary["ground_receipt"] = {
+                    "status": "pass",
+                    "runtime_tier_exercised": args.proof_tier,
+                    "project_bound": runtime["ground"]["project_bound"],
+                    "answer_quality_claim": False,
+                    "retrieval_quality_claim": False,
+                    "shared_server_claim": False,
+                    "accelerator_claim": False,
+                    "installed_runtime_provenance_proven": installed_runtime_provenance_proven,
+                }
+                summary["package_contract"]["highest_proof_tier"] = (
+                    "installed_ground"
+                    if args.proof_tier == "installed_runtime"
+                    else "packaged_ground"
+                )
+            else:
+                summary["package_contract"]["runtime_evidence"] = verify_runtime_against_manifest(
+                    manifest, runtime, args.engine_policy
+                )
+                summary["package_contract"]["highest_proof_tier"] = (
+                    "calibration" if args.proof_tier == "calibration" else "hosted_package"
+                )
+            if args.ground_only:
+                pass
+            elif args.server_behavior_only:
                 summary["server_behavior"] = {
                     "status": "pass",
                     "runtime_tier_exercised": args.proof_tier,
