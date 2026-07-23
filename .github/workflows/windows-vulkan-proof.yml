@@ -114,27 +114,12 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
-      - name: Install checksum-pinned 7-Zip bootstrap
-        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: |
-          $ErrorActionPreference = "Stop"
-          $toolRoot = Join-Path $env:RUNNER_TEMP "codestory-setup-python-tools"
-          New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
-          $sevenZip = Join-Path $toolRoot "7z.exe"
-          Invoke-WebRequest `
-            -Uri "https://www.7-zip.org/a/7zr.exe" `
-            -OutFile $sevenZip
-          $digest = (Get-FileHash -Algorithm SHA256 -Path $sevenZip).Hash.ToLowerInvariant()
-          if ($digest -ne "56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72") {
-            throw "checksum mismatch for the 7-Zip setup-python bootstrap"
-          }
-          & $sevenZip | Out-Null
-          $toolRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       - name: Install pinned Python
         uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.13"
+        env:
+          PSExecutionPolicyPreference: Bypass
 
       - name: Capture host evidence
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
