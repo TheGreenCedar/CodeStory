@@ -6,17 +6,26 @@ stable between candidates. Ordinary pull requests must not target this runner.
 
 ## v0.16 corpus boundary
 
-The v0.16 profile uses
-`codestory-release-corpus-v0.16-axios-js-ts-v1`: one Axios
-JavaScript/TypeScript task with three cold CLI packet repeats. The checked
-corpus contract binds the exact task-manifest bytes and rejects missing,
-substituted, or extra task rows. Ripgrep's pinned Rust task and project template
-remain available for follow-up diagnostics, but a retained three-repeat run
+The v0.16 measurement workflow uses
+`codestory-release-corpus-v0.16-axios-js-ts-v2`: one release-only Axios
+JavaScript/TypeScript task with three cold CLI packet repeats. Its deterministic
+CodeStory project manifest schedules `index.js` and `lib/` as JavaScript plus
+`index.d.ts` and `index.d.cts` as TypeScript. That source boundary excludes
+Axios's JSON-with-comments compiler fixtures structurally; production parsing
+and malformed-source policy are unchanged. The checked corpus contract binds
+the exact task and project-manifest bytes and rejects missing, changed, escaped,
+substituted, extra, or task-inconsistent declarations. Ripgrep's pinned Rust
+task and project template remain available for follow-up diagnostics, but a
+retained three-repeat run
 did not meet its preregistered file and citation recall thresholds, so v0.16
 makes no Ripgrep or general Rust packet-quality claim. Redis/C, shell dialects,
 and general parser completeness are also outside this release-evidence claim.
-The approved baseline profile records the corpus-contract path and SHA-256, so
-candidate evidence cannot silently widen, narrow, or replace that scope.
+The retained v1 task, corpus contract, raw evidence, and approved baseline stay
+unchanged. The first protected v2 run may establish the three raw Axios rows,
+but it cannot become release evidence until those exact bytes receive a separate
+approved, release-eligible baseline. The evaluator therefore fails closed while
+the approved profile still names v1; it cannot silently widen, narrow, or
+replace that scope.
 
 Cold CLI packet provenance is taken from the packet process that actually ran.
 It binds the packet's executed semantic stage, full sidecar diagnostics, and

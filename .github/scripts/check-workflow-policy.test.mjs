@@ -229,6 +229,36 @@ jobs: { check: { runs-on: ubuntu-latest, steps: [ { uses: vendor/action@${fullSh
   assert.deepEqual(block, flow);
 });
 
+test("release evidence policy pins the release-only Axios v2 task and corpus", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+  const file = "release-candidate-evidence.yml";
+  const mutations = [
+    ["repo corpus drifts", workflow => {
+      draftStep(workflow.jobs.measure, "Produce full-retrieval repo evidence")
+        .env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID = "codestory-release-corpus-v0.16-axios-js-ts-v1";
+    }, /repo evidence must bind the v0\.16 Axios v2 corpus/u],
+    ["packet corpus contract drifts", workflow => {
+      draftStep(workflow.jobs.measure, "Produce publishable packet evidence")
+        .env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT
+          = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json";
+    }, /packet evidence must bind the v0\.16 Axios v2 corpus contract/u],
+    ["packet task falls back to the holdout suite", workflow => {
+      const step = draftStep(workflow.jobs.measure, "Produce publishable packet evidence");
+      step.run = step.run.replace(
+        /--task-manifest [^\\\n]+/u,
+        "--task-suite holdout-retrieval --task-ids axios-request-dispatch",
+      );
+    }, /must select only the corpus-bound release task manifest/u],
+  ];
+  for (const [name, mutate, expected] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      assert.match(validateWorkflows(workflows).join("\n"), expected);
+    });
+  }
+});
+
 test("release workflows retain the closeout coordinator contract test", () => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   for (const [file, jobName] of [

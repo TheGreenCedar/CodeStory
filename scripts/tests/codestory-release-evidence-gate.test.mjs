@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -79,6 +79,115 @@ test("v0.16 release corpus contract rejects an omitted or substituted packet tas
     () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, task_id: "ripgrep-search-pipeline" })), root, identity, profile),
     /do not exactly match the checked-in release task scope/,
   );
+});
+
+function axiosV2CorpusFixture(mutate) {
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-axios-v2-corpus-"));
+  const taskRelative = "benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json";
+  const projectRelative = "benchmarks/tasks/release-evidence/axios-js-ts-codestory-project-v2.json";
+  const contractRelative = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json";
+  for (const relative of [taskRelative, projectRelative, contractRelative]) {
+    mkdirSync(path.dirname(path.join(dir, relative)), { recursive: true });
+    copyFileSync(path.join(root, relative), path.join(dir, relative));
+  }
+  const paths = {
+    task: path.join(dir, taskRelative),
+    project: path.join(dir, projectRelative),
+    contract: path.join(dir, contractRelative),
+  };
+  mutate?.(paths);
+  return { dir, paths, contractRelative };
+}
+
+function rewriteJson(filePath, mutate) {
+  const document = JSON.parse(readFileSync(filePath));
+  mutate(document);
+  writeFileSync(filePath, `${JSON.stringify(document, null, 2)}\n`);
+}
+
+function rebindTaskHash(paths) {
+  rewriteJson(paths.contract, contract => {
+    contract.task_manifests["axios-request-dispatch-v2"].sha256 = createHash("sha256")
+      .update(readFileSync(paths.task))
+      .digest("hex");
+  });
+}
+
+function validateAxiosV2Fixture(dir, paths, contractRelative) {
+  const contractBytes = readFileSync(paths.contract);
+  const contract = JSON.parse(contractBytes);
+  const identity = {
+    corpus_id: contract.corpus_id,
+    cache_id: "cold-inprocess-v1",
+    machine_fingerprint: "fixture/fingerprint",
+  };
+  const corpusContract = {
+    path: contractRelative,
+    sha256: createHash("sha256").update(contractBytes).digest("hex"),
+    corpus_id: contract.corpus_id,
+    task_ids: contract.task_ids,
+    runtime_modes: contract.runtime_modes,
+    repeats: contract.repeats,
+    task_manifests: contract.task_manifests,
+    task_repositories: { "axios-request-dispatch-v2": "axios" },
+    project_manifests: contract.project_manifests,
+  };
+  const rows = Array.from({ length: contract.repeats }, (_, index) => ({
+    repo: "axios",
+    task_id: "axios-request-dispatch-v2",
+    mode: "cold_cli_packet",
+    repeat: index + 1,
+  }));
+  return () => validatePacketCorpusContract(
+    { corpus_contract: corpusContract },
+    rows,
+    dir,
+    identity,
+    { corpus_contract: { path: contractRelative, sha256: corpusContract.sha256 } },
+  );
+}
+
+test("Axios v2 project manifest binding fails closed", async (t) => {
+  await t.test("accepts the exact checked-in task, project, and corpus bytes", () => {
+    const fixture = axiosV2CorpusFixture();
+    assert.doesNotThrow(validateAxiosV2Fixture(fixture.dir, fixture.paths, fixture.contractRelative));
+  });
+
+  const failures = [
+    ["missing", paths => rmSync(paths.project), /does not name a file/u],
+    ["changed", paths => writeFileSync(paths.project, `${readFileSync(paths.project, "utf8")}\n`), /project manifest hash does not match/u],
+    ["escaped", paths => {
+      rewriteJson(paths.task, task => {
+        task.repo.codestory_project_manifest.path = "../../../../outside-project.json";
+      });
+      rebindTaskHash(paths);
+    }, /project manifest path .* escapes its allowed directory/u],
+    ["substituted", paths => {
+      const substitute = path.join(path.dirname(paths.project), "substitute-project.json");
+      copyFileSync(paths.project, substitute);
+      rewriteJson(paths.contract, contract => {
+        contract.project_manifests["axios-request-dispatch-v2"].path
+          = "benchmarks/tasks/release-evidence/substitute-project.json";
+      });
+    }, /path does not match task declaration/u],
+    ["extra", paths => {
+      rewriteJson(paths.contract, contract => {
+        contract.project_manifests["extra-task"] = contract.project_manifests["axios-request-dispatch-v2"];
+      });
+    }, /keys must exactly match task declarations/u],
+    ["task-inconsistent", paths => {
+      rewriteJson(paths.task, task => {
+        task.repo.codestory_project_manifest.sha256 = "0".repeat(64);
+      });
+      rebindTaskHash(paths);
+    }, /hash does not match task declaration/u],
+  ];
+  for (const [name, mutate, expected] of failures) {
+    await t.test(name, () => {
+      const fixture = axiosV2CorpusFixture(mutate);
+      assert.throws(validateAxiosV2Fixture(fixture.dir, fixture.paths, fixture.contractRelative), expected);
+    });
+  }
 });
 
 test("fingerprint prefers a validated provisioned machine identity", () => {

@@ -236,6 +236,27 @@ because the v2 profile did not exist yet; its always-uploaded artifact
 The approved registry derives the fixed budgets from those retained raw bytes.
 That measurement is not repeated after registration.
 
+### Axios project-bound qualification reset
+
+Qualification run `29938499816` later failed closed while refreshing the same
+pinned Axios commit because the v1 release task had no CodeStory project
+manifest. Repository-wide discovery correctly treated three JSON-with-comments
+TypeScript fixture configs as strict JSON structural sources. The release-only
+`axios-request-dispatch-v2` task keeps the v1 prompt, expected evidence, quality
+thresholds, repository, and commit, but binds an exact project manifest with
+JavaScript sources `index.js` and `lib/` and TypeScript sources `index.d.ts` and
+`index.d.cts`. It does not add an Axios, fixture, benchmark, or JSONC exception
+to production parsing.
+
+The v2 corpus and evaluator independently bind the task and project-manifest
+paths and SHA-256 values. The workflow selects that exact task with
+`--task-manifest`; it does not add the release-only task to the general
+`holdout-retrieval` suite. Preserve the v1 task, corpus, raw evidence, and
+approved baseline bytes. Run one protected exact-head v2 measurement, retain
+all three publishable Axios rows, then approve a new baseline in a separate
+reviewed change. Until that approval exists, raw v2 measurement can pass while
+candidate evaluation remains correctly blocked by the v1 baseline identity.
+
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
 reported hashes and values in the short-lived repository Actions secret

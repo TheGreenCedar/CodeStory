@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -46,6 +46,10 @@ const RELEASE_CORPUS_CONTRACTS = new Map([
     "codestory-release-corpus-v0.16-axios-js-ts-v1",
     "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json",
   ],
+  [
+    "codestory-release-corpus-v0.16-axios-js-ts-v2",
+    "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json",
+  ],
 ]);
 
 function fail(message) { throw new Error(message); }
@@ -67,6 +71,11 @@ function fullSha(value, label) {
   return normalized;
 }
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
+function sha256Digest(value, label) {
+  const digest = text(value, label);
+  if (!SHA256.test(digest)) fail(`${label} must be a lowercase SHA-256 digest`);
+  return digest;
+}
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object") {
@@ -423,6 +432,41 @@ function statsContractFrom(repoRoot) {
   return contract;
 }
 
+function exactObjectKeys(value, expected, label) {
+  const actual = Object.keys(object(value, label)).sort();
+  const wanted = [...expected].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
+    fail(`${label} must contain exactly ${wanted.join(", ")}`);
+  }
+}
+
+function containedFile(baseDir, declaredPath, label) {
+  const selected = text(declaredPath, label);
+  if (path.isAbsolute(selected) || path.posix.isAbsolute(selected) || path.win32.isAbsolute(selected)) {
+    fail(`${label} must be relative`);
+  }
+  const resolvedBase = path.resolve(baseDir);
+  const absolutePath = path.resolve(resolvedBase, selected);
+  const relativePath = path.relative(resolvedBase, absolutePath);
+  if (relativePath === "" || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    fail(`${label} escapes its allowed directory`);
+  }
+  if (!existsSync(absolutePath) || !statSync(absolutePath).isFile()) {
+    fail(`${label} does not name a file`);
+  }
+  const realBase = realpathSync(resolvedBase);
+  const realFile = realpathSync(absolutePath);
+  const realRelative = path.relative(realBase, realFile);
+  if (realRelative === "" || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
+    fail(`${label} escapes its allowed directory`);
+  }
+  const canonicalPath = relativePath.replaceAll(path.sep, "/");
+  if (selected.replaceAll("\\", "/") !== canonicalPath) {
+    fail(`${label} must use its canonical relative path`);
+  }
+  return { absolutePath, canonicalPath };
+}
+
 function releaseCorpusContract(repoRoot, identity) {
   const relativePath = RELEASE_CORPUS_CONTRACTS.get(identity.corpus_id);
   if (!relativePath) return null;
@@ -458,20 +502,76 @@ function releaseCorpusContract(repoRoot, identity) {
     fail("release corpus contract task manifest keys must exactly match task IDs");
   }
   const taskRepositories = {};
+  const taskProjectManifests = {};
   for (const taskId of taskIds) {
     const declaration = object(contract.task_manifests[taskId], `release corpus task manifest ${taskId}`);
-    const manifestPath = path.resolve(repoRoot, text(declaration.path, `release corpus task manifest path ${taskId}`));
-    const relativeManifestPath = path.relative(repoRoot, manifestPath);
-    if (relativeManifestPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeManifestPath)) {
-      fail(`release corpus task manifest path escapes the repository for ${taskId}`);
-    }
+    exactObjectKeys(declaration, ["path", "sha256"], `release corpus task manifest ${taskId}`);
+    const { absolutePath: manifestPath } = containedFile(
+      repoRoot,
+      declaration.path,
+      `release corpus task manifest path ${taskId}`,
+    );
     const manifestBytes = readFileSync(manifestPath);
-    if (sha256(manifestBytes) !== text(declaration.sha256, `release corpus task manifest hash ${taskId}`)) {
+    if (sha256(manifestBytes) !== sha256Digest(declaration.sha256, `release corpus task manifest hash ${taskId}`)) {
       fail(`release corpus task manifest hash does not match for ${taskId}`);
     }
     const manifest = JSON.parse(manifestBytes.toString("utf8"));
     if (manifest.id !== taskId) fail(`release corpus task manifest ID does not match ${taskId}`);
     taskRepositories[taskId] = text(manifest.repo?.name, `release corpus task repository ${taskId}`);
+    const projectDeclaration = manifest.repo?.codestory_project_manifest;
+    if (projectDeclaration != null) {
+      exactObjectKeys(
+        projectDeclaration,
+        ["path", "sha256"],
+        `release task project manifest declaration ${taskId}`,
+      );
+      taskProjectManifests[taskId] = {
+        declaration: projectDeclaration,
+        taskDirectory: path.dirname(manifestPath),
+      };
+    }
+  }
+  const corpusProjectManifests = object(contract.project_manifests, "release corpus project_manifests");
+  const projectManifestIds = Object.keys(corpusProjectManifests).sort();
+  const taskProjectManifestIds = Object.keys(taskProjectManifests).sort();
+  if (JSON.stringify(projectManifestIds) !== JSON.stringify(taskProjectManifestIds)) {
+    fail("release corpus project manifest keys must exactly match task declarations");
+  }
+  for (const taskId of taskProjectManifestIds) {
+    const corpusDeclaration = object(
+      corpusProjectManifests[taskId],
+      `release corpus project manifest ${taskId}`,
+    );
+    exactObjectKeys(corpusDeclaration, ["path", "sha256"], `release corpus project manifest ${taskId}`);
+    const taskBinding = taskProjectManifests[taskId];
+    const taskDeclaration = taskBinding.declaration;
+    const taskFile = containedFile(
+      taskBinding.taskDirectory,
+      taskDeclaration.path,
+      `release task project manifest path ${taskId}`,
+    );
+    const corpusFile = containedFile(
+      repoRoot,
+      corpusDeclaration.path,
+      `release corpus project manifest path ${taskId}`,
+    );
+    if (realpathSync(taskFile.absolutePath) !== realpathSync(corpusFile.absolutePath)) {
+      fail(`release corpus project manifest path does not match task declaration for ${taskId}`);
+    }
+    const taskHash = sha256Digest(taskDeclaration.sha256, `release task project manifest hash ${taskId}`);
+    const corpusHash = sha256Digest(corpusDeclaration.sha256, `release corpus project manifest hash ${taskId}`);
+    if (taskHash !== corpusHash) {
+      fail(`release corpus project manifest hash does not match task declaration for ${taskId}`);
+    }
+    const projectBytes = readFileSync(corpusFile.absolutePath);
+    if (sha256(projectBytes) !== corpusHash) {
+      fail(`release corpus project manifest hash does not match for ${taskId}`);
+    }
+    try {
+      object(JSON.parse(projectBytes.toString("utf8")), `release corpus project manifest document ${taskId}`);
+    } catch (error) {
+      fail(`release corpus project manifest is malformed for ${taskId}: ${error.message}`);
+    }
   }
   return {
     path: relativePath,
@@ -482,7 +582,7 @@ function releaseCorpusContract(repoRoot, identity) {
     repeats: contract.repeats,
     task_manifests: contract.task_manifests,
     task_repositories: taskRepositories,
-    project_manifests: contract.project_manifests ?? {},
+    project_manifests: corpusProjectManifests,
   };
 }
 

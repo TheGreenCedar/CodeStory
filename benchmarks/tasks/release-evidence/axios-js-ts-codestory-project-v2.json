@@ -1,0 +1,36 @@
+{
+  "name": "axios-release-evidence-js-ts-v2",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "d338d79e-8068-5f31-9c06-1ae923e53f72",
+      "language": "JavaScript",
+      "standard": "Default",
+      "source_paths": [
+        "index.js",
+        "lib"
+      ],
+      "exclude_patterns": [
+        "**/node_modules/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    },
+    {
+      "id": "ff6673ae-20d3-5bb9-950d-c40f99affafa",
+      "language": "TypeScript",
+      "standard": "Default",
+      "source_paths": [
+        "index.d.ts",
+        "index.d.cts"
+      ],
+      "exclude_patterns": [
+        "**/node_modules/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

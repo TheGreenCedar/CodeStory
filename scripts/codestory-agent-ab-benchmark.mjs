@@ -7046,6 +7046,7 @@ export {
   isPathInside,
   isTrustedPublishableRepoUrl,
   loadTaskForResult,
+  loadReleaseEvidenceCorpusContract,
   loadTasks,
   manifestRepoMaterializationBlockers,
   materializeRepos,

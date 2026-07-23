@@ -7,6 +7,11 @@
 - Exact indexed primary-source files outrank helper symbols when their file stem
   directly matches a required packet probe, without granting the helpers
   behavior ownership.
+- The v0.16 Axios release-evidence task is now versioned separately from the
+  general holdout suite and bound to a checksum-pinned JavaScript/TypeScript
+  project manifest. The release gate independently verifies the task, project,
+  and corpus bindings while the retained v1 evidence and approved baseline stay
+  unchanged pending a new protected measurement and baseline approval.
 - Windows-only pre-publish qualification now skips unavailable ARM64 release
   evidence and retains protected Vulkan and candidate-installed provenance under
   an explicit server-behavior-only non-claim. Full release qualification remains
