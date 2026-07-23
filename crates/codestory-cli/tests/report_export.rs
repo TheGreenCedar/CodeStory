@@ -77,7 +77,7 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run codestory-cli");
     assert!(

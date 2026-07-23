@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use codestory_contracts::api::{
-    ApiError, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, SearchHit, SearchHitOrigin,
-    SearchMatchQualityDto,
+    ApiError, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
 };
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{
     AppController, compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank,
 };
@@ -36,6 +37,78 @@ pub struct ResolvedTarget {
     pub file_filter: Option<String>,
     pub selected: SearchHit,
     pub alternatives: Vec<SearchHit>,
+}
+
+pub fn prefer_function_body_target(
+    project_root: &Path,
+    mut target: ResolvedTarget,
+) -> ResolvedTarget {
+    if hit_looks_like_function_body(project_root, &target.selected) {
+        return target;
+    }
+    if !matches!(target.selected.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return target;
+    }
+    let Some((index, preferred)) = target
+        .alternatives
+        .iter()
+        .enumerate()
+        .find(|(_, hit)| {
+            function_body_promotion_matches(&target.selected, hit)
+                && hit_looks_like_function_body(project_root, hit)
+        })
+        .map(|(index, hit)| (index, hit.clone()))
+    else {
+        return target;
+    };
+    target.selected = preferred;
+    let promoted = target.alternatives.remove(index);
+    target.alternatives.insert(0, promoted);
+    target
+}
+
+fn function_body_promotion_matches(selected: &SearchHit, candidate: &SearchHit) -> bool {
+    if selected.display_name == candidate.display_name {
+        return true;
+    }
+    terminal_display_name(&selected.display_name) == terminal_display_name(&candidate.display_name)
+}
+
+fn terminal_display_name(name: &str) -> &str {
+    name.rsplit_once("::")
+        .map(|(_, terminal)| terminal)
+        .or_else(|| name.rsplit_once('.').map(|(_, terminal)| terminal))
+        .unwrap_or(name)
+}
+
+fn hit_looks_like_function_body(project_root: &Path, hit: &SearchHit) -> bool {
+    if !matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return false;
+    }
+    let Some(path) = hit.file_path.as_deref() else {
+        return false;
+    };
+    let Some(line) = hit.line else {
+        return false;
+    };
+    let path = Path::new(path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    let Ok(contents) = fs::read_to_string(&resolved) else {
+        return false;
+    };
+    let line_index = line.saturating_sub(1) as usize;
+    let window = contents
+        .lines()
+        .skip(line_index)
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let before_body = window.split('{').next().unwrap_or(window.as_str());
+    window.contains('{') && !before_body.contains(';')
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +194,15 @@ pub(crate) fn is_graph_target_candidate(hit: &SearchHit) -> bool {
     !matches!(
         hit.match_quality,
         Some(SearchMatchQualityDto::SemanticSuggestion | SearchMatchQualityDto::RepoText)
-    )
+    ) && hit.evidence_tier != Some(PacketEvidenceTierDto::StructuralText)
+        && !matches!(
+            hit.resolution_status,
+            Some(
+                PacketEvidenceResolutionDto::SourceRangeOnly
+                    | PacketEvidenceResolutionDto::Unresolved
+                    | PacketEvidenceResolutionDto::DiagnosticOnly
+            )
+        )
 }
 
 pub(crate) fn is_name_resolvable_graph_target(query: &str, hit: &SearchHit) -> bool {
@@ -268,10 +349,63 @@ pub(crate) fn search_hit_matches_file_filter(
     file_filter_match_bucket(project_root, hit, fragment) > 0
 }
 
+pub(crate) fn search_hit_matches_exact_file(
+    project_root: &Path,
+    hit: &SearchHit,
+    exact_path: &Path,
+) -> bool {
+    let Some(file_path) = hit.file_path.as_deref() else {
+        return false;
+    };
+    let file_path = Path::new(file_path);
+    let candidate = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        project_root.join(file_path)
+    };
+    if !candidate.is_file() || !codestory_workspace::same_workspace_path(&candidate, exact_path) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Some(candidate_relative) =
+            codestory_workspace::workspace_relative_path(project_root, &candidate)
+        else {
+            return false;
+        };
+        let Some(exact_relative) =
+            codestory_workspace::workspace_relative_path(project_root, exact_path)
+        else {
+            return false;
+        };
+        if unix_path_spelling_is_case_only_substitution(&candidate_relative, &exact_relative) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn unix_path_spelling_is_case_only_substitution(left: &Path, right: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let left = left.as_os_str().as_bytes();
+    let right = right.as_os_str().as_bytes();
+    left != right && left.eq_ignore_ascii_case(right)
+}
+
 pub(crate) fn file_filter_match_bucket(project_root: &Path, hit: &SearchHit, fragment: &str) -> u8 {
     let Some(file_path) = hit.file_path.as_deref() else {
         return 0;
     };
+    let fragment_path = Path::new(fragment);
+    if fragment_path.is_absolute() {
+        return if search_hit_matches_exact_file(project_root, hit, fragment_path) {
+            4
+        } else {
+            0
+        };
+    }
 
     let absolute = normalize_path_fragment(file_path);
     let relative = normalize_path_fragment(&relative_path(project_root, file_path));
@@ -559,13 +693,28 @@ impl AppController {
         match target {
             TargetSelection::Id(id) => {
                 let details = self.node_details(NodeDetailsRequest { id: id.clone() })?;
-                Ok(TargetResolution::Resolved(Box::new(ResolvedTarget {
-                    selector: TargetSelector::Id,
-                    requested: id.0,
-                    file_filter: None,
-                    selected: search_hit_from_node(&details),
-                    alternatives: Vec::new(),
-                })))
+                Ok(resolve_id_target(id, &details))
+            }
+            TargetSelection::Query { query, choose } => {
+                self.resolve_query_target(query, choose, file_filter)
+            }
+        }
+    }
+
+    /// Resolve a target for exact source navigation.
+    ///
+    /// Exact ids may name source-range-only diagnostic evidence from structural
+    /// collectors or endpoint schemas. Query selectors still use typed graph
+    /// resolution so snippets cannot silently select diagnostic search hits.
+    pub fn resolve_source_target(
+        &self,
+        target: TargetSelection,
+        file_filter: Option<&str>,
+    ) -> Result<TargetResolution, ApiError> {
+        match target {
+            TargetSelection::Id(id) => {
+                let details = self.node_details(NodeDetailsRequest { id: id.clone() })?;
+                Ok(resolve_source_id_target(id, &details))
             }
             TargetSelection::Query { query, choose } => {
                 self.resolve_query_target(query, choose, file_filter)
@@ -748,7 +897,7 @@ fn compare_resolution_candidates(
 }
 
 fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
-    SearchHit {
+    let mut hit = SearchHit {
         node_id: node.id.clone(),
         display_name: node.display_name.clone(),
         kind: node.kind,
@@ -758,14 +907,51 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         origin: SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
-        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        evidence_producer: Some("node_details".to_string()),
-        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        evidence_tier: Some(
+            node.evidence_tier
+                .unwrap_or(PacketEvidenceTierDto::ResolvedGraph),
+        ),
+        evidence_producer: Some(
+            node.evidence_producer
+                .clone()
+                .unwrap_or_else(|| "node_details".to_string()),
+        ),
+        resolution_status: Some(
+            node.resolution_status
+                .unwrap_or(PacketEvidenceResolutionDto::Resolved),
+        ),
         loss_reason: None,
         coverage_role: None,
-        eligible_for_sufficiency: Some(true),
+        eligible_for_sufficiency: None,
         score_breakdown: None,
+    };
+    decorate_search_hit_evidence(&mut hit);
+    hit
+}
+
+fn resolve_id_target(id: NodeId, details: &NodeDetailsDto) -> TargetResolution {
+    let selected = search_hit_from_node(details);
+    if !selected.resolvable || !is_graph_target_candidate(&selected) {
+        return TargetResolution::Rejected(format!(
+            "id_resolution: Node `{}` is source-range-only diagnostic evidence and cannot be selected as a typed graph target. Its cited source remains available through the node and snippet surfaces.",
+            id.0
+        ));
     }
+    resolved_id_target(id, selected)
+}
+
+fn resolve_source_id_target(id: NodeId, details: &NodeDetailsDto) -> TargetResolution {
+    resolved_id_target(id, search_hit_from_node(details))
+}
+
+fn resolved_id_target(id: NodeId, selected: SearchHit) -> TargetResolution {
+    TargetResolution::Resolved(Box::new(ResolvedTarget {
+        selector: TargetSelector::Id,
+        requested: id.0,
+        file_filter: None,
+        selected,
+        alternatives: Vec::new(),
+    }))
 }
 
 fn no_query_match_error(project_root: &Path, query: &str, file_filter: Option<&str>) -> String {
@@ -930,6 +1116,86 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exact_file_matching_is_case_sensitive_on_unix() {
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let exact = project.path().join("src").join("lib.rs");
+        std::fs::write(&exact, "fn target() {}\n").expect("source");
+        let matching = hit("1", "target", NodeKind::FUNCTION, 1.0, "src/lib.rs");
+        let wrong_case_path = project.path().join("src").join("LIB.rs");
+        if !wrong_case_path.is_file() {
+            std::fs::hard_link(&exact, &wrong_case_path).expect("case-only hard-link spelling");
+        }
+        let wrong_case = hit("2", "target", NodeKind::FUNCTION, 1.0, "src/LIB.rs");
+
+        assert!(search_hit_matches_exact_file(
+            project.path(),
+            &matching,
+            &exact
+        ));
+        assert!(codestory_workspace::same_workspace_path(
+            &wrong_case_path,
+            &exact
+        ));
+        assert!(!search_hit_matches_exact_file(
+            project.path(),
+            &wrong_case,
+            &exact
+        ));
+        assert_eq!(
+            file_filter_match_bucket(project.path(), &wrong_case, &exact.to_string_lossy()),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_file_matching_accepts_in_project_symlink_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let exact = project.path().join("src").join("lib.rs");
+        let symlink_alias = project.path().join("src").join("linked.rs");
+        let hard_link_alias = project.path().join("src").join("hard-linked.rs");
+        std::fs::write(&exact, "fn target() {}\n").expect("source");
+        symlink(&exact, &symlink_alias).expect("symlink alias");
+        std::fs::hard_link(&exact, &hard_link_alias).expect("hard-link alias");
+
+        for (id, path) in [
+            ("symlink", "src/linked.rs"),
+            ("hard-link", "src/hard-linked.rs"),
+        ] {
+            let alias = hit(id, "target", NodeKind::FUNCTION, 1.0, path);
+            assert!(search_hit_matches_exact_file(
+                project.path(),
+                &alias,
+                &exact
+            ));
+            assert_eq!(
+                file_filter_match_bucket(project.path(), &alias, &exact.to_string_lossy()),
+                4
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_file_matching_is_case_insensitive_on_windows() {
+        let project = tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        let exact = project.path().join("src").join("lib.rs");
+        std::fs::write(&exact, "fn target() {}\n").expect("source");
+        let alias = hit("1", "target", NodeKind::FUNCTION, 1.0, "SRC/LIB.RS");
+        assert!(search_hit_matches_exact_file(
+            project.path(),
+            &alias,
+            &exact
+        ));
+    }
+
     #[test]
     fn semantic_suggestions_are_not_graph_target_candidates() {
         let mut semantic = hit(
@@ -948,6 +1214,112 @@ mod tests {
         assert!(!is_graph_target_candidate(&semantic));
         assert!(!is_graph_target_candidate(&repo_text));
         assert!(is_graph_target_candidate(&fuzzy));
+    }
+
+    #[test]
+    fn node_details_target_keeps_structural_text_evidence_explicit() {
+        let details = NodeDetailsDto {
+            id: NodeId("cargo-package".to_string()),
+            kind: NodeKind::PACKAGE,
+            display_name: "demo".to_string(),
+            serialized_name: "demo".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_path: Some("crates/demo/Cargo.toml".to_string()),
+            start_line: Some(2),
+            start_col: Some(1),
+            end_line: Some(2),
+            end_col: Some(8),
+            evidence_tier: Some(PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_cargo_manifest_collector".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
+            member_access: None,
+            route_endpoint: None,
+        };
+        let hit = search_hit_from_node(&details);
+
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_cargo_manifest_collector")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert!(hit.resolvable, "the cited source range remains navigable");
+        assert!(!is_graph_target_candidate(&hit));
+        assert!(!is_resolvable_graph_target("demo", &hit));
+        assert!(matches!(
+            resolve_id_target(details.id.clone(), &details),
+            TargetResolution::Rejected(message)
+                if message.contains("source-range-only diagnostic evidence")
+        ));
+        let TargetResolution::Resolved(source_target) =
+            resolve_source_id_target(details.id.clone(), &details)
+        else {
+            panic!("an exact structural id should remain source-navigable");
+        };
+        assert_eq!(source_target.selected.node_id, details.id);
+        assert_eq!(
+            source_target.selected.resolution_status,
+            Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+    }
+
+    #[test]
+    fn direct_id_openapi_target_keeps_exact_source_identity_but_rejects_typed_resolution() {
+        let details = NodeDetailsDto {
+            id: NodeId("openapi-users".to_string()),
+            kind: NodeKind::FUNCTION,
+            display_name: "GET /api/users".to_string(),
+            serialized_name: "GET /api/users".to_string(),
+            qualified_name: None,
+            canonical_id: Some("openapi:endpoint:GET /api/users".to_string()),
+            file_path: Some("openapi.json".to_string()),
+            start_line: Some(8),
+            start_col: Some(1),
+            end_line: Some(8),
+            end_col: Some(16),
+            evidence_tier: Some(PacketEvidenceTierDto::ExactSource),
+            evidence_producer: Some("openapi_endpoint_schema".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
+            member_access: None,
+            route_endpoint: None,
+        };
+        let hit = search_hit_from_node(&details);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTierDto::ExactSource));
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert!(hit.resolvable, "the cited source range remains navigable");
+        assert!(!is_graph_target_candidate(&hit));
+        assert!(matches!(
+            resolve_id_target(details.id.clone(), &details),
+            TargetResolution::Rejected(message)
+                if message.contains("source-range-only diagnostic evidence")
+        ));
+        let TargetResolution::Resolved(source_target) =
+            resolve_source_id_target(details.id.clone(), &details)
+        else {
+            panic!("an exact OpenAPI id should remain source-navigable");
+        };
+        assert_eq!(source_target.selected.node_id, details.id);
+        assert_eq!(
+            source_target.selected.evidence_tier,
+            Some(PacketEvidenceTierDto::ExactSource)
+        );
     }
 
     #[test]

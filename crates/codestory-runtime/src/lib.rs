@@ -4,70 +4,104 @@
 //! retrieval sidecar coordination. Packet/search methods are sidecar-primary: degraded retrieval
 //! is surfaced as diagnostics or errors, not as product-equivalent answer evidence.
 
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use codestory_contracts::api::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
-    AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
-    AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload, BookmarkCategoryDto,
-    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
-    EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto, GraphEdgeDto,
-    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
-    GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexPublicationModeDto,
-    IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileLanguageCountDto,
-    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
-    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ApiErrorDetails,
+    AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, BookmarkCategoryDto,
+    BookmarkDto, CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    DatabaseSnapshotCopyTimings, EdgeId, EdgeKind, EdgeOccurrencesRequest,
+    EmbeddingProfileContractDto, FileCoverageDiagnosticDto, FrameworkRouteCoverageDto,
+    FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse,
+    GroundingBudgetDto, GroundingCoverageBucketDto, GroundingFileDigestDto,
+    GroundingOrientationConfidenceDto, GroundingOrientationDto, GroundingOrientationUncertaintyDto,
+    GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto,
+    IndexFreshnessDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode,
+    IndexPublicationDto, IndexPublicationModeDto, IndexedFileDto,
+    IndexedFileIncompleteReasonCountDto, IndexedFileLanguageCountDto, IndexedFileRoleDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto, IndexingPhaseTimings,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess, NodeDetailsDto,
+    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, OpenContainingFolderRequest,
+    OpenDefinitionRequest, OpenProjectRequest, ProjectSummary, ProjectionPersistenceFamilyTimings,
+    ProjectionPersistenceTimings, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
     SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
     SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    SourceOccurrenceDto, StartIndexingRequest, StorageStatsDto, StoredSemanticDocsContractDto,
-    SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto,
-    TrailContextDto, TrailFilterOptionsDto, UpdateBookmarkCategoryRequest, UpdateBookmarkRequest,
-    WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
+    SourceOccurrenceDto, SourcePolicyExclusionDto, StartIndexingRequest, StorageStatsDto,
+    StoredSemanticDocsContractDto, SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto,
+    SystemActionResponse, TrailConfigDto, TrailContextDto, TrailFilterOptionsDto,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WorkspaceMemberIndexDto,
+    WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
-use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
+use codestory_contracts::graph::{
+    AccessKind, Edge as GraphEdge, FileCoverageReason, Node as GraphNode,
+};
 use codestory_contracts::language_support::{
     LanguageSupportProfile, language_support_profile_for_ext,
     language_support_profile_for_language_name,
 };
 use codestory_indexer::{
-    CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
+    ArtifactCacheFamilyStats, ArtifactCachePolicies, ArtifactCachePolicy, CancellationToken,
+    IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
+#[cfg(test)]
+use codestory_store::RetrievalIndexManifest;
 use codestory_store::{
-    CURRENT_SCHEMA_VERSION, FileInfo, GroundingEdgeKindCount, GroundingNodeRecord,
-    IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
-    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
+    BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
+    DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
+    GroundingNodeRecord, IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, SourcePolicyExclusionPolicyIdentity,
+    SourcePolicyExclusionRecord, Store, StructuralTextPublicationCompatibility, SymbolSearchDoc,
     SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
+#[cfg(test)]
+use codestory_workspace::{DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION};
 use codestory_workspace::{
-    RefreshExecutionPlan, RefreshInputs, WorkspaceInventoryOutcome, WorkspaceManifest,
+    OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInputs, RefreshMode,
+    SourceIndexPolicy, WorkspaceInventoryOutcome, WorkspaceManifest, WorkspacePathIdentity,
+    process_source_index_policy, project_identity_v3,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod agent;
 pub use agent::{packet_step_trace_json, plan_packet};
+
+/// Result of explicitly republishing semantic projections from one pinned core.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticProjectionRepublishOutcome {
+    pub previous_publication: IndexPublicationRecord,
+    pub publication: IndexPublicationRecord,
+    pub semantic_policy_version: String,
+    pub symbol_document_count: u32,
+    pub dense_anchor_count: u64,
+    pub phase_timings: IndexingPhaseTimings,
+}
 mod browser;
 mod cache_rehydrate;
 pub mod graph_analysis;
@@ -75,11 +109,18 @@ mod graph_builders;
 mod graph_canonical;
 mod grounding;
 mod mermaid;
+mod path_identity;
 mod path_resolution;
+#[doc(hidden)]
+pub use path_resolution::resolve_project_file_path_from_root;
 mod query_language;
 mod repository_identity;
 mod search;
 mod search_runtime;
+#[cfg(feature = "benchmark-support")]
+pub mod benchmark_support {
+    pub use crate::search::engine::{SearchEngine, SymbolIndexSession, SymbolIndexWriteStats};
+}
 mod semantic_doc_text;
 mod services;
 mod support;
@@ -93,6 +134,7 @@ pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
+use path_identity::{OperationPathIdentityResolver, PathIdentityUnavailable};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
@@ -128,9 +170,15 @@ use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
     semantic_symbol_role_aliases,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
-    AgentService, BookmarkService, GroundingService, IndexService, ProjectService, SearchService,
-    TrailService,
+    ActivationCapabilities, ActivationCapabilityState, ActivationOperation, ActivationRun,
+    ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
+    ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
+    IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
+    TrailService, embedding_api_error,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
@@ -139,6 +187,7 @@ pub use symbol_workflow::{
 };
 pub use target_resolution::{
     AmbiguousTarget, ResolvedTarget, TargetResolution, TargetSelection, TargetSelector,
+    prefer_function_body_target,
 };
 
 #[cfg(feature = "test-support")]
@@ -180,6 +229,48 @@ type GraphNodeId = codestory_contracts::graph::NodeId;
 type WeightedGraphMatches = Vec<(GraphNodeId, f32)>;
 type GraphNodeNameMap = HashMap<GraphNodeId, String>;
 type ExpandedSymbolMatches = Option<(WeightedGraphMatches, GraphNodeNameMap)>;
+
+#[derive(Clone)]
+struct ActiveCoreRead {
+    controller_identity: usize,
+    storage: Rc<Storage>,
+    publication: IndexPublicationRecord,
+}
+
+thread_local! {
+    /// One complete core snapshot for the entire public operation. Every
+    /// graph/source/target adapter opened through the controller borrows this
+    /// same SQLite read transaction instead of opening a second generation.
+    static ACTIVE_CORE_READ: RefCell<Option<ActiveCoreRead>> = const { RefCell::new(None) };
+}
+
+enum ReadStorage {
+    Pinned(Rc<Storage>),
+    Owned(Storage),
+}
+
+impl Deref for ReadStorage {
+    type Target = Storage;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pinned(storage) => storage,
+            Self::Owned(storage) => storage,
+        }
+    }
+}
+
+struct ActiveCoreReadGuard {
+    previous: Option<ActiveCoreRead>,
+}
+
+impl Drop for ActiveCoreReadGuard {
+    fn drop(&mut self) {
+        ACTIVE_CORE_READ.with(|active| {
+            active.replace(self.previous.take());
+        });
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct RouteEndpointCanonicalMetadata {
@@ -308,62 +399,1308 @@ fn route_handler_certainty_rank(
 }
 
 #[derive(Debug, Clone)]
+struct RouteHandlerCandidate {
+    edge: GraphEdge,
+    target: GraphNode,
+}
+
+fn compare_optional_confidence_desc(left: Option<f32>, right: Option<f32>) -> Ordering {
+    let left = left.filter(|value| value.is_finite());
+    let right = right.filter(|value| value.is_finite());
+    match (left, right) {
+        (Some(left), Some(right)) => right.total_cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_route_handler_candidates(
+    left: &RouteHandlerCandidate,
+    right: &RouteHandlerCandidate,
+) -> Ordering {
+    // Persisted graph edges have unique IDs, so the edge ID tie-breaker makes
+    // this a total order for every valid route-handler candidate set.
+    compare_optional_confidence_desc(left.edge.confidence, right.edge.confidence)
+        .then_with(|| {
+            route_handler_certainty_rank(right.edge.certainty)
+                .cmp(&route_handler_certainty_rank(left.edge.certainty))
+        })
+        .then(left.target.canonical_id.cmp(&right.target.canonical_id))
+        .then(left.target.qualified_name.cmp(&right.target.qualified_name))
+        .then(
+            left.target
+                .serialized_name
+                .cmp(&right.target.serialized_name),
+        )
+        .then((left.target.kind as i32).cmp(&(right.target.kind as i32)))
+        .then(left.target.file_node_id.cmp(&right.target.file_node_id))
+        .then(left.target.start_line.cmp(&right.target.start_line))
+        .then(left.target.start_col.cmp(&right.target.start_col))
+        .then(left.target.end_line.cmp(&right.target.end_line))
+        .then(left.target.end_col.cmp(&right.target.end_col))
+        .then(left.target.id.cmp(&right.target.id))
+        .then(left.edge.id.cmp(&right.edge.id))
+        .then(left.edge.source.cmp(&right.edge.source))
+        .then(left.edge.target.cmp(&right.edge.target))
+        .then(left.edge.resolved_source.cmp(&right.edge.resolved_source))
+        .then(left.edge.resolved_target.cmp(&right.edge.resolved_target))
+        .then(left.edge.line.cmp(&right.edge.line))
+        .then(
+            left.edge
+                .callsite_identity
+                .cmp(&right.edge.callsite_identity),
+        )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffectedConfidenceFloor {
+    strength: u8,
+    label: String,
+}
+
+impl AffectedConfidenceFloor {
+    fn from_label(label: impl Into<String>) -> Self {
+        let mut label = label.into();
+        let strength = match label.as_str() {
+            "direct" => 7,
+            "certain" | "schema" => 6,
+            "probable" | "file_convention" | "decorator" | "annotation" | "attribute" => 5,
+            "graph" => 4,
+            "heuristic" => 3,
+            "uncertain" => 2,
+            "bounded" => 1,
+            _ => 1,
+        };
+        if !matches!(
+            label.as_str(),
+            "direct"
+                | "certain"
+                | "schema"
+                | "probable"
+                | "graph"
+                | "heuristic"
+                | "file_convention"
+                | "decorator"
+                | "annotation"
+                | "attribute"
+                | "uncertain"
+                | "bounded"
+        ) {
+            label = "bounded".to_string();
+        }
+        Self { strength, label }
+    }
+
+    fn bounded() -> Self {
+        Self::from_label("bounded")
+    }
+
+    fn weakest(&self, other: &Self) -> Self {
+        match self.strength.cmp(&other.strength) {
+            Ordering::Less => self.clone(),
+            Ordering::Greater => other.clone(),
+            Ordering::Equal if self.label <= other.label => self.clone(),
+            Ordering::Equal => other.clone(),
+        }
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AffectedPathTieStep {
+    edge_id: i64,
+    source_node_id: GraphNodeId,
+    target_node_id: GraphNodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AffectedGraphEvidence {
     distance: u32,
     reason: String,
-    confidence: String,
+    confidence_floor: AffectedConfidenceFloor,
+    previous_identity_proxy: bool,
+    path_tie_key: Vec<AffectedPathTieStep>,
 }
 
-fn normalized_affected_change_records(
-    req: &AffectedAnalysisRequest,
-) -> Vec<AffectedChangeRecordDto> {
-    if !req.change_records.is_empty() {
-        return req.change_records.clone();
+impl AffectedGraphEvidence {
+    fn seed(
+        node_id: GraphNodeId,
+        reason: impl Into<String>,
+        confidence_floor: AffectedConfidenceFloor,
+        previous_identity_proxy: bool,
+    ) -> Self {
+        Self {
+            distance: 0,
+            reason: reason.into(),
+            confidence_floor: if previous_identity_proxy {
+                AffectedConfidenceFloor::bounded()
+            } else {
+                confidence_floor
+            },
+            previous_identity_proxy,
+            path_tie_key: vec![AffectedPathTieStep {
+                edge_id: i64::MIN,
+                source_node_id: node_id,
+                target_node_id: node_id,
+            }],
+        }
     }
-    req.changed_paths
-        .iter()
-        .filter(|path| !path.trim().is_empty())
-        .map(|path| AffectedChangeRecordDto {
-            path: path.trim().to_string(),
-            kind: AffectedChangeKindDto::Unknown,
-            status: "path".to_string(),
-            previous_path: None,
+}
+
+fn compare_affected_evidence(
+    left: &AffectedGraphEvidence,
+    right: &AffectedGraphEvidence,
+) -> Ordering {
+    left.distance
+        .cmp(&right.distance)
+        .then(
+            left.previous_identity_proxy
+                .cmp(&right.previous_identity_proxy),
+        )
+        .then_with(|| {
+            right
+                .confidence_floor
+                .strength
+                .cmp(&left.confidence_floor.strength)
         })
-        .collect()
+        .then(
+            left.confidence_floor
+                .label
+                .cmp(&right.confidence_floor.label),
+        )
+        .then(left.path_tie_key.cmp(&right.path_tie_key))
+        .then(left.reason.cmp(&right.reason))
 }
 
-fn affected_change_record_keys(record: &AffectedChangeRecordDto) -> Vec<String> {
-    let mut keys = Vec::new();
-    let path = normalize_path_key(&record.path);
-    if !path.is_empty() {
-        keys.push(path);
+fn affected_evidence_is_better(
+    candidate: &AffectedGraphEvidence,
+    current: &AffectedGraphEvidence,
+) -> bool {
+    compare_affected_evidence(candidate, current) == Ordering::Less
+}
+
+fn normalized_affected_input(
+    input: &AffectedAnalysisInput,
+) -> Result<(Vec<String>, Vec<AffectedChangeRecordDto>), ApiError> {
+    let count = match input {
+        AffectedAnalysisInput::Paths(paths) => paths.len(),
+        AffectedAnalysisInput::ChangeRecords(records) => records.len(),
+    };
+    if !(1..=200).contains(&count) {
+        return Err(ApiError::invalid_argument(
+            "affected analysis requires between 1 and 200 path records",
+        ));
     }
-    if let Some(previous_path) = record.previous_path.as_deref() {
-        let previous = normalize_path_key(previous_path);
-        if !previous.is_empty() {
-            keys.push(previous);
+
+    match input {
+        AffectedAnalysisInput::Paths(paths) => {
+            let changed_paths = paths
+                .iter()
+                .map(|path| path.trim())
+                .map(|path| {
+                    if path.is_empty() {
+                        Err(ApiError::invalid_argument(
+                            "affected paths must be non-empty strings",
+                        ))
+                    } else {
+                        Ok(path.to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let change_records = changed_paths
+                .iter()
+                .map(|path| AffectedChangeRecordDto {
+                    path: path.clone(),
+                    kind: AffectedChangeKindDto::Unknown,
+                    status: "path".to_string(),
+                    previous_path: None,
+                })
+                .collect();
+            Ok((changed_paths, change_records))
+        }
+        AffectedAnalysisInput::ChangeRecords(records) => {
+            let mut normalized_records = Vec::with_capacity(records.len());
+            for record in records {
+                let path = record.path.trim();
+                if path.is_empty() {
+                    return Err(ApiError::invalid_argument(
+                        "affected change record paths must be non-empty strings",
+                    ));
+                }
+                let previous_path = record
+                    .previous_path
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|previous_path| {
+                        if previous_path.is_empty() {
+                            Err(ApiError::invalid_argument(
+                                "affected previous paths must be non-empty strings",
+                            ))
+                        } else if !matches!(
+                            &record.kind,
+                            AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied
+                        ) {
+                            Err(ApiError::invalid_argument(
+                                "affected previous_path is valid only for renamed or copied records",
+                            ))
+                        } else {
+                            Ok(previous_path.to_string())
+                        }
+                    })
+                    .transpose()?;
+                normalized_records.push(AffectedChangeRecordDto {
+                    path: path.to_string(),
+                    kind: record.kind.clone(),
+                    status: record.status.clone(),
+                    previous_path,
+                });
+            }
+            Ok((
+                normalized_records
+                    .iter()
+                    .map(|record| record.path.clone())
+                    .collect(),
+                normalized_records,
+            ))
         }
     }
-    keys.sort();
-    keys.dedup();
-    keys
 }
 
-fn affected_unmatched_reason(record: &AffectedChangeRecordDto) -> String {
+fn affected_change_path(root: &Path, raw: &str) -> PathBuf {
+    let requested = Path::new(raw);
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    }
+}
+
+type AffectedNativePathIdentityResolver = fn(&Path) -> io::Result<WorkspacePathIdentity>;
+
+/// Native path observations and freshness membership for one affected call.
+///
+/// Keeping the resolver and identity-keyed refresh sets together prevents the
+/// affected path from falling back to pairwise path comparisons or observing
+/// one spelling twice after a concurrent replacement.
+struct AffectedOperationIdentityIndex<R = AffectedNativePathIdentityResolver> {
+    resolver: OperationPathIdentityResolver<R>,
+    admitted_identities: HashSet<WorkspacePathIdentity>,
+    stale_identities: HashSet<WorkspacePathIdentity>,
+    freshness_identity_gaps: BTreeMap<PathBuf, String>,
+}
+
+impl AffectedOperationIdentityIndex<AffectedNativePathIdentityResolver> {
+    fn native() -> Self {
+        Self {
+            resolver: OperationPathIdentityResolver::native(),
+            admitted_identities: HashSet::new(),
+            stale_identities: HashSet::new(),
+            freshness_identity_gaps: BTreeMap::new(),
+        }
+    }
+}
+
+impl<R> AffectedOperationIdentityIndex<R>
+where
+    R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
+{
+    #[cfg(test)]
+    fn with_resolver(resolver: R) -> Self {
+        Self {
+            resolver: OperationPathIdentityResolver::with_resolver(resolver),
+            admitted_identities: HashSet::new(),
+            stale_identities: HashSet::new(),
+            freshness_identity_gaps: BTreeMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, path: &Path) -> Result<WorkspacePathIdentity, PathIdentityUnavailable> {
+        self.resolver.resolve(path)
+    }
+
+    fn record_admitted(&mut self, path: &Path) {
+        match self.resolve(path) {
+            Ok(identity) => {
+                self.admitted_identities.insert(identity);
+            }
+            Err(error) => self.record_freshness_gap(error),
+        }
+    }
+
+    fn record_stale(&mut self, path: &Path) {
+        match self.resolve(path) {
+            Ok(identity) => {
+                self.stale_identities.insert(identity);
+            }
+            Err(error) => self.record_freshness_gap(error),
+        }
+    }
+
+    fn record_freshness_gap(&mut self, error: PathIdentityUnavailable) {
+        self.freshness_identity_gaps
+            .entry(error.path.clone())
+            .or_insert_with(|| error.to_string());
+    }
+
+    fn freshness_identity_gap_count(&self) -> usize {
+        self.freshness_identity_gaps.len()
+    }
+
+    fn freshness_identity_gap_sample(&self) -> Option<String> {
+        self.freshness_identity_gaps.values().next().cloned()
+    }
+}
+
+struct AffectedIdentityMatches {
+    matched_file_ids: HashSet<GraphNodeId>,
+    matched_record_flags: Vec<bool>,
+    matched_record_index_by_file_id: HashMap<GraphNodeId, usize>,
+    graph_seeded_record_flags: Vec<bool>,
+    previous_record_index_by_file_id: HashMap<GraphNodeId, usize>,
+    current_identity_by_record: Vec<Option<WorkspacePathIdentity>>,
+    previous_identity_by_record: Vec<Option<WorkspacePathIdentity>>,
+    current_identity_error_by_record: Vec<Option<String>>,
+    previous_identity_error_by_record: Vec<Option<String>>,
+    indexed_identity_by_file_id: HashMap<GraphNodeId, WorkspacePathIdentity>,
+    unavailable_indexed_identity_count: usize,
+    unavailable_indexed_identity_sample: Option<String>,
+    work: AffectedIdentityMatchWork,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AffectedIdentityMatchWork {
+    record_visits: usize,
+    indexed_file_visits: usize,
+    current_identity_bucket_visits: usize,
+    previous_identity_bucket_visits: usize,
+    bucket_record_visits: usize,
+    indexed_bucket_file_visits: usize,
+}
+
+#[derive(Debug, Default)]
+struct AffectedOrderedIdentityBuckets {
+    positions: HashMap<WorkspacePathIdentity, usize>,
+    buckets: Vec<(WorkspacePathIdentity, Vec<usize>)>,
+}
+
+impl AffectedOrderedIdentityBuckets {
+    fn push(&mut self, identity: WorkspacePathIdentity, record_index: usize) {
+        if let Some(position) = self.positions.get(&identity).copied() {
+            self.buckets[position].1.push(record_index);
+            return;
+        }
+        let position = self.buckets.len();
+        self.positions.insert(identity.clone(), position);
+        self.buckets.push((identity, vec![record_index]));
+    }
+}
+
+fn match_affected_file_identities<'a, I, R>(
+    root: &Path,
+    change_records: &[AffectedChangeRecordDto],
+    indexed_files: I,
+    path_identities: &mut AffectedOperationIdentityIndex<R>,
+) -> AffectedIdentityMatches
+where
+    I: IntoIterator<Item = (GraphNodeId, &'a Path)>,
+    R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
+{
+    let mut work = AffectedIdentityMatchWork::default();
+    let mut current_buckets = AffectedOrderedIdentityBuckets::default();
+    let mut previous_buckets = AffectedOrderedIdentityBuckets::default();
+    let mut current_identity_by_record = Vec::with_capacity(change_records.len());
+    let mut previous_identity_by_record = Vec::with_capacity(change_records.len());
+    let mut current_identity_error_by_record = Vec::with_capacity(change_records.len());
+    let mut previous_identity_error_by_record = Vec::with_capacity(change_records.len());
+    for (record_index, record) in change_records.iter().enumerate() {
+        work.record_visits = work.record_visits.saturating_add(1);
+        let current_path = affected_change_path(root, &record.path);
+        match path_identities.resolve(&current_path) {
+            Ok(identity) => {
+                current_buckets.push(identity.clone(), record_index);
+                current_identity_by_record.push(Some(identity));
+                current_identity_error_by_record.push(None);
+            }
+            Err(error) => {
+                current_identity_by_record.push(None);
+                current_identity_error_by_record.push(Some(error.to_string()));
+            }
+        }
+
+        if matches!(
+            record.kind,
+            AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied
+        ) && let Some(previous_path) = record.previous_path.as_deref()
+        {
+            let previous_path = affected_change_path(root, previous_path);
+            match path_identities.resolve(&previous_path) {
+                Ok(identity) => {
+                    previous_buckets.push(identity.clone(), record_index);
+                    previous_identity_by_record.push(Some(identity));
+                    previous_identity_error_by_record.push(None);
+                }
+                Err(error) => {
+                    previous_identity_by_record.push(None);
+                    previous_identity_error_by_record.push(Some(error.to_string()));
+                }
+            }
+        } else {
+            previous_identity_by_record.push(None);
+            previous_identity_error_by_record.push(None);
+        }
+    }
+
+    let mut matched_file_ids = HashSet::new();
+    let mut matched_record_flags = vec![false; change_records.len()];
+    let mut matched_record_index_by_file_id = HashMap::<GraphNodeId, usize>::new();
+    let mut graph_seeded_record_flags = vec![false; change_records.len()];
+    let mut previous_record_index_by_file_id = HashMap::<GraphNodeId, usize>::new();
+    let mut unavailable_indexed_identity_count = 0_usize;
+    let mut unavailable_indexed_identity_sample = None::<(String, String)>;
+    let mut indexed_identity_by_file_id = HashMap::new();
+    let mut indexed_file_ids_by_identity =
+        HashMap::<WorkspacePathIdentity, Vec<GraphNodeId>>::new();
+    for (file_id, path) in indexed_files {
+        work.indexed_file_visits = work.indexed_file_visits.saturating_add(1);
+        let indexed_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let identity = match path_identities.resolve(&indexed_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                unavailable_indexed_identity_count += 1;
+                let candidate = (
+                    indexed_path.to_string_lossy().into_owned(),
+                    error.to_string(),
+                );
+                if unavailable_indexed_identity_sample
+                    .as_ref()
+                    .is_none_or(|current| candidate < *current)
+                {
+                    unavailable_indexed_identity_sample = Some(candidate);
+                }
+                continue;
+            }
+        };
+        indexed_identity_by_file_id.insert(file_id, identity.clone());
+        indexed_file_ids_by_identity
+            .entry(identity)
+            .or_default()
+            .push(file_id);
+    }
+
+    for (identity, record_indexes) in current_buckets.buckets {
+        work.current_identity_bucket_visits = work.current_identity_bucket_visits.saturating_add(1);
+        let Some(file_ids) = indexed_file_ids_by_identity.get(&identity) else {
+            continue;
+        };
+        let mut first_record_index = None::<usize>;
+        for record_index in record_indexes {
+            work.bucket_record_visits = work.bucket_record_visits.saturating_add(1);
+            matched_record_flags[record_index] = true;
+            graph_seeded_record_flags[record_index] = true;
+            first_record_index =
+                Some(first_record_index.map_or(record_index, |current| current.min(record_index)));
+        }
+        let Some(first_record_index) = first_record_index else {
+            continue;
+        };
+        for file_id in file_ids {
+            work.indexed_bucket_file_visits = work.indexed_bucket_file_visits.saturating_add(1);
+            matched_file_ids.insert(*file_id);
+            matched_record_index_by_file_id
+                .entry(*file_id)
+                .and_modify(|current| *current = (*current).min(first_record_index))
+                .or_insert(first_record_index);
+        }
+    }
+
+    for (identity, record_indexes) in previous_buckets.buckets {
+        work.previous_identity_bucket_visits =
+            work.previous_identity_bucket_visits.saturating_add(1);
+        let Some(file_ids) = indexed_file_ids_by_identity.get(&identity) else {
+            continue;
+        };
+        let mut first_eligible_record_index = None::<usize>;
+        for record_index in record_indexes {
+            work.bucket_record_visits = work.bucket_record_visits.saturating_add(1);
+            if matched_record_flags[record_index] {
+                continue;
+            }
+            graph_seeded_record_flags[record_index] = true;
+            first_eligible_record_index = Some(
+                first_eligible_record_index
+                    .map_or(record_index, |current| current.min(record_index)),
+            );
+        }
+        let Some(first_eligible_record_index) = first_eligible_record_index else {
+            continue;
+        };
+        for file_id in file_ids {
+            work.indexed_bucket_file_visits = work.indexed_bucket_file_visits.saturating_add(1);
+            if matched_file_ids.contains(file_id) {
+                continue;
+            }
+            previous_record_index_by_file_id
+                .entry(*file_id)
+                .and_modify(|current| *current = (*current).min(first_eligible_record_index))
+                .or_insert(first_eligible_record_index);
+        }
+    }
+
+    AffectedIdentityMatches {
+        matched_file_ids,
+        matched_record_flags,
+        matched_record_index_by_file_id,
+        graph_seeded_record_flags,
+        previous_record_index_by_file_id,
+        current_identity_by_record,
+        previous_identity_by_record,
+        current_identity_error_by_record,
+        previous_identity_error_by_record,
+        indexed_identity_by_file_id,
+        unavailable_indexed_identity_count,
+        unavailable_indexed_identity_sample: unavailable_indexed_identity_sample
+            .map(|(_, error)| error),
+        work,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AffectedResolvedInput {
+    current: PathBuf,
+    previous: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexFreshnessObservation {
+    freshness: IndexFreshnessDto,
+    inventory_complete: bool,
+    admitted_identities: HashSet<WorkspacePathIdentity>,
+    stale_identities: HashSet<WorkspacePathIdentity>,
+    identity_gap_count: usize,
+    identity_gap_sample: Option<String>,
+}
+
+impl IndexFreshnessObservation {
+    fn incomplete(freshness: IndexFreshnessDto) -> Self {
+        Self {
+            freshness,
+            inventory_complete: false,
+            admitted_identities: HashSet::new(),
+            stale_identities: HashSet::new(),
+            identity_gap_count: 0,
+            identity_gap_sample: None,
+        }
+    }
+
+    fn identity_is_admitted(&self, identity: &WorkspacePathIdentity) -> bool {
+        self.admitted_identities.contains(identity)
+    }
+
+    fn identity_is_stale(&self, identity: &WorkspacePathIdentity) -> bool {
+        self.stale_identities.contains(identity)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AffectedEvidenceGapCategory {
+    count: usize,
+    sample: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AffectedRelevantEvidenceGaps {
+    current: AffectedEvidenceGapCategory,
+    previous: AffectedEvidenceGapCategory,
+    indexed: AffectedEvidenceGapCategory,
+    freshness: AffectedEvidenceGapCategory,
+}
+
+struct AffectedRelevantEvidenceGapInput<'a> {
+    workspace_root: Option<&'a Path>,
+    resolved_inputs: &'a [AffectedResolvedInput],
+    matched_record_flags: &'a [bool],
+    current_identity_errors: &'a [Option<String>],
+    previous_identity_errors: &'a [Option<String>],
+    unavailable_indexed_identity_count: usize,
+    unavailable_indexed_identity_sample: Option<&'a str>,
+    freshness_evidence_affects_requested_claim: bool,
+    freshness_identity_gap_count: usize,
+    freshness_identity_gap_sample: Option<&'a str>,
+}
+
+fn affected_relevant_evidence_gaps(
+    input: AffectedRelevantEvidenceGapInput<'_>,
+) -> AffectedRelevantEvidenceGaps {
+    let current_errors = input
+        .current_identity_errors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, error)| {
+            let error = error.as_deref()?;
+            let resolved = input.resolved_inputs.get(index)?;
+            (input
+                .matched_record_flags
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+                || indexable_source_path_with_root(input.workspace_root, &resolved.current))
+            .then_some(error)
+        })
+        .collect::<Vec<_>>();
+    let previous_errors = input
+        .previous_identity_errors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, error)| {
+            let error = error.as_deref()?;
+            let resolved = input.resolved_inputs.get(index)?;
+            (!input
+                .matched_record_flags
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+                && resolved.previous.as_deref().is_some_and(|path| {
+                    indexable_source_path_with_root(input.workspace_root, path)
+                }))
+            .then_some(error)
+        })
+        .collect::<Vec<_>>();
+    let indexed_identity_is_relevant =
+        input
+            .resolved_inputs
+            .iter()
+            .enumerate()
+            .any(|(index, resolved)| {
+                input
+                    .matched_record_flags
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+                    || indexable_source_path_with_root(input.workspace_root, &resolved.current)
+                    || resolved.previous.as_deref().is_some_and(|path| {
+                        indexable_source_path_with_root(input.workspace_root, path)
+                    })
+            });
+
+    AffectedRelevantEvidenceGaps {
+        current: AffectedEvidenceGapCategory {
+            count: current_errors.len(),
+            sample: current_errors.first().map(|error| (*error).to_string()),
+        },
+        previous: AffectedEvidenceGapCategory {
+            count: previous_errors.len(),
+            sample: previous_errors.first().map(|error| (*error).to_string()),
+        },
+        indexed: AffectedEvidenceGapCategory {
+            count: if indexed_identity_is_relevant {
+                input.unavailable_indexed_identity_count
+            } else {
+                0
+            },
+            sample: if indexed_identity_is_relevant {
+                input
+                    .unavailable_indexed_identity_sample
+                    .map(str::to_string)
+            } else {
+                None
+            },
+        },
+        freshness: AffectedEvidenceGapCategory {
+            count: if input.freshness_evidence_affects_requested_claim {
+                input.freshness_identity_gap_count
+            } else {
+                0
+            },
+            sample: if input.freshness_evidence_affects_requested_claim {
+                input.freshness_identity_gap_sample.map(str::to_string)
+            } else {
+                None
+            },
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffectedEvidenceGapComposition {
+    gap_free: bool,
+    unavailable_evidence_count: usize,
+    blind_spots: Vec<String>,
+}
+
+impl AffectedEvidenceGapComposition {
+    fn confidence(&self) -> &'static str {
+        if self.gap_free { "complete" } else { "bounded" }
+    }
+}
+
+fn compose_affected_evidence_gaps(
+    base_unavailable_evidence_count: usize,
+    gaps: &AffectedRelevantEvidenceGaps,
+) -> AffectedEvidenceGapComposition {
+    let unavailable_evidence_count = [
+        base_unavailable_evidence_count,
+        gaps.current.count,
+        gaps.previous.count,
+        gaps.indexed.count,
+        gaps.freshness.count,
+    ]
+    .into_iter()
+    .fold(0_usize, usize::saturating_add);
+    let gap_free = gaps.current.count == 0
+        && gaps.previous.count == 0
+        && gaps.indexed.count == 0
+        && gaps.freshness.count == 0;
+    let mut blind_spots = Vec::new();
+    if gaps.current.count > 0 {
+        let detail = gaps
+            .current
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native current-path identity was unavailable for {} relevant changed records; completeness was downgraded ({detail})",
+            gaps.current.count
+        ));
+    }
+    if gaps.previous.count > 0 {
+        let detail = gaps
+            .previous
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native previous-path identity was unavailable for {} unmatched rename/copy records; completeness was downgraded ({detail})",
+            gaps.previous.count
+        ));
+    }
+    if gaps.indexed.count > 0 {
+        let detail = gaps
+            .indexed
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native path identity was unavailable for {} relevant indexed files; completeness was downgraded ({detail})",
+            gaps.indexed.count
+        ));
+    }
+    if gaps.freshness.count > 0 {
+        let detail = gaps
+            .freshness
+            .sample
+            .as_deref()
+            .unwrap_or("no identity error sample available");
+        blind_spots.push(format!(
+            "native path identity was unavailable for {} refresh-plan paths needed by the requested claim ({detail})",
+            gaps.freshness.count
+        ));
+    }
+
+    AffectedEvidenceGapComposition {
+        gap_free,
+        unavailable_evidence_count,
+        blind_spots,
+    }
+}
+
+struct AffectedCompletenessInput {
+    uncovered_input_count: usize,
+    direct_impact_count: usize,
+    propagated_impact_count: usize,
+    candidate_test_count: usize,
+    freshness_evidence_affects_requested_claim: bool,
+    gap_composition: AffectedEvidenceGapComposition,
+    truncation_reasons: Vec<String>,
+}
+
+fn compose_affected_completeness(
+    input: AffectedCompletenessInput,
+) -> AffectedAnalysisCompletenessDto {
+    let truncated = !input.truncation_reasons.is_empty();
+    let complete = input.uncovered_input_count == 0
+        && !truncated
+        && input.gap_composition.gap_free
+        && !input.freshness_evidence_affects_requested_claim;
+    AffectedAnalysisCompletenessDto {
+        complete,
+        confidence: if complete {
+            "complete"
+        } else if !input.gap_composition.gap_free {
+            input.gap_composition.confidence()
+        } else {
+            "bounded"
+        }
+        .to_string(),
+        direct_impact_count: clamp_usize_to_u32(input.direct_impact_count),
+        propagated_impact_count: clamp_usize_to_u32(input.propagated_impact_count),
+        candidate_test_count: clamp_usize_to_u32(input.candidate_test_count),
+        uncovered_input_count: clamp_usize_to_u32(input.uncovered_input_count),
+        unavailable_evidence_count: clamp_usize_to_u32(
+            input.gap_composition.unavailable_evidence_count,
+        ),
+        truncated,
+        truncation_reasons: input.truncation_reasons,
+    }
+}
+
+#[derive(Debug)]
+enum AffectedPathMetadataObservation {
+    RegularFile,
+    NonRegular,
+    Missing,
+    Unavailable {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+struct AffectedUnmatchedPathObservation<'a> {
+    workspace_root: Option<&'a Path>,
+    metadata: AffectedPathMetadataObservation,
+}
+
+fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            AffectedPathMetadataObservation::RegularFile
+        }
+        Ok(_) => AffectedPathMetadataObservation::NonRegular,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            AffectedPathMetadataObservation::Missing
+        }
+        Err(error) => AffectedPathMetadataObservation::Unavailable {
+            kind: error.kind(),
+            message: error.to_string(),
+        },
+    }
+}
+
+fn classify_unmatched_affected_input(
+    workspace_root: Option<&Path>,
+    record: &AffectedChangeRecordDto,
+    resolved: &AffectedResolvedInput,
+    freshness: &IndexFreshnessObservation,
+    current_identity: Option<&WorkspacePathIdentity>,
+    current_identity_error: Option<&str>,
+    previous_identity_error: Option<&str>,
+) -> (AffectedInputClassificationDto, String, Vec<String>) {
+    classify_unmatched_affected_input_with_metadata(
+        record,
+        resolved,
+        freshness,
+        current_identity,
+        current_identity_error,
+        previous_identity_error,
+        AffectedUnmatchedPathObservation {
+            workspace_root,
+            metadata: affected_path_metadata(&resolved.current),
+        },
+    )
+}
+
+fn classify_unmatched_affected_input_with_metadata(
+    record: &AffectedChangeRecordDto,
+    resolved: &AffectedResolvedInput,
+    freshness: &IndexFreshnessObservation,
+    current_identity: Option<&WorkspacePathIdentity>,
+    current_identity_error: Option<&str>,
+    previous_identity_error: Option<&str>,
+    observation: AffectedUnmatchedPathObservation<'_>,
+) -> (AffectedInputClassificationDto, String, Vec<String>) {
+    let mut evidence = Vec::new();
+    let path = &resolved.current;
+    let regular_file = match observation.metadata {
+        AffectedPathMetadataObservation::RegularFile => {
+            evidence.push(format!(
+                "resolved existing regular project file: {}",
+                path.display()
+            ));
+            true
+        }
+        AffectedPathMetadataObservation::NonRegular => {
+            evidence.push(format!(
+                "resolved existing non-regular project path: {}",
+                path.display()
+            ));
+            return (
+                AffectedInputClassificationDto::Malformed,
+                "resolved project path is not a regular file".to_string(),
+                evidence,
+            );
+        }
+        AffectedPathMetadataObservation::Missing => {
+            evidence.push(format!("resolved missing project path: {}", path.display()));
+            false
+        }
+        AffectedPathMetadataObservation::Unavailable { kind, message } => {
+            evidence.push(format!(
+                "metadata read failed for resolved project path {}: kind={kind:?} error={message}",
+                path.display()
+            ));
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "resolved project path metadata was unavailable, so existence and regular-file status could not be established"
+                    .to_string(),
+                evidence,
+            );
+        }
+    };
+
+    if regular_file {
+        if !indexable_source_path_with_root(observation.workspace_root, path) {
+            return (
+                AffectedInputClassificationDto::ValidUncovered,
+                "regular file exists inside the project but is outside current graph/index coverage"
+                    .to_string(),
+                evidence,
+            );
+        }
+        if let Some(error) = current_identity_error {
+            evidence.push(format!(
+                "native current-path identity was unavailable: {error}"
+            ));
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "path exists and is indexable, but native identity evidence was unavailable"
+                    .to_string(),
+                evidence,
+            );
+        }
+        let Some(current_identity) = current_identity else {
+            evidence.push("native current-path identity was not observed".to_string());
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "path exists and is indexable, but native identity evidence was unavailable"
+                    .to_string(),
+                evidence,
+            );
+        };
+        if freshness.identity_is_stale(current_identity) {
+            evidence
+                .push("complete freshness evidence identifies this path as changed or new".into());
+            return (
+                AffectedInputClassificationDto::StaleIndex,
+                "path is indexable and complete freshness evidence shows the publication is stale for it"
+                    .to_string(),
+                evidence,
+            );
+        }
+        if freshness.inventory_complete && !freshness.identity_is_admitted(current_identity) {
+            evidence.push(
+                "complete workspace inventory excludes this path from the admitted index set"
+                    .into(),
+            );
+            return (
+                AffectedInputClassificationDto::ValidUncovered,
+                "regular file exists inside the project but is excluded from current graph/index coverage"
+                    .to_string(),
+                evidence,
+            );
+        }
+        if !freshness.inventory_complete {
+            evidence.push(
+                "bounded freshness or refresh-plan identity evidence was unavailable for this indexable path"
+                    .into(),
+            );
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "path exists and is indexable, but bounded freshness evidence cannot explain its graph absence"
+                    .to_string(),
+                evidence,
+            );
+        }
+        evidence.push(
+            "path is indexable, but no indexed row or exact stale/error evidence was available"
+                .into(),
+        );
+        return (
+            AffectedInputClassificationDto::UnavailableEvidence,
+            "path exists and is indexable, but current evidence cannot explain its absence from the graph"
+                .to_string(),
+            evidence,
+        );
+    }
+
+    if let Some(error) = current_identity_error {
+        evidence.push(format!(
+            "native current-path identity was unavailable: {error}"
+        ));
+        return (
+            AffectedInputClassificationDto::UnavailableEvidence,
+            "missing-path identity was unavailable, so indexed membership could not be established"
+                .to_string(),
+            evidence,
+        );
+    }
+
     match record.kind {
-        AffectedChangeKindDto::Deleted => {
-            "deleted path did not match any indexed file; the index may already be stale or the path was never indexed"
-                .to_string()
-        }
+        AffectedChangeKindDto::Deleted => (
+            AffectedInputClassificationDto::ExpectedDeleted,
+            "deleted path is absent from both the workspace and indexed file inventory".to_string(),
+            evidence,
+        ),
         AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied => {
-            "renamed/copied path did not match current or previous indexed file path; reindex if the file moved"
-                .to_string()
+            if let Some(error) = previous_identity_error {
+                evidence.push(format!(
+                    "native previous-path identity was unavailable: {error}"
+                ));
+                return (
+                    AffectedInputClassificationDto::UnavailableEvidence,
+                    "previous rename/copy identity was unavailable, so bounded proxy coverage could not be established"
+                        .to_string(),
+                    evidence,
+                );
+            }
+            if let Some(previous) = resolved.previous.as_deref() {
+                match affected_path_metadata(previous) {
+                    AffectedPathMetadataObservation::RegularFile => {
+                        evidence.push("previous path exists as a regular file".to_string());
+                    }
+                    AffectedPathMetadataObservation::NonRegular => {
+                        evidence.push("previous path exists but is not a regular file".to_string());
+                    }
+                    AffectedPathMetadataObservation::Missing => {
+                        evidence.push("previous path is missing".to_string());
+                    }
+                    AffectedPathMetadataObservation::Unavailable { kind, message } => {
+                        evidence.push(format!(
+                            "metadata read failed for resolved previous project path {}: kind={kind:?} error={message}",
+                            previous.display()
+                        ));
+                        return (
+                            AffectedInputClassificationDto::UnavailableEvidence,
+                            "previous rename/copy path metadata was unavailable, so its file state could not be established"
+                                .to_string(),
+                            evidence,
+                        );
+                    }
+                }
+            }
+            (
+                AffectedInputClassificationDto::RenameUnresolved,
+                "neither the current nor previous rename/copy path matched indexed file identity"
+                    .to_string(),
+                evidence,
+            )
         }
-        AffectedChangeKindDto::Untracked => {
-            "untracked path is not in the index yet; run index --refresh incremental before graph traversal"
-                .to_string()
-        }
-        _ => "path did not match any indexed file; reindex or pass repo-relative paths".to_string(),
+        _ => (
+            AffectedInputClassificationDto::Missing,
+            "path does not exist inside the project and did not match indexed file identity"
+                .to_string(),
+            evidence,
+        ),
+    }
+}
+
+fn classify_matched_affected_input(
+    file: &AffectedMatchedFileDto,
+    stale: bool,
+    freshness_available: bool,
+) -> Option<(AffectedInputClassificationDto, String, Vec<String>)> {
+    if file.error_count > 0 {
+        return Some((
+            AffectedInputClassificationDto::Malformed,
+            "indexed path has exact recorded parse/index errors".to_string(),
+            vec![format!("indexed file error_count={}", file.error_count)],
+        ));
+    }
+    if stale {
+        return Some((
+            AffectedInputClassificationDto::StaleIndex,
+            "matched path has exact complete-inventory evidence of stale publication".to_string(),
+            vec!["complete freshness evidence identifies this path as stale".to_string()],
+        ));
+    }
+    if !freshness_available {
+        return Some((
+            AffectedInputClassificationDto::UnavailableEvidence,
+            "matched file identity is known, but bounded freshness evidence was unavailable"
+                .to_string(),
+            vec![
+                "bounded freshness or refresh-plan identity evidence was unavailable for this matched path"
+                    .to_string(),
+            ],
+        ));
+    }
+    if file.indexed && file.complete {
+        return None;
+    }
+    Some((
+        AffectedInputClassificationDto::UnavailableEvidence,
+        "matched file is incomplete or not indexed without an exact recorded error".to_string(),
+        vec![format!(
+            "indexed={} complete={} error_count={}",
+            file.indexed, file.complete, file.error_count
+        )],
+    ))
+}
+
+fn affected_files_follow_up_invocation(project: &str, path: &str) -> AffectedFollowUpInvocationDto {
+    AffectedFollowUpInvocationDto {
+        program: "codestory-cli".to_string(),
+        args: vec![
+            "files".to_string(),
+            "--project".to_string(),
+            project.to_string(),
+            "--path".to_string(),
+            path.to_string(),
+            "--format".to_string(),
+            "markdown".to_string(),
+        ],
+    }
+}
+
+fn affected_follow_ups(
+    project: &str,
+    uncovered_inputs: &[AffectedUncoveredInputDto],
+    freshness_diagnostic: Option<&str>,
+) -> Vec<AffectedFollowUpDto> {
+    let mut inputs = uncovered_inputs.iter().collect::<Vec<_>>();
+    inputs.sort_by(|left, right| {
+        affected_classification_rank(&left.classification)
+            .cmp(&affected_classification_rank(&right.classification))
+            .then(left.path.cmp(&right.path))
+            .then(left.reason.cmp(&right.reason))
+    });
+    let mut follow_ups = BTreeMap::<(u8, String, String), AffectedFollowUpDto>::new();
+    for input in inputs {
+        let (priority, dedupe_path, follow_up) = match input.classification {
+            AffectedInputClassificationDto::ValidUncovered => (
+                5,
+                input.path.clone(),
+                AffectedFollowUpDto {
+                    action: "inspect_graph_boundary".to_string(),
+                    reason: format!(
+                        "{} is a valid project file outside current graph coverage; source inspection is the relevant next step",
+                        input.path
+                    ),
+                    confidence: "direct".to_string(),
+                    invocation: None,
+                },
+            ),
+            AffectedInputClassificationDto::StaleIndex => (
+                0,
+                String::new(),
+                AffectedFollowUpDto {
+                    action: "refresh_stale_index".to_string(),
+                    reason:
+                        "complete requested-path freshness evidence shows the publication is stale"
+                            .to_string(),
+                    confidence: "direct".to_string(),
+                    invocation: Some(AffectedFollowUpInvocationDto {
+                        program: "codestory-cli".to_string(),
+                        args: vec![
+                            "index".to_string(),
+                            "--project".to_string(),
+                            project.to_string(),
+                            "--refresh".to_string(),
+                            "incremental".to_string(),
+                        ],
+                    }),
+                },
+            ),
+            AffectedInputClassificationDto::Missing
+            | AffectedInputClassificationDto::RenameUnresolved
+            | AffectedInputClassificationDto::ExpectedDeleted => (
+                1,
+                input.path.clone(),
+                AffectedFollowUpDto {
+                    action: "locate_input_path".to_string(),
+                    reason: format!(
+                        "confirm the exact project-relative spelling and file state for {}",
+                        input.path
+                    ),
+                    confidence: "direct".to_string(),
+                    invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
+                },
+            ),
+            AffectedInputClassificationDto::Malformed => {
+                let recorded_error = input
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.starts_with("indexed file error_count="));
+                (
+                    2,
+                    input.path.clone(),
+                    AffectedFollowUpDto {
+                        action: if recorded_error {
+                            "inspect_recorded_index_error"
+                        } else {
+                            "inspect_malformed_input"
+                        }
+                        .to_string(),
+                        reason: if recorded_error {
+                            format!(
+                                "inspect the exact recorded parse/index error for {} before retrying impact analysis",
+                                input.path
+                            )
+                        } else {
+                            format!(
+                                "confirm {} is a regular project file before retrying impact analysis",
+                                input.path
+                            )
+                        },
+                        confidence: "direct".to_string(),
+                        invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
+                    },
+                )
+            }
+            AffectedInputClassificationDto::UnavailableEvidence => (
+                3,
+                input.path.clone(),
+                AffectedFollowUpDto {
+                    action: "inspect_input_evidence".to_string(),
+                    reason: format!(
+                        "inspect the focused inventory row for {}; current evidence cannot classify its graph absence more strongly",
+                        input.path
+                    ),
+                    confidence: "bounded".to_string(),
+                    invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
+                },
+            ),
+        };
+        follow_ups
+            .entry((priority, follow_up.action.clone(), dedupe_path))
+            .or_insert(follow_up);
+    }
+    if let Some(reason) = freshness_diagnostic {
+        let follow_up = AffectedFollowUpDto {
+            action: "establish_freshness_evidence".to_string(),
+            reason: reason.to_string(),
+            confidence: "bounded".to_string(),
+            invocation: Some(AffectedFollowUpInvocationDto {
+                program: "codestory-cli".to_string(),
+                args: vec![
+                    "doctor".to_string(),
+                    "--project".to_string(),
+                    project.to_string(),
+                    "--format".to_string(),
+                    "markdown".to_string(),
+                ],
+            }),
+        };
+        follow_ups.insert((4, follow_up.action.clone(), String::new()), follow_up);
+    }
+    follow_ups.into_values().collect()
+}
+
+fn affected_classification_rank(classification: &AffectedInputClassificationDto) -> u8 {
+    match classification {
+        AffectedInputClassificationDto::StaleIndex => 0,
+        AffectedInputClassificationDto::Missing
+        | AffectedInputClassificationDto::ExpectedDeleted
+        | AffectedInputClassificationDto::RenameUnresolved => 1,
+        AffectedInputClassificationDto::Malformed => 2,
+        AffectedInputClassificationDto::UnavailableEvidence => 3,
+        AffectedInputClassificationDto::ValidUncovered => 4,
     }
 }
 
@@ -385,38 +1722,154 @@ fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'sta
     }
 }
 
-fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> String {
-    edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
-        .unwrap_or_else(|| "graph".to_string())
+fn affected_edge_confidence(edge: &codestory_contracts::graph::Edge) -> AffectedConfidenceFloor {
+    AffectedConfidenceFloor::from_label(
+        edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
+            .unwrap_or_else(|| "graph".to_string()),
+    )
 }
 
 fn affected_dependent_evidence(
     distance: u32,
-    edge: Option<&codestory_contracts::graph::Edge>,
+    edge: &codestory_contracts::graph::Edge,
     target_label: String,
+    parent: &AffectedGraphEvidence,
 ) -> AffectedGraphEvidence {
-    let (reason, confidence) = edge
-        .map(|edge| {
-            (
-                format!(
-                    "dependent reaches changed code via {} edge to {}",
-                    affected_edge_kind_label(edge.kind),
-                    target_label
-                ),
-                affected_edge_confidence(edge),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                format!("dependent reaches changed code through graph walk to {target_label}"),
-                "graph".to_string(),
-            )
-        });
+    let mut reason = format!(
+        "dependent reaches changed code via {} edge to {}",
+        affected_edge_kind_label(edge.kind),
+        target_label
+    );
+    let mut confidence_floor = parent
+        .confidence_floor
+        .weakest(&affected_edge_confidence(edge));
+    if parent.previous_identity_proxy {
+        reason = format!("bounded previous-identity proxy; {reason}");
+        confidence_floor = AffectedConfidenceFloor::bounded();
+    }
+    let mut path_tie_key = parent.path_tie_key.clone();
+    path_tie_key.push(AffectedPathTieStep {
+        edge_id: edge.id.0,
+        source_node_id: edge.effective_source(),
+        target_node_id: edge.effective_target(),
+    });
     AffectedGraphEvidence {
         distance,
         reason,
-        confidence,
+        confidence_floor,
+        previous_identity_proxy: parent.previous_identity_proxy,
+        path_tie_key,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AffectedReverseWalk {
+    distances: BTreeMap<GraphNodeId, u32>,
+    evidence: BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    visited_edge_count: usize,
+}
+
+fn compare_affected_reverse_edges(
+    left: &codestory_contracts::graph::Edge,
+    right: &codestory_contracts::graph::Edge,
+) -> Ordering {
+    left.effective_source()
+        .cmp(&right.effective_source())
+        .then(left.id.cmp(&right.id))
+        .then(left.effective_target().cmp(&right.effective_target()))
+        .then((left.kind as i32).cmp(&(right.kind as i32)))
+        .then(left.line.cmp(&right.line))
+        .then(left.source.cmp(&right.source))
+        .then(left.target.cmp(&right.target))
+        .then(left.resolved_source.cmp(&right.resolved_source))
+        .then(left.resolved_target.cmp(&right.resolved_target))
+        .then(left.callsite_identity.cmp(&right.callsite_identity))
+}
+
+fn affected_reverse_walk(
+    depth: u32,
+    edges: &[codestory_contracts::graph::Edge],
+    seed_evidence: BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    labels: &HashMap<GraphNodeId, String>,
+) -> AffectedReverseWalk {
+    let mut reverse_dependents = BTreeMap::<GraphNodeId, Vec<usize>>::new();
+    for (edge_index, edge) in edges.iter().enumerate() {
+        reverse_dependents
+            .entry(edge.effective_target())
+            .or_default()
+            .push(edge_index);
+    }
+    for edge_indexes in reverse_dependents.values_mut() {
+        edge_indexes
+            .sort_by(|left, right| compare_affected_reverse_edges(&edges[*left], &edges[*right]));
+    }
+
+    let mut distances = BTreeMap::<GraphNodeId, u32>::new();
+    let mut evidence = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
+    for (seed, seed_evidence) in seed_evidence {
+        distances.insert(seed, 0);
+        evidence.insert(seed, seed_evidence);
+    }
+    let mut frontier = distances.keys().copied().collect::<Vec<_>>();
+    let mut visited_edge_count = 0_usize;
+    for distance in 0..depth {
+        let next_distance = distance + 1;
+        let mut next_candidates = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
+        for node_id in frontier {
+            let Some(parent_evidence) = evidence.get(&node_id) else {
+                continue;
+            };
+            for edge_index in reverse_dependents.get(&node_id).into_iter().flatten() {
+                visited_edge_count = visited_edge_count.saturating_add(1);
+                let edge = &edges[*edge_index];
+                let dependent = edge.effective_source();
+                if distances.contains_key(&dependent) {
+                    continue;
+                }
+                let target_label = labels
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_else(|| node_id.0.to_string());
+                let candidate =
+                    affected_dependent_evidence(next_distance, edge, target_label, parent_evidence);
+                next_candidates
+                    .entry(dependent)
+                    .and_modify(|current| {
+                        if affected_evidence_is_better(&candidate, current) {
+                            current.clone_from(&candidate);
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+        frontier = Vec::with_capacity(next_candidates.len());
+        for (node_id, candidate) in next_candidates {
+            distances.insert(node_id, next_distance);
+            evidence.insert(node_id, candidate);
+            frontier.push(node_id);
+        }
+        if frontier.is_empty() {
+            break;
+        }
+    }
+
+    AffectedReverseWalk {
+        distances,
+        evidence,
+        visited_edge_count,
+    }
+}
+
+fn affected_route_confidence(
+    graph_evidence: &AffectedGraphEvidence,
+    route_confidence: Option<&str>,
+) -> String {
+    let route_floor = AffectedConfidenceFloor::from_label(route_confidence.unwrap_or("graph"));
+    graph_evidence
+        .confidence_floor
+        .weakest(&route_floor)
+        .label()
+        .to_string()
 }
 
 struct FrameworkRouteCoverageEntry {
@@ -2734,18 +4187,34 @@ fn search_plan_has_unbound_repo_text_group(groups: &[SearchPlanAnchorGroupDto]) 
 #[derive(Clone)]
 pub struct Runtime {
     controller: AppController,
+    activation: ActivationService,
+    public_operation: PublicOperationService,
 }
 
 impl Runtime {
     pub fn new() -> Self {
+        let controller = AppController::new();
+        let activation = ActivationService::new(controller.clone());
         Self {
-            controller: AppController::new(),
+            activation: activation.clone(),
+            public_operation: PublicOperationService::new_with_activation(
+                controller.clone(),
+                activation,
+            ),
+            controller,
         }
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        let controller = AppController::new_with_config(config);
+        let activation = ActivationService::new(controller.clone());
         Self {
-            controller: AppController::new_with_config(config),
+            activation: activation.clone(),
+            public_operation: PublicOperationService::new_with_activation(
+                controller.clone(),
+                activation,
+            ),
+            controller,
         }
     }
 
@@ -2778,7 +4247,15 @@ impl Runtime {
     }
 
     pub fn browser_service(&self) -> ReadOnlyBrowserService {
-        ReadOnlyBrowserService::new(self.controller.clone())
+        ReadOnlyBrowserService::new(self.controller.clone(), self.public_operation.clone())
+    }
+
+    pub fn activation_service(&self) -> ActivationService {
+        self.activation.clone()
+    }
+
+    pub fn public_operation_service(&self) -> PublicOperationService {
+        self.public_operation.clone()
     }
 
     pub fn events(&self) -> Receiver<AppEventPayload> {
@@ -2815,6 +4292,9 @@ struct OptionalResolutionTelemetry {
     resolution_import_candidate_index_ms: Option<u32>,
     resolution_call_semantic_index_ms: Option<u32>,
     resolution_import_semantic_index_ms: Option<u32>,
+    resolution_support_snapshot_limit_bytes: Option<u64>,
+    resolution_support_snapshot_stored: Option<bool>,
+    resolution_support_snapshot_skipped_oversize: Option<bool>,
     resolution_call_semantic_candidates_ms: Option<u32>,
     resolution_import_semantic_candidates_ms: Option<u32>,
     resolution_call_semantic_requests: Option<u32>,
@@ -2837,6 +4317,87 @@ struct OptionalResolutionTelemetry {
     resolved_imports_global_unique: Option<u32>,
     resolved_imports_fuzzy: Option<u32>,
     resolved_imports_semantic: Option<u32>,
+}
+
+fn artifact_cache_access_timings(stats: &ArtifactCacheFamilyStats) -> ArtifactCacheAccessTimings {
+    ArtifactCacheAccessTimings {
+        policy: match stats.policy {
+            ArtifactCachePolicy::KnownEmpty => ArtifactCachePolicyDto::KnownEmpty,
+            ArtifactCachePolicy::ReadThrough => ArtifactCachePolicyDto::ReadThrough,
+        },
+        logical_lookups: clamp_usize_to_u32(stats.logical_lookups),
+        physical_queries: clamp_usize_to_u32(stats.physical_queries),
+        hits: clamp_usize_to_u32(stats.hits),
+        misses: clamp_usize_to_u32(stats.misses),
+        reader_opens: clamp_usize_to_u32(stats.reader_opens),
+        lookup_wall_ms: clamp_u64_to_u32(stats.lookup_wall_ns / 1_000_000),
+    }
+}
+
+fn projection_persistence_family_timings(
+    stats: codestory_store::ProjectionPersistenceFamilyStats,
+) -> ProjectionPersistenceFamilyTimings {
+    ProjectionPersistenceFamilyTimings {
+        row_attempts: stats.row_attempts,
+        bound_bytes: stats.bound_bytes,
+        statement_executions: stats.statement_executions,
+        wall_ms: stats.wall_ms,
+    }
+}
+
+fn projection_persistence_timings(
+    stats: &codestory_store::ProjectionPersistenceStats,
+) -> ProjectionPersistenceTimings {
+    ProjectionPersistenceTimings {
+        transactions: stats.transactions.min(u32::MAX as u64) as u32,
+        row_attempts: stats.row_attempts(),
+        bound_bytes: stats.bound_bytes(),
+        statement_executions: stats.statement_executions(),
+        transaction_wall_ms: stats.transaction_wall_ms,
+        transaction_setup_ms: stats.transaction_setup_ms,
+        commit_ms: stats.commit_ms,
+        files: projection_persistence_family_timings(stats.files),
+        nodes: projection_persistence_family_timings(stats.nodes),
+        structural_text: projection_persistence_family_timings(stats.structural_text),
+        edges: projection_persistence_family_timings(stats.edges),
+        occurrences: projection_persistence_family_timings(stats.occurrences),
+        component_access: projection_persistence_family_timings(stats.component_access),
+        callable_projection: projection_persistence_family_timings(stats.callable_projection),
+        file_errors: projection_persistence_family_timings(stats.file_errors),
+        dirty_state: projection_persistence_family_timings(stats.dirty_state),
+    }
+}
+
+fn database_snapshot_copy_timings(
+    stats: codestory_store::DatabaseSnapshotCopyStats,
+) -> DatabaseSnapshotCopyTimings {
+    DatabaseSnapshotCopyTimings {
+        copy_ms: stats.copy_ms,
+        source_bytes: stats.source_bytes,
+        target_bytes: stats.target_bytes,
+    }
+}
+
+fn core_promotion_timings(stats: codestory_store::CorePromotionStats) -> CorePromotionTimings {
+    CorePromotionTimings {
+        total_ms: stats.total_ms,
+        lock_recovery_ms: stats.lock_recovery_ms,
+        candidate_validation_ms: stats.candidate_validation_ms,
+        previous_validation_ms: stats.previous_validation_ms,
+        rollback_backup_copy_ms: stats.rollback_backup_copy_ms,
+        backup_validation_ms: stats.backup_validation_ms,
+        prepared_journal_write_ms: stats.prepared_journal_write_ms,
+        prepared_journal_file_sync_ms: stats.prepared_journal_file_sync_ms,
+        prepared_journal_directory_sync_ms: stats.prepared_journal_directory_sync_ms,
+        staged_to_live_restore_ms: stats.staged_to_live_restore_ms,
+        promoted_validation_ms: stats.promoted_validation_ms,
+        committed_journal_ms: stats.committed_journal_ms,
+        cleanup_ms: stats.cleanup_ms,
+        unattributed_ms: stats.unattributed_ms,
+        candidate_bytes: stats.candidate_bytes,
+        previous_live_bytes: stats.previous_live_bytes,
+        rollback_backup_bytes: stats.rollback_backup_bytes,
+    }
 }
 
 impl OptionalResolutionTelemetry {
@@ -2891,6 +4452,12 @@ impl OptionalResolutionTelemetry {
         self.resolution_import_semantic_index_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_import_semantic_index_ms,
         ));
+        self.resolution_support_snapshot_limit_bytes =
+            Some(index_stats.resolution_support_snapshot_limit_bytes);
+        self.resolution_support_snapshot_stored =
+            Some(index_stats.resolution_support_snapshot_stored);
+        self.resolution_support_snapshot_skipped_oversize =
+            Some(index_stats.resolution_support_snapshot_skipped_oversize);
         self.resolution_call_semantic_candidates_ms = Some(clamp_u64_to_u32(
             index_stats.resolution_call_semantic_candidates_ms,
         ));
@@ -3311,17 +4878,21 @@ fn read_line_capped<R: BufRead>(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticProjectionMode {
-    PersistBackedDocs,
-    LoadPersistedDocs,
-    SkipPersistence,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SemanticProjectionStats {
     reported: bool,
+    semantic_context_index_ms: u32,
+    node_load_ms: u32,
+    node_load_rows: u32,
+    node_stream_batches: u32,
+    endpoint_load_ms: u32,
+    endpoint_load_rows: u32,
+    endpoint_load_batches: u32,
+    selected_nodes: u32,
+    context_file_count: u32,
+    context_path_bytes: u32,
+    node_lookup_entries: u32,
+    context_ms: u32,
     doc_build_ms: u32,
     embedding_ms: u32,
     db_upsert_ms: u32,
@@ -3355,7 +4926,16 @@ struct SemanticRefreshScope<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SearchStateBuildStats {
     search_projection_rebuild_ms: u32,
+    search_symbol_stream_ms: u32,
+    search_symbol_stream_rows: u32,
+    search_symbol_stream_batches: u32,
     search_symbol_index_ms: u32,
+    search_symbol_index_docs_written: u32,
+    search_symbol_index_writer_count: u32,
+    search_symbol_index_commit_count: u32,
+    search_symbol_index_reload_count: u32,
+    search_symbol_index_commit_ms: u32,
+    search_symbol_index_reload_ms: u32,
 }
 
 struct SearchStateBuildResult {
@@ -3380,6 +4960,18 @@ fn apply_semantic_projection_stats(
     if !stats.reported {
         return;
     }
+    timings.semantic_context_index_ms = Some(stats.semantic_context_index_ms);
+    timings.semantic_node_load_ms = Some(stats.node_load_ms);
+    timings.semantic_node_load_rows = Some(stats.node_load_rows);
+    timings.semantic_node_stream_batches = Some(stats.node_stream_batches);
+    timings.semantic_endpoint_load_ms = Some(stats.endpoint_load_ms);
+    timings.semantic_endpoint_load_rows = Some(stats.endpoint_load_rows);
+    timings.semantic_endpoint_load_batches = Some(stats.endpoint_load_batches);
+    timings.semantic_selected_nodes = Some(stats.selected_nodes);
+    timings.semantic_context_file_count = Some(stats.context_file_count);
+    timings.semantic_context_path_bytes = Some(stats.context_path_bytes);
+    timings.semantic_node_lookup_entries = Some(stats.node_lookup_entries);
+    timings.semantic_context_ms = Some(stats.context_ms);
     timings.semantic_doc_build_ms = Some(stats.doc_build_ms);
     timings.semantic_embedding_ms = Some(stats.embedding_ms);
     timings.semantic_db_upsert_ms = Some(stats.db_upsert_ms);
@@ -3401,68 +4993,80 @@ fn apply_semantic_projection_stats(
 
 fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRefreshStats) {
     timings.search_projection_rebuild_ms = Some(stats.search_stats.search_projection_rebuild_ms);
+    timings.search_symbol_stream_ms = Some(stats.search_stats.search_symbol_stream_ms);
+    timings.search_symbol_stream_rows = Some(stats.search_stats.search_symbol_stream_rows);
+    timings.search_symbol_stream_batches = Some(stats.search_stats.search_symbol_stream_batches);
     timings.search_symbol_index_ms = Some(stats.search_stats.search_symbol_index_ms);
+    timings.search_symbol_index_docs_written =
+        Some(stats.search_stats.search_symbol_index_docs_written);
+    timings.search_symbol_index_writer_count =
+        Some(stats.search_stats.search_symbol_index_writer_count);
+    timings.search_symbol_index_commit_count =
+        Some(stats.search_stats.search_symbol_index_commit_count);
+    timings.search_symbol_index_reload_count =
+        Some(stats.search_stats.search_symbol_index_reload_count);
+    timings.search_symbol_index_commit_ms = Some(stats.search_stats.search_symbol_index_commit_ms);
+    timings.search_symbol_index_reload_ms = Some(stats.search_stats.search_symbol_index_reload_ms);
     timings.runtime_cache_publish_ms = stats.runtime_cache_publish_ms;
     apply_semantic_projection_stats(timings, stats.semantic_stats);
 }
 
 #[cfg(test)]
 fn build_search_state(
-    storage: &mut Storage,
     search_storage_path: Option<&Path>,
     nodes: Vec<codestory_contracts::graph::Node>,
-    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-    semantic_projection_mode: SemanticProjectionMode,
-    hydrate_semantic_docs: bool,
 ) -> Result<SearchStateBuildResult, ApiError> {
-    build_search_state_for_runtime(
-        storage,
-        search_storage_path,
-        nodes,
-        llm_refresh_file_scope,
-        semantic_projection_mode,
-        hydrate_semantic_docs,
-        &test_sidecar_runtime_from_env(),
-    )
+    build_search_state_for_nodes(search_storage_path, nodes, None)
 }
 
-fn build_search_state_for_runtime(
-    storage: &mut Storage,
+#[cfg(test)]
+fn build_search_state_for_nodes(
     search_storage_path: Option<&Path>,
     nodes: Vec<codestory_contracts::graph::Node>,
-    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
-    semantic_projection_mode: SemanticProjectionMode,
-    hydrate_semantic_docs: bool,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<SearchStateBuildResult, ApiError> {
-    let projection_started = Instant::now();
-    match llm_refresh_file_scope {
-        Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
-        None => storage.rebuild_search_symbol_projection_from_node_table(),
-    }
-    .map_err(|e| ApiError::internal(format!("Failed to rebuild search symbol projection: {e}")))?;
-    let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
-
     let search_index_started = Instant::now();
-    let mut node_names = HashMap::new();
-    let mut engine = SearchEngine::new(search_storage_path)
-        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+    let mut node_names = HashMap::with_capacity(nodes.len());
+    let mut engine = SearchEngine::new(search_storage_path).map_err(|error| {
+        if search::engine::is_persisted_search_index_busy(&error) {
+            ApiError::new(
+                "cache_busy",
+                format!("Failed to init search engine: {error}"),
+            )
+        } else {
+            ApiError::internal(format!("Failed to init search engine: {error}"))
+        }
+    })?;
+    let mut symbol_session = engine.begin_symbol_index().map_err(|error| {
+        ApiError::internal(format!("Failed to start symbol index writer: {error}"))
+    })?;
     let mut search_nodes = Vec::with_capacity(nodes.len().min(SEARCH_NODE_BATCH_SIZE));
     for node in &nodes {
         let display_name = node_display_name(node);
         node_names.insert(node.id, display_name.clone());
         search_nodes.push((node.id, display_name));
         if search_nodes.len() >= SEARCH_NODE_BATCH_SIZE {
-            engine
-                .index_nodes(std::mem::take(&mut search_nodes))
+            symbol_session
+                .add_nodes(std::mem::take(&mut search_nodes))
                 .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
         }
     }
     if !search_nodes.is_empty() {
-        engine
-            .index_nodes(search_nodes)
+        symbol_session
+            .add_nodes(search_nodes)
             .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
     }
+    #[cfg(test)]
+    publication_test_checkpoint(PublicationTestBoundary::SearchIndexWrite, cancel_token)?;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let symbol_write_stats = symbol_session
+        .finish()
+        .map_err(|e| ApiError::internal(format!("Failed to commit symbol index: {e}")))?;
     if search_storage_path.is_some() && engine.full_text_doc_count() != nodes.len() {
         return Err(ApiError::internal(format!(
             "Persisted search generation validation failed: indexed {} docs for {} nodes",
@@ -3472,41 +5076,31 @@ fn build_search_state_for_runtime(
     }
     let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
     let search_stats = SearchStateBuildStats {
-        search_projection_rebuild_ms,
+        search_projection_rebuild_ms: 0,
+        search_symbol_stream_ms: 0,
+        search_symbol_stream_rows: clamp_usize_to_u32(nodes.len()),
+        search_symbol_stream_batches: clamp_usize_to_u32(
+            nodes.len().div_ceil(SEARCH_NODE_BATCH_SIZE),
+        ),
         search_symbol_index_ms,
+        search_symbol_index_docs_written: clamp_usize_to_u32(symbol_write_stats.docs_written),
+        search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
+        search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
+        search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
+        search_symbol_index_commit_ms: clamp_u128_to_u32(
+            symbol_write_stats.commit_duration.as_millis(),
+        ),
+        search_symbol_index_reload_ms: clamp_u128_to_u32(
+            symbol_write_stats.reload_duration.as_millis(),
+        ),
     };
-    let semantic_stats = match semantic_projection_mode {
-        SemanticProjectionMode::PersistBackedDocs => sync_llm_symbol_projection_for_runtime(
-            storage,
-            &nodes,
-            &node_names,
-            &mut engine,
-            SemanticRefreshScope {
-                file_ids: llm_refresh_file_scope,
-                component_reports: None,
-            },
-            hydrate_semantic_docs,
-            None,
-            runtime,
-        )?,
-        SemanticProjectionMode::LoadPersistedDocs => load_persisted_semantic_docs_for_runtime(
-            storage,
-            &mut engine,
-            hydrate_semantic_docs,
-            runtime,
-        )?,
-        SemanticProjectionMode::SkipPersistence => {
-            tracing::debug!("Skipping semantic docs for transient search-state build");
-            engine.index_llm_symbol_docs(Vec::new());
-            SemanticProjectionStats::default()
-        }
-    };
+    engine.index_llm_symbol_docs(Vec::new());
     Ok(SearchStateBuildResult {
         publication: None,
         node_names,
         engine,
         search_stats,
-        semantic_stats,
+        semantic_stats: SemanticProjectionStats::default(),
     })
 }
 
@@ -3535,23 +5129,326 @@ fn indexed_file_role(path: &Path) -> IndexedFileRoleDto {
     path_role_from_key(&normalize_path_key(&path.to_string_lossy()))
 }
 
-fn indexed_file_incomplete_reason(
+fn file_coverage_reason(
     file: &FileInfo,
-    errors_by_file: &HashMap<i64, u32>,
-) -> Option<(&'static str, &'static str)> {
+    errors_by_file: &HashMap<i64, Vec<FileCoverageReason>>,
+    has_verified_content: bool,
+) -> Option<FileCoverageReason> {
     if file.complete {
         return None;
     }
-    if errors_by_file.contains_key(&file.id) {
-        Some((
-            "index_error",
-            "recorded file-level index errors; inspect error_count or reindex the file",
-        ))
+    if let Some(reason) = errors_by_file
+        .get(&file.id)
+        .and_then(|reasons| reasons.first())
+    {
+        return Some(*reason);
+    }
+    if !file.complete && file.indexed && has_verified_content {
+        Some(FileCoverageReason::ParserPartial)
     } else {
-        Some((
-            "unknown",
-            "incomplete with no recorded file-level error; run a full reindex or inspect indexer logs",
-        ))
+        Some(FileCoverageReason::CollectorFailure)
+    }
+}
+
+fn file_coverage_retryable(reason: FileCoverageReason) -> bool {
+    matches!(
+        reason,
+        FileCoverageReason::SourceChanged
+            | FileCoverageReason::DiscoveryIncomplete
+            | FileCoverageReason::CollectorFailure
+    )
+}
+
+fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
+    match reason {
+        FileCoverageReason::ParserPartial => {
+            "stable verified source published with partial parser coverage"
+        }
+        FileCoverageReason::SourceChanged => "source changed while its projection was collected",
+        FileCoverageReason::Unreadable => "source bytes could not be read and verified",
+        FileCoverageReason::Malformed => {
+            "verified UTF-8 source is malformed for its structural format"
+        }
+        FileCoverageReason::Binary => "source is binary or is not valid UTF-8",
+        FileCoverageReason::Oversized => "source exceeds the configured indexing size limit",
+        FileCoverageReason::DiscoveryIncomplete => {
+            "workspace discovery could not prove a complete source inventory"
+        }
+        FileCoverageReason::CollectorFailure => {
+            "a source collector or projection write failed before verification completed"
+        }
+    }
+}
+
+fn full_refresh_execution_plan_with_coverage(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    policy: &SourceIndexPolicy,
+) -> Result<(RefreshExecutionPlan, Vec<OversizedSourceExclusionCandidate>), ApiError> {
+    let inventory = workspace
+        .source_inventory_with_policy(policy)
+        .map_err(|error| {
+            ApiError::source_coverage_failure(
+                "source_collector_failure",
+                format!("Failed to collect the full source inventory: {error}"),
+                vec![FileCoverageDiagnosticDto {
+                    path: ".".to_string(),
+                    reason: FileCoverageReason::CollectorFailure,
+                    retryable: true,
+                    verified_source: false,
+                    projection_available: false,
+                }],
+            )
+        })?;
+    if inventory.outcome != WorkspaceInventoryOutcome::Complete {
+        let reason = if inventory.outcome == WorkspaceInventoryOutcome::Unreadable {
+            FileCoverageReason::Unreadable
+        } else {
+            FileCoverageReason::DiscoveryIncomplete
+        };
+        let mut coverage_gaps = inventory
+            .issues
+            .iter()
+            .map(|issue| FileCoverageDiagnosticDto {
+                path: runtime_relative_path(root, &issue.path),
+                reason,
+                retryable: file_coverage_retryable(reason),
+                verified_source: false,
+                projection_available: false,
+            })
+            .collect::<Vec<_>>();
+        if coverage_gaps.is_empty() {
+            coverage_gaps.push(FileCoverageDiagnosticDto {
+                path: ".".to_string(),
+                reason,
+                retryable: file_coverage_retryable(reason),
+                verified_source: false,
+                projection_available: false,
+            });
+        }
+        return Err(ApiError::source_coverage_failure(
+            match reason {
+                FileCoverageReason::Unreadable => "source_unreadable",
+                _ => "source_discovery_incomplete",
+            },
+            format!(
+                "Effective refresh mode `full` requires a complete source inventory; discovery was {:?}.",
+                inventory.outcome
+            ),
+            coverage_gaps,
+        ));
+    }
+    Ok((
+        RefreshExecutionPlan {
+            mode: RefreshMode::FullRefresh,
+            files_to_index: inventory.files,
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        inventory.policy_exclusions,
+    ))
+}
+
+fn publish_source_policy_exclusions(
+    storage: &mut Store,
+    root: &Path,
+    publication: &IndexPublicationRecord,
+    exclusions: &[OversizedSourceExclusionCandidate],
+    policy: &SourceIndexPolicy,
+) -> Result<(), ApiError> {
+    let identity = project_identity_v3(root);
+    storage
+        .publish_source_policy_exclusion_generation(
+            publication,
+            &identity.project_id,
+            &identity.workspace_id,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &policy.policy_version,
+                policy.byte_cap,
+                policy.structural_unit_cap,
+            ),
+            exclusions,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to publish complete source policy exclusions: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn source_policy_exclusion_candidate(
+    record: &SourcePolicyExclusionRecord,
+) -> OversizedSourceExclusionCandidate {
+    OversizedSourceExclusionCandidate {
+        normalized_path: record.normalized_path.clone(),
+        content_hash: record.content_hash.clone(),
+        observed_size: record.observed_size,
+        observed_unit_count: record.observed_unit_count,
+        policy_version: record.policy_version.clone(),
+        byte_cap: record.byte_cap,
+        structural_unit_cap: record.structural_unit_cap,
+    }
+}
+
+fn revalidate_source_policy_exclusions(
+    workspace: &WorkspaceManifest,
+    exclusions: &[OversizedSourceExclusionCandidate],
+    policy: &SourceIndexPolicy,
+) -> Result<Vec<OversizedSourceExclusionCandidate>, ApiError> {
+    workspace
+        .revalidate_source_policy_exclusions(exclusions, policy)
+        .map_err(|error| {
+            ApiError::new(
+                "source_verification_failed",
+                format!(
+                    "Source policy exclusions changed before publication; the candidate core was discarded: {error}"
+                ),
+            )
+        })
+}
+
+fn validate_source_policy_exclusions(
+    storage: &Store,
+    root: &Path,
+    publication: &IndexPublicationRecord,
+    policy: &SourceIndexPolicy,
+) -> Result<(), ApiError> {
+    let identity = project_identity_v3(root);
+    storage
+        .validate_source_policy_exclusion_publication(
+            publication,
+            &identity.project_id,
+            &identity.workspace_id,
+            SourcePolicyExclusionPolicyIdentity::new(
+                &policy.policy_version,
+                policy.byte_cap,
+                policy.structural_unit_cap,
+            ),
+        )
+        .map_err(|error| {
+            ApiError::new(
+                "source_verification_failed",
+                format!("Source policy exclusion publication is incomplete or stale: {error}"),
+            )
+        })?;
+    Ok(())
+}
+
+fn validate_structural_text_units(
+    storage: &Store,
+    publication: &IndexPublicationRecord,
+) -> Result<(), ApiError> {
+    storage
+        .validate_structural_text_unit_publication(publication)
+        .map_err(|error| {
+            ApiError::new(
+                "source_verification_failed",
+                format!("Structural text unit publication is incomplete or stale: {error}"),
+            )
+        })?;
+    Ok(())
+}
+
+fn stored_file_coverage_diagnostics(
+    root: &Path,
+    storage: &Store,
+) -> Result<Vec<FileCoverageDiagnosticDto>, ApiError> {
+    let files = storage.get_files().map_err(|error| {
+        ApiError::internal(format!("Failed to load staged file coverage: {error}"))
+    })?;
+    let verified_file_ids = storage
+        .files()
+        .inventory()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load staged verified source identities: {error}"
+            ))
+        })?
+        .into_iter()
+        .filter_map(|file| file.content_hash.map(|_| file.id))
+        .collect::<HashSet<_>>();
+    let structural_projection_file_ids = storage
+        .get_structural_text_projection_file_ids()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load staged structural projection identities: {error}"
+            ))
+        })?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut dedicated_openapi_projection_file_ids = HashSet::new();
+    for file in &files {
+        if file.language == "openapi"
+            && verified_file_ids.contains(&file.id)
+            && storage
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to verify staged OpenAPI projection identity for {}: {error}",
+                        runtime_relative_path(root, &file.path)
+                    ))
+                })?
+        {
+            dedicated_openapi_projection_file_ids.insert(file.id);
+        }
+    }
+    let mut errors_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
+    for error in storage.get_errors(None).map_err(|error| {
+        ApiError::internal(format!("Failed to load staged file errors: {error}"))
+    })? {
+        if let Some(file_id) = error.file_id {
+            errors_by_file.entry(file_id.0).or_default().push(
+                error
+                    .coverage_reason
+                    .unwrap_or(FileCoverageReason::CollectorFailure),
+            );
+        }
+    }
+    Ok(files
+        .iter()
+        .filter_map(|file| {
+            let verified_source = verified_file_ids.contains(&file.id);
+            let dedicated_openapi_source = file.language == "openapi"
+                && verified_source
+                && dedicated_openapi_projection_file_ids.contains(&file.id);
+            let structural_projection_verified = dedicated_openapi_source
+                || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+                || (verified_source && structural_projection_file_ids.contains(&file.id));
+            let reason = if file.complete && !structural_projection_verified {
+                Some(FileCoverageReason::CollectorFailure)
+            } else {
+                file_coverage_reason(file, &errors_by_file, verified_source)
+            };
+            reason.map(|reason| FileCoverageDiagnosticDto {
+                path: runtime_relative_path(root, &file.path),
+                reason,
+                retryable: file_coverage_retryable(reason),
+                verified_source,
+                projection_available: file.indexed
+                    && verified_source
+                    && structural_projection_verified,
+            })
+        })
+        .collect())
+}
+
+fn source_coverage_failure_code(coverage_gaps: &[FileCoverageDiagnosticDto]) -> &'static str {
+    let Some(first) = coverage_gaps.first().map(|entry| entry.reason) else {
+        return "source_verification_failed";
+    };
+    if coverage_gaps.iter().any(|entry| entry.reason != first) {
+        return "source_verification_failed";
+    }
+    match first {
+        FileCoverageReason::ParserPartial => "source_verification_failed",
+        FileCoverageReason::SourceChanged => "source_changed",
+        FileCoverageReason::Unreadable => "source_unreadable",
+        FileCoverageReason::Malformed => "source_malformed",
+        FileCoverageReason::Binary => "source_binary",
+        FileCoverageReason::Oversized => "source_oversized",
+        FileCoverageReason::DiscoveryIncomplete => "source_discovery_incomplete",
+        FileCoverageReason::CollectorFailure => "source_collector_failure",
     }
 }
 
@@ -3573,6 +5470,34 @@ const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
 #[cfg(test)]
 const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 
+#[cfg(test)]
+type ActivationSearchRevalidateHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+type SemanticProjectionRevalidateHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+type FullRefreshStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
+#[cfg(test)]
+type IncrementalStagedStoreHook = Box<dyn FnOnce(&mut Storage)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_after_index_freshness_fence_test_hook(hook: impl FnOnce() + 'static) {
+    AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_index_freshness_fence_test_hook() {
+    let hook = AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn not_checked_index_freshness(
     reason: impl Into<String>,
     indexed_file_count: u32,
@@ -3592,6 +5517,14 @@ fn not_checked_index_freshness(
 }
 
 fn indexable_source_path(path: &Path) -> bool {
+    if path.to_str().is_some_and(|path| {
+        !Path::new(path).is_absolute()
+            && codestory_contracts::language_support::is_structural_source_path(path)
+            && codestory_contracts::language_support::structural_source_path_exclusion(path)
+                .is_some()
+    }) {
+        return false;
+    }
     let tree_sitter_supported = path
         .extension()
         .and_then(|value| value.to_str())
@@ -3604,6 +5537,20 @@ fn indexable_source_path(path: &Path) -> bool {
         || looks_like_openapi_source_path(path)
 }
 
+fn indexable_source_path_in_workspace(root: &Path, path: &Path) -> bool {
+    let Some(relative) = codestory_workspace::workspace_relative_path(root, path) else {
+        return false;
+    };
+    indexable_source_path(&relative)
+}
+
+fn indexable_source_path_with_root(root: Option<&Path>, path: &Path) -> bool {
+    root.map_or_else(
+        || indexable_source_path(path),
+        |root| indexable_source_path_in_workspace(root, path),
+    )
+}
+
 fn looks_like_openapi_source_path(path: &Path) -> bool {
     if !codestory_indexer::is_openapi_candidate_path(path) {
         return false;
@@ -3614,57 +5561,114 @@ fn looks_like_openapi_source_path(path: &Path) -> bool {
     codestory_indexer::looks_like_openapi_schema(&source)
 }
 
-fn index_freshness_from_storage(
+fn index_freshness_observation_from_storage(
     root: &Path,
     workspace: &WorkspaceManifest,
     storage: &Storage,
-) -> IndexFreshnessDto {
+    policy: &SourceIndexPolicy,
+) -> IndexFreshnessObservation {
+    let mut identities = AffectedOperationIdentityIndex::native();
+    index_freshness_observation_from_storage_with_identities(
+        root,
+        workspace,
+        storage,
+        policy,
+        &mut identities,
+    )
+}
+
+fn index_freshness_observation_from_storage_with_identities<R>(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    storage: &Storage,
+    policy: &SourceIndexPolicy,
+    identities: &mut AffectedOperationIdentityIndex<R>,
+) -> IndexFreshnessObservation
+where
+    R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
+{
     let started_at = Instant::now();
-    let files = match storage.get_files() {
-        Ok(files) => files,
-        Err(error) => {
-            return not_checked_index_freshness(
-                format!("failed to read indexed file inventory: {error}"),
-                0,
-                started_at,
-            );
-        }
-    };
-    let indexed_file_count = clamp_usize_to_u32(files.len());
     match storage.has_incomplete_incremental_run() {
         Ok(true) => {
-            return IndexFreshnessDto {
+            return IndexFreshnessObservation::incomplete(IndexFreshnessDto {
                 status: IndexFreshnessStatusDto::Stale,
                 changed_file_count: 0,
                 new_file_count: 0,
                 removed_file_count: 0,
                 checked_file_count: 0,
-                indexed_file_count,
+                indexed_file_count: 0,
                 duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
                 reason: Some(
                     "previous_incremental_run_incomplete_full_refresh_required".to_string(),
                 ),
                 samples: Vec::new(),
-            };
+            });
         }
         Ok(false) => {}
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to inspect incomplete index marker: {error}"),
-                indexed_file_count,
+                0,
                 started_at,
-            );
+            ));
         }
     }
+    match storage.get_complete_index_publication() {
+        Ok(Some(publication)) => {
+            if let Err(error) = validate_structural_text_units(storage, &publication) {
+                return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                    format!(
+                        "structural text unit publication is incomplete: {}",
+                        error.message
+                    ),
+                    0,
+                    started_at,
+                ));
+            }
+            if let Err(error) =
+                validate_source_policy_exclusions(storage, root, &publication, policy)
+            {
+                return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                    format!(
+                        "source policy exclusion publication is incomplete: {}",
+                        error.message
+                    ),
+                    0,
+                    started_at,
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                format!("failed to read complete core publication: {error}"),
+                0,
+                started_at,
+            ));
+        }
+    }
+    #[cfg(test)]
+    run_after_index_freshness_fence_test_hook();
+    let files = match storage.get_files() {
+        Ok(files) => files,
+        Err(error) => {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                format!("failed to read indexed file inventory: {error}"),
+                0,
+                started_at,
+            ));
+        }
+    };
+    let indexed_file_count = clamp_usize_to_u32(files.len());
     if files.is_empty() {
-        return not_checked_index_freshness(
+        return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
             "no indexed file inventory is available yet",
             indexed_file_count,
             started_at,
-        );
+        ));
     }
     if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
-        return not_checked_index_freshness(
+        return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
             format!(
                 "indexed file inventory exceeds bounded freshness cap ({} > {})",
                 files.len(),
@@ -3672,67 +5676,85 @@ fn index_freshness_from_storage(
             ),
             indexed_file_count,
             started_at,
-        );
+        ));
     }
 
     let stored_files = match storage.files().inventory() {
         Ok(files) => files,
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to read refresh inventory: {error}"),
                 indexed_file_count,
                 started_at,
-            );
+            ));
         }
     };
     let removed_paths = files
         .iter()
         .map(|file| (file.id, file.path.clone()))
         .collect::<HashMap<_, _>>();
+    let stored_policy_exclusions = match storage.get_source_policy_exclusions() {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+                format!("failed to read source policy exclusions: {error}"),
+                indexed_file_count,
+                started_at,
+            ));
+        }
+    };
     let refresh_inputs = RefreshInputs {
         stored_files,
+        policy_exclusions: stored_policy_exclusions
+            .iter()
+            .map(source_policy_exclusion_candidate)
+            .collect(),
         inventory: Default::default(),
     };
-    let refresh = match workspace
-        .build_execution_outcome_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
-    {
+    let refresh = match workspace.build_execution_outcome_bounded_with_policy(
+        &refresh_inputs,
+        INDEX_FRESHNESS_CURRENT_FILE_CAP,
+        policy,
+    ) {
         Ok(refresh) => refresh,
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to check workspace inventory: {error}"),
                 indexed_file_count,
                 started_at,
-            );
+            ));
         }
     };
-    if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+    if refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         let detail = refresh
+            .refresh
             .inventory_issues
             .first()
             .map(|issue| format!("{}: {}", issue.path.display(), issue.message));
-        return not_checked_index_freshness(
+        return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
             match detail {
                 Some(detail) => format!(
                     "current workspace inventory is {:?}: {detail}",
-                    refresh.inventory_outcome
+                    refresh.refresh.inventory_outcome
                 ),
                 None => format!(
                     "current workspace inventory is {:?} (>{})",
-                    refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
+                    refresh.refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
                 ),
             },
             indexed_file_count,
             started_at,
-        );
+        ));
     }
-    let plan = refresh.plan;
+    let current_policy_exclusions = refresh.policy_exclusions;
+    let plan = refresh.refresh.plan;
 
     let mut changed_file_count = 0u32;
     let mut new_file_count = 0u32;
     let mut samples = Vec::new();
     for path in &plan.files_to_index {
         let existing_indexed_file = plan.existing_file_ids.contains_key(path);
-        if !existing_indexed_file && !indexable_source_path(path) {
+        if !existing_indexed_file && !indexable_source_path_in_workspace(root, path) {
             continue;
         }
         let kind = if existing_indexed_file {
@@ -3750,7 +5772,60 @@ fn index_freshness_from_storage(
         }
     }
 
-    let removed_file_count = clamp_usize_to_u32(plan.files_to_remove.len());
+    let previous_policy_by_path = stored_policy_exclusions
+        .iter()
+        .map(|entry| (entry.normalized_path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let current_policy_paths = current_policy_exclusions
+        .iter()
+        .map(|entry| entry.normalized_path.as_str())
+        .collect::<HashSet<_>>();
+    let planned_paths = plan
+        .files_to_index
+        .iter()
+        .map(|path| runtime_relative_path(root, path))
+        .collect::<HashSet<_>>();
+    for exclusion in &current_policy_exclusions {
+        let kind = match previous_policy_by_path.get(exclusion.normalized_path.as_str()) {
+            Some(previous)
+                if previous.content_hash == exclusion.content_hash
+                    && previous.observed_size == exclusion.observed_size
+                    && previous.observed_unit_count == exclusion.observed_unit_count
+                    && previous.policy_version == exclusion.policy_version
+                    && previous.byte_cap == exclusion.byte_cap
+                    && previous.structural_unit_cap == exclusion.structural_unit_cap =>
+            {
+                continue;
+            }
+            Some(_) => {
+                changed_file_count = changed_file_count.saturating_add(1);
+                IndexFreshnessChangeKindDto::Changed
+            }
+            None => {
+                new_file_count = new_file_count.saturating_add(1);
+                IndexFreshnessChangeKindDto::New
+            }
+        };
+        if samples.len() < INDEX_FRESHNESS_SAMPLE_LIMIT {
+            samples.push(IndexFreshnessSampleDto {
+                kind,
+                path: exclusion.normalized_path.clone(),
+            });
+        }
+    }
+
+    let removed_policy_exclusions = stored_policy_exclusions
+        .iter()
+        .filter(|entry| {
+            !current_policy_paths.contains(entry.normalized_path.as_str())
+                && !planned_paths.contains(&entry.normalized_path)
+        })
+        .collect::<Vec<_>>();
+    let removed_file_count = clamp_usize_to_u32(
+        plan.files_to_remove
+            .len()
+            .saturating_add(removed_policy_exclusions.len()),
+    );
     for removed_id in &plan.files_to_remove {
         if samples.len() >= INDEX_FRESHNESS_SAMPLE_LIMIT {
             break;
@@ -3762,6 +5837,15 @@ fn index_freshness_from_storage(
             });
         }
     }
+    for removed in removed_policy_exclusions {
+        if samples.len() >= INDEX_FRESHNESS_SAMPLE_LIMIT {
+            break;
+        }
+        samples.push(IndexFreshnessSampleDto {
+            kind: IndexFreshnessChangeKindDto::Removed,
+            path: removed.normalized_path.clone(),
+        });
+    }
 
     let status = if changed_file_count == 0 && new_file_count == 0 && removed_file_count == 0 {
         IndexFreshnessStatusDto::Fresh
@@ -3772,17 +5856,67 @@ fn index_freshness_from_storage(
         .saturating_sub(removed_file_count)
         .saturating_add(new_file_count);
 
-    IndexFreshnessDto {
-        status,
-        changed_file_count,
-        new_file_count,
-        removed_file_count,
-        checked_file_count,
-        indexed_file_count,
-        duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
-        reason: None,
-        samples,
+    for path in plan
+        .existing_file_ids
+        .keys()
+        .chain(plan.files_to_index.iter())
+    {
+        identities.record_admitted(path);
     }
+    for path in &plan.files_to_index {
+        identities.record_stale(path);
+    }
+    for removed_id in &plan.files_to_remove {
+        let Some(path) = removed_paths.get(removed_id) else {
+            continue;
+        };
+        identities.record_stale(path);
+    }
+
+    let identity_gap_count = identities.freshness_identity_gap_count();
+    let identity_gap_sample = identities.freshness_identity_gap_sample();
+
+    IndexFreshnessObservation {
+        freshness: IndexFreshnessDto {
+            status,
+            changed_file_count,
+            new_file_count,
+            removed_file_count,
+            checked_file_count,
+            indexed_file_count,
+            duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+            reason: None,
+            samples,
+        },
+        inventory_complete: identity_gap_count == 0,
+        admitted_identities: identities.admitted_identities.clone(),
+        stale_identities: identities.stale_identities.clone(),
+        identity_gap_count,
+        identity_gap_sample,
+    }
+}
+
+fn index_freshness_from_storage_with_policy(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    storage: &Storage,
+    policy: &SourceIndexPolicy,
+) -> IndexFreshnessDto {
+    index_freshness_observation_from_storage(root, workspace, storage, policy).freshness
+}
+
+#[cfg(test)]
+fn index_freshness_from_storage(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    storage: &Storage,
+) -> IndexFreshnessDto {
+    index_freshness_from_storage_with_policy(
+        root,
+        workspace,
+        storage,
+        process_source_index_policy(),
+    )
 }
 
 fn workspace_member_index_summaries(
@@ -3987,8 +6121,11 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
 
 const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 6;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
+#[cfg(test)]
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
-const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
+const SEARCH_SYMBOL_STREAM_BATCH_SIZE: usize = 4_096;
+const SEMANTIC_NODE_STREAM_BATCH_SIZE: usize = 4_096;
+const SEMANTIC_EDGE_STREAM_BATCH_SIZE: usize = 4_096;
 const LLM_DOC_RELOAD_BATCH_SIZE: usize = 512;
 #[cfg(test)]
 const LLM_DOC_EMBED_BATCH_SIZE: usize = 128;
@@ -4009,9 +6146,11 @@ const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
 #[cfg(test)]
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
-const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
+const SEMANTIC_POLICY_VERSION: &str = codestory_retrieval::SEMANTIC_POLICY_VERSION;
+const LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION: u32 = 29;
+const LEGACY_OVERSIZED_SOURCE_POLICY_VERSION: &str = "oversized-source-v1";
 const SYMBOL_SEARCH_DOC_PROVENANCE: &str = "extracted";
-const DENSE_CENTRAL_LABEL_THRESHOLD: usize = 12;
+const DENSE_CENTRAL_RELATIONSHIP_THRESHOLD: usize = 12;
 const DENSE_CENTRAL_SCORE_THRESHOLD: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4022,6 +6161,34 @@ enum DenseAnchorReason {
     CentralGraphNode,
     ComponentReport,
     UnstructuredDoc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticProjectionSourcePolicyCompatibility {
+    Exact,
+    LegacyPredecessor,
+}
+
+fn semantic_projection_source_policy_compatibility(
+    recorded: SourcePolicyExclusionPolicyIdentity<'_>,
+    current: &SourceIndexPolicy,
+    schema_version: u32,
+    legacy_structural_empty: bool,
+) -> Option<SemanticProjectionSourcePolicyCompatibility> {
+    if recorded.byte_cap != current.byte_cap
+        || recorded.structural_unit_cap != current.structural_unit_cap
+    {
+        return None;
+    }
+    if recorded.policy_version == current.policy_version {
+        return Some(SemanticProjectionSourcePolicyCompatibility::Exact);
+    }
+    (recorded.policy_version == LEGACY_OVERSIZED_SOURCE_POLICY_VERSION
+        && current.policy_version
+            == codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION
+        && schema_version == LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION
+        && legacy_structural_empty)
+        .then_some(SemanticProjectionSourcePolicyCompatibility::LegacyPredecessor)
 }
 
 impl DenseAnchorReason {
@@ -4125,21 +6292,18 @@ fn current_embedding_contract_for_runtime(
 }
 
 fn search_index_storage_path(storage_path: &Path) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.search"))
+    codestory_workspace::legacy_search_directory_for_storage(storage_path)
 }
 
 fn search_index_generation_root(storage_path: &Path) -> PathBuf {
-    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codestory");
-    parent.join(format!("{stem}.search-generations"))
+    codestory_workspace::search_generation_directory_for_storage(storage_path)
+}
+
+fn runtime_workspace_manifest(
+    root: &Path,
+    storage_path: &Path,
+) -> anyhow::Result<WorkspaceManifest> {
+    WorkspaceManifest::open_with_storage_owned_exclusions(root.to_path_buf(), storage_path)
 }
 
 fn search_index_path_for_publication(
@@ -4265,8 +6429,17 @@ struct SearchGenerationCatalogGuard {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationTestBoundary {
+    SemanticContextIndexes,
+    SemanticNodePage,
+    SemanticStoredDocumentPage,
+    SemanticEndpointRead,
+    ProjectionSnapshotFinalize,
+    ProjectionSnapshotDetail,
+    ProjectionManifestIdentity,
     Identity,
     SearchBuild,
+    SearchSymbolPage,
+    SearchIndexWrite,
     SearchValidation,
     SearchCompletion,
     CatalogLock,
@@ -4286,11 +6459,120 @@ enum PublicationTestAction {
 thread_local! {
     static PUBLICATION_TEST_FAULT: std::cell::RefCell<Option<(PublicationTestBoundary, PublicationTestAction)>> =
         const { std::cell::RefCell::new(None) };
+    static ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<ActivationSearchRevalidateHook>> =
+        const { std::cell::RefCell::new(None) };
+    static SEMANTIC_PROJECTION_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<SemanticProjectionRevalidateHook>> =
+        const { std::cell::RefCell::new(None) };
+    static SOURCE_POLICY_BEFORE_REVALIDATE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static SOURCE_POLICY_AFTER_PLAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static FULL_REFRESH_STAGED_STORE_HOOK: std::cell::RefCell<Option<FullRefreshStagedStoreHook>> =
+        const { std::cell::RefCell::new(None) };
+    static INCREMENTAL_STAGED_STORE_HOOK: std::cell::RefCell<Option<IncrementalStagedStoreHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn arm_publication_test_fault(boundary: PublicationTestBoundary, action: PublicationTestAction) {
     PUBLICATION_TEST_FAULT.with(|fault| *fault.borrow_mut() = Some((boundary, action)));
+}
+
+#[cfg(test)]
+fn arm_activation_search_before_revalidate_hook(hook: impl FnOnce(&Path) + 'static) {
+    ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_activation_search_before_revalidate_hook(storage_path: &Path) {
+    ACTIVATION_SEARCH_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage_path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_semantic_projection_before_revalidate_hook(hook: impl FnOnce(&Path) + 'static) {
+    SEMANTIC_PROJECTION_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_semantic_projection_before_revalidate_hook(storage_path: &Path) {
+    SEMANTIC_PROJECTION_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook(storage_path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_source_policy_before_revalidate_hook(hook: impl FnOnce() + 'static) {
+    SOURCE_POLICY_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_source_policy_before_revalidate_hook() {
+    SOURCE_POLICY_BEFORE_REVALIDATE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_source_policy_after_plan_hook(hook: impl FnOnce() + 'static) {
+    SOURCE_POLICY_AFTER_PLAN_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_source_policy_after_plan_hook() {
+    SOURCE_POLICY_AFTER_PLAN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_full_refresh_staged_store_hook(hook: impl FnOnce(&mut Storage) + 'static) {
+    FULL_REFRESH_STAGED_STORE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_full_refresh_staged_store_hook(storage: &mut Storage) {
+    FULL_REFRESH_STAGED_STORE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage);
+        }
+    });
+}
+
+#[cfg(test)]
+fn arm_incremental_staged_store_hook(hook: impl FnOnce(&mut Storage) + 'static) {
+    INCREMENTAL_STAGED_STORE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_incremental_staged_store_hook(storage: &mut Storage) {
+    INCREMENTAL_STAGED_STORE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(storage);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -4483,6 +6765,16 @@ fn prune_search_generations(
         )
     });
 
+    // During staged publication the prepared search identity is newer than
+    // the still-live core. Keep the search generation bound to that live core
+    // as the rollback; a concurrent prepared generation must not consume the
+    // sole rollback slot merely because its completion marker was written.
+    let pinned_rollback_generation_id = Store::database_complete_index_publication(storage_path)
+        .ok()
+        .flatten()
+        .map(|publication| publication.generation_id)
+        .filter(|generation_id| generation_id != active_generation_id);
+
     let mut rollback_retained = false;
     for entry in generations {
         let path = entry.path();
@@ -4497,7 +6789,14 @@ fn prune_search_generations(
             Some(false)
         };
         match inspection {
-            Some(true) if !rollback_retained => rollback_retained = true,
+            Some(true)
+                if !rollback_retained
+                    && pinned_rollback_generation_id
+                        .as_ref()
+                        .is_none_or(|generation_id| generation_id == &name) =>
+            {
+                rollback_retained = true
+            }
             Some(_) => {
                 let relative = Path::new(relative_root).join(&name);
                 let _ = try_remove_search_generation(&deletion, &relative, &path)?;
@@ -4537,36 +6836,67 @@ fn discard_unpublished_search_generation(
     }
 }
 
-fn load_search_symbol_projection(
+fn load_canonical_search_symbols(
     storage: &Storage,
     batch_size: usize,
+    cancel_token: Option<&CancellationToken>,
+    mut consume_batch: impl FnMut(Vec<SearchSymbolProjection>) -> Result<(), ApiError>,
 ) -> Result<
     (
         HashMap<codestory_contracts::graph::NodeId, String>,
-        Vec<SearchSymbolProjection>,
+        SearchStateBuildStats,
     ),
     ApiError,
 > {
-    let mut node_names = HashMap::new();
-    let mut entries = Vec::new();
+    let count_started = Instant::now();
+    let expected_rows = storage
+        .get_canonical_search_symbol_count()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+        })?;
+    let mut node_names = HashMap::with_capacity(expected_rows as usize);
     let mut after_node_id = None;
     let batch_size = batch_size.max(1);
+    let mut stream_duration = count_started.elapsed();
+    let mut stream_rows = 0_usize;
+    let mut stream_batches = 0_usize;
     loop {
+        let batch_started = Instant::now();
         let batch = storage
-            .get_search_symbol_projection_batch_after(after_node_id, batch_size)
+            .get_canonical_search_symbol_batch_after(after_node_id, batch_size)
             .map_err(|e| {
-                ApiError::internal(format!("Failed to load search symbol projection: {e}"))
+                ApiError::internal(format!("Failed to stream canonical search symbols: {e}"))
             })?;
+        stream_duration = stream_duration.saturating_add(batch_started.elapsed());
         if batch.is_empty() {
             break;
         }
         after_node_id = batch.last().map(|entry| entry.node_id);
-        for entry in batch {
+        stream_rows = stream_rows.saturating_add(batch.len());
+        stream_batches = stream_batches.saturating_add(1);
+        for entry in &batch {
             node_names.insert(entry.node_id, entry.display_name.clone());
-            entries.push(entry);
+        }
+        consume_batch(batch)?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
         }
     }
-    Ok((node_names, entries))
+    if stream_rows != expected_rows as usize {
+        return Err(ApiError::internal(format!(
+            "Canonical search symbol stream count changed: expected {expected_rows}, loaded {stream_rows}"
+        )));
+    }
+    Ok((
+        node_names,
+        SearchStateBuildStats {
+            search_projection_rebuild_ms: 0,
+            search_symbol_stream_ms: clamp_u128_to_u32(stream_duration.as_millis()),
+            search_symbol_stream_rows: clamp_usize_to_u32(stream_rows),
+            search_symbol_stream_batches: clamp_usize_to_u32(stream_batches),
+            ..SearchStateBuildStats::default()
+        },
+    ))
 }
 
 struct LoadedSearchState {
@@ -4596,23 +6926,28 @@ fn load_persisted_search_state_for_runtime(
         ))
     })?;
     if publication.is_none() {
-        let nodes = storage.get_nodes().map_err(|error| {
-            ApiError::internal(format!("Failed to load legacy search nodes: {error}"))
-        })?;
-        let mut node_names = HashMap::with_capacity(nodes.len());
         let mut engine = SearchEngine::new(None).map_err(|error| {
             ApiError::internal(format!("Failed to init search engine: {error}"))
         })?;
-        let search_nodes = nodes
-            .iter()
-            .map(|node| {
-                let display_name = node_display_name(node);
-                node_names.insert(node.id, display_name.clone());
-                (node.id, display_name)
-            })
-            .collect();
-        engine.index_nodes(search_nodes).map_err(|error| {
-            ApiError::internal(format!("Failed to index legacy search nodes: {error}"))
+        let mut symbol_session = engine.begin_symbol_index().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to start legacy symbol index writer: {error}"
+            ))
+        })?;
+        let (node_names, _) = load_canonical_search_symbols(storage, 10_000, None, |batch| {
+            symbol_session
+                .add_nodes(
+                    batch
+                        .into_iter()
+                        .map(|entry| (entry.node_id, entry.display_name)),
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to index legacy search nodes: {error}"))
+                })
+        })?;
+        symbol_session.finish().map_err(|error| {
+            ApiError::internal(format!("Failed to finish legacy symbol index: {error}"))
         })?;
         load_persisted_semantic_docs_for_runtime(storage, &mut engine, false, runtime)?;
         return Ok(LoadedSearchState {
@@ -4621,8 +6956,6 @@ fn load_persisted_search_state_for_runtime(
             engine,
         });
     }
-    let (node_names, projection) =
-        load_search_symbol_projection(storage, SEARCH_SYMBOL_PROJECTION_BATCH_SIZE)?;
     let search_storage_path =
         search_index_path_for_publication(storage_path, publication.as_ref())?;
     let completion = publication.as_ref().and_then(|publication| {
@@ -4630,7 +6963,6 @@ fn load_persisted_search_state_for_runtime(
             .ok()?
             .to_string();
         read_search_generation_completion(&search_storage_path, &generation_id)
-            .filter(|marker| marker.symbol_count == projection.len() as u64)
     });
     if publication.is_some() && completion.is_none() {
         return Err(ApiError::new(
@@ -4648,20 +6980,35 @@ fn load_persisted_search_state_for_runtime(
                 ),
             )
         })?;
-    engine.load_symbol_projection(
-        projection
-            .iter()
-            .map(|entry| (entry.node_id, entry.display_name.clone())),
-    );
-    let completion_count_mismatch = completion
-        .as_ref()
-        .is_some_and(|marker| marker.tantivy_doc_count != engine.tantivy_doc_count() as u64);
-    if engine.full_text_doc_count() != projection.len() || completion_count_mismatch {
+    engine.load_symbol_projection(std::iter::empty());
+    let (node_names, stream_stats) =
+        load_canonical_search_symbols(storage, SEARCH_SYMBOL_STREAM_BATCH_SIZE, None, |batch| {
+            engine.extend_symbol_projection(
+                batch
+                    .into_iter()
+                    .map(|entry| (entry.node_id, entry.display_name)),
+            );
+            Ok(())
+        })?;
+    let completion_count_mismatch = completion.as_ref().is_some_and(|marker| {
+        marker.symbol_count != stream_stats.search_symbol_stream_rows as u64
+            || marker.tantivy_doc_count != engine.tantivy_doc_count() as u64
+    });
+    if engine.full_text_doc_count() != stream_stats.search_symbol_stream_rows as usize
+        || completion_count_mismatch
+    {
         return Err(ApiError::new(
             "cache_busy",
             format!(
-                "Completed search generation {} does not match its core projection.",
-                search_storage_path.display()
+                "Completed search generation {} does not match its core symbols: streamed={}, searchable={}, marker_symbols={}, stored_docs={}, marker_docs={}.",
+                search_storage_path.display(),
+                stream_stats.search_symbol_stream_rows,
+                engine.full_text_doc_count(),
+                completion.as_ref().map_or(0, |marker| marker.symbol_count),
+                engine.tantivy_doc_count(),
+                completion
+                    .as_ref()
+                    .map_or(0, |marker| marker.tantivy_doc_count),
             ),
         ));
     }
@@ -4859,7 +7206,7 @@ fn retrieval_state_from_storage_for_runtime(
     let stats = storage
         .get_llm_symbol_doc_stats()
         .map_err(|e| ApiError::internal(format!("Failed to query LLM symbol doc stats: {e}")))?;
-    let probe = embedding_runtime_availability_from_config(&runtime.embedding);
+    let probe = embedding_runtime_availability_from_config(runtime);
     let current_embedding = current_embedding_contract_for_runtime(runtime);
     let stored_embedding = stored_semantic_docs_contract_from_stats(&stats);
     let contract_mismatch = stats.doc_count > 0
@@ -5032,6 +7379,54 @@ fn llm_indexable_kind_for_scope(
     }
 }
 
+fn llm_indexable_kinds_for_scope(
+    scope: SemanticDocScope,
+) -> &'static [codestory_contracts::graph::NodeKind] {
+    use codestory_contracts::graph::NodeKind;
+
+    const DURABLE_SYMBOLS: &[NodeKind] = &[
+        NodeKind::STRUCT,
+        NodeKind::CLASS,
+        NodeKind::INTERFACE,
+        NodeKind::ANNOTATION,
+        NodeKind::UNION,
+        NodeKind::ENUM,
+        NodeKind::TYPEDEF,
+        NodeKind::FUNCTION,
+        NodeKind::METHOD,
+        NodeKind::MACRO,
+        NodeKind::GLOBAL_VARIABLE,
+        NodeKind::CONSTANT,
+        NodeKind::ENUM_CONSTANT,
+    ];
+    const ALL_SYMBOLS: &[NodeKind] = &[
+        NodeKind::MODULE,
+        NodeKind::NAMESPACE,
+        NodeKind::PACKAGE,
+        NodeKind::STRUCT,
+        NodeKind::CLASS,
+        NodeKind::INTERFACE,
+        NodeKind::ANNOTATION,
+        NodeKind::UNION,
+        NodeKind::ENUM,
+        NodeKind::TYPEDEF,
+        NodeKind::TYPE_PARAMETER,
+        NodeKind::FUNCTION,
+        NodeKind::METHOD,
+        NodeKind::MACRO,
+        NodeKind::GLOBAL_VARIABLE,
+        NodeKind::FIELD,
+        NodeKind::VARIABLE,
+        NodeKind::CONSTANT,
+        NodeKind::ENUM_CONSTANT,
+    ];
+
+    match scope {
+        SemanticDocScope::DurableSymbols => DURABLE_SYMBOLS,
+        SemanticDocScope::AllSymbols => ALL_SYMBOLS,
+    }
+}
+
 #[cfg(test)]
 fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
     llm_indexable_kind_for_scope(kind, semantic_doc_scope_from_env())
@@ -5129,18 +7524,119 @@ fn semantic_file_table_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, St
     display_paths
 }
 
-fn semantic_file_table_read_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
-    let (_, read_paths) = semantic_file_table_path_maps(files);
-    read_paths
-}
-
 #[derive(Default)]
 struct SemanticDocGraphContext {
     child_labels: HashMap<GraphNodeId, Vec<String>>,
     referenced_labels: HashMap<GraphNodeId, Vec<String>>,
     edge_digests: HashMap<GraphNodeId, Vec<String>>,
+    centrality: HashMap<GraphNodeId, DenseAnchorCentrality>,
     file_paths: HashMap<GraphNodeId, String>,
     file_read_paths: HashMap<GraphNodeId, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SemanticDocGraphPageStats {
+    endpoint_load_ms: u32,
+    endpoint_rows: u32,
+    endpoint_query_batches: u32,
+    lookup_entries: u32,
+}
+
+#[derive(Debug, Default)]
+struct SemanticNodeGraphSummary {
+    child_labels: Vec<String>,
+    referenced_labels: Vec<String>,
+    edge_kind_counts: HashMap<String, usize>,
+    centrality: DenseAnchorCentrality,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DenseAnchorCentrality {
+    child_count: usize,
+    related_count: usize,
+    edge_count: usize,
+}
+
+impl SemanticNodeGraphSummary {
+    fn observe_edge(
+        &mut self,
+        node: &GraphNode,
+        edge: &GraphEdge,
+        page_nodes: &HashMap<GraphNodeId, &GraphNode>,
+        endpoint_nodes: &HashMap<GraphNodeId, GraphNode>,
+        scope: SemanticDocScope,
+    ) {
+        let kind = format!("{:?}", edge.kind);
+        *self.edge_kind_counts.entry(kind).or_insert(0) += 1;
+        self.centrality.edge_count = self.centrality.edge_count.saturating_add(1);
+
+        if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+            && edge.source == node.id
+            && let Some(child) = semantic_graph_node(edge.target, page_nodes, endpoint_nodes)
+            && llm_indexable_kind_for_scope(child.kind, scope)
+        {
+            let label = node_display_name(child);
+            if !label.is_empty() {
+                self.centrality.child_count = self.centrality.child_count.saturating_add(1);
+                if self.child_labels.len() < 6 {
+                    self.child_labels.push(label);
+                }
+            }
+        }
+
+        let (source, target) = edge.effective_endpoints();
+        let other = if source == node.id {
+            target
+        } else if target == node.id {
+            source
+        } else {
+            return;
+        };
+        let Some(other_node) = semantic_graph_node(other, page_nodes, endpoint_nodes) else {
+            return;
+        };
+        if !llm_indexable_kind_for_scope(other_node.kind, scope) {
+            return;
+        }
+        let label = node_display_name(other_node);
+        if label.is_empty() {
+            return;
+        }
+        self.centrality.related_count = self.centrality.related_count.saturating_add(1);
+        if self.referenced_labels.len() < 6 && !self.referenced_labels.contains(&label) {
+            self.referenced_labels.push(label);
+        }
+    }
+
+    fn finish(
+        self,
+        limit: usize,
+    ) -> (Vec<String>, Vec<String>, Vec<String>, DenseAnchorCentrality) {
+        let mut counts = self.edge_kind_counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        let edge_digest = counts
+            .into_iter()
+            .take(limit)
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect();
+        (
+            self.child_labels,
+            self.referenced_labels,
+            edge_digest,
+            self.centrality,
+        )
+    }
+}
+
+fn semantic_graph_node<'a>(
+    node_id: GraphNodeId,
+    page_nodes: &'a HashMap<GraphNodeId, &'a GraphNode>,
+    endpoint_nodes: &'a HashMap<GraphNodeId, GraphNode>,
+) -> Option<&'a GraphNode> {
+    page_nodes
+        .get(&node_id)
+        .copied()
+        .or_else(|| endpoint_nodes.get(&node_id))
 }
 
 impl SemanticDocGraphContext {
@@ -5150,11 +7646,17 @@ impl SemanticDocGraphContext {
         semantic_nodes: &[&GraphNode],
         all_nodes: &[GraphNode],
     ) -> Result<Self, ApiError> {
+        let files = storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+        let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
         Self::build_for_scope(
             storage,
             semantic_nodes,
             all_nodes,
             semantic_doc_scope_from_env(),
+            file_paths,
+            file_read_paths,
         )
     }
 
@@ -5163,6 +7665,8 @@ impl SemanticDocGraphContext {
         semantic_nodes: &[&GraphNode],
         all_nodes: &[GraphNode],
         scope: SemanticDocScope,
+        mut file_paths: HashMap<GraphNodeId, String>,
+        mut file_read_paths: HashMap<GraphNodeId, String>,
     ) -> Result<Self, ApiError> {
         let nodes_by_id = all_nodes
             .iter()
@@ -5175,59 +7679,327 @@ impl SemanticDocGraphContext {
         let edges_by_node = storage.get_edges_for_node_ids(&node_ids).map_err(|e| {
             ApiError::internal(format!("Failed to load semantic doc graph context: {e}"))
         })?;
-        let files = storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
-        let file_table_paths = semantic_file_table_path_map(files.clone());
-        let file_table_read_paths = semantic_file_table_read_path_map(files);
-
-        let mut context = Self::default();
-        for node in semantic_nodes {
-            if let Some(file_id) = node.file_node_id
-                && let Some(file_node) = nodes_by_id.get(&file_id)
-            {
-                let file_path = file_table_paths
-                    .get(&file_id)
-                    .cloned()
-                    .unwrap_or_else(|| file_node.serialized_name.clone());
-                context.file_paths.insert(node.id, file_path);
-                let read_path = file_table_read_paths
-                    .get(&file_id)
-                    .cloned()
-                    .unwrap_or_else(|| file_node.serialized_name.clone());
-                context.file_read_paths.insert(node.id, read_path);
+        let context_file_ids = semantic_nodes
+            .iter()
+            .filter_map(|node| node.file_node_id)
+            .collect::<HashSet<_>>();
+        file_paths.retain(|file_id, _| context_file_ids.contains(file_id));
+        file_read_paths.retain(|file_id, _| context_file_ids.contains(file_id));
+        for file_id in context_file_ids {
+            if let Some(file_node) = nodes_by_id.get(&file_id) {
+                file_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
+                file_read_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
             }
+        }
 
+        let mut context = Self {
+            file_paths,
+            file_read_paths,
+            ..Default::default()
+        };
+        let endpoint_nodes = HashMap::new();
+        for node in semantic_nodes {
             let edges = edges_by_node
                 .get(&node.id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            context.child_labels.insert(
-                node.id,
-                child_symbol_labels_from_edges(node, edges, &nodes_by_id, 6, scope),
-            );
-            context.referenced_labels.insert(
-                node.id,
-                referenced_symbol_labels_from_edges(node, edges, &nodes_by_id, 6, scope),
-            );
-            context
-                .edge_digests
-                .insert(node.id, edge_digest_for_edges(edges, 6));
+            let mut summary = SemanticNodeGraphSummary::default();
+            for edge in edges {
+                summary.observe_edge(node, edge, &nodes_by_id, &endpoint_nodes, scope);
+            }
+            let (child_labels, referenced_labels, edge_digest, centrality) = summary.finish(6);
+            context.child_labels.insert(node.id, child_labels);
+            context.referenced_labels.insert(node.id, referenced_labels);
+            context.edge_digests.insert(node.id, edge_digest);
+            context.centrality.insert(node.id, centrality);
         }
 
         Ok(context)
     }
 
+    fn build_for_full_page(
+        storage: &Storage,
+        semantic_nodes: &[GraphNode],
+        scope: SemanticDocScope,
+        all_file_paths: &HashMap<GraphNodeId, String>,
+        all_file_read_paths: &HashMap<GraphNodeId, String>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<(Self, SemanticDocGraphPageStats), ApiError> {
+        let semantic_node_ids = semantic_nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let page_nodes = semantic_nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let context_file_ids = semantic_nodes
+            .iter()
+            .filter_map(|node| node.file_node_id)
+            .collect::<HashSet<_>>();
+        let mut stats = SemanticDocGraphPageStats {
+            lookup_entries: clamp_usize_to_u32(semantic_nodes.len()),
+            ..Default::default()
+        };
+        let mut summaries = semantic_node_ids
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, SemanticNodeGraphSummary::default()))
+            .collect::<HashMap<_, _>>();
+        let mut file_paths = context_file_ids
+            .iter()
+            .filter_map(|file_id| {
+                all_file_paths
+                    .get(file_id)
+                    .cloned()
+                    .map(|path| (*file_id, path))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut file_read_paths = context_file_ids
+            .iter()
+            .filter_map(|file_id| {
+                all_file_read_paths
+                    .get(file_id)
+                    .cloned()
+                    .map(|path| (*file_id, path))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut missing_file_ids = context_file_ids
+            .iter()
+            .filter(|file_id| !all_file_paths.contains_key(file_id))
+            .copied()
+            .collect::<Vec<_>>();
+        missing_file_ids.sort_unstable_by_key(|node_id| node_id.0);
+        if !missing_file_ids.is_empty() {
+            let endpoint_load_started = Instant::now();
+            let file_lookup = storage
+                .get_nodes_by_ids_no_cache_for_build(&missing_file_ids)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to load semantic file-node fallbacks: {e}"))
+                })?;
+            stats.endpoint_load_ms = stats.endpoint_load_ms.saturating_add(clamp_u128_to_u32(
+                endpoint_load_started.elapsed().as_millis(),
+            ));
+            stats.endpoint_rows = stats
+                .endpoint_rows
+                .saturating_add(clamp_usize_to_u32(file_lookup.nodes.len()));
+            stats.endpoint_query_batches = stats
+                .endpoint_query_batches
+                .saturating_add(clamp_usize_to_u32(file_lookup.query_batches));
+            stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
+                semantic_nodes.len().saturating_add(file_lookup.nodes.len()),
+            ));
+            for (file_id, file_node) in file_lookup.nodes {
+                file_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
+                file_read_paths
+                    .entry(file_id)
+                    .or_insert_with(|| file_node.serialized_name.clone());
+            }
+        }
+
+        for seed_node_ids in semantic_node_ids.chunks(BUILD_EDGE_SEED_BATCH_SIZE) {
+            let seed_node_id_set = seed_node_ids.iter().copied().collect::<HashSet<_>>();
+            let mut after_edge_id = None;
+            loop {
+                if is_indexing_cancelled(cancel_token) {
+                    return Err(indexing_cancelled_error());
+                }
+                let edges = storage
+                    .get_edges_for_node_ids_batch_after_for_build(
+                        seed_node_ids,
+                        after_edge_id,
+                        SEMANTIC_EDGE_STREAM_BATCH_SIZE,
+                    )
+                    .map_err(|e| {
+                        ApiError::internal(format!(
+                            "Failed to stream semantic doc graph context: {e}"
+                        ))
+                    })?;
+                if edges.is_empty() {
+                    break;
+                }
+                after_edge_id = edges.last().map(|edge| edge.id);
+
+                let mut endpoint_ids = HashSet::new();
+                for edge in &edges {
+                    let (source, target) = edge.effective_endpoints();
+                    let mut assigned_node_ids = [None, None];
+                    if seed_node_id_set.contains(&source) {
+                        assigned_node_ids[0] = Some(source);
+                    }
+                    if target != source && seed_node_id_set.contains(&target) {
+                        assigned_node_ids[1] = Some(target);
+                    }
+                    if assigned_node_ids.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    endpoint_ids.insert(source);
+                    endpoint_ids.insert(target);
+                    if edge.kind == codestory_contracts::graph::EdgeKind::MEMBER
+                        && assigned_node_ids.contains(&Some(edge.source))
+                    {
+                        endpoint_ids.insert(edge.target);
+                    }
+                }
+                endpoint_ids.retain(|node_id| !page_nodes.contains_key(node_id));
+                let mut endpoint_ids = endpoint_ids.into_iter().collect::<Vec<_>>();
+                endpoint_ids.sort_unstable_by_key(|node_id| node_id.0);
+
+                let endpoint_load_started = Instant::now();
+                let endpoint_lookup = storage
+                    .get_nodes_by_ids_no_cache_for_build(&endpoint_ids)
+                    .map_err(|e| {
+                        ApiError::internal(format!("Failed to load semantic endpoint nodes: {e}"))
+                    })?;
+                stats.endpoint_load_ms = stats.endpoint_load_ms.saturating_add(clamp_u128_to_u32(
+                    endpoint_load_started.elapsed().as_millis(),
+                ));
+                stats.endpoint_rows = stats
+                    .endpoint_rows
+                    .saturating_add(clamp_usize_to_u32(endpoint_lookup.nodes.len()));
+                stats.endpoint_query_batches = stats
+                    .endpoint_query_batches
+                    .saturating_add(clamp_usize_to_u32(endpoint_lookup.query_batches));
+                stats.lookup_entries = stats.lookup_entries.max(clamp_usize_to_u32(
+                    semantic_nodes
+                        .len()
+                        .saturating_add(endpoint_lookup.nodes.len()),
+                ));
+
+                for edge in &edges {
+                    let (source, target) = edge.effective_endpoints();
+                    if seed_node_id_set.contains(&source)
+                        && let Some(node) = page_nodes.get(&source).copied()
+                    {
+                        summaries.entry(source).or_default().observe_edge(
+                            node,
+                            edge,
+                            &page_nodes,
+                            &endpoint_lookup.nodes,
+                            scope,
+                        );
+                    }
+                    if target != source
+                        && seed_node_id_set.contains(&target)
+                        && let Some(node) = page_nodes.get(&target).copied()
+                    {
+                        summaries.entry(target).or_default().observe_edge(
+                            node,
+                            edge,
+                            &page_nodes,
+                            &endpoint_lookup.nodes,
+                            scope,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut context = Self {
+            file_paths,
+            file_read_paths,
+            ..Default::default()
+        };
+        for node in semantic_nodes {
+            let summary = summaries.remove(&node.id).unwrap_or_default();
+            let (child_labels, referenced_labels, edge_digest, centrality) = summary.finish(6);
+            context.child_labels.insert(node.id, child_labels);
+            context.referenced_labels.insert(node.id, referenced_labels);
+            context.edge_digests.insert(node.id, edge_digest);
+            context.centrality.insert(node.id, centrality);
+        }
+
+        Ok((context, stats))
+    }
+
     fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
-        self.file_paths.get(&node.id).map(String::as_str)
+        node.file_node_id
+            .and_then(|file_id| self.file_paths.get(&file_id))
+            .map(String::as_str)
     }
 
     fn file_read_path_for_node(&self, node: &GraphNode) -> Option<&str> {
-        self.file_read_paths
-            .get(&node.id)
-            .or_else(|| self.file_paths.get(&node.id))
-            .map(String::as_str)
+        node.file_node_id.and_then(|file_id| {
+            self.file_read_paths
+                .get(&file_id)
+                .or_else(|| self.file_paths.get(&file_id))
+                .map(String::as_str)
+        })
     }
+}
+
+fn semantic_graph_dependent_file_ids_by_seed(
+    storage: &Storage,
+    seed_file_ids: &HashSet<GraphNodeId>,
+) -> Result<HashMap<GraphNodeId, HashSet<GraphNodeId>>, ApiError> {
+    let mut dependent_file_ids = seed_file_ids
+        .iter()
+        .copied()
+        .map(|file_id| (file_id, HashSet::from([file_id])))
+        .collect::<HashMap<_, _>>();
+    if seed_file_ids.is_empty() {
+        return Ok(dependent_file_ids);
+    }
+
+    let nodes = storage.get_nodes().map_err(|error| {
+        ApiError::internal(format!("Failed to load semantic dependency nodes: {error}"))
+    })?;
+    let file_id_by_node = nodes
+        .iter()
+        .filter_map(|node| {
+            node.file_node_id
+                .or_else(|| {
+                    (node.kind == codestory_contracts::graph::NodeKind::FILE).then_some(node.id)
+                })
+                .map(|file_id| (node.id, file_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let seed_node_ids = file_id_by_node
+        .iter()
+        .filter_map(|(node_id, file_id)| seed_file_ids.contains(file_id).then_some(*node_id))
+        .collect::<Vec<_>>();
+    if seed_node_ids.is_empty() {
+        return Ok(dependent_file_ids);
+    }
+
+    let edges_by_node = storage
+        .get_edges_for_node_ids(&seed_node_ids)
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to load semantic dependency edges: {error}"))
+        })?;
+    let mut seen_edge_ids = HashSet::new();
+    for edge in edges_by_node.into_values().flatten() {
+        if !seen_edge_ids.insert(edge.id) {
+            continue;
+        }
+        let endpoint_file_ids = [
+            Some(edge.source),
+            Some(edge.target),
+            edge.resolved_source,
+            edge.resolved_target,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|node_id| file_id_by_node.get(&node_id).copied())
+        .collect::<HashSet<_>>();
+        for seed_file_id in endpoint_file_ids
+            .iter()
+            .filter(|file_id| seed_file_ids.contains(file_id))
+        {
+            dependent_file_ids
+                .entry(*seed_file_id)
+                .or_default()
+                .extend(endpoint_file_ids.iter().copied());
+        }
+    }
+    Ok(dependent_file_ids)
 }
 
 fn build_semantic_file_text_cache(
@@ -5248,7 +8020,7 @@ fn build_semantic_file_text_cache_with_limits(
     max_file_bytes: u64,
     max_cache_bytes: usize,
 ) -> HashMap<String, Option<String>> {
-    let mut file_paths = semantic_nodes
+    let file_paths = semantic_nodes
         .iter()
         .filter_map(|node| {
             let display_path = graph_context.file_path_for_node(node)?.to_string();
@@ -5258,8 +8030,32 @@ fn build_semantic_file_text_cache_with_limits(
                 .to_string();
             Some((display_path, read_path))
         })
-        .collect::<HashMap<_, _>>()
-        .into_iter()
+        .collect::<HashMap<_, _>>();
+    build_semantic_file_text_cache_from_paths_with_limits(
+        &file_paths,
+        max_file_bytes,
+        max_cache_bytes,
+    )
+}
+
+fn build_semantic_file_text_cache_from_paths(
+    file_paths: &HashMap<String, String>,
+) -> HashMap<String, Option<String>> {
+    build_semantic_file_text_cache_from_paths_with_limits(
+        file_paths,
+        SEMANTIC_FILE_TEXT_MAX_BYTES,
+        SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
+    )
+}
+
+fn build_semantic_file_text_cache_from_paths_with_limits(
+    file_paths: &HashMap<String, String>,
+    max_file_bytes: u64,
+    max_cache_bytes: usize,
+) -> HashMap<String, Option<String>> {
+    let mut file_paths = file_paths
+        .iter()
+        .map(|(display_path, read_path)| (display_path.clone(), read_path.clone()))
         .collect::<Vec<_>>();
     file_paths.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -5316,62 +8112,6 @@ fn edge_digest_for_node(storage: &Storage, node_id: GraphNodeId, limit: usize) -
         .and_then(|edges_by_node| edges_by_node.get(&node_id).cloned())
         .map(|edges| edge_digest_for_edges(&edges, limit))
         .unwrap_or_default()
-}
-
-fn referenced_symbol_labels_from_edges(
-    node: &GraphNode,
-    edges: &[GraphEdge],
-    nodes_by_id: &HashMap<GraphNodeId, &GraphNode>,
-    limit: usize,
-    scope: SemanticDocScope,
-) -> Vec<String> {
-    let mut labels = Vec::new();
-
-    for edge in edges {
-        let (source, target) = edge.effective_endpoints();
-        let other = if source == node.id {
-            target
-        } else if target == node.id {
-            source
-        } else {
-            continue;
-        };
-        let Some(other_node) = nodes_by_id.get(&other) else {
-            continue;
-        };
-        if !llm_indexable_kind_for_scope(other_node.kind, scope) {
-            continue;
-        }
-        let label = node_display_name(other_node);
-        if label.is_empty() || labels.contains(&label) {
-            continue;
-        }
-        labels.push(label);
-        if labels.len() >= limit {
-            break;
-        }
-    }
-
-    labels
-}
-
-fn child_symbol_labels_from_edges(
-    node: &GraphNode,
-    edges: &[GraphEdge],
-    nodes_by_id: &HashMap<GraphNodeId, &GraphNode>,
-    limit: usize,
-    scope: SemanticDocScope,
-) -> Vec<String> {
-    edges
-        .iter()
-        .filter(|edge| edge.kind == codestory_contracts::graph::EdgeKind::MEMBER)
-        .filter(|edge| edge.source == node.id)
-        .filter_map(|edge| nodes_by_id.get(&edge.target).copied())
-        .filter(|child| llm_indexable_kind_for_scope(child.kind, scope))
-        .map(node_display_name)
-        .filter(|label| !label.is_empty())
-        .take(limit)
-        .collect()
 }
 
 fn compact_doc_lines(lines: impl Iterator<Item = String>, limit: usize) -> Vec<String> {
@@ -5646,6 +8386,7 @@ struct PendingLlmSymbolDoc {
     qualified_name: Option<String>,
     file_path: Option<String>,
     start_line: Option<u32>,
+    end_line: Option<u32>,
     doc_text: String,
     doc_hash: String,
     dense_reason: DenseAnchorReason,
@@ -5656,97 +8397,6 @@ struct BuiltLlmSymbolDoc {
     symbol_doc: SymbolSearchDoc,
     pending: Option<PendingLlmSymbolDoc>,
     reusable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticVectorReuseContractKey {
-    backend: String,
-    profile: String,
-    model_id: String,
-    dimension: u32,
-    doc_shape: String,
-    semantic_policy_version: String,
-}
-
-impl SemanticVectorReuseContractKey {
-    fn from_existing(existing_doc: &LlmSymbolDocReuseMetadata) -> Option<Self> {
-        if existing_doc.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
-            || existing_doc.embedding_dim == 0
-        {
-            return None;
-        }
-        Some(Self {
-            backend: existing_doc.embedding_backend.clone()?,
-            profile: existing_doc.embedding_profile.clone()?,
-            model_id: existing_doc.embedding_model.clone(),
-            dimension: existing_doc.embedding_dim,
-            doc_shape: existing_doc.doc_shape.clone()?,
-            semantic_policy_version: existing_doc.semantic_policy_version.clone()?,
-        })
-    }
-
-    fn current(embedding_contract: &EmbeddingProfileContractDto, dimension: u32) -> Self {
-        Self {
-            backend: embedding_contract.backend.clone(),
-            profile: embedding_contract.profile.clone(),
-            model_id: embedding_contract.cache_key.clone(),
-            dimension,
-            doc_shape: embedding_contract.doc_shape.clone(),
-            semantic_policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-        }
-    }
-
-    fn matches_current_without_known_dimension(
-        &self,
-        embedding_contract: &EmbeddingProfileContractDto,
-    ) -> bool {
-        self.backend.as_str() == embedding_contract.backend.as_str()
-            && self.profile.as_str() == embedding_contract.profile.as_str()
-            && self.model_id.as_str() == embedding_contract.cache_key.as_str()
-            && self.dimension > 0
-            && self.doc_shape.as_str() == embedding_contract.doc_shape.as_str()
-            && self.semantic_policy_version.as_str() == SEMANTIC_POLICY_VERSION
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticVectorReuseKey {
-    contract: SemanticVectorReuseContractKey,
-    doc_hash: String,
-}
-
-impl SemanticVectorReuseKey {
-    fn from_existing(existing_doc: &LlmSymbolDocReuseMetadata) -> Option<Self> {
-        if existing_doc.doc_hash.is_empty() {
-            return None;
-        }
-        Some(Self {
-            contract: SemanticVectorReuseContractKey::from_existing(existing_doc)?,
-            doc_hash: existing_doc.doc_hash.clone(),
-        })
-    }
-
-    fn current(
-        doc_hash: &str,
-        embedding_contract: &EmbeddingProfileContractDto,
-        dimension: u32,
-    ) -> Self {
-        Self {
-            contract: SemanticVectorReuseContractKey::current(embedding_contract, dimension),
-            doc_hash: doc_hash.to_string(),
-        }
-    }
-
-    fn matches_current_without_known_dimension(
-        &self,
-        doc_hash: &str,
-        embedding_contract: &EmbeddingProfileContractDto,
-    ) -> bool {
-        self.doc_hash == doc_hash
-            && self
-                .contract
-                .matches_current_without_known_dimension(embedding_contract)
-    }
 }
 
 #[cfg(test)]
@@ -5772,35 +8422,6 @@ fn llm_symbol_doc_hash_with_alias(doc_text: &str, alias_mode: SemanticDocAliasMo
     format!("{hash:016x}")
 }
 
-fn llm_symbol_doc_contract_matches(
-    existing_doc: &LlmSymbolDocReuseMetadata,
-    embedding_contract: &EmbeddingProfileContractDto,
-) -> bool {
-    let Some(existing_key) = SemanticVectorReuseContractKey::from_existing(existing_doc) else {
-        return false;
-    };
-    if let Some(dimension) = embedding_contract.dimension {
-        return existing_key
-            == SemanticVectorReuseContractKey::current(embedding_contract, dimension);
-    }
-    existing_key.matches_current_without_known_dimension(embedding_contract)
-}
-
-fn llm_symbol_doc_can_reuse(
-    existing_doc: &LlmSymbolDocReuseMetadata,
-    doc_hash: &str,
-    embedding_contract: &EmbeddingProfileContractDto,
-) -> bool {
-    let Some(existing_key) = SemanticVectorReuseKey::from_existing(existing_doc) else {
-        return false;
-    };
-    if let Some(dimension) = embedding_contract.dimension {
-        return existing_key
-            == SemanticVectorReuseKey::current(doc_hash, embedding_contract, dimension);
-    }
-    existing_key.matches_current_without_known_dimension(doc_hash, embedding_contract)
-}
-
 fn observe_dense_anchor_reason(stats: &mut SemanticProjectionStats, reason: DenseAnchorReason) {
     match reason {
         DenseAnchorReason::PublicApi => {
@@ -5824,49 +8445,28 @@ fn observe_dense_anchor_reason(stats: &mut SemanticProjectionStats, reason: Dens
     }
 }
 
-fn semantic_edge_count(edge_digests: &[String]) -> usize {
-    edge_digests
-        .iter()
-        .filter_map(|digest| digest.rsplit_once('='))
-        .filter_map(|(_, raw)| raw.parse::<usize>().ok())
-        .sum()
-}
-
 fn dense_anchor_score(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> usize {
-    let child_count = graph_context
-        .child_labels
+    let centrality = graph_context
+        .centrality
         .get(&node_id)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let related_count = graph_context
-        .referenced_labels
-        .get(&node_id)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let edge_count = graph_context
-        .edge_digests
-        .get(&node_id)
-        .map(|digests| semantic_edge_count(digests))
-        .unwrap_or(0);
-    child_count
-        .saturating_add(related_count)
-        .saturating_add(edge_count)
+        .copied()
+        .unwrap_or_default();
+    centrality
+        .child_count
+        .saturating_add(centrality.related_count)
+        .saturating_add(centrality.edge_count)
 }
 
 fn dense_anchor_is_central(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> bool {
-    let label_count = graph_context
-        .child_labels
+    let centrality = graph_context
+        .centrality
         .get(&node_id)
-        .map(Vec::len)
-        .unwrap_or(0)
-        .saturating_add(
-            graph_context
-                .referenced_labels
-                .get(&node_id)
-                .map(Vec::len)
-                .unwrap_or(0),
-        );
-    label_count >= DENSE_CENTRAL_LABEL_THRESHOLD
+        .copied()
+        .unwrap_or_default();
+    centrality
+        .child_count
+        .saturating_add(centrality.related_count)
+        >= DENSE_CENTRAL_RELATIONSHIP_THRESHOLD
         && dense_anchor_score(graph_context, node_id) >= DENSE_CENTRAL_SCORE_THRESHOLD
 }
 
@@ -6156,167 +8756,197 @@ fn is_retrieval_artifact_node(node: &GraphNode) -> bool {
 fn build_component_report_docs(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
-    existing_docs: &HashMap<GraphNodeId, LlmSymbolDocReuseMetadata>,
-    embedding_contract: Option<&EmbeddingProfileContractDto>,
+    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
     updated_at_epoch_ms: i64,
 ) -> Vec<BuiltLlmSymbolDoc> {
     build_component_report_docs_with_policy(
         graph_context,
         semantic_nodes,
         existing_docs,
-        embedding_contract,
         updated_at_epoch_ms,
         semantic_doc_alias_mode_from_env(),
         semantic_doc_max_tokens_from_env(),
     )
 }
 
+#[derive(Debug)]
+struct ComponentReportNode {
+    node: GraphNode,
+    file_path: String,
+    centrality: usize,
+}
+
+#[derive(Debug, Default)]
+struct ComponentReportSummary {
+    symbol_count: usize,
+    files: BTreeSet<String>,
+    top_nodes: Vec<ComponentReportNode>,
+}
+
+#[derive(Debug, Default)]
+struct ComponentReportAccumulator {
+    components: BTreeMap<String, ComponentReportSummary>,
+}
+
+impl ComponentReportAccumulator {
+    fn observe(&mut self, graph_context: &SemanticDocGraphContext, semantic_nodes: &[&GraphNode]) {
+        for node in semantic_nodes {
+            let Some(file_path) = graph_context.file_path_for_node(node) else {
+                continue;
+            };
+            let Some(component_key) = semantic_component_key_for_path(Some(file_path)) else {
+                continue;
+            };
+            let summary = self.components.entry(component_key).or_default();
+            summary.symbol_count = summary.symbol_count.saturating_add(1);
+            summary.files.insert(file_path.to_string());
+            if summary.files.len() > 12 {
+                let last = summary.files.iter().next_back().cloned();
+                if let Some(last) = last {
+                    summary.files.remove(&last);
+                }
+            }
+            summary.top_nodes.push(ComponentReportNode {
+                node: (*node).clone(),
+                file_path: file_path.to_string(),
+                centrality: dense_anchor_score(graph_context, node.id),
+            });
+            summary.top_nodes.sort_by(|left, right| {
+                right
+                    .centrality
+                    .cmp(&left.centrality)
+                    .then_with(|| {
+                        node_display_name(&left.node).cmp(&node_display_name(&right.node))
+                    })
+                    .then_with(|| left.node.id.0.cmp(&right.node.id.0))
+            });
+            summary.top_nodes.truncate(8);
+        }
+    }
+
+    fn build_docs(
+        self,
+        existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
+        updated_at_epoch_ms: i64,
+        alias_mode: SemanticDocAliasMode,
+        max_tokens: usize,
+    ) -> Vec<BuiltLlmSymbolDoc> {
+        self.components
+            .into_iter()
+            .filter_map(|(component_key, summary)| {
+                let god_nodes = summary
+                    .top_nodes
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "- {} kind={:?} file={} centrality={}",
+                            node_display_name(&entry.node),
+                            entry.node.kind,
+                            entry.file_path,
+                            entry.centrality
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if god_nodes.is_empty() {
+                    return None;
+                }
+                let files = summary.files.into_iter().collect::<Vec<_>>();
+                let representative_file_path = files.first().cloned();
+
+                let mut doc_text = String::new();
+                let _ = writeln!(
+                    doc_text,
+                    "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
+                );
+                let _ = writeln!(doc_text, "component_report: {component_key}");
+                let _ = writeln!(
+                    doc_text,
+                    "source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"
+                );
+                let _ = writeln!(doc_text, "policy_version: {SEMANTIC_POLICY_VERSION}");
+                if let Some(path) = representative_file_path.as_deref() {
+                    let _ = writeln!(doc_text, "representative_file: {path}");
+                }
+                let _ = writeln!(doc_text, "symbol_count: {}", summary.symbol_count);
+                let _ = writeln!(doc_text, "file_count: {}", files.len());
+                if !files.is_empty() {
+                    let _ = writeln!(doc_text, "files: {}", files.join("; "));
+                }
+                let _ = writeln!(doc_text, "god_nodes:");
+                for line in god_nodes {
+                    let _ = writeln!(doc_text, "{line}");
+                }
+                doc_text = truncate_semantic_doc_text_to_token_budget(&doc_text, max_tokens);
+                let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, alias_mode);
+                let node_id = virtual_component_report_node_id(&component_key);
+                let display_name = format!("component_report:{component_key}");
+                let qualified_name = Some(format!("codestory::component_report::{component_key}"));
+                let kind = codestory_contracts::graph::NodeKind::MODULE;
+                let symbol_doc = SymbolSearchDoc {
+                    node_id,
+                    file_node_id: None,
+                    kind,
+                    display_name: display_name.clone(),
+                    qualified_name: qualified_name.clone(),
+                    file_path: representative_file_path.clone(),
+                    start_line: None,
+                    doc_text: doc_text.clone(),
+                    doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                    doc_hash: doc_hash.clone(),
+                    policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                    source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                    updated_at_epoch_ms,
+                };
+                let dense_reason = DenseAnchorReason::ComponentReport;
+                let reusable = existing_docs.get(&node_id).is_some_and(|existing_doc| {
+                    existing_doc.document_hash == doc_hash
+                        && existing_doc.selection_reason == dense_reason.as_str()
+                        && existing_doc.policy_version == SEMANTIC_POLICY_VERSION
+                });
+                let pending = Some(PendingLlmSymbolDoc {
+                    node_id,
+                    file_node_id: None,
+                    kind,
+                    display_name,
+                    qualified_name,
+                    file_path: representative_file_path,
+                    start_line: None,
+                    end_line: None,
+                    doc_text,
+                    doc_hash,
+                    dense_reason,
+                });
+                Some(BuiltLlmSymbolDoc {
+                    symbol_doc,
+                    pending,
+                    reusable,
+                })
+            })
+            .collect()
+    }
+}
+
 fn build_component_report_docs_with_policy(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
-    existing_docs: &HashMap<GraphNodeId, LlmSymbolDocReuseMetadata>,
-    embedding_contract: Option<&EmbeddingProfileContractDto>,
+    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
     updated_at_epoch_ms: i64,
     alias_mode: SemanticDocAliasMode,
     max_tokens: usize,
 ) -> Vec<BuiltLlmSymbolDoc> {
-    let mut components = BTreeMap::<String, Vec<&GraphNode>>::new();
-    for node in semantic_nodes {
-        let file_path = graph_context.file_path_for_node(node);
-        let Some(component_key) = semantic_component_key_for_path(file_path) else {
-            continue;
-        };
-        components.entry(component_key).or_default().push(*node);
-    }
-
-    components
-        .into_iter()
-        .filter_map(|(component_key, mut component_nodes)| {
-            component_nodes.sort_by(|left, right| {
-                dense_anchor_score(graph_context, right.id)
-                    .cmp(&dense_anchor_score(graph_context, left.id))
-                    .then_with(|| node_display_name(left).cmp(&node_display_name(right)))
-                    .then_with(|| left.id.0.cmp(&right.id.0))
-            });
-            let god_nodes = component_nodes
-                .iter()
-                .take(8)
-                .map(|node| {
-                    let file = graph_context.file_path_for_node(node).unwrap_or("");
-                    format!(
-                        "- {} kind={:?} file={} centrality={}",
-                        node_display_name(node),
-                        node.kind,
-                        file,
-                        dense_anchor_score(graph_context, node.id)
-                    )
-                })
-                .collect::<Vec<_>>();
-            if god_nodes.is_empty() {
-                return None;
-            }
-            let mut files = component_nodes
-                .iter()
-                .filter_map(|node| graph_context.file_path_for_node(node))
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            files.sort();
-            files.dedup();
-            files.truncate(12);
-            let representative_file_path = files.first().cloned();
-
-            let mut doc_text = String::new();
-            let _ = writeln!(
-                doc_text,
-                "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
-            );
-            let _ = writeln!(doc_text, "component_report: {component_key}");
-            let _ = writeln!(
-                doc_text,
-                "source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"
-            );
-            let _ = writeln!(doc_text, "policy_version: {SEMANTIC_POLICY_VERSION}");
-            if let Some(path) = representative_file_path.as_deref() {
-                let _ = writeln!(doc_text, "representative_file: {path}");
-            }
-            let _ = writeln!(doc_text, "symbol_count: {}", component_nodes.len());
-            let _ = writeln!(doc_text, "file_count: {}", files.len());
-            if !files.is_empty() {
-                let _ = writeln!(doc_text, "files: {}", files.join("; "));
-            }
-            let _ = writeln!(doc_text, "god_nodes:");
-            for line in god_nodes {
-                let _ = writeln!(doc_text, "{line}");
-            }
-            doc_text = truncate_semantic_doc_text_to_token_budget(&doc_text, max_tokens);
-            let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, alias_mode);
-            let node_id = virtual_component_report_node_id(&component_key);
-            let display_name = format!("component_report:{component_key}");
-            let qualified_name = Some(format!("codestory::component_report::{component_key}"));
-            let kind = codestory_contracts::graph::NodeKind::MODULE;
-            let symbol_doc = SymbolSearchDoc {
-                node_id,
-                file_node_id: None,
-                kind,
-                display_name: display_name.clone(),
-                qualified_name: qualified_name.clone(),
-                file_path: representative_file_path.clone(),
-                start_line: None,
-                doc_text: doc_text.clone(),
-                doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-                doc_hash: doc_hash.clone(),
-                policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-                source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
-                updated_at_epoch_ms,
-            };
-            let pending = embedding_contract.map(|embedding_contract| {
-                let dense_reason = DenseAnchorReason::ComponentReport;
-                let reusable = existing_docs.get(&node_id).is_some_and(|existing_doc| {
-                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, embedding_contract)
-                        && existing_doc.dense_reason.as_deref() == Some(dense_reason.as_str())
-                });
-                (
-                    PendingLlmSymbolDoc {
-                        node_id,
-                        file_node_id: None,
-                        kind,
-                        display_name,
-                        qualified_name,
-                        file_path: representative_file_path,
-                        start_line: None,
-                        doc_text,
-                        doc_hash,
-                        dense_reason,
-                    },
-                    reusable,
-                )
-            });
-            let (pending, reusable) = pending
-                .map(|(pending, reusable)| (Some(pending), reusable))
-                .unwrap_or((None, false));
-            Some(BuiltLlmSymbolDoc {
-                symbol_doc,
-                pending,
-                reusable,
-            })
-        })
-        .collect()
+    let mut accumulator = ComponentReportAccumulator::default();
+    accumulator.observe(graph_context, semantic_nodes);
+    accumulator.build_docs(existing_docs, updated_at_epoch_ms, alias_mode, max_tokens)
 }
 
-fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
-    docs.sort_by(|left, right| {
-        left.doc_text
-            .len()
-            .cmp(&right.doc_text.len())
-            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-    });
+fn sort_pending_dense_anchor_inputs(docs: &mut [PendingLlmSymbolDoc]) {
+    docs.sort_by_key(|doc| doc.node_id.0);
 }
 
-fn flush_pending_llm_symbol_docs(
+fn flush_pending_dense_anchor_inputs(
     storage: &mut Storage,
-    engine: &mut SearchEngine,
     batch: &[PendingLlmSymbolDoc],
-    embedding_contract: &EmbeddingProfileContractDto,
+    source_identity: &str,
     updated_at_epoch_ms: i64,
     stats: &mut SemanticProjectionStats,
     cancel_token: Option<&CancellationToken>,
@@ -6328,25 +8958,9 @@ fn flush_pending_llm_symbol_docs(
         return Err(indexing_cancelled_error());
     }
 
-    let payloads = batch
-        .iter()
-        .map(|doc| doc.doc_text.as_str())
-        .collect::<Vec<_>>();
-    let embedding_started = Instant::now();
-    let embeddings = engine
-        .embed_text_refs(&payloads)
-        .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e:#}")))?;
-    stats.embedding_ms = stats
-        .embedding_ms
-        .saturating_add(clamp_u128_to_u32(embedding_started.elapsed().as_millis()));
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
-
     let docs = batch
         .iter()
-        .zip(embeddings)
-        .map(|(doc, embedding)| LlmSymbolDoc {
+        .map(|doc| DenseAnchorInput {
             node_id: doc.node_id,
             file_node_id: doc.file_node_id,
             kind: doc.kind,
@@ -6354,43 +8968,313 @@ fn flush_pending_llm_symbol_docs(
             qualified_name: doc.qualified_name.clone(),
             file_path: doc.file_path.clone(),
             start_line: doc.start_line,
-            doc_text: doc.doc_text.clone(),
-            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-            doc_hash: doc.doc_hash.clone(),
-            embedding_profile: Some(embedding_contract.profile.clone()),
-            embedding_model: embedding_contract.cache_key.clone(),
-            embedding_backend: Some(embedding_contract.backend.clone()),
-            embedding_dim: embedding.len() as u32,
-            doc_shape: Some(embedding_contract.doc_shape.clone()),
-            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.to_string()),
-            dense_reason: Some(doc.dense_reason.as_str().to_string()),
-            embedding,
+            end_line: doc.end_line,
+            file_role: doc
+                .file_path
+                .as_deref()
+                .map(Path::new)
+                .map(StoreFileRole::classify_path)
+                .unwrap_or(StoreFileRole::Source),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: doc.doc_text.clone(),
+            document_hash: doc.doc_hash.clone(),
+            selection_reason: doc.dense_reason.as_str().to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: source_identity.to_string(),
             updated_at_epoch_ms,
         })
         .collect::<Vec<_>>();
 
-    persist_embedded_llm_symbol_docs(storage, &docs, stats, cancel_token)
+    let upsert_started = Instant::now();
+    storage
+        .upsert_dense_anchor_inputs_batch(&docs)
+        .map_err(|e| ApiError::internal(format!("Failed to upsert dense anchor inputs: {e}")))?;
+    stats.db_upsert_ms = stats
+        .db_upsert_ms
+        .saturating_add(clamp_u128_to_u32(upsert_started.elapsed().as_millis()));
+    Ok(())
 }
 
-fn persist_embedded_llm_symbol_docs(
+#[allow(clippy::too_many_arguments)]
+fn process_semantic_symbol_nodes(
     storage: &mut Storage,
-    docs: &[LlmSymbolDoc],
-    stats: &mut SemanticProjectionStats,
+    semantic_nodes: &[&GraphNode],
+    graph_context: &SemanticDocGraphContext,
+    file_text_cache: &HashMap<String, Option<String>>,
+    stored_docs: Option<&HashMap<GraphNodeId, SymbolSearchDoc>>,
+    component_access: &HashMap<GraphNodeId, AccessKind>,
+    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
+    updated_at_epoch_ms: i64,
+    semantic_alias_mode: SemanticDocAliasMode,
+    semantic_max_tokens: usize,
+    stream_sort_window_size: usize,
+    anchor_batch_size: usize,
+    source_identity: &str,
     cancel_token: Option<&CancellationToken>,
+    stats: &mut SemanticProjectionStats,
+    doc_build_ns: &mut u128,
+    pending_docs: &mut Vec<PendingLlmSymbolDoc>,
+    seen_symbol_node_ids: &mut Vec<GraphNodeId>,
+    seen_dense_node_ids: &mut Vec<GraphNodeId>,
+) -> Result<(), ApiError> {
+    for semantic_window in semantic_nodes.chunks(stream_sort_window_size.max(1)) {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let doc_build_started = Instant::now();
+        let built_docs = semantic_window
+            .par_iter()
+            .map(|node| {
+                let display_name = node_display_name(node);
+                let file_path = graph_context
+                    .file_path_for_node(node)
+                    .map(ToString::to_string);
+                let doc_text = if let Some(stored_docs) = stored_docs {
+                    let stored = stored_docs.get(&node.id).ok_or_else(|| {
+                        ApiError::new(
+                            "semantic_projection_migration_required",
+                            format!(
+                                "Stored semantic document {} is missing from the pinned core",
+                                node.id.0
+                            ),
+                        )
+                    })?;
+                    if stored.file_node_id != node.file_node_id
+                        || stored.kind != node.kind
+                        || stored.display_name != display_name
+                        || stored.qualified_name != node.qualified_name
+                        || stored.file_path != file_path
+                        || stored.start_line != node.start_line
+                        || stored.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
+                        || stored.source_provenance != SYMBOL_SEARCH_DOC_PROVENANCE
+                        || stored.doc_text.trim().is_empty()
+                        || stored.doc_hash
+                            != llm_symbol_doc_hash_with_alias(
+                                &stored.doc_text,
+                                semantic_alias_mode,
+                            )
+                    {
+                        return Err(ApiError::new(
+                            "semantic_projection_migration_required",
+                            format!(
+                                "Stored semantic document {} does not match the pinned graph and current document contract",
+                                node.id.0
+                            ),
+                        ));
+                    }
+                    stored.doc_text.clone()
+                } else {
+                    build_llm_symbol_doc_text_with_policy(
+                        graph_context,
+                        node,
+                        &display_name,
+                        file_path.as_deref(),
+                        file_text_cache,
+                        semantic_alias_mode,
+                        semantic_max_tokens,
+                    )
+                };
+                let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, semantic_alias_mode);
+                let dense_reason = dense_anchor_reason_for_node(
+                    graph_context,
+                    node,
+                    &display_name,
+                    file_path.as_deref(),
+                    &doc_text,
+                    component_access.get(&node.id).copied(),
+                );
+                let symbol_doc = SymbolSearchDoc {
+                    node_id: node.id,
+                    file_node_id: node.file_node_id,
+                    kind: node.kind,
+                    display_name: display_name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    file_path: file_path.clone(),
+                    start_line: node.start_line,
+                    doc_text: doc_text.clone(),
+                    doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                    doc_hash: doc_hash.clone(),
+                    policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                    source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                    updated_at_epoch_ms,
+                };
+                let pending_with_reuse = dense_reason.map(|dense_reason| {
+                    let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
+                        existing_doc.document_hash == doc_hash
+                            && existing_doc.selection_reason == dense_reason.as_str()
+                            && existing_doc.policy_version == SEMANTIC_POLICY_VERSION
+                    });
+                    (
+                        PendingLlmSymbolDoc {
+                            node_id: node.id,
+                            file_node_id: node.file_node_id,
+                            kind: node.kind,
+                            display_name,
+                            qualified_name: node.qualified_name.clone(),
+                            file_path,
+                            start_line: node.start_line,
+                            end_line: node.end_line,
+                            doc_text,
+                            doc_hash,
+                            dense_reason,
+                        },
+                        reusable,
+                    )
+                });
+                let (pending, reusable) = pending_with_reuse
+                    .map(|(pending, reusable)| (Some(pending), reusable))
+                    .unwrap_or((None, false));
+
+                Ok(BuiltLlmSymbolDoc {
+                    symbol_doc,
+                    pending,
+                    reusable,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        *doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+
+        let symbol_docs = built_docs
+            .iter()
+            .map(|built_doc| built_doc.symbol_doc.clone())
+            .collect::<Vec<_>>();
+        let symbol_upsert_started = Instant::now();
+        storage
+            .upsert_symbol_search_docs_batch(&symbol_docs)
+            .map_err(|e| ApiError::internal(format!("Failed to upsert symbol search docs: {e}")))?;
+        stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
+            symbol_upsert_started.elapsed().as_millis(),
+        ));
+        stats.symbol_search_docs_written = stats
+            .symbol_search_docs_written
+            .saturating_add(clamp_usize_to_u32(symbol_docs.len()));
+
+        for built_doc in built_docs {
+            seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+            let Some(pending_doc) = built_doc.pending else {
+                stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
+                continue;
+            };
+            seen_dense_node_ids.push(pending_doc.node_id);
+            observe_dense_anchor_reason(stats, pending_doc.dense_reason);
+            if built_doc.reusable {
+                stats.docs_reused = stats.docs_reused.saturating_add(1);
+            } else {
+                stats.docs_pending = stats.docs_pending.saturating_add(1);
+            }
+            pending_docs.push(pending_doc);
+        }
+
+        while pending_docs.len() >= anchor_batch_size {
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
+            sort_pending_dense_anchor_inputs(pending_docs);
+            flush_pending_dense_anchor_inputs(
+                storage,
+                &pending_docs[..anchor_batch_size],
+                source_identity,
+                updated_at_epoch_ms,
+                stats,
+                cancel_token,
+            )?;
+            pending_docs.drain(..anchor_batch_size);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_component_report_docs(
+    storage: &mut Storage,
+    built_reports: Vec<BuiltLlmSymbolDoc>,
+    source_identity: &str,
+    updated_at_epoch_ms: i64,
+    anchor_batch_size: usize,
+    cancel_token: Option<&CancellationToken>,
+    stats: &mut SemanticProjectionStats,
+    pending_docs: &mut Vec<PendingLlmSymbolDoc>,
+    seen_symbol_node_ids: &mut Vec<GraphNodeId>,
+    seen_dense_node_ids: &mut Vec<GraphNodeId>,
+    component_report_node_ids: &mut Vec<GraphNodeId>,
+    dense_component_report_node_ids: &mut Vec<GraphNodeId>,
 ) -> Result<(), ApiError> {
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    let upsert_started = Instant::now();
+    if built_reports.is_empty() {
+        return Ok(());
+    }
+
+    let report_symbol_docs = built_reports
+        .iter()
+        .map(|built_doc| built_doc.symbol_doc.clone())
+        .collect::<Vec<_>>();
+    let report_nodes = report_symbol_docs
+        .iter()
+        .map(|doc| GraphNode {
+            id: doc.node_id,
+            kind: doc.kind,
+            serialized_name: doc.display_name.clone(),
+            qualified_name: doc.qualified_name.clone(),
+            canonical_id: Some(format!("codestory:{}", doc.display_name)),
+            file_node_id: None,
+            start_line: None,
+            start_col: None,
+            end_line: None,
+            end_col: None,
+        })
+        .collect::<Vec<_>>();
     storage
-        .upsert_llm_symbol_docs_batch(docs)
-        .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
-    stats.db_upsert_ms = stats
-        .db_upsert_ms
-        .saturating_add(clamp_u128_to_u32(upsert_started.elapsed().as_millis()));
-    stats.docs_embedded = stats
-        .docs_embedded
-        .saturating_add(clamp_usize_to_u32(docs.len()));
+        .upsert_retrieval_artifact_nodes_batch(&report_nodes)
+        .map_err(|e| ApiError::internal(format!("Failed to upsert component report nodes: {e}")))?;
+    let symbol_upsert_started = Instant::now();
+    storage
+        .upsert_symbol_search_docs_batch(&report_symbol_docs)
+        .map_err(|e| ApiError::internal(format!("Failed to upsert component report docs: {e}")))?;
+    stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
+        symbol_upsert_started.elapsed().as_millis(),
+    ));
+    stats.symbol_search_docs_written = stats
+        .symbol_search_docs_written
+        .saturating_add(clamp_usize_to_u32(report_symbol_docs.len()));
+
+    for built_doc in built_reports {
+        seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+        component_report_node_ids.push(built_doc.symbol_doc.node_id);
+        let Some(pending_doc) = built_doc.pending else {
+            stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
+            continue;
+        };
+        seen_dense_node_ids.push(pending_doc.node_id);
+        dense_component_report_node_ids.push(pending_doc.node_id);
+        observe_dense_anchor_reason(stats, pending_doc.dense_reason);
+        if built_doc.reusable {
+            stats.docs_reused = stats.docs_reused.saturating_add(1);
+        } else {
+            stats.docs_pending = stats.docs_pending.saturating_add(1);
+        }
+        pending_docs.push(pending_doc);
+    }
+
+    while pending_docs.len() >= anchor_batch_size {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        sort_pending_dense_anchor_inputs(pending_docs);
+        flush_pending_dense_anchor_inputs(
+            storage,
+            &pending_docs[..anchor_batch_size],
+            source_identity,
+            updated_at_epoch_ms,
+            stats,
+            cancel_token,
+        )?;
+        pending_docs.drain(..anchor_batch_size);
+    }
     Ok(())
 }
 
@@ -6398,10 +9282,10 @@ fn persist_embedded_llm_symbol_docs(
 fn sync_llm_symbol_projection_for_runtime(
     storage: &mut Storage,
     nodes: &[codestory_contracts::graph::Node],
-    node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
     engine: &mut SearchEngine,
     refresh_scope: SemanticRefreshScope<'_>,
     hydrate_semantic_docs: bool,
+    source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<SemanticProjectionStats, ApiError> {
@@ -6413,54 +9297,35 @@ fn sync_llm_symbol_projection_for_runtime(
         return Err(indexing_cancelled_error());
     }
 
-    if !runtime.retrieval.hybrid_enabled {
-        if hydrate_semantic_docs {
-            engine.index_llm_symbol_docs(Vec::new());
-        }
-        return Ok(stats);
-    }
-
-    let embedding_contract = match engine.set_embedding_runtime_from_config(&runtime.embedding) {
-        Ok(()) => Some(current_embedding_contract_for_runtime(runtime).ok_or_else(|| {
-            ApiError::internal(
-                "Failed to resolve current embedding profile contract after configuring runtime",
-            )
-        })?),
-        Err(error) => {
-            tracing::warn!(
-                "embedding runtime unavailable ({error}); graph-native symbol docs will still be refreshed, but dense anchor retrieval will be unavailable until the llama.cpp embedding sidecar is reachable or embedding env points at an explicit diagnostic runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
-            );
-            None
-        }
-    };
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
-        .get_llm_symbol_doc_reuse_metadata()
-        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc metadata: {e}")))?
+        .get_dense_anchor_input_reuse_metadata()
+        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
         .into_iter()
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    let graph_doc_schema_mismatch = refresh_scope.file_ids.is_some()
+    let graph_doc_contract_mismatch = refresh_scope.file_ids.is_some()
         && storage
-            .has_symbol_search_doc_version_mismatch(LLM_SYMBOL_DOC_SCHEMA_VERSION)
+            .has_symbol_search_doc_contract_mismatch(
+                LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                SEMANTIC_POLICY_VERSION,
+            )
             .map_err(|e| {
                 ApiError::internal(format!(
-                    "Failed to inspect graph-native semantic doc versions: {e}"
+                    "Failed to inspect graph-native semantic doc contract: {e}"
                 ))
             })?;
-    let dense_doc_contract_mismatch = embedding_contract.as_ref().is_some_and(|contract| {
-        refresh_scope.file_ids.is_some()
-            && existing_docs
-                .values()
-                .any(|existing_doc| !llm_symbol_doc_contract_matches(existing_doc, contract))
-    });
+    let dense_doc_contract_mismatch = refresh_scope.file_ids.is_some()
+        && existing_docs
+            .values()
+            .any(|existing_doc| existing_doc.policy_version != SEMANTIC_POLICY_VERSION);
     let expand_semantic_scope_for_contract_repair =
-        graph_doc_schema_mismatch || dense_doc_contract_mismatch;
+        graph_doc_contract_mismatch || dense_doc_contract_mismatch;
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
-            graph_doc_schema_mismatch,
+            graph_doc_contract_mismatch,
             dense_doc_contract_mismatch,
             "Stored semantic-doc contract differs from the current schema or embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
         );
@@ -6470,33 +9335,27 @@ fn sync_llm_symbol_projection_for_runtime(
     } else {
         refresh_scope.file_ids
     };
-    let embed_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
+    let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
     let semantic_alias_mode =
         semantic_doc_alias_mode_from_value(&runtime.retrieval.semantic_doc_alias_mode);
     let semantic_max_tokens = runtime.retrieval.semantic_doc_max_tokens;
-    let stream_pending_docs = runtime.retrieval.stream_pending_docs;
     let stream_sort_window_batches = runtime.retrieval.stream_sort_window_batches;
-    let stream_sort_window_size = embed_batch_size.saturating_mul(stream_sort_window_batches);
-    tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
+    let stream_sort_window_size = anchor_batch_size.saturating_mul(stream_sort_window_batches);
+    tracing::debug!(
+        anchor_batch_size,
+        "Using dense anchor input publication batch size"
+    );
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_symbol_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut seen_dense_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut dense_component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut doc_build_ns = 0_u128;
-    let all_semantic_nodes = nodes
+    let semantic_scope = semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope);
+    let semantic_nodes = nodes
         .iter()
-        .filter(|node| {
-            llm_indexable_kind_for_scope(
-                node.kind,
-                semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
-            )
-        })
+        .filter(|node| llm_indexable_kind_for_scope(node.kind, semantic_scope))
         .filter(|node| !is_retrieval_artifact_node(node))
-        .collect::<Vec<_>>();
-    let semantic_nodes = all_semantic_nodes
-        .iter()
-        .copied()
         .filter(|node| {
             effective_llm_refresh_file_scope
                 .map(|scope| {
@@ -6507,11 +9366,10 @@ fn sync_llm_symbol_projection_for_runtime(
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
-    let file_paths = semantic_file_table_path_map(
-        storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?,
-    );
+    let files = storage
+        .get_files()
+        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+    let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
     let effective_component_report_scope = if expand_semantic_scope_for_contract_repair {
         None
     } else if let Some(refresh) = refresh_scope.component_reports {
@@ -6558,9 +9416,10 @@ fn sync_llm_symbol_projection_for_runtime(
             }
         }
     }
-    let report_semantic_nodes = all_semantic_nodes
+    let report_semantic_nodes = nodes
         .iter()
-        .copied()
+        .filter(|node| llm_indexable_kind_for_scope(node.kind, semantic_scope))
+        .filter(|node| !is_retrieval_artifact_node(node))
         .filter(|node| {
             effective_component_report_scope
                 .as_ref()
@@ -6590,277 +9449,95 @@ fn sync_llm_symbol_projection_for_runtime(
     let component_access = storage
         .get_component_access_map_for_nodes(&semantic_node_ids)
         .map_err(|e| ApiError::internal(format!("Failed to load symbol access metadata: {e}")))?;
+    let context_started = Instant::now();
     let graph_context = SemanticDocGraphContext::build_for_scope(
         storage,
         &context_nodes,
         nodes,
-        semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope),
+        semantic_scope,
+        file_paths,
+        file_read_paths,
     )?;
+    stats.context_ms = clamp_u128_to_u32(context_started.elapsed().as_millis());
+    stats.selected_nodes = clamp_usize_to_u32(semantic_nodes.len());
+    stats.context_file_count = clamp_usize_to_u32(graph_context.file_paths.len());
+    stats.context_path_bytes = clamp_usize_to_u32(
+        graph_context
+            .file_paths
+            .values()
+            .chain(graph_context.file_read_paths.values())
+            .map(String::len)
+            .sum(),
+    );
+    stats.node_lookup_entries = clamp_usize_to_u32(nodes.len());
     let file_cache_started = Instant::now();
     let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
     doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
 
-    for semantic_window in semantic_nodes.chunks(stream_sort_window_size.max(1)) {
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-        let doc_build_started = Instant::now();
-        let built_docs = semantic_window
-            .par_iter()
-            .map(|node| {
-                let display_name = node_names
-                    .get(&node.id)
-                    .cloned()
-                    .unwrap_or_else(|| node_display_name(node));
-                let file_path = graph_context
-                    .file_path_for_node(node)
-                    .map(ToString::to_string);
-                let doc_text = build_llm_symbol_doc_text_with_policy(
-                    &graph_context,
-                    node,
-                    &display_name,
-                    file_path.as_deref(),
-                    &file_text_cache,
-                    semantic_alias_mode,
-                    semantic_max_tokens,
-                );
-                let doc_hash = llm_symbol_doc_hash_with_alias(&doc_text, semantic_alias_mode);
-                let dense_reason = dense_anchor_reason_for_node(
-                    &graph_context,
-                    node,
-                    &display_name,
-                    file_path.as_deref(),
-                    &doc_text,
-                    component_access.get(&node.id).copied(),
-                );
-                let symbol_doc = SymbolSearchDoc {
-                    node_id: node.id,
-                    file_node_id: node.file_node_id,
-                    kind: node.kind,
-                    display_name: display_name.clone(),
-                    qualified_name: node.qualified_name.clone(),
-                    file_path: file_path.clone(),
-                    start_line: node.start_line,
-                    doc_text: doc_text.clone(),
-                    doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-                    doc_hash: doc_hash.clone(),
-                    policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-                    source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
-                    updated_at_epoch_ms,
-                };
-                let pending_with_reuse =
-                    embedding_contract.as_ref().and_then(|embedding_contract| {
-                        dense_reason.map(|dense_reason| {
-                            let reusable =
-                                existing_docs.get(&node.id).is_some_and(|existing_doc| {
-                                    llm_symbol_doc_can_reuse(
-                                        existing_doc,
-                                        &doc_hash,
-                                        embedding_contract,
-                                    ) && existing_doc.dense_reason.as_deref()
-                                        == Some(dense_reason.as_str())
-                                });
-                            (
-                                PendingLlmSymbolDoc {
-                                    node_id: node.id,
-                                    file_node_id: node.file_node_id,
-                                    kind: node.kind,
-                                    display_name,
-                                    qualified_name: node.qualified_name.clone(),
-                                    file_path,
-                                    start_line: node.start_line,
-                                    doc_text,
-                                    doc_hash,
-                                    dense_reason,
-                                },
-                                reusable,
-                            )
-                        })
-                    });
-                let (pending, reusable) = pending_with_reuse
-                    .map(|(pending, reusable)| (Some(pending), reusable))
-                    .unwrap_or((None, false));
+    process_semantic_symbol_nodes(
+        storage,
+        &semantic_nodes,
+        &graph_context,
+        &file_text_cache,
+        None,
+        &component_access,
+        &existing_docs,
+        updated_at_epoch_ms,
+        semantic_alias_mode,
+        semantic_max_tokens,
+        stream_sort_window_size,
+        anchor_batch_size,
+        source_identity,
+        cancel_token,
+        &mut stats,
+        &mut doc_build_ns,
+        &mut pending_docs,
+        &mut seen_symbol_node_ids,
+        &mut seen_dense_node_ids,
+    )?;
 
-                BuiltLlmSymbolDoc {
-                    symbol_doc,
-                    pending,
-                    reusable,
-                }
-            })
-            .collect::<Vec<_>>();
-        doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-
-        let symbol_docs = built_docs
-            .iter()
-            .map(|built_doc| built_doc.symbol_doc.clone())
-            .collect::<Vec<_>>();
-        let symbol_upsert_started = Instant::now();
-        storage
-            .upsert_symbol_search_docs_batch(&symbol_docs)
-            .map_err(|e| ApiError::internal(format!("Failed to upsert symbol search docs: {e}")))?;
-        stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
-            symbol_upsert_started.elapsed().as_millis(),
-        ));
-        stats.symbol_search_docs_written = stats
-            .symbol_search_docs_written
-            .saturating_add(clamp_usize_to_u32(symbol_docs.len()));
-
-        for built_doc in built_docs {
-            seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
-            let Some(pending_doc) = built_doc.pending else {
-                stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
-                continue;
-            };
-            seen_dense_node_ids.push(pending_doc.node_id);
-            observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
-            if built_doc.reusable {
-                stats.docs_reused = stats.docs_reused.saturating_add(1);
-                continue;
-            }
-
-            stats.docs_pending = stats.docs_pending.saturating_add(1);
-            pending_docs.push(pending_doc);
-        }
-
-        while stream_pending_docs && pending_docs.len() >= embed_batch_size {
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            let Some(embedding_contract) = embedding_contract.as_ref() else {
-                break;
-            };
-            sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
-            flush_pending_llm_symbol_docs(
-                storage,
-                engine,
-                &pending_docs[..embed_batch_size],
-                embedding_contract,
-                updated_at_epoch_ms,
-                &mut stats,
-                cancel_token,
-            )?;
-            pending_docs.drain(..embed_batch_size);
-        }
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
     }
-
-    {
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-        let report_build_started = Instant::now();
-        let built_reports = build_component_report_docs_with_policy(
-            &graph_context,
-            &report_semantic_nodes,
-            &existing_docs,
-            embedding_contract.as_ref(),
-            updated_at_epoch_ms,
-            semantic_alias_mode,
-            semantic_max_tokens,
-        );
-        doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-        if !built_reports.is_empty() {
-            let report_symbol_docs = built_reports
-                .iter()
-                .map(|built_doc| built_doc.symbol_doc.clone())
-                .collect::<Vec<_>>();
-            let report_nodes = report_symbol_docs
-                .iter()
-                .map(|doc| GraphNode {
-                    id: doc.node_id,
-                    kind: doc.kind,
-                    serialized_name: doc.display_name.clone(),
-                    qualified_name: doc.qualified_name.clone(),
-                    canonical_id: Some(format!("codestory:{}", doc.display_name)),
-                    file_node_id: None,
-                    start_line: None,
-                    start_col: None,
-                    end_line: None,
-                    end_col: None,
-                })
-                .collect::<Vec<_>>();
-            storage
-                .upsert_retrieval_artifact_nodes_batch(&report_nodes)
-                .map_err(|e| {
-                    ApiError::internal(format!("Failed to upsert component report nodes: {e}"))
-                })?;
-            let symbol_upsert_started = Instant::now();
-            storage
-                .upsert_symbol_search_docs_batch(&report_symbol_docs)
-                .map_err(|e| {
-                    ApiError::internal(format!("Failed to upsert component report docs: {e}"))
-                })?;
-            stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
-                symbol_upsert_started.elapsed().as_millis(),
-            ));
-            stats.symbol_search_docs_written = stats
-                .symbol_search_docs_written
-                .saturating_add(clamp_usize_to_u32(report_symbol_docs.len()));
-
-            for built_doc in built_reports {
-                seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
-                component_report_node_ids.push(built_doc.symbol_doc.node_id);
-                let Some(pending_doc) = built_doc.pending else {
-                    stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
-                    continue;
-                };
-                seen_dense_node_ids.push(pending_doc.node_id);
-                dense_component_report_node_ids.push(pending_doc.node_id);
-                observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
-                if built_doc.reusable {
-                    stats.docs_reused = stats.docs_reused.saturating_add(1);
-                    continue;
-                }
-                stats.docs_pending = stats.docs_pending.saturating_add(1);
-                pending_docs.push(pending_doc);
-            }
-
-            while stream_pending_docs && pending_docs.len() >= embed_batch_size {
-                if is_indexing_cancelled(cancel_token) {
-                    return Err(indexing_cancelled_error());
-                }
-                let Some(embedding_contract) = embedding_contract.as_ref() else {
-                    break;
-                };
-                sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
-                flush_pending_llm_symbol_docs(
-                    storage,
-                    engine,
-                    &pending_docs[..embed_batch_size],
-                    embedding_contract,
-                    updated_at_epoch_ms,
-                    &mut stats,
-                    cancel_token,
-                )?;
-                pending_docs.drain(..embed_batch_size);
-            }
-        }
-    }
+    let report_build_started = Instant::now();
+    let built_reports = build_component_report_docs_with_policy(
+        &graph_context,
+        &report_semantic_nodes,
+        &existing_docs,
+        updated_at_epoch_ms,
+        semantic_alias_mode,
+        semantic_max_tokens,
+    );
+    doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
+    publish_component_report_docs(
+        storage,
+        built_reports,
+        source_identity,
+        updated_at_epoch_ms,
+        anchor_batch_size,
+        cancel_token,
+        &mut stats,
+        &mut pending_docs,
+        &mut seen_symbol_node_ids,
+        &mut seen_dense_node_ids,
+        &mut component_report_node_ids,
+        &mut dense_component_report_node_ids,
+    )?;
     stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
 
-    if !stream_pending_docs {
-        sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
-    }
-    if let Some(embedding_contract) = embedding_contract.as_ref() {
-        for batch in pending_docs.chunks(embed_batch_size) {
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            flush_pending_llm_symbol_docs(
-                storage,
-                engine,
-                batch,
-                embedding_contract,
-                updated_at_epoch_ms,
-                &mut stats,
-                cancel_token,
-            )?;
+    sort_pending_dense_anchor_inputs(&mut pending_docs);
+    for batch in pending_docs.chunks(anchor_batch_size) {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
         }
+        flush_pending_dense_anchor_inputs(
+            storage,
+            batch,
+            source_identity,
+            updated_at_epoch_ms,
+            &mut stats,
+            cancel_token,
+        )?;
     }
 
     if is_indexing_cancelled(cancel_token) {
@@ -6880,27 +9557,22 @@ fn sync_llm_symbol_projection_for_runtime(
             .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
     };
-    let stale_dense_docs = if embedding_contract.is_some() {
-        if let Some(scope) = effective_llm_refresh_file_scope {
-            let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
-            storage
-                .delete_llm_symbol_docs_for_files_except_node_ids(
-                    &file_node_ids,
-                    &seen_dense_node_ids,
-                )
-                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
-        } else {
-            storage
-                .prune_llm_symbol_docs_to_node_ids(&seen_dense_node_ids)
-                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
-        }
+    let stale_dense_docs = if let Some(scope) = effective_llm_refresh_file_scope {
+        let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
+        storage
+            .delete_dense_anchor_inputs_for_files_except_node_ids(
+                &file_node_ids,
+                &seen_dense_node_ids,
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?
     } else {
-        storage.clear_llm_symbol_docs().map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to clear dense docs without an embedding runtime: {e}"
-            ))
-        })?
+        storage
+            .prune_dense_anchor_inputs_to_node_ids(&seen_dense_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?
     };
+    let removed_legacy_vectors = storage
+        .clear_llm_symbol_docs()
+        .map_err(|e| ApiError::internal(format!("Failed to remove legacy core vectors: {e}")))?;
     let stale_component_docs = storage
         .prune_retrieval_artifacts_to_node_ids(
             &component_report_node_ids,
@@ -6910,16 +9582,329 @@ fn sync_llm_symbol_projection_for_runtime(
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
     stats.docs_stale = clamp_usize_to_u32(
         stale_dense_docs
+            .saturating_add(removed_legacy_vectors)
             .saturating_add(stale_symbol_docs)
             .saturating_add(stale_component_docs),
     );
 
     if hydrate_semantic_docs {
-        let reload_started = Instant::now();
-        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-        stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+        engine.index_llm_symbol_docs(Vec::new());
     }
 
+    Ok(stats)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticProjectionDocumentSource {
+    SourceFiles,
+    StoredCore,
+}
+
+fn sync_full_llm_symbol_projection_streaming_for_runtime(
+    storage: &mut Storage,
+    source_identity: &str,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    document_source: SemanticProjectionDocumentSource,
+) -> Result<SemanticProjectionStats, ApiError> {
+    let mut stats = SemanticProjectionStats {
+        reported: true,
+        ..Default::default()
+    };
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+
+    let updated_at_epoch_ms = current_epoch_ms();
+    let existing_docs = storage
+        .get_dense_anchor_input_reuse_metadata()
+        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
+        .into_iter()
+        .map(|doc| (doc.node_id, doc))
+        .collect::<HashMap<_, _>>();
+    let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
+    let semantic_alias_mode =
+        semantic_doc_alias_mode_from_value(&runtime.retrieval.semantic_doc_alias_mode);
+    let semantic_max_tokens = runtime.retrieval.semantic_doc_max_tokens;
+    let stream_sort_window_size = anchor_batch_size
+        .saturating_mul(runtime.retrieval.stream_sort_window_batches)
+        .max(1);
+    let semantic_scope = semantic_doc_scope_from_value(&runtime.retrieval.semantic_doc_scope);
+    let semantic_kinds = llm_indexable_kinds_for_scope(semantic_scope);
+
+    let node_load_started = Instant::now();
+    let semantic_file_ids = storage
+        .get_node_file_ids_by_kinds_for_build(semantic_kinds)
+        .map_err(|e| ApiError::internal(format!("Failed to load semantic file ids: {e}")))?;
+    stats.node_load_ms = stats
+        .node_load_ms
+        .saturating_add(clamp_u128_to_u32(node_load_started.elapsed().as_millis()));
+    let files = storage
+        .get_files()
+        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+    let (mut file_paths, mut file_read_paths) = semantic_file_table_path_maps(files);
+    let semantic_file_id_set = semantic_file_ids.iter().copied().collect::<HashSet<_>>();
+    file_paths.retain(|file_id, _| semantic_file_id_set.contains(file_id));
+    file_read_paths.retain(|file_id, _| semantic_file_id_set.contains(file_id));
+
+    let mut missing_file_ids = semantic_file_ids
+        .iter()
+        .filter(|file_id| !file_paths.contains_key(file_id))
+        .copied()
+        .collect::<Vec<_>>();
+    missing_file_ids.sort_unstable_by_key(|file_id| file_id.0);
+    if !missing_file_ids.is_empty() {
+        let fallback_started = Instant::now();
+        let fallback_lookup = storage
+            .get_nodes_by_ids_no_cache_for_build(&missing_file_ids)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load semantic file-node fallbacks: {e}"))
+            })?;
+        stats.endpoint_load_ms = stats
+            .endpoint_load_ms
+            .saturating_add(clamp_u128_to_u32(fallback_started.elapsed().as_millis()));
+        stats.endpoint_load_rows = stats
+            .endpoint_load_rows
+            .saturating_add(clamp_usize_to_u32(fallback_lookup.nodes.len()));
+        stats.endpoint_load_batches = stats
+            .endpoint_load_batches
+            .saturating_add(clamp_usize_to_u32(fallback_lookup.query_batches));
+        for (file_id, node) in fallback_lookup.nodes {
+            file_paths
+                .entry(file_id)
+                .or_insert_with(|| node.serialized_name.clone());
+            file_read_paths
+                .entry(file_id)
+                .or_insert(node.serialized_name);
+        }
+    }
+    stats.context_file_count = clamp_usize_to_u32(file_paths.len());
+    stats.context_path_bytes = clamp_usize_to_u32(
+        file_paths
+            .values()
+            .chain(file_read_paths.values())
+            .map(String::len)
+            .sum(),
+    );
+    let mut doc_build_ns = 0_u128;
+    let file_text_cache = if document_source == SemanticProjectionDocumentSource::SourceFiles {
+        let mut file_text_paths = HashMap::new();
+        for file_id in &semantic_file_ids {
+            let Some(display_path) = file_paths.get(file_id) else {
+                continue;
+            };
+            let read_path = file_read_paths.get(file_id).unwrap_or(display_path).clone();
+            file_text_paths.insert(display_path.clone(), read_path);
+        }
+        let file_cache_started = Instant::now();
+        let cache = build_semantic_file_text_cache_from_paths(&file_text_paths);
+        doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
+        cache
+    } else {
+        HashMap::new()
+    };
+
+    let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
+    let mut seen_symbol_node_ids = Vec::<GraphNodeId>::new();
+    let mut seen_dense_node_ids = Vec::<GraphNodeId>::new();
+    let mut component_report_node_ids = Vec::<GraphNodeId>::new();
+    let mut dense_component_report_node_ids = Vec::<GraphNodeId>::new();
+    let mut component_reports = ComponentReportAccumulator::default();
+    let mut after_node_id = None;
+    loop {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let page_load_started = Instant::now();
+        let mut semantic_nodes = storage
+            .get_nodes_by_kinds_batch_after_for_build(
+                semantic_kinds,
+                after_node_id,
+                SEMANTIC_NODE_STREAM_BATCH_SIZE,
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to stream semantic nodes: {e}")))?;
+        stats.node_load_ms = stats
+            .node_load_ms
+            .saturating_add(clamp_u128_to_u32(page_load_started.elapsed().as_millis()));
+        if semantic_nodes.is_empty() {
+            break;
+        }
+        #[cfg(test)]
+        publication_test_checkpoint(PublicationTestBoundary::SemanticNodePage, cancel_token)?;
+        after_node_id = semantic_nodes.last().map(|node| node.id);
+        stats.node_stream_batches = stats.node_stream_batches.saturating_add(1);
+        stats.node_load_rows = stats
+            .node_load_rows
+            .saturating_add(clamp_usize_to_u32(semantic_nodes.len()));
+        semantic_nodes.retain(|node| !is_retrieval_artifact_node(node));
+        stats.selected_nodes = stats
+            .selected_nodes
+            .saturating_add(clamp_usize_to_u32(semantic_nodes.len()));
+        if semantic_nodes.is_empty() {
+            continue;
+        }
+
+        let semantic_node_ids = semantic_nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let stored_docs = if document_source == SemanticProjectionDocumentSource::StoredCore {
+            let docs = storage
+                .get_symbol_search_docs_for_node_ids(&semantic_node_ids)
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load pinned semantic documents: {error}"))
+                })?;
+            if docs.len() != semantic_node_ids.len() {
+                return Err(ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!(
+                        "Pinned core contains {} semantic nodes but only {} stored documents in this page",
+                        semantic_node_ids.len(),
+                        docs.len()
+                    ),
+                ));
+            }
+            Some(
+                docs.into_iter()
+                    .map(|doc| (doc.node_id, doc))
+                    .collect::<HashMap<_, _>>(),
+            )
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if document_source == SemanticProjectionDocumentSource::StoredCore {
+            publication_test_checkpoint(
+                PublicationTestBoundary::SemanticStoredDocumentPage,
+                cancel_token,
+            )?;
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
+        }
+        let component_access = storage
+            .get_component_access_map_for_nodes(&semantic_node_ids)
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to load symbol access metadata: {e}"))
+            })?;
+        let context_started = Instant::now();
+        let (graph_context, page_stats) = SemanticDocGraphContext::build_for_full_page(
+            storage,
+            &semantic_nodes,
+            semantic_scope,
+            &file_paths,
+            &file_read_paths,
+            cancel_token,
+        )?;
+        #[cfg(test)]
+        publication_test_checkpoint(PublicationTestBoundary::SemanticEndpointRead, cancel_token)?;
+        stats.context_ms = stats
+            .context_ms
+            .saturating_add(clamp_u128_to_u32(context_started.elapsed().as_millis()));
+        stats.endpoint_load_ms = stats
+            .endpoint_load_ms
+            .saturating_add(page_stats.endpoint_load_ms);
+        stats.endpoint_load_rows = stats
+            .endpoint_load_rows
+            .saturating_add(page_stats.endpoint_rows);
+        stats.endpoint_load_batches = stats
+            .endpoint_load_batches
+            .saturating_add(page_stats.endpoint_query_batches);
+        stats.node_lookup_entries = stats.node_lookup_entries.max(page_stats.lookup_entries);
+
+        let semantic_node_refs = semantic_nodes.iter().collect::<Vec<_>>();
+        component_reports.observe(&graph_context, &semantic_node_refs);
+        process_semantic_symbol_nodes(
+            storage,
+            &semantic_node_refs,
+            &graph_context,
+            &file_text_cache,
+            stored_docs.as_ref(),
+            &component_access,
+            &existing_docs,
+            updated_at_epoch_ms,
+            semantic_alias_mode,
+            semantic_max_tokens,
+            stream_sort_window_size,
+            anchor_batch_size,
+            source_identity,
+            cancel_token,
+            &mut stats,
+            &mut doc_build_ns,
+            &mut pending_docs,
+            &mut seen_symbol_node_ids,
+            &mut seen_dense_node_ids,
+        )?;
+    }
+
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let report_build_started = Instant::now();
+    let built_reports = component_reports.build_docs(
+        &existing_docs,
+        updated_at_epoch_ms,
+        semantic_alias_mode,
+        semantic_max_tokens,
+    );
+    doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
+    publish_component_report_docs(
+        storage,
+        built_reports,
+        source_identity,
+        updated_at_epoch_ms,
+        anchor_batch_size,
+        cancel_token,
+        &mut stats,
+        &mut pending_docs,
+        &mut seen_symbol_node_ids,
+        &mut seen_dense_node_ids,
+        &mut component_report_node_ids,
+        &mut dense_component_report_node_ids,
+    )?;
+    stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
+
+    sort_pending_dense_anchor_inputs(&mut pending_docs);
+    for batch in pending_docs.chunks(anchor_batch_size) {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        flush_pending_dense_anchor_inputs(
+            storage,
+            batch,
+            source_identity,
+            updated_at_epoch_ms,
+            &mut stats,
+            cancel_token,
+        )?;
+    }
+
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let prune_started = Instant::now();
+    let stale_symbol_docs = storage
+        .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
+        .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?;
+    let stale_dense_docs = storage
+        .prune_dense_anchor_inputs_to_node_ids(&seen_dense_node_ids)
+        .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?;
+    let removed_legacy_vectors = storage
+        .clear_llm_symbol_docs()
+        .map_err(|e| ApiError::internal(format!("Failed to remove legacy core vectors: {e}")))?;
+    let stale_component_docs = storage
+        .prune_retrieval_artifacts_to_node_ids(
+            &component_report_node_ids,
+            &dense_component_report_node_ids,
+        )
+        .map_err(|e| ApiError::internal(format!("Failed to prune component reports: {e}")))?;
+    stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
+    stats.docs_stale = clamp_usize_to_u32(
+        stale_dense_docs
+            .saturating_add(removed_legacy_vectors)
+            .saturating_add(stale_symbol_docs)
+            .saturating_add(stale_component_docs),
+    );
     Ok(stats)
 }
 
@@ -6934,8 +9919,10 @@ fn finalize_staged_semantic_docs(
         storage,
         llm_refresh_file_scope,
         component_report_refresh,
+        "core:test-publication",
         cancel_token,
         &test_sidecar_runtime_from_env(),
+        SemanticProjectionDocumentSource::SourceFiles,
     )
 }
 
@@ -6943,34 +9930,72 @@ fn finalize_staged_semantic_docs_for_runtime(
     storage: &mut Storage,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     component_report_refresh: Option<&ComponentReportRefreshScope>,
+    source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    document_source: SemanticProjectionDocumentSource,
 ) -> Result<SemanticProjectionStats, ApiError> {
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    let nodes = storage
-        .get_nodes()
-        .map_err(|error| ApiError::internal(format!("Failed to load staged nodes: {error}")))?;
-    let node_names = nodes
-        .iter()
-        .map(|node| (node.id, node_display_name(node)))
-        .collect::<HashMap<_, _>>();
-    let mut engine = SearchEngine::new(None)
-        .map_err(|error| ApiError::internal(format!("Failed to init semantic engine: {error}")))?;
-    sync_llm_symbol_projection_for_runtime(
-        storage,
-        &nodes,
-        &node_names,
-        &mut engine,
-        SemanticRefreshScope {
-            file_ids: llm_refresh_file_scope,
-            component_reports: component_report_refresh,
-        },
-        false,
+    let semantic_context_index_started = Instant::now();
+    storage
+        .create_semantic_context_endpoint_indexes_for_build()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to create staged semantic context endpoint indexes: {error}"
+            ))
+        })?;
+    let semantic_context_index_ms =
+        clamp_u128_to_u32(semantic_context_index_started.elapsed().as_millis());
+    #[cfg(test)]
+    publication_test_checkpoint(
+        PublicationTestBoundary::SemanticContextIndexes,
         cancel_token,
-        runtime,
-    )
+    )?;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let mut stats = if storage.is_staged_build()
+        && llm_refresh_file_scope.is_none()
+        && component_report_refresh.is_none()
+    {
+        sync_full_llm_symbol_projection_streaming_for_runtime(
+            storage,
+            source_identity,
+            cancel_token,
+            runtime,
+            document_source,
+        )?
+    } else {
+        let node_load_started = Instant::now();
+        let nodes = storage
+            .get_nodes()
+            .map_err(|error| ApiError::internal(format!("Failed to load staged nodes: {error}")))?;
+        let node_load_ms = clamp_u128_to_u32(node_load_started.elapsed().as_millis());
+        let node_load_rows = clamp_usize_to_u32(nodes.len());
+        let mut engine = SearchEngine::new(None).map_err(|error| {
+            ApiError::internal(format!("Failed to init semantic engine: {error}"))
+        })?;
+        let mut stats = sync_llm_symbol_projection_for_runtime(
+            storage,
+            &nodes,
+            &mut engine,
+            SemanticRefreshScope {
+                file_ids: llm_refresh_file_scope,
+                component_reports: component_report_refresh,
+            },
+            false,
+            source_identity,
+            cancel_token,
+            runtime,
+        )?;
+        stats.node_load_ms = node_load_ms;
+        stats.node_load_rows = node_load_rows;
+        stats
+    };
+    stats.semantic_context_index_ms = semantic_context_index_ms;
+    Ok(stats)
 }
 
 fn load_persisted_semantic_docs_for_runtime(
@@ -6986,7 +10011,7 @@ fn load_persisted_semantic_docs_for_runtime(
     if !hydrate_semantic_docs || !runtime.retrieval.hybrid_enabled {
         return Ok(stats);
     }
-    if let Err(error) = engine.set_embedding_runtime_from_config(&runtime.embedding) {
+    if let Err(error) = engine.set_embedding_runtime_for_runtime(runtime) {
         tracing::warn!(
             "embedding runtime unavailable while hydrating completed semantic docs: {error}"
         );
@@ -8071,6 +11096,28 @@ fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
     storage.map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
 }
 
+fn open_existing_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
+    if !path.is_file() {
+        return Err(ApiError::new(
+            "project_unavailable",
+            "no complete project storage is available",
+        ));
+    }
+    let schema = Storage::database_schema_version(path).map_err(|error| {
+        ApiError::internal(format!("Failed to inspect storage schema: {error}"))
+    })?;
+    if schema != CURRENT_SCHEMA_VERSION {
+        return Err(ApiError::new(
+            "project_unavailable",
+            format!(
+                "project storage schema {schema} is not readable by runtime schema {CURRENT_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    Storage::open_read_only(path)
+        .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
+}
+
 fn publish_search_engine(
     state: &mut AppState,
     engine: SearchEngine,
@@ -8099,6 +11146,7 @@ pub struct AppController {
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,
+    source_index_policy: Arc<SourceIndexPolicy>,
 }
 
 #[derive(Debug)]
@@ -8167,6 +11215,13 @@ impl AppController {
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        Self::new_with_source_index_policy(config, process_source_index_policy().clone())
+    }
+
+    fn new_with_source_index_policy(
+        config: codestory_retrieval::SidecarRuntimeConfig,
+        source_index_policy: SourceIndexPolicy,
+    ) -> Self {
         let (events_tx, events_rx) = unbounded();
         Self {
             state: Arc::new(Mutex::new(AppState {
@@ -8184,6 +11239,7 @@ impl AppController {
             events_tx,
             events_rx,
             runtime_config: Arc::new(config),
+            source_index_policy: Arc::new(source_index_policy),
         }
     }
 
@@ -8216,7 +11272,7 @@ impl AppController {
     }
 
     pub fn browser_service(&self) -> ReadOnlyBrowserService {
-        ReadOnlyBrowserService::new(self.clone())
+        ReadOnlyBrowserService::new(self.clone(), PublicOperationService::new(self.clone()))
     }
 
     /// Subscribe to backend events. Intended to be consumed by a single pump
@@ -8241,15 +11297,140 @@ impl AppController {
             .ok_or_else(no_project_error)
     }
 
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
     fn open_storage(&self) -> Result<Storage, ApiError> {
         let storage_path = self.require_storage_path()?;
         Storage::open(&storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))
     }
 
-    fn open_storage_read_only(&self) -> Result<Storage, ApiError> {
+    fn open_storage_read_only(&self) -> Result<ReadStorage, ApiError> {
+        if let Some(storage) = ACTIVE_CORE_READ.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|active| active.controller_identity == self.identity())
+                .map(|active| Rc::clone(&active.storage))
+        }) {
+            return Ok(ReadStorage::Pinned(storage));
+        }
         let storage_path = self.require_storage_path()?;
-        open_storage_for_read(&storage_path)
+        open_existing_storage_for_read(&storage_path).map(ReadStorage::Owned)
+    }
+
+    fn open_storage_for_freshness(&self) -> Result<ReadStorage, ApiError> {
+        if let Some(storage) = ACTIVE_CORE_READ.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|active| active.controller_identity == self.identity())
+                .map(|active| Rc::clone(&active.storage))
+        }) {
+            return Ok(ReadStorage::Pinned(storage));
+        }
+        let storage_path = self.require_storage_path()?;
+        Storage::open_freshness_observational(&storage_path)
+            .map(ReadStorage::Owned)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to open storage for freshness observation: {error}"
+                ))
+            })
+    }
+
+    fn active_core_publication(&self) -> Option<IndexPublicationRecord> {
+        ACTIVE_CORE_READ.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|active| active.controller_identity == self.identity())
+                .map(|active| active.publication.clone())
+        })
+    }
+
+    fn active_project_summary(&self) -> Result<ProjectSummary, ApiError> {
+        if self.active_core_publication().is_none() {
+            return Err(ApiError::internal(
+                "Active project summary requires a pinned public operation",
+            ));
+        }
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        let storage = self.open_storage_read_only()?;
+        self.project_summary_from_storage(&root, &storage_path, &storage)
+    }
+
+    fn with_complete_core_snapshot<T>(
+        &self,
+        build: impl FnOnce(&IndexPublicationRecord) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        if let Some(publication) = self.active_core_publication() {
+            return build(&publication);
+        }
+        let storage_path = self.require_storage_path()?;
+        let storage = Rc::new(open_existing_storage_for_read(&storage_path)?);
+        let installed_storage = Rc::clone(&storage);
+        let snapshot = storage.read_snapshot().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to begin public operation snapshot: {error}"
+            ))
+        })?;
+        let publication = snapshot
+            .storage()
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read public operation publication: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "project_unavailable",
+                    "no complete core publication is available",
+                )
+            })?;
+        let previous = ACTIVE_CORE_READ.with(|active| {
+            active.replace(Some(ActiveCoreRead {
+                controller_identity: self.identity(),
+                storage: installed_storage,
+                publication: publication.clone(),
+            }))
+        });
+        let guard = ActiveCoreReadGuard { previous };
+        let result = build(&publication);
+        drop(guard);
+        snapshot.finish().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finish public operation snapshot: {error}"
+            ))
+        })?;
+        let live = Store::database_complete_index_publication(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to revalidate public operation: {error}"))
+        })?;
+        if live.as_ref() != Some(&publication) {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the complete core publication changed during the public operation",
+            ));
+        }
+        result
+    }
+
+    fn index_freshness_uncached(&self) -> Result<IndexFreshnessDto, ApiError> {
+        let root = self.require_project_root()?;
+        let storage = self.open_storage_for_freshness()?;
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
+            .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+        Ok(index_freshness_from_storage_with_policy(
+            &root,
+            &workspace,
+            &storage,
+            &self.source_index_policy,
+        ))
     }
 
     fn resolve_project_file_path(
@@ -8300,6 +11481,15 @@ impl AppController {
     }
 
     fn ensure_search_state(&self) -> Result<(), ApiError> {
+        let pinned_publication = self.active_core_publication();
+        if let Some(publication) = pinned_publication.as_ref() {
+            let state = self.state.lock();
+            if state.search_engine.is_some()
+                && state.search_publication.as_ref() == Some(publication)
+            {
+                return Ok(());
+            }
+        }
         let storage_path = self.require_storage_path()?;
         let current_publication = Store::database_complete_index_publication(&storage_path)
             .map_err(|error| {
@@ -8307,6 +11497,14 @@ impl AppController {
                     "Failed to read current search publication: {error}"
                 ))
             })?;
+        if pinned_publication.as_ref() != current_publication.as_ref()
+            && pinned_publication.is_some()
+        {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the pinned core publication is no longer the current lexical search generation",
+            ));
+        }
         {
             let s = self.state.lock();
             if s.search_engine.is_some() && s.search_publication == current_publication {
@@ -8327,6 +11525,14 @@ impl AppController {
                 Err(error) => return Err(error),
             }
         };
+        if pinned_publication.as_ref() != loaded.publication.as_ref()
+            && pinned_publication.is_some()
+        {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the pinned core publication does not match the loaded lexical search generation",
+            ));
+        }
 
         let mut s = self.state.lock();
         if s.search_engine.is_none() || s.search_publication != loaded.publication {
@@ -8442,10 +11648,10 @@ impl AppController {
         node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
         id: codestory_contracts::graph::NodeId,
         score: f32,
-    ) -> Option<SearchHit> {
+    ) -> Result<Option<SearchHit>, ApiError> {
         let node = match storage.get_node(id) {
             Ok(Some(node)) if node.kind != codestory_contracts::graph::NodeKind::UNKNOWN => node,
-            _ => return None,
+            _ => return Ok(None),
         };
 
         let display_name = node_names
@@ -8472,8 +11678,14 @@ impl AppController {
             .canonical_id
             .as_deref()
             .is_some_and(|value| value.starts_with("openapi:endpoint:"));
+        let structural_unit = storage.get_structural_text_unit(id).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load structural provenance for node {}: {error}",
+                id.0
+            ))
+        })?;
 
-        Some(SearchHit {
+        let mut hit = SearchHit {
             node_id: NodeId::from(id),
             display_name,
             kind: NodeKind::from(node.kind),
@@ -8483,29 +11695,35 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
-            evidence_tier: Some(if openapi_endpoint {
+            evidence_tier: Some(if structural_unit.is_some() {
+                codestory_contracts::api::PacketEvidenceTierDto::StructuralText
+            } else if openapi_endpoint {
                 codestory_contracts::api::PacketEvidenceTierDto::ExactSource
             } else {
                 codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph
             }),
-            evidence_producer: Some(
+            evidence_producer: Some(if let Some(unit) = structural_unit.as_ref() {
+                unit.producer.clone()
+            } else {
                 if openapi_endpoint {
                     "openapi_endpoint_schema"
                 } else {
                     "route_endpoint"
                 }
-                .to_string(),
-            ),
-            resolution_status: Some(if openapi_endpoint {
+                .to_string()
+            }),
+            resolution_status: Some(if structural_unit.is_some() || openapi_endpoint {
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly
             } else {
                 codestory_contracts::api::PacketEvidenceResolutionDto::Resolved
             }),
             loss_reason: None,
             coverage_role: None,
-            eligible_for_sufficiency: Some(!openapi_endpoint),
+            eligible_for_sufficiency: Some(structural_unit.is_none() && !openapi_endpoint),
             score_breakdown: None,
-        })
+        };
+        decorate_search_hit_evidence(&mut hit);
+        Ok(Some(hit))
     }
 
     #[cfg(test)]
@@ -8828,7 +12046,10 @@ impl AppController {
 
         let mut hits = matches
             .into_iter()
-            .filter_map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         let project_root = self.require_project_root().ok();
         hits.sort_by(|left, right| {
@@ -8861,7 +12082,7 @@ impl AppController {
             error_count: clamp_i64_to_u32(stats.error_count),
             fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
-        let workspace = WorkspaceManifest::open(root.to_path_buf())
+        let workspace = runtime_workspace_manifest(root, storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
         let freshness =
@@ -8895,11 +12116,12 @@ impl AppController {
         if !storage_path.is_file() {
             return Ok(None);
         }
-        Store::database_complete_index_publication(storage_path)
+        Store::open_observational(storage_path)
+            .and_then(|storage| storage.get_complete_index_publication())
             .map(|publication| publication.map(index_publication_dto))
             .map_err(|error| {
                 ApiError::internal(format!(
-                    "Failed to read complete index publication: {error}"
+                    "Failed to observe complete index publication: {error}"
                 ))
             })
     }
@@ -9043,9 +12265,64 @@ impl AppController {
         self.open_project_summary_with_storage_inner(root, storage_path)
     }
 
+    pub fn inspect_project_summary_with_storage_path(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<Option<ProjectSummary>, ApiError> {
+        if !root.exists() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist: {}",
+                root.display()
+            )));
+        }
+        if !root.is_dir() {
+            return Err(ApiError::invalid_argument(format!(
+                "Project path is not a directory: {}",
+                root.display()
+            )));
+        }
+        if !storage_path.is_file() {
+            return Ok(None);
+        }
+        let storage = Storage::open_observational(&storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to open storage observationally: {error}"))
+        })?;
+        let snapshot = storage.read_snapshot().map_err(|error| {
+            ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
+        })?;
+        let summary =
+            self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
+        snapshot.finish().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finish project summary snapshot: {error}"
+            ))
+        })?;
+        let changed = {
+            let mut state = self.state.lock();
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+            }
+            state.project_root = Some(root);
+            state.storage_path = Some(storage_path);
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
+        }
+        Ok(Some(summary))
+    }
+
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
         let (root, storage_path) = {
-            let mut s = self.state.lock();
+            let s = self.state.lock();
             if s.is_indexing {
                 return Err(ApiError::invalid_argument(
                     "Indexing already in progress for this controller.",
@@ -9058,10 +12335,21 @@ impl AppController {
                 .storage_path
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
-            s.is_indexing = true;
-            s.index_freshness_cache = None;
             (root, storage_path)
         };
+        if req.mode == IndexMode::Incremental {
+            ensure_incremental_refresh_compatible(&root, &storage_path)?;
+        }
+        {
+            let mut s = self.state.lock();
+            if s.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            s.is_indexing = true;
+            s.index_freshness_cache = None;
+        }
 
         let events_tx = self.events_tx.clone();
         let controller = self.clone();
@@ -9078,6 +12366,7 @@ impl AppController {
                             &events_tx,
                             None,
                             &controller.runtime_config,
+                            &controller.source_index_policy,
                         ),
                         IndexMode::Incremental => index_incremental_for_runtime(
                             &root,
@@ -9085,6 +12374,7 @@ impl AppController {
                             &events_tx,
                             None,
                             &controller.runtime_config,
+                            &controller.source_index_policy,
                         ),
                     };
                     result.and_then(|summary| {
@@ -9119,7 +12409,7 @@ impl AppController {
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         let (root, storage_path) = {
-            let mut s = self.state.lock();
+            let s = self.state.lock();
             if s.is_indexing {
                 return Err(ApiError::invalid_argument(
                     "Indexing already in progress for this controller.",
@@ -9130,10 +12420,21 @@ impl AppController {
                 .storage_path
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
-            s.is_indexing = true;
-            s.index_freshness_cache = None;
             (root, storage_path)
         };
+        if mode == IndexMode::Incremental {
+            ensure_incremental_refresh_compatible(&root, &storage_path)?;
+        }
+        {
+            let mut s = self.state.lock();
+            if s.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            s.is_indexing = true;
+            s.index_freshness_cache = None;
+        }
 
         let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
             Ok(guard) => guard,
@@ -9150,6 +12451,7 @@ impl AppController {
                 &self.events_tx,
                 cancel_token,
                 &self.runtime_config,
+                &self.source_index_policy,
             ),
             IndexMode::Incremental => index_incremental_for_runtime(
                 &root,
@@ -9157,6 +12459,7 @@ impl AppController {
                 &self.events_tx,
                 cancel_token,
                 &self.runtime_config,
+                &self.source_index_policy,
             ),
         };
 
@@ -9230,6 +12533,7 @@ impl AppController {
                         false,
                         &self.runtime_config,
                         None,
+                        None,
                     )
                     .map(|result| CacheRefreshStats {
                         search_stats: result.search_stats,
@@ -9273,6 +12577,152 @@ impl AppController {
         state.is_indexing = false;
     }
 
+    pub(crate) fn prepare_search_state_for_activation(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), ApiError> {
+        let storage_path = self
+            .state
+            .lock()
+            .storage_path
+            .clone()
+            .ok_or_else(no_project_error)?;
+        let _writer_guard = IndexWriterGuard::try_acquire(&storage_path)?;
+        if cancel_token.is_cancelled() {
+            return Err(indexing_cancelled_error());
+        }
+
+        let mut storage = Storage::open(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open core storage for search preparation: {error}"
+            ))
+        })?;
+        let expected_publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read the complete core publication before search preparation: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "publication_changed",
+                    "The complete core publication disappeared before search preparation.",
+                )
+            })?;
+        let mut validate_before_completion =
+            |prepared_publication: &IndexPublicationRecord| -> Result<(), ApiError> {
+                if cancel_token.is_cancelled() {
+                    return Err(indexing_cancelled_error());
+                }
+
+                #[cfg(test)]
+                run_activation_search_before_revalidate_hook(&storage_path);
+
+                let live_publication = Store::database_index_publication(&storage_path).map_err(
+                    |error| {
+                        ApiError::internal(format!(
+                            "Failed to revalidate the core publication before search promotion: {error}"
+                        ))
+                    },
+                )?;
+                if prepared_publication != &expected_publication
+                    || live_publication.as_ref() != Some(&expected_publication)
+                {
+                    return Err(ApiError::new(
+                        "publication_changed",
+                        "The core publication changed while its search generation was being prepared.",
+                    ));
+                }
+                Ok(())
+            };
+        let prepared = rebuild_search_state_from_storage_for_runtime(
+            &mut storage,
+            &storage_path,
+            None,
+            false,
+            &self.runtime_config,
+            Some(cancel_token),
+            Some(&mut validate_before_completion),
+        )?;
+        if cancel_token.is_cancelled() {
+            return Err(indexing_cancelled_error());
+        }
+
+        let live_publication =
+            Store::database_index_publication(&storage_path).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to revalidate the core publication after search preparation: {error}"
+                ))
+            })?;
+        if prepared.publication.as_ref() != Some(&expected_publication)
+            || live_publication.as_ref() != Some(&expected_publication)
+        {
+            drop(prepared);
+            return Err(ApiError::new(
+                "publication_changed",
+                "The core publication changed while its search generation was being prepared.",
+            ));
+        }
+
+        publish_prepared_search_state(self, prepared);
+        Ok(())
+    }
+
+    pub(crate) fn complete_core_requires_publication_repair(
+        &self,
+        storage_path: &Path,
+    ) -> Result<bool, ApiError> {
+        if !storage_path.is_file() {
+            return Ok(false);
+        }
+        let storage = Store::open_read_only(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect dense-anchor publication readiness: {error}"
+            ))
+        })?;
+        let Some(publication) = storage.get_complete_index_publication().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect dense-anchor core publication: {error}"
+            ))
+        })?
+        else {
+            return Ok(false);
+        };
+        if storage
+            .validate_dense_anchor_publication(&publication)
+            .is_err()
+            || storage
+                .validate_structural_text_unit_publication(&publication)
+                .is_err()
+        {
+            return Ok(true);
+        }
+        let root = self.require_project_root()?;
+        Ok(validate_source_policy_exclusions(
+            &storage,
+            &root,
+            &publication,
+            &self.source_index_policy,
+        )
+        .is_err())
+    }
+
+    pub fn ensure_incremental_refresh_compatible(&self) -> Result<(), ApiError> {
+        let state = self.state.lock();
+        let root = state.project_root.as_deref().ok_or_else(no_project_error)?;
+        let storage_path = state.storage_path.as_deref().ok_or_else(no_project_error)?;
+        ensure_incremental_refresh_compatible(root, storage_path)
+    }
+
+    pub fn ensure_incremental_refresh_compatible_at(
+        &self,
+        root: &Path,
+        storage_path: &Path,
+    ) -> Result<(), ApiError> {
+        ensure_incremental_refresh_compatible(root, storage_path)
+    }
+
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, true, None)
     }
@@ -9300,39 +12750,167 @@ impl AppController {
         self.run_indexing_blocking_inner(mode, false, Some(cancel_token))
     }
 
+    pub fn republish_semantic_projections_blocking(
+        &self,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_blocking_inner(None)
+    }
+
+    pub fn republish_semantic_projections_blocking_with_cancel(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_blocking_inner(Some(cancel_token))
+    }
+
+    fn republish_semantic_projections_blocking_inner(
+        &self,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        let (root, storage_path) = {
+            let state = self.state.lock();
+            let root = state.project_root.clone().ok_or_else(no_project_error)?;
+            let storage_path = state
+                .storage_path
+                .clone()
+                .unwrap_or_else(|| root.join("codestory.db"));
+            (root, storage_path)
+        };
+        self.republish_semantic_projections_at_blocking_inner(root, storage_path, cancel_token)
+    }
+
+    pub fn republish_semantic_projections_at_blocking(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_at_blocking_inner(root, storage_path, None)
+    }
+
+    fn republish_semantic_projections_at_blocking_inner(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        if !root.is_dir() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist or is not a directory: {}",
+                root.display()
+            )));
+        }
+        {
+            let mut state = self.state.lock();
+            if state.is_indexing {
+                return Err(ApiError::invalid_argument(
+                    "Indexing already in progress for this controller.",
+                ));
+            }
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+            }
+            state.project_root = Some(root.clone());
+            state.storage_path = Some(storage_path.clone());
+            state.is_indexing = true;
+            state.index_freshness_cache = None;
+        }
+        let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.state.lock().is_indexing = false;
+                return Err(error);
+            }
+        };
+        let result = semantic_projection_republish_for_runtime(
+            &root,
+            &storage_path,
+            cancel_token,
+            &self.runtime_config,
+            &self.source_index_policy,
+        );
+        match result {
+            Ok((
+                summary,
+                previous_publication,
+                publication,
+                symbol_document_count,
+                dense_anchor_count,
+            )) => {
+                let phase_timings =
+                    self.finish_successful_indexing(summary, &storage_path, true, cancel_token)?;
+                Ok(SemanticProjectionRepublishOutcome {
+                    previous_publication,
+                    publication,
+                    semantic_policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                    symbol_document_count,
+                    dense_anchor_count,
+                    phase_timings,
+                })
+            }
+            Err(error) => {
+                let mut state = self.state.lock();
+                state.is_indexing = false;
+                state.index_freshness_cache = None;
+                Err(error)
+            }
+        }
+    }
+
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        if mode == IndexMode::Incremental {
+            ensure_incremental_refresh_compatible(&root, &storage_path)?;
+        }
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let mut incomplete_incremental_run = false;
         let refresh_inputs = if storage_path.exists() {
-            let store = Store::open(&storage_path)
-                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-            incomplete_incremental_run = store.has_incomplete_incremental_run().map_err(|e| {
-                ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
-            })?;
-            workspace_refresh_inputs(&store)?
+            let schema_version = Store::database_schema_version_observational(&storage_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to inspect dry-run storage without recovery: {error}"
+                    ))
+                })?;
+            if schema_version < CURRENT_SCHEMA_VERSION {
+                RefreshInputs::default()
+            } else {
+                let store =
+                    Store::open_freshness_observational(&storage_path).map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to inspect dry-run storage without mutation: {error}"
+                        ))
+                    })?;
+                workspace_refresh_inputs(&store)?
+            }
         } else {
             RefreshInputs::default()
         };
-        let effective_mode = if mode == IndexMode::Incremental && incomplete_incremental_run {
-            IndexMode::Full
-        } else {
-            mode
-        };
-        let execution_plan = match effective_mode {
-            IndexMode::Full => workspace.full_refresh_execution_plan().map_err(|e| {
-                ApiError::internal(format!("Failed to generate full refresh plan: {e}"))
-            })?,
+        let execution_plan = match mode {
+            IndexMode::Full => {
+                full_refresh_execution_plan_with_coverage(
+                    &root,
+                    &workspace,
+                    &self.source_index_policy,
+                )?
+                .0
+            }
             IndexMode::Incremental => {
                 workspace
-                    .build_execution_plan(&refresh_inputs)
+                    .build_execution_outcome_with_policy(&refresh_inputs, &self.source_index_policy)
                     .map_err(|e| {
                         ApiError::internal(format!(
                             "Failed to generate incremental refresh plan: {e}"
                         ))
                     })?
+                    .refresh
+                    .plan
             }
         };
         let members =
@@ -9340,7 +12918,7 @@ impl AppController {
         Ok(IndexDryRunDto {
             root: root.to_string_lossy().to_string(),
             storage_path: storage_path.to_string_lossy().to_string(),
-            refresh: effective_mode,
+            refresh: mode,
             files_to_index: execution_plan.files_to_index.len().min(u32::MAX as usize) as u32,
             files_to_remove: execution_plan.files_to_remove.len().min(u32::MAX as usize) as u32,
             sample_files_to_index: execution_plan
@@ -9902,7 +13480,7 @@ impl AppController {
         if !agent::retrieval_primary::sidecar_retrieval_primary_enabled(self) {
             let reason = agent::retrieval_primary::sidecar_retrieval_unavailable_reason(self)
                 .unwrap_or_else(|| {
-                    "sidecar retrieval primary is mandatory; legacy search is disabled".to_string()
+                    "full retrieval is mandatory; legacy search is disabled".to_string()
                 });
             return Err(
                 agent::retrieval_primary::sidecar_retrieval_unavailable_error(self, reason),
@@ -10042,6 +13620,7 @@ impl AppController {
 
         Ok(SearchResultsDto {
             query: original_query,
+            retrieval_publication: None,
             retrieval,
             retrieval_shadow,
             freshness,
@@ -10062,6 +13641,29 @@ impl AppController {
         self.ensure_consistent_read_state("Files")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
+        let publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read source policy exclusion publication identity: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "source_verification_failed",
+                    "Indexed-file coverage requires a complete core publication.",
+                )
+            })?;
+        validate_source_policy_exclusions(
+            &storage,
+            &root,
+            &publication,
+            &self.source_index_policy,
+        )?;
+        validate_structural_text_units(&storage, &publication)?;
+        let source_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
+            ApiError::internal(format!("Failed to load source policy exclusions: {error}"))
+        })?;
         let mut files = storage
             .get_files()
             .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
@@ -10070,10 +13672,23 @@ impl AppController {
         let errors = storage
             .get_errors(None)
             .map_err(|e| ApiError::internal(format!("Failed to load index errors: {e}")))?;
+        let verified_file_ids = storage
+            .files()
+            .inventory()
+            .map_err(|e| ApiError::internal(format!("Failed to load file inventory: {e}")))?
+            .into_iter()
+            .filter_map(|file| file.content_hash.map(|_| file.id))
+            .collect::<HashSet<_>>();
         let mut errors_by_file = HashMap::<i64, u32>::new();
+        let mut coverage_reasons_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
         for error in errors {
             if let Some(file_id) = error.file_id {
                 *errors_by_file.entry(file_id.0).or_default() += 1;
+                coverage_reasons_by_file.entry(file_id.0).or_default().push(
+                    error
+                        .coverage_reason
+                        .unwrap_or(FileCoverageReason::CollectorFailure),
+                );
             }
         }
 
@@ -10087,16 +13702,70 @@ impl AppController {
             indexed_file_count += u32::from(file.indexed);
             incomplete_file_count += u32::from(!file.complete);
             error_file_count += u32::from(errors_by_file.contains_key(&file.id));
-            if let Some((reason, detail)) = indexed_file_incomplete_reason(file, &errors_by_file) {
+            if let Some(reason) = file_coverage_reason(
+                file,
+                &coverage_reasons_by_file,
+                verified_file_ids.contains(&file.id),
+            ) {
                 let entry = incomplete_reason_counts
-                    .entry(reason.to_string())
-                    .or_insert_with(|| (0, detail.to_string()));
+                    .entry(reason.as_str().to_string())
+                    .or_insert_with(|| (0, file_coverage_detail(reason).to_string()));
                 entry.0 += 1;
             }
         }
+        let coverage_gaps = files
+            .iter()
+            .filter_map(|file| {
+                let verified_source = verified_file_ids.contains(&file.id);
+                file_coverage_reason(file, &coverage_reasons_by_file, verified_source).map(
+                    |reason| FileCoverageDiagnosticDto {
+                        path: runtime_relative_path(&root, &file.path),
+                        reason,
+                        retryable: file_coverage_retryable(reason),
+                        verified_source,
+                        projection_available: file.indexed && verified_source,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
 
         let path_filter = req.path_contains.as_deref().map(normalize_path_key);
         let language_filter = req.language.as_deref().map(str::to_ascii_lowercase);
+        let policy_exclusion_count = source_policy_exclusions.len().min(u32::MAX as usize) as u32;
+        let mut policy_exclusions = source_policy_exclusions
+            .into_iter()
+            .filter(|entry| {
+                let role = path_role_from_key(&normalize_path_key(&entry.normalized_path));
+                req.role.is_none_or(|requested| requested == role)
+                    && path_filter.as_deref().is_none_or(|needle| {
+                        normalize_path_key(&entry.normalized_path).contains(needle)
+                    })
+                    && language_filter.as_deref().is_none_or(|language| {
+                        indexed_file_matches_language_filter(
+                            "unknown",
+                            Path::new(&entry.normalized_path),
+                            language,
+                        )
+                    })
+            })
+            .map(|entry| SourcePolicyExclusionDto {
+                role: path_role_from_key(&normalize_path_key(&entry.normalized_path)),
+                path: entry.normalized_path,
+                content_hash: entry.content_hash,
+                observed_size: entry.observed_size,
+                observed_unit_count: entry.observed_unit_count,
+                policy_version: entry.policy_version,
+                byte_cap: entry.byte_cap,
+                structural_unit_cap: entry.structural_unit_cap,
+                project_id: entry.project_id,
+                workspace_id: entry.workspace_id,
+                core_generation_id: entry.core_generation_id,
+                core_run_id: entry.core_run_id,
+                graph_coverage: false,
+                semantic_coverage: false,
+            })
+            .collect::<Vec<_>>();
+        policy_exclusions.truncate(5_000);
         let mut visible = files
             .into_iter()
             .filter(|file| {
@@ -10133,6 +13802,11 @@ impl AppController {
             ));
         } else {
             coverage_notes.push("index usable; no file-level index errors recorded".to_string());
+        }
+        if policy_exclusion_count > 0 {
+            coverage_notes.push(format!(
+                "{policy_exclusion_count} verified source policy exclusions have no parser-backed graph or semantic coverage"
+            ));
         }
         let language_counts = language_counts
             .into_iter()
@@ -10172,12 +13846,15 @@ impl AppController {
                 visible_file_count,
                 incomplete_file_count,
                 error_file_count,
+                policy_exclusion_count,
                 incomplete_reason_counts,
                 truncated,
                 language_counts,
                 framework_route_coverage: framework_route_coverage_matrix(),
                 coverage_notes,
             },
+            coverage_gaps,
+            policy_exclusions,
             files: visible,
         })
     }
@@ -10190,6 +13867,19 @@ impl AppController {
         let root = self.require_project_root()?;
         let depth = req.depth.unwrap_or(2).clamp(1, 8);
         let filter = req.filter.as_deref().map(normalize_path_key);
+        let (changed_paths, change_records) = normalized_affected_input(&req.input)?;
+        let resolved_inputs = change_records
+            .iter()
+            .map(|record| {
+                let current = self.resolve_project_file_path(&record.path, true)?;
+                let previous = record
+                    .previous_path
+                    .as_deref()
+                    .map(|path| self.resolve_project_file_path(path, true))
+                    .transpose()?;
+                Ok(AffectedResolvedInput { current, previous })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
         let storage = self.open_storage_read_only()?;
         let files = storage
             .get_files()
@@ -10210,76 +13900,188 @@ impl AppController {
             }
         }
 
-        let change_records = normalized_affected_change_records(&req);
-        let mut matched_file_ids = HashSet::<GraphNodeId>::new();
-        let mut matched_changed_keys = HashSet::<String>::new();
-        let mut matched_record_by_file_id = HashMap::<GraphNodeId, AffectedChangeRecordDto>::new();
-        for file in &files {
-            let relative_key = normalize_path_key(&runtime_relative_path(&root, &file.path));
-            let absolute_key = normalize_path_key(&file.path.to_string_lossy());
-            let mut matched_records = Vec::new();
-            let matched_keys = change_records
-                .iter()
-                .flat_map(|record| {
-                    affected_change_record_keys(record)
-                        .into_iter()
-                        .map(move |key| (record, key))
-                })
-                .filter_map(|(record, changed)| {
-                    let changed = changed.as_str();
-                    let matched = relative_key == changed
-                        || relative_key.ends_with(changed)
-                        || changed.ends_with(&relative_key)
-                        || absolute_key == changed
-                        || absolute_key.ends_with(changed);
-                    matched.then_some((record, changed.to_string()))
-                })
-                .collect::<Vec<_>>();
-            if !matched_keys.is_empty() {
-                let file_id = codestory_contracts::graph::NodeId(file.id);
-                matched_file_ids.insert(file_id);
-                for (record, key) in matched_keys {
-                    matched_changed_keys.insert(key);
-                    matched_records.push(record.clone());
-                }
-                if let Some(record) = matched_records.first() {
-                    matched_record_by_file_id.insert(file_id, record.clone());
-                }
-            }
-        }
+        let storage_path = self.require_storage_path()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
+            .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+        let mut path_identities = AffectedOperationIdentityIndex::native();
+        let freshness_observation = index_freshness_observation_from_storage_with_identities(
+            &root,
+            &workspace,
+            &storage,
+            &self.source_index_policy,
+            &mut path_identities,
+        );
+        let freshness = &freshness_observation.freshness;
+        let identity_matches = match_affected_file_identities(
+            &root,
+            &change_records,
+            files.iter().map(|file| {
+                (
+                    codestory_contracts::graph::NodeId(file.id),
+                    file.path.as_path(),
+                )
+            }),
+            &mut path_identities,
+        );
+        let AffectedIdentityMatches {
+            matched_file_ids: current_matched_file_ids,
+            matched_record_flags: current_matched_record_flags,
+            matched_record_index_by_file_id,
+            graph_seeded_record_flags,
+            previous_record_index_by_file_id,
+            current_identity_by_record,
+            previous_identity_by_record: _previous_identity_by_record,
+            current_identity_error_by_record,
+            previous_identity_error_by_record,
+            indexed_identity_by_file_id,
+            unavailable_indexed_identity_count,
+            unavailable_indexed_identity_sample,
+            work: identity_match_work,
+        } = identity_matches;
+        tracing::debug!(
+            record_visits = identity_match_work.record_visits,
+            indexed_file_visits = identity_match_work.indexed_file_visits,
+            current_identity_bucket_visits = identity_match_work.current_identity_bucket_visits,
+            previous_identity_bucket_visits = identity_match_work.previous_identity_bucket_visits,
+            bucket_record_visits = identity_match_work.bucket_record_visits,
+            indexed_bucket_file_visits = identity_match_work.indexed_bucket_file_visits,
+            "affected identity matching work"
+        );
+        let previous_identity_seed_evidence = previous_record_index_by_file_id
+            .into_iter()
+            .map(|(file_id, record_index)| {
+                let record = &change_records[record_index];
+                (
+                    file_id,
+                    AffectedGraphEvidence::seed(
+                        file_id,
+                        format!(
+                            "previous indexed identity {} proxy-seeded graph evidence for current {} path {}",
+                            record.previous_path.as_deref().unwrap_or_default(),
+                            match &record.kind {
+                                AffectedChangeKindDto::Renamed => "renamed",
+                                AffectedChangeKindDto::Copied => "copied",
+                                _ => unreachable!("previous identity seeds are rename/copy only"),
+                            },
+                            record.path,
+                        ),
+                        AffectedConfidenceFloor::bounded(),
+                        true,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let graph_seed_file_ids = current_matched_file_ids
+            .iter()
+            .copied()
+            .chain(previous_identity_seed_evidence.keys().copied())
+            .collect::<BTreeSet<_>>();
         let mut matched_files = files
             .iter()
-            .filter(|file| matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id)))
+            .filter(|file| {
+                current_matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id))
+            })
             .map(|file| {
                 let file_id = codestory_contracts::graph::NodeId(file.id);
-                let record = matched_record_by_file_id.get(&file_id);
-                AffectedMatchedFileDto {
-                    path: runtime_relative_path(&root, &file.path),
-                    role: indexed_file_role(&file.path),
-                    indexed: file.indexed,
-                    complete: file.complete,
-                    change_kind: record.map(|record| record.kind.clone()),
-                    change_status: record.map(|record| record.status.clone()),
-                    previous_path: record.and_then(|record| record.previous_path.clone()),
-                    error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+                let record = matched_record_index_by_file_id
+                    .get(&file_id)
+                    .map(|record_index| &change_records[*record_index]);
+                (
+                    file_id,
+                    AffectedMatchedFileDto {
+                        path: runtime_relative_path(&root, &file.path),
+                        role: indexed_file_role(&file.path),
+                        indexed: file.indexed,
+                        complete: file.complete,
+                        change_kind: record.map(|record| record.kind.clone()),
+                        change_status: record.map(|record| record.status.clone()),
+                        previous_path: record.and_then(|record| record.previous_path.clone()),
+                        error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        matched_files
+            .sort_by(|left, right| left.1.path.cmp(&right.1.path).then(left.0.cmp(&right.0)));
+        let mut unmatched_freshness_unavailable = false;
+        let unmatched_paths = change_records
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !current_matched_record_flags[*index])
+            .map(|(index, record)| {
+                let (classification, mut reason, mut evidence) = classify_unmatched_affected_input(
+                    Some(&root),
+                    record,
+                    &resolved_inputs[index],
+                    &freshness_observation,
+                    current_identity_by_record[index].as_ref(),
+                    current_identity_error_by_record[index].as_deref(),
+                    previous_identity_error_by_record[index].as_deref(),
+                );
+                unmatched_freshness_unavailable |= matches!(
+                    affected_path_metadata(&resolved_inputs[index].current),
+                    AffectedPathMetadataObservation::RegularFile
+                ) && indexable_source_path_in_workspace(&root, &resolved_inputs[index].current)
+                    && current_identity_error_by_record[index].is_none()
+                    && current_identity_by_record[index]
+                        .as_ref()
+                        .is_some_and(|identity| !freshness_observation.identity_is_stale(identity))
+                    && !freshness_observation.inventory_complete;
+                if graph_seeded_record_flags[index] {
+                    evidence.push(format!(
+                        "previous indexed identity {} supplied bounded proxy graph evidence",
+                        record.previous_path.as_deref().unwrap_or_default()
+                    ));
+                    if classification == AffectedInputClassificationDto::RenameUnresolved {
+                        reason = "current rename/copy path remains unresolved; the previous indexed identity supplies bounded graph evidence but does not establish current-path coverage"
+                            .to_string();
+                    }
+                }
+                AffectedUnmatchedPathDto {
+                    path: record.path.clone(),
+                    classification,
+                    reason,
+                    evidence,
+                    change_kind: Some(record.kind.clone()),
+                    change_status: Some(record.status.clone()),
+                    previous_path: record.previous_path.clone(),
                 }
             })
             .collect::<Vec<_>>();
-        matched_files.sort_by(|left, right| left.path.cmp(&right.path));
-        let unmatched_paths = change_records
+        let mut uncovered_inputs = unmatched_paths
             .iter()
-            .filter(|record| {
-                affected_change_record_keys(record)
-                    .iter()
-                    .all(|key| !matched_changed_keys.contains(key))
+            .map(|input| AffectedUncoveredInputDto {
+                path: input.path.clone(),
+                classification: input.classification.clone(),
+                reason: input.reason.clone(),
+                evidence: input.evidence.clone(),
             })
-            .map(|record| AffectedUnmatchedPathDto {
-                path: record.path.clone(),
-                reason: affected_unmatched_reason(record),
-                change_kind: Some(record.kind.clone()),
-                change_status: Some(record.status.clone()),
-                previous_path: record.previous_path.clone(),
-            })
+            .collect::<Vec<_>>();
+        let mut matched_freshness_unavailable = false;
+        for (file_id, file) in &matched_files {
+            let stale = indexed_identity_by_file_id
+                .get(file_id)
+                .is_some_and(|identity| freshness_observation.identity_is_stale(identity));
+            matched_freshness_unavailable |=
+                !stale && file.error_count == 0 && !freshness_observation.inventory_complete;
+            let Some((classification, reason, evidence)) = classify_matched_affected_input(
+                file,
+                stale,
+                freshness_observation.inventory_complete
+                    && freshness.status != IndexFreshnessStatusDto::NotChecked,
+            ) else {
+                continue;
+            };
+            uncovered_inputs.push(AffectedUncoveredInputDto {
+                path: file.path.clone(),
+                classification,
+                reason,
+                evidence,
+            });
+        }
+        let matched_files = matched_files
+            .into_iter()
+            .map(|(_, file)| file)
             .collect::<Vec<_>>();
 
         let mut labels = self.cached_labels(nodes.iter().map(|node| node.id));
@@ -10309,74 +14111,66 @@ impl AppController {
                 node_ids_by_file.entry(file_id).or_default().push(node.id);
             }
         }
-
-        let mut seeds = HashSet::<GraphNodeId>::new();
-        for file_id in &matched_file_ids {
-            seeds.insert(*file_id);
-            if let Some(file_nodes) = node_ids_by_file.get(file_id) {
-                seeds.extend(file_nodes.iter().copied());
-            }
+        for node_ids in node_ids_by_file.values_mut() {
+            node_ids.sort_unstable();
         }
 
-        let mut reverse_dependents = HashMap::<GraphNodeId, Vec<(GraphNodeId, usize)>>::new();
-        for (edge_index, edge) in edges.iter().enumerate() {
-            let source = edge.effective_source();
-            let target = edge.effective_target();
-            reverse_dependents
-                .entry(target)
-                .or_default()
-                .push((source, edge_index));
-        }
-
-        let mut distances = HashMap::<GraphNodeId, u32>::new();
-        let mut evidence = HashMap::<GraphNodeId, AffectedGraphEvidence>::new();
-        let mut queue = VecDeque::<(GraphNodeId, u32)>::new();
-        for seed in seeds {
-            distances.insert(seed, 0);
-            let seed_reason = nodes_by_id
-                .get(&seed)
-                .map(|node| {
-                    if node.kind == codestory_contracts::graph::NodeKind::FILE {
-                        "changed file matched input path"
-                    } else {
-                        "symbol declared in changed file"
+        let mut seed_evidence = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
+        for file_id in &graph_seed_file_ids {
+            let file_evidence = previous_identity_seed_evidence.get(file_id).cloned();
+            let file_candidate = file_evidence.clone().unwrap_or_else(|| {
+                AffectedGraphEvidence::seed(
+                    *file_id,
+                    "changed file matched current input path",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    false,
+                )
+            });
+            seed_evidence
+                .entry(*file_id)
+                .and_modify(|current| {
+                    if affected_evidence_is_better(&file_candidate, current) {
+                        current.clone_from(&file_candidate);
                     }
                 })
-                .unwrap_or("changed path seed");
-            evidence.insert(
-                seed,
-                AffectedGraphEvidence {
-                    distance: 0,
-                    reason: seed_reason.to_string(),
-                    confidence: "direct".to_string(),
-                },
-            );
-            queue.push_back((seed, 0));
-        }
-        while let Some((node_id, distance)) = queue.pop_front() {
-            if distance >= depth {
-                continue;
-            }
-            for (dependent, edge_id) in reverse_dependents.get(&node_id).into_iter().flatten() {
-                let next_distance = distance + 1;
-                if distances
-                    .get(dependent)
-                    .is_none_or(|current| next_distance < *current)
-                {
-                    distances.insert(*dependent, next_distance);
-                    let edge = edges.get(*edge_id);
-                    let target_label = labels
-                        .get(&node_id)
-                        .cloned()
-                        .unwrap_or_else(|| node_id.0.to_string());
-                    evidence.insert(
-                        *dependent,
-                        affected_dependent_evidence(next_distance, edge, target_label),
-                    );
-                    queue.push_back((*dependent, next_distance));
+                .or_insert(file_candidate);
+            if let Some(file_nodes) = node_ids_by_file.get(file_id) {
+                for node_id in file_nodes {
+                    let node_candidate = file_evidence
+                        .as_ref()
+                        .map(|evidence| {
+                            AffectedGraphEvidence::seed(
+                                *node_id,
+                                evidence.reason.clone(),
+                                evidence.confidence_floor.clone(),
+                                evidence.previous_identity_proxy,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            AffectedGraphEvidence::seed(
+                                *node_id,
+                                "symbol declared in file matched by current input path",
+                                AffectedConfidenceFloor::from_label("direct"),
+                                false,
+                            )
+                        });
+                    seed_evidence
+                        .entry(*node_id)
+                        .and_modify(|current| {
+                            if affected_evidence_is_better(&node_candidate, current) {
+                                current.clone_from(&node_candidate);
+                            }
+                        })
+                        .or_insert(node_candidate);
                 }
             }
         }
+
+        let AffectedReverseWalk {
+            distances,
+            evidence,
+            visited_edge_count,
+        } = affected_reverse_walk(depth, &edges, seed_evidence, &labels);
 
         let mut impacted_symbols = distances
             .iter()
@@ -10398,15 +14192,17 @@ impl AppController {
                 }) {
                     return None;
                 }
-                let graph_evidence =
-                    evidence
-                        .get(node_id)
-                        .cloned()
-                        .unwrap_or_else(|| AffectedGraphEvidence {
-                            distance: *distance,
-                            reason: "reached by dependent graph walk".to_string(),
-                            confidence: "graph".to_string(),
-                        });
+                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
+                    let mut fallback = AffectedGraphEvidence::seed(
+                        *node_id,
+                        "reached by dependent graph walk",
+                        AffectedConfidenceFloor::from_label("graph"),
+                        false,
+                    );
+                    fallback.distance = *distance;
+                    fallback
+                });
+                let confidence = graph_evidence.confidence_floor.label().to_string();
                 Some(AffectedSymbolDto {
                     node_id: NodeId::from(*node_id),
                     display_name: labels
@@ -10419,16 +14215,27 @@ impl AppController {
                     distance: *distance,
                     graph_depth: graph_evidence.distance,
                     reason: graph_evidence.reason,
-                    confidence: graph_evidence.confidence,
+                    confidence,
                 })
             })
             .collect::<Vec<_>>();
+        let direct_impact_count = impacted_symbols
+            .iter()
+            .filter(|symbol| symbol.distance == 0)
+            .count();
+        let propagated_impact_count = impacted_symbols
+            .iter()
+            .filter(|symbol| symbol.distance > 0)
+            .count();
         impacted_symbols.sort_by(|left, right| {
             left.distance
                 .cmp(&right.distance)
                 .then(left.file_path.cmp(&right.file_path))
                 .then(left.display_name.cmp(&right.display_name))
+                .then(left.node_id.0.cmp(&right.node_id.0))
         });
+        let impacted_symbol_total = impacted_symbols.len();
+        let impacted_symbols_truncated = impacted_symbol_total > 200;
         impacted_symbols.truncate(200);
 
         let mut impacted_routes = distances
@@ -10458,22 +14265,18 @@ impl AppController {
                     file_path.as_deref(),
                     &display_name,
                 )?;
-                let graph_evidence =
-                    evidence
-                        .get(node_id)
-                        .cloned()
-                        .unwrap_or_else(|| AffectedGraphEvidence {
-                            distance: *distance,
-                            reason: "route endpoint reached by dependent graph walk".to_string(),
-                            confidence: route
-                                .confidence
-                                .clone()
-                                .unwrap_or_else(|| "graph".to_string()),
-                        });
-                let confidence = route
-                    .confidence
-                    .clone()
-                    .unwrap_or_else(|| graph_evidence.confidence.clone());
+                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
+                    let mut fallback = AffectedGraphEvidence::seed(
+                        *node_id,
+                        "route endpoint reached by dependent graph walk",
+                        AffectedConfidenceFloor::from_label("graph"),
+                        false,
+                    );
+                    fallback.distance = *distance;
+                    fallback
+                });
+                let confidence =
+                    affected_route_confidence(&graph_evidence, route.confidence.as_deref());
                 Some(AffectedRouteDto {
                     node_id: NodeId::from(*node_id),
                     display_name,
@@ -10492,7 +14295,10 @@ impl AppController {
                 .cmp(&right.distance)
                 .then(left.file_path.cmp(&right.file_path))
                 .then(left.display_name.cmp(&right.display_name))
+                .then(left.node_id.0.cmp(&right.node_id.0))
         });
+        let impacted_route_total = impacted_routes.len();
+        let impacted_routes_truncated = impacted_route_total > 100;
         impacted_routes.truncate(100);
 
         let mut impacted_by_test_file = BTreeMap::<String, (u32, u32, String)>::new();
@@ -10529,24 +14335,65 @@ impl AppController {
 
         let mut notes = Vec::new();
         let mut blind_spots = Vec::new();
-        if matched_file_ids.is_empty() {
-            let note =
-                "no changed paths matched indexed files; pass repo-relative paths or reindex first"
-                    .to_string();
+        let freshness_evidence_affects_requested_claim =
+            unmatched_freshness_unavailable || matched_freshness_unavailable;
+        let relevant_evidence_gaps =
+            affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+                workspace_root: Some(&root),
+                resolved_inputs: &resolved_inputs,
+                matched_record_flags: &current_matched_record_flags,
+                current_identity_errors: &current_identity_error_by_record,
+                previous_identity_errors: &previous_identity_error_by_record,
+                unavailable_indexed_identity_count,
+                unavailable_indexed_identity_sample: unavailable_indexed_identity_sample.as_deref(),
+                freshness_evidence_affects_requested_claim,
+                freshness_identity_gap_count: freshness_observation.identity_gap_count,
+                freshness_identity_gap_sample: freshness_observation.identity_gap_sample.as_deref(),
+            });
+        let unavailable_input_count = uncovered_inputs
+            .iter()
+            .filter(|input| {
+                input.classification == AffectedInputClassificationDto::UnavailableEvidence
+            })
+            .count();
+        let gap_composition =
+            compose_affected_evidence_gaps(unavailable_input_count, &relevant_evidence_gaps);
+        if current_matched_file_ids.is_empty() {
+            let note = "no current input paths matched indexed file identity; inspect the typed uncovered-input evidence"
+                .to_string();
             notes.push(note.clone());
-            blind_spots.push(note);
+            if graph_seed_file_ids.is_empty() {
+                blind_spots.push(note);
+            }
         } else {
             notes.push(format!(
-                "matched {} indexed files; dependency walk expanded files into contained symbols",
-                matched_file_ids.len()
+                "matched {} indexed files by current path; dependency walk expanded files into contained symbols",
+                current_matched_file_ids.len()
             ));
         }
-        if !unmatched_paths.is_empty() {
+        let graph_seeded_input_count = graph_seeded_record_flags
+            .iter()
+            .filter(|seeded| **seeded)
+            .count();
+        let graph_unseeded_input_count = change_records
+            .len()
+            .saturating_sub(graph_seeded_input_count);
+        if graph_unseeded_input_count > 0 {
             blind_spots.push(format!(
-                "{} changed paths were unmatched and excluded from graph traversal",
-                unmatched_paths.len()
+                "{graph_unseeded_input_count} inputs had no indexed current or previous identity and were excluded from graph traversal"
             ));
         }
+        let previous_only_seed_count = graph_seeded_record_flags
+            .iter()
+            .zip(&current_matched_record_flags)
+            .filter(|(seeded, matched)| **seeded && !**matched)
+            .count();
+        if previous_only_seed_count > 0 {
+            notes.push(format!(
+                "{previous_only_seed_count} current input paths were classified separately while their previous indexed identities seeded graph traversal"
+            ));
+        }
+        blind_spots.extend(gap_composition.blind_spots.iter().cloned());
         if matched_files
             .iter()
             .any(|file| !file.complete || file.error_count > 0)
@@ -10564,26 +14411,89 @@ impl AppController {
         if impacted_tests.is_empty() {
             notes.push("no impacted test-like files found in the indexed graph".to_string());
         }
+        let mut truncation_reasons = Vec::new();
+        if impacted_symbols_truncated {
+            truncation_reasons.push(format!(
+                "impacted_symbols retained 200 of {impacted_symbol_total} results"
+            ));
+        }
+        if impacted_routes_truncated {
+            truncation_reasons.push(format!(
+                "impacted_routes retained 100 of {impacted_route_total} results"
+            ));
+        }
+        let truncated = !truncation_reasons.is_empty();
+        if truncated {
+            blind_spots.extend(truncation_reasons.iter().cloned());
+        }
+
         let project = root.to_string_lossy().to_string();
-        let next_commands = vec![
-            format!("codestory-cli files --project \"{project}\" --format markdown"),
-            format!("codestory-cli doctor --project \"{project}\" --format markdown"),
-            format!("codestory-cli index --project \"{project}\" --refresh full"),
-        ];
+        if freshness.status == IndexFreshnessStatusDto::Stale
+            && !uncovered_inputs
+                .iter()
+                .any(|input| input.classification == AffectedInputClassificationDto::StaleIndex)
+        {
+            blind_spots.push(
+                "the workspace has unrelated stale index state, but no requested input was classified stale"
+                    .to_string(),
+            );
+        }
+        let freshness_diagnostic = freshness_evidence_affects_requested_claim.then(|| {
+            freshness
+                .reason
+                .as_deref()
+                .map(|reason| {
+                    format!(
+                        "inspect observational freshness because requested-path evidence was unavailable: {reason}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "inspect observational freshness because requested-path refresh-plan identity evidence was unavailable"
+                        .to_string()
+                })
+        });
+        if freshness_diagnostic.is_some() {
+            blind_spots.push(
+                "bounded index freshness evidence was unavailable for a requested indexable path; no complete no-impact claim is possible"
+                    .to_string(),
+            );
+        }
+        let follow_ups =
+            affected_follow_ups(&project, &uncovered_inputs, freshness_diagnostic.as_deref());
+        let completeness = compose_affected_completeness(AffectedCompletenessInput {
+            uncovered_input_count: uncovered_inputs.len(),
+            direct_impact_count,
+            propagated_impact_count,
+            candidate_test_count: impacted_tests.len(),
+            freshness_evidence_affects_requested_claim,
+            gap_composition,
+            truncation_reasons,
+        });
+        let bounds = AffectedAnalysisBoundsDto {
+            requested_depth: depth,
+            maximum_depth: 8,
+            visited_node_count: clamp_usize_to_u32(distances.len()),
+            visited_edge_count: clamp_usize_to_u32(visited_edge_count),
+            impacted_symbol_limit: 200,
+            impacted_route_limit: 100,
+        };
 
         Ok(AffectedAnalysisDto {
             project_root: project,
-            changed_paths: req.changed_paths,
+            changed_paths,
             change_records,
             matched_files,
             unmatched_paths,
-            matched_file_count: matched_file_ids.len().min(u32::MAX as usize) as u32,
+            uncovered_inputs,
+            matched_file_count: current_matched_file_ids.len().min(u32::MAX as usize) as u32,
             depth,
             impacted_symbols,
             impacted_routes,
             impacted_tests,
+            bounds,
+            completeness,
             blind_spots,
-            next_commands,
+            follow_ups,
             notes,
         })
     }
@@ -10611,7 +14521,10 @@ impl AppController {
         };
         Ok(expanded_matches
             .into_iter()
-            .filter_map(|(id, score)| Self::build_search_hit(storage, &node_names, id, score))
+            .map(|(id, score)| Self::build_search_hit(storage, &node_names, id, score))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect())
     }
 
@@ -10646,8 +14559,8 @@ impl AppController {
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let storage = self.open_storage_read_only()?;
-        let workspace = WorkspaceManifest::open(root.clone())
+        let storage = self.open_storage_for_freshness()?;
+        let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let freshness =
             self.cached_index_freshness_from_storage(&root, &storage_path, &workspace, &storage);
@@ -10684,7 +14597,12 @@ impl AppController {
     ) -> IndexFreshnessDto {
         if !matches!(storage.has_incomplete_incremental_run(), Ok(false)) {
             self.state.lock().index_freshness_cache = None;
-            return index_freshness_from_storage(root, workspace, storage);
+            return index_freshness_from_storage_with_policy(
+                root,
+                workspace,
+                storage,
+                &self.source_index_policy,
+            );
         }
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
         let storage_fingerprint = storage_fingerprint(storage_path);
@@ -10700,7 +14618,12 @@ impl AppController {
             }
         }
 
-        let freshness = index_freshness_from_storage(root, workspace, storage);
+        let freshness = index_freshness_from_storage_with_policy(
+            root,
+            workspace,
+            storage,
+            &self.source_index_policy,
+        );
         let mut state = self.state.lock();
         state.index_freshness_cache = Some(CachedIndexFreshness {
             root: root.to_path_buf(),
@@ -10844,7 +14767,7 @@ impl AppController {
             {
                 if !engine.embedding_runtime_configured()
                     && let Err(error) =
-                        engine.set_embedding_runtime_from_config(&self.runtime_config.embedding)
+                        engine.set_embedding_runtime_for_runtime(&self.runtime_config)
                 {
                     tracing::warn!(
                         "Search embedding runtime unavailable during hybrid load: {error}"
@@ -10910,7 +14833,7 @@ impl AppController {
         let mut out = Vec::with_capacity(hybrid.len());
         for scored in hybrid {
             if let Some(mut hit) =
-                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)
+                Self::build_search_hit(&storage, &node_names, scored.node_id, scored.total_score)?
             {
                 hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
                     lexical: scored.lexical_score,
@@ -11326,6 +15249,15 @@ impl AppController {
 
         let route_endpoint =
             self.route_endpoint_metadata(&storage, &node, file_path.as_deref(), &display_name);
+        let structural_unit = storage.get_structural_text_unit(node.id).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to query structural evidence metadata: {error}"
+            ))
+        })?;
+        let openapi_endpoint = node
+            .canonical_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("openapi:endpoint:"));
 
         Ok(NodeDetailsDto {
             id: NodeId::from(node.id),
@@ -11339,6 +15271,19 @@ impl AppController {
             start_col: node.start_col,
             end_line: node.end_line,
             end_col: node.end_col,
+            evidence_tier: structural_unit
+                .as_ref()
+                .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+                .or_else(|| {
+                    openapi_endpoint
+                        .then_some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+                }),
+            evidence_producer: structural_unit
+                .as_ref()
+                .map(|unit| unit.producer.clone())
+                .or_else(|| openapi_endpoint.then(|| "openapi_endpoint_schema".to_string())),
+            resolution_status: (structural_unit.is_some() || openapi_endpoint)
+                .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             member_access: member_access_dto(storage.get_component_access(node.id).ok().flatten()),
             route_endpoint,
         })
@@ -11394,36 +15339,27 @@ impl AppController {
                 edge.kind == codestory_contracts::graph::EdgeKind::CALL
                     && edge.effective_source() == route_node.id
             })
+            .filter_map(|edge| {
+                let target = storage.get_node(edge.effective_target()).ok().flatten()?;
+                let terminal = target
+                    .qualified_name
+                    .as_deref()
+                    .unwrap_or(&target.serialized_name)
+                    .rsplit([':', '.', '#'])
+                    .next()
+                    .unwrap_or(&target.serialized_name)
+                    .to_ascii_lowercase();
+                if matches!(
+                    terminal.as_str(),
+                    "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "route"
+                ) {
+                    return None;
+                }
+                Some(RouteHandlerCandidate { edge, target })
+            })
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .confidence
-                .partial_cmp(&left.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    route_handler_certainty_rank(right.certainty)
-                        .cmp(&route_handler_certainty_rank(left.certainty))
-                })
-        });
-        let (edge, target) = candidates.into_iter().find_map(|edge| {
-            let target_id = edge.effective_target();
-            let target = storage.get_node(target_id).ok().flatten()?;
-            let terminal = target
-                .qualified_name
-                .as_deref()
-                .unwrap_or(&target.serialized_name)
-                .rsplit([':', '.', '#'])
-                .next()
-                .unwrap_or(&target.serialized_name)
-                .to_ascii_lowercase();
-            if matches!(
-                terminal.as_str(),
-                "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "route"
-            ) {
-                return None;
-            }
-            Some((edge, target))
-        })?;
+        candidates.sort_by(compare_route_handler_candidates);
+        let RouteHandlerCandidate { edge, target } = candidates.into_iter().next()?;
         let display_name = self
             .state
             .lock()
@@ -11596,6 +15532,58 @@ struct IndexingRunSummary {
     prepared_search_state: Option<SearchStateBuildResult>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FullRefreshWallDurations {
+    live_inspection: Duration,
+    source_discovery: Duration,
+    stage_open: Duration,
+    indexer_execution: Duration,
+    coverage_validation: Duration,
+    copy_forward: Duration,
+    semantic_stage: Duration,
+    snapshot_stage: Duration,
+    publication_prepare: Duration,
+    search_generation: Duration,
+    catalog_publication: Duration,
+}
+
+impl FullRefreshWallDurations {
+    fn finish(self, core_refresh: Duration) -> FullRefreshWallTimings {
+        let accounted = [
+            self.live_inspection,
+            self.source_discovery,
+            self.stage_open,
+            self.indexer_execution,
+            self.coverage_validation,
+            self.copy_forward,
+            self.semantic_stage,
+            self.snapshot_stage,
+            self.publication_prepare,
+            self.search_generation,
+            self.catalog_publication,
+        ]
+        .into_iter()
+        .fold(Duration::ZERO, Duration::saturating_add);
+        let unattributed = core_refresh.saturating_sub(accounted);
+
+        FullRefreshWallTimings {
+            core_refresh_ms: clamp_u128_to_u32(core_refresh.as_millis()),
+            live_inspection_ms: clamp_u128_to_u32(self.live_inspection.as_millis()),
+            source_discovery_ms: clamp_u128_to_u32(self.source_discovery.as_millis()),
+            stage_open_ms: clamp_u128_to_u32(self.stage_open.as_millis()),
+            indexer_execution_ms: clamp_u128_to_u32(self.indexer_execution.as_millis()),
+            coverage_validation_ms: clamp_u128_to_u32(self.coverage_validation.as_millis()),
+            copy_forward_ms: clamp_u128_to_u32(self.copy_forward.as_millis()),
+            semantic_stage_ms: clamp_u128_to_u32(self.semantic_stage.as_millis()),
+            snapshot_stage_ms: clamp_u128_to_u32(self.snapshot_stage.as_millis()),
+            publication_prepare_ms: clamp_u128_to_u32(self.publication_prepare.as_millis()),
+            search_generation_ms: clamp_u128_to_u32(self.search_generation.as_millis()),
+            catalog_publication_ms: clamp_u128_to_u32(self.catalog_publication.as_millis()),
+            unattributed_ms: clamp_u128_to_u32(unattributed.as_millis()),
+        }
+    }
+}
+
 fn next_index_publication(
     previous: Option<&IndexPublicationRecord>,
     mode: IndexPublicationMode,
@@ -11623,6 +15611,7 @@ fn index_publication_dto(publication: IndexPublicationRecord) -> IndexPublicatio
         mode: match publication.mode {
             IndexPublicationMode::Full => IndexPublicationModeDto::Full,
             IndexPublicationMode::Incremental => IndexPublicationModeDto::Incremental,
+            IndexPublicationMode::SemanticProjection => IndexPublicationModeDto::SemanticProjection,
         },
         published_at_epoch_ms: publication.published_at_epoch_ms,
     }
@@ -11688,13 +15677,476 @@ impl Drop for IndexWriterGuard {
     }
 }
 
+fn semantic_projection_republish_for_runtime(
+    root: &Path,
+    storage_path: &Path,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<
+    (
+        IndexingRunSummary,
+        IndexPublicationRecord,
+        IndexPublicationRecord,
+        u32,
+        u64,
+    ),
+    ApiError,
+> {
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    if !storage_path.is_file() {
+        return Err(ApiError::new(
+            "semantic_projection_core_missing",
+            "Semantic projection republish requires an existing complete core publication.",
+        ));
+    }
+
+    let expected_schema_version =
+        Store::database_schema_version(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to pin the stored core schema version: {error}"
+            ))
+        })?;
+
+    let expected_publication = Store::database_complete_index_publication(storage_path)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to pin the complete core publication: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                "semantic_projection_core_incomplete",
+                "Semantic projection republish requires a complete core publication.",
+            )
+        })?;
+    let mut staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to clone the pinned core for semantic projection republish: {error}"
+        ))
+    })?;
+    let cleanup_staged_path = staged.path().to_path_buf();
+    let result = (|| {
+        let staged_publication = staged
+            .store_mut()
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to validate the staged core publication: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "semantic_projection_core_incomplete",
+                    "The staged core publication is incomplete.",
+                )
+            })?;
+        if staged_publication != expected_publication {
+            return Err(ApiError::new(
+                "publication_changed",
+                "The cloned core does not match the pinned live publication.",
+            ));
+        }
+        staged
+            .store_mut()
+            .validate_dense_anchor_publication(&expected_publication)
+            .map_err(|error| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!("Pinned dense-anchor publication is not complete: {error}"),
+                )
+            })?;
+        let structural_compatibility = staged
+            .store_mut()
+            .validate_structural_text_unit_publication_or_legacy_empty(&expected_publication)
+            .map_err(|error| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    format!("Pinned structural state is not compatible: {error}"),
+                )
+            })?;
+        if structural_compatibility == StructuralTextPublicationCompatibility::LegacyEmpty
+            && expected_schema_version != LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(ApiError::new(
+                "semantic_projection_migration_required",
+                "A missing structural publication is compatible only with a schema-29 retained core whose structural stores are empty.",
+            ));
+        }
+        let source_manifest = staged
+            .store_mut()
+            .get_source_policy_exclusion_manifest()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to load the pinned source-policy manifest: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "semantic_projection_migration_required",
+                    "Pinned source-policy publication is missing.",
+                )
+            })?;
+        let recorded_source_policy = SourcePolicyExclusionPolicyIdentity::new(
+            &source_manifest.policy_version,
+            source_manifest.byte_cap,
+            source_manifest.structural_unit_cap,
+        );
+        let selected_identity = project_identity_v3(root);
+        if source_manifest.project_id != selected_identity.project_id
+            || source_manifest.workspace_id != selected_identity.workspace_id
+        {
+            return Err(ApiError::new(
+                "semantic_projection_project_mismatch",
+                "The selected project root does not own the cached core publication.",
+            ));
+        }
+        let source_policy_compatibility = semantic_projection_source_policy_compatibility(
+            recorded_source_policy,
+            source_index_policy,
+            expected_schema_version,
+            structural_compatibility == StructuralTextPublicationCompatibility::LegacyEmpty,
+        )
+        .ok_or_else(|| {
+            ApiError::new(
+                "semantic_projection_migration_required",
+                "Pinned source-policy identity differs from the current runtime policy; run a source refresh before republishing semantic projections.",
+            )
+        })?;
+        let source_policy_validation = match source_policy_compatibility {
+            SemanticProjectionSourcePolicyCompatibility::Exact => staged
+                .store_mut()
+                .validate_source_policy_exclusion_publication(
+                    &expected_publication,
+                    &source_manifest.project_id,
+                    &source_manifest.workspace_id,
+                    recorded_source_policy,
+                ),
+            SemanticProjectionSourcePolicyCompatibility::LegacyPredecessor => staged
+                .store_mut()
+                .validate_legacy_v1_source_policy_exclusion_publication(
+                    &expected_publication,
+                    &source_manifest.project_id,
+                    &source_manifest.workspace_id,
+                    recorded_source_policy,
+                ),
+        };
+        source_policy_validation.map_err(|error| {
+            ApiError::new(
+                "semantic_projection_migration_required",
+                format!("Pinned source-policy publication is not complete: {error}"),
+            )
+        })?;
+        let source_exclusions =
+            staged
+                .store_mut()
+                .get_source_policy_exclusions()
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to load pinned source-policy exclusions: {error}"
+                    ))
+                })?;
+
+        let publication = next_index_publication(
+            Some(&expected_publication),
+            IndexPublicationMode::SemanticProjection,
+            &Uuid::new_v4().to_string(),
+        )?;
+        let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        staged
+            .store_mut()
+            .begin_incremental_run()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to fence the staged semantic projection writer: {error}"
+                ))
+            })?;
+        staged
+            .store_mut()
+            .invalidate_grounding_snapshots()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to invalidate staged derived snapshots: {error}"
+                ))
+            })?;
+
+        let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
+            staged.store_mut(),
+            None,
+            None,
+            &source_identity,
+            cancel_token,
+            runtime,
+            SemanticProjectionDocumentSource::StoredCore,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finalize staged semantic projection snapshots: {error}"
+            ))
+        })?;
+        #[cfg(test)]
+        publication_test_checkpoint(
+            PublicationTestBoundary::ProjectionSnapshotFinalize,
+            cancel_token,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let detail_started = Instant::now();
+        staged.snapshots().refresh_detail().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to refresh staged grounding detail snapshot: {error}"
+            ))
+        })?;
+        #[cfg(test)]
+        publication_test_checkpoint(
+            PublicationTestBoundary::ProjectionSnapshotDetail,
+            cancel_token,
+        )?;
+        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+
+        #[cfg(test)]
+        publication_test_checkpoint(
+            PublicationTestBoundary::ProjectionManifestIdentity,
+            cancel_token,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let dense_manifest = staged
+            .store_mut()
+            .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to publish semantic dense-anchor inputs: {error}"
+                ))
+            })?;
+        let current_source_policy = SourcePolicyExclusionPolicyIdentity::new(
+            &source_index_policy.policy_version,
+            source_index_policy.byte_cap,
+            source_index_policy.structural_unit_cap,
+        );
+        let source_candidates = source_exclusions
+            .iter()
+            .map(|record| {
+                let mut candidate = source_policy_exclusion_candidate(record);
+                candidate.policy_version = source_index_policy.policy_version.clone();
+                candidate.byte_cap = source_index_policy.byte_cap;
+                candidate.structural_unit_cap = source_index_policy.structural_unit_cap;
+                candidate
+            })
+            .collect::<Vec<_>>();
+        staged
+            .store_mut()
+            .publish_source_policy_exclusion_generation(
+                &publication,
+                &selected_identity.project_id,
+                &selected_identity.workspace_id,
+                current_source_policy,
+                &source_candidates,
+            )
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind pinned source-policy exclusions: {error}"
+                ))
+            })?;
+        staged
+            .store_mut()
+            .publish_structural_text_unit_generation(&publication)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind pinned structural publication: {error}"
+                ))
+            })?;
+        staged
+            .store_mut()
+            .put_index_publication(&publication)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to persist staged semantic projection identity: {error}"
+                ))
+            })?;
+
+        let prepared_search_state = match rebuild_search_state_from_storage_for_runtime(
+            staged.store_mut(),
+            storage_path,
+            None,
+            false,
+            runtime,
+            cancel_token,
+            None,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(error);
+            }
+        };
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        let staged_path = staged.path().to_path_buf();
+        #[cfg(test)]
+        if let Err(error) =
+            publication_test_checkpoint(PublicationTestBoundary::CatalogLock, cancel_token)
+        {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        #[cfg(test)]
+        run_semantic_projection_before_revalidate_hook(storage_path);
+        let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
+            Ok(guard) => guard,
+            Err(error) => {
+                drop(prepared_search_state);
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(error);
+            }
+        };
+        let live_publication = match Store::database_complete_index_publication(storage_path) {
+            Ok(publication) => publication,
+            Err(error) => {
+                drop(prepared_search_state);
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(ApiError::internal(format!(
+                    "Failed to revalidate the pinned core before promotion: {error}"
+                )));
+            }
+        };
+        if live_publication.as_ref() != Some(&expected_publication) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(ApiError::new(
+                "publication_changed",
+                "The live core changed while semantic projections were being rebuilt.",
+            ));
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        #[cfg(test)]
+        if let Err(error) =
+            publication_test_checkpoint(PublicationTestBoundary::MarkerCompletion, cancel_token)
+        {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        staged
+            .store_mut()
+            .finish_incremental_run()
+            .map_err(|error| {
+                discard_unpublished_search_generation(storage_path, &publication);
+                ApiError::internal(format!(
+                    "Failed to complete the staged semantic projection marker: {error}"
+                ))
+            })?;
+
+        let publish_started = Instant::now();
+        #[cfg(test)]
+        if let Err(error) =
+            publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)
+        {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+        if is_indexing_cancelled(cancel_token) {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(indexing_cancelled_error());
+        }
+        let staged_publish_stats = staged.publish_with_stats(storage_path).map_err(|error| {
+            discard_unpublished_search_generation(storage_path, &publication);
+            ApiError::internal(format!(
+                "Failed to publish staged semantic projections: {error}. Preserved staged snapshot at {}",
+                staged_path.display()
+            ))
+        })?;
+        let mut phase_timings = IndexingPhaseTimings {
+            deferred_indexes_ms: Some(
+                staged_finalize_stats
+                    .deferred_indexes_ms
+                    .saturating_add(staged_semantic_stats.semantic_context_index_ms),
+            ),
+            summary_snapshot_ms: Some(staged_finalize_stats.summary_snapshot_ms),
+            detail_snapshot_ms: Some(detail_snapshot_ms),
+            publish_ms: Some(clamp_u128_to_u32(publish_started.elapsed().as_millis())),
+            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
+                .sqlite_wal_autocheckpoint_bytes,
+            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
+            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
+            staged_snapshot_copy: staged_publish_stats
+                .snapshot_copy
+                .map(database_snapshot_copy_timings),
+            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
+            ..Default::default()
+        };
+        apply_semantic_projection_stats(&mut phase_timings, staged_semantic_stats);
+        Ok((
+            IndexingRunSummary {
+                phase_timings,
+                staged_semantic_stats,
+                llm_refresh_scope: None,
+                #[cfg(test)]
+                publication: publication.clone(),
+                prepared_search_state: Some(prepared_search_state),
+            },
+            publication,
+            staged_semantic_stats.symbol_search_docs_written,
+            dense_manifest.anchor_count,
+        ))
+    })();
+
+    match result {
+        Ok((summary, publication, symbol_document_count, dense_anchor_count)) => Ok((
+            summary,
+            expected_publication,
+            publication,
+            symbol_document_count,
+            dense_anchor_count,
+        )),
+        Err(error) => {
+            let _ = SnapshotStore::discard_staged(&cleanup_staged_path);
+            Err(error)
+        }
+    }
+}
+
 fn index_full_for_runtime(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
+    let core_refresh_started = Instant::now();
+    let mut wall_durations = FullRefreshWallDurations::default();
+    let mut wall_stage_started = Instant::now();
     let previous_publication = if storage_path.exists() {
         Store::database_index_publication(storage_path).map_err(|error| {
             ApiError::internal(format!(
@@ -11705,6 +16157,13 @@ fn index_full_for_runtime(
         None
     };
     let publication_run_id = Uuid::new_v4().to_string();
+    let publication = next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Full,
+        &publication_run_id,
+    )?;
+    let dense_anchor_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
     let recovering_incomplete_run = if storage_path.exists() {
         match Storage::database_schema_version(storage_path) {
             Ok(version) if version > codestory_store::CURRENT_SCHEMA_VERSION => {
@@ -11733,25 +16192,111 @@ fn index_full_for_runtime(
     } else {
         false
     };
-    let workspace = WorkspaceManifest::open(root.to_path_buf())
+    let has_verified_live_publication = !recovering_incomplete_run
+        && previous_publication.as_ref().is_some_and(|expected| {
+            let live = match Store::open_read_only(storage_path) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %storage_path.display(),
+                        "Live publication could not be opened for verification: {error}"
+                    );
+                    return false;
+                }
+            };
+            match live.get_complete_index_publication() {
+                Ok(Some(publication)) if publication == *expected => {
+                    match live.validate_dense_anchor_publication(&publication) {
+                        Ok(_) => {
+                            validate_structural_text_units(&live, &publication).is_ok()
+                                && validate_source_policy_exclusions(
+                                    &live,
+                                    root,
+                                    &publication,
+                                    source_index_policy,
+                                )
+                                .is_ok()
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                path = %storage_path.display(),
+                                "Live dense anchor publication could not be verified: {error}"
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok(_) => false,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %storage_path.display(),
+                        "Live core publication could not be verified: {error}"
+                    );
+                    false
+                }
+            }
+        });
+    wall_durations.live_inspection = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
+    let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-    let execution_plan = workspace
-        .full_refresh_execution_plan()
-        .map_err(|e| ApiError::internal(format!("Failed to collect files: {e}")))?;
+    let (execution_plan, mut policy_exclusions) =
+        full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
 
+    wall_durations.source_discovery = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
         file_count: total_files,
     });
 
-    let mut staged = SnapshotStore::open_staged(storage_path)
+    #[cfg(test)]
+    run_source_policy_after_plan_hook();
+
+    let mut staged = SnapshotStore::open_disposable_full_refresh(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
+    #[cfg(test)]
+    run_full_refresh_staged_store_hook(staged.store_mut());
     let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
+    let copied_structural_artifacts = if has_verified_live_publication {
+        match staged
+            .store_mut()
+            .copy_structural_text_artifact_cache_from(storage_path)
+        {
+            Ok(copied) => {
+                tracing::debug!(
+                    copied,
+                    "Copied verified structural artifacts into staged storage"
+                );
+                copied
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to copy verified structural artifacts into staged storage; recollecting: {error}"
+                );
+                0
+            }
+        }
+    } else {
+        0
+    };
 
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
-    let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-    let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
+    let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
+        .with_source_index_policy(source_index_policy.clone())
+        .with_artifact_cache_policies(ArtifactCachePolicies {
+            parser: ArtifactCachePolicy::KnownEmpty,
+            structural: if copied_structural_artifacts > 0 {
+                ArtifactCachePolicy::ReadThrough
+            } else {
+                ArtifactCachePolicy::KnownEmpty
+            },
+        });
+    wall_durations.stage_open = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
+    let result =
+        indexer.run_with_policy_exclusions(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
     drop(bus);
     let _ = forwarder.join();
@@ -11761,7 +16306,10 @@ fn index_full_for_runtime(
             let _ = staged.discard();
             return Err(indexing_cancelled_error());
         }
-        Ok(stats) => stats,
+        Ok(outcome) => {
+            policy_exclusions.extend(outcome.policy_exclusions);
+            outcome.stats
+        }
         Err(_) if is_indexing_cancelled(cancel_token) => {
             let _ = staged.discard();
             return Err(indexing_cancelled_error());
@@ -11771,6 +16319,55 @@ fn index_full_for_runtime(
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
         }
     };
+    wall_durations.indexer_execution = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
+    let coverage_gaps = match stored_file_coverage_diagnostics(root, staged.store_mut()) {
+        Ok(coverage_gaps) => coverage_gaps,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    let blocking_gaps = coverage_gaps
+        .iter()
+        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !blocking_gaps.is_empty() {
+        let sample = blocking_gaps
+            .iter()
+            .take(3)
+            .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remainder = blocking_gaps.len().saturating_sub(3);
+        let sample = if remainder > 0 {
+            format!("{sample}, and {remainder} more")
+        } else {
+            sample
+        };
+        let preserved_state = if has_verified_live_publication {
+            "The previous complete publication was preserved"
+        } else if recovering_incomplete_run {
+            "The existing live index and its incomplete-run recovery fence were preserved"
+        } else if previous_publication.is_some() {
+            "The existing live index was preserved and no replacement publication was created"
+        } else {
+            "No core publication was created"
+        };
+        let count = blocking_gaps.len();
+        let code = source_coverage_failure_code(&blocking_gaps);
+        let _ = staged.discard();
+        return Err(ApiError::source_coverage_failure(
+            code,
+            format!(
+                "Effective refresh mode `full` could not verify {count} scheduled file(s): {sample}. {preserved_state}."
+            ),
+            blocking_gaps,
+        ));
+    }
+    wall_durations.coverage_validation = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     if can_copy_forward {
         match staged
             .store_mut()
@@ -11797,19 +16394,26 @@ fn index_full_for_runtime(
                 tracing::warn!("Failed to copy symbol docs into staged storage: {error}")
             }
         }
-        match staged.store_mut().copy_llm_symbol_docs_from(storage_path) {
-            Ok(copied) => tracing::debug!(copied, "Copied semantic docs into staged storage"),
+        match staged
+            .store_mut()
+            .copy_dense_anchor_inputs_from(storage_path)
+        {
+            Ok(copied) => tracing::debug!(copied, "Copied dense anchor inputs into staged storage"),
             Err(error) => {
-                tracing::warn!("Failed to copy semantic docs into staged storage: {error}")
+                tracing::warn!("Failed to copy dense anchor inputs into staged storage: {error}")
             }
         }
     }
+    wall_durations.copy_forward = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let staged_semantic_stats = match finalize_staged_semantic_docs_for_runtime(
         staged.store_mut(),
         None,
         None,
+        &dense_anchor_source_identity,
         cancel_token,
         runtime,
+        SemanticProjectionDocumentSource::SourceFiles,
     ) {
         Ok(stats) => stats,
         Err(error) => {
@@ -11821,6 +16425,8 @@ fn index_full_for_runtime(
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
     }
+    wall_durations.semantic_stage = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let staged_finalize_stats = match staged.snapshots().finalize_staged() {
         Ok(stats) => stats,
         Err(err) => {
@@ -11830,7 +16436,9 @@ fn index_full_for_runtime(
             )));
         }
     };
-    let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
+    let deferred_indexes_ms = staged_finalize_stats
+        .deferred_indexes_ms
+        .saturating_add(staged_semantic_stats.semantic_context_index_ms);
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let detail_started = Instant::now();
     if let Err(err) = staged.snapshots().refresh_detail() {
@@ -11844,28 +16452,60 @@ fn index_full_for_runtime(
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
     }
+    wall_durations.snapshot_stage = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     if recovering_incomplete_run && let Err(err) = staged.store_mut().begin_incremental_run() {
         let _ = staged.discard();
         return Err(ApiError::internal(format!(
             "Failed to preserve incomplete marker through staged recovery: {err}"
         )));
     }
-    let publication = match next_index_publication(
-        previous_publication.as_ref(),
-        IndexPublicationMode::Full,
-        &publication_run_id,
-    ) {
-        Ok(publication) => publication,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
     #[cfg(test)]
     if let Err(error) = publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)
     {
         let _ = staged.discard();
         return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete dense anchor inputs: {error}"
+        )));
+    }
+    #[cfg(test)]
+    run_source_policy_before_revalidate_hook();
+    let policy_exclusions = match revalidate_source_policy_exclusions(
+        &workspace,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_source_policy_exclusions(
+        staged.store_mut(),
+        root,
+        &publication,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
+        let _ = staged.discard();
+        return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_structural_text_unit_generation(&publication)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete structural text units: {error}"
+        )));
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -11873,6 +16513,8 @@ fn index_full_for_runtime(
             "Failed to persist staged full publication identity: {error}"
         )));
     }
+    wall_durations.publication_prepare = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let prepared_search_state = match rebuild_search_state_from_storage_for_runtime(
         staged.store_mut(),
         storage_path,
@@ -11880,6 +16522,7 @@ fn index_full_for_runtime(
         false,
         runtime,
         cancel_token,
+        None,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -11894,6 +16537,8 @@ fn index_full_for_runtime(
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
+    wall_durations.search_generation = wall_stage_started.elapsed();
+    wall_stage_started = Instant::now();
     let staged_path = staged.path().to_path_buf();
     #[cfg(test)]
     if let Err(error) =
@@ -11960,27 +16605,109 @@ fn index_full_for_runtime(
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
-    if let Err(err) = staged.publish(storage_path) {
-        drop(prepared_search_state);
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(ApiError::internal(format!(
-            "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
-            staged_path.display()
-        )));
-    }
+    let staged_publish_stats = match staged.publish_with_stats(storage_path) {
+        Ok(stats) => stats,
+        Err(err) => {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(ApiError::internal(format!(
+                "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
+                staged_path.display()
+            )));
+        }
+    };
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
+    wall_durations.catalog_publication = wall_stage_started.elapsed();
+    let full_refresh_wall = wall_durations.finish(core_refresh_started.elapsed());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
+    let full_refresh_pipeline_enabled = index_stats.full_refresh_queue_capacity > 0;
+    let full_refresh_chunking_enabled = index_stats.full_refresh_chunk_target_bytes > 0;
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
+            full_refresh_wall: Some(full_refresh_wall),
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
             projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
             edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
+            artifact_cache_write_ms: Some(clamp_u64_to_u32(index_stats.artifact_cache_write_ms)),
+            artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
+            artifact_cache_write_transactions: Some(clamp_usize_to_u32(
+                index_stats.artifact_cache_write_transactions,
+            )),
+            parser_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.parser_artifact_cache,
+            )),
+            structural_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.structural_artifact_cache,
+            )),
+            full_refresh_chunks_produced: full_refresh_pipeline_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunks_produced)),
+            full_refresh_chunks_persisted: full_refresh_pipeline_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunks_persisted),
+            ),
+            full_refresh_queue_capacity: full_refresh_pipeline_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_queue_capacity)),
+            full_refresh_queue_high_water: full_refresh_pipeline_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_queue_high_water),
+            ),
+            full_refresh_producer_blocked_ms: full_refresh_pipeline_enabled.then_some(
+                clamp_u64_to_u32(index_stats.full_refresh_producer_blocked_ms),
+            ),
+            full_refresh_writer_idle_ms: full_refresh_pipeline_enabled
+                .then_some(clamp_u64_to_u32(index_stats.full_refresh_writer_idle_ms)),
+            full_refresh_chunk_target_bytes: full_refresh_chunking_enabled
+                .then_some(index_stats.full_refresh_chunk_target_bytes),
+            full_refresh_chunk_target_nodes: full_refresh_chunking_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunk_target_nodes),
+            ),
+            full_refresh_chunk_file_ceiling: full_refresh_chunking_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunk_file_ceiling),
+            ),
+            full_refresh_chunk_max_files: full_refresh_chunking_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunk_max_files)),
+            full_refresh_chunk_max_planned_bytes: full_refresh_chunking_enabled
+                .then_some(index_stats.full_refresh_chunk_max_planned_bytes),
+            full_refresh_chunk_max_nodes: full_refresh_chunking_enabled
+                .then_some(clamp_usize_to_u32(index_stats.full_refresh_chunk_max_nodes)),
+            full_refresh_chunk_budget_overruns: full_refresh_chunking_enabled.then_some(
+                clamp_usize_to_u32(index_stats.full_refresh_chunk_budget_overruns),
+            ),
+            full_refresh_chunk_planning_ms: full_refresh_chunking_enabled
+                .then_some(clamp_u64_to_u32(index_stats.full_refresh_chunk_planning_ms)),
+            source_prepare_ms: Some(clamp_u64_to_u32(index_stats.source_prepare_ms)),
+            projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
+            projection_batch_transactions: Some(clamp_usize_to_u32(
+                index_stats.projection_batch_transactions,
+            )),
+            projection_persistence: Some(projection_persistence_timings(
+                &index_stats.projection_persistence,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
+            search_symbol_stream_ms: None,
+            search_symbol_stream_rows: None,
+            search_symbol_stream_batches: None,
             search_symbol_index_ms: None,
+            search_symbol_index_docs_written: None,
+            search_symbol_index_writer_count: None,
+            search_symbol_index_commit_count: None,
+            search_symbol_index_reload_count: None,
+            search_symbol_index_commit_ms: None,
+            search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_context_index_ms: None,
+            semantic_node_load_ms: None,
+            semantic_node_load_rows: None,
+            semantic_node_stream_batches: None,
+            semantic_endpoint_load_ms: None,
+            semantic_endpoint_load_rows: None,
+            semantic_endpoint_load_batches: None,
+            semantic_selected_nodes: None,
+            semantic_context_file_count: None,
+            semantic_context_path_bytes: None,
+            semantic_node_lookup_entries: None,
+            semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
@@ -12002,6 +16729,14 @@ fn index_full_for_runtime(
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms,
             publish_ms: Some(publish_ms),
+            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
+                .sqlite_wal_autocheckpoint_bytes,
+            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
+            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
+            staged_snapshot_copy: staged_publish_stats
+                .snapshot_copy
+                .map(database_snapshot_copy_timings),
+            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -12029,6 +16764,12 @@ fn index_full_for_runtime(
                 .resolution_call_semantic_index_ms,
             resolution_import_semantic_index_ms: resolution_telemetry
                 .resolution_import_semantic_index_ms,
+            resolution_support_snapshot_limit_bytes: resolution_telemetry
+                .resolution_support_snapshot_limit_bytes,
+            resolution_support_snapshot_stored: resolution_telemetry
+                .resolution_support_snapshot_stored,
+            resolution_support_snapshot_skipped_oversize: resolution_telemetry
+                .resolution_support_snapshot_skipped_oversize,
             resolution_call_semantic_candidates_ms: resolution_telemetry
                 .resolution_call_semantic_candidates_ms,
             resolution_import_semantic_candidates_ms: resolution_telemetry
@@ -12082,6 +16823,7 @@ fn index_incremental(
         events_tx,
         cancel_token,
         &test_sidecar_runtime_from_env(),
+        process_source_index_policy(),
     )
 }
 
@@ -12091,6 +16833,7 @@ fn index_incremental_for_runtime(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
 ) -> Result<IndexingRunSummary, ApiError> {
     run_incremental_indexing_common(
         root,
@@ -12098,11 +16841,7 @@ fn index_incremental_for_runtime(
         events_tx,
         cancel_token,
         runtime,
-        |workspace, inputs| {
-            workspace
-                .build_execution_plan(inputs)
-                .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))
-        },
+        source_index_policy,
     )
 }
 
@@ -12128,44 +16867,136 @@ fn spawn_progress_forwarder(
     })
 }
 
-fn run_incremental_indexing_common<F>(
+const FULL_REFRESH_REQUIRED_ERROR_CODE: &str = "full_refresh_required";
+
+fn full_refresh_required_error(
+    root: &Path,
+    reason_code: &str,
+    reason: impl AsRef<str>,
+) -> ApiError {
+    let project = root.to_string_lossy().to_string();
+    let next_command = format!(
+        "codestory-cli index --project {} --refresh full",
+        quote_refresh_command_argument(&project)
+    );
+    ApiError::with_details(
+        FULL_REFRESH_REQUIRED_ERROR_CODE,
+        format!(
+            "Refresh compatibility rejected the request before workspace reads: requested=incremental effective=none required=full reason={}",
+            reason.as_ref()
+        ),
+        ApiErrorDetails {
+            cause_code: Some(reason_code.to_string()),
+            failed_layer: Some("core_publication_compatibility".to_string()),
+            project: Some(project),
+            next_commands: vec![next_command.clone()],
+            minimum_next: vec![next_command.clone()],
+            full_repair: vec![next_command],
+            readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
+        },
+    )
+}
+
+#[cfg(windows)]
+fn quote_refresh_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_refresh_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn ensure_incremental_refresh_compatible(root: &Path, storage_path: &Path) -> Result<(), ApiError> {
+    if !storage_path.is_file() {
+        return Err(full_refresh_required_error(
+            root,
+            "complete_core_publication_missing",
+            "complete_core_publication_missing",
+        ));
+    }
+    let schema_version = Store::database_schema_version_observational(storage_path).map_err(
+        |error| {
+            ApiError::internal(format!(
+                "Failed to inspect incremental refresh schema compatibility without recovery: {error}"
+            ))
+        },
+    )?;
+    if schema_version < CURRENT_SCHEMA_VERSION {
+        let (reason_code, reason) = if schema_version == 0 {
+            (
+                "complete_core_publication_missing",
+                "complete_core_publication_missing".to_string(),
+            )
+        } else {
+            (
+                "core_schema_upgrade_required",
+                format!(
+                    "core_schema_upgrade_required:observed={schema_version}:required={CURRENT_SCHEMA_VERSION}"
+                ),
+            )
+        };
+        return Err(full_refresh_required_error(root, reason_code, reason));
+    }
+    let storage = Store::open_freshness_observational(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect incremental refresh compatibility: {error}"
+        ))
+    })?;
+    if storage.has_incomplete_incremental_run().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect incomplete incremental marker: {error}"
+        ))
+    })? {
+        return Err(full_refresh_required_error(
+            root,
+            "incomplete_incremental_publication",
+            "incomplete_incremental_publication",
+        ));
+    }
+    let Some(publication) = storage.get_complete_index_publication().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect complete core publication: {error}"
+        ))
+    })?
+    else {
+        return Err(full_refresh_required_error(
+            root,
+            "complete_core_publication_missing",
+            "complete_core_publication_missing",
+        ));
+    };
+    if let Err(error) = storage.validate_structural_text_unit_publication(&publication) {
+        return Err(full_refresh_required_error(
+            root,
+            "structural_publication_incompatible",
+            format!("structural_publication_incompatible:{error}"),
+        ));
+    }
+    Ok(())
+}
+
+fn run_incremental_indexing_common(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
-    refresh_builder: F,
-) -> Result<IndexingRunSummary, ApiError>
-where
-    F: FnOnce(&WorkspaceManifest, &RefreshInputs) -> Result<RefreshExecutionPlan, ApiError>,
-{
-    let live_exists = storage_path.exists();
-    let live_is_incomplete = live_exists
-        && Store::database_has_incomplete_incremental_run(storage_path).map_err(|e| {
-            ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
-        })?;
-    if live_is_incomplete {
-        let _ = events_tx.send(AppEventPayload::StatusUpdate {
-            message: "A prior incremental index run was interrupted; rebuilding through staged full recovery."
-                .to_string(),
-        });
-        return index_full_for_runtime(root, storage_path, events_tx, cancel_token, runtime);
-    }
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<IndexingRunSummary, ApiError> {
+    ensure_incremental_refresh_compatible(root, storage_path)?;
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
 
-    let mut staged = if live_exists {
-        SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to clone live storage for incremental build: {e}"
-            ))
-        })?
-    } else {
-        SnapshotStore::open_staged(storage_path).map_err(|e| {
-            ApiError::internal(format!("Failed to open staged incremental storage: {e}"))
-        })?
-    };
+    let mut staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
+        ApiError::internal(format!(
+            "Failed to clone live storage for incremental build: {e}"
+        ))
+    })?;
     let previous_publication = match staged.store_mut().get_index_publication() {
         Ok(publication) => publication,
         Err(error) => {
@@ -12175,143 +17006,308 @@ where
             )));
         }
     };
+    let rebuild_complete_dense_anchor_set = staged
+        .store_mut()
+        .get_dense_anchor_publication_manifest()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read staged dense anchor publication identity: {error}"
+            ))
+        })?
+        .is_none();
     let publication_run_id = Uuid::new_v4().to_string();
-    let staged_result =
-        (|| {
-            staged.store_mut().begin_incremental_run().map_err(|e| {
+    let publication = next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Incremental,
+        &publication_run_id,
+    )?;
+    let dense_anchor_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let staged_result = (|| {
+        staged.store_mut().begin_incremental_run().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to persist staged incomplete index marker: {e}"
+            ))
+        })?;
+        staged
+            .store_mut()
+            .invalidate_grounding_snapshots()
+            .map_err(|e| {
                 ApiError::internal(format!(
-                    "Failed to persist staged incomplete index marker: {e}"
+                    "Failed to invalidate staged derived index snapshots: {e}"
                 ))
             })?;
+
+        let workspace = runtime_workspace_manifest(root, storage_path)
+            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
+        let policy_refresh = workspace
+            .build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
+            .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))?;
+        if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+            let reason = if policy_refresh.refresh.inventory_outcome
+                == WorkspaceInventoryOutcome::Unreadable
+            {
+                FileCoverageReason::Unreadable
+            } else {
+                FileCoverageReason::DiscoveryIncomplete
+            };
+            let mut gaps = policy_refresh
+                .refresh
+                .inventory_issues
+                .iter()
+                .map(|issue| FileCoverageDiagnosticDto {
+                    path: runtime_relative_path(root, &issue.path),
+                    reason,
+                    retryable: file_coverage_retryable(reason),
+                    verified_source: false,
+                    projection_available: false,
+                })
+                .collect::<Vec<_>>();
+            if gaps.is_empty() {
+                gaps.push(FileCoverageDiagnosticDto {
+                    path: ".".into(),
+                    reason,
+                    retryable: file_coverage_retryable(reason),
+                    verified_source: false,
+                    projection_available: false,
+                });
+            }
+            return Err(ApiError::source_coverage_failure(
+                source_coverage_failure_code(&gaps),
+                format!(
+                    "Incremental refresh requires a complete source inventory; discovery was {:?}.",
+                    policy_refresh.refresh.inventory_outcome
+                ),
+                gaps,
+            ));
+        }
+        let execution_plan = policy_refresh.refresh.plan;
+        let mut policy_exclusions = policy_refresh.policy_exclusions;
+        let mut planned_semantic_seed_file_ids = execution_plan
+            .files_to_remove
+            .iter()
+            .copied()
+            .map(codestory_contracts::graph::NodeId)
+            .collect::<HashSet<_>>();
+        let mut previous_indexed_file_ids_by_path = HashMap::new();
+        let mut policy_excluded_semantic_seed_file_ids = HashSet::new();
+        for path in &execution_plan.files_to_index {
+            let normalized_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            };
+            if let Some(file_info) = staged
+                .store_mut()
+                .get_file_by_path(&normalized_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve previous semantic scope for {}: {error}",
+                        normalized_path.display()
+                    ))
+                })?
+            {
+                let file_id = codestory_contracts::graph::NodeId(file_info.id);
+                planned_semantic_seed_file_ids.insert(file_id);
+                previous_indexed_file_ids_by_path
+                    .insert(runtime_relative_path(root, &normalized_path), file_id);
+            }
+        }
+        let previous_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
+            staged.store_mut(),
+            &planned_semantic_seed_file_ids,
+        )?;
+        let existing_file_paths = semantic_file_table_path_map(
             staged
                 .store_mut()
-                .invalidate_grounding_snapshots()
-                .map_err(|e| {
+                .get_files()
+                .map_err(|error| ApiError::internal(format!("Failed to load files: {error}")))?,
+        );
+        let mut removed_component_keys = HashSet::new();
+        for file_id in &execution_plan.files_to_remove {
+            let path = existing_file_paths
+                .get(&codestory_contracts::graph::NodeId(*file_id))
+                .ok_or_else(|| {
                     ApiError::internal(format!(
-                        "Failed to invalidate staged derived index snapshots: {e}"
+                        "Removed file is missing from staged component scope: {file_id}"
                     ))
                 })?;
-
-            let workspace = WorkspaceManifest::open(root.to_path_buf())
-                .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-            let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
-            let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
-            let existing_file_paths =
-                semantic_file_table_path_map(staged.store_mut().get_files().map_err(|error| {
-                    ApiError::internal(format!("Failed to load files: {error}"))
-                })?);
-            let mut removed_component_keys = HashSet::new();
-            for file_id in &execution_plan.files_to_remove {
-                let path = existing_file_paths
-                    .get(&codestory_contracts::graph::NodeId(*file_id))
-                    .ok_or_else(|| {
-                        ApiError::internal(format!(
-                            "Removed file is missing from staged component scope: {file_id}"
-                        ))
-                    })?;
-                if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
-                    removed_component_keys.insert(component_key);
-                }
+            if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
+                removed_component_keys.insert(component_key);
             }
-            let component_report_refresh = ComponentReportRefreshScope {
-                previous_file_paths: existing_file_paths,
-                removed_component_keys,
-            };
+        }
+        let mut component_report_refresh = ComponentReportRefreshScope {
+            previous_file_paths: existing_file_paths,
+            removed_component_keys,
+        };
 
-            let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
-            let _ = events_tx.send(AppEventPayload::IndexingStarted {
-                file_count: total_files,
-            });
+        let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
+        let _ = events_tx.send(AppEventPayload::IndexingStarted {
+            file_count: total_files,
+        });
 
-            let bus = EventBus::new();
-            let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
-            if is_indexing_cancelled(cancel_token) {
-                drop(bus);
-                let _ = forwarder.join();
-                return Err(indexing_cancelled_error());
-            }
-            let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-            let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
-
-            // Drop bus so forwarder unblocks.
+        #[cfg(test)]
+        run_incremental_staged_store_hook(staged.store_mut());
+        let bus = EventBus::new();
+        let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+        if is_indexing_cancelled(cancel_token) {
             drop(bus);
             let _ = forwarder.join();
+            return Err(indexing_cancelled_error());
+        }
+        let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
+            .with_source_index_policy(source_index_policy.clone());
+        let result = indexer.run_with_policy_exclusions(
+            staged.store_mut(),
+            &execution_plan,
+            &bus,
+            cancel_token,
+        );
 
-            let index_stats = match result {
-                Ok(_) if is_indexing_cancelled(cancel_token) => {
-                    return Err(indexing_cancelled_error());
+        // Drop bus so forwarder unblocks.
+        drop(bus);
+        let _ = forwarder.join();
+
+        let index_stats = match result {
+            Ok(_) if is_indexing_cancelled(cancel_token) => {
+                return Err(indexing_cancelled_error());
+            }
+            Ok(outcome) => {
+                for exclusion in &outcome.policy_exclusions {
+                    if let Some(file_id) =
+                        previous_indexed_file_ids_by_path.get(&exclusion.normalized_path)
+                    {
+                        policy_excluded_semantic_seed_file_ids.insert(*file_id);
+                        if let Some(component_key) = component_report_refresh
+                            .previous_file_paths
+                            .get(file_id)
+                            .and_then(|path| semantic_component_key_for_path(Some(path)))
+                        {
+                            component_report_refresh
+                                .removed_component_keys
+                                .insert(component_key);
+                        }
+                    }
                 }
-                Ok(stats) => stats,
-                Err(_) if is_indexing_cancelled(cancel_token) => {
-                    return Err(indexing_cancelled_error());
-                }
-                Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+                policy_exclusions.extend(outcome.policy_exclusions);
+                outcome.stats
+            }
+            Err(_) if is_indexing_cancelled(cancel_token) => {
+                return Err(indexing_cancelled_error());
+            }
+            Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+        };
+        let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
+            .into_iter()
+            .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+            .collect::<Vec<_>>();
+        if !blocking_gaps.is_empty() {
+            let count = blocking_gaps.len();
+            let sample = blocking_gaps
+                .iter()
+                .take(3)
+                .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ApiError::source_coverage_failure(
+                source_coverage_failure_code(&blocking_gaps),
+                format!(
+                    "Incremental refresh could not verify {count} scheduled file(s): {sample}. The previous complete publication was preserved."
+                ),
+                blocking_gaps,
+            ));
+        }
+        let mut semantic_refresh_seed_file_ids = HashSet::new();
+        for path in &execution_plan.files_to_index {
+            let normalized_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
             };
-            let mut llm_refresh_scope = HashSet::new();
-            for path in &execution_plan.files_to_index {
-                let normalized_path = if path.is_absolute() {
-                    path.clone()
-                } else {
-                    root.join(path)
-                };
-                let file_info = staged
-                    .store_mut()
-                    .get_file_by_path(&normalized_path)
-                    .map_err(|error| {
-                        ApiError::internal(format!(
-                            "Failed to resolve indexed semantic scope for {}: {error}",
-                            normalized_path.display()
-                        ))
-                    })?;
-                // Workspace refresh plans include discovered files that have no
-                // graph collector. Only files materialized in the staged graph
-                // can own semantic documents.
-                if let Some(file_info) = file_info {
-                    llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
-                }
+            let file_info = staged
+                .store_mut()
+                .get_file_by_path(&normalized_path)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve indexed semantic scope for {}: {error}",
+                        normalized_path.display()
+                    ))
+                })?;
+            // Workspace refresh plans include discovered files that have no graph
+            // collector, while incomplete reads preserve the last verified graph.
+            // Only complete files can prove that their semantic projection changed.
+            if let Some(file_info) = file_info
+                && file_info.complete
+            {
+                semantic_refresh_seed_file_ids
+                    .insert(codestory_contracts::graph::NodeId(file_info.id));
             }
-            for file_id in &execution_plan.files_to_remove {
-                llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
+        }
+        semantic_refresh_seed_file_ids.extend(
+            execution_plan
+                .files_to_remove
+                .iter()
+                .copied()
+                .map(codestory_contracts::graph::NodeId),
+        );
+        semantic_refresh_seed_file_ids.extend(policy_excluded_semantic_seed_file_ids);
+        let current_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
+            staged.store_mut(),
+            &semantic_refresh_seed_file_ids,
+        )?;
+        let mut llm_refresh_scope = semantic_refresh_seed_file_ids.clone();
+        for seed_file_id in &semantic_refresh_seed_file_ids {
+            if let Some(file_ids) = previous_semantic_dependents_by_seed.get(seed_file_id) {
+                llm_refresh_scope.extend(file_ids.iter().copied());
             }
-            let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
-                staged.store_mut(),
-                Some(&llm_refresh_scope),
-                Some(&component_report_refresh),
-                cancel_token,
-                runtime,
-            )?;
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
+            if let Some(file_ids) = current_semantic_dependents_by_seed.get(seed_file_id) {
+                llm_refresh_scope.extend(file_ids.iter().copied());
             }
-            let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to finalize staged incremental storage: {e}"
-                ))
-            })?;
-            let detail_started = Instant::now();
-            staged.snapshots().refresh_detail().map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to refresh staged grounding detail snapshot: {e}"
-                ))
-            })?;
-            let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            Ok((
-                index_stats,
-                staged_finalize_stats,
-                detail_snapshot_ms,
-                llm_refresh_scope,
-                staged_semantic_stats,
+        }
+        let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
+            staged.store_mut(),
+            (!rebuild_complete_dense_anchor_set).then_some(&llm_refresh_scope),
+            (!rebuild_complete_dense_anchor_set).then_some(&component_report_refresh),
+            &dense_anchor_source_identity,
+            cancel_token,
+            runtime,
+            SemanticProjectionDocumentSource::SourceFiles,
+        )?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to finalize staged incremental storage: {e}"
             ))
-        })();
+        })?;
+        let detail_started = Instant::now();
+        staged.snapshots().refresh_detail().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to refresh staged grounding detail snapshot: {e}"
+            ))
+        })?;
+        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        Ok((
+            index_stats,
+            staged_finalize_stats,
+            detail_snapshot_ms,
+            llm_refresh_scope,
+            staged_semantic_stats,
+            policy_exclusions,
+        ))
+    })();
     let (
         index_stats,
         staged_finalize_stats,
         detail_snapshot_ms,
         llm_refresh_scope,
         staged_semantic_stats,
+        policy_exclusions,
     ) = match staged_result {
         Ok(result) => result,
         Err(error) => {
@@ -12319,7 +17315,9 @@ where
             return Err(error);
         }
     };
-    let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
+    let deferred_indexes_ms = staged_finalize_stats
+        .deferred_indexes_ms
+        .saturating_add(staged_semantic_stats.semantic_context_index_ms);
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
 
@@ -12327,22 +17325,54 @@ where
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
     }
-    let publication = match next_index_publication(
-        previous_publication.as_ref(),
-        IndexPublicationMode::Incremental,
-        &publication_run_id,
-    ) {
-        Ok(publication) => publication,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
     #[cfg(test)]
     if let Err(error) = publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)
     {
         let _ = staged.discard();
         return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete dense anchor inputs: {error}"
+        )));
+    }
+    #[cfg(test)]
+    run_source_policy_before_revalidate_hook();
+    let workspace = runtime_workspace_manifest(root, storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to reopen project: {error}")))?;
+    let policy_exclusions = match revalidate_source_policy_exclusions(
+        &workspace,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_source_policy_exclusions(
+        staged.store_mut(),
+        root,
+        &publication,
+        &policy_exclusions,
+        source_index_policy,
+    ) {
+        let _ = staged.discard();
+        return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_structural_text_unit_generation(&publication)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete structural text units: {error}"
+        )));
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -12357,6 +17387,7 @@ where
         false,
         runtime,
         cancel_token,
+        None,
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -12435,27 +17466,85 @@ where
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
-    if let Err(error) = staged.publish(storage_path) {
-        drop(prepared_search_state);
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(ApiError::internal(format!(
-            "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
-            staged_path.display()
-        )));
-    }
+    let staged_publish_stats = match staged.publish_with_stats(storage_path) {
+        Ok(stats) => stats,
+        Err(error) => {
+            drop(prepared_search_state);
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(ApiError::internal(format!(
+                "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
+                staged_path.display()
+            )));
+        }
+    };
     let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
 
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
+            full_refresh_wall: None,
             parse_index_ms: clamp_u64_to_u32(index_stats.parse_index_ms),
             projection_flush_ms: clamp_u64_to_u32(index_stats.projection_flush_ms),
             edge_resolution_ms: clamp_u64_to_u32(index_stats.edge_resolution_ms),
             error_flush_ms: clamp_u64_to_u32(index_stats.error_flush_ms),
             cleanup_ms: clamp_u64_to_u32(index_stats.cleanup_ms),
+            artifact_cache_write_ms: Some(clamp_u64_to_u32(index_stats.artifact_cache_write_ms)),
+            artifact_cache_writes: Some(clamp_usize_to_u32(index_stats.artifact_cache_writes)),
+            artifact_cache_write_transactions: Some(clamp_usize_to_u32(
+                index_stats.artifact_cache_write_transactions,
+            )),
+            parser_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.parser_artifact_cache,
+            )),
+            structural_artifact_cache: Some(artifact_cache_access_timings(
+                &index_stats.structural_artifact_cache,
+            )),
+            full_refresh_chunks_produced: None,
+            full_refresh_chunks_persisted: None,
+            full_refresh_queue_capacity: None,
+            full_refresh_queue_high_water: None,
+            full_refresh_producer_blocked_ms: None,
+            full_refresh_writer_idle_ms: None,
+            full_refresh_chunk_target_bytes: None,
+            full_refresh_chunk_target_nodes: None,
+            full_refresh_chunk_file_ceiling: None,
+            full_refresh_chunk_max_files: None,
+            full_refresh_chunk_max_planned_bytes: None,
+            full_refresh_chunk_max_nodes: None,
+            full_refresh_chunk_budget_overruns: None,
+            full_refresh_chunk_planning_ms: None,
+            source_prepare_ms: Some(clamp_u64_to_u32(index_stats.source_prepare_ms)),
+            projection_batch_wall_ms: Some(clamp_u64_to_u32(index_stats.projection_batch_wall_ms)),
+            projection_batch_transactions: Some(clamp_usize_to_u32(
+                index_stats.projection_batch_transactions,
+            )),
+            projection_persistence: Some(projection_persistence_timings(
+                &index_stats.projection_persistence,
+            )),
             cache_refresh_ms: None,
             search_projection_rebuild_ms: None,
+            search_symbol_stream_ms: None,
+            search_symbol_stream_rows: None,
+            search_symbol_stream_batches: None,
             search_symbol_index_ms: None,
+            search_symbol_index_docs_written: None,
+            search_symbol_index_writer_count: None,
+            search_symbol_index_commit_count: None,
+            search_symbol_index_reload_count: None,
+            search_symbol_index_commit_ms: None,
+            search_symbol_index_reload_ms: None,
             runtime_cache_publish_ms: None,
+            semantic_context_index_ms: None,
+            semantic_node_load_ms: None,
+            semantic_node_load_rows: None,
+            semantic_node_stream_batches: None,
+            semantic_endpoint_load_ms: None,
+            semantic_endpoint_load_rows: None,
+            semantic_endpoint_load_batches: None,
+            semantic_selected_nodes: None,
+            semantic_context_file_count: None,
+            semantic_context_path_bytes: None,
+            semantic_node_lookup_entries: None,
+            semantic_context_ms: None,
             semantic_doc_build_ms: None,
             semantic_embedding_ms: None,
             semantic_db_upsert_ms: None,
@@ -12477,6 +17566,14 @@ where
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: Some(detail_snapshot_ms),
             publish_ms: Some(publish_ms),
+            staged_sqlite_wal_autocheckpoint_bytes: staged_publish_stats
+                .sqlite_wal_autocheckpoint_bytes,
+            staged_sqlite_checkpoint_ms: staged_publish_stats.sqlite_checkpoint_ms,
+            staged_sqlite_sync_ms: staged_publish_stats.sqlite_sync_ms,
+            staged_snapshot_copy: staged_publish_stats
+                .snapshot_copy
+                .map(database_snapshot_copy_timings),
+            core_promotion: Some(core_promotion_timings(staged_publish_stats.core_promotion)),
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -12504,6 +17601,12 @@ where
                 .resolution_call_semantic_index_ms,
             resolution_import_semantic_index_ms: resolution_telemetry
                 .resolution_import_semantic_index_ms,
+            resolution_support_snapshot_limit_bytes: resolution_telemetry
+                .resolution_support_snapshot_limit_bytes,
+            resolution_support_snapshot_stored: resolution_telemetry
+                .resolution_support_snapshot_stored,
+            resolution_support_snapshot_skipped_oversize: resolution_telemetry
+                .resolution_support_snapshot_skipped_oversize,
             resolution_call_semantic_candidates_ms: resolution_telemetry
                 .resolution_call_semantic_candidates_ms,
             resolution_import_semantic_candidates_ms: resolution_telemetry
@@ -12560,6 +17663,14 @@ fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
             .files()
             .inventory()
             .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?,
+        policy_exclusions: store
+            .get_source_policy_exclusions()
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to read source policy exclusions: {e}"))
+            })?
+            .iter()
+            .map(source_policy_exclusion_candidate)
+            .collect(),
         inventory: Default::default(),
     })
 }
@@ -12568,10 +17679,9 @@ fn reuse_completed_search_state(
     storage: &mut Storage,
     search_storage_path: &Path,
     publication: &IndexPublicationRecord,
-    nodes: &[codestory_contracts::graph::Node],
-    llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     hydrate_semantic_docs: bool,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<Option<SearchStateBuildResult>, ApiError> {
     let generation_id = Uuid::parse_str(&publication.generation_id)
         .map_err(|error| {
@@ -12582,22 +17692,9 @@ fn reuse_completed_search_state(
         })?
         .to_string();
     let Some(marker) = read_search_generation_completion(search_storage_path, &generation_id)
-        .filter(|marker| marker.symbol_count == nodes.len() as u64)
     else {
         return Ok(None);
     };
-
-    let projection_started = Instant::now();
-    match llm_refresh_scope {
-        Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
-        None => storage.rebuild_search_symbol_projection_from_node_table(),
-    }
-    .map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to rebuild search symbol projection before generation reuse: {error}"
-        ))
-    })?;
-    let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
 
     let search_index_started = Instant::now();
     let mut engine = match SearchEngine::open_existing(search_storage_path) {
@@ -12610,26 +17707,36 @@ fn reuse_completed_search_state(
             return Ok(None);
         }
     };
-    let mut node_names = HashMap::with_capacity(nodes.len());
-    engine.load_symbol_projection(nodes.iter().map(|node| {
-        let display_name = node_display_name(node);
-        node_names.insert(node.id, display_name.clone());
-        (node.id, display_name)
-    }));
-    if engine.full_text_doc_count() != nodes.len()
+    engine.load_symbol_projection(std::iter::empty());
+    let (node_names, mut search_stats) = load_canonical_search_symbols(
+        storage,
+        SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+        cancel_token,
+        |batch| {
+            engine.extend_symbol_projection(
+                batch
+                    .into_iter()
+                    .map(|entry| (entry.node_id, entry.display_name)),
+            );
+            Ok(())
+        },
+    )?;
+    if marker.symbol_count != search_stats.search_symbol_stream_rows as u64
+        || engine.full_text_doc_count() != search_stats.search_symbol_stream_rows as usize
         || engine.tantivy_doc_count() as u64 != marker.tantivy_doc_count
     {
         tracing::warn!(
             path = %search_storage_path.display(),
             searchable_docs = engine.full_text_doc_count(),
             stored_docs = engine.tantivy_doc_count(),
-            expected_symbols = nodes.len(),
+            expected_symbols = search_stats.search_symbol_stream_rows,
             expected_stored_docs = marker.tantivy_doc_count,
             "Completed persisted search generation count validation failed and will be rebuilt"
         );
         return Ok(None);
     }
-    let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
+    search_stats.search_symbol_index_ms =
+        clamp_u128_to_u32(search_index_started.elapsed().as_millis());
     let semantic_stats = load_persisted_semantic_docs_for_runtime(
         storage,
         &mut engine,
@@ -12640,12 +17747,124 @@ fn reuse_completed_search_state(
         publication: Some(publication.clone()),
         node_names,
         engine,
-        search_stats: SearchStateBuildStats {
-            search_projection_rebuild_ms,
-            search_symbol_index_ms,
-        },
+        search_stats,
         semantic_stats,
     }))
+}
+
+fn build_persisted_search_state_from_canonical_symbols(
+    storage: &mut Storage,
+    search_storage_path: &Path,
+    hydrate_semantic_docs: bool,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<SearchStateBuildResult, ApiError> {
+    let search_index_started = Instant::now();
+    let count_started = Instant::now();
+    let expected_rows = storage
+        .get_canonical_search_symbol_count()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to count canonical search symbols: {error}"))
+        })?;
+    let mut stream_duration = count_started.elapsed();
+    let mut engine = SearchEngine::new(Some(search_storage_path)).map_err(|error| {
+        if search::engine::is_persisted_search_index_busy(&error) {
+            ApiError::new(
+                "cache_busy",
+                format!("Failed to init search engine: {error}"),
+            )
+        } else {
+            ApiError::internal(format!("Failed to init search engine: {error}"))
+        }
+    })?;
+    let mut node_names = HashMap::with_capacity(expected_rows as usize);
+    let mut symbol_session = engine.begin_symbol_index().map_err(|error| {
+        ApiError::internal(format!("Failed to start symbol index writer: {error}"))
+    })?;
+    let mut after_node_id = None;
+    let mut stream_rows = 0_usize;
+    let mut stream_batches = 0_usize;
+    loop {
+        let batch_started = Instant::now();
+        let batch = storage
+            .get_canonical_search_symbol_batch_after(after_node_id, SEARCH_SYMBOL_STREAM_BATCH_SIZE)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to stream canonical search symbols: {error}"
+                ))
+            })?;
+        stream_duration = stream_duration.saturating_add(batch_started.elapsed());
+        if batch.is_empty() {
+            break;
+        }
+        after_node_id = batch.last().map(|entry| entry.node_id);
+        stream_rows = stream_rows.saturating_add(batch.len());
+        stream_batches = stream_batches.saturating_add(1);
+        let symbols = batch
+            .into_iter()
+            .map(|entry| {
+                node_names.insert(entry.node_id, entry.display_name.clone());
+                (entry.node_id, entry.display_name)
+            })
+            .collect::<Vec<_>>();
+        symbol_session.add_nodes(symbols).map_err(|error| {
+            ApiError::internal(format!("Failed to index search nodes: {error}"))
+        })?;
+        #[cfg(test)]
+        publication_test_checkpoint(PublicationTestBoundary::SearchSymbolPage, cancel_token)?;
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+    }
+    if stream_rows != expected_rows as usize {
+        return Err(ApiError::internal(format!(
+            "Canonical search symbol stream count changed: expected {expected_rows}, loaded {stream_rows}"
+        )));
+    }
+    #[cfg(test)]
+    publication_test_checkpoint(PublicationTestBoundary::SearchIndexWrite, cancel_token)?;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let symbol_write_stats = symbol_session
+        .finish()
+        .map_err(|error| ApiError::internal(format!("Failed to commit symbol index: {error}")))?;
+    if engine.full_text_doc_count() != stream_rows {
+        return Err(ApiError::internal(format!(
+            "Persisted search generation validation failed: indexed {} docs for {stream_rows} canonical symbols",
+            engine.full_text_doc_count()
+        )));
+    }
+    let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
+    let semantic_stats = load_persisted_semantic_docs_for_runtime(
+        storage,
+        &mut engine,
+        hydrate_semantic_docs,
+        runtime,
+    )?;
+    Ok(SearchStateBuildResult {
+        publication: None,
+        node_names,
+        engine,
+        search_stats: SearchStateBuildStats {
+            search_projection_rebuild_ms: 0,
+            search_symbol_stream_ms: clamp_u128_to_u32(stream_duration.as_millis()),
+            search_symbol_stream_rows: clamp_usize_to_u32(stream_rows),
+            search_symbol_stream_batches: clamp_usize_to_u32(stream_batches),
+            search_symbol_index_ms,
+            search_symbol_index_docs_written: clamp_usize_to_u32(symbol_write_stats.docs_written),
+            search_symbol_index_writer_count: clamp_usize_to_u32(symbol_write_stats.writer_count),
+            search_symbol_index_commit_count: clamp_usize_to_u32(symbol_write_stats.commit_count),
+            search_symbol_index_reload_count: clamp_usize_to_u32(symbol_write_stats.reload_count),
+            search_symbol_index_commit_ms: clamp_u128_to_u32(
+                symbol_write_stats.commit_duration.as_millis(),
+            ),
+            search_symbol_index_reload_ms: clamp_u128_to_u32(
+                symbol_write_stats.reload_duration.as_millis(),
+            ),
+        },
+        semantic_stats,
+    })
 }
 
 #[cfg(test)]
@@ -12662,16 +17881,21 @@ fn rebuild_search_state_from_storage(
         hydrate_semantic_docs,
         &test_sidecar_runtime_from_env(),
         None,
+        None,
     )
 }
+
+type SearchCompletionValidator<'a> =
+    &'a mut dyn FnMut(&IndexPublicationRecord) -> Result<(), ApiError>;
 
 fn rebuild_search_state_from_storage_for_runtime(
     storage: &mut Storage,
     storage_path: &Path,
-    llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+    _llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     hydrate_semantic_docs: bool,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     cancel_token: Option<&CancellationToken>,
+    mut validate_before_completion: Option<SearchCompletionValidator<'_>>,
 ) -> Result<SearchStateBuildResult, ApiError> {
     let publication = storage.get_index_publication().map_err(|error| {
         ApiError::internal(format!(
@@ -12684,18 +17908,14 @@ fn rebuild_search_state_from_storage_for_runtime(
         .transpose()?;
     let search_storage_path =
         search_index_path_for_publication(storage_path, publication.as_ref())?;
-    let nodes = storage
-        .get_nodes()
-        .map_err(|e| ApiError::internal(format!("Failed to load nodes for search rebuild: {e}")))?;
     let reused = match publication.as_ref() {
         Some(publication) => reuse_completed_search_state(
             storage,
             &search_storage_path,
             publication,
-            &nodes,
-            llm_refresh_scope,
             hydrate_semantic_docs,
             runtime,
+            cancel_token,
         )?,
         None => None,
     };
@@ -12707,17 +17927,16 @@ fn rebuild_search_state_from_storage_for_runtime(
     let built_new = reused.is_none();
     let mut result = match reused {
         Some(result) => result,
-        None => build_search_state_for_runtime(
+        None => build_persisted_search_state_from_canonical_symbols(
             storage,
-            Some(search_storage_path.as_path()),
-            nodes,
-            llm_refresh_scope,
-            SemanticProjectionMode::LoadPersistedDocs,
+            search_storage_path.as_path(),
             hydrate_semantic_docs,
             runtime,
+            cancel_token,
         )
-        .map_err(|e| {
-            ApiError::internal(format!("Failed to rebuild search state: {}", e.message))
+        .map_err(|mut error| {
+            error.message = format!("Failed to rebuild search state: {}", error.message);
+            error
         })?,
     };
     if is_indexing_cancelled(cancel_token) {
@@ -12735,6 +17954,13 @@ fn rebuild_search_state_from_storage_for_runtime(
     if built_new && let Some(publication) = publication.as_ref() {
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
+        }
+        if let Some(validate) = validate_before_completion.as_mut()
+            && let Err(error) = validate(publication)
+        {
+            drop(result);
+            discard_unpublished_search_generation(storage_path, publication);
+            return Err(error);
         }
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::SearchCompletion, cancel_token)?;
@@ -12784,6 +18010,7 @@ fn refresh_caches(
         true,
         &controller.runtime_config,
         None,
+        None,
     );
 
     match refreshed {
@@ -12829,10 +18056,868 @@ mod tests {
         ResolutionCertainty, SourceLocation,
     };
     use crossbeam_channel::unbounded;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::MutexGuard as StdMutexGuard;
     use tempfile::tempdir;
+
+    #[path = "activation_coverage_tests.rs"]
+    mod activation_coverage_tests;
+
+    fn default_source_policy_identity() -> SourcePolicyExclusionPolicyIdentity<'static> {
+        SourcePolicyExclusionPolicyIdentity::new(
+            OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        )
+    }
+
+    fn legacy_source_policy_identity() -> SourcePolicyExclusionPolicyIdentity<'static> {
+        SourcePolicyExclusionPolicyIdentity::new(
+            LEGACY_OVERSIZED_SOURCE_POLICY_VERSION,
+            DEFAULT_SOURCE_FILE_BYTE_CAP,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+        )
+    }
+
+    fn legacy_source_policy_exclusion_digest_for_test(
+        records: &[SourcePolicyExclusionRecord],
+    ) -> String {
+        fn hash_part(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"codestory-source-policy-exclusion-publication-v1\0");
+        for record in records {
+            for value in [
+                record.normalized_path.as_bytes(),
+                record.project_id.as_bytes(),
+                record.workspace_id.as_bytes(),
+                record.content_hash.as_bytes(),
+                record.policy_version.as_bytes(),
+                record.core_generation_id.as_bytes(),
+                record.core_run_id.as_bytes(),
+            ] {
+                hash_part(&mut hasher, value);
+            }
+            hash_part(&mut hasher, &record.observed_size.to_le_bytes());
+            hash_part(&mut hasher, &record.byte_cap.to_le_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn semantic_projection_source_policy_bridge_is_directional_and_cap_exact() {
+        let current = SourceIndexPolicy::default();
+        assert_eq!(
+            semantic_projection_source_policy_compatibility(
+                default_source_policy_identity(),
+                &current,
+                30,
+                false,
+            ),
+            Some(SemanticProjectionSourcePolicyCompatibility::Exact)
+        );
+        assert_eq!(
+            semantic_projection_source_policy_compatibility(
+                legacy_source_policy_identity(),
+                &current,
+                LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION,
+                true,
+            ),
+            Some(SemanticProjectionSourcePolicyCompatibility::LegacyPredecessor)
+        );
+        for recorded in [
+            SourcePolicyExclusionPolicyIdentity::new(
+                "unknown-source-policy",
+                current.byte_cap,
+                current.structural_unit_cap,
+            ),
+            SourcePolicyExclusionPolicyIdentity::new(
+                LEGACY_OVERSIZED_SOURCE_POLICY_VERSION,
+                current.byte_cap + 1,
+                current.structural_unit_cap,
+            ),
+            SourcePolicyExclusionPolicyIdentity::new(
+                LEGACY_OVERSIZED_SOURCE_POLICY_VERSION,
+                current.byte_cap,
+                current.structural_unit_cap + 1,
+            ),
+        ] {
+            assert_eq!(
+                semantic_projection_source_policy_compatibility(
+                    recorded,
+                    &current,
+                    LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION,
+                    true,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            semantic_projection_source_policy_compatibility(
+                legacy_source_policy_identity(),
+                &current,
+                30,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            semantic_projection_source_policy_compatibility(
+                legacy_source_policy_identity(),
+                &current,
+                LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION,
+                false,
+            ),
+            None
+        );
+        let legacy_runtime = SourceIndexPolicy {
+            policy_version: LEGACY_OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+            byte_cap: current.byte_cap,
+            structural_unit_cap: current.structural_unit_cap,
+        };
+        assert_eq!(
+            semantic_projection_source_policy_compatibility(
+                default_source_policy_identity(),
+                &legacy_runtime,
+                LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION,
+                true,
+            ),
+            None
+        );
+    }
+
+    fn test_retrieval_manifest(
+        project_id: &str,
+        symbol_doc_count: i64,
+        dense_projection_count: i64,
+    ) -> RetrievalIndexManifest {
+        RetrievalIndexManifest {
+            project_id: project_id.to_string(),
+            lexical_version: "retained-v1".to_string(),
+            semantic_generation: "retained-v1".to_string(),
+            scip_revision: None,
+            built_at_epoch_ms: 1,
+            disk_bytes: Some(1),
+            degraded_modes_json: "[]".to_string(),
+            embedding_backend: Some("retained-v1".to_string()),
+            embedding_dim: Some(1),
+            sidecar_schema_version: Some(1),
+            sidecar_input_hash: Some("1".repeat(64)),
+            sidecar_generation: Some("retained-v1".to_string()),
+            projection_count: Some(1),
+            symbol_doc_count: Some(symbol_doc_count),
+            dense_projection_count: Some(dense_projection_count),
+            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.to_string()),
+            graph_artifact_hash: Some("2".repeat(64)),
+            dense_reason_counts_json: Some("{}".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        }
+    }
+
+    #[test]
+    fn full_refresh_wall_residual_uses_raw_durations_before_millis_conversion() {
+        let wall = FullRefreshWallDurations {
+            live_inspection: Duration::from_micros(750),
+            source_discovery: Duration::from_micros(250),
+            ..FullRefreshWallDurations::default()
+        }
+        .finish(Duration::from_micros(1_500));
+
+        assert_eq!(wall.core_refresh_ms, 1);
+        assert_eq!(wall.live_inspection_ms, 0);
+        assert_eq!(wall.source_discovery_ms, 0);
+        assert_eq!(wall.unattributed_ms, 0);
+    }
+
+    fn all_permutations<T: Clone>(values: &[T]) -> Vec<Vec<T>> {
+        fn visit<T: Clone>(values: &mut [T], index: usize, output: &mut Vec<Vec<T>>) {
+            if index == values.len() {
+                output.push(values.to_vec());
+                return;
+            }
+            for candidate in index..values.len() {
+                values.swap(index, candidate);
+                visit(values, index + 1, output);
+                values.swap(index, candidate);
+            }
+        }
+
+        let mut values = values.to_vec();
+        let mut output = Vec::new();
+        visit(&mut values, 0, &mut output);
+        output
+    }
+
+    #[test]
+    fn affected_identity_matching_visits_one_bucket_for_all_same_identity_aliases() {
+        let root = tempdir().expect("project");
+        let seed = root.path().join("identity-seed.rs");
+        fs::write(&seed, "pub fn seed() {}\n").expect("write identity seed");
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&seed).expect("shared native identity");
+        let change_records = (0..200)
+            .map(|index| AffectedChangeRecordDto {
+                path: format!("changed-alias-{index}.rs"),
+                kind: AffectedChangeKindDto::Renamed,
+                status: "R".to_string(),
+                previous_path: Some(format!("previous-alias-{index}.rs")),
+            })
+            .collect::<Vec<_>>();
+        let indexed_files = (0..25_000)
+            .map(|index| {
+                (
+                    CoreNodeId(index + 1),
+                    root.path().join(format!("indexed-alias-{index}.rs")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let resolver_calls = std::cell::Cell::new(0_usize);
+        let mut path_identities = AffectedOperationIdentityIndex::with_resolver(|_: &Path| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            Ok(shared_identity.clone())
+        });
+        for (_, path) in &indexed_files {
+            path_identities.record_admitted(path);
+            path_identities.record_stale(path);
+        }
+
+        // The injected identity models 25,000 indexed hardlink spellings and
+        // 200 current and previous aliases of the same native file. Refresh
+        // membership and affected matching share each indexed observation.
+        let matches = match_affected_file_identities(
+            root.path(),
+            &change_records,
+            indexed_files
+                .iter()
+                .map(|(file_id, path)| (*file_id, path.as_path())),
+            &mut path_identities,
+        );
+
+        assert_eq!(resolver_calls.get(), 25_400);
+        assert_eq!(matches.matched_file_ids.len(), 25_000);
+        assert_eq!(
+            matches
+                .matched_record_flags
+                .iter()
+                .filter(|matched| **matched)
+                .count(),
+            200
+        );
+        assert_eq!(matches.matched_record_index_by_file_id.len(), 25_000);
+        assert!(
+            matches
+                .matched_record_index_by_file_id
+                .values()
+                .all(|record_index| *record_index == 0)
+        );
+        assert_eq!(matches.work.record_visits, 200);
+        assert_eq!(matches.work.indexed_file_visits, 25_000);
+        assert_eq!(matches.work.current_identity_bucket_visits, 1);
+        assert_eq!(matches.work.previous_identity_bucket_visits, 1);
+        assert!(matches.work.bucket_record_visits <= change_records.len() * 2);
+        assert!(matches.work.indexed_bucket_file_visits <= indexed_files.len() * 2);
+        assert!(
+            matches
+                .current_identity_error_by_record
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            matches
+                .previous_identity_error_by_record
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(matches.unavailable_indexed_identity_count, 0);
+    }
+
+    #[test]
+    fn affected_identity_matching_uses_native_hardlink_identity() {
+        let root = tempdir().expect("project");
+        let indexed = root.path().join("indexed.rs");
+        let alias = root.path().join("alias.rs");
+        fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+        fs::hard_link(&indexed, &alias).expect("create hardlink alias");
+        let records = vec![affected_test_record(
+            AffectedChangeKindDto::Modified,
+            "alias.rs",
+        )];
+        let mut identities = AffectedOperationIdentityIndex::native();
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut identities,
+        );
+
+        assert_eq!(matches.matched_file_ids, HashSet::from([CoreNodeId(1)]));
+        assert_eq!(matches.matched_record_flags, vec![true]);
+        assert_eq!(matches.work.indexed_file_visits, 1);
+    }
+
+    #[test]
+    fn affected_identity_matching_processes_first_seen_previous_bucket_once() {
+        let root = tempdir().expect("project");
+        let shared_seed = root.path().join("shared.rs");
+        fs::write(&shared_seed, "pub fn shared() {}\n").expect("write shared seed");
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&shared_seed).expect("shared identity");
+        let distinct_identities = (0..3)
+            .map(|index| {
+                let path = root.path().join(format!("distinct-{index}.rs"));
+                fs::write(&path, format!("pub fn distinct_{index}() {{}}\n"))
+                    .expect("write distinct seed");
+                codestory_workspace::workspace_path_identity(&path).expect("distinct identity")
+            })
+            .collect::<Vec<_>>();
+        let records = (0..3)
+            .map(|index| {
+                affected_test_move_record(
+                    AffectedChangeKindDto::Renamed,
+                    &format!("current-{index}.rs"),
+                    &format!("previous-{index}.rs"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let indexed = [
+            (CoreNodeId(30), PathBuf::from("indexed-30.rs")),
+            (CoreNodeId(10), PathBuf::from("indexed-10.rs")),
+            (CoreNodeId(20), PathBuf::from("indexed-20.rs")),
+        ];
+        let mut identities = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if let Some(index) = name
+                    .strip_prefix("current-")
+                    .and_then(|value| value.strip_suffix(".rs"))
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    return Ok(distinct_identities[index].clone());
+                }
+                Ok(shared_identity.clone())
+            }
+        });
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &records,
+            indexed
+                .iter()
+                .map(|(file_id, path)| (*file_id, path.as_path())),
+            &mut identities,
+        );
+
+        assert!(matches.matched_file_ids.is_empty());
+        assert_eq!(matches.graph_seeded_record_flags, vec![true, true, true]);
+        assert_eq!(
+            matches
+                .previous_record_index_by_file_id
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                (CoreNodeId(10), 0),
+                (CoreNodeId(20), 0),
+                (CoreNodeId(30), 0),
+            ])
+        );
+        assert_eq!(matches.work.record_visits, 3);
+        assert_eq!(matches.work.indexed_file_visits, 3);
+        assert_eq!(matches.work.current_identity_bucket_visits, 3);
+        assert_eq!(matches.work.previous_identity_bucket_visits, 1);
+        assert_eq!(matches.work.bucket_record_visits, 3);
+        assert_eq!(matches.work.indexed_bucket_file_visits, 3);
+    }
+
+    #[test]
+    fn affected_identity_matching_is_invariant_to_indexed_input_order() {
+        let root = tempdir().expect("project");
+        let first_seed = root.path().join("first-seed.rs");
+        let second_seed = root.path().join("second-seed.rs");
+        fs::write(&first_seed, "pub fn first() {}\n").expect("write first seed");
+        fs::write(&second_seed, "pub fn second() {}\n").expect("write second seed");
+        let first_identity =
+            codestory_workspace::workspace_path_identity(&first_seed).expect("first identity");
+        let second_identity =
+            codestory_workspace::workspace_path_identity(&second_seed).expect("second identity");
+        let records = vec![
+            affected_test_record(AffectedChangeKindDto::Modified, "current-first.rs"),
+            affected_test_record(AffectedChangeKindDto::Modified, "current-second.rs"),
+        ];
+        let forward = vec![
+            (CoreNodeId(30), PathBuf::from("indexed-first-z.rs")),
+            (CoreNodeId(10), PathBuf::from("indexed-first-a.rs")),
+            (CoreNodeId(20), PathBuf::from("indexed-second.rs")),
+            (CoreNodeId(40), PathBuf::from("missing-z.rs")),
+            (CoreNodeId(50), PathBuf::from("missing-a.rs")),
+        ];
+        let run = |indexed: &[(CoreNodeId, PathBuf)]| {
+            let first_identity = first_identity.clone();
+            let second_identity = second_identity.clone();
+            let mut identities =
+                AffectedOperationIdentityIndex::with_resolver(move |path: &Path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    if name == "current-first.rs" || name.starts_with("indexed-first-") {
+                        return Ok(first_identity.clone());
+                    }
+                    if matches!(name, "current-second.rs" | "indexed-second.rs") {
+                        return Ok(second_identity.clone());
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{name} unavailable"),
+                    ))
+                });
+            let matches = match_affected_file_identities(
+                root.path(),
+                &records,
+                indexed
+                    .iter()
+                    .map(|(file_id, path)| (*file_id, path.as_path())),
+                &mut identities,
+            );
+            (
+                matches.matched_file_ids,
+                matches.matched_record_flags,
+                matches.matched_record_index_by_file_id,
+                matches.graph_seeded_record_flags,
+                matches.unavailable_indexed_identity_count,
+                matches.unavailable_indexed_identity_sample,
+                matches.work,
+            )
+        };
+
+        let mut reverse = forward.clone();
+        reverse.reverse();
+        let mut rotated = forward.clone();
+        rotated.rotate_left(2);
+        let expected = run(&forward);
+        assert_eq!(run(&reverse), expected);
+        assert_eq!(run(&rotated), expected);
+        assert_eq!(expected.4, 2);
+        assert!(
+            expected
+                .5
+                .as_deref()
+                .is_some_and(|sample| sample.contains("missing-a.rs unavailable"))
+        );
+    }
+
+    #[test]
+    fn affected_identity_matching_counts_actual_two_phase_worst_case_work() {
+        let root = tempdir().expect("project");
+        let shared_seed = root.path().join("shared-seed.rs");
+        let previous_seed = root.path().join("previous-seed.rs");
+        let current_seed = root.path().join("current-seed.rs");
+        for path in [&shared_seed, &previous_seed, &current_seed] {
+            fs::write(path, "pub fn seed() {}\n").expect("write identity seed");
+        }
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&shared_seed).expect("shared identity");
+        let previous_identity = codestory_workspace::workspace_path_identity(&previous_seed)
+            .expect("previous identity");
+        let current_identity =
+            codestory_workspace::workspace_path_identity(&current_seed).expect("current identity");
+        let records = vec![
+            affected_test_move_record(
+                AffectedChangeKindDto::Renamed,
+                "current-matched.rs",
+                "previous-unmatched.rs",
+            ),
+            affected_test_move_record(
+                AffectedChangeKindDto::Renamed,
+                "current-unmatched.rs",
+                "previous-matched.rs",
+            ),
+        ];
+        let indexed = (0..1_000)
+            .map(|index| {
+                (
+                    CoreNodeId(index + 1),
+                    PathBuf::from(format!("indexed-{index}.rs")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let resolver_calls = std::cell::Cell::new(0_usize);
+        let resolver_calls_for_run = &resolver_calls;
+        let mut identities = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                resolver_calls_for_run.set(resolver_calls_for_run.get() + 1);
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if name == "current-matched.rs"
+                    || name == "previous-matched.rs"
+                    || name.starts_with("indexed-")
+                {
+                    Ok(shared_identity.clone())
+                } else if name == "previous-unmatched.rs" {
+                    Ok(previous_identity.clone())
+                } else {
+                    Ok(current_identity.clone())
+                }
+            }
+        });
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &records,
+            indexed
+                .iter()
+                .map(|(file_id, path)| (*file_id, path.as_path())),
+            &mut identities,
+        );
+
+        assert_eq!(resolver_calls.get(), indexed.len() + records.len() * 2);
+        assert_eq!(matches.matched_file_ids.len(), indexed.len());
+        assert_eq!(matches.matched_record_flags, vec![true, false]);
+        assert_eq!(matches.graph_seeded_record_flags, vec![true, true]);
+        assert!(matches.previous_record_index_by_file_id.is_empty());
+        assert_eq!(matches.work.record_visits, records.len());
+        assert_eq!(matches.work.indexed_file_visits, indexed.len());
+        assert_eq!(matches.work.bucket_record_visits, records.len());
+        assert_eq!(matches.work.indexed_bucket_file_visits, indexed.len() * 2);
+        assert!(matches.work.bucket_record_visits <= records.len() * 2);
+        assert!(matches.work.indexed_bucket_file_visits <= indexed.len() * 2);
+    }
+
+    #[test]
+    fn affected_identity_matching_reports_unavailable_observations() {
+        let root = tempdir().expect("project");
+        let change_records = vec![AffectedChangeRecordDto {
+            path: "identity-unavailable.rs".to_string(),
+            kind: AffectedChangeKindDto::Modified,
+            status: "M".to_string(),
+            previous_path: None,
+        }];
+        let indexed_path = PathBuf::from("identity-unavailable.rs");
+        let resolver_calls = std::cell::Cell::new(0_usize);
+        let mut path_identities = AffectedOperationIdentityIndex::with_resolver(|_: &Path| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected identity failure",
+            ))
+        });
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &change_records,
+            std::iter::once((CoreNodeId(1), indexed_path.as_path())),
+            &mut path_identities,
+        );
+
+        assert_eq!(resolver_calls.get(), 1);
+        assert!(matches.matched_file_ids.is_empty());
+        assert_eq!(matches.matched_record_flags, vec![false]);
+        assert_eq!(
+            matches
+                .current_identity_error_by_record
+                .iter()
+                .filter(|error| error.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(matches.unavailable_indexed_identity_count, 1);
+        assert!(
+            matches.current_identity_error_by_record[0]
+                .as_deref()
+                .is_some_and(|sample| sample.contains("injected identity failure"))
+        );
+        assert!(
+            matches
+                .unavailable_indexed_identity_sample
+                .as_deref()
+                .is_some_and(|sample| sample.contains("injected identity failure"))
+        );
+    }
+
+    #[test]
+    fn affected_identity_matching_accounts_current_previous_and_indexed_failures_independently() {
+        let root = tempdir().expect("project");
+        let shared_seed = root.path().join("shared-seed.rs");
+        let distinct_seed = root.path().join("distinct-seed.rs");
+        fs::write(&shared_seed, "pub fn shared() {}\n").expect("write shared seed");
+        fs::write(&distinct_seed, "pub fn distinct() {}\n").expect("write distinct seed");
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&shared_seed).expect("shared identity");
+        let distinct_identity = codestory_workspace::workspace_path_identity(&distinct_seed)
+            .expect("distinct identity");
+        let records = vec![affected_test_move_record(
+            AffectedChangeKindDto::Renamed,
+            "current.rs",
+            "previous.rs",
+        )];
+        let indexed = PathBuf::from("indexed.rs");
+
+        let mut current_failure = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("current.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "current identity failure",
+                    ))
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let current = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut current_failure,
+        );
+        assert!(
+            current.current_identity_error_by_record[0]
+                .as_deref()
+                .is_some_and(|error| error.contains("current identity failure"))
+        );
+        assert_eq!(current.matched_record_flags, vec![false]);
+        assert_eq!(current.graph_seeded_record_flags, vec![true]);
+
+        let mut previous_failure = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            let distinct_identity = distinct_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("previous.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "previous identity failure",
+                    ))
+                } else if path.ends_with("current.rs") {
+                    Ok(distinct_identity.clone())
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let previous = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut previous_failure,
+        );
+        assert!(
+            previous.previous_identity_error_by_record[0]
+                .as_deref()
+                .is_some_and(|error| error.contains("previous identity failure"))
+        );
+        assert_eq!(previous.matched_record_flags, vec![false]);
+        assert_eq!(previous.graph_seeded_record_flags, vec![false]);
+
+        let mut indexed_failure = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("indexed.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "indexed identity failure",
+                    ))
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let indexed_result = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut indexed_failure,
+        );
+        assert_eq!(indexed_result.unavailable_indexed_identity_count, 1);
+        assert!(
+            indexed_result
+                .unavailable_indexed_identity_sample
+                .as_deref()
+                .is_some_and(|error| error.contains("indexed identity failure"))
+        );
+        assert_eq!(indexed_result.matched_record_flags, vec![false]);
+
+        let mut excludable_previous = AffectedOperationIdentityIndex::with_resolver({
+            let shared_identity = shared_identity.clone();
+            move |path: &Path| {
+                if path.ends_with("previous.rs") {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "excludable previous identity failure",
+                    ))
+                } else {
+                    Ok(shared_identity.clone())
+                }
+            }
+        });
+        let excludable = match_affected_file_identities(
+            root.path(),
+            &records,
+            std::iter::once((CoreNodeId(1), indexed.as_path())),
+            &mut excludable_previous,
+        );
+        assert_eq!(excludable.matched_record_flags, vec![true]);
+        assert!(excludable.previous_identity_error_by_record[0].is_some());
+    }
+
+    #[test]
+    fn affected_gap_composition_has_zero_one_hot_and_all_four_controls() {
+        let completeness_for = |gap_composition| {
+            compose_affected_completeness(AffectedCompletenessInput {
+                uncovered_input_count: 0,
+                direct_impact_count: 1,
+                propagated_impact_count: 2,
+                candidate_test_count: 3,
+                freshness_evidence_affects_requested_claim: false,
+                gap_composition,
+                truncation_reasons: Vec::new(),
+            })
+        };
+        let zero = compose_affected_evidence_gaps(0, &AffectedRelevantEvidenceGaps::default());
+        assert!(zero.gap_free);
+        assert_eq!(zero.confidence(), "complete");
+        assert_eq!(zero.unavailable_evidence_count, 0);
+        assert!(zero.blind_spots.is_empty());
+        let zero_completeness = completeness_for(zero);
+        assert!(zero_completeness.complete);
+        assert_eq!(zero_completeness.confidence, "complete");
+        assert_eq!(zero_completeness.unavailable_evidence_count, 0);
+
+        for category in ["current", "previous", "indexed", "freshness"] {
+            let mut gaps = AffectedRelevantEvidenceGaps::default();
+            let gap = match category {
+                "current" => &mut gaps.current,
+                "previous" => &mut gaps.previous,
+                "indexed" => &mut gaps.indexed,
+                "freshness" => &mut gaps.freshness,
+                _ => unreachable!(),
+            };
+            gap.count = 1;
+            gap.sample = Some(format!("{category} sample"));
+            let composition = compose_affected_evidence_gaps(0, &gaps);
+            assert!(!composition.gap_free, "{category}");
+            assert_eq!(composition.confidence(), "bounded", "{category}");
+            assert_eq!(composition.unavailable_evidence_count, 1, "{category}");
+            assert_eq!(composition.blind_spots.len(), 1, "{category}");
+            assert!(composition.blind_spots[0].contains(category), "{category}");
+            let completeness = completeness_for(composition);
+            assert!(!completeness.complete, "{category}");
+            assert_eq!(completeness.confidence, "bounded", "{category}");
+            assert_eq!(completeness.unavailable_evidence_count, 1, "{category}");
+        }
+
+        let all_four = AffectedRelevantEvidenceGaps {
+            current: AffectedEvidenceGapCategory {
+                count: 1,
+                sample: Some("current sample".to_string()),
+            },
+            previous: AffectedEvidenceGapCategory {
+                count: 2,
+                sample: Some("previous sample".to_string()),
+            },
+            indexed: AffectedEvidenceGapCategory {
+                count: 3,
+                sample: Some("indexed sample".to_string()),
+            },
+            freshness: AffectedEvidenceGapCategory {
+                count: 4,
+                sample: Some("freshness sample".to_string()),
+            },
+        };
+        let composition = compose_affected_evidence_gaps(0, &all_four);
+        assert!(!composition.gap_free);
+        assert_eq!(composition.confidence(), "bounded");
+        assert_eq!(composition.unavailable_evidence_count, 10);
+        assert_eq!(composition.blind_spots.len(), 4);
+        for (blind_spot, category) in composition.blind_spots.iter().zip([
+            "current-path",
+            "previous-path",
+            "indexed files",
+            "refresh-plan",
+        ]) {
+            assert!(blind_spot.contains(category), "{blind_spot}");
+        }
+        let completeness = completeness_for(composition);
+        assert!(!completeness.complete);
+        assert_eq!(completeness.confidence, "bounded");
+        assert_eq!(completeness.unavailable_evidence_count, 10);
+    }
+
+    #[test]
+    fn affected_gap_relevance_is_pure_and_excludes_previous_after_current_match() {
+        let resolved = vec![AffectedResolvedInput {
+            current: PathBuf::from("current.rs"),
+            previous: Some(PathBuf::from("previous.rs")),
+        }];
+        let current_errors = vec![Some("current gap".to_string())];
+        let previous_errors = vec![Some("previous gap".to_string())];
+        let unmatched = [false];
+        let all_relevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
+            resolved_inputs: &resolved,
+            matched_record_flags: &unmatched,
+            current_identity_errors: &current_errors,
+            previous_identity_errors: &previous_errors,
+            unavailable_indexed_identity_count: 2,
+            unavailable_indexed_identity_sample: Some("indexed gap"),
+            freshness_evidence_affects_requested_claim: true,
+            freshness_identity_gap_count: 3,
+            freshness_identity_gap_sample: Some("freshness gap"),
+        });
+        assert_eq!(all_relevant.current.count, 1);
+        assert_eq!(all_relevant.previous.count, 1);
+        assert_eq!(all_relevant.indexed.count, 2);
+        assert_eq!(all_relevant.freshness.count, 3);
+
+        let matched = [true];
+        let current_wins = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
+            resolved_inputs: &resolved,
+            matched_record_flags: &matched,
+            current_identity_errors: &current_errors,
+            previous_identity_errors: &previous_errors,
+            unavailable_indexed_identity_count: 0,
+            unavailable_indexed_identity_sample: None,
+            freshness_evidence_affects_requested_claim: false,
+            freshness_identity_gap_count: 0,
+            freshness_identity_gap_sample: None,
+        });
+        assert_eq!(current_wins.current.count, 1);
+        assert_eq!(current_wins.previous.count, 0);
+
+        let svg = vec![AffectedResolvedInput {
+            current: PathBuf::from("desk.svg"),
+            previous: None,
+        }];
+        let irrelevant = affected_relevant_evidence_gaps(AffectedRelevantEvidenceGapInput {
+            workspace_root: None,
+            resolved_inputs: &svg,
+            matched_record_flags: &[false],
+            current_identity_errors: &current_errors,
+            previous_identity_errors: &[None],
+            unavailable_indexed_identity_count: 4,
+            unavailable_indexed_identity_sample: Some("irrelevant indexed gap"),
+            freshness_evidence_affects_requested_claim: false,
+            freshness_identity_gap_count: 5,
+            freshness_identity_gap_sample: Some("irrelevant freshness gap"),
+        });
+        assert_eq!(irrelevant, AffectedRelevantEvidenceGaps::default());
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -12869,22 +18954,1166 @@ mod tests {
         }
     }
 
-    fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
+    fn assert_mandatory_retrieval_unavailable(error: &ApiError) {
         assert_eq!(error.code, "retrieval_unavailable");
         assert!(
             error
                 .message
-                .contains("sidecar retrieval primary is unavailable or degraded")
-                || error
-                    .message
-                    .contains("sidecar retrieval primary is mandatory"),
-            "expected mandatory sidecar failure, got {error:?}"
+                .contains("retrieval is unavailable or degraded")
+                || error.message.contains("full retrieval is mandatory"),
+            "expected mandatory retrieval failure, got {error:?}"
         );
         let details = error.details.as_ref().expect("retrieval error details");
-        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_engine"));
         assert!(
             !details.next_commands.is_empty(),
-            "retrieval error should include repair commands: {error:?}"
+            "retrieval error should include recovery commands: {error:?}"
+        );
+    }
+
+    fn affected_test_freshness(
+        root: &Path,
+        status: IndexFreshnessStatusDto,
+        samples: Vec<IndexFreshnessSampleDto>,
+    ) -> IndexFreshnessObservation {
+        let stale_paths = samples
+            .iter()
+            .map(|sample| root.join(&sample.path))
+            .collect::<Vec<_>>();
+        let stale_identities = stale_paths
+            .iter()
+            .map(|path| {
+                codestory_workspace::workspace_path_identity(path)
+                    .expect("test freshness path identity")
+            })
+            .collect::<HashSet<_>>();
+        IndexFreshnessObservation {
+            freshness: IndexFreshnessDto {
+                status,
+                changed_file_count: 0,
+                new_file_count: 0,
+                removed_file_count: 0,
+                checked_file_count: 1,
+                indexed_file_count: 1,
+                duration_ms: 0,
+                reason: None,
+                samples,
+            },
+            inventory_complete: status != IndexFreshnessStatusDto::NotChecked,
+            admitted_identities: stale_identities.clone(),
+            stale_identities,
+            identity_gap_count: 0,
+            identity_gap_sample: None,
+        }
+    }
+
+    fn classify_unmatched_affected_input_for_test(
+        record: &AffectedChangeRecordDto,
+        resolved: &AffectedResolvedInput,
+        freshness: &IndexFreshnessObservation,
+    ) -> (AffectedInputClassificationDto, String, Vec<String>) {
+        let current_identity = codestory_workspace::workspace_path_identity(&resolved.current).ok();
+        classify_unmatched_affected_input(
+            None,
+            record,
+            resolved,
+            freshness,
+            current_identity.as_ref(),
+            None,
+            None,
+        )
+    }
+
+    fn affected_test_record(kind: AffectedChangeKindDto, path: &str) -> AffectedChangeRecordDto {
+        AffectedChangeRecordDto {
+            path: path.to_string(),
+            kind,
+            status: "test".to_string(),
+            previous_path: None,
+        }
+    }
+
+    fn affected_test_move_record(
+        kind: AffectedChangeKindDto,
+        path: &str,
+        previous_path: &str,
+    ) -> AffectedChangeRecordDto {
+        AffectedChangeRecordDto {
+            path: path.to_string(),
+            kind,
+            status: "test".to_string(),
+            previous_path: Some(previous_path.to_string()),
+        }
+    }
+
+    #[test]
+    fn affected_runtime_normalization_rejects_previous_path_for_non_move_records() {
+        let error = normalized_affected_input(&AffectedAnalysisInput::ChangeRecords(vec![
+            affected_test_move_record(AffectedChangeKindDto::Modified, "new.rs", "old.rs"),
+        ]))
+        .expect_err("modified records must not carry previous identity");
+
+        assert_eq!(error.code, "invalid_argument");
+        assert!(error.message.contains("renamed or copied"));
+    }
+
+    #[test]
+    fn affected_unmatched_classification_uses_positive_path_and_freshness_evidence() {
+        let project = tempdir().expect("project");
+        let svg = project.path().join("desk.svg");
+        fs::write(&svg, "<svg/>").expect("write svg");
+        let fresh =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        let resolved_svg = AffectedResolvedInput {
+            current: svg.clone(),
+            previous: None,
+        };
+        let (classification, _, _) = classify_unmatched_affected_input_for_test(
+            &affected_test_record(AffectedChangeKindDto::Modified, "desk.svg"),
+            &resolved_svg,
+            &fresh,
+        );
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+
+        let source = project.path().join("new.rs");
+        fs::write(&source, "pub fn new_source() {}\n").expect("write source");
+        let stale = affected_test_freshness(
+            project.path(),
+            IndexFreshnessStatusDto::Stale,
+            vec![IndexFreshnessSampleDto {
+                kind: IndexFreshnessChangeKindDto::New,
+                path: "new.rs".to_string(),
+            }],
+        );
+        let resolved_source = AffectedResolvedInput {
+            current: source,
+            previous: None,
+        };
+        let (classification, _, evidence) = classify_unmatched_affected_input_for_test(
+            &affected_test_record(AffectedChangeKindDto::Added, "new.rs"),
+            &resolved_source,
+            &stale,
+        );
+        assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
+        assert!(
+            evidence
+                .iter()
+                .any(|entry| entry.contains("freshness evidence"))
+        );
+    }
+
+    #[test]
+    fn affected_unmatched_classification_distinguishes_missing_delete_and_rename() {
+        let project = tempdir().expect("project");
+        fs::create_dir(project.path().join("src")).expect("create source directory");
+        let missing = resolve_project_file_path_from_root(
+            project.path(),
+            "src/deleted/parents/missing.rs",
+            true,
+        )
+        .expect("resolve nested missing current path");
+        let previous = resolve_project_file_path_from_root(
+            project.path(),
+            "src/old/deleted/parents/previous.rs",
+            true,
+        )
+        .expect("resolve nested missing previous path");
+        let resolved = AffectedResolvedInput {
+            current: missing,
+            previous: Some(previous),
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        for (kind, expected) in [
+            (
+                AffectedChangeKindDto::Modified,
+                AffectedInputClassificationDto::Missing,
+            ),
+            (
+                AffectedChangeKindDto::Deleted,
+                AffectedInputClassificationDto::ExpectedDeleted,
+            ),
+            (
+                AffectedChangeKindDto::Renamed,
+                AffectedInputClassificationDto::RenameUnresolved,
+            ),
+        ] {
+            let (classification, _, _) = classify_unmatched_affected_input_for_test(
+                &affected_test_record(kind, "src/deleted/parents/missing.rs"),
+                &resolved,
+                &freshness,
+            );
+            assert_eq!(classification, expected);
+        }
+    }
+
+    #[test]
+    fn affected_unmatched_directory_is_malformed_not_valid_uncovered() {
+        let project = tempdir().expect("project");
+        let directory = project.path().join("assets");
+        fs::create_dir(&directory).expect("create directory");
+        let resolved = AffectedResolvedInput {
+            current: directory,
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+
+        let (classification, reason, _) = classify_unmatched_affected_input_for_test(
+            &affected_test_record(AffectedChangeKindDto::Modified, "assets"),
+            &resolved,
+            &freshness,
+        );
+
+        assert_eq!(classification, AffectedInputClassificationDto::Malformed);
+        assert!(reason.contains("regular file"));
+    }
+
+    #[test]
+    fn affected_unmatched_metadata_error_is_unavailable_not_missing() {
+        let project = tempdir().expect("project");
+        let resolved = AffectedResolvedInput {
+            current: project.path().join("unreadable.rs"),
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+
+        let (classification, reason, evidence) = classify_unmatched_affected_input_with_metadata(
+            &affected_test_record(AffectedChangeKindDto::Modified, "unreadable.rs"),
+            &resolved,
+            &freshness,
+            None,
+            None,
+            None,
+            AffectedUnmatchedPathObservation {
+                workspace_root: None,
+                metadata: AffectedPathMetadataObservation::Unavailable {
+                    kind: io::ErrorKind::PermissionDenied,
+                    message: "injected metadata denial".to_string(),
+                },
+            },
+        );
+
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::UnavailableEvidence
+        );
+        assert!(reason.contains("metadata was unavailable"));
+        assert!(evidence.iter().any(|item| {
+            item.contains("kind=PermissionDenied") && item.contains("injected metadata denial")
+        }));
+        assert!(evidence.iter().all(|item| !item.contains("missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn affected_unmatched_broken_symlink_is_malformed_not_missing() {
+        let project = tempdir().expect("project");
+        let broken_link = project.path().join("broken.rs");
+        std::os::unix::fs::symlink(project.path().join("absent-target.rs"), &broken_link)
+            .expect("create broken symlink");
+        let resolved = AffectedResolvedInput {
+            current: broken_link,
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+
+        let (classification, reason, _) = classify_unmatched_affected_input_for_test(
+            &affected_test_record(AffectedChangeKindDto::Modified, "broken.rs"),
+            &resolved,
+            &freshness,
+        );
+
+        assert_eq!(classification, AffectedInputClassificationDto::Malformed);
+        assert!(reason.contains("regular file"));
+    }
+
+    #[test]
+    fn affected_matched_recorded_error_takes_precedence_over_stale_evidence() {
+        let mut file = AffectedMatchedFileDto {
+            path: "src/lib.rs".to_string(),
+            role: IndexedFileRoleDto::Source,
+            indexed: true,
+            complete: false,
+            change_kind: Some(AffectedChangeKindDto::Modified),
+            change_status: Some("M".to_string()),
+            previous_path: None,
+            error_count: 1,
+        };
+
+        let (classification, _, evidence) =
+            classify_matched_affected_input(&file, true, true).expect("incomplete evidence");
+        assert_eq!(classification, AffectedInputClassificationDto::Malformed);
+        assert!(evidence.iter().any(|item| item.contains("error_count=1")));
+
+        file.error_count = 0;
+        let (classification, _, _) =
+            classify_matched_affected_input(&file, true, true).expect("stale evidence");
+        assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
+    }
+
+    #[test]
+    fn affected_indexable_absence_uses_complete_inventory_and_exact_staleness() {
+        let project = tempdir().expect("project");
+        let excluded = project.path().join("target/excluded.rs");
+        fs::create_dir_all(excluded.parent().expect("excluded parent")).expect("create target");
+        fs::write(&excluded, "pub fn excluded() {}\n").expect("write excluded source");
+        let resolved = AffectedResolvedInput {
+            current: excluded.clone(),
+            previous: None,
+        };
+        let record = affected_test_record(AffectedChangeKindDto::Modified, "target/excluded.rs");
+        let admitted_identity =
+            codestory_workspace::workspace_path_identity(&project.path().join("src/lib.rs"))
+                .expect("admitted identity");
+        let unrelated_stale_identity =
+            codestory_workspace::workspace_path_identity(&project.path().join("src/unrelated.rs"))
+                .expect("unrelated stale identity");
+
+        let complete_excluded = IndexFreshnessObservation {
+            freshness: affected_test_freshness(
+                project.path(),
+                IndexFreshnessStatusDto::Stale,
+                Vec::new(),
+            )
+            .freshness,
+            inventory_complete: true,
+            admitted_identities: HashSet::from([admitted_identity]),
+            stale_identities: HashSet::from([unrelated_stale_identity]),
+            identity_gap_count: 0,
+            identity_gap_sample: None,
+        };
+        let (classification, _, evidence) =
+            classify_unmatched_affected_input_for_test(&record, &resolved, &complete_excluded);
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.contains("inventory excludes"))
+        );
+
+        let excluded_identity =
+            codestory_workspace::workspace_path_identity(&excluded).expect("excluded identity");
+        let exact_stale = IndexFreshnessObservation {
+            admitted_identities: HashSet::from([excluded_identity.clone()]),
+            stale_identities: HashSet::from([excluded_identity]),
+            ..complete_excluded.clone()
+        };
+        let (classification, _, _) =
+            classify_unmatched_affected_input_for_test(&record, &resolved, &exact_stale);
+        assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
+
+        let incomplete = IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+            "bounded inventory",
+            1,
+            Instant::now(),
+        ));
+        let (classification, _, _) =
+            classify_unmatched_affected_input_for_test(&record, &resolved, &incomplete);
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::UnavailableEvidence
+        );
+    }
+
+    #[test]
+    fn affected_refresh_follow_up_requires_requested_stale_classification() {
+        let unrelated_stale = AffectedUncoveredInputDto {
+            path: "target/excluded.rs".to_string(),
+            classification: AffectedInputClassificationDto::ValidUncovered,
+            reason: "excluded by complete inventory".to_string(),
+            evidence: Vec::new(),
+        };
+        let follow_ups = affected_follow_ups("/project", &[unrelated_stale], None);
+        assert!(
+            follow_ups
+                .iter()
+                .all(|follow_up| follow_up.action != "refresh_stale_index")
+        );
+
+        let requested_stale = AffectedUncoveredInputDto {
+            path: "src/lib.rs".to_string(),
+            classification: AffectedInputClassificationDto::StaleIndex,
+            reason: "exact stale path".to_string(),
+            evidence: Vec::new(),
+        };
+        let follow_ups = affected_follow_ups("/project", &[requested_stale], None);
+        assert_eq!(
+            follow_ups
+                .iter()
+                .filter(|follow_up| follow_up.action == "refresh_stale_index")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn affected_follow_ups_are_deduplicated_and_empty_for_complete_input() {
+        let duplicate = AffectedUncoveredInputDto {
+            path: "desk.svg".to_string(),
+            classification: AffectedInputClassificationDto::ValidUncovered,
+            reason: "outside graph coverage".to_string(),
+            evidence: Vec::new(),
+        };
+
+        let follow_ups = affected_follow_ups("/project", &[duplicate.clone(), duplicate], None);
+
+        assert_eq!(follow_ups.len(), 1);
+        assert_eq!(follow_ups[0].action, "inspect_graph_boundary");
+        assert!(follow_ups[0].invocation.is_none());
+        assert!(affected_follow_ups("/project", &[], None).is_empty());
+    }
+
+    #[test]
+    fn affected_not_checked_svg_has_no_doctor_or_index_follow_up() {
+        let project = tempdir().expect("project");
+        fs::write(project.path().join("desk.svg"), "<svg/>\n").expect("write SVG");
+        Storage::open(project.path().join("codestory.db")).expect("create empty storage");
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["desk.svg".to_string()]),
+                depth: Some(1),
+                filter: None,
+            })
+            .expect("analyze SVG without freshness inventory");
+
+        assert_eq!(
+            result.uncovered_inputs[0].classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert_eq!(result.follow_ups.len(), 1);
+        assert_eq!(result.follow_ups[0].action, "inspect_graph_boundary");
+        assert!(result.follow_ups[0].invocation.is_none());
+    }
+
+    #[test]
+    fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
+        let project = tempdir().expect("project");
+        let source_dir = project.path().join("src");
+        fs::create_dir(&source_dir).expect("create source directory");
+        let requested = source_dir.join("requested.rs");
+        let unrelated = source_dir.join("unrelated.rs");
+        fs::write(&requested, "pub fn requested() {}\n").expect("write requested source");
+        fs::write(&unrelated, "pub fn unrelated() {}\n").expect("write unrelated source");
+        let requested_mtime = fs::metadata(&requested)
+            .expect("requested metadata")
+            .modified()
+            .expect("requested mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("requested mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        {
+            let mut storage = Storage::open(project.path().join("codestory.db"))
+                .expect("open stale fixture storage");
+            for file in [
+                FileInfo {
+                    id: 1,
+                    path: requested.clone(),
+                    language: "rust".to_string(),
+                    modification_time: requested_mtime,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                },
+                FileInfo {
+                    id: 2,
+                    path: unrelated.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                },
+            ] {
+                storage.insert_file(&file).expect("insert fixture file");
+            }
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: requested.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(10),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "requested".to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FILE,
+                        serialized_name: unrelated.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert fixture nodes");
+        }
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["src/requested.rs".to_string()]),
+                depth: Some(1),
+                filter: None,
+            })
+            .expect("analyze fresh requested path");
+
+        assert!(result.completeness.complete, "{result:?}");
+        assert!(result.follow_ups.is_empty(), "{result:?}");
+        assert!(
+            result
+                .blind_spots
+                .iter()
+                .any(|spot| spot.contains("unrelated stale index state"))
+        );
+    }
+
+    #[test]
+    fn affected_rename_and_copy_classify_current_path_while_previous_identity_only_seeds_graph() {
+        let project = tempdir().expect("project");
+        let source_dir = project.path().join("src");
+        fs::create_dir_all(&source_dir).expect("create source directory");
+        let previous_path = source_dir.join("old.rs");
+        fs::write(&previous_path, "pub fn previous_seed() {}\n").expect("write previous source");
+        let modification_time = fs::metadata(&previous_path)
+            .expect("previous metadata")
+            .modified()
+            .expect("previous mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let storage_path = project.path().join("codestory.db");
+        {
+            let mut storage = Storage::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: previous_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("insert previous file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: previous_path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "previous_seed".to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert previous graph");
+        }
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+
+        for (kind, current_name) in [
+            (AffectedChangeKindDto::Renamed, "renamed.rs"),
+            (AffectedChangeKindDto::Copied, "copied.rs"),
+        ] {
+            let current_path = source_dir.join(current_name);
+            fs::write(&current_path, "pub fn current_source() {}\n").expect("write current source");
+            let result = controller
+                .affected_analysis(AffectedAnalysisRequest {
+                    input: AffectedAnalysisInput::ChangeRecords(vec![affected_test_move_record(
+                        kind,
+                        &format!("src/{current_name}"),
+                        "src/old.rs",
+                    )]),
+                    depth: Some(2),
+                    filter: None,
+                })
+                .expect("analyze current move path");
+
+            assert_eq!(result.matched_file_count, 0);
+            assert!(result.matched_files.is_empty());
+            assert_eq!(result.unmatched_paths.len(), 1);
+            assert_eq!(
+                result.unmatched_paths[0].classification,
+                AffectedInputClassificationDto::StaleIndex
+            );
+            assert_eq!(
+                result
+                    .follow_ups
+                    .iter()
+                    .filter(|follow_up| follow_up.action == "refresh_stale_index")
+                    .count(),
+                1
+            );
+            assert!(
+                result
+                    .blind_spots
+                    .iter()
+                    .all(|blind_spot| !blind_spot.contains("unrelated stale index state"))
+            );
+            let proxy_symbol = result
+                .impacted_symbols
+                .iter()
+                .find(|symbol| symbol.display_name == "previous_seed")
+                .expect("previous identity proxy symbol");
+            assert_eq!(proxy_symbol.confidence, "bounded");
+            assert!(proxy_symbol.reason.contains("previous indexed identity"));
+            fs::remove_file(current_path).expect("remove current source");
+        }
+
+        let svg_path = project.path().join("desk.svg");
+        fs::write(&svg_path, "<svg/>\n").expect("write svg");
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::ChangeRecords(vec![affected_test_move_record(
+                    AffectedChangeKindDto::Copied,
+                    "desk.svg",
+                    "src/old.rs",
+                )]),
+                depth: Some(2),
+                filter: None,
+            })
+            .expect("analyze copied static asset");
+
+        assert_eq!(result.matched_file_count, 0);
+        assert_eq!(
+            result.unmatched_paths[0].classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert_eq!(result.follow_ups.len(), 1);
+        assert_eq!(result.follow_ups[0].action, "inspect_graph_boundary");
+        assert!(
+            result
+                .follow_ups
+                .iter()
+                .all(|follow_up| follow_up.action != "refresh_stale_index")
+        );
+        let proxy_symbol = result
+            .impacted_symbols
+            .iter()
+            .find(|symbol| symbol.display_name == "previous_seed")
+            .expect("static copy retains bounded proxy seed");
+        assert_eq!(proxy_symbol.confidence, "bounded");
+
+        let current_path = source_dir.join("current.rs");
+        fs::write(&current_path, "pub fn current_seed() {}\n").expect("write indexed current");
+        let current_mtime = fs::metadata(&current_path)
+            .expect("current metadata")
+            .modified()
+            .expect("current mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        {
+            let mut storage = Storage::open(&storage_path).expect("reopen storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 3,
+                    path: current_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: current_mtime,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("insert current file");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(3),
+                        kind: NodeKind::FILE,
+                        serialized_name: current_path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(4),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "current_seed".to_string(),
+                        file_node_id: Some(CoreNodeId(3)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert current graph");
+        }
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::ChangeRecords(vec![affected_test_move_record(
+                    AffectedChangeKindDto::Copied,
+                    "src/current.rs",
+                    "src/old.rs",
+                )]),
+                depth: Some(2),
+                filter: None,
+            })
+            .expect("analyze indexed current identity");
+        assert_eq!(result.matched_file_count, 1);
+        assert!(
+            result.impacted_symbols.iter().any(
+                |symbol| symbol.display_name == "current_seed" && symbol.confidence == "direct"
+            )
+        );
+        assert!(
+            result
+                .impacted_symbols
+                .iter()
+                .all(|symbol| symbol.display_name != "previous_seed")
+        );
+    }
+
+    #[test]
+    fn affected_reverse_walk_is_total_across_every_edge_and_seed_permutation() {
+        let edges = vec![
+            Edge {
+                id: EdgeId(100),
+                source: CoreNodeId(30),
+                target: CoreNodeId(10),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(101),
+                source: CoreNodeId(30),
+                target: CoreNodeId(11),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(102),
+                source: CoreNodeId(30),
+                target: CoreNodeId(20),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(201),
+                source: CoreNodeId(40),
+                target: CoreNodeId(30),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Uncertain),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(301),
+                source: CoreNodeId(50),
+                target: CoreNodeId(20),
+                kind: EdgeKind::CALL,
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            },
+        ];
+        let seeds = vec![
+            (
+                CoreNodeId(10),
+                AffectedGraphEvidence::seed(
+                    CoreNodeId(10),
+                    "first direct seed",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    false,
+                ),
+            ),
+            (
+                CoreNodeId(11),
+                AffectedGraphEvidence::seed(
+                    CoreNodeId(11),
+                    "second direct seed",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    false,
+                ),
+            ),
+            (
+                CoreNodeId(20),
+                AffectedGraphEvidence::seed(
+                    CoreNodeId(20),
+                    "previous identity proxy seed",
+                    AffectedConfidenceFloor::from_label("direct"),
+                    true,
+                ),
+            ),
+        ];
+        let labels = HashMap::from([
+            (CoreNodeId(10), "first_seed".to_string()),
+            (CoreNodeId(11), "second_seed".to_string()),
+            (CoreNodeId(20), "proxy_seed".to_string()),
+            (CoreNodeId(30), "convergence".to_string()),
+        ]);
+        let edge_permutations = all_permutations(&edges);
+        let seed_permutations = all_permutations(&seeds);
+        assert_eq!(edge_permutations.len(), 120);
+        assert_eq!(seed_permutations.len(), 6);
+
+        let mut expected = None;
+        for edge_order in edge_permutations {
+            for seed_order in &seed_permutations {
+                let seed_evidence = seed_order.iter().cloned().collect::<BTreeMap<_, _>>();
+                let walk = affected_reverse_walk(2, &edge_order, seed_evidence, &labels);
+                if let Some(expected) = expected.as_ref() {
+                    assert_eq!(&walk, expected);
+                } else {
+                    expected = Some(walk);
+                }
+            }
+        }
+
+        let walk = expected.expect("deterministic reverse walk");
+        assert_eq!(walk.visited_edge_count, 5);
+        let convergence = &walk.evidence[&CoreNodeId(30)];
+        assert_eq!(convergence.confidence_floor.label(), "certain");
+        assert!(!convergence.previous_identity_proxy);
+        assert_eq!(
+            convergence.path_tie_key,
+            vec![
+                AffectedPathTieStep {
+                    edge_id: i64::MIN,
+                    source_node_id: CoreNodeId(10),
+                    target_node_id: CoreNodeId(10),
+                },
+                AffectedPathTieStep {
+                    edge_id: 100,
+                    source_node_id: CoreNodeId(30),
+                    target_node_id: CoreNodeId(10),
+                },
+            ]
+        );
+        assert_eq!(
+            walk.evidence[&CoreNodeId(40)].confidence_floor.label(),
+            "uncertain",
+            "the weakest edge floor must survive the complete path"
+        );
+        assert_eq!(
+            walk.evidence[&CoreNodeId(50)].confidence_floor.label(),
+            "bounded",
+            "a previous-identity proxy must remain bounded across traversal"
+        );
+    }
+
+    #[test]
+    fn affected_route_confidence_is_the_weaker_graph_or_metadata_floor() {
+        let probable = AffectedConfidenceFloor::from_label("probable");
+        for structured_label in ["file_convention", "decorator", "annotation", "attribute"] {
+            assert_eq!(
+                AffectedConfidenceFloor::from_label(structured_label).strength,
+                probable.strength,
+                "{structured_label} must retain the probable structured-evidence tier"
+            );
+        }
+        assert!(probable.strength > AffectedConfidenceFloor::from_label("graph").strength);
+        assert!(
+            AffectedConfidenceFloor::from_label("graph").strength
+                > AffectedConfidenceFloor::from_label("heuristic").strength
+        );
+
+        let graph = AffectedGraphEvidence::seed(
+            CoreNodeId(1),
+            "graph route evidence",
+            AffectedConfidenceFloor::from_label("certain"),
+            false,
+        );
+        let nested_metadata_label = "heuristic".to_string();
+        assert_eq!(
+            affected_route_confidence(&graph, Some(&nested_metadata_label)),
+            "heuristic"
+        );
+        assert_eq!(nested_metadata_label, "heuristic");
+
+        let proxy = AffectedGraphEvidence::seed(
+            CoreNodeId(2),
+            "proxy route evidence",
+            AffectedConfidenceFloor::from_label("schema"),
+            true,
+        );
+        assert_eq!(affected_route_confidence(&proxy, Some("schema")), "bounded");
+        assert_eq!(affected_route_confidence(&graph, None), "graph");
+    }
+
+    #[test]
+    fn route_handler_comparator_is_total_across_every_candidate_permutation() {
+        let candidate = |edge_id: i64,
+                         confidence: Option<f32>,
+                         certainty: ResolutionCertainty,
+                         semantic: &str,
+                         start_line: u32,
+                         target_id: i64| RouteHandlerCandidate {
+            edge: Edge {
+                id: EdgeId(edge_id),
+                source: CoreNodeId(900),
+                target: CoreNodeId(target_id),
+                kind: EdgeKind::CALL,
+                confidence,
+                certainty: Some(certainty),
+                ..Default::default()
+            },
+            target: Node {
+                id: CoreNodeId(target_id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: semantic.to_string(),
+                qualified_name: Some(semantic.to_string()),
+                canonical_id: Some(semantic.to_string()),
+                file_node_id: Some(CoreNodeId(800)),
+                start_line: Some(start_line),
+                start_col: Some(1),
+                end_line: Some(start_line),
+                end_col: Some(2),
+            },
+        };
+        let candidates = vec![
+            candidate(1, Some(0.9), ResolutionCertainty::Uncertain, "zeta", 9, 9),
+            candidate(2, Some(0.8), ResolutionCertainty::Certain, "alpha", 1, 1),
+            candidate(3, Some(0.8), ResolutionCertainty::Certain, "alpha", 1, 1),
+            candidate(4, Some(0.8), ResolutionCertainty::Certain, "alpha", 1, 2),
+            candidate(5, Some(0.8), ResolutionCertainty::Certain, "alpha", 2, 3),
+            candidate(
+                6,
+                Some(0.8),
+                ResolutionCertainty::Probable,
+                "aardvark",
+                1,
+                4,
+            ),
+            candidate(7, Some(0.8), ResolutionCertainty::Certain, "beta", 1, 5),
+        ];
+        let permutations = all_permutations(&candidates);
+        assert_eq!(permutations.len(), 5_040);
+        for mut permutation in permutations {
+            permutation.sort_by(compare_route_handler_candidates);
+            assert_eq!(
+                permutation
+                    .iter()
+                    .map(|candidate| candidate.edge.id.0)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5, 7, 6]
+            );
+        }
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                compare_optional_confidence_desc(Some(non_finite), None),
+                Ordering::Equal,
+                "non-finite confidence must rank as absent"
+            );
+        }
+        assert_eq!(
+            compare_optional_confidence_desc(Some(0.0), None),
+            Ordering::Less,
+            "every finite confidence must rank ahead of absent quality"
+        );
+
+        let hostile = vec![
+            candidate(11, Some(0.9), ResolutionCertainty::Certain, "same", 1, 100),
+            candidate(12, Some(0.4), ResolutionCertainty::Certain, "same", 1, 100),
+            candidate(13, None, ResolutionCertainty::Certain, "same", 1, 100),
+            candidate(
+                14,
+                Some(f32::NAN),
+                ResolutionCertainty::Certain,
+                "same",
+                1,
+                100,
+            ),
+            candidate(
+                15,
+                Some(f32::INFINITY),
+                ResolutionCertainty::Certain,
+                "same",
+                1,
+                100,
+            ),
+            candidate(
+                16,
+                Some(f32::NEG_INFINITY),
+                ResolutionCertainty::Certain,
+                "same",
+                1,
+                100,
+            ),
+        ];
+        let permutations = all_permutations(&hostile);
+        assert_eq!(permutations.len(), 720);
+        for mut permutation in permutations {
+            permutation.sort_by(compare_route_handler_candidates);
+            assert_eq!(
+                permutation
+                    .iter()
+                    .map(|candidate| candidate.edge.id.0)
+                    .collect::<Vec<_>>(),
+                vec![11, 12, 13, 14, 15, 16]
+            );
+        }
+        for left in &hostile {
+            assert_eq!(
+                compare_route_handler_candidates(left, left),
+                Ordering::Equal
+            );
+            for right in &hostile {
+                assert_eq!(
+                    compare_route_handler_candidates(left, right),
+                    compare_route_handler_candidates(right, left).reverse()
+                );
+                for third in &hostile {
+                    let left_to_right = compare_route_handler_candidates(left, right);
+                    let right_to_third = compare_route_handler_candidates(right, third);
+                    if left_to_right != Ordering::Greater && right_to_third != Ordering::Greater {
+                        assert_ne!(
+                            compare_route_handler_candidates(left, third),
+                            Ordering::Greater
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affected_graph_cycle_terminates_and_result_caps_are_enforced() {
+        let project = tempdir().expect("project");
+        let source_dir = project.path().join("src");
+        fs::create_dir_all(&source_dir).expect("create source directory");
+        let source_path = source_dir.join("lib.rs");
+        fs::write(&source_path, "pub fn seed() {}\n").expect("write source");
+        let modification_time = fs::metadata(&source_path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+
+        {
+            let mut storage =
+                Storage::open(project.path().join("codestory.db")).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("insert source file");
+            let mut nodes = vec![
+                Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: source_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "seed".to_string(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            ];
+            let mut edges = Vec::new();
+            for index in 0..220_i64 {
+                let node_id = CoreNodeId(1_000 + index);
+                nodes.push(Node {
+                    id: node_id,
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("route_{index}"),
+                    canonical_id: Some(format!("openapi:endpoint:GET /route/{index}")),
+                    start_line: Some(1),
+                    ..Default::default()
+                });
+                edges.push(Edge {
+                    id: EdgeId(2_000 + index),
+                    source: node_id,
+                    target: CoreNodeId(2),
+                    kind: EdgeKind::CALL,
+                    ..Default::default()
+                });
+            }
+            edges.push(Edge {
+                id: EdgeId(9_999),
+                source: CoreNodeId(2),
+                target: CoreNodeId(1_000),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            });
+            storage.insert_nodes_batch(&nodes).expect("insert nodes");
+            storage.insert_edges_batch(&edges).expect("insert edges");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["src/lib.rs".to_string()]),
+                depth: Some(8),
+                filter: None,
+            })
+            .expect("affected analysis");
+
+        assert_eq!(result.impacted_symbols.len(), 200);
+        assert_eq!(result.impacted_routes.len(), 100);
+        assert!(result.completeness.truncated);
+        assert!(!result.completeness.complete);
+        assert_eq!(result.bounds.impacted_symbol_limit, 200);
+        assert_eq!(result.bounds.impacted_route_limit, 100);
+        assert!(
+            result.bounds.visited_node_count <= 222,
+            "cycle should not revisit nodes without bound: {:?}",
+            result.bounds
+        );
+        assert_eq!(
+            result.completeness.truncation_reasons,
+            vec![
+                "impacted_symbols retained 200 of 221 results".to_string(),
+                "impacted_routes retained 100 of 220 results".to_string(),
+            ]
         );
     }
 
@@ -12899,6 +20128,12 @@ mod tests {
             "public/index.html",
             "public/site.css",
             "db/schema.sql",
+            "docs/guide.mdx",
+            "config/service.yaml",
+            "config/service.toml",
+            "config/service.json",
+            "scripts/setup.zsh",
+            "scripts/build.ps1",
         ] {
             assert!(
                 indexable_source_path(Path::new(relative_path)),
@@ -12913,6 +20148,555 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+        for excluded in [
+            "vendor/config.json",
+            "generated/docs.md",
+            "config/package-lock.json",
+            "skills-lock.json",
+            "secrets/deploy.ps1",
+            "web/app.min.json",
+        ] {
+            assert!(
+                !indexable_source_path(Path::new(excluded)),
+                "runtime freshness should honor structural exclusion: {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_openapi_coverage_requires_authenticated_file_owned_projection_evidence() {
+        let project = tempdir().expect("project");
+        let mut storage = Storage::new_in_memory().expect("storage");
+        let sources = [
+            (
+                "openapi.json",
+                "{\"openapi\":\"3.1.0\",\"paths\":{\"/json-ready\":{\"get\":{}}}}\n",
+            ),
+            (
+                "openapi.yaml",
+                "openapi: 3.1.0\npaths:\n  /yaml-ready:\n    get:\n      responses: {}\n",
+            ),
+            ("config.json", "{\"enabled\":true}\n"),
+        ];
+        let files_to_index = sources
+            .iter()
+            .map(|(relative, source)| {
+                let path = project.path().join(relative);
+                fs::write(&path, source).expect("write projected source");
+                path
+            })
+            .collect::<Vec<_>>();
+        V2WorkspaceIndexer::new(project.path().to_path_buf())
+            .run(
+                &mut storage,
+                &RefreshExecutionPlan {
+                    mode: RefreshMode::FullRefresh,
+                    files_to_index,
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )
+            .expect("index real OpenAPI and generic JSON projections");
+        let real_diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
+            .expect("verify real projections");
+        assert!(
+            real_diagnostics.is_empty(),
+            "real projections must authenticate coverage: {real_diagnostics:#?}"
+        );
+
+        for (id, relative, language) in [
+            (9_000_001, "metadata-only.json", "openapi"),
+            (9_000_002, "forged-openapi.json", "openapi"),
+            (9_000_003, "wrong-language.json", "json"),
+        ] {
+            let path = project.path().join(relative);
+            fs::write(&path, "{}\n").expect("write structural source");
+            let file = FileInfo {
+                id,
+                path,
+                language: language.to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            };
+            storage.insert_file(&file).expect("insert indexed file");
+            storage
+                .update_file_metadata(&file, Some(&format!("{id:064x}")))
+                .expect("persist verified source identity");
+        }
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(9_000_002),
+                    kind: NodeKind::FILE,
+                    serialized_name: project
+                        .path()
+                        .join("forged-openapi.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_100_002),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /forged".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /forged".to_string()),
+                    file_node_id: Some(CoreNodeId(9_000_002)),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_000_003),
+                    kind: NodeKind::FILE,
+                    serialized_name: project
+                        .path()
+                        .join("wrong-language.json")
+                        .to_string_lossy()
+                        .to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(9_100_003),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /wrong-language".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /wrong-language".to_string()),
+                    file_node_id: Some(CoreNodeId(9_000_003)),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert forged endpoint nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(9_200_003),
+                source: CoreNodeId(9_000_003),
+                target: CoreNodeId(9_100_003),
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(CoreNodeId(9_000_003)),
+                ..Default::default()
+            }])
+            .expect("insert wrong-language member edge");
+        storage
+            .insert_occurrences_batch(&[Occurrence {
+                element_id: 9_100_003,
+                kind: OccurrenceKind::DEFINITION,
+                location: SourceLocation {
+                    file_node_id: CoreNodeId(9_000_003),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 2,
+                },
+            }])
+            .expect("insert wrong-language definition occurrence");
+        assert!(
+            storage
+                .has_file_owned_openapi_endpoint_projection(9_000_003)
+                .expect("verify wrong-language graph evidence"),
+            "runtime language check must reject otherwise authenticated OpenAPI graph evidence"
+        );
+
+        let diagnostics = stored_file_coverage_diagnostics(project.path(), &storage)
+            .expect("load stored file coverage");
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "metadata-only.json",
+                "forged-openapi.json",
+                "wrong-language.json",
+            ])
+        );
+        assert!(diagnostics.iter().all(|diagnostic| diagnostic.reason
+            == FileCoverageReason::CollectorFailure
+            && diagnostic.verified_source
+            && !diagnostic.projection_available));
+    }
+
+    #[test]
+    fn incremental_openapi_structural_transitions_replace_file_owned_projection_atomically() {
+        fn endpoint_ids(storage: &Storage) -> HashSet<String> {
+            storage
+                .get_nodes()
+                .expect("load endpoint nodes")
+                .into_iter()
+                .filter_map(|node| node.canonical_id)
+                .filter(|canonical_id| canonical_id.starts_with("openapi:endpoint:"))
+                .collect()
+        }
+
+        let workspace = tempdir().expect("workspace");
+        let schema_path = workspace.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/old\":{\"get\":{}}}}\n",
+        )
+        .expect("write baseline OpenAPI source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open OpenAPI project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline OpenAPI projection");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        assert_eq!(
+            endpoint_ids(&Storage::open(&storage_path).expect("reopen baseline")),
+            HashSet::from(["openapi:endpoint:GET /old".to_string()])
+        );
+
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/renamed\":{\"post\":{}}}}\n",
+        )
+        .expect("write renamed OpenAPI endpoint");
+        arm_publication_test_fault(
+            PublicationTestBoundary::MarkerCompletion,
+            PublicationTestAction::Fail,
+        );
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("injected staged transition failure must reject publication");
+        assert_eq!(error.code, "internal");
+        let preserved = Storage::open(&storage_path).expect("open preserved baseline");
+        assert_eq!(
+            preserved
+                .get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline)
+        );
+        assert_eq!(
+            endpoint_ids(&preserved),
+            HashSet::from(["openapi:endpoint:GET /old".to_string()])
+        );
+        drop(preserved);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish renamed OpenAPI endpoint");
+        let renamed = Storage::open(&storage_path).expect("open renamed projection");
+        assert_eq!(
+            endpoint_ids(&renamed),
+            HashSet::from(["openapi:endpoint:POST /renamed".to_string()])
+        );
+        let file = renamed
+            .get_file_by_path(&schema_path)
+            .expect("read renamed file")
+            .expect("renamed file");
+        assert_eq!(file.language, "openapi");
+        assert!(
+            renamed
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("authenticate renamed endpoint")
+        );
+        drop(renamed);
+
+        fs::write(&schema_path, "{\"enabled\":true}\n").expect("write generic JSON source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish OpenAPI to generic transition");
+        let generic = Storage::open(&storage_path).expect("open generic projection");
+        assert!(endpoint_ids(&generic).is_empty());
+        let file = generic
+            .get_file_by_path(&schema_path)
+            .expect("read generic file")
+            .expect("generic file");
+        assert_eq!(file.language, "json");
+        assert!(
+            !generic
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("reject removed OpenAPI endpoint")
+        );
+        assert!(
+            generic
+                .get_structural_text_projection_file_ids()
+                .expect("read generic structural projections")
+                .contains(&file.id)
+        );
+        drop(generic);
+
+        fs::write(
+            &schema_path,
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/restored\":{\"get\":{}}}}\n",
+        )
+        .expect("write restored OpenAPI source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish generic to OpenAPI transition");
+        let restored = Storage::open(&storage_path).expect("open restored projection");
+        assert_eq!(
+            endpoint_ids(&restored),
+            HashSet::from(["openapi:endpoint:GET /restored".to_string()])
+        );
+        let file = restored
+            .get_file_by_path(&schema_path)
+            .expect("read restored file")
+            .expect("restored file");
+        assert_eq!(file.language, "openapi");
+        assert!(
+            restored
+                .has_file_owned_openapi_endpoint_projection(file.id)
+                .expect("authenticate restored endpoint")
+        );
+        assert!(
+            !restored
+                .get_structural_text_projection_file_ids()
+                .expect("read restored structural projections")
+                .contains(&file.id)
+        );
+        assert!(
+            stored_file_coverage_diagnostics(workspace.path(), &restored)
+                .expect("verify restored coverage")
+                .is_empty()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn affected_absolute_excluded_structural_path_is_valid_but_uncovered() {
+        let project = tempdir().expect("project");
+        let excluded = project.path().join("vendor/config.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))
+            .expect("create excluded parent");
+        fs::write(&excluded, "{\"ignored\":true}\n").expect("write excluded source");
+        assert!(!indexable_source_path_in_workspace(
+            project.path(),
+            &excluded
+        ));
+        let resolved = AffectedResolvedInput {
+            current: excluded.clone(),
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        let identity =
+            codestory_workspace::workspace_path_identity(&excluded).expect("excluded identity");
+        let (classification, reason, _) = classify_unmatched_affected_input(
+            Some(project.path()),
+            &affected_test_record(AffectedChangeKindDto::Modified, "vendor/config.json"),
+            &resolved,
+            &freshness,
+            Some(&identity),
+            None,
+            None,
+        );
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert!(reason.contains("outside current graph/index coverage"));
+    }
+
+    fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
+        let modification_time = fs::metadata(path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        storage
+            .insert_file(&FileInfo {
+                id,
+                path: path.to_path_buf(),
+                language: "rust".into(),
+                modification_time,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert current indexed file");
+    }
+
+    #[test]
+    fn newly_discovered_hardlink_alias_remains_new_for_freshness() {
+        let project = tempdir().expect("project");
+        let indexed = project.path().join("lib.rs");
+        let alias = project.path().join("alias.rs");
+        fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+        fs::hard_link(&indexed, &alias).expect("create source hardlink alias");
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        insert_current_indexed_file(&storage, 1, &indexed);
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 1);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert!(freshness.samples.iter().any(|sample| {
+            sample.kind == IndexFreshnessChangeKindDto::New && sample.path == "alias.rs"
+        }));
+    }
+
+    #[test]
+    fn unsupported_extension_hardlink_alias_stays_outside_freshness() {
+        let project = tempdir().expect("project");
+        let indexed = project.path().join("lib.rs");
+        let alias = project.path().join("source-alias.unsupported-binary");
+        fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+        fs::hard_link(&indexed, &alias).expect("create unsupported hardlink alias");
+        assert!(!indexable_source_path(&alias));
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        insert_current_indexed_file(&storage, 1, &indexed);
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 0);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert!(freshness.samples.is_empty());
+    }
+
+    #[test]
+    fn incomplete_run_fence_wins_before_indexed_inventory() {
+        let project = tempdir().expect("project");
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        storage
+            .begin_incremental_run()
+            .expect("install incomplete-run fence");
+        storage
+            .get_connection()
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable fixture foreign keys");
+        storage
+            .get_connection()
+            .execute("DROP TABLE file", [])
+            .expect("remove indexed inventory");
+        storage
+            .get_connection()
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore fixture foreign keys");
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(
+            freshness.reason.as_deref(),
+            Some("previous_incremental_run_incomplete_full_refresh_required")
+        );
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 0);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert_eq!(freshness.checked_file_count, 0);
+        assert_eq!(freshness.indexed_file_count, 0);
+        assert!(freshness.samples.is_empty());
+    }
+
+    #[test]
+    fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writer() {
+        let project = tempdir().expect("project");
+        let source_path = project.path().join("lib.rs");
+        fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let modification_time = fs::metadata(&source_path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let database = tempdir().expect("database directory");
+        let storage_path = database.path().join("codestory.db");
+        let keeper = Storage::open(&storage_path).expect("open fixture storage");
+        keeper
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert coherent file projection");
+        assert!(
+            storage_path.with_extension("db-wal").is_file(),
+            "fixture must retain WAL state"
+        );
+        assert!(
+            storage_path.with_extension("db-shm").is_file(),
+            "fixture must retain its WAL index"
+        );
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let observed = Storage::open_freshness_observational(&storage_path)
+            .expect("open owned freshness snapshot");
+
+        let (release_writer, writer_released) = std::sync::mpsc::channel();
+        let (writer_done, await_writer) = std::sync::mpsc::channel();
+        let writer_storage_path = storage_path.clone();
+        let projected_after_fence = project.path().join("removed-after-fence.rs");
+        let writer = std::thread::spawn(move || {
+            writer_released.recv().expect("release concurrent writer");
+            let storage = Storage::open(&writer_storage_path).expect("open concurrent writer");
+            storage
+                .begin_incremental_run()
+                .expect("install concurrent incomplete fence");
+            storage
+                .insert_file(&FileInfo {
+                    id: 2,
+                    path: projected_after_fence,
+                    language: "rust".into(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("mutate projection after the fence read");
+            writer_done.send(()).expect("signal writer completion");
+        });
+        arm_after_index_freshness_fence_test_hook(move || {
+            release_writer.send(()).expect("start concurrent writer");
+            await_writer.recv().expect("wait for concurrent writer");
+        });
+
+        let before = index_freshness_from_storage(project.path(), &workspace, &observed);
+        writer.join().expect("join concurrent writer");
+        assert_eq!(before.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(before.changed_file_count, 0);
+        assert_eq!(before.new_file_count, 0);
+        assert_eq!(before.removed_file_count, 0);
+        assert_eq!(before.indexed_file_count, 1);
+        assert!(before.samples.is_empty());
+        drop(observed);
+
+        let fenced = Storage::open_freshness_observational(&storage_path)
+            .expect("open post-writer freshness snapshot");
+        let after = index_freshness_from_storage(project.path(), &workspace, &fenced);
+        assert_eq!(after.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(
+            after.reason.as_deref(),
+            Some("previous_incremental_run_incomplete_full_refresh_required")
+        );
+        assert_eq!(after.changed_file_count, 0);
+        assert_eq!(after.new_file_count, 0);
+        assert_eq!(after.removed_file_count, 0);
+        assert_eq!(after.indexed_file_count, 0);
+        assert!(after.samples.is_empty());
+        drop(fenced);
+        drop(keeper);
     }
 
     #[test]
@@ -12955,6 +20739,7 @@ mod tests {
                 column: None,
                 is_fatal: true,
                 index_step: codestory_contracts::graph::IndexStep::Indexing,
+                coverage_reason: Some(FileCoverageReason::Unreadable),
             })
             .expect("file error");
         let retry = index_freshness_from_storage(project.path(), &workspace, &storage);
@@ -13033,15 +20818,6 @@ mod tests {
         HybridTestEnv {
             guards: vec![
                 EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
-                EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, "hash"),
-                EnvGuard::set(EMBEDDING_PROFILE_ENV, "bge-small-en-v1.5"),
-                EnvGuard::remove(EMBEDDING_MODEL_ID_ENV),
-                EnvGuard::remove(EMBEDDING_POOLING_ENV),
-                EnvGuard::remove(EMBEDDING_QUERY_PREFIX_ENV),
-                EnvGuard::remove(EMBEDDING_DOCUMENT_PREFIX_ENV),
-                EnvGuard::remove(EMBEDDING_LAYER_NORM_ENV),
-                EnvGuard::remove(EMBEDDING_TRUNCATE_DIM_ENV),
-                EnvGuard::remove(EMBEDDING_EXPECTED_DIM_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV),
@@ -13423,6 +21199,19 @@ mod tests {
             NodeKind::BUILTIN_TYPE,
             SemanticDocScope::AllSymbols
         ));
+        for raw_kind in 0..=NodeKind::UNKNOWN as i32 {
+            let kind = NodeKind::try_from(raw_kind).expect("known node kind");
+            for scope in [
+                SemanticDocScope::DurableSymbols,
+                SemanticDocScope::AllSymbols,
+            ] {
+                assert_eq!(
+                    llm_indexable_kinds_for_scope(scope).contains(&kind),
+                    llm_indexable_kind_for_scope(kind, scope),
+                    "streamed kind filter drifted for {kind:?} in {scope:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -13468,6 +21257,7 @@ mod tests {
             qualified_name: None,
             file_path: None,
             start_line: None,
+            end_line: None,
             doc_text: doc_text.to_string(),
             doc_hash: llm_symbol_doc_hash(doc_text),
             dense_reason: DenseAnchorReason::PublicApi,
@@ -13487,16 +21277,19 @@ mod tests {
         }
     }
 
-    fn semantic_policy_context(path: &str, node_id: CoreNodeId) -> SemanticDocGraphContext {
+    fn semantic_policy_context(path: &str, node: &Node) -> SemanticDocGraphContext {
         let mut context = SemanticDocGraphContext::default();
-        context.file_paths.insert(node_id, path.to_string());
+        context.file_paths.insert(
+            node.file_node_id.expect("semantic policy test file id"),
+            path.to_string(),
+        );
         context
     }
 
     #[test]
     fn dense_policy_skips_private_trivial_helpers() {
         let node = semantic_policy_node(10, NodeKind::FUNCTION, "helper", 1);
-        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+        let context = semantic_policy_context("src/internal/helper.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -13513,7 +21306,7 @@ mod tests {
     #[test]
     fn dense_policy_does_not_treat_every_handler_name_as_entrypoint() {
         let node = semantic_policy_node(14, NodeKind::FUNCTION, "handler", 1);
-        let context = semantic_policy_context("src/internal/request.rs", node.id);
+        let context = semantic_policy_context("src/internal/request.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -13531,26 +21324,31 @@ mod tests {
     fn dense_policy_only_embeds_high_signal_central_nodes() {
         let ordinary = semantic_policy_node(15, NodeKind::FUNCTION, "ordinary", 1);
         let central = semantic_policy_node(16, NodeKind::FUNCTION, "central", 1);
-        let mut context = semantic_policy_context("src/internal/graph.rs", ordinary.id);
-        context
-            .file_paths
-            .insert(central.id, "src/internal/graph.rs".to_string());
-        context.child_labels.insert(
+        let mut context = semantic_policy_context("src/internal/graph.rs", &ordinary);
+        context.centrality.insert(
             ordinary.id,
-            ["a", "b", "c", "d"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            DenseAnchorCentrality {
+                child_count: 2,
+                related_count: 2,
+                edge_count: 4,
+            },
+        );
+        context.child_labels.insert(
+            central.id,
+            (0..6).map(|index| format!("child_{index}")).collect(),
         );
         context.referenced_labels.insert(
             central.id,
-            (0..DENSE_CENTRAL_LABEL_THRESHOLD)
-                .map(|index| format!("ref_{index}"))
-                .collect(),
+            (0..6).map(|index| format!("ref_{index}")).collect(),
         );
-        context
-            .edge_digests
-            .insert(central.id, vec!["CALL=24".to_string()]);
+        context.centrality.insert(
+            central.id,
+            DenseAnchorCentrality {
+                child_count: 0,
+                related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+                edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+            },
+        );
 
         assert_eq!(
             dense_anchor_reason_for_node(
@@ -13574,6 +21372,53 @@ mod tests {
             ),
             Some(DenseAnchorReason::CentralGraphNode)
         );
+        assert_eq!(
+            context
+                .child_labels
+                .get(&central.id)
+                .expect("bounded child labels")
+                .len(),
+            6
+        );
+        assert_eq!(
+            context
+                .referenced_labels
+                .get(&central.id)
+                .expect("bounded related labels")
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn dense_policy_keeps_low_degree_local_functions_and_variables_sparse() {
+        let function = semantic_policy_node(17, NodeKind::FUNCTION, "local_fn", 1);
+        let variable = semantic_policy_node(18, NodeKind::VARIABLE, "local_value", 1);
+        let mut context = semantic_policy_context("src/internal/local.rs", &function);
+        for node_id in [function.id, variable.id] {
+            context.centrality.insert(
+                node_id,
+                DenseAnchorCentrality {
+                    child_count: 0,
+                    related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD - 1,
+                    edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+                },
+            );
+        }
+
+        for node in [&function, &variable] {
+            assert_eq!(
+                dense_anchor_reason_for_node(
+                    &context,
+                    node,
+                    &node.serialized_name,
+                    Some("src/internal/local.rs"),
+                    "semantic_doc_version: 6\nkind: local\n",
+                    Some(AccessKind::Private),
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -13581,7 +21426,7 @@ mod tests {
         let public_node = semantic_policy_node(11, NodeKind::STRUCT, "ReportBuilder", 1);
         let entrypoint_node = semantic_policy_node(12, NodeKind::FUNCTION, "main", 1);
         let documented_node = semantic_policy_node(13, NodeKind::METHOD, "parse_config", 1);
-        let context = semantic_policy_context("src/lib.rs", public_node.id);
+        let context = semantic_policy_context("src/lib.rs", &public_node);
 
         assert_eq!(
             dense_anchor_reason_for_node(
@@ -13621,30 +21466,34 @@ mod tests {
     #[test]
     fn dense_policy_classifies_cross_language_entrypoints_and_surfaces() {
         let python_app = semantic_policy_node(21, NodeKind::FUNCTION, "app", 1);
-        let go_command = semantic_policy_node(22, NodeKind::FUNCTION, "run", 1);
-        let csharp_program = semantic_policy_node(23, NodeKind::CLASS, "Program", 1);
-        let java_application = semantic_policy_node(24, NodeKind::CLASS, "Application", 1);
-        let c_header_api = semantic_policy_node(25, NodeKind::STRUCT, "ClientApi", 1);
-        let python_package_api = semantic_policy_node(26, NodeKind::CLASS, "PackageClient", 1);
+        let go_command = semantic_policy_node(22, NodeKind::FUNCTION, "run", 2);
+        let csharp_program = semantic_policy_node(23, NodeKind::CLASS, "Program", 3);
+        let java_application = semantic_policy_node(24, NodeKind::CLASS, "Application", 4);
+        let c_header_api = semantic_policy_node(25, NodeKind::STRUCT, "ClientApi", 5);
+        let python_package_api = semantic_policy_node(26, NodeKind::CLASS, "PackageClient", 6);
         let mut context = SemanticDocGraphContext::default();
-        context
-            .file_paths
-            .insert(python_app.id, "service/app.py".to_string());
-        context
-            .file_paths
-            .insert(go_command.id, "cmd/server/main.go".to_string());
-        context
-            .file_paths
-            .insert(csharp_program.id, "src/Program.cs".to_string());
         context.file_paths.insert(
-            java_application.id,
+            python_app.file_node_id.expect("file id"),
+            "service/app.py".to_string(),
+        );
+        context.file_paths.insert(
+            go_command.file_node_id.expect("file id"),
+            "cmd/server/main.go".to_string(),
+        );
+        context.file_paths.insert(
+            csharp_program.file_node_id.expect("file id"),
+            "src/Program.cs".to_string(),
+        );
+        context.file_paths.insert(
+            java_application.file_node_id.expect("file id"),
             "src/main/java/com/acme/Application.java".to_string(),
         );
-        context
-            .file_paths
-            .insert(c_header_api.id, "include/acme/client_api.hpp".to_string());
         context.file_paths.insert(
-            python_package_api.id,
+            c_header_api.file_node_id.expect("file id"),
+            "include/acme/client_api.hpp".to_string(),
+        );
+        context.file_paths.insert(
+            python_package_api.file_node_id.expect("file id"),
             "packages/acme_sdk/__init__.py".to_string(),
         );
 
@@ -13698,7 +21547,7 @@ mod tests {
     #[test]
     fn dense_policy_does_not_embed_plain_public_callables_by_default() {
         let node = semantic_policy_node(17, NodeKind::FUNCTION, "plain_public_function", 1);
-        let context = semantic_policy_context("src/lib.rs", node.id);
+        let context = semantic_policy_context("src/lib.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -13715,7 +21564,7 @@ mod tests {
     #[test]
     fn dense_policy_embeds_package_public_callables_for_dynamic_frameworks() {
         let node = semantic_policy_node(19, NodeKind::FUNCTION, "handle", 1);
-        let context = semantic_policy_context("lib/router/index.js", node.id);
+        let context = semantic_policy_context("lib/router/index.js", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -13730,7 +21579,7 @@ mod tests {
 
         let windows_node = semantic_policy_node(29, NodeKind::METHOD, "GET /json", 1);
         let windows_path = r"\\?\C:\repo\expressjs-express\lib\response.js";
-        let windows_context = semantic_policy_context(windows_path, windows_node.id);
+        let windows_context = semantic_policy_context(windows_path, &windows_node);
 
         let windows_reason = dense_anchor_reason_for_node(
             &windows_context,
@@ -13747,7 +21596,7 @@ mod tests {
     #[test]
     fn dense_policy_does_not_embed_comment_only_symbols_by_default() {
         let node = semantic_policy_node(18, NodeKind::FUNCTION, "commented_helper", 1);
-        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+        let context = semantic_policy_context("src/internal/helper.rs", &node);
 
         let reason = dense_anchor_reason_for_node(
             &context,
@@ -13764,17 +21613,12 @@ mod tests {
     #[test]
     fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
         let node = semantic_policy_node(20, NodeKind::FUNCTION, "central_service", 1);
-        let mut context = semantic_policy_context("crates/app/src/service.rs", node.id);
+        let mut context = semantic_policy_context("crates/app/src/service.rs", &node);
         context
             .edge_digests
             .insert(node.id, vec!["CALL=9".to_string()]);
-        let reports = build_component_report_docs(
-            &context,
-            &[&node],
-            &std::collections::HashMap::new(),
-            None,
-            123,
-        );
+        let reports =
+            build_component_report_docs(&context, &[&node], &std::collections::HashMap::new(), 123);
 
         assert_eq!(reports.len(), 1);
         let report = &reports[0];
@@ -13792,7 +21636,16 @@ mod tests {
             Some("crates/app/src/service.rs")
         );
         assert!(report.symbol_doc.doc_text.contains("god_nodes:"));
-        assert!(report.pending.is_none());
+        let pending = report
+            .pending
+            .as_ref()
+            .expect("component report should publish a dense anchor input");
+        assert_eq!(pending.node_id, report.symbol_doc.node_id);
+        assert_eq!(pending.dense_reason, DenseAnchorReason::ComponentReport);
+        assert_eq!(pending.doc_hash, report.symbol_doc.doc_hash);
+        assert_eq!(pending.doc_text, report.symbol_doc.doc_text);
+        assert!(pending.end_line.is_none());
+        assert!(!report.reusable);
     }
 
     #[test]
@@ -13804,7 +21657,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_graph_context_uses_repo_relative_file_table_paths() {
+    fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
         let temp = tempdir().expect("create temp dir");
         let storage_path = temp.path().join("codestory.db");
         let mut storage = Storage::open(&storage_path).expect("open storage");
@@ -13835,15 +21688,37 @@ mod tests {
             start_line: Some(1),
             ..Default::default()
         };
+        let second_function_node = Node {
+            id: CoreNodeId(102),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "nvm_echo".to_string(),
+            file_node_id: Some(CoreNodeId(11)),
+            start_line: Some(2),
+            ..Default::default()
+        };
         storage
-            .insert_nodes_batch(&[file_node.clone(), function_node.clone()])
+            .insert_nodes_batch(&[
+                file_node.clone(),
+                function_node.clone(),
+                second_function_node.clone(),
+            ])
             .expect("insert nodes");
-        let nodes = vec![file_node, function_node.clone()];
-        let semantic_nodes = vec![&function_node];
+        let nodes = vec![
+            file_node,
+            function_node.clone(),
+            second_function_node.clone(),
+        ];
+        let semantic_nodes = vec![&function_node, &second_function_node];
         let context =
             SemanticDocGraphContext::build(&storage, &semantic_nodes, &nodes).expect("context");
 
+        assert_eq!(context.file_paths.len(), 1);
+        assert_eq!(context.file_read_paths.len(), 1);
         assert_eq!(context.file_path_for_node(&function_node), Some("nvm.sh"));
+        assert_eq!(
+            context.file_path_for_node(&second_function_node),
+            Some("nvm.sh")
+        );
         assert_eq!(
             context.file_read_path_for_node(&function_node),
             Some("C:/work/nvm/nvm.sh")
@@ -13852,7 +21727,6 @@ mod tests {
             &context,
             &semantic_nodes,
             &std::collections::HashMap::new(),
-            None,
             123,
         );
         assert_eq!(reports.len(), 1);
@@ -13862,6 +21736,62 @@ mod tests {
                 .symbol_doc
                 .doc_text
                 .contains("component_report: dir:.")
+        );
+    }
+
+    #[test]
+    fn semantic_refresh_scope_includes_files_connected_to_changed_graph_nodes() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/caller.rs".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/callee.rs".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "caller".into(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(22),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "callee".into(),
+                    file_node_id: Some(CoreNodeId(2)),
+                    ..Default::default()
+                },
+            ])
+            .expect("nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(1),
+                source: CoreNodeId(11),
+                target: CoreNodeId(22),
+                kind: EdgeKind::CALL,
+                resolved_source: Some(CoreNodeId(11)),
+                resolved_target: Some(CoreNodeId(22)),
+                ..Default::default()
+            }])
+            .expect("edge");
+
+        let dependents =
+            semantic_graph_dependent_file_ids_by_seed(&storage, &HashSet::from([CoreNodeId(1)]))
+                .expect("semantic dependents");
+
+        assert_eq!(
+            dependents.get(&CoreNodeId(1)),
+            Some(&HashSet::from([CoreNodeId(1), CoreNodeId(2)])),
+            "an untouched endpoint file must be recomputed when related-symbol and edge text can change"
         );
     }
 
@@ -13879,10 +21809,11 @@ mod tests {
             start_line: Some(1),
             ..Default::default()
         };
-        context.file_paths.insert(node.id, display_path.to_string());
+        let file_id = node.file_node_id.expect("semantic cache test file id");
+        context.file_paths.insert(file_id, display_path.to_string());
         context
             .file_read_paths
-            .insert(node.id, read_path.to_string_lossy().to_string());
+            .insert(file_id, read_path.to_string_lossy().to_string());
         node
     }
 
@@ -13938,38 +21869,19 @@ mod tests {
         assert_eq!(cache.get("c.rs"), Some(&None));
     }
 
-    fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
-        docs.chunks(batch_size)
-            .map(|batch| {
-                let max_len = batch
-                    .iter()
-                    .map(|doc| doc.doc_text.len())
-                    .max()
-                    .unwrap_or(0);
-                max_len * batch.len()
-            })
-            .sum()
-    }
-
     #[test]
-    fn semantic_docs_are_length_bucketed_before_embedding() {
+    fn dense_anchor_inputs_are_sorted_deterministically_before_publication() {
         let mut docs = vec![
             pending_semantic_doc_for_test(1, &"x".repeat(900)),
             pending_semantic_doc_for_test(2, "tiny"),
             pending_semantic_doc_for_test(3, &"m".repeat(880)),
             pending_semantic_doc_for_test(4, "small"),
         ];
-        let original_cost = padded_char_cost(&docs, 2);
-
-        sort_pending_llm_symbol_docs_for_embedding_batches(&mut docs);
+        sort_pending_dense_anchor_inputs(&mut docs);
 
         assert_eq!(
             docs.iter().map(|doc| doc.node_id.0).collect::<Vec<_>>(),
-            vec![2, 4, 3, 1]
-        );
-        assert!(
-            padded_char_cost(&docs, 2) < (original_cost * 3 / 5),
-            "length bucketing should avoid padding tiny docs to long-doc batches"
+            vec![1, 2, 3, 4]
         );
     }
 
@@ -16042,7 +23954,7 @@ pub fn exact_symbol_anchor() {{}}
             "Explain how AppController fits into this repo"
         ));
         assert!(query_has_symbol_or_literal_signal(
-            "Explain `CODESTORY_EMBED_RUNTIME_MODE` in this repo"
+            "Explain `CODESTORY_EMBED_ALLOW_CPU` in this repo"
         ));
         assert!(query_has_symbol_or_literal_signal(
             "Explain crates/codestory-runtime/src/lib.rs in this repo"
@@ -16052,7 +23964,7 @@ pub fn exact_symbol_anchor() {{}}
     #[test]
     fn file_text_matching_prefers_high_signal_identifier_literals() {
         let contents = r#"
-pub const CODESTORY_EMBED_RUNTIME_MODE: &str = "hash";
+pub const CODESTORY_EMBED_ALLOW_CPU: &str = "1";
 
 fn build_llm_symbol_doc_text() -> String {
     String::new()
@@ -16070,8 +23982,8 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(
             file_text_match_line(
                 contents,
-                "What sets CODESTORY_EMBED_RUNTIME_MODE?",
-                &extract_symbol_search_terms("What sets CODESTORY_EMBED_RUNTIME_MODE?")
+                "What sets CODESTORY_EMBED_ALLOW_CPU?",
+                &extract_symbol_search_terms("What sets CODESTORY_EMBED_ALLOW_CPU?")
             ),
             Some(2)
         );
@@ -16153,13 +24065,46 @@ fn build_llm_symbol_doc_text() -> String {
 
         let definition_hit =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(11), 1.0)
+                .expect("provenance lookup")
                 .expect("definition hit");
         assert_eq!(definition_hit.file_path.as_deref(), Some("src/lib.rs"));
         assert_eq!(definition_hit.line, Some(42));
 
         assert!(
-            AppController::build_search_hit(&storage, &node_names, CoreNodeId(12), 1.0).is_none(),
+            AppController::build_search_hit(&storage, &node_names, CoreNodeId(12), 1.0)
+                .expect("provenance lookup")
+                .is_none(),
             "unknown placeholder nodes should be dropped from indexed results"
+        );
+    }
+
+    #[test]
+    fn build_search_hit_fails_closed_when_structural_provenance_cannot_be_read() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(13),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "handler".to_string(),
+                ..Default::default()
+            }])
+            .expect("insert node");
+        storage
+            .get_connection()
+            .execute("DROP TABLE structural_text_unit", [])
+            .expect("inject structural provenance read failure");
+
+        let error = AppController::build_search_hit(
+            &storage,
+            &HashMap::from([(CoreNodeId(13), "handler".to_string())]),
+            CoreNodeId(13),
+            1.0,
+        )
+        .expect_err("provenance storage failures must abort indexed-symbol search");
+        assert!(
+            error
+                .message
+                .contains("Failed to load structural provenance for node 13")
         );
     }
 
@@ -16242,16 +24187,21 @@ fn build_llm_symbol_doc_text() -> String {
         ]);
 
         let ast = AppController::build_search_hit(&storage, &node_names, CoreNodeId(22), 1.0)
+            .expect("provenance lookup")
             .expect("ast route hit");
         let text_only = AppController::build_search_hit(&storage, &node_names, CoreNodeId(23), 1.0)
+            .expect("provenance lookup")
             .expect("text-only route hit");
         let normal = AppController::build_search_hit(&storage, &node_names, CoreNodeId(24), 1.0)
+            .expect("provenance lookup")
             .expect("normal hit");
         let tree_sitter =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(25), 1.0)
+                .expect("provenance lookup")
                 .expect("tree-sitter route hit");
         let lexical_fallback =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(26), 1.0)
+                .expect("provenance lookup")
                 .expect("lexical fallback route hit");
 
         assert!(
@@ -16263,6 +24213,11 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(tree_sitter.score, ast.score);
         assert_eq!(lexical_fallback.score, text_only.score);
         assert_eq!(normal.score, 1.0);
+        assert_eq!(
+            normal.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            "a valid missing unit remains resolved graph evidence"
+        );
 
         let mut hits = [text_only, ast.clone()];
         hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
@@ -16294,6 +24249,7 @@ fn build_llm_symbol_doc_text() -> String {
         let node_names = HashMap::from([(CoreNodeId(31), "GET /api/users".to_string())]);
 
         let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(31), 1.0)
+            .expect("provenance lookup")
             .expect("OpenAPI endpoint hit");
 
         assert_eq!(
@@ -16312,6 +24268,106 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn build_search_hit_marks_generic_structural_collectors_as_non_sufficient() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        let source_hash = "a".repeat(64);
+        let unit = codestory_store::StructuralTextUnit {
+            node_id: CoreNodeId(41),
+            file_id: 40,
+            placement_id: "b".repeat(64),
+            content_hash: "c".repeat(64),
+            source_content_hash: source_hash.clone(),
+            descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "structural_markdown_collector".to_string(),
+            evidence_tier: "structural_text".to_string(),
+            resolution: "source_range_only".to_string(),
+            language: "markdown".to_string(),
+            kind: NodeKind::MODULE,
+            start_line: 2,
+            start_col: 1,
+            end_line: 2,
+            end_col: 4,
+            file_role: codestory_store::FileRole::Source,
+        };
+        storage
+            .projections()
+            .flush_projection_batch(codestory_store::ProjectionBatch {
+                files: &[codestory_store::FileInfo {
+                    id: 40,
+                    path: PathBuf::from("docs/demo.md"),
+                    language: "markdown".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: codestory_store::FileRole::Source,
+                }],
+                file_content_hashes: &[codestory_store::FileContentHash {
+                    file_id: 40,
+                    content_hash: source_hash.clone(),
+                }],
+                nodes: &[
+                    Node {
+                        id: CoreNodeId(40),
+                        kind: NodeKind::FILE,
+                        serialized_name: "docs/demo.md".to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(41),
+                        kind: NodeKind::MODULE,
+                        serialized_name: "demo".to_string(),
+                        file_node_id: Some(CoreNodeId(40)),
+                        start_line: Some(2),
+                        start_col: Some(1),
+                        end_line: Some(2),
+                        end_col: Some(4),
+                        ..Default::default()
+                    },
+                ],
+                structural_text_units: std::slice::from_ref(&unit),
+                structural_text_projections: &[codestory_store::StructuralTextProjection {
+                    file_id: 40,
+                    source_content_hash: source_hash,
+                    descriptor_version: codestory_store::STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+                    producer: "structural_markdown_collector".to_string(),
+                    language: "markdown".to_string(),
+                    file_role: codestory_store::FileRole::Source,
+                    unit_count: 1,
+                    unit_digest: codestory_store::structural_text_unit_digest(
+                        std::slice::from_ref(&unit),
+                    ),
+                }],
+                structural_text_cache_writes: &[],
+                edges: &[],
+                occurrences: &[],
+                component_access: &[],
+                callable_projection_states: &[],
+                file_errors: &[],
+            })
+            .expect("insert verified structural projection");
+        let node_names = HashMap::from([(CoreNodeId(41), "demo".to_string())]);
+
+        let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(41), 1.0)
+            .expect("provenance lookup")
+            .expect("structural hit");
+
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_markdown_collector")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
     fn indexed_files_reports_incomplete_reason_counts() {
         let temp = tempdir().expect("temp dir");
         let storage_path = temp.path().join("cache").join("codestory.db");
@@ -16323,20 +24379,24 @@ fn build_llm_symbol_doc_text() -> String {
         std::fs::write(&error_path, "fn broken( {\n").expect("write error");
 
         {
-            let storage = Storage::open(&storage_path).expect("open storage");
+            let mut storage = Storage::open(&storage_path).expect("open storage");
             for (id, path) in [(11, unknown_path), (12, error_path)] {
-                storage
-                    .insert_file(&FileInfo {
-                        id,
-                        path,
-                        language: "rust".to_string(),
-                        modification_time: 1,
-                        indexed: true,
-                        complete: false,
-                        line_count: 1,
-                        file_role: codestory_store::FileRole::Source,
-                    })
-                    .expect("insert file");
+                let file = FileInfo {
+                    id,
+                    path,
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: false,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                };
+                storage.insert_file(&file).expect("insert file");
+                if id == 11 {
+                    storage
+                        .update_file_metadata(&file, Some("verified-partial"))
+                        .expect("persist verified content hash");
+                }
             }
             storage
                 .insert_error(&codestory_contracts::graph::ErrorInfo {
@@ -16346,13 +24406,31 @@ fn build_llm_symbol_doc_text() -> String {
                     column: Some(1),
                     is_fatal: false,
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
                 })
                 .expect("insert error");
+            let publication = test_index_publication(1, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+            let identity = project_identity_v3(temp.path());
+            storage
+                .publish_source_policy_exclusion_generation(
+                    &publication,
+                    &identity.project_id,
+                    &identity.workspace_id,
+                    default_source_policy_identity(),
+                    &[],
+                )
+                .expect("publish source policy identity");
+            storage
+                .publish_structural_text_unit_generation(&publication)
+                .expect("publish structural text identity");
+            storage
+                .put_index_publication(&publication)
+                .expect("publish complete core identity");
         }
 
         let controller = AppController::new();
         controller
-            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .open_project_summary_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
         let output = controller
             .indexed_files(IndexedFilesRequest {
@@ -16376,18 +24454,24 @@ fn build_llm_symbol_doc_text() -> String {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(reasons.get("index_error").map(|entry| entry.0), Some(1));
-        assert_eq!(reasons.get("unknown").map(|entry| entry.0), Some(1));
-        assert!(
-            reasons
-                .get("unknown")
-                .is_some_and(|entry| entry.1.contains("full reindex")),
-            "{reasons:?}"
+        assert_eq!(
+            reasons.get("collector_failure").map(|entry| entry.0),
+            Some(1)
         );
+        assert_eq!(reasons.get("parser_partial").map(|entry| entry.0), Some(1));
+        assert_eq!(output.coverage_gaps.len(), 2);
+        let partial = output
+            .coverage_gaps
+            .iter()
+            .find(|entry| entry.reason == FileCoverageReason::ParserPartial)
+            .expect("parser partial diagnostic");
+        assert!(!partial.retryable);
+        assert!(partial.verified_source);
+        assert!(partial.projection_available);
     }
 
     #[test]
-    fn build_search_state_scopes_projection_rebuild_to_touched_files() {
+    fn build_search_state_ignores_stale_legacy_projection_rows() {
         let mut storage = Storage::new_in_memory().expect("storage");
         storage
             .insert_nodes_batch(&[
@@ -16422,10 +24506,6 @@ fn build_llm_symbol_doc_text() -> String {
             ])
             .expect("insert nodes");
         storage
-            .rebuild_search_symbol_projection_from_node_table()
-            .expect("full projection");
-
-        storage
             .insert_nodes_batch(&[Node {
                 id: CoreNodeId(901),
                 kind: NodeKind::FUNCTION,
@@ -16443,16 +24523,16 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("seed untouched stale projection");
 
         let nodes = storage.get_nodes().expect("nodes");
-        let touched = HashSet::from([CoreNodeId(900)]);
-        build_search_state(
-            &mut storage,
-            None,
-            nodes,
-            Some(&touched),
-            SemanticProjectionMode::SkipPersistence,
-            false,
-        )
-        .expect("scoped search state");
+        let result =
+            build_search_state(None, nodes).expect("build search state from canonical nodes");
+        assert_eq!(
+            result.node_names.get(&CoreNodeId(901)).map(String::as_str),
+            Some("pkg::renamed")
+        );
+        assert_eq!(
+            result.node_names.get(&CoreNodeId(911)).map(String::as_str),
+            Some("pkg::untouched")
+        );
 
         let projection = storage
             .get_search_symbol_projection_batch_after(None, 10)
@@ -16462,16 +24542,85 @@ fn build_llm_symbol_doc_text() -> String {
             .map(|entry| (entry.node_id, entry.display_name))
             .collect();
         assert_eq!(
-            names_by_id.get(&CoreNodeId(900)).map(String::as_str),
-            Some("src/changed.rs")
-        );
-        assert_eq!(
-            names_by_id.get(&CoreNodeId(901)).map(String::as_str),
-            Some("pkg::renamed")
-        );
-        assert_eq!(
             names_by_id.get(&CoreNodeId(911)).map(String::as_str),
             Some("stale_other_file")
+        );
+    }
+
+    #[test]
+    fn persisted_search_build_streams_multiple_pages_through_one_writer() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("search stream tempdir");
+        let storage_path = temp.path().join("codestory.db");
+        let search_path = temp.path().join("search-generation");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        let nodes = (1..=4_100_i64)
+            .map(|id| Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("symbol_{id}"),
+                qualified_name: (id % 2 == 0).then(|| format!("pkg::symbol_{id}")),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert streamed search nodes");
+
+        let cancelled_search_path = temp.path().join("cancelled-search-generation");
+        let cancel_token = CancellationToken::new();
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchSymbolPage,
+            PublicationTestAction::Cancel,
+        );
+        let cancelled = match build_persisted_search_state_from_canonical_symbols(
+            &mut storage,
+            &cancelled_search_path,
+            false,
+            &test_sidecar_runtime_from_env(),
+            Some(&cancel_token),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("cancel after the first non-final page"),
+        };
+        assert_eq!(cancelled.code, "cancelled");
+        assert!(cancel_token.is_cancelled());
+        assert!(
+            !search_generation_completion_path(&cancelled_search_path).exists(),
+            "cancelled page stream must not publish a completion marker"
+        );
+        let cancelled_engine = SearchEngine::open_existing(&cancelled_search_path)
+            .expect("open uncommitted cancelled generation");
+        assert_eq!(
+            cancelled_engine.tantivy_doc_count(),
+            0,
+            "cancelled non-final page must not commit Tantivy documents"
+        );
+        drop(cancelled_engine);
+
+        let result = build_persisted_search_state_from_canonical_symbols(
+            &mut storage,
+            &search_path,
+            false,
+            &test_sidecar_runtime_from_env(),
+            None,
+        )
+        .expect("build persisted search from canonical stream");
+
+        assert_eq!(result.search_stats.search_projection_rebuild_ms, 0);
+        assert_eq!(result.search_stats.search_symbol_stream_rows, 4_100);
+        assert_eq!(result.search_stats.search_symbol_stream_batches, 2);
+        assert_eq!(result.search_stats.search_symbol_index_docs_written, 4_100);
+        assert_eq!(result.search_stats.search_symbol_index_writer_count, 1);
+        assert_eq!(result.search_stats.search_symbol_index_commit_count, 1);
+        assert_eq!(result.search_stats.search_symbol_index_reload_count, 1);
+        assert_eq!(result.node_names.len(), 4_100);
+        assert_eq!(result.engine.full_text_doc_count(), 4_100);
+        assert_eq!(
+            storage
+                .get_search_symbol_projection_count()
+                .expect("count legacy projection"),
+            0
         );
     }
 
@@ -16539,7 +24688,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
     }
 
     #[test]
@@ -16593,10 +24742,9 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
         controller
-            .open_project(OpenProjectRequest {
-                path: workspace.path().to_string_lossy().to_string(),
-            })
+            .open_project_with_storage_path(workspace.path().to_path_buf(), storage_path)
             .expect("open workspace");
         controller
             .run_indexing_blocking(IndexMode::Full)
@@ -16613,7 +24761,7 @@ fn build_llm_symbol_doc_text() -> String {
                     hybrid_limits: None,
                 })
                 .expect_err("search fixtures should require full sidecars");
-            assert_mandatory_sidecar_unavailable(&error);
+            assert_mandatory_retrieval_unavailable(&error);
         }
     }
 
@@ -16623,10 +24771,9 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
         controller
-            .open_project(OpenProjectRequest {
-                path: workspace.path().to_string_lossy().to_string(),
-            })
+            .open_project_with_storage_path(workspace.path().to_path_buf(), storage_path)
             .expect("open workspace");
         controller
             .run_indexing_blocking(IndexMode::Full)
@@ -16642,7 +24789,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("generic repo explanation search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&generic_error);
+        assert_mandatory_retrieval_unavailable(&generic_error);
 
         let symbol_error = controller
             .search_results(SearchRequest {
@@ -16654,7 +24801,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("symbol-like repo explanation search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&symbol_error);
+        assert_mandatory_retrieval_unavailable(&symbol_error);
     }
 
     #[test]
@@ -16707,7 +24854,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("natural language search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error_without_plan);
+        assert_mandatory_retrieval_unavailable(&error_without_plan);
 
         let error_with_plan = controller
             .search_results(SearchRequest {
@@ -16719,12 +24866,11 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("natural language search plan should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error_with_plan);
+        assert_mandatory_retrieval_unavailable(&error_with_plan);
     }
 
     #[test]
     fn build_search_state_prefers_qualified_name() {
-        let mut storage = Storage::new_in_memory().expect("storage");
         let nodes = vec![Node {
             id: CoreNodeId(1),
             kind: NodeKind::FUNCTION,
@@ -16733,15 +24879,7 @@ fn build_llm_symbol_doc_text() -> String {
             ..Default::default()
         }];
 
-        let result = build_search_state(
-            &mut storage,
-            None,
-            nodes,
-            None,
-            SemanticProjectionMode::SkipPersistence,
-            true,
-        )
-        .expect("build search state");
+        let result = build_search_state(None, nodes).expect("build search state");
         let node_names = result.node_names;
         let engine = result.engine;
         assert_eq!(
@@ -16795,7 +24933,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn run_indexing_without_runtime_refresh_populates_semantic_docs_in_storage() {
+    fn run_indexing_without_runtime_refresh_populates_dense_anchor_inputs_in_storage() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16818,17 +24956,2021 @@ fn build_llm_symbol_doc_text() -> String {
         drop(state);
 
         let storage = Storage::open(&storage_path).expect("reopen storage");
-        let stats = storage
-            .get_llm_symbol_doc_stats()
-            .expect("semantic doc stats");
+        let anchors = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs");
         assert!(
-            stats.doc_count > 0,
-            "expected full indexing to persist semantic docs without requiring a follow-up open"
+            !anchors.is_empty(),
+            "expected full indexing to publish dense anchor inputs without requiring a follow-up open"
+        );
+        assert!(anchors.iter().all(|anchor| {
+            !anchor.document_hash.is_empty()
+                && anchor.policy_version == SEMANTIC_POLICY_VERSION
+                && anchor.source_identity.starts_with("core:")
+                && !anchor.text.is_empty()
+        }));
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("core publication")
+            .expect("complete core publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("complete dense anchor manifest");
+        assert_eq!(manifest.anchor_count as usize, anchors.len());
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic docs")
+                .is_empty(),
+            "core indexing must not persist vectors"
         );
     }
 
     #[test]
-    fn full_refresh_reuses_unchanged_semantic_docs_from_previous_live_index() {
+    fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full index");
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_manifest = first_storage
+            .validate_dense_anchor_publication(&first_publication)
+            .expect("first dense manifest");
+        drop(first_storage);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental index");
+        let storage = Storage::open(&storage_path).expect("incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("incremental publication")
+            .expect("complete incremental publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("incremental dense manifest");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_ne!(manifest.core_run_id, first_manifest.core_run_id);
+        let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        assert!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("carried dense anchors")
+                .iter()
+                .all(|anchor| anchor.source_identity == expected_source)
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn core_dense_anchor_publication_ignores_disabled_retrieval_intent() {
+        let _lock = process_env_test_lock();
+        let _hybrid = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("core index without retrieval activation");
+
+        let storage = Storage::open(&storage_path).expect("core storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("core publication")
+            .expect("complete core publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("dense anchors are complete without retrieval activation");
+        assert!(manifest.anchor_count > 0);
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
+        );
+        assert!(controller.state.lock().search_engine.is_none());
+    }
+
+    #[test]
+    fn core_dense_anchor_publication_succeeds_when_embedding_backend_is_unavailable() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let embedding_cache_root = workspace.path().join("embedding-unavailable");
+        fs::create_dir_all(&embedding_cache_root).expect("embedding cache root");
+        fs::write(
+            embedding_cache_root.join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER),
+            b"unavailable",
+        )
+        .expect("embedding unavailable marker");
+        let process_defaults = codestory_retrieval::SidecarProcessDefaults::new(
+            embedding_cache_root,
+            codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+        );
+        let runtime =
+            codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+                Some(workspace.path()),
+                codestory_retrieval::SidecarProfile::Local,
+                None,
+                &process_defaults,
+                &codestory_retrieval::SidecarRuntimeOverrides::default(),
+            );
+        let unavailable =
+            codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime)
+                .expect_err("test runtime must reject embedding initialization");
+        assert!(
+            unavailable
+                .to_string()
+                .contains("embedding backend unavailable")
+        );
+        assert!(
+            !codestory_retrieval::probe_product_embedding_runtime_for_runtime(&runtime).reachable
+        );
+
+        let controller = AppController::new_with_config(runtime);
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("core indexing must not initialize or access embeddings");
+
+        let storage = Storage::open(&storage_path).expect("core storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("core publication")
+            .expect("complete core publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("dense publication without embeddings");
+        assert!(manifest.anchor_count > 0);
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy vectors")
+                .is_empty()
+        );
+    }
+
+    fn make_source_exceed_default_index_byte_cap(path: &Path, reason: &str) {
+        let mut source = fs::read_to_string(path).expect("read source");
+        source.push_str("\n// ");
+        source.push_str(reason);
+        source.push_str("\n// ");
+        let padding = (DEFAULT_SOURCE_FILE_BYTE_CAP as usize)
+            .saturating_sub(source.len())
+            .saturating_add(1);
+        source.push_str(&"x".repeat(padding));
+        source.push('\n');
+        fs::write(path, source).expect("write oversized source");
+
+        let size = fs::metadata(path).expect("oversized source metadata").len();
+        assert!(
+            size > DEFAULT_SOURCE_FILE_BYTE_CAP,
+            "fixture source must exceed the default index byte cap: {size}"
+        );
+    }
+
+    #[test]
+    fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("small.rs"), "pub fn small() {}\n")
+            .expect("write control source");
+        let evidence_path = workspace.path().join("evidence-generated.json");
+        let mut evidence = String::from("{");
+        for index in 0..=codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP {
+            if index > 0 {
+                evidence.push(',');
+            }
+            evidence.push_str(&format!("\"key{index}\":{index}"));
+        }
+        evidence.push('}');
+        fs::write(&evidence_path, &evidence).expect("write bounded structural fixture");
+        assert!(evidence.len() as u64 <= DEFAULT_SOURCE_FILE_BYTE_CAP);
+
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("unit-bound source should not block core publication");
+
+        let storage = Storage::open(&storage_path).expect("open published storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read publication")
+            .expect("complete publication");
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("verified exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 1);
+        let exclusions = storage
+            .get_source_policy_exclusions()
+            .expect("read exclusions");
+        assert_eq!(exclusions[0].normalized_path, "evidence-generated.json");
+        assert_eq!(
+            exclusions[0].observed_unit_count,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
+        );
+        assert_eq!(
+            exclusions[0].structural_unit_cap,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP
+        );
+        assert!(
+            storage
+                .get_file_by_path(&evidence_path)
+                .expect("read file row")
+                .is_none(),
+            "excluded content must not retain graph or structural projection"
+        );
+        let files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: Some("evidence-generated.json".into()),
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("read native exclusion diagnostics");
+        assert_eq!(files.policy_exclusions.len(), 1);
+        assert!(!files.policy_exclusions[0].graph_coverage);
+        assert!(!files.policy_exclusions[0].semantic_coverage);
+        assert_eq!(
+            files.policy_exclusions[0].observed_unit_count,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP + 1
+        );
+        let workspace_manifest =
+            WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+        let freshness =
+            index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 0);
+        assert_eq!(freshness.removed_file_count, 0);
+    }
+
+    #[test]
+    fn incremental_refresh_replaces_structural_projection_and_semantics_with_unit_exclusion() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let component_dir = workspace.path().join("alpha");
+        fs::create_dir_all(&component_dir).expect("component directory");
+        let evidence_path = component_dir.join("evidence.json");
+        fs::write(&evidence_path, "{\"kept\":1}").expect("initial structural source");
+        fs::write(workspace.path().join("control.rs"), "pub fn control() {}\n")
+            .expect("control source");
+
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full publication");
+
+        let initial_storage = Storage::open(&storage_path).expect("initial storage");
+        let initial_file = initial_storage
+            .get_file_by_path(&evidence_path)
+            .expect("initial file lookup")
+            .expect("initial parser-backed file");
+        let initial_file_id = codestory_contracts::graph::NodeId(initial_file.id);
+        assert!(
+            initial_storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("initial symbol docs")
+                .iter()
+                .any(|doc| doc.file_node_id == Some(initial_file_id)),
+            "the initial structural projection must have semantic evidence to invalidate"
+        );
+        assert!(
+            initial_storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("initial component reports")
+                .iter()
+                .any(|doc| doc.display_name == "component_report:dir:alpha"),
+            "the initial structural projection must contribute an alpha component report"
+        );
+        drop(initial_storage);
+
+        let mut over_bound = String::from("{");
+        for index in 0..=codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP {
+            if index > 0 {
+                over_bound.push(',');
+            }
+            over_bound.push_str(&format!("\"key{index}\":{index}"));
+        }
+        over_bound.push('}');
+        assert!(over_bound.len() as u64 <= DEFAULT_SOURCE_FILE_BYTE_CAP);
+        fs::write(&evidence_path, over_bound).expect("unit-bound structural source");
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental unit exclusion publication");
+        let excluded_storage = Storage::open(&storage_path).expect("excluded storage");
+        assert!(
+            excluded_storage
+                .get_file_by_path(&evidence_path)
+                .expect("excluded file lookup")
+                .is_none(),
+            "unit exclusion must remove the previous parser-backed projection"
+        );
+        assert!(
+            excluded_storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("excluded symbol docs")
+                .iter()
+                .all(|doc| {
+                    doc.file_node_id != Some(initial_file_id)
+                        && doc.display_name != "component_report:dir:alpha"
+                }),
+            "unit exclusion must remove stale file semantics and its component report"
+        );
+        assert!(
+            excluded_storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("excluded dense anchors")
+                .iter()
+                .all(|doc| doc.file_node_id != Some(initial_file_id)),
+            "unit exclusion must remove stale dense evidence"
+        );
+        assert_eq!(
+            excluded_storage
+                .get_source_policy_exclusions()
+                .expect("unit exclusions")
+                .len(),
+            1
+        );
+        drop(excluded_storage);
+
+        fs::write(&evidence_path, "{\"reevaluated\":2}")
+            .expect("source changed back below unit cap");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental policy reevaluation");
+        let restored_storage = Storage::open(&storage_path).expect("restored storage");
+        assert!(
+            restored_storage
+                .get_file_by_path(&evidence_path)
+                .expect("restored file lookup")
+                .is_some(),
+            "changed content below the policy cap must be indexed again"
+        );
+        assert!(
+            restored_storage
+                .get_source_policy_exclusions()
+                .expect("restored exclusions")
+                .is_empty(),
+            "the old content-bound exclusion must not survive reevaluation"
+        );
+    }
+
+    #[test]
+    fn incremental_structural_unit_exclusion_revalidates_content_at_identity_fence() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let evidence_path = workspace.path().join("evidence.json");
+        fs::write(&evidence_path, "{\"baseline\":1}").expect("baseline structural source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("baseline publication");
+        let baseline = Storage::open(&storage_path)
+            .expect("baseline storage")
+            .get_complete_index_publication()
+            .expect("baseline publication read")
+            .expect("complete baseline publication");
+
+        let mut over_bound = String::from("{");
+        for index in 0..=codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP {
+            if index > 0 {
+                over_bound.push(',');
+            }
+            over_bound.push_str(&format!("\"key{index}\":{index}"));
+        }
+        over_bound.push('}');
+        fs::write(&evidence_path, over_bound).expect("unit-bound structural source");
+        let changed_path = evidence_path.clone();
+        arm_source_policy_before_revalidate_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("classified unit exclusion");
+            bytes.push(b' ');
+            fs::write(&changed_path, bytes).expect("drift classified unit exclusion");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("drifted unit exclusion must fail closed");
+        assert_eq!(error.code, "source_verification_failed");
+        let live = Storage::open(&storage_path).expect("preserved live storage");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("preserved publication"),
+            Some(baseline)
+        );
+        assert!(
+            live.get_file_by_path(&evidence_path)
+                .expect("preserved parser-backed file")
+                .is_some()
+        );
+        assert!(
+            live.get_source_policy_exclusions()
+                .expect("preserved exclusions")
+                .is_empty()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn structural_unit_policy_change_invalidates_exclusion_and_forces_reevaluation() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let evidence_path = workspace.path().join("evidence.json");
+        fs::write(&evidence_path, "{\"one\":1,\"two\":2,\"three\":3}").expect("structural source");
+        fs::write(workspace.path().join("control.rs"), "pub fn control() {}\n")
+            .expect("control source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let excluding_policy = SourceIndexPolicy {
+            policy_version: OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+            byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+            structural_unit_cap: 2,
+        };
+        let excluding_controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            excluding_policy.clone(),
+        );
+        excluding_controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open excluding controller");
+        excluding_controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish custom-cap exclusion");
+
+        let excluded_storage = Storage::open(&storage_path).expect("excluded storage");
+        let publication = excluded_storage
+            .get_complete_index_publication()
+            .expect("excluded publication")
+            .expect("complete excluded publication");
+        let excluded_manifest = excluded_storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &excluding_policy.policy_version,
+                    excluding_policy.byte_cap,
+                    excluding_policy.structural_unit_cap,
+                ),
+            )
+            .expect("custom unit cap manifest");
+        assert_eq!(excluded_manifest.structural_unit_cap, 2);
+        assert_eq!(excluded_manifest.exclusion_count, 1);
+        drop(excluded_storage);
+
+        let admitting_policy = SourceIndexPolicy {
+            structural_unit_cap: 3,
+            ..excluding_policy
+        };
+        let admitting_controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            admitting_policy.clone(),
+        );
+        admitting_controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open admitting controller");
+        assert!(
+            admitting_controller
+                .complete_core_requires_publication_repair(&storage_path)
+                .expect("policy change freshness"),
+            "a changed unit cap must invalidate the prior publication identity"
+        );
+        let error = admitting_controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: None,
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect_err("mismatched unit-cap reader must fail closed");
+        assert_eq!(error.code, "source_verification_failed");
+
+        admitting_controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("reevaluate source under changed unit cap");
+        let admitted_storage = Storage::open(&storage_path).expect("admitted storage");
+        let admitted_publication = admitted_storage
+            .get_complete_index_publication()
+            .expect("admitted publication")
+            .expect("complete admitted publication");
+        let admitted_manifest = admitted_storage
+            .validate_source_policy_exclusion_publication(
+                &admitted_publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &admitting_policy.policy_version,
+                    admitting_policy.byte_cap,
+                    admitting_policy.structural_unit_cap,
+                ),
+            )
+            .expect("changed-cap manifest");
+        assert_eq!(admitted_manifest.structural_unit_cap, 3);
+        assert_eq!(admitted_manifest.exclusion_count, 0);
+        assert!(
+            admitted_storage
+                .get_file_by_path(&evidence_path)
+                .expect("reevaluated file")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_coverage() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        make_source_exceed_default_index_byte_cap(
+            &workspace.path().join("rust_tictactoe.rs"),
+            "first full-refresh candidate is deliberately oversized",
+        );
+        fs::create_dir_all(workspace.path().join("generated")).expect("generated fixture dir");
+        fs::create_dir_all(workspace.path().join("vendor")).expect("vendor fixture dir");
+        fs::write(
+            workspace.path().join("generated/registers.h"),
+            vec![b'g'; DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1],
+        )
+        .expect("generated oversized fixture");
+        fs::write(
+            workspace.path().join("vendor/bundle.js"),
+            vec![b'v'; DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1],
+        )
+        .expect("vendor oversized fixture");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("verified oversized source should not block first publication");
+
+        let storage = Storage::open(&storage_path).expect("open published storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read publication")
+            .expect("complete publication");
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("verified exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 3);
+        let exclusions = storage
+            .get_source_policy_exclusions()
+            .expect("source exclusions");
+        assert_eq!(
+            exclusions
+                .iter()
+                .map(|entry| entry.normalized_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "generated/registers.h",
+                "rust_tictactoe.rs",
+                "vendor/bundle.js"
+            ]
+        );
+        assert!(
+            exclusions
+                .iter()
+                .all(|entry| entry.observed_size > entry.byte_cap)
+        );
+        assert!(
+            storage
+                .get_file_by_path(&workspace.path().join("rust_tictactoe.rs"))
+                .expect("excluded file lookup")
+                .is_none(),
+            "policy exclusion must not create parser-backed file coverage"
+        );
+        let files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: Some("rust_tictactoe.rs".into()),
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("agent-facing file coverage");
+        assert!(files.coverage_gaps.is_empty());
+        assert_eq!(files.policy_exclusions.len(), 1);
+        assert!(!files.policy_exclusions[0].graph_coverage);
+        assert!(!files.policy_exclusions[0].semantic_coverage);
+        let all_files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: None,
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("all agent-facing file coverage");
+        assert_eq!(all_files.summary.policy_exclusion_count, 3);
+        assert!(
+            all_files
+                .policy_exclusions
+                .iter()
+                .any(|entry| entry.role == IndexedFileRoleDto::Generated)
+        );
+        assert!(
+            all_files
+                .policy_exclusions
+                .iter()
+                .any(|entry| entry.role == IndexedFileRoleDto::Vendor)
+        );
+        let workspace_manifest =
+            WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace manifest");
+        let freshness =
+            index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        storage
+            .get_connection()
+            .execute("DELETE FROM source_policy_exclusion_publication", [])
+            .expect("corrupt exclusion publication identity");
+        assert!(
+            controller
+                .complete_core_requires_publication_repair(&storage_path)
+                .expect("missing migrated manifest requires writer repair")
+        );
+        let incomplete =
+            index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
+        assert_eq!(incomplete.status, IndexFreshnessStatusDto::NotChecked);
+        assert!(
+            incomplete
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("source policy exclusion publication"))
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_revalidates_excluded_bytes_at_identity_fence_and_preserves_live_core() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline core");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline core")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "full refresh identity-fence drift fixture",
+        );
+        let changed_path = source_path.clone();
+        arm_source_policy_before_revalidate_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("read classified exclusion");
+            bytes.extend_from_slice(b"\n// changed after classification\n");
+            fs::write(&changed_path, bytes).expect("mutate classified exclusion");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("changed exclusion must reject full candidate");
+        assert_eq!(error.code, "source_verification_failed");
+        let live = Storage::open(&storage_path).expect("reopen preserved live core");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline.clone())
+        );
+        let manifest = live
+            .validate_source_policy_exclusion_publication(
+                &baseline,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("baseline exclusion manifest remains valid");
+        assert_eq!(manifest.exclusion_count, 0);
+        assert!(
+            live.get_file_by_path(&source_path)
+                .expect("read preserved file projection")
+                .is_some()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn incremental_refresh_revalidates_excluded_bytes_at_identity_fence_and_preserves_live_core() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline core");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline core")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "incremental identity-fence drift fixture",
+        );
+        let changed_path = source_path.clone();
+        arm_source_policy_before_revalidate_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("read classified exclusion");
+            bytes.extend_from_slice(b"\n// changed after classification\n");
+            fs::write(&changed_path, bytes).expect("mutate classified exclusion");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("changed exclusion must reject incremental candidate");
+        assert_eq!(error.code, "source_verification_failed");
+        let live = Storage::open(&storage_path).expect("reopen preserved live core");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline.clone())
+        );
+        let manifest = live
+            .validate_source_policy_exclusion_publication(
+                &baseline,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("baseline exclusion manifest remains valid");
+        assert_eq!(manifest.exclusion_count, 0);
+        assert!(
+            live.get_file_by_path(&source_path)
+                .expect("read preserved file projection")
+                .is_some()
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn non_default_source_policy_cap_is_shared_by_planning_indexer_publication_and_readers() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let large_path = workspace.path().join("large.rs");
+        fs::write(workspace.path().join("small.rs"), "pub fn small() {}\n")
+            .expect("write small source");
+        fs::write(
+            &large_path,
+            "// oversized\n// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+        )
+        .expect("write policy source");
+        let policy = SourceIndexPolicy::oversized(64);
+        let manifest = WorkspaceManifest::open(workspace.path().to_path_buf()).expect("workspace");
+        let inventory = manifest
+            .source_inventory_with_policy(&policy)
+            .expect("classify with explicit policy");
+        assert_eq!(inventory.policy_exclusions.len(), 1);
+        assert_eq!(inventory.policy_exclusions[0].normalized_path, "large.rs");
+        assert_eq!(inventory.policy_exclusions[0].byte_cap, 64);
+
+        let mut fallback = Storage::new_in_memory().expect("fallback storage");
+        let fallback_plan = RefreshExecutionPlan {
+            mode: RefreshMode::FullRefresh,
+            files_to_index: vec![large_path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        V2WorkspaceIndexer::new(workspace.path().to_path_buf())
+            .with_source_file_byte_cap(policy.byte_cap)
+            .run(&mut fallback, &fallback_plan, &EventBus::new(), None)
+            .expect("indexer fallback records oversized coverage");
+        assert!(
+            fallback
+                .get_errors(None)
+                .expect("fallback errors")
+                .iter()
+                .any(|error| error.coverage_reason == Some(FileCoverageReason::Oversized)),
+            "the parser fallback must enforce the same 64-byte cap"
+        );
+
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            policy.clone(),
+        );
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish non-default policy core");
+        let storage = Storage::open(&storage_path).expect("open policy core");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read policy publication")
+            .expect("complete policy publication");
+        let published = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &project_identity_v3(workspace.path()).project_id,
+                &project_identity_v3(workspace.path()).workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &policy.policy_version,
+                    policy.byte_cap,
+                    policy.structural_unit_cap,
+                ),
+            )
+            .expect("manifest uses the injected policy");
+        assert_eq!(published.byte_cap, 64);
+        assert_eq!(published.exclusion_count, 1);
+        let files = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: Some("large.rs".into()),
+                language: None,
+                role: None,
+                limit: None,
+            })
+            .expect("matching policy reader accepts the manifest");
+        assert_eq!(files.policy_exclusions[0].byte_cap, 64);
+
+        for incompatible in [
+            SourceIndexPolicy::oversized(65),
+            SourceIndexPolicy {
+                policy_version: "oversized-source-v2".into(),
+                byte_cap: 64,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            },
+        ] {
+            let reader = AppController::new_with_source_index_policy(
+                test_sidecar_runtime_from_env(),
+                incompatible,
+            );
+            reader
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("bind incompatible reader");
+            assert!(
+                reader
+                    .complete_core_requires_publication_repair(&storage_path)
+                    .expect("inspect repair requirement")
+            );
+            let error = reader
+                .indexed_files(IndexedFilesRequest {
+                    path_contains: None,
+                    language: None,
+                    role: None,
+                    limit: None,
+                })
+                .expect_err("incompatible reader must fail closed");
+            assert_eq!(error.code, "source_verification_failed");
+        }
+    }
+
+    #[test]
+    fn special_collector_growth_after_planning_cannot_publish() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace");
+        let source_path = workspace.path().join("schema.sql");
+        fs::write(&source_path, "CREATE TABLE drifted (id INTEGER);\n")
+            .expect("write below-cap structural source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            SourceIndexPolicy::oversized(64),
+        );
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+
+        let changed_path = source_path.clone();
+        arm_source_policy_after_plan_hook(move || {
+            let mut bytes = fs::read(&changed_path).expect("read planned structural source");
+            bytes.resize(65, b' ');
+            fs::write(&changed_path, bytes).expect("grow structural source after planning");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("post-plan oversized structural source must reject publication");
+        assert_eq!(error.code, "source_oversized");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details.coverage_gaps.iter().any(|gap| {
+                gap.path == "schema.sql"
+                    && gap.reason == FileCoverageReason::Oversized
+                    && !gap.verified_source
+                    && !gap.projection_available
+            })
+        }));
+        if storage_path.exists() {
+            assert!(
+                Storage::open(&storage_path)
+                    .expect("open rejected live storage")
+                    .get_index_publication()
+                    .expect("read rejected publication")
+                    .is_none()
+            );
+        }
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn partial_discovery_keeps_oversized_candidates_blocking_and_publishes_nothing() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        fs::write(
+            workspace.path().join("src/large.rs"),
+            vec![b'x'; DEFAULT_SOURCE_FILE_BYTE_CAP as usize + 1],
+        )
+        .expect("oversized source");
+        fs::write(
+            workspace.path().join("codestory_workspace.json"),
+            r#"{"members":["src","missing"]}"#,
+        )
+        .expect("partial workspace manifest");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open partial project");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("partial discovery cannot authorize exclusions");
+
+        assert_eq!(error.code, "source_discovery_incomplete");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::DiscoveryIncomplete)
+        }));
+        if storage_path.exists() {
+            let storage = Storage::open(&storage_path).expect("partial storage");
+            assert!(
+                storage
+                    .get_source_policy_exclusion_manifest()
+                    .expect("partial exclusion manifest")
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .get_index_publication()
+                    .expect("partial core publication")
+                    .is_none()
+            );
+        }
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn changed_source_is_reevaluated_into_a_new_verified_exclusion() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_file_id = first_storage
+            .get_file_by_path(&source_path)
+            .expect("first file lookup")
+            .expect("indexed Rust source")
+            .id;
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file_id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert!(
+            !first_anchors.is_empty(),
+            "fixture needs Rust dense anchors"
+        );
+        drop(first_storage);
+
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "scheduled but deliberately oversized for this index run",
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental exclusion publication");
+
+        let storage = Storage::open(&storage_path).expect("incremental storage");
+        assert!(
+            storage
+                .get_file_by_path(&source_path)
+                .expect("file lookup")
+                .is_none(),
+            "excluded source must not retain parser-backed file coverage"
+        );
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("incremental publication")
+            .expect("complete incremental publication");
+        assert_ne!(publication, first_publication);
+        let identity = project_identity_v3(workspace.path());
+        storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("complete exclusion publication");
+        let first_exclusion = storage
+            .get_source_policy_exclusions()
+            .expect("first exclusions")
+            .into_iter()
+            .find(|entry| entry.normalized_path == "rust_tictactoe.rs")
+            .expect("Rust exclusion");
+        let retained_anchors = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("current anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file_id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert!(retained_anchors.is_empty());
+        assert!(!first_anchors.is_empty());
+        drop(storage);
+
+        fs::write(
+            &source_path,
+            format!(
+                "{}\n// changed oversized content\n",
+                fs::read_to_string(&source_path).unwrap()
+            ),
+        )
+        .expect("change oversized source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("changed exclusion reevaluation");
+        let changed = Storage::open(&storage_path)
+            .expect("changed storage")
+            .get_source_policy_exclusions()
+            .expect("changed exclusions")
+            .into_iter()
+            .find(|entry| entry.normalized_path == "rust_tictactoe.rs")
+            .expect("changed Rust exclusion");
+        assert_ne!(changed.content_hash, first_exclusion.content_hash);
+        assert!(changed.observed_size > first_exclusion.observed_size);
+    }
+
+    #[test]
+    fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let identity = project_identity_v3(workspace.path());
+        let mut before_storage = Storage::open(&storage_path).expect("open complete core");
+        let before = before_storage
+            .get_complete_index_publication()
+            .expect("read complete core")
+            .expect("complete publication");
+        let exclusions = (0_u64..112)
+            .map(|index| OversizedSourceExclusionCandidate {
+                normalized_path: format!("legacy/excluded-{index}.rs"),
+                content_hash: format!("{index:064x}"),
+                observed_size: DEFAULT_SOURCE_FILE_BYTE_CAP + 1 + index,
+                observed_unit_count: 0,
+                policy_version: LEGACY_OVERSIZED_SOURCE_POLICY_VERSION.to_string(),
+                byte_cap: DEFAULT_SOURCE_FILE_BYTE_CAP,
+                structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            })
+            .collect::<Vec<_>>();
+        before_storage
+            .publish_source_policy_exclusion_generation(
+                &before,
+                &identity.project_id,
+                &identity.workspace_id,
+                legacy_source_policy_identity(),
+                &exclusions,
+            )
+            .expect("replace retained source-policy publication");
+        let legacy_source_policy_digest = legacy_source_policy_exclusion_digest_for_test(
+            &before_storage
+                .get_source_policy_exclusions()
+                .expect("read retained source-policy exclusions"),
+        );
+        let dense_before = before_storage
+            .validate_dense_anchor_publication(&before)
+            .expect("retained dense publication");
+        assert!(dense_before.anchor_count > 0);
+        let symbol_doc_count = before_storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("retained symbol documents")
+            .len();
+        assert!(symbol_doc_count > 0);
+        before_storage
+            .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                &identity.project_id,
+                symbol_doc_count as i64,
+                dense_before.anchor_count as i64,
+            ))
+            .expect("publish retained retrieval manifest");
+        let before_retrieval = before_storage
+            .get_retrieval_index_publication(&identity.project_id)
+            .expect("read retrieval publication")
+            .expect("retained retrieval publication");
+        drop(before_storage);
+
+        let legacy = rusqlite::Connection::open(&storage_path).expect("open retained v1 core");
+        legacy
+            .execute(
+                "UPDATE source_policy_exclusion_publication
+                 SET schema_version = 1, exclusion_digest = ?1",
+                rusqlite::params![legacy_source_policy_digest],
+            )
+            .expect("restore authentic retained v1 publication identity");
+        legacy
+            .execute_batch(
+                "DELETE FROM structural_text_unit_publication;
+                 ALTER TABLE index_publication RENAME TO index_publication_v30;
+                 CREATE TABLE index_publication (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL CHECK (generation > 0),
+                    generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+                    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+                    mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+                    published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+                 );
+                 INSERT INTO index_publication
+                 SELECT * FROM index_publication_v30;
+                 DROP TABLE index_publication_v30;
+                 PRAGMA user_version = 29;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("downgrade retained core to schema 29");
+        drop(legacy);
+        for entry in fs::read_dir(workspace.path()).expect("list fixture root") {
+            let path = entry.expect("fixture entry").path();
+            if path.file_name().is_some_and(|name| name == ".cache") {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).expect("remove source directory");
+            } else {
+                fs::remove_file(&path).expect("remove source file");
+            }
+        }
+
+        let outcome = controller
+            .republish_semantic_projections_at_blocking(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("republish from stored core");
+
+        assert_eq!(outcome.previous_publication, before);
+        assert_eq!(outcome.publication.generation, before.generation + 1);
+        assert_eq!(
+            outcome.publication.mode,
+            IndexPublicationMode::SemanticProjection
+        );
+        assert!(
+            outcome
+                .phase_timings
+                .symbol_search_docs_written
+                .is_some_and(|count| count > 0)
+        );
+        let storage = Storage::open(&storage_path).expect("open republished core");
+        assert_eq!(
+            storage
+                .get_connection()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            30
+        );
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read republished core"),
+            Some(outcome.publication.clone())
+        );
+        storage
+            .validate_dense_anchor_publication(&outcome.publication)
+            .expect("dense publication is coherent");
+        storage
+            .validate_structural_text_unit_publication(&outcome.publication)
+            .expect("structural publication is rebound");
+        let structural = storage
+            .get_structural_text_unit_publication_manifest()
+            .expect("read structural manifest")
+            .expect("explicit empty structural manifest");
+        assert_eq!(structural.unit_count, 0);
+        assert_eq!(structural.projection_count, 0);
+        let source_manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &outcome.publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("source policy is rebound");
+        assert_eq!(source_manifest.exclusion_count, 112);
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication(&identity.project_id)
+                .expect("read unchanged retrieval publication")
+                .as_ref(),
+            Some(&before_retrieval),
+            "projection-only core publication must not synthesize retrieval artifacts"
+        );
+        drop(storage);
+        let incompatible = AppController::new_with_source_index_policy(
+            test_sidecar_runtime_from_env(),
+            SourceIndexPolicy::oversized(DEFAULT_SOURCE_FILE_BYTE_CAP + 1),
+        );
+        incompatible
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open core with incompatible source policy");
+        let error = incompatible
+            .republish_semantic_projections_blocking()
+            .expect_err("source policy drift must fail closed");
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read publication after rejected source policy"),
+            Some(outcome.publication)
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = {
+            let mut storage = Storage::open(&storage_path).expect("open complete core");
+            let publication = storage
+                .get_complete_index_publication()
+                .expect("read complete core")
+                .expect("complete publication");
+            assert!(
+                storage
+                    .clear_symbol_search_docs()
+                    .expect("remove stored semantic documents")
+                    > 0
+            );
+            publication
+        };
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("missing stored document must fail closed");
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved publication"),
+            Some(before)
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_rejects_a_cache_owned_by_another_project() {
+        let _env = hybrid_test_env();
+        let selected = copy_tictactoe_workspace();
+        let owner = copy_tictactoe_workspace();
+        let storage_path = owner.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                owner.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open cache owner");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish owned core");
+        let before = Storage::database_complete_index_publication(&storage_path)
+            .expect("read owned publication");
+        let search_before = persisted_search_generation_names(&storage_path);
+
+        let error = controller
+            .republish_semantic_projections_at_blocking(
+                selected.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect_err("foreign cache must fail closed");
+
+        assert_eq!(error.code, "semantic_projection_project_mismatch");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved owned publication"),
+            before
+        );
+        assert_eq!(
+            persisted_search_generation_names(&storage_path),
+            search_before
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_rejects_manifestless_nonempty_structural_state() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = Storage::database_complete_index_publication(&storage_path)
+            .expect("read complete publication");
+        {
+            let storage = Storage::open(&storage_path).expect("open structural fixture");
+            storage
+                .get_connection()
+                .execute_batch(
+                    "DELETE FROM structural_text_unit_publication;
+                     INSERT INTO structural_text_artifact_cache (
+                        file_path, file_id, cache_key, source_content_hash,
+                        descriptor_version, producer, artifact_digest, artifact_blob,
+                        updated_at_epoch_ms
+                     ) VALUES ('legacy.txt', -1, 'v1:test',
+                        '1111111111111111111111111111111111111111111111111111111111111111',
+                        1, 'test',
+                        '2222222222222222222222222222222222222222222222222222222222222222',
+                        X'01', 1);",
+                )
+                .expect("seed nonempty unmanifested structural state");
+        }
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("unmanifested structural rows must fail closed");
+
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert!(error.message.contains("nonempty state"));
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved publication"),
+            before
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_rejects_manifestless_current_schema() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let before = Storage::database_complete_index_publication(&storage_path)
+            .expect("read complete publication");
+        Storage::open(&storage_path)
+            .expect("open current core")
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove current structural manifest");
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("current schema cannot use legacy compatibility");
+
+        assert_eq!(error.code, "semantic_projection_migration_required");
+        assert!(error.message.contains("schema-29 retained core"));
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read preserved publication"),
+            before
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn semantic_projection_republish_respects_the_shared_writer_lock() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let publication = Storage::database_complete_index_publication(&storage_path)
+            .expect("read complete publication");
+        let _guard = IndexWriterGuard::try_acquire(&storage_path).expect("hold writer lock");
+
+        let error = controller
+            .republish_semantic_projections_blocking()
+            .expect_err("second writer must be rejected");
+        assert_eq!(error.code, "cache_busy");
+        assert_eq!(
+            Storage::database_complete_index_publication(&storage_path)
+                .expect("read unchanged publication"),
+            publication
+        );
+    }
+
+    #[test]
+    fn semantic_projection_republish_fail_and_cancel_matrix_preserves_complete_core_and_search() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let runtime = test_sidecar_runtime_from_env();
+        let controller = AppController::new_with_config(runtime.clone());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let identity = project_identity_v3(workspace.path());
+        let (publication, retrieval_publication) = {
+            let mut storage = Storage::open(&storage_path).expect("open baseline core");
+            let publication = storage
+                .get_complete_index_publication()
+                .expect("read baseline publication")
+                .expect("complete baseline publication");
+            let symbol_doc_count = storage
+                .get_symbol_search_doc_count()
+                .expect("count baseline symbol documents");
+            let dense_count = storage
+                .validate_dense_anchor_publication(&publication)
+                .expect("validate baseline dense publication")
+                .anchor_count;
+            storage
+                .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                    &identity.project_id,
+                    symbol_doc_count as i64,
+                    dense_count as i64,
+                ))
+                .expect("publish baseline retrieval identity");
+            let retrieval = storage
+                .get_retrieval_index_publication(&identity.project_id)
+                .expect("read baseline retrieval identity")
+                .expect("baseline retrieval publication");
+            (publication, retrieval)
+        };
+        let search_generations = persisted_search_generation_names(&storage_path);
+        for boundary in [
+            PublicationTestBoundary::SemanticContextIndexes,
+            PublicationTestBoundary::SemanticNodePage,
+            PublicationTestBoundary::SemanticStoredDocumentPage,
+            PublicationTestBoundary::SemanticEndpointRead,
+            PublicationTestBoundary::ProjectionSnapshotFinalize,
+            PublicationTestBoundary::ProjectionSnapshotDetail,
+            PublicationTestBoundary::ProjectionManifestIdentity,
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestBoundary::SearchSymbolPage,
+            PublicationTestBoundary::SearchIndexWrite,
+            PublicationTestBoundary::SearchValidation,
+            PublicationTestBoundary::SearchCompletion,
+            PublicationTestBoundary::CatalogLock,
+            PublicationTestBoundary::MarkerCompletion,
+            PublicationTestBoundary::DatabaseReplacement,
+        ] {
+            for action in [PublicationTestAction::Fail, PublicationTestAction::Cancel] {
+                let cancel = CancellationToken::new();
+                arm_publication_test_fault(boundary, action);
+                let error = match semantic_projection_republish_for_runtime(
+                    workspace.path(),
+                    &storage_path,
+                    Some(&cancel),
+                    &runtime,
+                    controller.source_index_policy.as_ref(),
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("faulted projection republish must not publish"),
+                };
+                assert_eq!(
+                    error.code,
+                    if action == PublicationTestAction::Cancel {
+                        "cancelled"
+                    } else {
+                        "internal"
+                    },
+                    "boundary={boundary:?} action={action:?}: {error:?}"
+                );
+                assert_eq!(
+                    cancel.is_cancelled(),
+                    action == PublicationTestAction::Cancel
+                );
+                assert_eq!(
+                    Storage::database_complete_index_publication(&storage_path)
+                        .expect("read preserved publication"),
+                    Some(publication.clone()),
+                    "boundary={boundary:?} action={action:?}"
+                );
+                assert_eq!(
+                    persisted_search_generation_names(&storage_path),
+                    search_generations,
+                    "boundary={boundary:?} action={action:?}"
+                );
+                assert_eq!(
+                    Storage::open(&storage_path)
+                        .expect("open preserved retrieval state")
+                        .get_retrieval_index_publication(&identity.project_id)
+                        .expect("read preserved retrieval state"),
+                    Some(retrieval_publication.clone()),
+                    "boundary={boundary:?} action={action:?}"
+                );
+                assert_no_staged_publication_artifacts(&storage_path);
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_projection_republish_runtime_cache_fault_completes_committed_generation() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let identity = project_identity_v3(workspace.path());
+        let (mut previous_publication, retrieval_publication) = {
+            let mut storage = Storage::open(&storage_path).expect("open baseline core");
+            let publication = storage
+                .get_complete_index_publication()
+                .expect("read baseline publication")
+                .expect("complete baseline publication");
+            let symbol_doc_count = storage
+                .get_symbol_search_doc_count()
+                .expect("count baseline symbol documents");
+            let dense_count = storage
+                .validate_dense_anchor_publication(&publication)
+                .expect("validate baseline dense publication")
+                .anchor_count;
+            storage
+                .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                    &identity.project_id,
+                    symbol_doc_count as i64,
+                    dense_count as i64,
+                ))
+                .expect("publish baseline retrieval identity");
+            let retrieval = storage
+                .get_retrieval_index_publication(&identity.project_id)
+                .expect("read baseline retrieval identity")
+                .expect("baseline retrieval publication");
+            (publication, retrieval)
+        };
+
+        for action in [PublicationTestAction::Fail, PublicationTestAction::Cancel] {
+            let cancel_token = CancellationToken::new();
+            arm_publication_test_fault(PublicationTestBoundary::RuntimeCache, action);
+            let outcome = controller
+                .republish_semantic_projections_blocking_with_cancel(&cancel_token)
+                .expect("post-commit runtime-cache fault must complete publication");
+            PUBLICATION_TEST_FAULT.with(|fault| {
+                assert!(
+                    fault.borrow().is_none(),
+                    "runtime-cache fault was not reached: {action:?}"
+                );
+            });
+
+            assert_eq!(outcome.previous_publication, previous_publication);
+            assert_eq!(
+                outcome.publication.generation,
+                previous_publication.generation + 1
+            );
+            assert_eq!(
+                outcome.publication.mode,
+                IndexPublicationMode::SemanticProjection
+            );
+            assert_eq!(
+                cancel_token.is_cancelled(),
+                action == PublicationTestAction::Cancel
+            );
+            assert_eq!(
+                Storage::database_complete_index_publication(&storage_path)
+                    .expect("read committed semantic publication"),
+                Some(outcome.publication.clone())
+            );
+
+            let state = controller.state.lock();
+            assert!(!state.is_indexing);
+            assert!(state.search_engine.is_some());
+            assert_eq!(
+                state.search_publication.as_ref(),
+                Some(&outcome.publication),
+                "prepared search state must become the committed runtime generation"
+            );
+            drop(state);
+
+            let search_generations = persisted_search_generation_names(&storage_path);
+            assert!(
+                search_generations.contains(&outcome.publication.generation_id),
+                "committed search generation must remain current: {search_generations:?}"
+            );
+            assert!(
+                search_generations.len() <= 2,
+                "only the current and one complete rollback generation may remain: {search_generations:?}"
+            );
+            for generation in &search_generations {
+                assert!(
+                    read_search_generation_completion(
+                        &search_index_generation_root(&storage_path).join(generation),
+                        generation,
+                    )
+                    .is_some(),
+                    "persisted search generation must be complete: {generation}"
+                );
+            }
+            assert_eq!(
+                Storage::open(&storage_path)
+                    .expect("open retained retrieval state")
+                    .get_retrieval_index_publication(&identity.project_id)
+                    .expect("read retained retrieval state"),
+                Some(retrieval_publication.clone()),
+                "semantic projection publication must leave retrieval intentionally stale"
+            );
+            assert_no_staged_publication_artifacts(&storage_path);
+            previous_publication = outcome.publication;
+        }
+    }
+
+    #[test]
+    fn semantic_projection_republish_detects_generation_drift_and_keeps_competing_publication() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let runtime = test_sidecar_runtime_from_env();
+        let controller = AppController::new_with_config(runtime.clone());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline core");
+        let baseline = Storage::database_complete_index_publication(&storage_path)
+            .expect("read baseline")
+            .expect("baseline publication");
+        let baseline_search = persisted_search_generation_names(&storage_path);
+        let baseline_search_generation =
+            search_index_path_for_publication(&storage_path, Some(&baseline))
+                .expect("baseline search path")
+                .file_name()
+                .expect("baseline search generation")
+                .to_string_lossy()
+                .to_string();
+        assert!(baseline_search.contains(&baseline_search_generation));
+        let competing_publication = Arc::new(std::sync::Mutex::new(None));
+        let captured_publication = Arc::clone(&competing_publication);
+        let competing_root = workspace.path().to_path_buf();
+        let competing_runtime = runtime.clone();
+        arm_semantic_projection_before_revalidate_hook(move |path| {
+            let competing = AppController::new_with_config(competing_runtime)
+                .republish_semantic_projections_at_blocking(competing_root, path.to_path_buf())
+                .expect("publish competing generation");
+            *captured_publication
+                .lock()
+                .expect("capture competing publication") = Some(competing.publication);
+        });
+
+        let error = match semantic_projection_republish_for_runtime(
+            workspace.path(),
+            &storage_path,
+            None,
+            &runtime,
+            controller.source_index_policy.as_ref(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("outer writer must detect competing generation"),
+        };
+
+        assert_eq!(error.code, "publication_changed");
+        let competing = competing_publication
+            .lock()
+            .expect("read competing publication")
+            .clone()
+            .expect("competing publication captured");
+        assert_eq!(competing.generation, baseline.generation + 1);
+        let storage = Storage::open(&storage_path).expect("open competing core");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read competing core"),
+            Some(competing.clone())
+        );
+        storage
+            .validate_dense_anchor_publication(&competing)
+            .expect("competing dense publication");
+        storage
+            .validate_structural_text_unit_publication(&competing)
+            .expect("competing structural publication");
+        let identity = project_identity_v3(workspace.path());
+        storage
+            .validate_source_policy_exclusion_publication(
+                &competing,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("competing source-policy publication");
+        let current_search = persisted_search_generation_names(&storage_path);
+        assert!(
+            current_search.contains(&baseline_search_generation),
+            "the complete rollback search generation must remain usable: baseline={baseline_search:?} current={current_search:?}"
+        );
+        assert!(
+            current_search.contains(&competing.generation_id),
+            "the competing complete search generation must remain usable: {current_search:?}"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_replaces_previous_graph_with_verified_exclusion() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_file = first_storage
+            .get_file_by_path(&source_path)
+            .expect("first file lookup")
+            .expect("indexed Rust source");
+        assert!(first_file.complete, "initial source must be verified");
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file.id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert!(
+            !first_anchors.is_empty(),
+            "fixture needs Rust dense anchors"
+        );
+        drop(first_storage);
+
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "scheduled but deliberately oversized for this full refresh",
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full refresh should publish the verified exclusion");
+
+        let storage = Storage::open(&storage_path).expect("replacement live storage");
+        assert!(
+            storage
+                .get_file_by_path(&source_path)
+                .expect("replacement file lookup")
+                .is_none(),
+            "excluded content cannot retain a parser-backed file row"
+        );
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("replacement publication")
+            .expect("complete replacement publication");
+        assert_ne!(publication, first_publication);
+        let identity = project_identity_v3(workspace.path());
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("replacement exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 1);
+        let retained_anchors = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("replacement anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file.id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert!(retained_anchors.is_empty());
+        assert!(!first_anchors.is_empty());
+    }
+
+    #[test]
+    fn full_recovery_publishes_verified_exclusion_and_clears_recovery_fence() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        first_storage
+            .begin_incremental_run()
+            .expect("mark interrupted incremental run");
+        drop(first_storage);
+
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "recovery candidate is deliberately oversized",
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("verified exclusion should complete full recovery");
+
+        let storage = Storage::open(&storage_path).expect("recovered storage");
+        assert!(
+            !storage
+                .has_incomplete_incremental_run()
+                .expect("cleared recovery fence"),
+            "complete recovery must clear the interrupted-run fence"
+        );
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("recovered complete publication")
+            .expect("complete recovered publication");
+        assert_ne!(publication, first_publication);
+        let identity = project_identity_v3(workspace.path());
+        let manifest = storage
+            .validate_source_policy_exclusion_publication(
+                &publication,
+                &identity.project_id,
+                &identity.workspace_id,
+                default_source_policy_identity(),
+            )
+            .expect("recovered exclusion manifest");
+        assert_eq!(manifest.exclusion_count, 1);
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_reuses_unchanged_dense_anchor_inputs_from_previous_live_index() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16844,21 +26986,36 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("first full index");
         assert!(
-            first_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "initial full refresh should embed semantic docs"
+            first_timings.semantic_docs_pending.unwrap_or(0) > 0,
+            "initial full refresh should publish pending dense anchor inputs"
         );
+        assert_eq!(first_timings.semantic_docs_embedded.unwrap_or(0), 0);
         assert_eq!(first_timings.semantic_docs_reused.unwrap_or(0), 0);
 
-        let first_docs = Storage::open(&storage_path)
-            .expect("open first storage")
-            .get_all_llm_symbol_docs()
-            .expect("first semantic docs");
+        let first_storage = Storage::open(&storage_path).expect("open first storage");
+        let first_docs = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first dense anchor inputs");
         assert!(
-            first_docs
-                .iter()
-                .all(|doc| doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-                    && !doc.doc_hash.is_empty()),
-            "semantic docs should carry reuse metadata"
+            first_docs.iter().all(|doc| !doc.document_hash.is_empty()
+                && doc.policy_version == SEMANTIC_POLICY_VERSION
+                && doc.source_identity.starts_with("core:")),
+            "dense anchor inputs should carry content, policy, and source reuse identity"
+        );
+        let first_reuse = first_docs
+            .iter()
+            .map(|doc| {
+                (
+                    doc.node_id,
+                    (doc.document_hash.clone(), doc.source_identity.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(
+            first_storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
         );
 
         let second_timings = controller
@@ -16875,16 +27032,34 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(
             second_timings.semantic_docs_embedded.unwrap_or(u32::MAX),
             0,
-            "unchanged full refresh should not re-embed semantic docs"
+            "core refreshes must not embed semantic docs"
         );
         assert!(
             second_timings.semantic_docs_reused.unwrap_or(0) > 0,
-            "unchanged full refresh should reuse semantic docs copied into the staged DB"
+            "unchanged full refresh should reuse dense anchor content copied into the staged DB"
+        );
+        assert_eq!(second_timings.semantic_docs_pending.unwrap_or(u32::MAX), 0);
+        let second_storage = Storage::open(&storage_path).expect("open second storage");
+        let second_docs = second_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("second dense anchor inputs");
+        assert!(second_docs.iter().all(|doc| {
+            first_reuse.get(&doc.node_id).is_some_and(|(hash, source)| {
+                hash == &doc.document_hash
+                    && source != &doc.source_identity
+                    && doc.source_identity.starts_with("core:")
+            })
+        }));
+        assert!(
+            second_storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
         );
     }
 
     #[test]
-    fn unchanged_incremental_refresh_rebuilds_previous_semantic_doc_schema() {
+    fn unchanged_incremental_refresh_rebuilds_previous_dense_anchor_contract() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16901,29 +27076,25 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("initial full index");
 
         let mut contaminated_docs = Storage::open(&storage_path)
-            .expect("open storage before schema downgrade")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs before schema downgrade");
+            .expect("open storage before contract downgrade")
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before contract downgrade");
         assert!(
             !contaminated_docs.is_empty(),
-            "fixture should persist semantic docs"
+            "fixture should persist dense anchor inputs"
         );
         for doc in &mut contaminated_docs {
-            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
-            doc.doc_text
+            doc.policy_version = "graph_first_v0".to_string();
+            doc.source_identity = "core:legacy-publication".to_string();
+            doc.text
                 .push_str("domain_aliases: benchmark-shaped legacy text\n");
-            doc.doc_shape = doc.doc_shape.as_ref().map(|shape| {
-                shape.replace(
-                    &format!("semantic_doc_version={LLM_SYMBOL_DOC_SCHEMA_VERSION}"),
-                    &format!("semantic_doc_version={}", LLM_SYMBOL_DOC_SCHEMA_VERSION - 1),
-                )
-            });
+            doc.document_hash = format!("legacy-{}", doc.node_id.0);
         }
         let contaminated_count = contaminated_docs.len();
         Storage::open(&storage_path)
-            .expect("reopen storage for schema downgrade")
-            .upsert_llm_symbol_docs_batch(&contaminated_docs)
-            .expect("persist downgraded semantic docs");
+            .expect("reopen storage for contract downgrade")
+            .upsert_dense_anchor_inputs_batch(&contaminated_docs)
+            .expect("persist downgraded dense anchor inputs");
 
         let mut contaminated_symbol_docs = Storage::open(&storage_path)
             .expect("open graph-native docs before schema downgrade")
@@ -16948,10 +27119,11 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("unchanged incremental refresh repairs semantic doc schema");
         assert!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0)
+            repair_timings.semantic_docs_pending.unwrap_or(0)
                 >= clamp_usize_to_u32(contaminated_count),
-            "schema drift must expand an empty incremental scope and rebuild all semantic docs"
+            "contract drift must expand an empty incremental scope and rebuild all dense anchors"
         );
+        assert_eq!(repair_timings.semantic_docs_embedded.unwrap_or(0), 0);
         assert!(
             repair_timings.symbol_search_docs_written.unwrap_or(0)
                 >= clamp_usize_to_u32(contaminated_symbol_count),
@@ -16960,15 +27132,17 @@ fn build_llm_symbol_doc_text() -> String {
 
         let repaired_docs = Storage::open(&storage_path)
             .expect("open storage after schema repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after schema repair");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs after contract repair");
         assert!(
             repaired_docs.iter().all(|doc| {
-                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
-                    && !doc.doc_text.contains("domain_aliases:")
+                doc.policy_version == SEMANTIC_POLICY_VERSION
+                    && doc.source_identity.starts_with("core:")
+                    && doc.source_identity != "core:legacy-publication"
+                    && !doc.document_hash.starts_with("legacy-")
+                    && !doc.text.contains("domain_aliases:")
             }),
-            "unchanged incremental repair should replace every previous-schema semantic document"
+            "unchanged incremental repair should replace every stale dense anchor input"
         );
         let repaired_symbol_docs = Storage::open(&storage_path)
             .expect("open graph-native docs after schema repair")
@@ -16981,11 +27155,18 @@ fn build_llm_symbol_doc_text() -> String {
             }),
             "unchanged incremental repair should replace every previous-schema graph-native semantic document"
         );
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open legacy vector store")
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic docs")
+                .is_empty()
+        );
     }
 
     #[test]
-    fn unchanged_incremental_refresh_repairs_graph_docs_without_embedding_runtime() {
-        let mut env = hybrid_test_env();
+    fn unchanged_incremental_refresh_repairs_zero_dense_previous_policy() {
+        let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
@@ -17000,77 +27181,83 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("initial full index");
 
-        let mut contaminated_docs = Storage::open(&storage_path)
-            .expect("open graph-native docs before schema downgrade")
-            .get_symbol_search_docs_batch_after(None, 10_000)
-            .expect("graph-native docs before schema downgrade");
+        let mut storage = Storage::open(&storage_path).expect("open current semantic publication");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("load core publication")
+            .expect("complete core publication");
         assert!(
-            !contaminated_docs.is_empty(),
-            "fixture should persist graph-native semantic docs"
+            storage
+                .clear_dense_anchor_inputs()
+                .expect("remove current dense anchors")
+                > 0,
+            "fixture must begin with current dense anchors"
         );
-        for doc in &mut contaminated_docs {
-            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
-            doc.doc_text
-                .push_str("domain_aliases: benchmark-shaped legacy text\n");
-        }
-        let contaminated_count = contaminated_docs.len();
-        Storage::open(&storage_path)
-            .expect("reopen storage for graph-native schema downgrade")
-            .upsert_symbol_search_docs_batch(&contaminated_docs)
-            .expect("persist downgraded graph-native semantic docs");
+        let legacy_manifest = storage
+            .publish_dense_anchor_generation(&publication, "graph_first_v1")
+            .expect("publish valid zero-dense previous policy");
+        assert_eq!(legacy_manifest.anchor_count, 0);
+        assert_eq!(legacy_manifest.policy_version, "graph_first_v1");
 
-        env.push(EnvGuard::set(
-            EMBEDDING_RUNTIME_MODE_ENV,
-            "unavailable-test-backend",
-        ));
-        env.push(EnvGuard::set(
-            EMBEDDING_BACKEND_ENV,
-            "unavailable-test-backend",
-        ));
-        let reopened = AppController::new_with_config(test_sidecar_runtime_from_env());
-        reopened
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("reopen project without embedding runtime");
-        let repair_timings = reopened
+        let mut symbol_docs = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load graph-native docs");
+        assert!(!symbol_docs.is_empty(), "fixture must contain symbol docs");
+        for doc in &mut symbol_docs {
+            doc.policy_version = "graph_first_v1".to_string();
+        }
+        let symbol_count = symbol_docs.len();
+        storage
+            .upsert_symbol_search_docs_batch(&symbol_docs)
+            .expect("persist previous-policy symbol docs");
+        drop(storage);
+
+        let repair_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("unchanged incremental refresh repairs graph-native docs");
-        assert_eq!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0),
-            0,
-            "unavailable embedding runtime should not fabricate dense semantic rebuilds"
-        );
+            .expect("unchanged incremental refresh repairs previous policy");
         assert!(
             repair_timings.symbol_search_docs_written.unwrap_or(0)
-                >= clamp_usize_to_u32(contaminated_count),
-            "graph-native schema repair must not depend on a dense embedding runtime"
+                >= clamp_usize_to_u32(symbol_count),
+            "symbol-doc policy drift must expand an empty incremental scope"
+        );
+        assert!(
+            repair_timings.semantic_docs_pending.unwrap_or(0) > 0,
+            "the repaired policy must be able to publish newly eligible dense anchors"
         );
 
-        let repaired_docs = Storage::open(&storage_path)
-            .expect("open graph-native docs after no-embedding repair")
-            .get_symbol_search_docs_batch_after(None, 10_000)
-            .expect("graph-native docs after no-embedding repair");
+        let repaired = Storage::open(&storage_path).expect("open repaired semantic publication");
+        let repaired_anchors = repaired
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("load repaired dense anchors");
+        assert!(!repaired_anchors.is_empty());
         assert!(
-            repaired_docs.iter().all(|doc| {
-                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-                    && !doc.doc_text.contains("domain_aliases:")
-            }),
-            "no-embedding repair should replace every previous-schema graph-native semantic document"
+            repaired_anchors
+                .iter()
+                .all(|doc| doc.policy_version == SEMANTIC_POLICY_VERSION)
         );
         assert!(
-            Storage::open(&storage_path)
-                .expect("open dense docs after no-embedding repair")
-                .get_all_llm_symbol_docs()
-                .expect("dense docs after no-embedding repair")
-                .is_empty(),
-            "an unavailable embedding runtime must not carry stale dense docs into the new core generation"
+            repaired
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("load repaired symbol docs")
+                .iter()
+                .all(|doc| doc.policy_version == SEMANTIC_POLICY_VERSION)
+        );
+        let repaired_publication = repaired
+            .get_complete_index_publication()
+            .expect("load repaired core publication")
+            .expect("complete repaired publication");
+        let repaired_manifest = repaired
+            .validate_dense_anchor_publication(&repaired_publication)
+            .expect("validate repaired dense publication");
+        assert_eq!(repaired_manifest.policy_version, SEMANTIC_POLICY_VERSION);
+        assert_eq!(
+            repaired_manifest.anchor_count as usize,
+            repaired_anchors.len()
         );
     }
 
     #[test]
-    fn full_refresh_repairs_reused_semantic_docs_missing_contract_metadata() {
+    fn full_refresh_repairs_reused_dense_anchors_missing_contract_metadata() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -17088,52 +27275,73 @@ fn build_llm_symbol_doc_text() -> String {
 
         let mut legacy_docs = Storage::open(&storage_path)
             .expect("open storage before legacy rewrite")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs before legacy rewrite");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before legacy rewrite");
         assert!(
             !legacy_docs.is_empty(),
-            "initial full index should persist semantic docs"
+            "initial full index should persist dense anchor inputs"
         );
         for doc in &mut legacy_docs {
-            doc.embedding_profile = None;
-            doc.embedding_backend = None;
-            doc.doc_shape = None;
+            doc.policy_version.clear();
+            doc.source_identity = "core:legacy-unknown".to_string();
         }
         Storage::open(&storage_path)
             .expect("reopen storage for legacy rewrite")
-            .upsert_llm_symbol_docs_batch(&legacy_docs)
-            .expect("rewrite legacy semantic docs");
+            .upsert_dense_anchor_inputs_batch(&legacy_docs)
+            .expect("rewrite legacy dense anchor inputs");
 
         let repair_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("full refresh repairs legacy contract metadata");
         assert!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "missing contract metadata should prevent stale semantic docs from being reused"
+            repair_timings.semantic_docs_pending.unwrap_or(0) > 0,
+            "missing contract metadata should prevent stale dense anchors from being reused"
         );
+        assert_eq!(repair_timings.semantic_docs_embedded.unwrap_or(0), 0);
 
         let repaired_docs = Storage::open(&storage_path)
             .expect("open storage after repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after repair");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs after repair");
         assert!(
             repaired_docs.iter().all(|doc| {
-                doc.embedding_profile.as_deref() == Some("bge-small-en-v1.5")
-                    && doc.embedding_backend.as_deref() == Some("hash")
-                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
+                doc.policy_version == SEMANTIC_POLICY_VERSION
+                    && doc.source_identity.starts_with("core:")
+                    && doc.source_identity != "core:legacy-unknown"
+                    && !doc.document_hash.is_empty()
             }),
-            "full refresh should backfill reusable docs with the current semantic contract"
+            "full refresh should backfill dense anchors with the current core contract"
+        );
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open legacy vector store")
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic docs")
+                .is_empty()
         );
     }
 
     #[test]
-    fn full_refresh_rebuilds_semantic_docs_when_embedding_dimension_changes() {
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
-        let workspace = copy_tictactoe_workspace();
+    fn incremental_refresh_rebuilds_untouched_dense_anchor_after_cross_file_edge_removal() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace dir");
+        let src = workspace.path().join("src");
+        fs::create_dir_all(&src).expect("create source directory");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"semantic-scope-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write package manifest");
+        let callee_path = src.join("lib.rs");
+        let caller_path = src.join("main.rs");
+        fs::write(&callee_path, "pub struct Helper;\n").expect("write callee source");
+        fs::write(
+            &caller_path,
+            "mod lib;\nuse crate::lib::Helper;\npub fn run() -> Helper { Helper }\n",
+        )
+        .expect("write caller source");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -17142,44 +27350,72 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("open project summary");
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("first full index");
+            .expect("full index");
 
-        let first_docs = Storage::open(&storage_path)
-            .expect("open storage after first index")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after first index");
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first dense anchors");
+        let first_anchor = first_anchors
+            .iter()
+            .find(|anchor| {
+                anchor.display_name == "Helper" && anchor.file_path.as_deref() == Some("src/lib.rs")
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "callee dense anchor; available={:?}",
+                    first_anchors
+                        .iter()
+                        .map(|anchor| (
+                            anchor.display_name.as_str(),
+                            anchor.file_path.as_deref(),
+                            anchor.file_node_id,
+                            anchor.selection_reason.as_str(),
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            });
         assert!(
-            first_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
-            "initial hash docs should use the configured dimension"
+            first_anchor.text.contains("edge_digest: IMPORT=1"),
+            "the initial callee document must expose the cross-file import edge: {}",
+            first_anchor.text
         );
+        let callee_bytes = fs::read(&callee_path).expect("read untouched callee source");
+        drop(first_storage);
 
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
-        let repair_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-        repair_controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary with updated runtime");
-        let repair_timings = repair_controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("second full index after dimension change");
-        assert!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "dimension drift should rebuild semantic docs instead of reusing stale vectors"
+        fs::write(&caller_path, "pub fn run() -> i32 { 2 }\n").expect("remove cross-file edge");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental caller refresh");
+
+        assert_eq!(
+            fs::read(&callee_path).expect("reread untouched callee source"),
+            callee_bytes,
+            "the endpoint source must remain byte-for-byte untouched"
         );
-
-        let repaired_docs = Storage::open(&storage_path)
-            .expect("open storage after dimension repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after dimension repair");
+        let storage = Storage::open(&storage_path).expect("incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("incremental publication")
+            .expect("complete incremental publication");
+        storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("complete dense anchor publication");
+        let rebuilt_anchor = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("rebuilt dense anchors")
+            .into_iter()
+            .find(|anchor| anchor.node_id == first_anchor.node_id)
+            .expect("rebuilt callee dense anchor");
+        assert_ne!(
+            rebuilt_anchor.document_hash, first_anchor.document_hash,
+            "removing a cross-file edge must rebuild the connected untouched endpoint"
+        );
         assert!(
-            repaired_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
-            "full refresh should persist semantic docs with the new dimension"
+            !rebuilt_anchor.text.contains("edge_digest: IMPORT=1"),
+            "the rebuilt endpoint must not retain the removed cross-file edge: {}",
+            rebuilt_anchor.text
         );
     }
 
@@ -17420,83 +27656,6 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn incremental_refresh_rebuilds_all_semantic_docs_when_embedding_contract_changes() {
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
-        let workspace = copy_tictactoe_workspace();
-        let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-
-        controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary");
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("initial full index");
-
-        let before_docs = Storage::open(&storage_path)
-            .expect("open storage before drift")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs before drift");
-        assert!(
-            !before_docs.is_empty(),
-            "fixture should persist semantic docs"
-        );
-        assert!(
-            before_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
-            "initial docs should use the first embedding contract"
-        );
-
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
-        let rust_fixture = workspace.path().join("rust_tictactoe.rs");
-        let mut source = fs::read_to_string(&rust_fixture).expect("read rust fixture");
-        source.push_str("\nfn codestory_contract_drift_added_hint() -> i32 { 7 }\n");
-        fs::write(&rust_fixture, source).expect("write changed rust fixture");
-
-        let repair_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-        repair_controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary with updated runtime");
-        let incremental_timings = repair_controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("incremental index after contract drift");
-        assert!(
-            incremental_timings.semantic_docs_embedded.unwrap_or(0)
-                >= clamp_usize_to_u32(before_docs.len()),
-            "contract drift should expand incremental semantic sync beyond the touched file"
-        );
-
-        let repaired_docs = Storage::open(&storage_path)
-            .expect("open storage after drift repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after drift repair");
-        assert!(
-            repaired_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
-            "incremental repair should leave all stored semantic docs on the current contract"
-        );
-        let repaired_symbol_docs = Storage::open(&storage_path)
-            .expect("open storage after drift repair for symbol docs")
-            .get_symbol_search_docs_batch_after(None, 10_000)
-            .expect("symbol docs after drift repair");
-        assert!(
-            repaired_symbol_docs.iter().any(|doc| doc
-                .display_name
-                .contains("codestory_contract_drift_added_hint")),
-            "incremental repair should still include symbol docs from the touched file"
-        );
-    }
-
-    #[test]
     fn grounding_snapshot_from_summary_open_keeps_search_state_cold() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -17528,9 +27687,25 @@ fn build_llm_symbol_doc_text() -> String {
         let snapshot = controller
             .grounding_snapshot(GroundingBudgetDto::Balanced)
             .expect("grounding snapshot");
-        assert_eq!(
-            snapshot.retrieval.as_ref().map(|state| state.mode),
-            Some(RetrievalModeDto::Hybrid)
+        let retrieval = snapshot.retrieval.expect("retrieval state");
+        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
+        assert!(!retrieval.semantic_ready);
+        assert_eq!(retrieval.semantic_doc_count, 0);
+
+        let storage = Storage::open(&storage_path).expect("open indexed storage");
+        assert!(
+            !storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("dense anchor inputs")
+                .is_empty(),
+            "core indexing should publish embedding-free dense anchor inputs"
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic rows")
+                .is_empty(),
+            "core indexing should not publish retrieval-owned embeddings"
         );
 
         let state = controller.state.lock();
@@ -17559,7 +27734,9 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("index without runtime refresh");
 
         let retrieval = controller.retrieval_state().expect("retrieval state");
-        assert_eq!(retrieval.mode, RetrievalModeDto::Hybrid);
+        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
+        assert!(!retrieval.semantic_ready);
+        assert_eq!(retrieval.semantic_doc_count, 0);
 
         let state = controller.state.lock();
         assert!(
@@ -17634,7 +27811,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("repo-text search should still require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
     }
 
     #[test]
@@ -17713,7 +27890,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("repo-text auto fallback should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
     }
 
     #[test]
@@ -18105,82 +28282,608 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn staged_semantic_finalization_rebuilds_mixed_model_docs() {
+    fn staged_semantic_finalization_repairs_mixed_dense_anchor_contracts() {
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
         let mut storage = Storage::new_in_memory().expect("storage");
         insert_semantic_fixture_nodes(&mut storage, &file_path);
 
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-a"));
-        finalize_staged_semantic_docs(&mut storage, None, None, None)
+        let _env = hybrid_test_env();
+        let initial_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
             .expect("initial finalization");
-        assert_eq!(
-            storage
-                .get_llm_symbol_doc_stats()
-                .expect("initial doc stats")
-                .embedding_model
-                .as_deref(),
-            Some("model-a")
-        );
-        let mut seeded_docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("initial semantic docs");
-        if seeded_docs.len() == 1 {
-            let mut extra = seeded_docs[0].clone();
-            extra.node_id = CoreNodeId(3);
-            extra.display_name = "beta".to_string();
-            extra.qualified_name = Some("pkg::beta".to_string());
-            extra.dense_reason = Some("documented_nontrivial".to_string());
-            storage
-                .upsert_llm_symbol_docs_batch(&[extra])
-                .expect("seed second dense doc");
-            seeded_docs = storage
-                .get_all_llm_symbol_docs()
-                .expect("seeded semantic docs");
-        }
+        assert!(initial_stats.docs_pending > 0);
+        assert_eq!(initial_stats.docs_embedded, 0);
+        let seeded_docs = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("initial dense anchor inputs");
         let mixed_node_id = seeded_docs
             .last()
-            .expect("at least one semantic doc")
+            .expect("at least one dense anchor input")
             .node_id
             .0;
 
         storage
             .get_connection()
             .execute(
-                "UPDATE llm_symbol_doc
-                 SET embedding_model = CASE
-                     WHEN node_id = ?1 THEN 'model-b'
-                     ELSE embedding_model
-                 END",
+                "UPDATE dense_anchor_input
+                 SET policy_version = 'graph_first_v0',
+                     source_identity = 'core:legacy-publication',
+                     document_hash = 'legacy-document-hash'
+                 WHERE node_id = ?1",
                 [mixed_node_id],
             )
-            .expect("mark one semantic doc as mixed");
-        assert_eq!(
-            storage
-                .get_llm_symbol_doc_stats()
-                .expect("mixed doc stats")
-                .embedding_model,
-            None
-        );
+            .expect("mark one dense anchor contract as stale");
 
-        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-b"));
-        finalize_staged_semantic_docs(&mut storage, None, None, None)
-            .expect("mixed corpus should force finalization");
+        let repair_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("mixed dense anchor contract should force finalization");
+        assert!(repair_stats.docs_pending > 0);
+        assert_eq!(repair_stats.docs_embedded, 0);
 
         let docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("reloaded semantic docs");
-        assert!(!docs.is_empty(), "expected rebuilt semantic docs");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("reloaded dense anchor inputs");
+        assert!(!docs.is_empty(), "expected rebuilt dense anchor inputs");
         assert!(
-            docs.iter().all(|doc| doc.embedding_model == "model-b"),
-            "expected mixed semantic docs to be rebuilt to a uniform model"
+            docs.iter().all(|doc| {
+                doc.policy_version == SEMANTIC_POLICY_VERSION
+                    && doc.source_identity == "core:test-publication"
+                    && doc.document_hash != "legacy-document-hash"
+            }),
+            "expected mixed dense anchor inputs to be rebuilt to one core contract"
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
         );
     }
 
     #[test]
+    fn staged_full_semantic_projection_streams_bounded_node_pages() {
+        let temp = tempdir().expect("create temp dir");
+        let source_path = temp.path().join("generated.rs");
+        fs::write(&source_path, "pub fn generated() {}\n").expect("write source");
+        let storage_path = temp.path().join("staged.db");
+        let mut storage = Storage::open_build(&storage_path).expect("open staged build");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert file");
+        let mut nodes = vec![
+            Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FILE,
+                serialized_name: source_path.to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(9_000),
+                kind: NodeKind::BUILTIN_TYPE,
+                serialized_name: "shared_endpoint".to_string(),
+                ..Default::default()
+            },
+        ];
+        nodes.extend((0_i64..4_097).map(|offset| Node {
+            id: CoreNodeId(10 + offset),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("generated_{offset:04}"),
+            qualified_name: Some(format!("generated::generated_{offset:04}")),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(1),
+            end_line: Some(1),
+            ..Default::default()
+        }));
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert streamed nodes");
+        storage
+            .insert_edges_batch(&[
+                Edge {
+                    id: EdgeId(1),
+                    source: CoreNodeId(10),
+                    target: CoreNodeId(9_000),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(CoreNodeId(1)),
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(2),
+                    source: CoreNodeId(4_106),
+                    target: CoreNodeId(9_000),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(CoreNodeId(1)),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert shared endpoint edges");
+
+        let _env = hybrid_test_env();
+        let stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("stream semantic projection");
+
+        assert_eq!(stats.node_load_rows, 4_097);
+        assert_eq!(stats.selected_nodes, 4_097);
+        assert_eq!(stats.node_stream_batches, 2);
+        assert_eq!(stats.endpoint_load_rows, 2);
+        assert_eq!(stats.endpoint_load_batches, 2);
+        assert_eq!(stats.node_lookup_entries, 4_097);
+        assert_eq!(stats.context_file_count, 1);
+        assert_eq!(
+            storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("load streamed symbol docs")
+                .into_iter()
+                .filter(|doc| !doc.display_name.starts_with("component_report:"))
+                .count(),
+            4_097
+        );
+
+        let _scope = EnvGuard::set(SEMANTIC_DOC_SCOPE_ENV, "all");
+        let all_scope_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("repeat all-symbol stream");
+        assert_eq!(all_scope_stats.node_load_rows, 4_098);
+        assert_eq!(all_scope_stats.selected_nodes, 4_097);
+        assert_eq!(
+            storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("load all-scope symbol docs")
+                .into_iter()
+                .filter(|doc| !doc.display_name.starts_with("component_report:"))
+                .count(),
+            4_097,
+            "retained component-report artifacts must not re-enter the symbol stream"
+        );
+    }
+
+    #[test]
+    fn staged_semantic_graph_context_bounds_high_degree_endpoint_state() {
+        const INCIDENT_EDGE_COUNT: i64 = SEMANTIC_EDGE_STREAM_BATCH_SIZE as i64 * 2 + 17;
+        const IGNORED_CALL_RAW_TARGET: CoreNodeId = CoreNodeId(90_000);
+        const IGNORED_CALL_RESOLVED_TARGET: CoreNodeId = CoreNodeId(90_001);
+
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("staged.db");
+        let mut storage = Storage::open_build(&storage_path).expect("open staged build");
+        let hub = Node {
+            id: CoreNodeId(1),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "hub".to_string(),
+            ..Default::default()
+        };
+        let mut nodes = vec![hub.clone()];
+        nodes.extend((0_i64..INCIDENT_EDGE_COUNT).map(|offset| Node {
+            id: CoreNodeId(10_000 + offset),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("child_{offset:05}"),
+            ..Default::default()
+        }));
+        nodes.extend([
+            Node {
+                id: IGNORED_CALL_RAW_TARGET,
+                kind: NodeKind::BUILTIN_TYPE,
+                serialized_name: "ignored_raw_target".to_string(),
+                ..Default::default()
+            },
+            Node {
+                id: IGNORED_CALL_RESOLVED_TARGET,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "ignored_resolution_must_not_appear".to_string(),
+                ..Default::default()
+            },
+        ]);
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert high-degree nodes");
+        let mut edges = vec![Edge {
+            id: EdgeId(-1),
+            source: hub.id,
+            target: IGNORED_CALL_RAW_TARGET,
+            kind: EdgeKind::CALL,
+            resolved_target: Some(IGNORED_CALL_RESOLVED_TARGET),
+            confidence: Some(0.2),
+            certainty: Some(codestory_contracts::graph::ResolutionCertainty::Uncertain),
+            ..Default::default()
+        }];
+        edges.extend(
+            (0_i64..INCIDENT_EDGE_COUNT)
+                .map(|offset| Edge {
+                    id: EdgeId(offset + 1),
+                    source: hub.id,
+                    target: CoreNodeId(10_000 + offset),
+                    kind: EdgeKind::CALL,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        );
+        storage
+            .insert_edges_batch(&edges)
+            .expect("insert high-degree edges");
+        storage
+            .create_semantic_context_endpoint_indexes_for_build()
+            .expect("create semantic endpoint indexes");
+
+        let legacy = SemanticDocGraphContext::build_for_scope(
+            &storage,
+            &[&hub],
+            &nodes,
+            SemanticDocScope::DurableSymbols,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("build legacy high-degree context");
+        let (streamed, stats) = SemanticDocGraphContext::build_for_full_page(
+            &storage,
+            std::slice::from_ref(&hub),
+            SemanticDocScope::DurableSymbols,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+        )
+        .expect("stream high-degree context");
+
+        assert_eq!(streamed.child_labels, legacy.child_labels);
+        assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+        assert_eq!(streamed.edge_digests, legacy.edge_digests);
+        assert_eq!(streamed.centrality, legacy.centrality);
+        assert!(
+            streamed
+                .child_labels
+                .get(&hub.id)
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            streamed
+                .referenced_labels
+                .get(&hub.id)
+                .expect("bounded related labels")
+                .len(),
+            6
+        );
+        assert_eq!(
+            streamed.edge_digests.get(&hub.id),
+            Some(&vec![format!("CALL={}", INCIDENT_EDGE_COUNT + 1)])
+        );
+        assert_eq!(
+            streamed.centrality.get(&hub.id),
+            Some(&DenseAnchorCentrality {
+                child_count: 0,
+                related_count: INCIDENT_EDGE_COUNT as usize,
+                edge_count: INCIDENT_EDGE_COUNT as usize + 1,
+            })
+        );
+        assert!(dense_anchor_is_central(&streamed, hub.id));
+        assert!(
+            !streamed
+                .referenced_labels
+                .get(&hub.id)
+                .expect("hub referenced labels")
+                .iter()
+                .any(|label| label == "ignored_resolution_must_not_appear"),
+            "ignored CALL resolution must retain the raw non-indexable endpoint"
+        );
+        assert!(stats.endpoint_rows >= INCIDENT_EDGE_COUNT as u32);
+        assert!(
+            stats.lookup_entries <= (SEMANTIC_EDGE_STREAM_BATCH_SIZE + 3) as u32,
+            "high-degree endpoint state exceeded one bounded edge batch: {stats:?}"
+        );
+        assert!(
+            stats.endpoint_rows > stats.lookup_entries,
+            "telemetry must distinguish cumulative endpoint rows from peak lookup entries"
+        );
+    }
+
+    #[test]
+    fn staged_semantic_graph_context_counts_cross_seed_chunk_edge_once_per_endpoint() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("staged.db");
+        let mut storage = Storage::open_build(&storage_path).expect("open staged build");
+        let nodes = (1_i64..=BUILD_EDGE_SEED_BATCH_SIZE as i64 + 1)
+            .map(|id| Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("node_{id:03}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert cross-chunk nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(1),
+                source: nodes[0].id,
+                target: nodes[BUILD_EDGE_SEED_BATCH_SIZE].id,
+                kind: EdgeKind::USAGE,
+                ..Default::default()
+            }])
+            .expect("insert cross-chunk edge");
+        storage
+            .create_semantic_context_endpoint_indexes_for_build()
+            .expect("create semantic endpoint indexes");
+
+        let node_refs = nodes.iter().collect::<Vec<_>>();
+        let legacy = SemanticDocGraphContext::build_for_scope(
+            &storage,
+            &node_refs,
+            &nodes,
+            SemanticDocScope::DurableSymbols,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("build legacy cross-chunk context");
+        let (streamed, stats) = SemanticDocGraphContext::build_for_full_page(
+            &storage,
+            &nodes,
+            SemanticDocScope::DurableSymbols,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+        )
+        .expect("stream cross-chunk context");
+
+        assert_eq!(streamed.child_labels, legacy.child_labels);
+        assert_eq!(streamed.referenced_labels, legacy.referenced_labels);
+        assert_eq!(streamed.edge_digests, legacy.edge_digests);
+        for endpoint in [nodes[0].id, nodes[BUILD_EDGE_SEED_BATCH_SIZE].id] {
+            assert_eq!(
+                streamed.edge_digests.get(&endpoint),
+                Some(&vec!["USAGE=1".to_string()])
+            );
+        }
+        assert_eq!(stats.lookup_entries, nodes.len() as u32);
+    }
+
+    #[test]
+    fn staged_semantic_stream_matches_legacy_bytes_order_pruning_and_component_reports() {
+        const SYMBOL_COUNT: i64 = 4_097;
+        const FILE_COUNT: i64 = 13;
+        const STALE_NODE_ID: CoreNodeId = CoreNodeId(900_000);
+
+        let _env = hybrid_test_env();
+        let _tokens = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "8192");
+        let temp = tempdir().expect("create temp dir");
+        let mut files = Vec::new();
+        let mut file_nodes = Vec::new();
+        for file_index in 0_i64..FILE_COUNT {
+            let file_name = if file_index == 0 {
+                "lib.rs".to_string()
+            } else {
+                format!("unit_{file_index:02}.rs")
+            };
+            let path = temp.path().join("crates/demo/src").join(file_name);
+            fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture parent");
+            fs::write(&path, format!("pub fn source_{file_index:02}() {{}}\n"))
+                .expect("write semantic source fixture");
+            let file_id = CoreNodeId(100_000 + file_index);
+            files.push(FileInfo {
+                id: file_id.0,
+                path: path.clone(),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            });
+            file_nodes.push(Node {
+                id: file_id,
+                kind: NodeKind::FILE,
+                serialized_name: path.to_string_lossy().to_string(),
+                ..Default::default()
+            });
+        }
+        let symbols = (1_i64..=SYMBOL_COUNT)
+            .map(|id| Node {
+                id: CoreNodeId(id),
+                kind: if id == 1 {
+                    NodeKind::STRUCT
+                } else {
+                    NodeKind::FUNCTION
+                },
+                serialized_name: format!("symbol_{id:04}"),
+                qualified_name: Some(format!("demo::symbol_{id:04}")),
+                file_node_id: Some(CoreNodeId(100_000 + (id - 1) % FILE_COUNT)),
+                start_line: Some(1),
+                end_line: Some(1),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let external_nodes = (0_i64..10)
+            .map(|offset| Node {
+                id: CoreNodeId(200_000 + offset),
+                kind: NodeKind::BUILTIN_TYPE,
+                serialized_name: format!("external_{offset:02}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let ranked_node_ids = (1_i64..=9)
+            .chain(std::iter::once(SYMBOL_COUNT))
+            .collect::<Vec<_>>();
+        let edges = ranked_node_ids
+            .iter()
+            .enumerate()
+            .map(|(offset, node_id)| Edge {
+                id: EdgeId(offset as i64 + 1),
+                source: CoreNodeId(*node_id),
+                target: external_nodes[offset].id,
+                kind: EdgeKind::CALL,
+                resolved_target: (*node_id == SYMBOL_COUNT).then_some(CoreNodeId(2)),
+                confidence: (*node_id == SYMBOL_COUNT).then_some(0.2),
+                certainty: (*node_id == SYMBOL_COUNT)
+                    .then_some(codestory_contracts::graph::ResolutionCertainty::Uncertain),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let stale_symbol_doc = SymbolSearchDoc {
+            node_id: STALE_NODE_ID,
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "stale".to_string(),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: "stale".to_string(),
+            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            doc_hash: "stale".to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            updated_at_epoch_ms: 1,
+        };
+        let stale_dense_input = DenseAnchorInput {
+            node_id: STALE_NODE_ID,
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "stale".to_string(),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            file_role: codestory_store::FileRole::Source,
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: "stale".to_string(),
+            document_hash: "stale".to_string(),
+            selection_reason: DenseAnchorReason::PublicApi.as_str().to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: "core:stale".to_string(),
+            updated_at_epoch_ms: 1,
+        };
+
+        let seed = |storage: &mut Storage| {
+            storage
+                .insert_files_batch(&files)
+                .expect("insert semantic files");
+            let mut nodes = file_nodes.clone();
+            nodes.extend(symbols.clone());
+            nodes.extend(external_nodes.clone());
+            nodes.push(Node {
+                id: STALE_NODE_ID,
+                kind: NodeKind::FUNCTION,
+                serialized_name: "component_report:stale".to_string(),
+                canonical_id: Some("codestory:component_report:stale".to_string()),
+                ..Default::default()
+            });
+            storage
+                .insert_nodes_batch(&nodes)
+                .expect("insert semantic nodes");
+            storage
+                .insert_component_access_batch(&[(CoreNodeId(1), AccessKind::Public)])
+                .expect("insert public semantic access");
+            storage
+                .insert_edges_batch(&edges)
+                .expect("insert semantic edges");
+            storage
+                .upsert_symbol_search_docs_batch(std::slice::from_ref(&stale_symbol_doc))
+                .expect("seed stale symbol doc");
+            storage
+                .upsert_dense_anchor_inputs_batch(std::slice::from_ref(&stale_dense_input))
+                .expect("seed stale dense input");
+        };
+
+        let legacy_path = temp.path().join("legacy.db");
+        let streamed_path = temp.path().join("streamed.db");
+        let mut legacy = Storage::open(&legacy_path).expect("open legacy store");
+        let mut streamed = Storage::open_build(&streamed_path).expect("open staged store");
+        seed(&mut legacy);
+        seed(&mut streamed);
+        let legacy_stats = finalize_staged_semantic_docs(&mut legacy, None, None, None)
+            .expect("build legacy semantic projection");
+        let streamed_stats = finalize_staged_semantic_docs(&mut streamed, None, None, None)
+            .expect("build streamed semantic projection");
+
+        let normalize_symbol_docs = |storage: &Storage| {
+            let mut docs = storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("load symbol docs");
+            for doc in &mut docs {
+                doc.updated_at_epoch_ms = 0;
+            }
+            docs
+        };
+        let normalize_dense_inputs = |storage: &Storage| {
+            let mut inputs = storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("load dense inputs");
+            for input in &mut inputs {
+                input.updated_at_epoch_ms = 0;
+            }
+            inputs
+        };
+        let legacy_docs = normalize_symbol_docs(&legacy);
+        let streamed_docs = normalize_symbol_docs(&streamed);
+        let legacy_dense = normalize_dense_inputs(&legacy);
+        let streamed_dense = normalize_dense_inputs(&streamed);
+
+        assert_eq!(streamed_stats.node_stream_batches, 2);
+        assert_eq!(legacy_stats.selected_nodes, SYMBOL_COUNT as u32);
+        assert_eq!(streamed_stats.selected_nodes, SYMBOL_COUNT as u32);
+        assert_eq!(legacy_stats.docs_stale, 2);
+        assert_eq!(streamed_stats.docs_stale, 2);
+        assert_eq!(streamed_docs, legacy_docs);
+        assert_eq!(streamed_dense, legacy_dense);
+        assert!(
+            streamed_docs
+                .windows(2)
+                .all(|pair| pair[0].node_id.0 < pair[1].node_id.0)
+        );
+        assert!(
+            streamed_dense
+                .windows(2)
+                .all(|pair| pair[0].node_id.0 < pair[1].node_id.0)
+        );
+        assert!(streamed_docs.iter().all(|doc| doc.node_id != STALE_NODE_ID));
+        assert!(
+            streamed_dense
+                .iter()
+                .all(|input| input.node_id != STALE_NODE_ID)
+        );
+        let dense_reasons = streamed_dense
+            .iter()
+            .map(|input| input.selection_reason.as_str())
+            .collect::<HashSet<_>>();
+        assert!(dense_reasons.contains(DenseAnchorReason::PublicApi.as_str()));
+        assert!(dense_reasons.contains(DenseAnchorReason::ComponentReport.as_str()));
+
+        let reports = streamed_docs
+            .iter()
+            .filter(|doc| doc.display_name.starts_with("component_report:"))
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0].doc_text;
+        assert!(report.contains("symbol_count: 4097"), "{report}");
+        assert!(report.contains("file_count: 12"), "{report}");
+        assert!(!report.contains("unit_12.rs"), "{report}");
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("- demo::symbol_"))
+                .count(),
+            8,
+            "{report}"
+        );
+        assert!(report.contains("- demo::symbol_0008 "), "{report}");
+        assert!(!report.contains("- demo::symbol_0009 "), "{report}");
+        assert!(!report.contains("- demo::symbol_4097 "), "{report}");
+        let dense_report = streamed_dense
+            .iter()
+            .find(|input| input.node_id == reports[0].node_id)
+            .expect("component report dense input");
+        assert_eq!(dense_report.text, reports[0].doc_text);
+        assert_eq!(dense_report.document_hash, reports[0].doc_hash);
+    }
+
+    #[test]
     fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
-        let mut env = hybrid_test_env();
+        let _env = hybrid_test_env();
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
         let storage_path = temp.path().join("codestory.db");
@@ -18194,9 +28897,18 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("publish identity");
         finalize_staged_semantic_docs(&mut storage, None, None, None)
             .expect("finalize semantic rows");
-        let before = storage
+        let before_legacy = storage
             .get_all_llm_symbol_docs()
-            .expect("semantic rows before cache load");
+            .expect("legacy semantic rows before cache load");
+        let before_symbolic = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbolic rows before cache load");
+        let before_dense = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before cache load");
+        assert!(before_legacy.is_empty());
+        assert!(!before_symbolic.is_empty());
+        assert!(!before_dense.is_empty());
         storage
             .get_connection()
             .execute_batch(
@@ -18211,43 +28923,47 @@ fn build_llm_symbol_doc_text() -> String {
                  CREATE TRIGGER reject_live_symbol_update BEFORE UPDATE ON symbol_search_doc
                  BEGIN SELECT RAISE(ABORT, 'live symbol update'); END;
                  CREATE TRIGGER reject_live_symbol_delete BEFORE DELETE ON symbol_search_doc
-                 BEGIN SELECT RAISE(ABORT, 'live symbol delete'); END;",
+                 BEGIN SELECT RAISE(ABORT, 'live symbol delete'); END;
+                 CREATE TRIGGER reject_live_dense_insert BEFORE INSERT ON dense_anchor_input
+                 BEGIN SELECT RAISE(ABORT, 'live dense insert'); END;
+                 CREATE TRIGGER reject_live_dense_update BEFORE UPDATE ON dense_anchor_input
+                 BEGIN SELECT RAISE(ABORT, 'live dense update'); END;
+                 CREATE TRIGGER reject_live_dense_delete BEFORE DELETE ON dense_anchor_input
+                 BEGIN SELECT RAISE(ABORT, 'live dense delete'); END;",
             )
             .expect("install live semantic mutation guards");
 
         let result = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
             .expect("hydrate cache without semantic persistence");
 
-        assert!(result.engine.semantic_index_ready());
+        assert!(!result.engine.semantic_index_ready());
+        assert_eq!(result.engine.full_text_doc_count(), result.node_names.len());
         assert_eq!(
             storage
                 .get_all_llm_symbol_docs()
-                .expect("semantic rows after cache load"),
-            before
-        );
-
-        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "incompatible-model"));
-        let mismatched = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
-            .expect("reject incompatible semantic cache without persistence");
-        assert_eq!(mismatched.engine.semantic_doc_count(), 0);
-        let retrieval = retrieval_state_from_storage(&storage).expect("mismatched retrieval state");
-        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
-        assert_eq!(
-            retrieval.fallback_reason,
-            Some(RetrievalFallbackReasonDto::DegradedRuntime)
+                .expect("legacy semantic rows after cache load"),
+            before_legacy
         );
         assert_eq!(
             storage
-                .get_all_llm_symbol_docs()
-                .expect("semantic rows after rejected cache load"),
-            before
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("symbolic rows after cache load"),
+            before_symbolic
+        );
+        assert_eq!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("dense anchor inputs after cache load"),
+            before_dense
         );
 
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
-        let error = persist_embedded_llm_symbol_docs(
+        let error = flush_pending_dense_anchor_inputs(
             &mut storage,
-            &before[..1],
+            &[pending_semantic_doc_for_test(1, "cancelled")],
+            "core:test-publication",
+            current_epoch_ms(),
             &mut SemanticProjectionStats::default(),
             Some(&cancel_token),
         )
@@ -18342,8 +29058,20 @@ fn build_llm_symbol_doc_text() -> String {
         insert_semantic_fixture_nodes(&mut storage, &file_path);
         let old_publication = test_index_publication(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
         storage
+            .publish_structural_text_unit_generation(&old_publication)
+            .expect("publish old structural text identity");
+        storage
             .put_index_publication(&old_publication)
             .expect("publish old identity");
+        storage
+            .publish_source_policy_exclusion_generation(
+                &old_publication,
+                "test-project",
+                "test-workspace",
+                default_source_policy_identity(),
+                &[],
+            )
+            .expect("publish old source policy identity");
         drop(
             rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
                 .expect("build old generation"),
@@ -18375,34 +29103,38 @@ fn build_llm_symbol_doc_text() -> String {
                 [],
             )
             .expect("rename symbol in staged core");
-        staged
-            .store_mut()
-            .clear_search_symbol_projection()
-            .expect("clear staged projection");
-        staged
-            .store_mut()
-            .rebuild_search_symbol_projection_from_node_table()
-            .expect("rebuild staged projection");
         let new_publication = test_index_publication(2, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        staged
+            .store_mut()
+            .publish_structural_text_unit_generation(&new_publication)
+            .expect("publish staged structural text identity");
         staged
             .store_mut()
             .put_index_publication(&new_publication)
             .expect("publish staged identity");
         staged
+            .store_mut()
+            .publish_source_policy_exclusion_generation(
+                &new_publication,
+                "test-project",
+                "test-workspace",
+                default_source_policy_identity(),
+                &[],
+            )
+            .expect("publish staged source policy identity");
+        staged
             .publish(&storage_path)
             .expect("publish replacement core");
 
         let mut live = Storage::open(&storage_path).expect("open replacement core");
-        let nodes = live.get_nodes().expect("load replacement nodes");
         let search_path = search_index_path_for_publication(&storage_path, Some(&new_publication))
             .expect("replacement search path");
-        let mut built = build_search_state(
+        let mut built = build_persisted_search_state_from_canonical_symbols(
             &mut live,
-            Some(&search_path),
-            nodes,
-            None,
-            SemanticProjectionMode::PersistBackedDocs,
+            &search_path,
             false,
+            &test_sidecar_runtime_from_env(),
+            None,
         )
         .expect("build replacement search generation");
         write_search_generation_completion(
@@ -18467,7 +29199,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn missing_or_corrupt_expected_search_generation_is_not_rebuilt_by_a_reader() {
+    fn missing_corrupt_or_count_mismatched_search_generation_is_not_rebuilt_by_a_reader() {
         let _env = hybrid_test_env();
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
@@ -18492,6 +29224,25 @@ fn build_llm_symbol_doc_text() -> String {
             rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
                 .expect("writer builds expected generation"),
         );
+        let completion_path = search_generation_completion_path(&expected_path);
+        let correct_completion = fs::read(&completion_path).expect("read completion marker");
+        let mut mismatched_completion: SearchGenerationCompletion =
+            serde_json::from_slice(&correct_completion).expect("decode completion marker");
+        mismatched_completion.symbol_count = mismatched_completion.symbol_count.saturating_add(1);
+        fs::write(
+            &completion_path,
+            serde_json::to_vec(&mismatched_completion).expect("encode mismatched completion"),
+        )
+        .expect("write mismatched completion marker");
+
+        let mismatch_error = match load_persisted_search_state(&mut storage, &storage_path) {
+            Err(error) => error,
+            Ok(_) => panic!("reader must reject a count-mismatched search generation"),
+        };
+        assert_eq!(mismatch_error.code, "cache_busy");
+        assert!(expected_path.is_dir());
+
+        fs::write(&completion_path, correct_completion).expect("restore completion marker");
         fs::remove_dir_all(&expected_path).expect("remove built generation");
         fs::write(&expected_path, b"corrupt search generation")
             .expect("write corrupt generation artifact");
@@ -18521,6 +29272,42 @@ fn build_llm_symbol_doc_text() -> String {
         let finisher_state =
             rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
                 .expect("indexing finisher builds search generation");
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_docs_written,
+            3
+        );
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_writer_count,
+            1
+        );
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_commit_count,
+            1
+        );
+        assert_eq!(
+            finisher_state.search_stats.search_symbol_index_reload_count,
+            1
+        );
+        let reused_state =
+            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+                .expect("indexing finisher reuses completed search generation");
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_docs_written,
+            0
+        );
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_writer_count,
+            0
+        );
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_commit_count,
+            0
+        );
+        assert_eq!(
+            reused_state.search_stats.search_symbol_index_reload_count,
+            0
+        );
+        drop(reused_state);
         env.push(EnvGuard::set(
             crate::search::engine::SYMBOL_FULL_TEXT_INDEX_ENV,
             "false",
@@ -18775,8 +29562,8 @@ fn build_llm_symbol_doc_text() -> String {
     fn inexact_search_results_deduplicate_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
-                node_id: NodeId("llamacpp-url-env".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(178),
@@ -18793,8 +29580,8 @@ fn build_llm_symbol_doc_text() -> String {
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("llamacpp-url-env-copy".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id-copy".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(187),
@@ -18811,8 +29598,8 @@ fn build_llm_symbol_doc_text() -> String {
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("endpoint-parser".to_string()),
-                display_name: "LlamaCppEndpoint::parse".to_string(),
+                node_id: NodeId("other-helper".to_string()),
+                display_name: "EmbeddingEngineCache::open".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(194),
@@ -18832,27 +29619,27 @@ fn build_llm_symbol_doc_text() -> String {
 
         hits.sort_by(|left, right| {
             compare_search_hits(
-                "llama.cpp embeddings endpoint URL environment variable configuration",
+                "embedding engine identity parser configuration",
                 left,
                 right,
             )
         });
         dedupe_inexact_search_hits_by_display_key(
-            "llama.cpp embeddings endpoint URL environment variable configuration",
+            "embedding engine identity parser configuration",
             &mut hits,
         );
 
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].node_id, NodeId("endpoint-parser".to_string()));
-        assert_eq!(hits[1].node_id, NodeId("llamacpp-url-env".to_string()));
+        assert_eq!(hits[0].node_id, NodeId("embedding-engine-id".to_string()));
+        assert_eq!(hits[1].node_id, NodeId("other-helper".to_string()));
     }
 
     #[test]
     fn exact_search_results_keep_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
-                node_id: NodeId("llamacpp-url-env".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(178),
@@ -18869,8 +29656,8 @@ fn build_llm_symbol_doc_text() -> String {
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("llamacpp-url-env-copy".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id-copy".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(187),
@@ -18888,7 +29675,7 @@ fn build_llm_symbol_doc_text() -> String {
             },
         ];
 
-        dedupe_inexact_search_hits_by_display_key("LLAMACPP_EMBEDDINGS_URL_ENV", &mut hits);
+        dedupe_inexact_search_hits_by_display_key("EMBEDDING_ENGINE_ID", &mut hits);
 
         assert_eq!(hits.len(), 2);
     }
@@ -19311,6 +30098,14 @@ fn build_llm_symbol_doc_text() -> String {
                 storage_path.clone(),
             )
             .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish compatible baseline");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn value() -> i32 { 2 }\n",
+        )
+        .expect("modify source");
         let events = controller.events();
 
         controller
@@ -19348,7 +30143,52 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn empty_full_refresh_reports_adaptive_chunk_config() {
+        let workspace = tempdir().expect("workspace dir");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("empty full publication");
+
+        assert_eq!(
+            timings.full_refresh_chunk_target_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(timings.full_refresh_chunk_target_nodes, Some(120_000));
+        assert_eq!(timings.full_refresh_chunk_file_ceiling, Some(512));
+        assert_eq!(timings.full_refresh_chunk_max_files, Some(0));
+        assert_eq!(timings.full_refresh_chunk_max_planned_bytes, Some(0));
+        assert_eq!(timings.full_refresh_chunk_max_nodes, Some(0));
+        assert_eq!(timings.full_refresh_chunk_budget_overruns, Some(0));
+        assert!(timings.full_refresh_chunk_planning_ms.is_some());
+    }
+
+    #[test]
     fn full_and_incremental_publications_advance_one_durable_generation() {
+        let assert_promotion_reconciles = |promotion: &CorePromotionTimings| {
+            let named_ms = promotion
+                .lock_recovery_ms
+                .saturating_add(promotion.candidate_validation_ms)
+                .saturating_add(promotion.previous_validation_ms)
+                .saturating_add(promotion.rollback_backup_copy_ms.unwrap_or_default())
+                .saturating_add(promotion.backup_validation_ms.unwrap_or_default())
+                .saturating_add(promotion.prepared_journal_write_ms)
+                .saturating_add(promotion.prepared_journal_file_sync_ms)
+                .saturating_add(promotion.prepared_journal_directory_sync_ms)
+                .saturating_add(promotion.staged_to_live_restore_ms)
+                .saturating_add(promotion.promoted_validation_ms)
+                .saturating_add(promotion.committed_journal_ms)
+                .saturating_add(promotion.cleanup_ms);
+            assert_eq!(
+                named_ms.saturating_add(promotion.unattributed_ms),
+                promotion.total_ms
+            );
+        };
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -19364,9 +30204,167 @@ fn build_llm_symbol_doc_text() -> String {
             )
             .expect("open project");
 
-        controller
+        let full_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("first full publication");
+        let parser_cache = full_timings
+            .parser_artifact_cache
+            .as_ref()
+            .expect("parser cache telemetry");
+        assert_eq!(parser_cache.policy, ArtifactCachePolicyDto::KnownEmpty);
+        assert_eq!(parser_cache.logical_lookups, 1);
+        assert_eq!(parser_cache.physical_queries, 0);
+        assert_eq!(parser_cache.hits, 0);
+        assert_eq!(parser_cache.misses, 1);
+        assert_eq!(parser_cache.reader_opens, 0);
+        assert_eq!(parser_cache.lookup_wall_ms, 0);
+        let structural_cache = full_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("structural cache telemetry");
+        assert_eq!(structural_cache.policy, ArtifactCachePolicyDto::KnownEmpty);
+        assert_eq!(structural_cache.logical_lookups, 0);
+        assert_eq!(structural_cache.physical_queries, 0);
+        assert_eq!(structural_cache.reader_opens, 0);
+        assert_eq!(full_timings.full_refresh_queue_capacity, Some(1));
+        assert_eq!(full_timings.full_refresh_queue_high_water, Some(1));
+        assert_eq!(full_timings.full_refresh_chunks_produced, Some(1));
+        assert_eq!(full_timings.full_refresh_chunks_persisted, Some(1));
+        assert!(full_timings.full_refresh_producer_blocked_ms.is_some());
+        assert!(full_timings.full_refresh_writer_idle_ms.is_some());
+        assert_eq!(
+            full_timings.full_refresh_chunk_target_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(full_timings.full_refresh_chunk_target_nodes, Some(120_000));
+        assert_eq!(full_timings.full_refresh_chunk_file_ceiling, Some(512));
+        assert_eq!(full_timings.full_refresh_chunk_max_files, Some(1));
+        assert!(full_timings.full_refresh_chunk_max_planned_bytes.is_some());
+        assert!(full_timings.full_refresh_chunk_max_nodes.is_some());
+        assert_eq!(full_timings.full_refresh_chunk_budget_overruns, Some(0));
+        assert!(full_timings.full_refresh_chunk_planning_ms.is_some());
+        let full_projection = full_timings
+            .projection_persistence
+            .as_ref()
+            .expect("full projection persistence telemetry");
+        assert_eq!(
+            Some(full_projection.transactions),
+            full_timings.projection_batch_transactions
+        );
+        assert!(full_projection.row_attempts > 0);
+        assert!(full_projection.bound_bytes > 0);
+        assert!(full_projection.statement_executions > 0);
+        assert_eq!(
+            full_projection.dirty_state.statement_executions,
+            u64::from(full_projection.transactions) * 4
+        );
+        assert_eq!(
+            full_timings.staged_sqlite_wal_autocheckpoint_bytes,
+            Some(64 * 1024 * 1024)
+        );
+        assert!(full_timings.staged_sqlite_checkpoint_ms.is_some());
+        assert!(full_timings.staged_sqlite_sync_ms.is_some());
+        assert!(full_timings.staged_snapshot_copy.is_none());
+        let full_promotion = full_timings
+            .core_promotion
+            .as_ref()
+            .expect("first full promotion telemetry");
+        assert!(full_promotion.previous_live_bytes.is_none());
+        assert!(full_promotion.rollback_backup_copy_ms.is_none());
+        assert!(full_promotion.backup_validation_ms.is_none());
+        assert!(full_promotion.rollback_backup_bytes.is_none());
+        assert!(full_promotion.candidate_bytes > 0);
+        assert_promotion_reconciles(full_promotion);
+        assert_eq!(full_timings.search_projection_rebuild_ms, Some(0));
+        assert!(full_timings.search_symbol_stream_ms.is_some());
+        assert!(
+            full_timings
+                .search_symbol_stream_rows
+                .is_some_and(|rows| rows > 0)
+        );
+        assert_eq!(full_timings.search_symbol_stream_batches, Some(1));
+        assert_eq!(full_timings.search_symbol_index_writer_count, Some(1));
+        assert_eq!(full_timings.search_symbol_index_commit_count, Some(1));
+        assert_eq!(full_timings.search_symbol_index_reload_count, Some(1));
+        assert!(full_timings.search_symbol_index_commit_ms.is_some());
+        assert!(full_timings.search_symbol_index_reload_ms.is_some());
+        assert!(full_timings.semantic_context_index_ms.is_some());
+        assert!(full_timings.semantic_node_load_ms.is_some());
+        assert!(
+            full_timings.deferred_indexes_ms.unwrap_or_default()
+                >= full_timings.semantic_context_index_ms.unwrap_or_default()
+        );
+        assert!(
+            full_timings
+                .semantic_node_load_rows
+                .is_some_and(|rows| rows > 0)
+        );
+        assert!(
+            full_timings
+                .semantic_node_stream_batches
+                .is_some_and(|batches| batches > 0)
+        );
+        assert!(full_timings.semantic_endpoint_load_ms.is_some());
+        assert!(full_timings.semantic_endpoint_load_rows.is_some());
+        assert!(full_timings.semantic_endpoint_load_batches.is_some());
+        assert!(
+            full_timings
+                .semantic_selected_nodes
+                .is_some_and(|rows| rows > 0)
+        );
+        assert_eq!(
+            full_timings.semantic_selected_nodes,
+            full_timings.semantic_node_load_rows
+        );
+        assert!(
+            full_timings
+                .semantic_context_file_count
+                .is_some_and(|files| files > 0)
+        );
+        assert!(
+            full_timings
+                .semantic_context_path_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            full_timings
+                .semantic_node_lookup_entries
+                .is_some_and(|peak| {
+                    peak <= full_timings
+                        .semantic_node_load_rows
+                        .unwrap_or_default()
+                        .saturating_add(
+                            full_timings.semantic_endpoint_load_rows.unwrap_or_default(),
+                        )
+                })
+        );
+        assert!(full_timings.semantic_context_ms.is_some());
+        let full_refresh_wall = full_timings
+            .full_refresh_wall
+            .as_ref()
+            .expect("full refresh wall accounting");
+        let accounted_ms = full_refresh_wall
+            .live_inspection_ms
+            .saturating_add(full_refresh_wall.source_discovery_ms)
+            .saturating_add(full_refresh_wall.stage_open_ms)
+            .saturating_add(full_refresh_wall.indexer_execution_ms)
+            .saturating_add(full_refresh_wall.coverage_validation_ms)
+            .saturating_add(full_refresh_wall.copy_forward_ms)
+            .saturating_add(full_refresh_wall.semantic_stage_ms)
+            .saturating_add(full_refresh_wall.snapshot_stage_ms)
+            .saturating_add(full_refresh_wall.publication_prepare_ms)
+            .saturating_add(full_refresh_wall.search_generation_ms)
+            .saturating_add(full_refresh_wall.catalog_publication_ms)
+            .saturating_add(full_refresh_wall.unattributed_ms);
+        assert!(accounted_ms <= full_refresh_wall.core_refresh_ms);
+        assert_eq!(
+            Storage::open(&storage_path)
+                .expect("open full publication")
+                .get_search_symbol_projection_count()
+                .expect("count legacy search projection"),
+            0,
+            "fresh full publication must not materialize the legacy projection table"
+        );
         let first = controller
             .index_publication()
             .expect("read first publication")
@@ -19379,9 +30377,85 @@ fn build_llm_symbol_doc_text() -> String {
             "pub fn second_value() -> i32 { 2 }\n",
         )
         .expect("write incremental source");
-        controller
+        let incremental_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incremental publication");
+        let incremental_parser_cache = incremental_timings
+            .parser_artifact_cache
+            .as_ref()
+            .expect("incremental parser cache telemetry");
+        assert_eq!(
+            incremental_parser_cache.policy,
+            ArtifactCachePolicyDto::ReadThrough
+        );
+        assert_eq!(incremental_parser_cache.logical_lookups, 1);
+        assert_eq!(incremental_parser_cache.physical_queries, 1);
+        assert_eq!(incremental_parser_cache.hits, 0);
+        assert_eq!(incremental_parser_cache.misses, 1);
+        assert_eq!(incremental_parser_cache.reader_opens, 0);
+        assert!(incremental_timings.full_refresh_queue_capacity.is_none());
+        assert!(incremental_timings.full_refresh_chunks_produced.is_none());
+        assert!(
+            incremental_timings
+                .full_refresh_chunk_target_bytes
+                .is_none()
+        );
+        assert!(
+            incremental_timings
+                .full_refresh_chunk_target_nodes
+                .is_none()
+        );
+        assert!(incremental_timings.full_refresh_chunk_planning_ms.is_none());
+        assert!(incremental_timings.full_refresh_wall.is_none());
+        let incremental_projection = incremental_timings
+            .projection_persistence
+            .as_ref()
+            .expect("incremental projection persistence telemetry");
+        assert_eq!(
+            Some(incremental_projection.transactions),
+            incremental_timings.projection_batch_transactions
+        );
+        assert!(incremental_projection.row_attempts > 0);
+        assert_eq!(
+            incremental_projection.dirty_state.statement_executions,
+            u64::from(incremental_projection.transactions) * 4
+        );
+        assert!(
+            incremental_timings
+                .staged_sqlite_wal_autocheckpoint_bytes
+                .is_none()
+        );
+        assert!(incremental_timings.staged_sqlite_checkpoint_ms.is_none());
+        assert!(incremental_timings.staged_sqlite_sync_ms.is_none());
+        let incremental_copy = incremental_timings
+            .staged_snapshot_copy
+            .as_ref()
+            .expect("incremental snapshot-copy telemetry");
+        assert!(incremental_copy.source_bytes > 0);
+        assert_eq!(incremental_copy.source_bytes, incremental_copy.target_bytes);
+        let incremental_promotion = incremental_timings
+            .core_promotion
+            .as_ref()
+            .expect("incremental promotion telemetry");
+        assert_eq!(
+            incremental_promotion.previous_live_bytes,
+            Some(incremental_copy.source_bytes)
+        );
+        assert_eq!(
+            incremental_promotion.rollback_backup_bytes,
+            incremental_promotion.previous_live_bytes
+        );
+        assert!(incremental_promotion.rollback_backup_copy_ms.is_some());
+        assert!(incremental_promotion.backup_validation_ms.is_some());
+        assert_promotion_reconciles(incremental_promotion);
+        assert_eq!(incremental_timings.search_projection_rebuild_ms, Some(0));
+        assert!(incremental_timings.search_symbol_stream_ms.is_some());
+        assert!(
+            incremental_timings
+                .search_symbol_stream_rows
+                .is_some_and(|rows| rows > full_timings.search_symbol_stream_rows.unwrap_or(0))
+        );
+        assert_eq!(incremental_timings.search_symbol_stream_batches, Some(1));
         let second = controller
             .index_publication()
             .expect("read second publication")
@@ -19391,9 +30465,22 @@ fn build_llm_symbol_doc_text() -> String {
         assert_ne!(second.generation_id, first.generation_id);
         assert_ne!(second.run_id, first.run_id);
 
-        controller
+        let second_full_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("second full publication");
+        assert!(second_full_timings.staged_snapshot_copy.is_none());
+        let second_full_promotion = second_full_timings
+            .core_promotion
+            .as_ref()
+            .expect("replacement full promotion telemetry");
+        assert!(second_full_promotion.previous_live_bytes.is_some());
+        assert!(second_full_promotion.rollback_backup_copy_ms.is_some());
+        assert!(second_full_promotion.backup_validation_ms.is_some());
+        assert_eq!(
+            second_full_promotion.rollback_backup_bytes,
+            second_full_promotion.previous_live_bytes
+        );
+        assert_promotion_reconciles(second_full_promotion);
         let third = controller
             .index_publication()
             .expect("read third publication")
@@ -19406,6 +30493,961 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
+        let workspace = tempdir().expect("workspace dir");
+        let markdown_path = workspace.path().join("guide.md");
+        let json_path = workspace.path().join("config.json");
+        fs::write(&markdown_path, "# Stable\n").expect("write markdown");
+        fs::write(&json_path, "{\"service\":{\"name\":\"api\"}}\n").expect("write JSON");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+
+        let first_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish first structural generation");
+        let first_structural_cache = first_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("first structural cache telemetry");
+        assert_eq!(
+            first_structural_cache.policy,
+            ArtifactCachePolicyDto::KnownEmpty
+        );
+        assert_eq!(first_structural_cache.logical_lookups, 2);
+        assert_eq!(first_structural_cache.physical_queries, 0);
+        assert_eq!(first_structural_cache.hits, 0);
+        assert_eq!(first_structural_cache.misses, 2);
+        assert_eq!(first_structural_cache.reader_opens, 0);
+        assert_eq!(first_structural_cache.lookup_wall_ms, 0);
+        let first = Store::database_index_publication(&storage_path)
+            .expect("read first publication")
+            .expect("first publication");
+        let first_store = Store::open_read_only(&storage_path).expect("open first publication");
+        let first_manifest = first_store
+            .validate_structural_text_unit_publication(&first)
+            .expect("validate first structural manifest");
+        assert_eq!(first_manifest.projection_count, 2);
+        assert!(first_manifest.unit_count >= 2);
+        let first_cache = {
+            let mut statement = first_store
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, cache_key
+                 FROM structural_text_artifact_cache
+                 ORDER BY file_path",
+                )
+                .expect("prepare first structural cache keys");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query first structural cache keys")
+                .map(|row| row.expect("read first structural cache key"))
+                .collect::<HashMap<String, String>>()
+        };
+        drop(first_store);
+        assert_eq!(first_cache.len(), 2);
+
+        fs::write(&markdown_path, "# Replacement\n").expect("change markdown");
+        let second_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish second structural generation");
+        let second_structural_cache = second_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("second structural cache telemetry");
+        assert_eq!(
+            second_structural_cache.policy,
+            ArtifactCachePolicyDto::ReadThrough
+        );
+        assert_eq!(second_structural_cache.logical_lookups, 2);
+        assert_eq!(second_structural_cache.physical_queries, 2);
+        assert_eq!(second_structural_cache.hits, 1);
+        assert_eq!(second_structural_cache.misses, 1);
+        assert_eq!(second_structural_cache.reader_opens, 1);
+        let second = Store::database_index_publication(&storage_path)
+            .expect("read second publication")
+            .expect("second publication");
+        assert_eq!(second.generation, first.generation + 1);
+        let second_store = Store::open_read_only(&storage_path).expect("open second publication");
+        let second_manifest = second_store
+            .validate_structural_text_unit_publication(&second)
+            .expect("validate second structural manifest");
+        assert_eq!(second_manifest.projection_count, 2);
+        assert_ne!(second_manifest.unit_digest, first_manifest.unit_digest);
+        let second_cache = {
+            let mut statement = second_store
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, cache_key
+                 FROM structural_text_artifact_cache
+                 ORDER BY file_path",
+                )
+                .expect("prepare second structural cache keys");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query second structural cache keys")
+                .map(|row| row.expect("read second structural cache key"))
+                .collect::<HashMap<String, String>>()
+        };
+        drop(second_store);
+        assert_ne!(first_cache.get("guide.md"), second_cache.get("guide.md"));
+        assert_eq!(
+            first_cache.get("config.json"),
+            second_cache.get("config.json")
+        );
+
+        fs::write(&json_path, "{\"replacement\":{\"name\":\"api\"}}\n").expect("change JSON");
+        std::fs::File::options()
+            .write(true)
+            .open(&json_path)
+            .expect("open changed JSON")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+            )
+            .expect("advance changed sql mtime");
+        let incremental_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("publish structural incremental");
+        let incremental_structural_cache = incremental_timings
+            .structural_artifact_cache
+            .as_ref()
+            .expect("incremental structural cache telemetry");
+        assert_eq!(
+            incremental_structural_cache.policy,
+            ArtifactCachePolicyDto::ReadThrough
+        );
+        assert_eq!(incremental_structural_cache.logical_lookups, 1);
+        assert_eq!(incremental_structural_cache.physical_queries, 1);
+        assert_eq!(incremental_structural_cache.hits, 0);
+        assert_eq!(incremental_structural_cache.misses, 1);
+        assert_eq!(incremental_structural_cache.reader_opens, 0);
+        let third = Store::database_index_publication(&storage_path)
+            .expect("read incremental publication")
+            .expect("incremental publication");
+        assert_eq!(third.generation, second.generation + 1);
+        assert_eq!(third.mode, IndexPublicationMode::Incremental);
+        let third_store = Store::open_read_only(&storage_path).expect("open incremental");
+        let third_manifest = third_store
+            .validate_structural_text_unit_publication(&third)
+            .expect("validate incremental structural manifest");
+        assert_eq!(third_manifest.projection_count, 2);
+        let third_names = third_store
+            .get_nodes()
+            .expect("read incremental nodes")
+            .into_iter()
+            .map(|node| node.serialized_name)
+            .collect::<HashSet<_>>();
+        assert!(
+            third_names.contains("replacement"),
+            "incremental structural nodes: {third_names:?}"
+        );
+        assert!(!third_names.contains("service"));
+        drop(third_store);
+        let structural_before_failure = structural_live_identity(&storage_path);
+        assert!(structural_before_failure.manifest.unit_count > 0);
+        assert_eq!(structural_before_failure.cache_rows.len(), 2);
+
+        fs::write(&markdown_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("invalid structural input must fail closed");
+        assert_eq!(error.code, "source_binary");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Binary)
+        }));
+        let preserved = Store::database_index_publication(&storage_path)
+            .expect("read preserved publication")
+            .expect("preserved publication");
+        assert_eq!(preserved, third);
+        Store::open_read_only(&storage_path)
+            .expect("open preserved publication")
+            .validate_structural_text_unit_publication(&preserved)
+            .expect("previous structural manifest remains valid");
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "collector failure changed the prior structural manifest or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        fs::write(&markdown_path, "# Replacement\n").expect("restore markdown");
+        fs::write(
+            workspace.path().join("malformed.json"),
+            "{\"missing_value\":",
+        )
+        .expect("write malformed JSON");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("malformed structural input must fail closed");
+        assert_eq!(error.code, "source_malformed");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Malformed)
+        }));
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "malformed input changed the prior structural manifest or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        fs::remove_file(workspace.path().join("malformed.json"))
+            .expect("remove malformed JSON fixture");
+        let unreadable_path = markdown_path.clone();
+        arm_source_policy_after_plan_hook(move || {
+            fs::remove_file(&unreadable_path).expect("remove planned markdown source");
+            fs::create_dir(&unreadable_path)
+                .expect("replace planned markdown source with unreadable directory");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("unreadable structural replacement must fail closed");
+        assert_eq!(error.code, "source_unreadable");
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details
+                .coverage_gaps
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Unreadable)
+        }));
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            structural_before_failure,
+            "unreadable replacement changed the prior core publication, structural manifest, or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn structural_publication_survives_unreadable_and_partial_discovery_failures() {
+        for scenario in ["unreadable", "partial-discovery"] {
+            let workspace = tempdir().expect("workspace dir");
+            let source_root = workspace.path().join("src");
+            fs::create_dir_all(&source_root).expect("source directory");
+            let css_path = source_root.join("styles.css");
+            fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
+            let manifest_path = workspace.path().join("codestory_workspace.json");
+            fs::write(&manifest_path, r#"{"members":["src"]}"#)
+                .expect("write complete workspace manifest");
+            let storage_path = workspace.path().join(".cache/codestory.db");
+            let controller = AppController::new();
+            controller
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("open structural project");
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish structural baseline");
+            let baseline = structural_live_identity(&storage_path);
+            assert!(baseline.manifest.unit_count > 0);
+            assert_eq!(baseline.cache_rows.len(), 1);
+
+            let error = if scenario == "unreadable" {
+                let unreadable_path = css_path.clone();
+                arm_source_policy_after_plan_hook(move || {
+                    fs::remove_file(&unreadable_path).expect("remove planned structural source");
+                    fs::create_dir(&unreadable_path)
+                        .expect("replace planned source with unreadable directory");
+                });
+                controller
+                    .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                    .expect_err("unreadable structural source must reject publication")
+            } else {
+                fs::write(&manifest_path, r#"{"members":["src","missing-member"]}"#)
+                    .expect("make workspace discovery partial");
+                controller
+                    .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                    .expect_err("partial discovery must reject publication")
+            };
+            let expected_reason = if scenario == "unreadable" {
+                FileCoverageReason::Unreadable
+            } else {
+                FileCoverageReason::DiscoveryIncomplete
+            };
+            assert!(
+                error.details.as_ref().is_some_and(|details| details
+                    .coverage_gaps
+                    .iter()
+                    .any(|gap| gap.reason == expected_reason)),
+                "{scenario} did not report the expected coverage gap: {error:?}"
+            );
+            assert_eq!(
+                structural_live_identity(&storage_path),
+                baseline,
+                "{scenario} changed the prior structural manifest or cache identity"
+            );
+            assert_no_staged_publication_artifacts(&storage_path);
+        }
+    }
+
+    #[test]
+    fn staged_structural_cache_write_failure_preserves_nonempty_live_generation() {
+        let workspace = tempdir().expect("workspace dir");
+        let css_path = workspace.path().join("styles.css");
+        fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
+        let storage_path = workspace.path().join(".cache/codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open structural project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish structural baseline");
+        let baseline = structural_live_identity(&storage_path);
+        assert!(baseline.manifest.unit_count > 0);
+        assert_eq!(baseline.cache_rows.len(), 1);
+
+        fs::write(&css_path, ".replacement { color: blue; }\n")
+            .expect("write replacement structural source");
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TRIGGER reject_structural_cache_write
+                     BEFORE INSERT ON structural_text_artifact_cache
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced staged structural cache failure');
+                     END;",
+                )
+                .expect("install staged structural cache fault");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("staged structural write failure must reject publication");
+        assert!(
+            error
+                .message
+                .contains("forced staged structural cache failure"),
+            "{error:?}"
+        );
+        assert_eq!(
+            structural_live_identity(&storage_path),
+            baseline,
+            "staged structural write failure changed the live manifest or cache identity"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn incremental_cache_read_faults_recollect_in_staged_candidate_and_preserve_live_publication() {
+        for (family, cache_table) in [
+            ("parser", "index_artifact_cache"),
+            ("structural", "structural_text_artifact_cache"),
+        ] {
+            let workspace = tempdir().expect("workspace dir");
+            let rust_path = workspace.path().join("lib.rs");
+            let json_path = workspace.path().join("config.json");
+            fs::write(&rust_path, "pub fn retained_parser() -> i32 { 1 }\n")
+                .expect("write parser source");
+            fs::write(&json_path, "{\"service\":{\"name\":\"api\"}}\n")
+                .expect("write structural source");
+            let storage_path = workspace.path().join(".cache/codestory.db");
+            let controller = AppController::new();
+            controller
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("open cache fault project");
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish cache fault baseline");
+
+            let parser_baseline = parser_cache_live_identity(&storage_path);
+            let structural_baseline = structural_live_identity(&storage_path);
+            assert_eq!(parser_baseline.cache_rows.len(), 1);
+            assert_eq!(structural_baseline.cache_rows.len(), 1);
+            assert_eq!(
+                parser_baseline.publication, structural_baseline.publication,
+                "cache families must belong to the same complete publication"
+            );
+
+            let changed_path = if family == "parser" {
+                fs::write(&rust_path, "pub fn replacement_parser() -> i32 { 2 }\n")
+                    .expect("change parser source");
+                &rust_path
+            } else {
+                fs::write(&json_path, "{\"replacement\":{\"name\":\"api\"}}\n")
+                    .expect("change structural source");
+                &json_path
+            };
+            std::fs::File::options()
+                .write(true)
+                .open(changed_path)
+                .expect("open changed cache source")
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+                )
+                .expect("advance changed cache source mtime");
+
+            let denied_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let staged_cache_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let denied_reads_hook = denied_reads.clone();
+            let staged_cache_writes_hook = staged_cache_writes.clone();
+            arm_incremental_staged_store_hook(move |storage| {
+                let denied_reads = denied_reads_hook.clone();
+                storage
+                    .get_connection()
+                    .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                        if matches!(
+                            context.action,
+                            rusqlite::hooks::AuthAction::Read { table_name, .. }
+                                if table_name == cache_table
+                        ) && denied_reads
+                            .compare_exchange(
+                                0,
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok()
+                        {
+                            rusqlite::hooks::Authorization::Deny
+                        } else {
+                            rusqlite::hooks::Authorization::Allow
+                        }
+                    }))
+                    .expect("install staged cache read fault");
+                storage
+                    .get_connection()
+                    .update_hook(Some(move |action, _: &str, updated_table: &str, _| {
+                        if updated_table == cache_table
+                            && matches!(
+                                action,
+                                rusqlite::hooks::Action::SQLITE_INSERT
+                                    | rusqlite::hooks::Action::SQLITE_UPDATE
+                            )
+                        {
+                            staged_cache_writes_hook
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }))
+                    .expect("observe staged cache writes");
+            });
+            arm_publication_test_fault(
+                PublicationTestBoundary::SearchBuild,
+                PublicationTestAction::Fail,
+            );
+
+            let error = controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect_err("later publication fault must reject recollected candidate");
+            assert!(
+                error.message.contains("SearchBuild"),
+                "{family} candidate did not reach the later publication boundary: {error:?}"
+            );
+            assert_eq!(
+                denied_reads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{family} staged cache read fault was not exercised exactly once"
+            );
+            assert!(
+                staged_cache_writes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "{family} read failure did not recollect and persist a staged cache entry"
+            );
+            PUBLICATION_TEST_FAULT.with(|fault| {
+                assert!(
+                    fault.borrow().is_none(),
+                    "{family} candidate did not reach the armed publication fault"
+                );
+            });
+
+            assert_eq!(
+                parser_cache_live_identity(&storage_path),
+                parser_baseline,
+                "{family} candidate changed the live parser cache or publication"
+            );
+            assert_eq!(
+                structural_live_identity(&storage_path),
+                structural_baseline,
+                "{family} candidate changed the live structural cache, manifest, or publication"
+            );
+            let live =
+                Storage::open_read_only(&storage_path).expect("open preserved live publication");
+            assert!(storage_has_symbol(&live, "retained_parser"));
+            assert!(storage_has_symbol(&live, "service"));
+            assert!(!storage_has_symbol(&live, "replacement_parser"));
+            assert!(!storage_has_symbol(&live, "replacement"));
+            drop(live);
+            assert_no_staged_publication_artifacts(&storage_path);
+        }
+    }
+
+    #[test]
+    fn structural_publication_survives_cancellation_and_promotion_rollback_boundaries() {
+        for (boundary, action, mode) in [
+            (
+                PublicationTestBoundary::SearchBuild,
+                PublicationTestAction::Cancel,
+                IndexMode::Full,
+            ),
+            (
+                PublicationTestBoundary::DatabaseReplacement,
+                PublicationTestAction::Fail,
+                IndexMode::Full,
+            ),
+            (
+                PublicationTestBoundary::MarkerCompletion,
+                PublicationTestAction::Fail,
+                IndexMode::Incremental,
+            ),
+        ] {
+            let workspace = tempdir().expect("workspace dir");
+            let css_path = workspace.path().join("styles.css");
+            let rust_path = workspace.path().join("lib.rs");
+            fs::write(&css_path, ".stable { color: green; }\n").expect("write structural source");
+            fs::write(&rust_path, "pub fn baseline() -> i32 { 1 }\n").expect("write parser source");
+            let storage_path = workspace.path().join(".cache/codestory.db");
+            let controller = AppController::new();
+            controller
+                .open_project_summary_with_storage_path(
+                    workspace.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("open structural project");
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish structural baseline");
+            let baseline = structural_live_identity(&storage_path);
+            assert!(baseline.manifest.unit_count > 0);
+            assert_eq!(baseline.cache_rows.len(), 1);
+
+            fs::write(&rust_path, "pub fn replacement() -> i32 { 2 }\n")
+                .expect("write replacement parser source");
+            let cancel_token = CancellationToken::new();
+            arm_publication_test_fault(boundary, action);
+            let error = controller
+                .run_indexing_blocking_without_runtime_refresh_with_cancel(mode, &cancel_token)
+                .expect_err("injected transition must reject publication");
+            PUBLICATION_TEST_FAULT.with(|fault| {
+                assert!(
+                    fault.borrow().is_none(),
+                    "structural transition fault was not reached: {boundary:?}"
+                );
+            });
+            match action {
+                PublicationTestAction::Cancel => {
+                    assert_eq!(error.code, "cancelled");
+                    assert!(cancel_token.is_cancelled());
+                }
+                PublicationTestAction::Fail => {
+                    assert_eq!(error.code, "internal");
+                    assert!(error.message.contains(&format!("{boundary:?}")));
+                }
+            }
+            assert_eq!(
+                structural_live_identity(&storage_path),
+                baseline,
+                "{boundary:?} changed the prior structural manifest or cache identity"
+            );
+            assert_no_staged_publication_artifacts(&storage_path);
+        }
+    }
+
+    #[test]
+    fn explicit_incremental_rejects_incompatible_structural_publication_before_source_reads() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"legacy-demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let previous = Store::database_index_publication(&storage_path)
+            .expect("read baseline")
+            .expect("baseline publication");
+        let storage = Store::open(&storage_path).expect("open baseline");
+        storage
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove structural manifest");
+        drop(storage);
+        fs::write(
+            workspace.path().join("malformed.json"),
+            "{\"missing_value\":",
+        )
+        .expect("write source that would fail a full parse");
+        let database_before = fs::read(&storage_path).expect("read incompatible database");
+        let wal_path = storage_path.with_extension("db-wal");
+        let wal_before = fs::read(&wal_path).ok();
+
+        for error in [
+            controller
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject incompatible incremental"),
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect_err("execution must reject incompatible incremental"),
+        ] {
+            assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            assert!(error.message.contains("requested=incremental"));
+            assert!(error.message.contains("effective=none"));
+            assert!(error.message.contains("required=full"));
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("structural_publication_incompatible")
+            );
+        }
+        assert_eq!(
+            fs::read(&storage_path).expect("read database after rejected requests"),
+            database_before,
+            "compatibility rejection must not mutate the live database"
+        );
+        assert_eq!(
+            fs::read(&wal_path).ok(),
+            wal_before,
+            "compatibility rejection must not mutate the live WAL"
+        );
+        assert_eq!(
+            Store::database_index_publication(&storage_path)
+                .expect("read preserved publication")
+                .expect("preserved publication"),
+            previous
+        );
+        assert!(!controller.state.lock().is_indexing);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        let full_error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("explicit full refresh must reach malformed source verification");
+        assert_eq!(full_error.code, "source_malformed");
+        assert!(
+            full_error
+                .message
+                .contains("Effective refresh mode `full` could not verify"),
+            "unexpected full-refresh error: {full_error:?}"
+        );
+    }
+
+    #[test]
+    fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn legacy_value() -> i32 { 28 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish current baseline");
+        {
+            let storage = Storage::open(&storage_path).expect("open schema fixture");
+            storage
+                .get_connection()
+                .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
+                .expect("stamp supported pre-current schema");
+        }
+        let database_before = fs::read(&storage_path).expect("read old-schema database");
+        let wal_path = storage_path.with_extension("db-wal");
+        let wal_before = fs::read(&wal_path).ok();
+        let cache_path = storage_path.parent().expect("cache path");
+        let cache_entries_before = {
+            let mut entries = fs::read_dir(cache_path)
+                .expect("list cache before compatibility checks")
+                .map(|entry| {
+                    entry
+                        .expect("read cache entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+
+        for error in [
+            controller
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject the old schema"),
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect_err("execution must reject the old schema"),
+        ] {
+            assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            assert_eq!(
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("core_schema_upgrade_required")
+            );
+        }
+        let auto_effective_dry_run = controller
+            .dry_run_index(IndexMode::Full)
+            .expect("auto-selected full dry-run must inspect old schema without migrating it");
+        assert_eq!(auto_effective_dry_run.refresh, IndexMode::Full);
+        assert_eq!(
+            fs::read(&storage_path).expect("read database after rejected requests"),
+            database_before,
+            "old-schema compatibility checks must preserve database bytes"
+        );
+        assert_eq!(
+            fs::read(&wal_path).ok(),
+            wal_before,
+            "old-schema compatibility checks must preserve WAL bytes"
+        );
+        let cache_entries_after = {
+            let mut entries = fs::read_dir(cache_path)
+                .expect("list cache after compatibility checks")
+                .map(|entry| {
+                    entry
+                        .expect("read cache entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        assert_eq!(cache_entries_after, cache_entries_before);
+        assert!(!controller.state.lock().is_indexing);
+        assert_no_staged_publication_artifacts(&storage_path);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("explicit full refresh upgrades the supported old schema");
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("read upgraded schema"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn full_refresh_required_command_quotes_shell_metacharacters() {
+        let error = full_refresh_required_error(
+            Path::new("repo/$hidden/quoted'path"),
+            "core_schema_upgrade_required",
+            "core_schema_upgrade_required",
+        );
+        let command = error
+            .details
+            .expect("typed compatibility details")
+            .next_commands
+            .into_iter()
+            .next()
+            .expect("full-refresh repair command");
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            command,
+            "codestory-cli index --project 'repo/$hidden/quoted'\\''path' --refresh full"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            command,
+            "codestory-cli index --project 'repo/$hidden/quoted''path' --refresh full"
+        );
+    }
+
+    #[test]
+    fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn retained_value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TRIGGER reject_pipeline_cache_write
+                     BEFORE INSERT ON index_artifact_cache
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced runtime pipeline cache failure');
+                     END;",
+                )
+                .expect("install staged writer failure");
+        });
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("injected pipeline writer failure must reject the candidate");
+        assert!(
+            error
+                .message
+                .contains("forced runtime pipeline cache failure"),
+            "{error:?}"
+        );
+
+        let live = Storage::open(&storage_path).expect("reopen retained live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retained publication"),
+            Some(baseline)
+        );
+        assert!(
+            live.get_nodes()
+                .expect("read retained graph")
+                .iter()
+                .any(|node| node.serialized_name == "retained_value")
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_semantic_endpoint_index_failure_preserves_live_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn retained_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+
+        fs::write(&source_path, "pub fn rejected_generation() -> i32 { 2 }\n")
+            .expect("write replacement source");
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TABLE idx_edge_source (
+                         collision INTEGER
+                     );",
+                )
+                .expect("install semantic endpoint index collision");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("semantic endpoint index failure must reject the candidate");
+        assert!(error.message.contains("idx_edge_source"), "{error:?}");
+
+        let live = Storage::open(&storage_path).expect("reopen retained live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retained publication"),
+            Some(baseline)
+        );
+        assert!(storage_has_symbol(&live, "retained_generation"));
+        assert!(!storage_has_symbol(&live, "rejected_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn full_refresh_post_summary_index_failure_preserves_live_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn retained_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open baseline")
+            .get_complete_index_publication()
+            .expect("read baseline publication")
+            .expect("baseline publication");
+
+        fs::write(&source_path, "pub fn rejected_generation() -> i32 { 2 }\n")
+            .expect("write replacement source");
+        arm_full_refresh_staged_store_hook(|storage| {
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TABLE idx_grounding_file_snapshot_path (
+                         collision INTEGER
+                     );",
+                )
+                .expect("install post-summary index collision");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("post-summary destination index failure must reject the candidate");
+        assert!(
+            error.message.contains("idx_grounding_file_snapshot_path"),
+            "{error:?}"
+        );
+
+        let live = Storage::open(&storage_path).expect("reopen retained live publication");
+        assert_eq!(
+            live.get_complete_index_publication()
+                .expect("read retained publication"),
+            Some(baseline)
+        );
+        assert!(storage_has_symbol(&live, "retained_generation"));
+        assert!(!storage_has_symbol(&live, "rejected_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
     fn incremental_publication_ignores_changed_files_without_graph_collectors() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
@@ -19413,8 +31455,8 @@ fn build_llm_symbol_doc_text() -> String {
             "pub fn first_value() -> i32 { 1 }\n",
         )
         .expect("write source");
-        let instructions = workspace.path().join("AGENTS.md");
-        fs::write(&instructions, "# Initial instructions\n").expect("write instructions");
+        let unsupported = workspace.path().join("notes.txt");
+        fs::write(&unsupported, "Initial notes\n").expect("write unsupported file");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
         controller
@@ -19432,7 +31474,7 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("read first publication")
             .expect("first publication identity");
 
-        fs::write(&instructions, "# Updated instructions\n").expect("update instructions");
+        fs::write(&unsupported, "Updated notes\n").expect("update unsupported file");
         let dry_run = controller
             .dry_run_index(IndexMode::Incremental)
             .expect("plan unsupported file refresh");
@@ -19440,7 +31482,7 @@ fn build_llm_symbol_doc_text() -> String {
             dry_run
                 .sample_files_to_index
                 .iter()
-                .any(|path| path == "AGENTS.md"),
+                .any(|path| path == "notes.txt"),
             "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
         );
         controller
@@ -19456,7 +31498,7 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             Storage::open(&storage_path)
                 .expect("open published storage")
-                .get_file_by_path(&instructions)
+                .get_file_by_path(&unsupported)
                 .expect("look up unsupported file")
                 .is_none(),
             "files without graph collectors should not be invented in semantic scope"
@@ -19499,7 +31541,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn legacy_schema_18_incomplete_marker_recovers_to_first_publication() {
+    fn legacy_schema_18_incomplete_marker_requires_explicit_full_recovery() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -19534,9 +31576,26 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("read legacy publication")
                 .is_none()
         );
-        controller
+        let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("recover legacy marker");
+            .expect_err("explicit incremental must reject the legacy incomplete marker");
+        assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("incomplete_incremental_publication")
+        );
+        assert!(
+            Storage::database_index_publication(&storage_path)
+                .expect("read rejected legacy publication")
+                .is_none()
+        );
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("recover legacy marker with an explicit full refresh");
 
         assert_eq!(
             Storage::database_schema_version(&storage_path).expect("recovered schema"),
@@ -19608,16 +31667,82 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("live detail readiness"),
             "pre-publication failure must preserve the live detail snapshot"
         );
-        assert_ne!(
-            Storage::database_schema_version(&storage_path).expect("replacement schema"),
-            codestory_store::CURRENT_SCHEMA_VERSION
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE incomplete_index_run
+                 SET started_at_epoch_ms = started_at_epoch_ms
+                 WHERE id = 1",
+                [],
+            )
+            .expect("retain the fence in committed WAL state");
+        let fenced_schema =
+            Storage::database_schema_version(&storage_path).expect("replacement schema");
+        assert_ne!(fenced_schema, codestory_store::CURRENT_SCHEMA_VERSION);
+        let wal_path = storage_path.with_extension("db-wal");
+        assert!(wal_path.is_file(), "fenced fixture must retain WAL state");
+        let database_before =
+            fs::read(&storage_path).expect("read fenced database before freshness");
+        let wal_before = fs::read(&wal_path).expect("read fenced WAL before freshness");
+
+        let cached = controller
+            .index_freshness()
+            .expect("cached recovery freshness");
+        let uncached = controller
+            .index_freshness_uncached()
+            .expect("uncached recovery freshness");
+        for freshness in [&cached, &uncached] {
+            assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+            assert_eq!(
+                freshness.reason.as_deref(),
+                Some("previous_incremental_run_incomplete_full_refresh_required")
+            );
+            assert_eq!(freshness.changed_file_count, 0);
+            assert_eq!(freshness.new_file_count, 0);
+            assert_eq!(freshness.removed_file_count, 0);
+            assert_eq!(freshness.checked_file_count, 0);
+            assert_eq!(freshness.indexed_file_count, 0);
+            assert!(freshness.samples.is_empty());
+        }
+        assert_eq!(
+            fs::read(&storage_path).expect("read fenced database after freshness"),
+            database_before
         );
         assert_eq!(
-            controller
-                .index_freshness()
-                .expect("recovery freshness")
-                .status,
-            IndexFreshnessStatusDto::Stale
+            fs::read(&wal_path).expect("read fenced WAL after freshness"),
+            wal_before
+        );
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("schema after freshness"),
+            fenced_schema
+        );
+        assert!(
+            storage
+                .has_incomplete_incremental_run()
+                .expect("marker after freshness"),
+            "freshness observation must preserve the durable fence"
+        );
+
+        drop(storage);
+        fs::remove_file(&search_path).expect("remove search rebuild blocker");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("successful full recovery");
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("recovered schema"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        let readable = Storage::open_read_only(&storage_path).expect("open recovered publication");
+        assert!(
+            !readable
+                .has_incomplete_incremental_run()
+                .expect("read recovered marker")
+        );
+        assert!(
+            readable
+                .get_complete_index_publication()
+                .expect("read recovered publication")
+                .is_some()
         );
     }
 
@@ -19942,9 +32067,14 @@ fn build_llm_symbol_doc_text() -> String {
         }
     }
 
-    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 8] = [
+    const PUBLICATION_TRANSITION_BOUNDARIES: [PublicationTestBoundary; 13] = [
+        PublicationTestBoundary::SemanticContextIndexes,
+        PublicationTestBoundary::SemanticNodePage,
+        PublicationTestBoundary::SemanticEndpointRead,
         PublicationTestBoundary::Identity,
         PublicationTestBoundary::SearchBuild,
+        PublicationTestBoundary::SearchSymbolPage,
+        PublicationTestBoundary::SearchIndexWrite,
         PublicationTestBoundary::SearchValidation,
         PublicationTestBoundary::SearchCompletion,
         PublicationTestBoundary::CatalogLock,
@@ -19952,6 +32082,90 @@ fn build_llm_symbol_doc_text() -> String {
         PublicationTestBoundary::MarkerCompletion,
         PublicationTestBoundary::RuntimeCache,
     ];
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StructuralLiveIdentity {
+        publication: IndexPublicationRecord,
+        manifest: codestory_store::StructuralTextUnitPublicationManifest,
+        cache_rows: Vec<(String, i64, String, String, i64, String, String)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ParserCacheLiveIdentity {
+        publication: IndexPublicationRecord,
+        cache_rows: Vec<(String, String, Vec<u8>, i64)>,
+    }
+
+    fn parser_cache_live_identity(storage_path: &Path) -> ParserCacheLiveIdentity {
+        let storage = Storage::open_read_only(storage_path).expect("open parser publication");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read parser core publication")
+            .expect("complete parser core publication");
+        let cache_rows = {
+            let mut statement = storage
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, cache_key, artifact_blob, updated_at_epoch_ms
+                     FROM index_artifact_cache
+                     ORDER BY file_path",
+                )
+                .expect("prepare parser cache identity");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .expect("query parser cache identity")
+                .map(|row| row.expect("read parser cache identity"))
+                .collect()
+        };
+        ParserCacheLiveIdentity {
+            publication,
+            cache_rows,
+        }
+    }
+
+    fn structural_live_identity(storage_path: &Path) -> StructuralLiveIdentity {
+        let storage = Storage::open_read_only(storage_path).expect("open structural publication");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("read structural core publication")
+            .expect("complete structural core publication");
+        let manifest = storage
+            .validate_structural_text_unit_publication(&publication)
+            .expect("validate structural publication");
+        let cache_rows = {
+            let mut statement = storage
+                .get_connection()
+                .prepare(
+                    "SELECT file_path, file_id, cache_key, source_content_hash,
+                            descriptor_version, producer, artifact_digest
+                     FROM structural_text_artifact_cache
+                     ORDER BY file_path",
+                )
+                .expect("prepare structural cache identity");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .expect("query structural cache identity")
+                .map(|row| row.expect("read structural cache identity"))
+                .collect()
+        };
+        StructuralLiveIdentity {
+            publication,
+            manifest,
+            cache_rows,
+        }
+    }
 
     fn assert_no_staged_publication_artifacts(storage_path: &Path) {
         let parent = storage_path.parent().expect("storage parent");
@@ -20135,16 +32349,24 @@ fn build_llm_symbol_doc_text() -> String {
                 summary.publication.is_none(),
                 "fenced generation was served"
             );
+            let dry_run_error = restarted
+                .dry_run_index(IndexMode::Incremental)
+                .expect_err("dry-run must reject implicit recovery escalation");
+            assert_eq!(dry_run_error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
             assert_eq!(
-                restarted
-                    .dry_run_index(IndexMode::Incremental)
-                    .expect("plan fenced recovery")
-                    .refresh,
-                IndexMode::Full
+                dry_run_error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.cause_code.as_deref()),
+                Some("incomplete_incremental_publication")
             );
-            restarted
+            let execution_error = restarted
                 .run_indexing_blocking(IndexMode::Incremental)
-                .expect("restart publication recovery");
+                .expect_err("execution must reject implicit recovery escalation");
+            assert_eq!(execution_error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+            restarted
+                .run_indexing_blocking(IndexMode::Full)
+                .expect("explicit full publication recovery");
             let storage = Storage::open(storage_path).expect("open recovered storage");
             let recovered = storage
                 .get_complete_index_publication()
@@ -20208,6 +32430,14 @@ fn build_llm_symbol_doc_text() -> String {
             {
                 continue;
             }
+            if matches!(
+                boundary,
+                PublicationTestBoundary::SemanticNodePage
+                    | PublicationTestBoundary::SemanticEndpointRead
+            ) && mode != IndexMode::Full
+            {
+                continue;
+            }
             for action in [PublicationTestAction::Fail, PublicationTestAction::Cancel] {
                 eprintln!("publication matrix: {mode:?} {boundary:?} {action:?}");
                 fs::remove_dir_all(storage_path.parent().expect("matrix cache directory"))
@@ -20229,6 +32459,192 @@ fn build_llm_symbol_doc_text() -> String {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_service_shared_cancellation_stops_full_refresh_before_core_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open shared-cancellation baseline");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("publish shared-cancellation baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open shared-cancellation baseline")
+            .get_complete_index_publication()
+            .expect("read shared-cancellation baseline")
+            .expect("complete shared-cancellation baseline");
+
+        fs::write(&source_path, "pub fn new_generation() -> i32 { 2 }\n")
+            .expect("write replacement source");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestAction::Cancel,
+        );
+        let error = crate::services::IndexService::new(controller)
+            .run_indexing_blocking_with_cancel_flag(IndexMode::Full, Arc::clone(&cancelled))
+            .expect_err("shared cancellation must stop the full refresh before publication");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        let storage = Storage::open(&storage_path).expect("open cancelled publication");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read cancelled publication"),
+            Some(baseline),
+            "shared cancellation advanced the core publication"
+        );
+        assert!(storage_has_symbol(&storage, "old_generation"));
+        assert!(!storage_has_symbol(&storage, "new_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    fn assert_symbol_index_failure_preserves_previous_complete_publication(
+        fault: search::engine::SymbolIndexTestFault,
+        expected_error: &str,
+    ) {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open add-failure baseline");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("publish add-failure baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open add-failure baseline")
+            .get_complete_index_publication()
+            .expect("read add-failure baseline")
+            .expect("complete add-failure baseline");
+
+        fs::write(
+            &source_path,
+            "pub fn new_generation() -> i32 { 2 }\npub fn another_symbol() {}\n",
+        )
+        .expect("write replacement source");
+        search::engine::arm_symbol_index_test_fault(fault);
+        let error = controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect_err("symbol index failure must reject the candidate");
+
+        assert!(error.message.contains(expected_error));
+        let storage = Storage::open(&storage_path).expect("open preserved publication");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read preserved publication"),
+            Some(baseline)
+        );
+        assert!(storage_has_symbol(&storage, "old_generation"));
+        assert!(!storage_has_symbol(&storage, "new_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
+    fn symbol_index_add_failure_preserves_previous_complete_publication() {
+        assert_symbol_index_failure_preserves_previous_complete_publication(
+            search::engine::SymbolIndexTestFault::AddDocumentAfterOne,
+            "add-document failure",
+        );
+    }
+
+    #[test]
+    fn symbol_index_commit_failure_preserves_previous_complete_publication() {
+        assert_symbol_index_failure_preserves_previous_complete_publication(
+            search::engine::SymbolIndexTestFault::Commit,
+            "commit failure",
+        );
+    }
+
+    #[test]
+    fn cancelled_full_refresh_preserves_previous_verified_exclusion_manifest() {
+        let workspace = tempdir().expect("workspace dir");
+        let ordinary = workspace.path().join("lib.rs");
+        let oversized = workspace.path().join("generated.rs");
+        fs::write(&ordinary, "pub fn stable() -> i32 { 1 }\n").expect("write ordinary source");
+        fs::write(&oversized, "pub fn generated() {}\n").expect("write generated source");
+        make_source_exceed_default_index_byte_cap(&oversized, "baseline exclusion");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open exclusion cancellation baseline");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish exclusion cancellation baseline");
+        let baseline_storage = Storage::open(&storage_path).expect("baseline storage");
+        let baseline_publication = baseline_storage
+            .get_complete_index_publication()
+            .expect("baseline publication")
+            .expect("complete baseline publication");
+        let baseline_manifest = baseline_storage
+            .get_source_policy_exclusion_manifest()
+            .expect("baseline exclusion manifest")
+            .expect("complete baseline exclusion manifest");
+        let baseline_exclusions = baseline_storage
+            .get_source_policy_exclusions()
+            .expect("baseline exclusions");
+        drop(baseline_storage);
+
+        fs::write(
+            &oversized,
+            format!("{}\n// changed\n", fs::read_to_string(&oversized).unwrap()),
+        )
+        .expect("change excluded source");
+        let cancel_token = CancellationToken::new();
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestAction::Cancel,
+        );
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh_with_cancel(
+                IndexMode::Full,
+                &cancel_token,
+            )
+            .expect_err("cancelled exclusion refresh must fail visibly");
+        assert_eq!(error.code, "cancelled");
+
+        let storage = Storage::open(&storage_path).expect("cancelled exclusion storage");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("preserved complete publication"),
+            Some(baseline_publication)
+        );
+        assert_eq!(
+            storage
+                .get_source_policy_exclusion_manifest()
+                .expect("preserved exclusion manifest"),
+            Some(baseline_manifest)
+        );
+        assert_eq!(
+            storage
+                .get_source_policy_exclusions()
+                .expect("preserved exclusions"),
+            baseline_exclusions
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]
@@ -20378,7 +32794,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn cancelled_first_incremental_does_not_create_a_live_database() {
+    fn first_incremental_requires_full_before_cancellation_or_storage_creation() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -20397,13 +32813,20 @@ fn build_llm_symbol_doc_text() -> String {
             Some(&cancel_token),
         ) {
             Err(error) => error,
-            Ok(_) => panic!("pre-cancelled first incremental must fail visibly"),
+            Ok(_) => panic!("first incremental must fail visibly"),
         };
 
-        assert_eq!(error.code, "cancelled");
+        assert_eq!(error.code, FULL_REFRESH_REQUIRED_ERROR_CODE);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("complete_core_publication_missing")
+        );
         assert!(
             !storage_path.exists(),
-            "a cancelled first run must not manufacture a live generation"
+            "a rejected first incremental must not manufacture a live generation"
         );
         let cache_dir = storage_path.parent().expect("cache parent");
         if cache_dir.exists() {
@@ -20413,7 +32836,7 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("read cache entries");
             assert!(
                 staged_artifacts.is_empty(),
-                "cancelled first run left staged debris: {staged_artifacts:?}"
+                "rejected first incremental left staged debris: {staged_artifacts:?}"
             );
         }
     }
@@ -20631,7 +33054,7 @@ fn build_llm_symbol_doc_text() -> String {
             })
             .expect_err("search should require full sidecars after summary open");
 
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
         let state = controller.state.lock();
         assert!(state.search_engine.is_none());
         assert!(state.node_names.is_empty());

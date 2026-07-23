@@ -35,10 +35,10 @@ function requestedProbes(packet, anchors, label) {
   return [...anchors].sort();
 }
 
-export class FullSidecarBlockedError extends Error {}
+export class FullRetrievalBlockedError extends Error {}
 
 export function evidenceStatusForError(error) {
-  return error instanceof FullSidecarBlockedError ? "blocked" : "failed";
+  return error instanceof FullRetrievalBlockedError ? "blocked" : "failed";
 }
 
 function generation(status) {
@@ -55,7 +55,7 @@ function generation(status) {
 export function verifyDrillPacketParity({ packet, report, summary, markdown, anchors, beforeStatus, afterStatus, artifacts }) {
   assert.equal(beforeStatus.retrieval_mode, "full", `before retrieval_mode=${beforeStatus.retrieval_mode ?? "missing"}`);
   assert.equal(afterStatus.retrieval_mode, "full", `after retrieval_mode=${afterStatus.retrieval_mode ?? "missing"}`);
-  assert.deepEqual(generation(afterStatus), generation(beforeStatus), "sidecar generation changed during proof");
+  assert.deepEqual(generation(afterStatus), generation(beforeStatus), "retrieval generation changed during proof");
 
   const drillPacket = report.evidence_packet;
   assert.deepEqual(drillPacket.sufficiency, packet.sufficiency, "sufficiency differs");
@@ -145,7 +145,7 @@ function main() {
     const beforeStatus = parseJson(runCli(values.cli, statusArgs, transcript, "retrieval-status-before"), "retrieval status before");
     evidence.readiness = { retrieval_mode: beforeStatus.retrieval_mode, degraded_reason: beforeStatus.degraded_reason ?? null, manifest_contract: beforeStatus.manifest_contract ?? null };
     if (beforeStatus.retrieval_mode !== "full") {
-      throw new FullSidecarBlockedError(`full-sidecar proof blocked: retrieval_mode=${beforeStatus.retrieval_mode ?? "missing"}; degraded_reason=${beforeStatus.degraded_reason ?? "missing"}`);
+      throw new FullRetrievalBlockedError(`full-retrieval proof blocked: retrieval_mode=${beforeStatus.retrieval_mode ?? "missing"}; degraded_reason=${beforeStatus.degraded_reason ?? "missing"}`);
     }
 
     const packetArgs = ["packet", "--project", project, ...agentSelection, "--question", values.question, "--budget", "standard", "--refresh", "none", "--format", "json"];

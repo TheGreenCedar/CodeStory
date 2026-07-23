@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+exec /opt/glslc-root/lib64/ld-linux-x86-64.so.2 \
+  --library-path /opt/glslc-root/lib/x86_64-linux-gnu:/opt/glslc-root/usr/lib/x86_64-linux-gnu \
+  /opt/glslc-root/usr/bin/glslc "$@"

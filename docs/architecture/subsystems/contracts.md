@@ -1,31 +1,37 @@
 # Contracts Subsystem
 
-`codestory-contracts` owns the shared model used by the final V2 crates.
+`codestory-contracts` owns stable types shared across source-of-truth layers,
+runtime, and adapters. It contains contracts, not orchestration or rendering.
 
 ## Ownership
 
-- graph/domain primitives such as nodes, edges, occurrences, trail config, and bookmarks
-- adapter-facing DTOs for CLI and runtime services
-- grounding and trail contract groupings
-- shared event-bus and domain event types
+- graph nodes, edges, occurrences, locations, bookmarks, and trails;
+- workspace and refresh DTOs;
+- API requests, responses, IDs, structured errors, and lifecycle events;
+- grounding, readiness, status, publication, and symbol-workflow DTOs;
+- tagged packet probes plus normalized resolution, ambiguity, and rejection
+  metadata;
+- language-support profiles and evidence tiers.
 
-## Entry Points
+## Entry points
 
-- `crates/codestory-contracts/src/graph.rs`
-- `crates/codestory-contracts/src/api.rs`
-- `crates/codestory-contracts/src/events.rs`
-- `crates/codestory-contracts/src/grounding.rs`
-- `crates/codestory-contracts/src/trail.rs`
+- `src/graph.rs` and `src/graph/`: graph domain
+- `src/api.rs` and `src/api/`: adapter-facing DTOs, errors, IDs, and events
+- `src/grounding.rs` and `src/trail.rs`: evidence groupings
+- `src/workspace.rs`: shared workspace contracts
+- `src/language_support.rs`: source-of-truth support labels
 
-## How To Extend It
+## Extension rules
 
-- Add new shared graph or trail primitives under `graph/` and export them through `graph.rs`.
-- Add new request/response DTOs under `api/` and export them through `api.rs`.
-- Add cross-layer lifecycle or boundary events under `events/` and export only the public ones.
-- Keep runtime-local commands and CLI-only formatting types out of this crate.
+- add a type here when two owning layers must exchange the same stable meaning;
+- keep storage schemas, runtime planners, and CLI formatting private to their
+  owning crates;
+- prefer closed enums and structured errors at trust and readiness boundaries;
+- preserve wire names deliberately when implementation vocabulary changes.
 
-## Failure Signatures
+## Failure signatures
 
-- runtime or CLI imports a private type from another crate instead of using `codestory-contracts`
-- wildcard exports creep back into the public surface
-- UI-only or adapter-only types leak into `events`
+- runtime or CLI imports another crate's private type instead of a contract;
+- DTOs perform I/O or choose product behavior;
+- adapter-only formatting types become shared domain concepts;
+- a support or readiness label exists without one source-of-truth definition.

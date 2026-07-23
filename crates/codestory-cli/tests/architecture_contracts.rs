@@ -420,9 +420,9 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
 fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
     let runtime = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        runtime.contains("SnapshotStore::open_staged(storage_path)")
+        runtime.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
             && runtime.contains("finalize_staged()")
-            && runtime.contains("staged.publish(storage_path)"),
+            && runtime.contains("staged.publish_with_stats(storage_path)"),
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
@@ -462,8 +462,57 @@ fn staged_publication_identity_and_fence_are_complete_before_publication() {
                 .matches("staged.store_mut().finish_incremental_run()")
                 .count()
                 >= 2
-            && runtime.matches("staged.publish(storage_path)").count() >= 2,
+            && runtime
+                .matches("staged.publish_with_stats(storage_path)")
+                .count()
+                >= 2,
         "full and incremental staging should persist publication identity and clear compatibility fences before publishing"
+    );
+}
+
+#[test]
+fn product_search_builds_stream_canonical_nodes_without_legacy_projection_rebuilds() {
+    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    let persisted_builder = source_between(
+        &runtime,
+        "fn build_persisted_search_state_from_canonical_symbols(",
+        "#[cfg(test)]\nfn rebuild_search_state_from_storage(",
+    );
+    let runtime_rebuild = source_between(
+        &runtime,
+        "fn rebuild_search_state_from_storage_for_runtime(",
+        "fn refresh_caches(",
+    );
+    let retrieval = read("crates/codestory-retrieval/src/index.rs");
+    let retrieval_scip = read("crates/codestory-retrieval/src/scip_index.rs");
+    let scip_emit = source_between(
+        &retrieval_scip,
+        "pub fn emit_scip_artifacts_from_store(",
+        "fn scip_revision_for_symbols(",
+    );
+
+    assert!(
+        persisted_builder.contains("get_canonical_search_symbol_count()")
+            && persisted_builder.contains("get_canonical_search_symbol_batch_after(")
+            && persisted_builder.contains("engine.begin_symbol_index()")
+            && runtime_rebuild.contains("build_persisted_search_state_from_canonical_symbols("),
+        "persisted product search should stream canonical node pages through one symbol writer"
+    );
+    for forbidden in [
+        ".get_nodes()",
+        "rebuild_search_symbol_projection",
+        "get_search_symbol_projection_batch_after",
+    ] {
+        assert!(
+            !persisted_builder.contains(forbidden) && !runtime_rebuild.contains(forbidden),
+            "runtime product search build must not use legacy materialization path {forbidden}"
+        );
+    }
+    assert!(
+        !retrieval.contains("rebuild_search_symbol_projection")
+            && scip_emit.contains("get_canonical_search_symbol_detail_batch_after(")
+            && !scip_emit.contains("get_search_symbol_projection"),
+        "retrieval preparation and SCIP emission should not rebuild or read the legacy search projection"
     );
 }
 

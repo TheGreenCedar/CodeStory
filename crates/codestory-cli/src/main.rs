@@ -14,10 +14,11 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
-    AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAnswerDto,
-    AgentAskRequest, AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CommandFailureEnvelope,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpInvocationDto, AgentAnswerDto, AgentAskRequest, AgentCitationDto,
+    AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CommandFailureEnvelope,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, FrameworkRouteCoverageDto,
     GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
     IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
@@ -37,7 +38,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -50,14 +51,14 @@ mod config;
 mod display;
 mod drill_targeting;
 mod embedding_config;
+mod embedding_qualification;
+mod embedding_server_transport;
 mod explore;
 mod file_state;
 mod http_transport;
 mod local_refresh_status;
 mod output;
 mod readiness;
-mod readiness_broker;
-mod ready_repair_status;
 mod report;
 mod retrieval;
 mod runtime;
@@ -72,44 +73,46 @@ use args::{
     BookmarkAddOutput, BookmarkCommand, BookmarkListCommand, BookmarkListOutput, BookmarkOutput,
     BookmarkRemoveCommand, BookmarkRemoveOutput, CacheAction, CacheCommand, Cli, CliDirection,
     CliTrailMode, Command, CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand,
-    DoctorOutput, DoctorSidecarStatusOutput, DrillAnchorOutput, DrillAnchorTimingsOutput,
-    DrillBridgeEvidenceOutput, DrillBridgeOutput, DrillCommand, DrillCommandStatusOutput,
-    DrillExecutionBoundaryOutput, DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput,
-    DrillSuiteCommand, DrillSuiteExpectationOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
+    DoctorOutput, DrillAnchorOutput, DrillAnchorTimingsOutput, DrillBridgeEvidenceOutput,
+    DrillBridgeOutput, DrillCommand, DrillCommandStatusOutput, DrillExecutionBoundaryOutput,
+    DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput, DrillSuiteCommand,
+    DrillSuiteExpectationOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
     DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
     DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
     DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
-    FilesCommand, FixCommand, FixOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
-    IndexDryRunOutput, IndexOutput, InternalOwnedDeleteCommand, PacketCommand, ProjectArgs,
-    QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput,
-    ReadyCommand, ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
-    ServeCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand,
-    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction,
-    TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
-    build_trail_request,
+    FilesCommand, GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput,
+    IndexOutput, InternalOwnedDeleteCommand, PacketCommand, ProjectArgs, QueryCommand, QueryOutput,
+    QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand, ReadyOutput,
+    RepoTextMode, RetrievalStatusOutput, SearchCommand, SearchHitOutput, SearchOutput,
+    ServeCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput, SymbolCommand,
+    SymbolJsonOutput, SymbolWorkflowCommand, TaskAction, TaskBriefCommand, TaskCommand,
+    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 #[cfg(test)]
 use http_transport::search_repo_text_mode_param;
 use output::{
-    REPO_CONTENT_BOUNDARY_LINE, context_packet_json, emit, emit_text, render_agent_citation,
-    render_context_markdown, render_doctor_markdown, render_drill_markdown, render_fix_markdown,
-    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
-    render_query_markdown, render_ready_markdown, render_search_markdown, render_snippet_markdown,
-    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
-    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
+    REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, context_packet_json, emit,
+    emit_public_operation, render_agent_citation, render_context_markdown, render_doctor_markdown,
+    render_drill_markdown, render_ground_markdown, render_index_dry_run_markdown,
+    render_index_markdown, render_query_markdown, render_ready_markdown, render_search_markdown,
+    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
+    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
+    validate_output_file_parent,
 };
 use runtime::{
-    AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
-    resolve_refresh_request, resolve_target,
+    AmbiguousTargetError, RuntimeContext, annotate_refresh_error, ensure_index_ready,
+    index_mode_name, map_api_error, map_api_error_for_project, refresh_label, refresh_mode_name,
+    resolve_source_target, resolve_target,
 };
 use serde::Deserialize;
 #[cfg(test)]
 use stdio_catalog::{
-    prompts_list_json as stdio_prompts_list_json, resources_list_json as stdio_resources_list_json,
-    tools_list_json as stdio_tools_list_json,
+    prompts_list_json as stdio_prompts_list_json,
+    resource_templates_list_json as stdio_resource_templates_list_json,
+    resources_list_json as stdio_resources_list_json, tools_list_json as stdio_tools_list_json,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -122,10 +125,6 @@ const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
 const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
-const READY_REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
-const READY_REPAIR_LOCAL_REFRESH_WAIT: Duration = Duration::from_secs(5 * 60);
-const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
-const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
 
 fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
@@ -203,6 +202,11 @@ async fn main() -> ExitCode {
             if json {
                 let envelope = structured
                     .map(|failure| failure.envelope.clone())
+                    .or_else(|| {
+                        runtime::api_error_in_chain(&error)
+                            .cloned()
+                            .map(CommandFailureEnvelope::new)
+                    })
                     .unwrap_or_else(|| generic_command_failure(&error));
                 let output_file = structured
                     .and_then(|failure| failure.output_file.as_deref())
@@ -217,7 +221,7 @@ async fn main() -> ExitCode {
                     eprintln!("Error: failed to write {}: {write_error}", path.display());
                     return ExitCode::FAILURE;
                 }
-                eprintln!("Error: {}", error);
+                eprintln!("Error: {}", command_failure_message(&error));
             }
             ExitCode::FAILURE
         }
@@ -225,6 +229,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
+    if let Some(mode) = embedding_client_transport_mode(&cli.command) {
+        embedding_server_transport::install_client_transport(mode)
+            .context("install native embedding server transport")?;
+    }
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
@@ -234,7 +242,6 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Task(cmd) => run_task(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Ready(cmd) => run_ready(cmd),
-        Command::Fix(cmd) => run_fix(cmd),
         Command::Smoke(cmd) => run_smoke(cmd),
         Command::Agent(cmd) => run_agent(cmd),
         Command::Cache(cmd) => run_cache(cmd),
@@ -261,8 +268,33 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Serve(cmd) => run_serve(cmd).await,
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
-        Command::Sidecar(cmd) => run_sidecar(cmd),
         Command::InternalOwnedDelete(cmd) => run_internal_owned_delete(cmd),
+        Command::InternalEmbeddingServer => {
+            embedding_server_transport::run_internal_embedding_server()
+        }
+        Command::InternalEmbeddingQualification(cmd) => {
+            embedding_qualification::run_internal_embedding_qualification(cmd)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
+        Command::InternalEmbeddingQualificationWorker(cmd) => {
+            embedding_qualification::run_internal_embedding_qualification_worker(cmd)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        }
+    }
+}
+
+fn embedding_client_transport_mode(
+    command: &Command,
+) -> Option<embedding_server_transport::ClientTransportMode> {
+    match command {
+        Command::Ground(_) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
+        Command::Retrieval(args::RetrievalCommand {
+            action: args::RetrievalAction::Status(_),
+        }) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
+        Command::InternalEmbeddingServer => None,
+        // This is deliberately an allowlist for attested observe-only capture. New commands retain
+        // fresh exact executable identity unless their transport behavior is reviewed explicitly.
+        _ => Some(embedding_server_transport::ClientTransportMode::SpawnCapable),
     }
 }
 
@@ -304,12 +336,16 @@ fn command_failure_envelope(
         code,
         message,
         ApiErrorDetails {
+            cause_code: None,
             failed_layer: Some(failed_layer.into()),
             project: None,
             next_commands: Vec::new(),
             minimum_next: Vec::new(),
             full_repair: Vec::new(),
             readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
         },
     ))
     .with_context(context)
@@ -324,6 +360,14 @@ fn generic_command_failure(error: &anyhow::Error) -> CommandFailureEnvelope {
             "causes": error.chain().skip(1).map(ToString::to_string).collect::<Vec<_>>()
         }),
     )
+}
+
+fn command_failure_message(error: &anyhow::Error) -> String {
+    if runtime::api_error_in_chain(error).is_some() {
+        format!("{error:#}")
+    } else {
+        error.to_string()
+    }
 }
 
 fn json_output_requested(args: &[OsString]) -> bool {
@@ -360,21 +404,6 @@ fn emit_command_failure(envelope: &CommandFailureEnvelope, output_file: Option<&
     println!("{json}");
 }
 
-fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
-    match cmd.action {
-        SidecarAction::Status(status_cmd) => retrieval::run_retrieval_status(status_cmd),
-        SidecarAction::Inventory(inventory_cmd) => {
-            retrieval::run_retrieval_inventory(inventory_cmd)
-        }
-        SidecarAction::Unknown(args) => {
-            let subcommand = args.first().map(String::as_str).unwrap_or("<unknown>");
-            bail!(
-                "unknown sidecar subcommand `{subcommand}`; use `codestory-cli sidecar status`, `codestory-cli sidecar inventory`, or `codestory-cli retrieval status`"
-            )
-        }
-    }
-}
-
 fn new_agent_surface_runtime(
     project: &ProjectArgs,
     profile: Option<args::CliSidecarProfile>,
@@ -385,7 +414,7 @@ fn new_agent_surface_runtime(
 
 struct OpenedAgentSurface {
     runtime: RuntimeContext,
-    before: ProjectSummary,
+    before: Option<ProjectSummary>,
     opened: runtime::OpenedProject,
 }
 
@@ -397,15 +426,20 @@ fn open_agent_surface(
     surface: &'static str,
 ) -> Result<OpenedAgentSurface> {
     let runtime = new_agent_surface_runtime(project, profile, run_id)?;
-    let before = runtime.open_project_summary()?;
-    let opened = runtime.ensure_open_from_summary(refresh, before.clone())?;
+    let (before, opened) = runtime.ensure_open_with_before(refresh)?;
     ensure_index_ready(&opened, surface)?;
-    ensure_agent_surface_gpu_proof(&runtime, surface)?;
+    codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
+        .map_err(map_embedding_preflight_error)
+        .with_context(|| format!("initialize retrieval for {surface}"))?;
     Ok(OpenedAgentSurface {
         runtime,
         before,
         opened,
     })
+}
+
+fn map_embedding_preflight_error(error: anyhow::Error) -> anyhow::Error {
+    codestory_runtime::embedding_api_error(&error).map_or(error, map_api_error)
 }
 
 fn run_cache(cmd: CacheCommand) -> Result<()> {
@@ -662,14 +696,20 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         RuntimeContext::new(&cmd.project)?
     };
     if cmd.dry_run {
-        let summary = runtime.open_project_summary()?;
-        let refresh_mode =
-            resolve_refresh_request(cmd.refresh, &summary).unwrap_or(IndexMode::Incremental);
-        let dry_run = runtime
-            .index
-            .dry_run_index(refresh_mode)
-            .map_err(map_api_error)?;
-        let output = IndexDryRunOutput { dry_run: &dry_run };
+        let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
+        let refresh_mode = decision.effective_mode.unwrap_or(IndexMode::Incremental);
+        let dry_run = runtime.index.dry_run_index(refresh_mode).map_err(|error| {
+            map_api_error_for_project(
+                annotate_refresh_error(error, cmd.refresh, refresh_mode),
+                &runtime.project_root,
+            )
+        })?;
+        let output = IndexDryRunOutput {
+            requested_refresh: refresh_mode_name(cmd.refresh),
+            effective_refresh: index_mode_name(refresh_mode),
+            compatibility_reason: decision.reason.as_deref(),
+            dry_run: &dry_run,
+        };
         let markdown = render_index_dry_run_markdown(&output);
         return emit(cmd.format, &output, markdown, cmd.output_file.as_deref());
     }
@@ -712,6 +752,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         project: &opened.summary.root,
         storage_path: &storage_path,
         refresh: &refresh_label,
+        refresh_reason: opened.refresh_reason.as_deref(),
         summary: &opened.summary,
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
@@ -781,185 +822,6 @@ fn format_progress_bar(current: u32, total: u32) -> String {
         "[{}{}]",
         "#".repeat(filled as usize),
         "-".repeat(WIDTH.saturating_sub(filled) as usize)
-    )
-}
-
-struct ReadyRepairProgress {
-    profile: &'static str,
-    run_id: String,
-    namespace: String,
-    project_root: PathBuf,
-    cache_root: PathBuf,
-    phase: Arc<Mutex<&'static str>>,
-    done: Arc<AtomicBool>,
-    start: Instant,
-    started_at_epoch_ms: i64,
-    pid: u32,
-    attempt_id: Option<String>,
-    sidecar: codestory_retrieval::SidecarRuntimeConfig,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl ReadyRepairProgress {
-    fn start(
-        sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-        project_root: &Path,
-        cache_root: &Path,
-    ) -> Self {
-        let phase = Arc::new(Mutex::new("starting"));
-        let done = Arc::new(AtomicBool::new(false));
-        let start = Instant::now();
-        let started_at_epoch_ms = ready_repair_status::now_epoch_ms();
-        let pid = std::process::id();
-        let attempt_id = std::env::var(ready_repair_status::READY_REPAIR_ATTEMPT_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let profile = sidecar.profile.as_str();
-        let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
-        let namespace = sidecar.namespace.clone();
-        let project_root = project_root.to_path_buf();
-        let cache_root = cache_root.to_path_buf();
-        let sidecar_for_worker = sidecar.clone();
-        let worker_phase = Arc::clone(&phase);
-        let worker_done = Arc::clone(&done);
-        let worker_run_id = run_id.clone();
-        let worker_namespace = namespace.clone();
-        let worker_project_root = project_root.clone();
-        let worker_cache_root = cache_root.clone();
-        let worker_attempt_id = attempt_id.clone();
-        let _ = ready_repair_status::write_ready_repair_status_for_attempt(
-            sidecar,
-            &project_root,
-            "starting",
-            started_at_epoch_ms,
-            pid,
-            attempt_id.as_deref(),
-        );
-        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-            project_root: project_root.clone(),
-            cache_root: cache_root.clone(),
-            agent_run_id: sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: None,
-            reconciliation: None,
-        });
-        let handle = std::thread::spawn(move || {
-            while !worker_done.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(100));
-                if start.elapsed() < READY_REPAIR_PROGRESS_INTERVAL {
-                    continue;
-                }
-                let elapsed = start.elapsed().as_secs();
-                if !elapsed.is_multiple_of(READY_REPAIR_PROGRESS_INTERVAL.as_secs()) {
-                    continue;
-                }
-                let phase = *worker_phase.lock().expect("ready repair phase lock");
-                eprintln!(
-                    "{}",
-                    ready_repair_progress_line(
-                        phase,
-                        profile,
-                        &worker_run_id,
-                        &worker_namespace,
-                        elapsed,
-                        "active"
-                    )
-                );
-                let _ = ready_repair_status::write_ready_repair_status_for_attempt(
-                    &sidecar_for_worker,
-                    &worker_project_root,
-                    phase,
-                    started_at_epoch_ms,
-                    pid,
-                    worker_attempt_id.as_deref(),
-                );
-                let _ = readiness_broker::refresh_broker_snapshot(
-                    readiness_broker::BrokerSnapshotInput {
-                        project_root: worker_project_root.clone(),
-                        cache_root: worker_cache_root.clone(),
-                        agent_run_id: sidecar_for_worker.run_id.clone(),
-                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                        gpu_proof: None,
-                        reconciliation: None,
-                    },
-                );
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        });
-        Self {
-            profile,
-            run_id,
-            namespace,
-            project_root,
-            cache_root,
-            phase,
-            done,
-            start,
-            started_at_epoch_ms,
-            pid,
-            attempt_id,
-            sidecar: sidecar.clone(),
-            handle: Some(handle),
-        }
-    }
-
-    fn set_phase(&self, phase: &'static str) {
-        *self.phase.lock().expect("ready repair phase lock") = phase;
-        eprintln!(
-            "{}",
-            ready_repair_progress_line(
-                phase,
-                self.profile,
-                &self.run_id,
-                &self.namespace,
-                self.start.elapsed().as_secs(),
-                "started"
-            )
-        );
-        let _ = ready_repair_status::write_ready_repair_status_for_attempt(
-            &self.sidecar,
-            &self.project_root,
-            phase,
-            self.started_at_epoch_ms,
-            self.pid,
-            self.attempt_id.as_deref(),
-        );
-        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-            project_root: self.project_root.clone(),
-            cache_root: self.cache_root.clone(),
-            agent_run_id: self.sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: None,
-            reconciliation: None,
-        });
-    }
-}
-
-impl Drop for ReadyRepairProgress {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-        ready_repair_status::clear_ready_repair_status_for_attempt(
-            &self.sidecar,
-            self.started_at_epoch_ms,
-            self.pid,
-            self.attempt_id.as_deref(),
-        );
-    }
-}
-
-fn ready_repair_progress_line(
-    phase: &str,
-    profile: &str,
-    run_id: &str,
-    namespace: &str,
-    elapsed_s: u64,
-    status: &str,
-) -> String {
-    format!(
-        "[ready-repair] phase=\"{phase}\" profile={profile} run_id={run_id} namespace={namespace} elapsed_s={elapsed_s} status={status}"
     )
 }
 
@@ -1048,12 +910,16 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
             "smoke_failed",
             format!("smoke profile {} failed", output.profile),
             ApiErrorDetails {
+                cause_code: None,
                 failed_layer: Some("smoke".to_string()),
                 project: Some(output.project.clone()),
                 next_commands: output.repair_hints.clone(),
                 minimum_next: output.repair_hints.iter().take(1).cloned().collect(),
                 full_repair: output.repair_hints.clone(),
                 readiness: None,
+                embedding_capacity: None,
+                embedding_retry: None,
+                coverage_gaps: Vec::new(),
             },
         ))
         .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
@@ -1218,12 +1084,11 @@ fn run_ci_agent_smoke(project: &ProjectArgs) -> SmokeOutput {
     let start = Instant::now();
     let fake_path = "__codestory_smoke_fake_change__.rs";
     match runtime.browser.affected_analysis(AffectedAnalysisRequest {
-        changed_paths: vec![fake_path.to_string()],
-        change_records: vec![affected_path_record(
+        input: AffectedAnalysisInput::ChangeRecords(vec![affected_path_record(
             fake_path,
             AffectedChangeKindDto::Unknown,
             "smoke",
-        )],
+        )]),
         depth: Some(1),
         filter: None,
     }) {
@@ -1388,49 +1253,63 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "context")?;
 
-    let resolved = resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
-    let target_prompt = context_target_prompt(&resolved);
-    let request = AgentAskRequest {
-        prompt: target_prompt,
-        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
-            preset: AgentRetrievalPresetDto::Investigate,
-        },
-        focus_node_id: Some(resolved.target.selected.node_id.clone()),
-        max_results: Some(cmd.max_results.clamp(1, 25)),
-        response_mode: AgentResponseModeDto::Markdown,
-        latency_budget_ms: None,
-        include_evidence: !cmd.no_evidence,
-        hybrid_weights: None,
-    };
+    let operation = runtime.run_public_operation("context", || {
+        let resolved =
+            resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
+        let target_prompt = context_target_prompt(&resolved);
+        let request = AgentAskRequest {
+            prompt: target_prompt,
+            retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+                preset: AgentRetrievalPresetDto::Investigate,
+            },
+            focus_node_id: Some(resolved.target.selected.node_id.clone()),
+            max_results: Some(cmd.max_results.clamp(1, 25)),
+            response_mode: AgentResponseModeDto::Markdown,
+            latency_budget_ms: None,
+            include_evidence: !cmd.no_evidence,
+            hybrid_weights: None,
+        };
 
-    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
-    answer
-        .retrieval_trace
-        .annotations
-        .push("mode=db_first".to_string());
-    annotate_answer_with_context_target(&mut answer, &resolved);
-    let markdown = render_context_markdown(&runtime.project_root, &answer);
-    let output = ContextJsonOutput {
-        target: ContextTargetOutput {
-            selector: resolved.selector,
-            requested: resolved.requested,
-            bookmark_id: resolved
-                .bookmark
-                .as_ref()
-                .map(|bookmark| bookmark.id.clone()),
-        },
-        resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
-        context: context_packet_json(&answer),
-    };
+        let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
+        answer
+            .retrieval_trace
+            .annotations
+            .push("mode=db_first".to_string());
+        annotate_answer_with_context_target(&mut answer, &resolved);
+        let markdown = render_context_markdown(&runtime.project_root, &answer);
+        let output = ContextJsonOutput {
+            target: ContextTargetOutput {
+                selector: resolved.selector,
+                requested: resolved.requested,
+                bookmark_id: resolved
+                    .bookmark
+                    .as_ref()
+                    .map(|bookmark| bookmark.id.clone()),
+            },
+            resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
+            context: context_packet_json(&answer),
+        };
+        let rendered = RenderedPublicOutput::structured(&output, markdown)?;
+        Ok((answer, rendered))
+    })?;
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
-        write_context_bundle(bundle_dir, &output, &answer.graphs, &markdown)?;
+        let (json, markdown) = operation
+            .value
+            .1
+            .structured_parts()
+            .expect("context always renders structured output");
+        let json = runtime::public_operation_json_value(&operation, json)?;
+        write_context_bundle(bundle_dir, &json, &operation.value.0.graphs, markdown)?;
     }
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime::map_public_operation(operation, |(_, rendered)| rendered);
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
+        .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } = open_agent_surface(
         &cmd.project,
         cmd.profile,
@@ -1439,23 +1318,36 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
         "packet",
     )?;
 
-    let packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question: cmd.question,
-            budget: cmd.budget.into(),
-            task_class: cmd.task_class.map(Into::into),
-            extra_probes: cmd.extra_probes,
-            include_evidence: !cmd.no_evidence,
-            latency_budget_ms: cmd.latency_budget_ms,
-        })
-        .map_err(map_api_error)?;
-    if let Some(path) = &cmd.step_trace_out {
-        let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
-        std::fs::write(path, serde_json::to_string_pretty(&trace)?)?;
+    let operation = runtime.run_public_operation("packet", || {
+        let packet = runtime
+            .browser
+            .packet(AgentPacketRequestDto {
+                question: cmd.question.clone(),
+                budget: cmd.budget.into(),
+                task_class: cmd.task_class.map(Into::into),
+                probes: cmd.probes.clone(),
+                extra_probes: cmd.extra_probes.clone(),
+                include_evidence: !cmd.no_evidence,
+                latency_budget_ms: cmd.latency_budget_ms,
+            })
+            .map_err(map_api_error)?;
+        let step_trace = if cmd.step_trace_out.is_some() {
+            let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
+            Some(serde_json::to_string_pretty(&trace)?)
+        } else {
+            None
+        };
+        let markdown = render_packet_markdown(&runtime.project_root, &packet);
+        Ok((
+            RenderedPublicOutput::structured(&packet, markdown)?,
+            step_trace,
+        ))
+    })?;
+    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, &operation.value.1) {
+        std::fs::write(path, trace)?;
     }
-    let markdown = render_packet_markdown(&runtime.project_root, &packet);
-    emit(cmd.format, &packet, markdown, cmd.output_file.as_deref())
+    let operation = runtime::map_public_operation(operation, |(rendered, _)| rendered);
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_task(cmd: TaskCommand) -> Result<()> {
@@ -1467,23 +1359,29 @@ fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
+        .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
-    let packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question: cmd.prompt,
-            budget: cmd.budget.into(),
-            task_class: Some(PacketTaskClassDto::EditPlanning),
-            extra_probes: cmd.extra_probes,
-            include_evidence: !cmd.no_evidence,
-            latency_budget_ms: cmd.latency_budget_ms,
-        })
-        .map_err(map_api_error)?;
-    let brief = build_task_brief_output(&runtime.project_root, &packet);
-    let markdown = render_task_brief_markdown(&brief);
-    emit(cmd.format, &brief, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("packet", || {
+        let packet = runtime
+            .browser
+            .packet(AgentPacketRequestDto {
+                question: cmd.prompt.clone(),
+                budget: cmd.budget.into(),
+                task_class: Some(PacketTaskClassDto::EditPlanning),
+                probes: cmd.probes.clone(),
+                extra_probes: cmd.extra_probes.clone(),
+                include_evidence: !cmd.no_evidence,
+                latency_budget_ms: cmd.latency_budget_ms,
+            })
+            .map_err(map_api_error)?;
+        let brief = build_task_brief_output(&runtime.project_root, &packet);
+        let markdown = render_task_brief_markdown(&brief);
+        RenderedPublicOutput::structured(&brief, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2351,67 +2249,24 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn run_fix(cmd: FixCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, "fix")?;
-    preflight_output_file(cmd.output_file.as_deref())?;
-    let ready_cmd = ReadyCommand {
-        project: cmd.project,
-        goal: Some(args::ReadyGoal::Agent),
-        repair: true,
-        wait_fresh: false,
-        run_id: cmd.run_id,
-        format: cmd.format,
-        output_file: None,
-    };
-    let ready = build_ready_output(&ready_cmd)?;
-    let status = fix_status(&ready);
-    let output = FixOutput {
-        status,
-        ready: status == "ready",
-        goal: ReadinessGoalDto::AgentPacketSearch,
-        action: "ready_agent_repair",
-        result: ready,
-    };
-    let markdown = render_fix_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
-}
-
 fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
-    let runtime = if cmd.repair {
-        if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
-            new_agent_surface_runtime(&cmd.project, None, None)?
-        } else {
-            RuntimeContext::new(&cmd.project)?
-        }
-    } else {
-        RuntimeContext::new_inspect_only(&cmd.project)?
-    };
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let agent_run_id = cmd.run_id.as_deref();
-    let repaired_sidecar = if cmd.repair {
-        repair_ready_state(&runtime, cmd.goal, agent_run_id)?
-    } else {
-        None
-    };
-    let (summary, local_refresh) = if cmd.wait_fresh && !cmd.repair {
+    let (summary, local_refresh) = if cmd.wait_fresh {
         wait_for_local_freshness(&cmd.project, &runtime)?
     } else {
         (runtime.open_project_summary()?, None)
     };
-    let raw_sidecar = ready_sidecar_status(&runtime, repaired_sidecar, cmd.goal, agent_run_id);
     let readiness_sidecar = if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
-        selected_agent_readiness_sidecar_status(&runtime, agent_run_id, &raw_sidecar)
+        agent_readiness_status(&runtime, agent_run_id)
     } else {
-        raw_sidecar
+        doctor_sidecar_status(&runtime)
     };
-    let selected_agent_run_id =
-        selected_agent_broker_run_id(readiness_sidecar.run_id.as_deref(), agent_run_id);
-    let readiness_broker = observe_readiness_broker(
-        &runtime,
-        &readiness_sidecar,
-        selected_agent_run_id.as_deref(),
-    );
-    let readiness_sidecar =
-        agent_sidecar_with_gpu_proof(&readiness_sidecar, readiness_broker.gpu_proof.as_ref());
+    let selected_agent_run_id = readiness_sidecar
+        .run_id
+        .as_deref()
+        .or(agent_run_id)
+        .map(str::to_string);
     let mut verdicts = build_summary_readiness(
         &summary.root,
         &summary.stats,
@@ -2423,7 +2278,6 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         &verdicts,
         selected_agent_run_id.as_deref(),
         Some(&readiness_sidecar),
-        Some(&readiness_broker),
     );
     if let Some(goal) = cmd.goal {
         let goal = goal.as_dto();
@@ -2433,197 +2287,12 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         verdicts,
         local_refresh,
         readiness_lanes,
-        readiness_broker: Some(readiness_broker),
     };
     Ok(output)
 }
 
-fn selected_agent_broker_run_id(
-    selected_run_id: Option<&str>,
-    requested_run_id: Option<&str>,
-) -> Option<String> {
-    selected_run_id.or(requested_run_id).map(str::to_string)
-}
-
-pub(crate) fn broker_gpu_proof_input_from_sidecar(
-    sidecar: &DoctorSidecarStatusOutput,
-) -> readiness_broker::BrokerGpuProofInput {
-    readiness_broker::BrokerGpuProofInput {
-        embedding_device_policy: Some(sidecar.embedding_device_policy.clone()),
-        embedding_device_state: Some(sidecar.embedding_device_state.clone()),
-        embedding_device_observation_source: Some(
-            sidecar.embedding_device_observation_source.clone(),
-        ),
-        embedding_detected_provider: sidecar.embedding_detected_provider.clone(),
-        embedding_detected_gpu: sidecar.embedding_detected_gpu.clone(),
-        embedding_accelerator_requested: Some(sidecar.embedding_accelerator_requested),
-        embedding_accelerator_request_provider: sidecar
-            .embedding_accelerator_request_provider
-            .clone(),
-        embedding_accelerator_request_device: sidecar.embedding_accelerator_request_device.clone(),
-        embedding_cpu_allowed: Some(sidecar.embedding_cpu_allowed),
-        embed_smoke_ok: None,
-        embed_smoke_ms: None,
-        degraded_reason: sidecar.degraded_reason.clone(),
-    }
-}
-
-fn observe_readiness_broker(
-    runtime: &RuntimeContext,
-    sidecar: &DoctorSidecarStatusOutput,
-    agent_run_id: Option<&str>,
-) -> readiness_broker::ReadinessBrokerSnapshot {
-    readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-        project_root: runtime.project_root.clone(),
-        cache_root: runtime.cache_root.clone(),
-        agent_run_id: agent_run_id.map(str::to_string),
-        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-        gpu_proof: Some(broker_gpu_proof_input_from_sidecar(sidecar)),
-        reconciliation: None,
-    })
-}
-
-pub(crate) fn agent_sidecar_with_gpu_proof(
-    sidecar: &DoctorSidecarStatusOutput,
-    gpu_proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
-) -> DoctorSidecarStatusOutput {
-    let mut sidecar = sidecar.clone();
-    if agent_surface_requires_identity_bound_gpu_proof(&sidecar)
-        && !gpu_proof.is_some_and(identity_bound_gpu_proof_is_verified)
-        && sidecar.degraded_reason.is_none()
-    {
-        sidecar.degraded_reason = Some("gpu_unverified".to_string());
-    }
-    sidecar
-}
-
-fn ensure_agent_surface_gpu_proof(runtime: &RuntimeContext, surface: &str) -> Result<()> {
-    let sidecar = runtime.sidecar.clone();
-    let status = doctor_sidecar_status_for_runtime(runtime, sidecar.clone());
-    if sidecar.profile != codestory_retrieval::SidecarProfile::Agent
-        || !agent_surface_requires_identity_bound_gpu_proof(&status)
-    {
-        return Ok(());
-    }
-
-    let broker = readiness_broker::observe_broker_snapshot_for_sidecar(
-        readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id: sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&status)),
-            reconciliation: None,
-        },
-        &sidecar,
-    );
-    let live_degraded_reason = status.degraded_reason.clone();
-    if live_degraded_reason.is_none()
-        && agent_surface_gpu_proof_is_valid(&status, &sidecar, broker.gpu_proof.as_ref())
-    {
-        return Ok(());
-    }
-
-    let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
-    let project_arg = display::quote_command_argument_value(&project);
-    let repair = agent_ready_repair_command(&project_arg, sidecar.run_id.as_deref());
-    let status_command =
-        retrieval_status_command_for_agent(&project_arg, sidecar.run_id.as_deref());
-    let next_commands = vec![repair, status_command];
-    let proof_status = broker
-        .gpu_proof
-        .as_ref()
-        .map(|proof| proof.proof_status.as_str())
-        .unwrap_or("missing");
-    let degraded_reason = live_degraded_reason.unwrap_or_else(|| "gpu_unverified".to_string());
-    let message = if degraded_reason == "gpu_unverified" {
-        format!(
-            "gpu_unverified: `{surface}` requires identity-bound accelerator smoke proof for the selected agent runtime; current broker proof is `{proof_status}`"
-        )
-    } else {
-        format!(
-            "{degraded_reason}: `{surface}` requires a live selected agent runtime with matching process identity and verified accelerator proof"
-        )
-    };
-    Err(StructuredCommandFailure {
-        envelope: CommandFailureEnvelope::new(ApiError::retrieval_unavailable(
-            message,
-            project,
-            next_commands,
-        ))
-        .with_context(serde_json::json!({
-            "degraded_reason": degraded_reason,
-            "profile": sidecar.profile.as_str(),
-            "run_id": sidecar.run_id,
-            "namespace": sidecar.namespace,
-            "proof_status": proof_status,
-            "surface": surface,
-        })),
-        output_file: None,
-        markdown: None,
-    }
-    .into())
-}
-
-fn identity_bound_gpu_proof_is_verified(proof: &readiness_broker::BrokerGpuProofSnapshot) -> bool {
-    proof.proof_status == "verified" && proof.runtime_identity.is_some()
-}
-
-fn gpu_proof_matches_selected_runtime(
-    proof: &readiness_broker::BrokerGpuProofSnapshot,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
-) -> bool {
-    if !identity_bound_gpu_proof_is_verified(proof) {
-        return false;
-    }
-    let identity = proof
-        .runtime_identity
-        .as_ref()
-        .expect("verified proof identity checked above");
-    identity.profile == runtime.profile.as_str()
-        && identity.run_id == runtime.run_id
-        && identity.namespace == runtime.namespace
-        && identity.compose_project == runtime.compose_project
-        && identity.embed_url == runtime.ownership().ports.embed_url
-        && runtime
-            .project_identity
-            .as_ref()
-            .is_none_or(|expected| identity.workspace_id == expected.workspace_id)
-}
-
-fn agent_surface_gpu_proof_is_valid(
-    status: &DoctorSidecarStatusOutput,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
-    proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
-) -> bool {
-    !agent_surface_requires_identity_bound_gpu_proof(status)
-        || proof.is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, runtime))
-}
-
-fn agent_surface_requires_identity_bound_gpu_proof(status: &DoctorSidecarStatusOutput) -> bool {
-    status.retrieval_mode == "full"
-        && status.embedding_device_policy == "accelerator_required"
-        && !status.embedding_cpu_allowed
-}
-
-fn doctor_sidecar_status_is_live_ready(status: &DoctorSidecarStatusOutput) -> bool {
+fn doctor_sidecar_status_is_live_ready(status: &RetrievalStatusOutput) -> bool {
     status.retrieval_mode == "full" && status.degraded_reason.is_none()
-}
-
-fn fix_status(output: &ReadyOutput) -> &'static str {
-    let Some(non_ready) = readiness::primary_non_ready(&output.verdicts) else {
-        return "ready";
-    };
-    if non_ready
-        .minimum_next
-        .iter()
-        .chain(non_ready.full_repair.iter())
-        .any(|command| command.starts_with("Restart/reload the Codex host/app"))
-    {
-        "blocked_requires_host_reload"
-    } else {
-        "blocked_with_error"
-    }
 }
 
 pub(crate) fn wait_for_local_freshness(
@@ -2814,34 +2483,16 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     } else {
         (summary, None)
     };
-    let sidecar = doctor_sidecar_status(&runtime);
-    let readiness_sidecar = selected_agent_readiness_sidecar_status(&runtime, None, &sidecar);
-    let readiness_broker = observe_readiness_broker(
-        &runtime,
-        &readiness_sidecar,
-        readiness_sidecar.run_id.as_deref(),
-    );
-    let readiness_sidecar =
-        agent_sidecar_with_gpu_proof(&readiness_sidecar, readiness_broker.gpu_proof.as_ref());
+    let readiness_sidecar = agent_readiness_status(&runtime, None);
     let readiness = build_summary_readiness(
         &summary.root,
         &summary.stats,
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(
-        &runtime,
-        &readiness,
-        None,
-        Some(&readiness_sidecar),
-        Some(&readiness_broker),
-    );
-    let output = build_agent_preflight_output(
-        &readiness,
-        Path::new(&summary.root),
-        readiness_lanes,
-        local_refresh,
-    );
+    let readiness_lanes =
+        build_readiness_lanes_for_runtime(&runtime, &readiness, None, Some(&readiness_sidecar));
+    let output = build_agent_preflight_output(&readiness, readiness_lanes, local_refresh);
     let markdown = render_agent_preflight_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -2905,623 +2556,6 @@ fn agent_preflight_local_refresh_foreground_budget() -> Duration {
         .unwrap_or(AGENT_PREFLIGHT_LOCAL_REFRESH_FOREGROUND_BUDGET)
 }
 
-fn repair_ready_state(
-    runtime: &RuntimeContext,
-    goal: Option<args::ReadyGoal>,
-    run_id: Option<&str>,
-) -> Result<Option<codestory_retrieval::SidecarRuntimeConfig>> {
-    let agent_goal = matches!(goal, None | Some(args::ReadyGoal::Agent));
-    let sidecar = agent_goal.then(|| {
-        runtime.sidecar.with_profile_and_run_id(
-            Some(&runtime.project_root),
-            codestory_retrieval::SidecarProfile::Agent,
-            run_id,
-        )
-    });
-    let plugin_worker = std::env::var("CODESTORY_PLUGIN_SIDECAR_REPAIR").as_deref() == Ok("1");
-    let handoff_attempt = std::env::var(ready_repair_status::READY_REPAIR_ATTEMPT_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let mut handoff_reservation =
-        match (sidecar.as_ref(), plugin_worker, handoff_attempt.as_deref()) {
-            (Some(sidecar), true, Some(attempt_id)) => Some(
-                ready_repair_status::adopt_ready_repair_reservation(
-                    sidecar,
-                    &runtime.project_root,
-                    attempt_id,
-                )
-                .context("adopt MCP ready-repair reservation")?,
-            ),
-            (_, true, None) => {
-                bail!("MCP ready-repair worker is missing its reservation attempt id")
-            }
-            (_, false, Some(_)) => bail!("ready-repair attempt id requires the MCP worker marker"),
-            _ => None,
-        };
-    if let Some(reservation) = handoff_reservation.as_mut() {
-        reservation.disarm();
-    }
-    let local_refresh_handoff = if plugin_worker {
-        Some(
-            local_refresh_status::wait_for_local_refresh_lock(
-                &runtime.cache_root,
-                &runtime.project_root,
-                READY_REPAIR_LOCAL_REFRESH_WAIT,
-            )
-            .context("wait for local refresh before MCP ready repair")?,
-        )
-    } else {
-        None
-    };
-    if let Some(sidecar) = sidecar.as_ref()
-        && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            sidecar.clone(),
-        )
-    {
-        let broker = readiness_broker::observe_broker_snapshot_for_sidecar(
-            readiness_broker::BrokerSnapshotInput {
-                project_root: runtime.project_root.clone(),
-                cache_root: runtime.cache_root.clone(),
-                agent_run_id: sidecar.run_id.clone(),
-                cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                gpu_proof: Some(broker_gpu_proof_input_from_report(&existing_status)),
-                reconciliation: None,
-            },
-            sidecar,
-        );
-        if ready_repair_existing_sidecar_is_reusable(
-            &existing_status,
-            broker.gpu_proof.as_ref(),
-            sidecar,
-        ) {
-            eprintln!(
-                "ready repair agent sidecar already full with identity-bound GPU proof: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
-                sidecar.run_id.as_deref().unwrap_or("none"),
-                sidecar.namespace,
-                sidecar.compose_project,
-                existing_status.embedding_device_state,
-                existing_status.embedding_device_observation_source,
-                existing_status.embedding_cpu_allowed
-            );
-            return Ok(Some(sidecar.clone()));
-        }
-    }
-
-    if let Some(sidecar) = sidecar.as_ref() {
-        let reconciliation = readiness_broker::reconcile_before_enqueue(
-            &runtime.project_root,
-            &runtime.cache_root,
-            sidecar.run_id.as_deref(),
-            env!("CARGO_PKG_VERSION"),
-        );
-        let enqueue_block_reason = reconciliation.enqueue_block_reason();
-        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id: sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: None,
-            reconciliation: Some(reconciliation),
-        });
-        if let Some(reason) = enqueue_block_reason {
-            bail!(
-                "ready repair cannot start while broker ownership is unresolved: {reason}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
-                runtime.project_root.display(),
-                sidecar
-                    .run_id
-                    .as_deref()
-                    .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-            );
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    maybe_exit_ready_repair_worker_probe(handoff_reservation.as_ref());
-
-    let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
-    ensure_index_ready(&opened, "ready repair")?;
-    drop(local_refresh_handoff);
-    if !agent_goal {
-        return Ok(None);
-    }
-
-    let storage_scope = codestory_retrieval::BootstrapStorageScope::from_parts(
-        Some(runtime.project_root.as_path()),
-        Some(runtime.storage_path.as_path()),
-        Some(runtime.cache_root.as_path()),
-    );
-    let mut sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
-    let _project_repair_lock = match ready_repair_status::try_acquire_project_ready_repair_lock(
-        &sidecar,
-        &runtime.project_root,
-    )? {
-        ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
-        ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
-            if let Some(status) = busy.status.as_ref() {
-                bail!(
-                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={} reason={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
-                    status.project_root,
-                    status.profile,
-                    status.run_id.as_deref().unwrap_or("none"),
-                    status.namespace,
-                    status.phase,
-                    status.pid,
-                    busy.reason.as_deref().unwrap_or("active_status"),
-                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                    sidecar
-                        .run_id
-                        .as_deref()
-                        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-                );
-            }
-            bail!(
-                "ready repair already starting for project={} profile=agent run_id={} namespace={} reason={}; lock_path={}",
-                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                sidecar.run_id.as_deref().unwrap_or("none"),
-                sidecar.namespace,
-                busy.reason.as_deref().unwrap_or("lock_present"),
-                busy.lock_path.display()
-            );
-        }
-    };
-    let _repair_lock = match ready_repair_status::try_acquire_ready_repair_lock(
-        &sidecar,
-        &runtime.project_root,
-    )? {
-        ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
-        ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
-            if let Some(status) = busy.status.as_ref() {
-                bail!(
-                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={} reason={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
-                    status.project_root,
-                    status.profile,
-                    status.run_id.as_deref().unwrap_or("none"),
-                    status.namespace,
-                    status.phase,
-                    status.pid,
-                    busy.reason.as_deref().unwrap_or("active_status"),
-                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                    sidecar
-                        .run_id
-                        .as_deref()
-                        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-                );
-            }
-            bail!(
-                "ready repair already starting for project={} profile=agent run_id={} namespace={} reason={}; lock_path={}",
-                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                sidecar.run_id.as_deref().unwrap_or("none"),
-                sidecar.namespace,
-                busy.reason.as_deref().unwrap_or("lock_present"),
-                busy.lock_path.display()
-            );
-        }
-    };
-    let broker_scope = readiness_broker::agent_repair_scope(
-        &runtime.project_root,
-        sidecar.run_id.as_deref(),
-        env!("CARGO_PKG_VERSION"),
-    );
-    let ReadyRepairResult {
-        final_status: _final_status,
-        gpu_proof,
-    } = run_ready_repair_with_native_embedding_lease(
-        runtime,
-        &mut sidecar,
-        &broker_scope,
-        &storage_scope,
-    )?;
-    let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-        project_root: runtime.project_root.clone(),
-        cache_root: runtime.cache_root.clone(),
-        agent_run_id: sidecar.run_id.clone(),
-        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-        gpu_proof: Some(gpu_proof),
-        reconciliation: None,
-    });
-    Ok(Some(sidecar))
-}
-
-#[cfg(debug_assertions)]
-fn maybe_exit_ready_repair_worker_probe(
-    reservation: Option<&ready_repair_status::ReadyRepairReservation>,
-) {
-    use std::io::Write as _;
-
-    let Some(reservation) = reservation else {
-        return;
-    };
-    if std::env::var("CODESTORY_PLUGIN_SIDECAR_REPAIR").as_deref() != Ok("1") {
-        return;
-    }
-    let Some(exit_code) = std::env::var("CODESTORY_TEST_READY_REPAIR_WORKER_EXIT_CODE")
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-    else {
-        return;
-    };
-    let attempt_id = reservation.attempt_id();
-    let mut stdout = std::io::stdout().lock();
-    let mut stderr = std::io::stderr().lock();
-    let stdout_payload = vec![b'o'; 40 * 1024];
-    let stderr_payload = vec![b'e'; 40 * 1024];
-    let _ = stdout.write_all(&stdout_payload);
-    let _ = writeln!(
-        stdout,
-        "ready-repair worker probe stdout attempt_id={attempt_id}"
-    );
-    let _ = stderr.write_all(&stderr_payload);
-    let _ = writeln!(
-        stderr,
-        "ready-repair worker probe stderr attempt_id={attempt_id}"
-    );
-    let _ = stdout.flush();
-    let _ = stderr.flush();
-    std::process::exit(exit_code);
-}
-
-#[derive(Debug, Clone)]
-struct ReadyRepairResult {
-    final_status: codestory_retrieval::RetrievalStatusReport,
-    gpu_proof: readiness_broker::BrokerGpuProofInput,
-}
-
-fn run_ready_repair_with_native_embedding_lease(
-    runtime: &RuntimeContext,
-    sidecar: &mut codestory_retrieval::SidecarRuntimeConfig,
-    broker_scope: &readiness_broker::BrokerScope,
-    storage_scope: &codestory_retrieval::BootstrapStorageScope,
-) -> Result<ReadyRepairResult> {
-    eprintln!(
-        "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
-        sidecar.run_id.as_deref().unwrap_or("none"),
-        sidecar.namespace,
-        sidecar.compose_project
-    );
-    let progress = ReadyRepairProgress::start(sidecar, &runtime.project_root, &runtime.cache_root);
-    readiness_broker::run_with_native_embedding_lease_lifecycle(
-        readiness_broker::NativeEmbeddingLeaseLifecycleParams {
-            scope: broker_scope,
-            sidecar,
-            resource: readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-            wait: Duration::from_secs(30),
-            poll: Duration::from_millis(250),
-            bootstrap_context: "ready repair retrieval bootstrap",
-            sidecar_cleanup_label: "ready repair sidecar",
-        },
-        |selected_sidecar,
-         allow_native_embedding_spawn,
-         reusable_native_embedding_launch,
-         observe_new_native_launch| {
-            codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
-                selected_sidecar,
-                Some(runtime.project_root.as_path()),
-                codestory_retrieval::BootstrapSidecarsOptions {
-                    storage_scope: storage_scope.clone(),
-                    compose_file: None,
-                    skip_compose: false,
-                    wait_timeout: Duration::from_secs(90),
-                    allow_native_embedding_spawn,
-                    reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
-                },
-                |phase| progress.set_phase(phase),
-                observe_new_native_launch,
-            )
-        },
-        |bootstrap| &bootstrap.state,
-        |bootstrap, selected_sidecar| {
-            let infrastructure = ready_repair_infrastructure_with_runtime_observation(
-                &bootstrap.infrastructure,
-                &runtime.project_root,
-                &runtime.storage_path,
-                selected_sidecar,
-            );
-            let embed_smoke =
-                match ensure_ready_repair_embed_liveness(&infrastructure, selected_sidecar) {
-                    Ok(smoke) => smoke,
-                    Err(error) => {
-                        let mut failed = broker_gpu_proof_input_from_infrastructure_with_smoke(
-                            &infrastructure,
-                            None,
-                        );
-                        failed.embed_smoke_ok = Some(false);
-                        failed.degraded_reason = Some("gpu_unverified".into());
-                        let _ = readiness_broker::refresh_broker_snapshot(
-                            readiness_broker::BrokerSnapshotInput {
-                                project_root: runtime.project_root.clone(),
-                                cache_root: runtime.cache_root.clone(),
-                                agent_run_id: selected_sidecar.run_id.clone(),
-                                cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                                gpu_proof: Some(failed),
-                                reconciliation: None,
-                            },
-                        );
-                        return Err(error);
-                    }
-                };
-            let mut infrastructure = infrastructure;
-            if let Some(smoke) = embed_smoke.as_ref() {
-                infrastructure.embedding_device_policy = smoke.device.requested_policy.into();
-                infrastructure.embedding_device_state = smoke.device.observed_state.into();
-                infrastructure.embedding_device_observation_source =
-                    smoke.device.observation_source.into();
-                infrastructure.embedding_detected_provider = smoke.device.detected_provider.clone();
-                infrastructure.embedding_detected_gpu = smoke.device.detected_gpu.clone();
-                infrastructure.embedding_accelerator_requested = smoke.device.accelerator_requested;
-                infrastructure.embedding_accelerator_request_provider =
-                    smoke.device.accelerator_request_provider.clone();
-                infrastructure.embedding_accelerator_request_device =
-                    smoke.device.accelerator_request_device.clone();
-            }
-            let gpu_proof = broker_gpu_proof_input_from_infrastructure_with_smoke(
-                &infrastructure,
-                embed_smoke.as_ref(),
-            );
-            if !infrastructure.embedding_cpu_allowed
-                && readiness_broker::gpu_proof(gpu_proof.clone()).proof_status != "verified"
-            {
-                bail!(
-                    "gpu_unverified: native embedding smoke did not prove requested accelerator work before long semantic indexing"
-                );
-            }
-            let _ =
-                readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-                    project_root: runtime.project_root.clone(),
-                    cache_root: runtime.cache_root.clone(),
-                    agent_run_id: selected_sidecar.run_id.clone(),
-                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                    gpu_proof: Some(gpu_proof.clone()),
-                    reconciliation: None,
-                });
-            progress.set_phase("Qdrant finalize");
-            codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-                &runtime.project_root,
-                &runtime.storage_path,
-                selected_sidecar,
-            )
-            .context("ready repair project qdrant repair")?;
-            progress.set_phase("graph artifact");
-            runtime
-                .index
-                .run_indexing_blocking(IndexMode::Full)
-                .map_err(map_api_error)
-                .context("ready repair retrieval index refresh")?;
-            codestory_retrieval::finalize_index_for_runtime_with_progress(
-                &runtime.project_root,
-                &runtime.storage_path,
-                selected_sidecar,
-                |phase| progress.set_phase(phase),
-            )
-            .with_context(|| {
-                format!(
-                    "ready repair retrieval index finalize using {}",
-                    retrieval::format_sidecar_runtime(selected_sidecar)
-                )
-            })?;
-            progress.set_phase("readiness check");
-            let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
-                &runtime.project_root,
-                Some(&runtime.storage_path),
-                selected_sidecar.clone(),
-            )
-            .context("ready repair final retrieval status")?;
-            ensure_ready_repair_full_sidecar(&final_status)?;
-            Ok(ReadyRepairResult {
-                final_status,
-                gpu_proof,
-            })
-        },
-    )
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReadyRepairEmbedSmoke {
-    ok: Option<bool>,
-    ms: Option<u64>,
-}
-
-fn ensure_ready_repair_embed_liveness(
-    infrastructure: &codestory_retrieval::InfrastructureHealth,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Result<Option<codestory_retrieval::EmbeddingAcceleratorSmoke>> {
-    if infrastructure.embedding_cpu_allowed {
-        return Ok(None);
-    }
-    codestory_retrieval::ensure_embedding_accelerator_smoke_for_runtime(sidecar)
-}
-
-#[cfg(test)]
-fn ensure_ready_repair_embed_liveness_with_probe(
-    infrastructure: &codestory_retrieval::InfrastructureHealth,
-    probe: impl FnOnce() -> codestory_retrieval::EmbeddingRuntimeProbe,
-) -> Result<ReadyRepairEmbedSmoke> {
-    if !infrastructure.embedding_cpu_allowed
-        && infrastructure.embedding_device_state != "accelerated"
-    {
-        bail!(
-            "gpu_unverified: ready repair embedding device policy failed before long semantic indexing: requested_policy={} observed_device={}; set CODESTORY_EMBED_ALLOW_CPU=1 or CODESTORY_EMBED_DEVICE_POLICY=allow_cpu for intentional CPU-backed retrieval",
-            infrastructure.embedding_device_policy,
-            infrastructure.embedding_device_state
-        );
-    }
-    if infrastructure.embedding_cpu_allowed {
-        return Ok(ReadyRepairEmbedSmoke { ok: None, ms: None });
-    }
-    let smoke = probe();
-    if !smoke.reachable {
-        bail!(
-            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; lexical_ready={} ({}); qdrant_reachable={} ({})",
-            smoke.detail,
-            infrastructure.lexical_ready,
-            infrastructure.lexical_detail,
-            infrastructure.qdrant_reachable,
-            infrastructure.qdrant_detail
-        );
-    }
-    Ok(ReadyRepairEmbedSmoke {
-        ok: Some(true),
-        ms: smoke.elapsed_ms,
-    })
-}
-
-fn broker_gpu_proof_input_from_infrastructure_with_smoke(
-    infrastructure: &codestory_retrieval::InfrastructureHealth,
-    smoke: Option<&codestory_retrieval::EmbeddingAcceleratorSmoke>,
-) -> readiness_broker::BrokerGpuProofInput {
-    readiness_broker::BrokerGpuProofInput {
-        embedding_device_policy: Some(infrastructure.embedding_device_policy.clone()),
-        embedding_device_state: Some(infrastructure.embedding_device_state.clone()),
-        embedding_device_observation_source: Some(
-            infrastructure.embedding_device_observation_source.clone(),
-        ),
-        embedding_detected_provider: infrastructure.embedding_detected_provider.clone(),
-        embedding_detected_gpu: infrastructure.embedding_detected_gpu.clone(),
-        embedding_accelerator_requested: Some(infrastructure.embedding_accelerator_requested),
-        embedding_accelerator_request_provider: infrastructure
-            .embedding_accelerator_request_provider
-            .clone(),
-        embedding_accelerator_request_device: infrastructure
-            .embedding_accelerator_request_device
-            .clone(),
-        embedding_cpu_allowed: Some(infrastructure.embedding_cpu_allowed),
-        embed_smoke_ok: smoke.map(|_| true),
-        embed_smoke_ms: smoke.map(|smoke| smoke.elapsed_ms),
-        degraded_reason: (!infrastructure.embedding_cpu_allowed
-            && (infrastructure.embedding_device_state != "accelerated" || smoke.is_none()))
-        .then(|| "gpu_unverified".to_string()),
-    }
-}
-
-pub(crate) fn broker_gpu_proof_input_from_report(
-    report: &codestory_retrieval::RetrievalStatusReport,
-) -> readiness_broker::BrokerGpuProofInput {
-    readiness_broker::BrokerGpuProofInput {
-        embedding_device_policy: Some(report.embedding_device_policy.clone()),
-        embedding_device_state: Some(report.embedding_device_state.clone()),
-        embedding_device_observation_source: Some(
-            report.embedding_device_observation_source.clone(),
-        ),
-        embedding_detected_provider: report.embedding_detected_provider.clone(),
-        embedding_detected_gpu: report.embedding_detected_gpu.clone(),
-        embedding_accelerator_requested: Some(report.embedding_accelerator_requested),
-        embedding_accelerator_request_provider: report
-            .embedding_accelerator_request_provider
-            .clone(),
-        embedding_accelerator_request_device: report.embedding_accelerator_request_device.clone(),
-        embedding_cpu_allowed: Some(report.embedding_cpu_allowed),
-        embed_smoke_ok: None,
-        embed_smoke_ms: None,
-        degraded_reason: report.degraded_reason.clone(),
-    }
-}
-
-fn ready_repair_infrastructure_with_runtime_observation(
-    infrastructure: &codestory_retrieval::InfrastructureHealth,
-    project_root: &Path,
-    storage_path: &Path,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> codestory_retrieval::InfrastructureHealth {
-    if infrastructure.embedding_cpu_allowed
-        || infrastructure.embedding_device_state == "accelerated"
-    {
-        return infrastructure.clone();
-    }
-    let deadline = Instant::now() + READY_REPAIR_EMBED_OBSERVATION_TIMEOUT;
-    loop {
-        if let Some(refreshed) = ready_repair_observed_infrastructure(
-            infrastructure,
-            project_root,
-            storage_path,
-            sidecar,
-        ) {
-            return refreshed;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return infrastructure.clone();
-        }
-        std::thread::sleep((deadline - now).min(READY_REPAIR_EMBED_OBSERVATION_POLL));
-    }
-}
-
-fn ready_repair_observed_infrastructure(
-    infrastructure: &codestory_retrieval::InfrastructureHealth,
-    project_root: &Path,
-    storage_path: &Path,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Option<codestory_retrieval::InfrastructureHealth> {
-    let report = codestory_retrieval::strict_sidecar_status_for_runtime(
-        project_root,
-        Some(storage_path),
-        sidecar.clone(),
-    )
-    .ok()?;
-    if !report.embedding_cpu_allowed && report.embedding_device_state != "accelerated" {
-        return None;
-    }
-    let mut refreshed = infrastructure.clone();
-    refreshed.embedding_device_policy = report.embedding_device_policy;
-    refreshed.embedding_device_state = report.embedding_device_state;
-    refreshed.embedding_device_observation_source = report.embedding_device_observation_source;
-    refreshed.embedding_detected_provider = report.embedding_detected_provider;
-    refreshed.embedding_detected_gpu = report.embedding_detected_gpu;
-    refreshed.embedding_accelerator_requested = report.embedding_accelerator_requested;
-    refreshed.embedding_accelerator_request_provider =
-        report.embedding_accelerator_request_provider;
-    refreshed.embedding_accelerator_request_device = report.embedding_accelerator_request_device;
-    refreshed.embedding_cpu_allowed = report.embedding_cpu_allowed;
-    Some(refreshed)
-}
-
-fn ensure_ready_repair_full_sidecar(
-    report: &codestory_retrieval::RetrievalStatusReport,
-) -> Result<()> {
-    if report.is_live_ready() {
-        return Ok(());
-    }
-    let reason = report.degraded_reason.as_deref().unwrap_or("unknown");
-    let manifest_note = if reason == "retrieval_manifest_missing" {
-        " after finalize; retrieval manifest was not persisted"
-    } else {
-        ""
-    };
-    bail!(
-        "ready repair final retrieval status did not reach full mode{manifest_note}: mode={} degraded_reason={} embedding_device_state={} observation_source={} {}; {}; {}",
-        report.retrieval_mode,
-        reason,
-        report.embedding_device_state,
-        report.embedding_device_observation_source,
-        ready_repair_component_detail(&report.lexical),
-        ready_repair_component_detail(&report.qdrant),
-        ready_repair_component_detail(&report.scip)
-    )
-}
-
-fn ready_repair_existing_sidecar_is_reusable(
-    report: &codestory_retrieval::RetrievalStatusReport,
-    gpu_proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> bool {
-    ensure_ready_repair_full_sidecar(report).is_ok()
-        && report.embedding_device_policy == "accelerator_required"
-        && report.embedding_device_state == "accelerated"
-        && !report.embedding_cpu_allowed
-        && gpu_proof.is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, sidecar))
-}
-
-fn ready_repair_component_detail(component: &codestory_retrieval::ComponentHealth) -> String {
-    format!(
-        "{}={:?} reason={} detail={}",
-        component.name,
-        component.status,
-        component.degraded_reason.as_deref().unwrap_or("none"),
-        component.detail
-    )
-}
-
 const LOCAL_GRAPH_AGENT_SURFACES: &[&str] = &[
     "ground", "files", "symbol", "callers", "callees", "trail", "trace", "snippet", "affected",
 ];
@@ -3529,7 +2563,6 @@ const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "
 
 fn build_agent_preflight_output(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
-    project_root: &Path,
     readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     local_refresh: Option<readiness::LocalRefreshOutput>,
 ) -> args::AgentPreflightOutput {
@@ -3564,7 +2597,7 @@ fn build_agent_preflight_output(
     } else {
         "blocked"
     };
-    let repair_command = readiness::primary_non_ready(readiness)
+    let next_command = readiness::primary_non_ready(readiness)
         .and_then(|verdict| verdict.full_repair.first().cloned());
     let human_summary = agent_preflight_summary(local_ready, full_ready, local);
 
@@ -3583,10 +2616,9 @@ fn build_agent_preflight_output(
             .cloned()
             .expect("agent_packet_search readiness lane"),
         readiness_lanes,
-        sidecar_setup: stdio_transport::stdio_sidecar_setup_status(project_root),
         safe_surfaces,
         blocked_surfaces,
-        repair_command,
+        next_command,
         human_summary,
     }
 }
@@ -3632,7 +2664,7 @@ fn agent_preflight_summary(
 ) -> String {
     match (local_ready, full_ready) {
         (_, true) => "Local graph and full retrieval are ready.".to_string(),
-        (true, false) => "Local graph is ready. Full retrieval needs sidecar repair.".to_string(),
+        (true, false) => "Local graph is ready. Full retrieval needs a rebuild.".to_string(),
         (false, _) => format!(
             "Local graph is not ready: {} Full retrieval is also unavailable for agent packet/search.",
             local.summary
@@ -3713,16 +2745,9 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
             "full_retrieval_embedding_device: policy=`{policy}` observed=`{state}`{source}{detected}{request} cpu_allowed={cpu_allowed}"
         );
     }
-    if let Some(state) = output
-        .sidecar_setup
-        .get("state")
-        .and_then(|value| value.as_str())
-    {
-        let _ = writeln!(markdown, "sidecar_setup: `{state}`");
-    }
     let _ = writeln!(markdown, "human_summary: {}", output.human_summary);
-    if let Some(command) = output.repair_command.as_deref() {
-        let _ = writeln!(markdown, "repair_command: `{command}`");
+    if let Some(command) = output.next_command.as_deref() {
+        let _ = writeln!(markdown, "next_command: `{command}`");
     }
     markdown
 }
@@ -3737,13 +2762,16 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         cmd.refresh,
         "search",
     )?;
-    let search_results = runtime
-        .browser
-        .search_results(search_request_from_command(&cmd))
-        .map_err(map_api_error)?;
-    let output = search_output_from_results(&runtime, &search_results, cmd.why);
-    let markdown = render_search_markdown(&runtime.project_root, &output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("search", || {
+        let search_results = runtime
+            .browser
+            .search_results(search_request_from_command(&cmd))
+            .map_err(map_api_error)?;
+        let output = search_output_from_results(&runtime, &search_results, cmd.why);
+        let markdown = render_search_markdown(&runtime.project_root, &output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
@@ -3759,13 +2787,13 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
 
 fn run_drill(cmd: DrillCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "drill")?;
-    let output = execute_drill(&cmd)?;
-    let contents = write_drill_outputs(cmd.format, &cmd.output_dir, &output)?;
+    let operation = execute_drill(&cmd)?;
+    let contents = write_drill_outputs(cmd.format, &cmd.output_dir, &operation)?;
     print!("{}", contents.selected);
     Ok(())
 }
 
-fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
+fn execute_drill(cmd: &DrillCommand) -> Result<codestory_runtime::PublicOperation<DrillOutput>> {
     let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
     let total_timer = Instant::now();
     let setup_timer = Instant::now();
@@ -3785,14 +2813,14 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
     }
-    let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        runtime.sidecar.clone(),
-    )
-    .ok()
-    .map(|status| status.retrieval_mode);
     let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
+    let before_stats = before.as_ref().map(|summary| &summary.stats);
+    let before_unavailable_reason = before.is_none().then(|| {
+        opened
+            .refresh_reason
+            .clone()
+            .unwrap_or_else(|| "pre_refresh_summary_unavailable".to_string())
+    });
     let setup_ms = elapsed_ms(setup_timer);
 
     let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
@@ -3805,79 +2833,94 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         question,
         budget: PacketBudgetModeDto::Standard,
         task_class: None,
+        probes: Vec::new(),
         extra_probes: drill_anchors.clone(),
         include_evidence: true,
         latency_budget_ms: None,
     };
-    let evidence_packet =
-        execute_drill_packet(packet_request, |request| runtime.browser.packet(request))?;
-    let question_search_ms = elapsed_ms(packet_timer);
-    let evidence_assembly_timer = Instant::now();
-    let citations = drill_packet_citations(&evidence_packet);
-    let anchor_outputs = drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
-    let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
-    let mut all_verification_targets =
-        drill_packet_verification_targets(&runtime.project_root, &citations);
-    dedupe_verification_targets(&mut all_verification_targets);
-    let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
-    let question_search = Some(DrillCommandStatusOutput {
-        command: "packet".to_string(),
-        status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
-        duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
-        artifact: None,
-        error: None,
-    });
-    let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
-    let drill_timings = DrillRuntimeTimingsOutput {
-        total_ms: elapsed_ms(total_timer),
-        setup_ms,
-        question_search_ms,
-        anchor_resolution_ms: 0,
-        supplemental_search_ms: 0,
-        bridge_evidence_ms: 0,
-        evidence_assembly_ms,
-    };
-
-    Ok(DrillOutput {
-        project: display::clean_path_string(&opened.summary.root),
-        label: cmd.label.clone(),
-        question: cmd.question.clone(),
-        output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
-        mechanical: DrillMechanicalOutput {
-            before_files: before.stats.file_count,
-            before_nodes: before.stats.node_count,
-            before_edges: before.stats.edge_count,
-            before_errors: before.stats.error_count,
-            after_files: opened.summary.stats.file_count,
-            after_nodes: opened.summary.stats.node_count,
-            after_edges: opened.summary.stats.edge_count,
-            after_errors: opened.summary.stats.error_count,
-            refresh,
-            retrieval: opened.summary.retrieval.clone(),
-            sidecar_retrieval_mode,
-            freshness: opened.summary.freshness.clone(),
-            phase_timings: opened.phase_timings.clone(),
-            drill_timings,
-        },
-        question_search,
-        question_supplemental_searches: Vec::new(),
-        anchors: anchor_outputs,
-        bridges: bridge_outputs,
-        execution_boundaries: vec![DrillExecutionBoundaryOutput {
+    runtime.run_public_operation("drill", || {
+        let pinned_summary = runtime.active_project_summary()?;
+        let pinned_publication = runtime
+            .public_operation
+            .active_publication()
+            .context("drill public operation has active publication identity")?;
+        let sidecar_retrieval_mode = pinned_publication
+            .retrieval_publication
+            .as_ref()
+            .map(|_| "full".to_string());
+        let evidence_packet = execute_drill_packet(packet_request.clone(), |request| {
+            runtime.browser.packet(request)
+        })?;
+        let question_search_ms = elapsed_ms(packet_timer);
+        let evidence_assembly_timer = Instant::now();
+        let citations = drill_packet_citations(&evidence_packet);
+        let anchor_outputs =
+            drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
+        let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
+        let mut all_verification_targets =
+            drill_packet_verification_targets(&runtime.project_root, &citations);
+        dedupe_verification_targets(&mut all_verification_targets);
+        let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
+        let question_search = Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            flow: vec![
-                "plan question and explicit anchor probes".to_string(),
-                "execute one bounded batch retrieval".to_string(),
-                "adapt citations and sufficiency into drill reports".to_string(),
-            ],
-            source_files: vec![
-                "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
-                "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
-            ],
-        }],
-        verification_targets: all_verification_targets,
-        evidence_packet,
-        next_commands,
+            status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
+            duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
+            artifact: None,
+            error: None,
+        });
+        let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
+        let drill_timings = DrillRuntimeTimingsOutput {
+            total_ms: elapsed_ms(total_timer),
+            setup_ms,
+            question_search_ms,
+            anchor_resolution_ms: 0,
+            supplemental_search_ms: 0,
+            bridge_evidence_ms: 0,
+            evidence_assembly_ms,
+        };
+
+        Ok(DrillOutput {
+            project: display::clean_path_string(&pinned_summary.root),
+            label: cmd.label.clone(),
+            question: cmd.question.clone(),
+            output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
+            mechanical: DrillMechanicalOutput {
+                before_files: before_stats.map(|stats| stats.file_count),
+                before_nodes: before_stats.map(|stats| stats.node_count),
+                before_edges: before_stats.map(|stats| stats.edge_count),
+                before_errors: before_stats.map(|stats| stats.error_count),
+                before_unavailable_reason: before_unavailable_reason.clone(),
+                after_files: pinned_summary.stats.file_count,
+                after_nodes: pinned_summary.stats.node_count,
+                after_edges: pinned_summary.stats.edge_count,
+                after_errors: pinned_summary.stats.error_count,
+                refresh: refresh.clone(),
+                retrieval: pinned_summary.retrieval.clone(),
+                sidecar_retrieval_mode,
+                freshness: pinned_summary.freshness.clone(),
+                phase_timings: opened.phase_timings.clone(),
+                drill_timings,
+            },
+            question_search,
+            question_supplemental_searches: Vec::new(),
+            anchors: anchor_outputs,
+            bridges: bridge_outputs,
+            execution_boundaries: vec![DrillExecutionBoundaryOutput {
+                command: "packet".to_string(),
+                flow: vec![
+                    "plan question and explicit anchor probes".to_string(),
+                    "execute one bounded batch retrieval".to_string(),
+                    "adapt citations and sufficiency into drill reports".to_string(),
+                ],
+                source_files: vec![
+                    "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+                    "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
+                ],
+            }],
+            verification_targets: all_verification_targets,
+            evidence_packet,
+            next_commands,
+        })
     })
 }
 
@@ -3979,6 +3022,10 @@ fn drill_search_hit_from_packet_citation(
         origin: citation.origin,
         match_quality,
         resolvable: citation.resolvable,
+        evidence_tier: citation.evidence_tier,
+        evidence_producer: citation.evidence_producer.clone(),
+        resolution_status: citation.resolution_status,
+        eligible_for_sufficiency: citation.eligible_for_sufficiency,
         score_breakdown: citation.retrieval_score_breakdown.clone(),
         duplicate_of: None,
         excerpt: None,
@@ -4015,7 +3062,12 @@ fn drill_packet_verification_target(
 }
 
 fn drill_packet_citation_is_typed_resolvable(citation: &AgentCitationDto) -> bool {
-    citation.resolvable && citation.kind != NodeKind::UNKNOWN
+    citation.resolvable
+        && citation.kind != NodeKind::UNKNOWN
+        && citation.evidence_tier
+            != Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        && citation.resolution_status
+            != Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
 }
 
 fn drill_packet_verification_targets(
@@ -4111,15 +3163,16 @@ fn drill_packet_citations_share_graph_evidence(
 fn write_drill_outputs(
     format: args::OutputFormat,
     output_dir: &std::path::Path,
-    output: &DrillOutput,
+    operation: &codestory_runtime::PublicOperation<DrillOutput>,
 ) -> Result<DrillReportContents> {
+    let output = &operation.value;
     let report_ext = match format {
         args::OutputFormat::Markdown => "md",
         args::OutputFormat::Json => "json",
         args::OutputFormat::Dot => unreachable!("dot was rejected above"),
     };
     let markdown = render_drill_markdown(output);
-    let contents = render_drill_contents(format, output, &markdown)?;
+    let contents = render_drill_contents(format, operation, &markdown)?;
     let report_path = output_dir.join(format!("drill-report.{report_ext}"));
     write_drill_report_file(&report_path, &contents.selected)?;
     let markdown_path = output_dir.join("drill-report.md");
@@ -4131,6 +3184,7 @@ fn write_drill_outputs(
         write_drill_report_file(&json_path, &contents.json)?;
     }
     let summary = drill_summary(output);
+    let summary = runtime::public_operation_json_value(operation, &summary)?;
     let summary_json = ensure_trailing_newline(
         serde_json::to_string_pretty(&summary).context("Failed to serialize drill summary JSON")?,
     );
@@ -4381,9 +3435,9 @@ fn run_drill_suite_case(
         format: cmd.format,
         jobs: drill_jobs,
     };
-    match execute_drill(&drill_cmd).and_then(|drill_output| {
-        write_drill_outputs(cmd.format, &repo_output_dir, &drill_output)?;
-        Ok(drill_summary(&drill_output))
+    match execute_drill(&drill_cmd).and_then(|operation| {
+        write_drill_outputs(cmd.format, &repo_output_dir, &operation)?;
+        Ok(drill_summary(&operation.value))
     }) {
         Ok(summary) => {
             emit_drill_suite_progress(drill_suite_repo_progress_done_message(
@@ -4603,10 +3657,11 @@ fn blocked_drill_suite_repo_output(
             full_report_markdown: String::new(),
             mechanical: DrillSummaryMechanicalOutput {
                 refresh: refresh_label(refresh, None),
-                before: drill_summary_stats(0, 0, 0, 0),
+                before: Some(drill_summary_stats(0, 0, 0, 0)),
+                before_unavailable_reason: None,
                 after: drill_summary_stats(0, 0, 0, 1),
                 index_ready: false,
-                error_delta: 1,
+                error_delta: Some(1),
                 retrieval_status: None,
                 freshness_status: Some("unknown".to_string()),
                 stale_file_count: 0,
@@ -4888,9 +3943,9 @@ fn drill_suite_retrieval_blockers(
         .into_iter()
         .map(|(status, repos)| {
             let next_action = if status.contains("MissingEmbeddingRuntime") {
-                "run `codestory-cli retrieval bootstrap --project <repo>`, then rebuild with `codestory-cli retrieval index --project <repo> --refresh full` before trusting packet/search evidence".to_string()
+                "rebuild with `codestory-cli retrieval index --project <repo> --refresh full`; the embedded engine initializes automatically".to_string()
             } else if status.contains("MissingSemanticDocs") {
-                "rerun `codestory-cli retrieval index --project <repo> --refresh full` after sidecar setup before trusting packet/search evidence".to_string()
+                "rerun `codestory-cli retrieval index --project <repo> --refresh full` before trusting packet/search evidence".to_string()
             } else {
                 "inspect doctor/retrieval status and repair to retrieval_mode=full before treating broad search quality as repo-specific".to_string()
             };
@@ -4929,12 +3984,13 @@ struct DrillReportContents {
 
 fn render_drill_contents(
     format: args::OutputFormat,
-    output: &DrillOutput,
+    operation: &codestory_runtime::PublicOperation<DrillOutput>,
     markdown: &str,
 ) -> Result<DrillReportContents> {
     let markdown = ensure_trailing_newline(markdown.to_string());
+    let output = runtime::public_operation_json_value(operation, &operation.value)?;
     let json = ensure_trailing_newline(
-        serde_json::to_string_pretty(output).context("Failed to serialize drill JSON")?,
+        serde_json::to_string_pretty(&output).context("Failed to serialize drill JSON")?,
     );
     let selected = match format {
         args::OutputFormat::Markdown => markdown.clone(),
@@ -4959,6 +4015,17 @@ fn write_drill_report_file(path: &std::path::Path, content: &str) -> Result<()> 
 
 fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     let sufficiency = &output.evidence_packet.sufficiency;
+    let before_stats = match (
+        output.mechanical.before_files,
+        output.mechanical.before_nodes,
+        output.mechanical.before_edges,
+        output.mechanical.before_errors,
+    ) {
+        (Some(files), Some(nodes), Some(edges), Some(errors)) => {
+            Some(drill_summary_stats(files, nodes, edges, errors))
+        }
+        _ => None,
+    };
     let anchor_statuses: Vec<_> = output
         .anchors
         .iter()
@@ -5097,12 +4164,8 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         full_report_markdown: "drill-report.md".to_string(),
         mechanical: DrillSummaryMechanicalOutput {
             refresh: output.mechanical.refresh.clone(),
-            before: drill_summary_stats(
-                output.mechanical.before_files,
-                output.mechanical.before_nodes,
-                output.mechanical.before_edges,
-                output.mechanical.before_errors,
-            ),
+            before: before_stats,
+            before_unavailable_reason: output.mechanical.before_unavailable_reason.clone(),
             after: drill_summary_stats(
                 output.mechanical.after_files,
                 output.mechanical.after_nodes,
@@ -5110,8 +4173,9 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
                 output.mechanical.after_errors,
             ),
             index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
-            error_delta: i64::from(output.mechanical.after_errors)
-                - i64::from(output.mechanical.before_errors),
+            error_delta: output.mechanical.before_errors.map(|before_errors| {
+                i64::from(output.mechanical.after_errors) - i64::from(before_errors)
+            }),
             retrieval_status: output
                 .mechanical
                 .retrieval
@@ -5414,7 +4478,7 @@ fn drill_summary_retrieval_status(
             return "full".to_string();
         }
         return format!(
-            "{mode}:sidecar_degraded; legacy={}",
+            "{mode}:retrieval_degraded; legacy={}",
             drill_summary_legacy_retrieval_status(retrieval)
         );
     }
@@ -5442,11 +4506,11 @@ fn drill_summary_legacy_retrieval_status(
 fn drill_suite_retrieval_label(status: Option<&str>) -> &str {
     match status {
         Some("full") => "full",
-        Some(value) if value.contains("sidecar_degraded") => "needs-retrieval-repair",
+        Some(value) if value.contains("retrieval_degraded") => "needs-retrieval-refresh",
         Some(value) if value.contains("semantic_ready") || value == "hybrid-ready" => "degraded",
-        Some(value) if value.contains("semantic_unavailable") => "needs-retrieval-repair",
+        Some(value) if value.contains("semantic_unavailable") => "needs-retrieval-refresh",
         Some("hybrid") => "degraded",
-        Some("symbolic") => "needs-retrieval-repair",
+        Some("symbolic") => "needs-retrieval-refresh",
         Some(_) => "partial",
         None => "unknown",
     }
@@ -5654,34 +4718,42 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_index_ready(&opened, "symbol")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let context = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-    if cmd.mermaid {
-        return emit_text(render_symbol_mermaid(&context), cmd.output_file.as_deref());
-    }
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let verification_targets = resolution.resolved.verification_targets.clone();
-    let markdown = render_symbol_markdown(
-        &runtime.project_root,
-        &target,
-        &context,
-        &verification_targets,
-    );
-    let output = SymbolJsonOutput {
-        resolution,
-        symbol: &context,
-        verification_targets,
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
     };
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let context = runtime
+            .browser
+            .symbol_context(target.selected.node_id.clone())
+            .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        if cmd.mermaid {
+            return Ok(RenderedPublicOutput::text(render_symbol_mermaid(&context)));
+        }
+        let verification_targets = resolution.resolved.verification_targets.clone();
+        let markdown = render_symbol_markdown(
+            &runtime.project_root,
+            &target,
+            &context,
+            &verification_targets,
+        );
+        let output = SymbolJsonOutput {
+            resolution,
+            symbol: &context,
+            verification_targets,
+        };
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 #[derive(serde::Serialize)]
@@ -5714,64 +4786,73 @@ fn run_symbol_workflow(
     ensure_index_ready(&opened, mode.label())?;
 
     let file_filter = cmd.target.file_filter();
-    let target = match cmd.target.selection()? {
-        args::TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
-        args::TargetSelection::Query { query, choose } => {
-            codestory_runtime::TargetSelection::Query { query, choose }
-        }
+    let operation_name = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
     };
-    let response = match runtime
-        .browser
-        .symbol_workflow(codestory_runtime::SymbolWorkflowRequest {
-            mode,
-            target,
-            file_filter,
-            depth: cmd.depth,
-            max_nodes: cmd.max_nodes,
-            include_tests: cmd.include_tests,
-        }) {
-        Ok(codestory_runtime::SymbolWorkflowOutcome::Complete(response)) => *response,
-        Ok(codestory_runtime::SymbolWorkflowOutcome::Ambiguous(ambiguous)) => {
-            return structured_ambiguous_target_failure(
-                &runtime,
-                AmbiguousTargetError {
-                    query: ambiguous.query,
-                    file_filter: ambiguous.file_filter,
-                    alternatives: ambiguous.alternatives,
-                    message: ambiguous.message,
-                },
-                cmd.format,
-                cmd.output_file.as_deref(),
-            );
-        }
-        Ok(codestory_runtime::SymbolWorkflowOutcome::Rejected(message)) => bail!(message),
-        Err(error) => return Err(map_api_error(error)),
-    };
-    let resolution_target =
-        runtime::ResolvedTarget::from_runtime(response.resolution.target.clone());
-    let resolution = build_query_resolution_output_from_occurrences(
-        &runtime.project_root,
-        &resolution_target,
-        &response.resolution.occurrences,
-    );
-    let output = SymbolWorkflowOutput {
-        workflow: response.workflow,
-        project_root: &response.project_root,
-        resolution,
-        symbol: &response.symbol,
-        direct_callers: &response.direct_callers,
-        transitive_callers: &response.transitive_callers,
-        impacted_files: &response.impacted_files,
-        impacted_routes: &response.impacted_routes,
-        likely_tests: &response.likely_tests,
-        caps: &response.caps,
-        unknowns: &response.unknowns,
-        next_commands: &response.next_commands,
-        affected: response.affected.as_ref(),
-        trail: &response.trail,
-    };
-    let markdown = render_symbol_workflow_markdown(mode, &output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation(operation_name, || {
+        let target = match cmd.target.selection()? {
+            args::TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
+            args::TargetSelection::Query { query, choose } => {
+                codestory_runtime::TargetSelection::Query { query, choose }
+            }
+        };
+        let response = match runtime
+            .browser
+            .symbol_workflow(codestory_runtime::SymbolWorkflowRequest {
+                mode,
+                target,
+                file_filter: file_filter.clone(),
+                depth: cmd.depth,
+                max_nodes: cmd.max_nodes,
+                include_tests: cmd.include_tests,
+            })
+            .map_err(map_api_error)?
+        {
+            codestory_runtime::SymbolWorkflowOutcome::Complete(response) => *response,
+            codestory_runtime::SymbolWorkflowOutcome::Ambiguous(ambiguous) => {
+                return structured_ambiguous_target_failure(
+                    &runtime,
+                    AmbiguousTargetError {
+                        query: ambiguous.query,
+                        file_filter: ambiguous.file_filter,
+                        alternatives: ambiguous.alternatives,
+                        message: ambiguous.message,
+                    },
+                    cmd.format,
+                    cmd.output_file.as_deref(),
+                );
+            }
+            codestory_runtime::SymbolWorkflowOutcome::Rejected(message) => bail!(message),
+        };
+        let resolution_target =
+            runtime::ResolvedTarget::from_runtime(response.resolution.target.clone());
+        let resolution = build_query_resolution_output_from_occurrences(
+            &runtime.project_root,
+            &resolution_target,
+            &response.resolution.occurrences,
+        );
+        let output = SymbolWorkflowOutput {
+            workflow: response.workflow,
+            project_root: &response.project_root,
+            resolution,
+            symbol: &response.symbol,
+            direct_callers: &response.direct_callers,
+            transitive_callers: &response.transitive_callers,
+            impacted_files: &response.impacted_files,
+            impacted_routes: &response.impacted_routes,
+            likely_tests: &response.likely_tests,
+            caps: &response.caps,
+            unknowns: &response.unknowns,
+            next_commands: &response.next_commands,
+            affected: response.affected.as_ref(),
+            trail: &response.trail,
+        };
+        let markdown = render_symbol_workflow_markdown(mode, &output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn render_symbol_workflow_markdown(
@@ -5899,46 +4980,54 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     ensure_index_ready(&opened, "trail")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let request = build_trail_request(&target.selected.node_id, &cmd);
-    let context = runtime
-        .browser
-        .trail_context(request)
-        .map_err(map_api_error)?;
-    if cmd.mermaid {
-        return emit_text(render_trail_mermaid(&context), cmd.output_file.as_deref());
-    }
-    if cmd.format == args::OutputFormat::Dot {
-        return emit_text(
-            render_trail_dot(&runtime.project_root, &context),
-            cmd.output_file.as_deref(),
-        );
-    }
-    let notes = trail_guidance_notes(&context);
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let mut markdown = if let Some(story) = context.story.as_ref() {
-        render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
     } else {
-        render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
+        "graph"
     };
-    if !notes.is_empty() {
-        let _ = writeln!(markdown, "notes:");
-        for note in &notes {
-            let _ = writeln!(markdown, "- {note}");
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let request = build_trail_request(&target.selected.node_id, &cmd);
+        let context = runtime
+            .browser
+            .trail_context(request)
+            .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        if cmd.mermaid {
+            return Ok(RenderedPublicOutput::text(render_trail_mermaid(&context)));
         }
-    }
-    let output = TrailJsonOutput {
-        resolution,
-        trail: &context,
-        notes,
-    };
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+        if cmd.format == args::OutputFormat::Dot {
+            return Ok(RenderedPublicOutput::text(render_trail_dot(
+                &runtime.project_root,
+                &context,
+            )));
+        }
+        let notes = trail_guidance_notes(&context);
+        let mut markdown = if let Some(story) = context.story.as_ref() {
+            render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
+        } else {
+            render_trail_markdown(&runtime.project_root, &target, &context, &cmd)
+        };
+        if !notes.is_empty() {
+            let _ = writeln!(markdown, "notes:");
+            for note in &notes {
+                let _ = writeln!(markdown, "- {note}");
+            }
+        }
+        let output = TrailJsonOutput {
+            resolution,
+            trail: &context,
+            notes,
+        };
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_callers(mut cmd: TrailCommand) -> Result<()> {
@@ -5973,78 +5062,6 @@ fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> 
     )]
 }
 
-fn prefer_function_body_target(
-    project_root: &std::path::Path,
-    mut target: runtime::ResolvedTarget,
-) -> runtime::ResolvedTarget {
-    if hit_looks_like_function_body(project_root, &target.selected) {
-        return target;
-    }
-    if !matches!(target.selected.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
-        return target;
-    }
-    let Some((index, preferred)) = target
-        .alternatives
-        .iter()
-        .enumerate()
-        .find(|(_, hit)| {
-            function_body_promotion_matches(&target.selected, hit)
-                && hit_looks_like_function_body(project_root, hit)
-        })
-        .map(|(index, hit)| (index, hit.clone()))
-    else {
-        return target;
-    };
-    target.selected = preferred;
-    let promoted = target.alternatives.remove(index);
-    target.alternatives.insert(0, promoted);
-    target
-}
-
-fn function_body_promotion_matches(selected: &SearchHit, candidate: &SearchHit) -> bool {
-    if selected.display_name == candidate.display_name {
-        return true;
-    }
-    terminal_display_name(&selected.display_name) == terminal_display_name(&candidate.display_name)
-}
-
-fn terminal_display_name(name: &str) -> &str {
-    name.rsplit_once("::")
-        .map(|(_, terminal)| terminal)
-        .or_else(|| name.rsplit_once('.').map(|(_, terminal)| terminal))
-        .unwrap_or(name)
-}
-
-fn hit_looks_like_function_body(project_root: &std::path::Path, hit: &SearchHit) -> bool {
-    if !matches!(hit.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
-        return false;
-    }
-    let Some(path) = hit.file_path.as_deref() else {
-        return false;
-    };
-    let Some(line) = hit.line else {
-        return false;
-    };
-    let path = std::path::Path::new(path);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
-    };
-    let Ok(contents) = fs::read_to_string(&resolved) else {
-        return false;
-    };
-    let line_index = line.saturating_sub(1) as usize;
-    let window = contents
-        .lines()
-        .skip(line_index)
-        .take(8)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let before_body = window.split('{').next().unwrap_or(window.as_str());
-    window.contains('{') && !before_body.contains(';')
-}
-
 fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -6053,46 +5070,54 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let target = if cmd.function_body {
-        prefer_function_body_target(&runtime.project_root, target)
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
     } else {
-        target
+        "graph"
     };
-    let context = if cmd.function_body {
-        runtime
-            .browser
-            .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
-    } else {
-        runtime
-            .browser
-            .snippet_context(target.selected.node_id.clone(), cmd.context)
-    }
-    .map_err(map_api_error)?;
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let verification_targets = resolution.resolved.verification_targets.clone();
-    let markdown = render_snippet_markdown(
-        &runtime.project_root,
-        &target,
-        &context,
-        colorize,
-        &verification_targets,
-    );
-    let output = SnippetJsonOutput {
-        resolution,
-        snippet: &context,
-        verification_targets,
-    };
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_source_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let target = if cmd.function_body {
+            runtime::prefer_function_body_target(&runtime.project_root, target)
+        } else {
+            target
+        };
+        let context = if cmd.function_body {
+            runtime
+                .browser
+                .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
+        } else {
+            runtime
+                .browser
+                .snippet_context(target.selected.node_id.clone(), cmd.context)
+        }
+        .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        let verification_targets = resolution.resolved.verification_targets.clone();
+        let markdown = render_snippet_markdown(
+            &runtime.project_root,
+            &target,
+            &context,
+            colorize,
+            &verification_targets,
+        );
+        let output = SnippetJsonOutput {
+            resolution,
+            snippet: &context,
+            verification_targets,
+        };
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_query(cmd: QueryCommand) -> Result<()> {
@@ -6120,20 +5145,23 @@ fn run_query(cmd: QueryCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "query")?;
-    let items = runtime
-        .browser
-        .query(&ast)
-        .map_err(map_api_error)?
-        .iter()
-        .map(|item| explore::browser_query_item_to_output(&runtime.project_root, item))
-        .collect();
-    let output = QueryOutput {
-        query: query.to_string(),
-        ast,
-        items,
-    };
-    let markdown = render_query_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("graph", || {
+        let items = runtime
+            .browser
+            .query(&ast)
+            .map_err(map_api_error)?
+            .iter()
+            .map(|item| explore::browser_query_item_to_output(&runtime.project_root, item))
+            .collect();
+        let output = QueryOutput {
+            query: query.to_string(),
+            ast: ast.clone(),
+            items,
+        };
+        let markdown = render_query_markdown(&output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_files(cmd: FilesCommand) -> Result<()> {
@@ -6146,17 +5174,20 @@ fn run_files(cmd: FilesCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "files")?;
-    let output = runtime
-        .browser
-        .indexed_files(IndexedFilesRequest {
-            path_contains: cmd.path,
-            language: cmd.language,
-            role: cmd.role.map(Into::into),
-            limit: Some(cmd.limit),
-        })
-        .map_err(map_api_error)?;
-    let markdown = render_files_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_public_operation("graph", || {
+        let output = runtime
+            .browser
+            .indexed_files(IndexedFilesRequest {
+                path_contains: cmd.path.clone(),
+                language: cmd.language.clone(),
+                role: cmd.role.map(Into::into),
+                limit: Some(cmd.limit),
+            })
+            .map_err(map_api_error)?;
+        let markdown = render_files_markdown(&output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn run_affected(cmd: AffectedCommand) -> Result<()> {
@@ -6167,21 +5198,19 @@ fn run_affected(cmd: AffectedCommand) -> Result<()> {
     ensure_index_ready(&opened, "affected")?;
     let change_records =
         affected_change_records(&cmd).map_err(|error| affected_discovery_error(&cmd, error))?;
-    let changed_paths = change_records
-        .iter()
-        .map(|record| record.path.clone())
-        .collect::<Vec<_>>();
-    let output = runtime
-        .browser
-        .affected_analysis(AffectedAnalysisRequest {
-            changed_paths,
-            change_records,
-            depth: Some(cmd.depth),
-            filter: cmd.filter,
-        })
-        .map_err(map_api_error)?;
-    let markdown = render_affected_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    let operation = runtime.run_observational_public_operation("affected", || {
+        let output = runtime
+            .browser
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::ChangeRecords(change_records.clone()),
+                depth: Some(cmd.depth),
+                filter: cmd.filter.clone(),
+            })
+            .map_err(map_api_error)?;
+        let markdown = render_affected_markdown(&output);
+        RenderedPublicOutput::structured(&output, markdown)
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 fn affected_change_records(cmd: &AffectedCommand) -> Result<Vec<AffectedChangeRecordDto>> {
@@ -6472,6 +5501,7 @@ fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> 
     markdown.push_str("# indexed files\n\n");
     render_files_summary(&mut markdown, output);
     render_framework_route_coverage(&mut markdown, output);
+    render_source_policy_exclusions(&mut markdown, output);
     render_indexed_file_rows(&mut markdown, output);
     markdown
 }
@@ -6480,11 +5510,12 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
     let status = if output.usable { "usable" } else { "empty" };
     let _ = writeln!(
         markdown,
-        "- index: {status}; whole index files: {}; indexed: {}; incomplete: {}; error files: {}; filtered files: {}; visible rows: {}; truncated: {}",
+        "- index: {status}; whole index files: {}; indexed: {}; incomplete: {}; error files: {}; policy exclusions: {}; filtered files: {}; visible rows: {}; truncated: {}",
         output.summary.file_count,
         output.summary.indexed_file_count,
         output.summary.incomplete_file_count,
         output.summary.error_file_count,
+        output.summary.policy_exclusion_count,
         output.summary.filtered_file_count,
         output.summary.visible_file_count,
         output.summary.truncated
@@ -6524,6 +5555,33 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
     }
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");
+    }
+}
+
+fn render_source_policy_exclusions(
+    markdown: &mut String,
+    output: &codestory_contracts::api::IndexedFilesDto,
+) {
+    if output.policy_exclusions.is_empty() {
+        return;
+    }
+    markdown.push_str(
+        "\nverified policy exclusions (source inventory only; no graph or semantic coverage):\n",
+    );
+    for exclusion in &output.policy_exclusions {
+        let _ = writeln!(
+            markdown,
+            "- {} ({:?}, {} bytes, {} structural units, policy={} byte_cap={} unit_cap={}, core={}/{})",
+            exclusion.path,
+            exclusion.role,
+            exclusion.observed_size,
+            exclusion.observed_unit_count,
+            exclusion.policy_version,
+            exclusion.byte_cap,
+            exclusion.structural_unit_cap,
+            exclusion.core_generation_id,
+            exclusion.core_run_id,
+        );
     }
 }
 
@@ -6617,6 +5675,27 @@ fn render_affected_summary(
         output.impacted_routes.len(),
         output.impacted_tests.len()
     );
+    let _ = writeln!(
+        markdown,
+        "- completeness: complete={} confidence={} direct={} propagated={} uncovered={} unavailable={} truncated={}",
+        output.completeness.complete,
+        output.completeness.confidence,
+        output.completeness.direct_impact_count,
+        output.completeness.propagated_impact_count,
+        output.completeness.uncovered_input_count,
+        output.completeness.unavailable_evidence_count,
+        output.completeness.truncated
+    );
+    let _ = writeln!(
+        markdown,
+        "- bounds: requested_depth={} maximum_depth={} visited_nodes={} visited_edges={} symbol_limit={} route_limit={}",
+        output.bounds.requested_depth,
+        output.bounds.maximum_depth,
+        output.bounds.visited_node_count,
+        output.bounds.visited_edge_count,
+        output.bounds.impacted_symbol_limit,
+        output.bounds.impacted_route_limit
+    );
     if !output.changed_paths.is_empty() {
         markdown.push_str("- changed paths:\n");
         for path in &output.changed_paths {
@@ -6677,7 +5756,7 @@ fn render_affected_matched_files(
     if !output.unmatched_paths.is_empty() {
         markdown.push_str("\nunmatched paths:\n");
         for path in &output.unmatched_paths {
-            let mut markers = Vec::new();
+            let mut markers = vec![format!("classification={:?}", path.classification)];
             if let Some(kind) = path.change_kind.as_ref() {
                 markers.push(format!("change={kind:?}"));
             }
@@ -6786,6 +5865,18 @@ fn render_affected_symbols(
     }
 }
 
+fn render_affected_invocation(invocation: &AffectedFollowUpInvocationDto) -> String {
+    std::iter::once(invocation.program.clone())
+        .chain(
+            invocation
+                .args
+                .iter()
+                .map(|arg| quote_command_argument_value(arg)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_affected_footer(
     markdown: &mut String,
     output: &codestory_contracts::api::AffectedAnalysisDto,
@@ -6796,10 +5887,20 @@ fn render_affected_footer(
             let _ = writeln!(markdown, "- {blind_spot}");
         }
     }
-    if !output.next_commands.is_empty() {
-        markdown.push_str("\nnext_commands:\n");
-        for command in &output.next_commands {
-            let _ = writeln!(markdown, "- `{command}`");
+    if !output.follow_ups.is_empty() {
+        markdown.push_str("\nfollow-ups:\n");
+        for follow_up in &output.follow_ups {
+            let invocation = follow_up
+                .invocation
+                .as_ref()
+                .map(render_affected_invocation)
+                .map(|invocation| format!(" invocation=`{invocation}`"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- {} [{}]: {}{}",
+                follow_up.action, follow_up.confidence, follow_up.reason, invocation
+            );
         }
     }
 }
@@ -6812,10 +5913,10 @@ async fn run_serve(cmd: ServeCommand) -> Result<()> {
         return stdio_transport::run_stdio_server(None, cmd.refresh).await;
     }
     let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
         return stdio_transport::run_stdio_server(Some(runtime), cmd.refresh).await;
     }
+    let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
@@ -6915,6 +6016,29 @@ fn resolve_target_or_emit_ambiguity(
     }
 }
 
+fn resolve_source_target_or_emit_ambiguity(
+    runtime: &RuntimeContext,
+    target: args::TargetSelection,
+    file_filter: Option<&str>,
+    format: args::OutputFormat,
+    output_file: Option<&std::path::Path>,
+) -> Result<runtime::ResolvedTarget> {
+    match resolve_source_target(runtime, target, file_filter) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+                return structured_ambiguous_target_failure(
+                    runtime,
+                    ambiguous.clone(),
+                    format,
+                    output_file,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 fn structured_ambiguous_target_failure<T>(
     runtime: &RuntimeContext,
     ambiguous: AmbiguousTargetError,
@@ -6940,12 +6064,16 @@ fn ambiguous_command_failure(
         output.error.code,
         message,
         ApiErrorDetails {
+            cause_code: None,
             failed_layer: Some(output.error.failed_layer.to_string()),
             project: Some(display::clean_path_string(&project_root.to_string_lossy())),
             next_commands: output.error.next_commands.clone(),
             minimum_next: output.error.next_commands.iter().take(1).cloned().collect(),
             full_repair: output.error.next_commands.clone(),
             readiness: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            coverage_gaps: Vec::new(),
         },
     ))
     .with_context(serde_json::json!({
@@ -7119,28 +6247,15 @@ fn build_doctor_output(
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
     let sidecar_retrieval = doctor_sidecar_status(runtime);
-    let readiness_sidecar =
-        selected_agent_readiness_sidecar_status(runtime, None, &sidecar_retrieval);
-    let readiness_broker = observe_readiness_broker(
-        runtime,
-        &readiness_sidecar,
-        readiness_sidecar.run_id.as_deref(),
-    );
-    let readiness_sidecar =
-        agent_sidecar_with_gpu_proof(&readiness_sidecar, readiness_broker.gpu_proof.as_ref());
+    let readiness_sidecar = agent_readiness_status(runtime, None);
     let readiness = build_summary_readiness(
         &project,
         &summary.stats,
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(
-        runtime,
-        &readiness,
-        None,
-        Some(&readiness_sidecar),
-        Some(&readiness_broker),
-    );
+    let readiness_lanes =
+        build_readiness_lanes_for_runtime(runtime, &readiness, None, Some(&readiness_sidecar));
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -7179,23 +6294,17 @@ fn build_doctor_output(
         )
     });
     checks.push(doctor_sidecar_check(&readiness_sidecar));
-    if let Some(retrieval) = retrieval.as_ref() {
-        checks.push(semantic_health_check(retrieval, &summary.stats));
-        if retrieval.stored_embedding.is_some() {
-            checks.push(semantic_contract_check(retrieval));
-        }
+    if let Some(retrieval) = retrieval.as_ref()
+        && retrieval.stored_embedding.is_some()
+    {
+        checks.push(semantic_contract_check(retrieval));
     }
     if let Some(freshness) = summary.freshness.as_ref() {
         checks.push(index_freshness_check(freshness));
     }
 
     let environment = [
-        "CODESTORY_EMBED_PROFILE",
-        "CODESTORY_EMBED_MODEL_ID",
-        "CODESTORY_EMBED_BACKEND",
-        "CODESTORY_EMBED_RUNTIME_MODE",
-        "CODESTORY_EMBED_LLAMACPP_URL",
-        "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
+        "CODESTORY_EMBED_ALLOW_CPU",
         "CODESTORY_STORED_VECTOR_ENCODING",
         "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
         "CODESTORY_SEMANTIC_DOC_ALIAS_MODE",
@@ -7221,7 +6330,6 @@ fn build_doctor_output(
         freshness: summary.freshness.clone(),
         readiness,
         readiness_lanes,
-        readiness_broker: Some(readiness_broker),
         checks,
         next_commands,
         environment,
@@ -7232,7 +6340,7 @@ fn build_summary_readiness(
     project: &str,
     stats: &codestory_contracts::api::StorageStatsDto,
     freshness: Option<&IndexFreshnessDto>,
-    sidecar: &DoctorSidecarStatusOutput,
+    sidecar: &RetrievalStatusOutput,
 ) -> Vec<codestory_contracts::api::ReadinessVerdictDto> {
     readiness::build_readiness_verdicts(readiness::ReadinessInputs {
         project,
@@ -7243,7 +6351,7 @@ fn build_summary_readiness(
 }
 
 fn readiness_sidecar_input(
-    sidecar: &DoctorSidecarStatusOutput,
+    sidecar: &RetrievalStatusOutput,
 ) -> readiness::ReadinessSidecarInput<'_> {
     readiness::ReadinessSidecarInput {
         profile: sidecar.profile.as_deref(),
@@ -7270,50 +6378,22 @@ fn readiness_sidecar_input(
     }
 }
 
-fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput {
+fn doctor_sidecar_status(runtime: &RuntimeContext) -> RetrievalStatusOutput {
     let sidecar = runtime.sidecar.clone();
     match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
         sidecar.clone(),
     ) {
-        Ok(report) => {
-            let status = doctor_sidecar_status_from_report(report, Some(&sidecar));
-            let handoff_failure = doctor_sidecar_status_is_live_ready(&status)
-                .then(|| doctor_sidecar_profile_handoff_failure(runtime))
-                .flatten();
-            apply_sidecar_profile_handoff(status, handoff_failure)
-        }
+        Ok(report) => doctor_sidecar_status_from_report(report, Some(&sidecar)),
         Err(error) => doctor_sidecar_status_error(error, Some(&sidecar)),
     }
-}
-
-fn ready_sidecar_status(
-    runtime: &RuntimeContext,
-    repaired_sidecar: Option<codestory_retrieval::SidecarRuntimeConfig>,
-    goal: Option<args::ReadyGoal>,
-    run_id: Option<&str>,
-) -> DoctorSidecarStatusOutput {
-    if let Some(sidecar) = repaired_sidecar {
-        return doctor_sidecar_status_for_runtime(runtime, sidecar);
-    }
-    if matches!(goal, Some(args::ReadyGoal::Agent))
-        && let Some(run_id) = run_id
-    {
-        let sidecar = runtime.sidecar.with_profile_and_run_id(
-            Some(&runtime.project_root),
-            codestory_retrieval::SidecarProfile::Agent,
-            Some(run_id),
-        );
-        return doctor_sidecar_status_for_runtime(runtime, sidecar);
-    }
-    doctor_sidecar_status(runtime)
 }
 
 fn doctor_sidecar_status_for_runtime(
     runtime: &RuntimeContext,
     sidecar: codestory_retrieval::SidecarRuntimeConfig,
-) -> DoctorSidecarStatusOutput {
+) -> RetrievalStatusOutput {
     match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -7327,7 +6407,7 @@ fn doctor_sidecar_status_for_runtime(
 fn doctor_sidecar_status_from_report(
     report: codestory_retrieval::RetrievalStatusReport,
     runtime: Option<&codestory_retrieval::SidecarRuntimeConfig>,
-) -> DoctorSidecarStatusOutput {
+) -> RetrievalStatusOutput {
     let manifest_generation = report
         .manifest
         .as_ref()
@@ -7352,15 +6432,8 @@ fn doctor_sidecar_status_from_report(
         .manifest
         .as_ref()
         .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
-    DoctorSidecarStatusOutput {
-        profile: runtime
-            .map(|runtime| runtime.profile.as_str().to_string())
-            .or_else(|| {
-                report
-                    .ownership
-                    .as_ref()
-                    .map(|ownership| ownership.profile.clone())
-            }),
+    RetrievalStatusOutput {
+        profile: runtime.map(|runtime| runtime.profile.as_str().to_string()),
         run_id: runtime.and_then(|runtime| runtime.run_id.clone()),
         retrieval_mode: report.retrieval_mode,
         degraded_reason: report.degraded_reason,
@@ -7385,15 +6458,15 @@ fn doctor_sidecar_status_from_report(
 fn doctor_sidecar_status_error(
     error: anyhow::Error,
     runtime: Option<&codestory_retrieval::SidecarRuntimeConfig>,
-) -> DoctorSidecarStatusOutput {
-    DoctorSidecarStatusOutput {
+) -> RetrievalStatusOutput {
+    RetrievalStatusOutput {
         profile: runtime.map(|runtime| runtime.profile.as_str().to_string()),
         run_id: runtime.and_then(|runtime| runtime.run_id.clone()),
         retrieval_mode: "unavailable".to_string(),
-        degraded_reason: Some(format!("sidecar_status_error: {error}")),
+        degraded_reason: Some(format!("retrieval_status_error: {error}")),
         embedding_device_policy: "accelerator_required".to_string(),
         embedding_device_state: "unknown".to_string(),
-        embedding_device_observation_source: "sidecar_unobserved".to_string(),
+        embedding_device_observation_source: "retrieval_unobserved".to_string(),
         embedding_detected_provider: None,
         embedding_detected_gpu: None,
         embedding_accelerator_requested: false,
@@ -7409,44 +6482,20 @@ fn doctor_sidecar_status_error(
     }
 }
 
-pub(crate) fn selected_agent_readiness_sidecar_status(
-    runtime: &RuntimeContext,
-    run_id: Option<&str>,
-    fallback: &DoctorSidecarStatusOutput,
-) -> DoctorSidecarStatusOutput {
+fn agent_readiness_status(runtime: &RuntimeContext, run_id: Option<&str>) -> RetrievalStatusOutput {
     let agent_runtime = runtime.sidecar.with_profile_and_run_id(
         Some(&runtime.project_root),
         codestory_retrieval::SidecarProfile::Agent,
         run_id,
     );
-    let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
-    lane_scoped_agent_readiness_sidecar(fallback, agent_status)
-}
-
-fn lane_scoped_agent_readiness_sidecar(
-    fallback: &DoctorSidecarStatusOutput,
-    agent_status: DoctorSidecarStatusOutput,
-) -> DoctorSidecarStatusOutput {
-    if doctor_sidecar_status_is_live_ready(&agent_status) {
-        return agent_status;
-    }
-    if fallback.profile.as_deref() == Some("agent")
-        && fallback
-            .degraded_reason
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with("profile_handoff_mismatch:"))
-    {
-        return fallback.clone();
-    }
-    agent_status
+    doctor_sidecar_status_for_runtime(runtime, agent_runtime)
 }
 
 pub(crate) fn build_readiness_lanes_for_runtime(
     runtime: &RuntimeContext,
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     agent_run_id: Option<&str>,
-    selected_agent_status: Option<&DoctorSidecarStatusOutput>,
-    broker: Option<&readiness_broker::ReadinessBrokerSnapshot>,
+    selected_agent_status: Option<&RetrievalStatusOutput>,
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
@@ -7455,19 +6504,17 @@ pub(crate) fn build_readiness_lanes_for_runtime(
         codestory_retrieval::SidecarProfile::Local,
         None,
     );
-    let agent_runtime = runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        codestory_retrieval::SidecarProfile::Agent,
-        agent_run_id,
-    );
     let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
-    let agent_status = selected_agent_status
-        .cloned()
-        .unwrap_or_else(|| doctor_sidecar_status_for_runtime(runtime, agent_runtime.clone()));
-    let agent_status = agent_sidecar_with_gpu_proof(
-        &agent_status,
-        broker.and_then(|snapshot| snapshot.gpu_proof.as_ref()),
-    );
+    let agent_status = selected_agent_status.cloned().unwrap_or_else(|| {
+        doctor_sidecar_status_for_runtime(
+            runtime,
+            runtime.sidecar.with_profile_and_run_id(
+                Some(&runtime.project_root),
+                codestory_retrieval::SidecarProfile::Agent,
+                agent_run_id,
+            ),
+        )
+    });
     let agent_verdict = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);
@@ -7485,42 +6532,7 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
-    apply_ready_repair_status_overlay(
-        &mut lanes,
-        &runtime.project_root,
-        &agent_runtime,
-        &project_arg,
-    );
-    if let Some(broker) = broker {
-        apply_broker_ready_repair_overlay(&mut lanes, broker, &project_arg);
-    }
     lanes
-}
-
-fn apply_broker_ready_repair_overlay(
-    lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
-    broker: &readiness_broker::ReadinessBrokerSnapshot,
-    project_arg: &str,
-) {
-    let Some(operation) = broker.operations.iter().find(|operation| {
-        operation.operation_kind == "agent_repair" && operation.status == "running"
-    }) else {
-        return;
-    };
-    let Some(lane) = lanes.get_mut("agent_packet_search") else {
-        return;
-    };
-    lane.status = ReadinessStatusDto::Repairing;
-    lane.profile = operation.profile.clone();
-    lane.run_id = operation.run_id.clone();
-    lane.namespace = operation.namespace.clone();
-    lane.compose_project = operation.compose_project.clone();
-    lane.phase = operation.phase.clone();
-    lane.repair_updated_at_epoch_ms = operation.updated_at_epoch_ms;
-    lane.next_command = Some(retrieval_status_command_for_agent(
-        project_arg,
-        operation.run_id.as_deref(),
-    ));
 }
 
 #[cfg(test)]
@@ -7537,7 +6549,7 @@ fn agent_readiness_sidecar_runtime(
 
 fn readiness_lane_output(
     lane: &str,
-    sidecar: &DoctorSidecarStatusOutput,
+    sidecar: &RetrievalStatusOutput,
     verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
     project_arg: &str,
 ) -> ReadinessLaneOutput {
@@ -7550,44 +6562,16 @@ fn readiness_lane_output(
             .unwrap_or_else(|| "unknown".to_string()),
         run_id: sidecar.run_id.clone(),
         namespace: None,
-        compose_project: None,
         phase: None,
         repair_updated_at_epoch_ms: None,
-        sidecar_mode: sidecar.retrieval_mode.clone(),
+        retrieval_mode: sidecar.retrieval_mode.clone(),
         degraded_reason: sidecar.degraded_reason.clone(),
         next_command: lane_next_command(lane, sidecar, status, verdict, project_arg),
     }
 }
 
-fn apply_ready_repair_status_overlay(
-    lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
-    project_root: &Path,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-    project_arg: &str,
-) {
-    let Some(status) =
-        ready_repair_status::active_ready_repair_status_for_sidecar(project_root, sidecar)
-    else {
-        return;
-    };
-    let Some(lane) = lanes.get_mut("agent_packet_search") else {
-        return;
-    };
-    lane.status = ReadinessStatusDto::Repairing;
-    lane.profile = status.profile;
-    lane.run_id = status.run_id.clone();
-    lane.namespace = Some(status.namespace);
-    lane.compose_project = Some(status.compose_project);
-    lane.phase = Some(status.phase);
-    lane.repair_updated_at_epoch_ms = Some(status.updated_at_epoch_ms);
-    lane.next_command = Some(retrieval_status_command_for_agent(
-        project_arg,
-        status.run_id.as_deref(),
-    ));
-}
-
 fn readiness_lane_status(
-    sidecar: &DoctorSidecarStatusOutput,
+    sidecar: &RetrievalStatusOutput,
     verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
 ) -> ReadinessStatusDto {
     let sidecar_status = if doctor_sidecar_status_is_live_ready(sidecar) {
@@ -7618,7 +6602,7 @@ fn readiness_lane_status(
 
 fn lane_next_command(
     lane: &str,
-    sidecar: &DoctorSidecarStatusOutput,
+    sidecar: &RetrievalStatusOutput,
     status: ReadinessStatusDto,
     verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
     project_arg: &str,
@@ -7630,9 +6614,9 @@ fn lane_next_command(
         return Some(command.clone());
     }
     match lane {
-        "agent_packet_search" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(
-            agent_ready_repair_command(project_arg, sidecar.run_id.as_deref()),
-        ),
+        "agent_packet_search" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(format!(
+            "codestory-cli retrieval index --project {project_arg} --profile agent --refresh auto --format json"
+        )),
         "local_default" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(format!(
             "codestory-cli retrieval index --project {project_arg} --profile local --refresh full --format json"
         )),
@@ -7640,28 +6624,7 @@ fn lane_next_command(
     }
 }
 
-fn agent_ready_repair_command(project_arg: &str, run_id: Option<&str>) -> String {
-    let mut command =
-        format!("codestory-cli ready --goal agent --repair --project {project_arg} --format json");
-    if let Some(run_id) = run_id {
-        command.push_str(" --run-id ");
-        command.push_str(&display::quote_command_argument_value(run_id));
-    }
-    command
-}
-
-fn retrieval_status_command_for_agent(project_arg: &str, run_id: Option<&str>) -> String {
-    let mut command =
-        format!("codestory-cli retrieval status --project {project_arg} --profile agent");
-    if let Some(run_id) = run_id {
-        command.push_str(" --run-id ");
-        command.push_str(&display::quote_command_argument_value(run_id));
-    }
-    command.push_str(" --format json");
-    command
-}
-
-fn retrieval_status_command(sidecar: &DoctorSidecarStatusOutput, project_arg: &str) -> String {
+fn retrieval_status_command(sidecar: &RetrievalStatusOutput, project_arg: &str) -> String {
     let mut command = format!(
         "codestory-cli retrieval status --project {project_arg} --profile {}",
         sidecar.profile.as_deref().unwrap_or("local")
@@ -7672,46 +6635,6 @@ fn retrieval_status_command(sidecar: &DoctorSidecarStatusOutput, project_arg: &s
     }
     command.push_str(" --format json");
     command
-}
-
-fn apply_sidecar_profile_handoff(
-    mut status: DoctorSidecarStatusOutput,
-    handoff_failure: Option<String>,
-) -> DoctorSidecarStatusOutput {
-    if let Some(reason) = handoff_failure {
-        status.degraded_reason = Some(reason);
-    }
-    status
-}
-
-fn doctor_sidecar_profile_handoff_failure(runtime: &RuntimeContext) -> Option<String> {
-    let active = runtime.sidecar.clone();
-    if active.profile == codestory_retrieval::SidecarProfile::Local {
-        return None;
-    }
-    let local = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        crate::sidecar_runtime::for_project(
-            &runtime.project_root,
-            codestory_retrieval::SidecarProfile::Local,
-        ),
-    );
-    match local {
-        Ok(report) if report.is_live_ready() => None,
-        Ok(report) => Some(format!(
-            "profile_handoff_mismatch: active profile={} namespace={} is full but local/default profile is mode={} reason={}",
-            active.profile.as_str(),
-            active.namespace,
-            report.retrieval_mode,
-            report.degraded_reason.as_deref().unwrap_or("unknown")
-        )),
-        Err(error) => Some(format!(
-            "profile_handoff_mismatch: active profile={} namespace={} is full but local/default status failed: {error}",
-            active.profile.as_str(),
-            active.namespace
-        )),
-    }
 }
 
 fn doctor_env_check_message(name: &str, value: &str) -> String {
@@ -7755,48 +6678,6 @@ fn redact_url_token(token: &str) -> String {
     format!(
         "{prefix}{}{suffix}",
         embedding_config::redact_url_for_display(url)
-    )
-}
-
-fn semantic_health_check(
-    retrieval: &codestory_contracts::api::RetrievalStateDto,
-    stats: &codestory_contracts::api::StorageStatsDto,
-) -> DoctorCheckOutput {
-    if retrieval.semantic_ready {
-        if stats.file_count > 0 && retrieval.semantic_doc_count < stats.file_count {
-            return doctor_check(
-                "semantic",
-                "warn",
-                format!(
-                    "legacy semantic diagnostic partial: {} semantic docs for {} indexed files. Mandatory retrieval health is reported by sidecar_retrieval; run `codestory-cli retrieval index --refresh full` after repairing sidecars.",
-                    retrieval.semantic_doc_count, stats.file_count
-                ),
-            );
-        }
-
-        return doctor_check(
-            "semantic",
-            "info",
-            format!(
-                "legacy semantic diagnostic ok: stored hybrid/semantic docs are available (docs={}); mandatory retrieval health is reported by sidecar_retrieval.",
-                retrieval.semantic_doc_count
-            ),
-        );
-    }
-
-    let message = retrieval.fallback_message.clone().unwrap_or_else(|| {
-        "Legacy semantic diagnostics are not ready; mandatory retrieval health is reported by sidecar_retrieval.".to_string()
-    });
-    let status =
-        if retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime) {
-            "warn"
-        } else {
-            "info"
-        };
-    doctor_check(
-        "semantic",
-        status,
-        format!("legacy semantic diagnostic failed: {message}"),
     )
 }
 
@@ -7924,7 +6805,7 @@ fn semantic_contract_check(
             "semantic_contract",
             "info",
             format!(
-                "semantic stale: {}. Resolve the product embedding sidecar first with `codestory-cli retrieval bootstrap`; then run `codestory-cli retrieval index --refresh full` before trusting packet/search evidence.",
+                "semantic stale: {}. Run `codestory-cli retrieval index --refresh full`; the embedded engine initializes automatically.",
                 gaps.join("; ")
             ),
         )
@@ -7973,7 +6854,7 @@ fn doctor_check(
     }
 }
 
-fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutput {
+fn doctor_sidecar_check(sidecar: &RetrievalStatusOutput) -> DoctorCheckOutput {
     if doctor_sidecar_status_is_live_ready(sidecar) {
         let device_note = if sidecar.embedding_cpu_allowed {
             format!(
@@ -7989,9 +6870,7 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
         return doctor_check(
             "sidecar_retrieval",
             "ok",
-            format!(
-                "mandatory sidecar retrieval is full; packet/search evidence can use sidecar primary.{device_note}"
-            ),
+            format!("retrieval is ready for packet/search evidence.{device_note}"),
         );
     }
 
@@ -8003,7 +6882,7 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
         "sidecar_retrieval",
         "error",
         format!(
-            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); packet/search evidence is blocked until sidecars are full.",
+            "retrieval is not ready (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); packet/search evidence remains blocked.",
             sidecar.retrieval_mode,
             sidecar.embedding_device_policy,
             sidecar.embedding_device_state,
@@ -8060,9 +6939,6 @@ fn index_next_commands(
         && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
     {
         commands.push(format!(
-            "codestory-cli retrieval bootstrap --project {project}"
-        ));
-        commands.push(format!(
             "codestory-cli retrieval index --project {project} --refresh full"
         ));
     }
@@ -8109,10 +6985,15 @@ fn write_context_bundle<T: serde::Serialize>(
             "context.json details were omitted because the summary still exceeded the bundle byte cap."
                 .to_string(),
         );
+        let metadata = serde_json::to_value(output)
+            .ok()
+            .and_then(|value| value.get("_meta").cloned())
+            .unwrap_or(serde_json::Value::Null);
         context_json = serde_json::to_string_pretty(&serde_json::json!({
             "truncated": true,
             "reason": "context bundle output hit its byte cap",
             "action": "Narrow the target or use JSON output without --bundle for the full in-memory response.",
+            "_meta": metadata,
         }))
         .context("Failed to serialize minimal context bundle summary JSON")?;
     }
@@ -8223,6 +7104,7 @@ fn context_bundle_summary_json<T: serde::Serialize>(output: &T) -> Result<String
         "truncated": true,
         "reason": "context bundle output hit its byte cap",
         "action": "Narrow the target or use JSON output without --bundle for the full in-memory response.",
+        "_meta": value.get("_meta"),
         "target": value.get("target"),
         "resolution": value.get("resolution"),
         "context_summary": value.pointer("/context/summary"),
@@ -8512,6 +7394,10 @@ fn build_search_hit_output(
             .match_quality
             .unwrap_or_else(|| search_match_quality(query, hit)),
         resolvable: hit.resolvable,
+        evidence_tier: hit.evidence_tier,
+        evidence_producer: hit.evidence_producer.clone(),
+        resolution_status: hit.resolution_status,
+        eligible_for_sufficiency: hit.eligible_for_sufficiency,
         score_breakdown,
         duplicate_of: None,
         excerpt: repo_text_excerpt(project_root, hit),
@@ -9149,22 +8035,108 @@ fn compact_excerpt(line: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::RefreshMode;
     use crate::display::{clean_path_string, relative_path};
-    use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
+    use crate::runtime::{cache_root_for_project, fnv1a_hex};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
-        AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse,
-        IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto,
-        IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId,
-        PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto,
-        PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
-        ProjectSummary, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-        SemanticModeDto, StorageStatsDto, TrailContextDto,
+        AgentRetrievalTraceDto, CorePromotionTimings, DatabaseSnapshotCopyTimings, EdgeId,
+        EdgeKind, FullRefreshWallTimings, GraphEdgeDto, GraphNodeDto, GraphResponse,
+        IndexDryRunDto, IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+        IndexedFileRoleDto, IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings,
+        NodeDetailsDto, NodeId, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
+        PacketClaimDto, PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto,
+        PacketSufficiencyDto, ProjectSummary, ProjectionPersistenceFamilyTimings,
+        ProjectionPersistenceTimings, RetrievalModeDto, RetrievalStateDto, SearchHit,
+        SearchHitOrigin, SemanticModeDto, SourcePolicyExclusionDto, StorageStatsDto,
+        TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn parsed_command(args: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("codestory-cli").chain(args.iter().copied()))
+            .expect("command should parse")
+            .command
+    }
+
+    #[test]
+    fn ground_and_retrieval_status_install_observe_only_live_transport() {
+        for args in [&["ground"][..], &["retrieval", "status"][..]] {
+            assert_eq!(
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
+                "{args:?} should retain a live observe transport without spawn authority"
+            );
+        }
+    }
+
+    #[test]
+    fn ground_and_retrieval_status_retain_the_native_live_probe() -> Result<()> {
+        for args in [&["ground"][..], &["retrieval", "status"][..]] {
+            assert_eq!(
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::ObserveOnly)
+            );
+        }
+        embedding_server_transport::install_client_transport(
+            embedding_server_transport::ClientTransportMode::ObserveOnly,
+        )?;
+        let runtime = sidecar_runtime::local();
+        let client = codestory_retrieval::PerUserEmbeddingClient::for_runtime(&runtime)?;
+        if let Err(error) = client.observe() {
+            let message = format!("{error:#}");
+            assert!(
+                !message.contains("embedding_server_transport_unavailable")
+                    && !message.contains("embedding_server_spawn_forbidden"),
+                "an observational command must execute the native live probe: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_client_transport_startup_keeps_embedding_capable_commands() {
+        for args in [
+            &["index"][..],
+            &["packet", "--question", "explain the runtime"][..],
+            &["search", "--query", "RuntimeContext"][..],
+            &["retrieval", "index"][..],
+            &["retrieval", "query", "RuntimeContext"][..],
+            &["serve"][..],
+            &[
+                "internal-embedding-qualification",
+                "--request",
+                "/private/request.json",
+                "--output",
+                "/private/output.json",
+            ][..],
+        ] {
+            assert_eq!(
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::SpawnCapable),
+                "{args:?} should retain exact executable identity capture"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_client_transport_startup_keeps_non_status_and_server_boundaries() {
+        for args in [
+            &["retrieval", "inventory"][..],
+            &["retrieval", "republish-projections"][..],
+        ] {
+            assert_eq!(
+                embedding_client_transport_mode(&parsed_command(args)),
+                Some(embedding_server_transport::ClientTransportMode::SpawnCapable),
+                "{args:?} should not widen the observational exemption"
+            );
+        }
+        assert_eq!(
+            embedding_client_transport_mode(&parsed_command(&["internal-embedding-server"])),
+            None
+        );
+    }
 
     struct EnvVarSnapshot<'a> {
         values: Vec<(&'a str, Option<std::ffi::OsString>)>,
@@ -9198,6 +8170,146 @@ mod tests {
         }
     }
 
+    fn agent_surface_refresh_fixture() -> (tempfile::TempDir, ProjectArgs, PathBuf, u32) {
+        let temp = tempdir().expect("create temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(project.join("src")).expect("create source directory");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"agent-surface-refresh-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        fs::write(
+            project.join("src/lib.rs"),
+            "pub fn agent_surface_refresh_fixture() -> u32 { 1 }\n",
+        )
+        .expect("write source");
+        let project_args = ProjectArgs {
+            project,
+            cache_dir: Some(cache),
+        };
+        let runtime = RuntimeContext::new_inspect_only(&project_args).expect("create runtime");
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish current core generation");
+        let storage_path = runtime.storage_path.clone();
+        let schema_version = sqlite_schema_version(&storage_path);
+        (temp, project_args, storage_path, schema_version)
+    }
+
+    fn sqlite_schema_version(path: &Path) -> u32 {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open database read-only");
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("read schema version")
+    }
+
+    fn stamp_sqlite_schema_version(path: &Path, version: u32) {
+        let connection = rusqlite::Connection::open(path).expect("open database");
+        connection
+            .pragma_update(None, "user_version", version)
+            .expect("stamp schema version");
+    }
+
+    fn durable_database_and_wal(path: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+        (
+            fs::read(path).expect("read database"),
+            fs::read(path.with_extension("db-wal")).ok(),
+        )
+    }
+
+    #[test]
+    fn agent_surface_preflights_precurrent_schema_before_summary_open() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvVarSnapshot::clear(&[
+            "CODESTORY_RETRIEVAL_PROFILE",
+            "CODESTORY_RETRIEVAL_RUN_ID",
+            "CI",
+            "GITHUB_ACTIONS",
+        ]);
+        let (_temp, project_args, storage_path, current_schema) = agent_surface_refresh_fixture();
+        assert!(current_schema > 1, "fixture needs a pre-current schema");
+        let old_schema = current_schema - 1;
+        stamp_sqlite_schema_version(&storage_path, old_schema);
+        let durable_before = durable_database_and_wal(&storage_path);
+
+        let error = match open_agent_surface(
+            &project_args,
+            None,
+            None,
+            args::RefreshMode::Incremental,
+            "packet",
+        ) {
+            Ok(_) => panic!("explicit incremental must reject the old schema"),
+            Err(error) => error,
+        };
+        let api = runtime::api_error_in_chain(&error).expect("typed compatibility error");
+        assert_eq!(api.code, "full_refresh_required");
+        assert_eq!(
+            api.details
+                .as_deref()
+                .and_then(|details| details.cause_code.as_deref()),
+            Some("core_schema_upgrade_required")
+        );
+        assert_eq!(durable_database_and_wal(&storage_path), durable_before);
+        assert_eq!(sqlite_schema_version(&storage_path), old_schema);
+
+        let opened =
+            open_agent_surface(&project_args, None, None, args::RefreshMode::Auto, "packet")
+                .expect("auto may select full recovery");
+        assert!(
+            opened.before.is_none(),
+            "compatibility recovery has no safe pre-refresh summary"
+        );
+        assert_eq!(opened.opened.refresh_mode, Some(IndexMode::Full));
+        assert_eq!(
+            opened.opened.refresh_reason.as_deref(),
+            Some("core_schema_upgrade_required")
+        );
+        assert_eq!(sqlite_schema_version(&storage_path), current_schema);
+    }
+
+    #[test]
+    fn agent_surface_preflight_preserves_pending_promotion_without_recovery() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvVarSnapshot::clear(&[
+            "CODESTORY_RETRIEVAL_PROFILE",
+            "CODESTORY_RETRIEVAL_RUN_ID",
+            "CI",
+            "GITHUB_ACTIONS",
+        ]);
+        let (_temp, project_args, storage_path, _current_schema) = agent_surface_refresh_fixture();
+        let prepared_path = PathBuf::from(format!(
+            "{}.promotion.prepared.json",
+            storage_path.display()
+        ));
+        let prepared = b"pending promotion evidence";
+        fs::write(&prepared_path, prepared).expect("write pending promotion marker");
+        let durable_before = durable_database_and_wal(&storage_path);
+
+        for refresh in [args::RefreshMode::Auto, args::RefreshMode::Incremental] {
+            let error = match open_agent_surface(&project_args, None, None, refresh, "packet") {
+                Ok(_) => panic!("pending promotion must fail closed for {refresh:?}"),
+                Err(error) => error,
+            };
+            let api = runtime::api_error_in_chain(&error).expect("typed fail-closed error");
+            assert_eq!(api.code, "internal");
+            assert!(
+                api.message.contains("promotion recovery is pending"),
+                "{api:?}"
+            );
+        }
+
+        assert_eq!(durable_database_and_wal(&storage_path), durable_before);
+        assert_eq!(
+            fs::read(&prepared_path).expect("pending promotion marker remains"),
+            prepared
+        );
+    }
+
     fn assert_order(markdown: &str, first: &str, second: &str) {
         let first_index = markdown
             .find(first)
@@ -9209,6 +8321,28 @@ mod tests {
             first_index < second_index,
             "expected `{first}` before `{second}` in:\n{markdown}"
         );
+    }
+
+    #[test]
+    fn command_failure_message_keeps_typed_guidance_through_outer_context() {
+        let error = map_api_error(ApiError::retrieval_unavailable(
+            "retrieval is unavailable",
+            "/tmp/project",
+            vec!["codestory-cli retrieval index --project /tmp/project".to_string()],
+        ))
+        .context("retrieval index finalize");
+
+        let message = command_failure_message(&error);
+        assert!(message.starts_with("retrieval index finalize:"));
+        assert!(message.contains("retrieval_unavailable: retrieval is unavailable"));
+        assert!(message.contains("Minimum next:"));
+    }
+
+    #[test]
+    fn command_failure_message_leaves_untyped_errors_unchanged() {
+        let error = anyhow::anyhow!("storage unavailable").context("open project");
+
+        assert_eq!(command_failure_message(&error), "open project");
     }
 
     #[test]
@@ -9300,503 +8434,12 @@ mod tests {
         }
     }
 
-    fn ready_repair_test_component(
-        name: &str,
-        status: codestory_retrieval::ComponentStatus,
-        reason: &str,
-    ) -> codestory_retrieval::ComponentHealth {
-        codestory_retrieval::ComponentHealth {
-            name: name.into(),
-            status,
-            latency_ms: None,
-            detail: reason.into(),
-            degraded_reason: Some(reason.into()),
-            capabilities: codestory_retrieval::SidecarCapabilities::NONE,
-        }
-    }
-
-    fn ready_repair_test_report(
-        mode: &str,
-        reason: Option<&str>,
-    ) -> codestory_retrieval::RetrievalStatusReport {
-        codestory_retrieval::RetrievalStatusReport {
-            retrieval_mode: mode.into(),
-            ownership: None,
-            sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
-            degraded_reason: reason.map(str::to_string),
-            repair: None,
-            query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
-            manifest_vector_embedding_backend: None,
-            manifest_vector_embedding_dim: None,
-            stored_doc_vector_producer_backend: None,
-            stored_doc_vector_dim: None,
-            stored_doc_vector_mixed_backends: None,
-            embedding_device_policy: "accelerator_required".into(),
-            embedding_device_state: "accelerated".into(),
-            embedding_device_observation_source: "native_log".into(),
-            embedding_detected_provider: Some("amd".into()),
-            embedding_detected_gpu: Some("Vulkan0".into()),
-            embedding_accelerator_requested: true,
-            embedding_accelerator_request_provider: Some("vulkan".into()),
-            embedding_accelerator_request_device: Some("Vulkan0".into()),
-            embedding_cpu_allowed: false,
-            embedding_launch: None,
-            lexical: ready_repair_test_component(
-                "lexical",
-                codestory_retrieval::ComponentStatus::Unavailable,
-                "retrieval_manifest_missing",
-            ),
-            qdrant: ready_repair_test_component(
-                "qdrant",
-                codestory_retrieval::ComponentStatus::Unavailable,
-                "retrieval_manifest_missing",
-            ),
-            scip: ready_repair_test_component(
-                "scip",
-                codestory_retrieval::ComponentStatus::Unavailable,
-                "retrieval_manifest_missing",
-            ),
-            manifest_contract: None,
-            manifest: None,
-        }
-    }
-
-    #[test]
-    fn ready_repair_final_status_accepts_full_mode() {
-        let report = ready_repair_test_report("full", None);
-
-        ensure_ready_repair_full_sidecar(&report).expect("full mode should pass");
-    }
-
-    #[test]
-    fn ready_repair_final_snapshot_preserves_embed_smoke_proof() {
-        let final_status = ready_repair_test_report("full", None);
-        let infrastructure = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
-            embed_reachable: true,
-            embedding_device_policy: "accelerator_required".into(),
-            embedding_device_state: "accelerated".into(),
-            embedding_device_observation_source: "native_log".into(),
-            embedding_detected_provider: Some("amd".into()),
-            embedding_detected_gpu: Some("Vulkan0".into()),
-            embedding_accelerator_requested: true,
-            embedding_accelerator_request_provider: Some("vulkan".into()),
-            embedding_accelerator_request_device: Some("Vulkan0".into()),
-            embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
-            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
-        };
-        let result = ReadyRepairResult {
-            final_status,
-            gpu_proof: broker_gpu_proof_input_from_infrastructure_with_smoke(
-                &infrastructure,
-                Some(&codestory_retrieval::EmbeddingAcceleratorSmoke {
-                    elapsed_ms: 17,
-                    device: codestory_retrieval::EmbeddingDeviceReadiness {
-                        requested_policy: "accelerator_required",
-                        observed_state: "accelerated",
-                        observation_source: "native_log",
-                        detected_provider: Some("amd".into()),
-                        detected_gpu: Some("Vulkan0".into()),
-                        accelerator_requested: true,
-                        accelerator_request_provider: Some("vulkan".into()),
-                        accelerator_request_device: Some("Vulkan0".into()),
-                        cpu_allowed: false,
-                        full_retrieval_allowed: true,
-                        degraded_reason: None,
-                    },
-                }),
-            ),
-        };
-
-        let final_proof = readiness_broker::gpu_proof(result.gpu_proof.clone());
-        assert_eq!(final_proof.proof_status, "verified");
-        assert_eq!(final_proof.embed_smoke_ok, Some(true));
-        assert_eq!(final_proof.embed_smoke_ms, Some(17));
-
-        let report_only =
-            readiness_broker::gpu_proof(broker_gpu_proof_input_from_report(&result.final_status));
-        assert_eq!(report_only.proof_status, "gpu_unverified");
-        assert_eq!(report_only.embed_smoke_ok, None);
-    }
-
-    #[test]
-    fn ready_repair_reuses_only_accelerated_sidecar_with_identity_bound_proof() {
-        let project = tempfile::tempdir().expect("project");
-        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
-            project.path(),
-            codestory_retrieval::SidecarProfile::Agent,
-            Some("shared-agent"),
-        );
-        let full_accelerated = ready_repair_test_report("full", None);
-        let mut proof_input = broker_gpu_proof_input_from_report(&full_accelerated);
-        proof_input.embed_smoke_ok = Some(true);
-        proof_input.embed_smoke_ms = Some(17);
-        let mut verified = readiness_broker::gpu_proof(proof_input);
-        verified.runtime_identity = Some(readiness_broker::BrokerGpuRuntimeIdentity {
-            workspace_id: sidecar
-                .project_identity
-                .as_ref()
-                .expect("project identity")
-                .workspace_id
-                .clone(),
-            profile: sidecar.profile.as_str().into(),
-            run_id: sidecar.run_id.clone(),
-            namespace: sidecar.namespace.clone(),
-            compose_project: sidecar.compose_project.clone(),
-            embed_url: codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
-            embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
-            embedding_endpoint_fingerprint_sha256: sidecar
-                .ownership()
-                .embedding_endpoint_fingerprint_sha256,
-            started_at_epoch_ms: 1,
-            embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
-                provider: "vulkan".into(),
-                launch_mode: codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
-                    .as_str()
-                    .into(),
-                endpoint: "http://127.0.0.1:18080".into(),
-                pid: Some(1234),
-                spawned_at_epoch_ms: Some(1),
-                process_start_identity: None,
-                spawn_protocol: None,
-                launch_args: vec!["--port".into(), "18080".into()],
-                launch_fingerprint_sha256: Some("fingerprint".into()),
-                executable_source: Some("managed".into()),
-                executable_path: Some("C:/cache/llama-server.exe".into()),
-                model_path: Some("C:/cache/model.gguf".into()),
-                log_path: Some("C:/cache/llama-server-native.log".into()),
-                requested_device: Some("Vulkan0".into()),
-            }),
-        });
-        let surface_status = doctor_sidecar_status_from_report(
-            ready_repair_test_report("full", None),
-            Some(&sidecar),
-        );
-        assert!(!agent_surface_gpu_proof_is_valid(
-            &surface_status,
-            &sidecar,
-            None,
-        ));
-        assert!(agent_surface_gpu_proof_is_valid(
-            &surface_status,
-            &sidecar,
-            Some(&verified),
-        ));
-        assert!(ready_repair_existing_sidecar_is_reusable(
-            &full_accelerated,
-            Some(&verified),
-            &sidecar,
-        ));
-
-        let mut shared_endpoint_sidecar = sidecar.clone();
-        shared_endpoint_sidecar
-            .use_broker_verified_native_embedding_endpoint(8080)
-            .expect("retarget agent runtime to broker-verified endpoint");
-        let mut shared_endpoint_proof = verified.clone();
-        shared_endpoint_proof
-            .runtime_identity
-            .as_mut()
-            .expect("runtime identity")
-            .embed_url = shared_endpoint_sidecar.ownership().ports.embed_url.clone();
-        assert_ne!(shared_endpoint_sidecar.embed_http_port, 8080);
-        assert!(ready_repair_existing_sidecar_is_reusable(
-            &full_accelerated,
-            Some(&shared_endpoint_proof),
-            &shared_endpoint_sidecar,
-        ));
-        assert!(!ready_repair_existing_sidecar_is_reusable(
-            &full_accelerated,
-            None,
-            &sidecar,
-        ));
-
-        let mut unbound = verified.clone();
-        unbound.runtime_identity = None;
-        assert!(!ready_repair_existing_sidecar_is_reusable(
-            &full_accelerated,
-            Some(&unbound),
-            &sidecar,
-        ));
-        let mut mismatched = verified.clone();
-        mismatched
-            .runtime_identity
-            .as_mut()
-            .expect("runtime identity")
-            .namespace
-            .push_str("-other");
-        assert!(!ready_repair_existing_sidecar_is_reusable(
-            &full_accelerated,
-            Some(&mismatched),
-            &sidecar,
-        ));
-
-        let mut cpu_full = ready_repair_test_report("full", None);
-        cpu_full.embedding_device_state = "cpu".into();
-        cpu_full.embedding_cpu_allowed = true;
-        assert!(!ready_repair_existing_sidecar_is_reusable(
-            &cpu_full,
-            Some(&verified),
-            &sidecar,
-        ));
-
-        let mut unknown_full = ready_repair_test_report("full", None);
-        unknown_full.embedding_device_state = "unknown".into();
-        assert!(!ready_repair_existing_sidecar_is_reusable(
-            &unknown_full,
-            Some(&verified),
-            &sidecar,
-        ));
-    }
-
-    #[test]
-    fn ready_repair_progress_line_names_phase_identity_and_status() {
-        let line = ready_repair_progress_line(
-            "Qdrant finalize",
-            "agent",
-            "shared-agent",
-            "codestory-agent",
-            10,
-            "active",
-        );
-
-        assert!(line.starts_with("[ready-repair] "));
-        assert!(line.contains("phase=\"Qdrant finalize\""));
-        assert!(line.contains("profile=agent"));
-        assert!(line.contains("run_id=shared-agent"));
-        assert!(line.contains("namespace=codestory-agent"));
-        assert!(line.contains("elapsed_s=10"));
-        assert!(line.contains("status=active"));
-    }
-
-    #[test]
-    fn ready_repair_final_status_blocks_missing_manifest_after_finalize() {
-        let report = ready_repair_test_report("unavailable", Some("retrieval_manifest_missing"));
-
-        let error = ensure_ready_repair_full_sidecar(&report)
-            .expect_err("missing manifest after finalize must fail repair");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("did not reach full mode after finalize"));
-        assert!(message.contains("retrieval manifest was not persisted"));
-        assert!(message.contains("embedding_device_state=accelerated"));
-        assert!(message.contains("observation_source=native_log"));
-        assert!(message.contains("lexical=Unavailable"));
-        assert!(message.contains("qdrant=Unavailable"));
-        assert!(message.contains("scip=Unavailable"));
-    }
-
-    #[test]
-    fn ready_repair_embed_liveness_blocks_before_semantic_smoke() {
-        let infrastructure = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
-            embed_reachable: false,
-            embedding_device_policy: "accelerator_required".into(),
-            embedding_device_state: "accelerated".into(),
-            embedding_device_observation_source: "manual_env".into(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
-            embed_detail:
-                "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
-                    .into(),
-        };
-
-        let error = ensure_ready_repair_embed_liveness_with_probe(&infrastructure, || {
-            codestory_retrieval::EmbeddingRuntimeProbe {
-                reachable: false,
-                detail: "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
-                    .into(),
-                elapsed_ms: Some(8),
-            }
-        })
-        .expect_err("unreachable embedding endpoint must stop ready repair");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("embedding sidecar liveness failed"));
-        assert!(message.contains("before mandatory Qdrant semantic smoke"));
-        assert!(message.contains("http://127.0.0.1:55280/v1/embeddings"));
-    }
-
-    #[test]
-    fn ready_repair_blocks_unknown_embedding_device_before_indexing() {
-        let infrastructure = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
-            embed_reachable: true,
-            embedding_device_policy: "accelerator_required".into(),
-            embedding_device_state: "unknown".into(),
-            embedding_device_observation_source: "sidecar_unobserved".into(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
-            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
-        };
-
-        let error = ensure_ready_repair_embed_liveness_with_probe(&infrastructure, || {
-            unreachable!("device policy must fail before probing")
-        })
-        .expect_err("unknown device should stop ready repair before indexing");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("embedding device policy failed before long semantic indexing"));
-        assert!(message.contains("requested_policy=accelerator_required"));
-        assert!(message.contains("observed_device=unknown"));
-    }
-
-    #[test]
-    fn ready_repair_waits_for_native_log_before_liveness_failure() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env = EnvVarSnapshot::clear(&[
-            "CODESTORY_EMBED_SERVER_LAUNCH",
-            "CODESTORY_EMBED_ALLOW_CPU",
-            "CODESTORY_EMBED_DEVICE_POLICY",
-            "CODESTORY_EMBED_DEVICE_STATE",
-            "CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT",
-        ]);
-        unsafe {
-            std::env::set_var("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
-            std::env::set_var("CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT", "1");
-        }
-        let root = tempdir().expect("temp dir");
-        let sidecar = codestory_retrieval::SidecarRuntimeConfig {
-            project_identity: None,
-            layout: codestory_retrieval::SidecarLayout {
-                qdrant_http_port: 16333,
-                qdrant_grpc_port: 16334,
-                lexical_data_dir: root.path().join("lexical"),
-                qdrant_data_dir: root.path().join("qdrant"),
-                scip_artifacts_root: root.path().join("scip"),
-                state_file: root.path().join("state").join("retrieval-sidecars.json"),
-            },
-            profile: codestory_retrieval::SidecarProfile::Agent,
-            run_id: Some("shared-agent".into()),
-            namespace: "agent-shared-agent".into(),
-            compose_project: "codestory-agent-shared-agent".into(),
-            embed_http_port: 18080,
-            cleanup_command: "codestory-cli retrieval down".into(),
-            labels: BTreeMap::new(),
-            ..crate::sidecar_runtime::local()
-        };
-        let state_dir = sidecar.layout.state_file.parent().expect("state parent");
-        fs::create_dir_all(state_dir).expect("create state dir");
-        let log_path = state_dir.join("llama-server-native.log");
-        let stale = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
-            embed_reachable: true,
-            embedding_device_policy: "accelerator_required".into(),
-            embedding_device_state: "unknown".into(),
-            embedding_device_observation_source: "sidecar_state".into(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
-            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
-        };
-        ensure_ready_repair_embed_liveness_with_probe(&stale, || {
-            panic!("probe must not run when device state is unknown")
-        })
-        .expect_err("stale bootstrap observation should fail before re-observation");
-
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            fs::write(
-                log_path,
-                "starting native llama.cpp embedding server: test --device Vulkan0\nusing device Vulkan0\noffloaded 13/13 layers to GPU\n",
-            )
-            .expect("write native log");
-        });
-        let refreshed = ready_repair_infrastructure_with_runtime_observation(
-            &stale,
-            root.path(),
-            &root.path().join("missing.db"),
-            &sidecar,
-        );
-        writer.join().expect("native log writer");
-
-        assert_eq!(refreshed.embedding_device_state, "accelerated");
-        assert_eq!(refreshed.embedding_device_observation_source, "native_log");
-        let smoke = ensure_ready_repair_embed_liveness_with_probe(&refreshed, || {
-            codestory_retrieval::EmbeddingRuntimeProbe {
-                reachable: true,
-                detail: "llama.cpp embeddings reachable dim=768".into(),
-                elapsed_ms: Some(15),
-            }
-        })
-        .expect("native log observation should allow repair to continue");
-        assert_eq!(smoke.ok, Some(true));
-        assert_eq!(smoke.ms, Some(15));
-    }
-
-    #[test]
-    fn sidecar_profile_handoff_preserves_full_manifest_classification() {
-        let status = DoctorSidecarStatusOutput {
-            profile: Some("agent".to_string()),
-            run_id: Some("run".to_string()),
-            retrieval_mode: "full".to_string(),
-            degraded_reason: None,
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "accelerated".to_string(),
-            embedding_device_observation_source: "manual_env".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: Some("generation".to_string()),
-            manifest_input_hash: Some("hash".to_string()),
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
-
-        let downgraded = apply_sidecar_profile_handoff(
-            status,
-            Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
-                    .to_string(),
-            ),
-        );
-
-        assert_eq!(downgraded.retrieval_mode, "full");
-        assert_eq!(
-            downgraded.degraded_reason.as_deref(),
-            Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
-            )
-        );
-    }
-
     #[test]
     fn agent_readiness_runtime_does_not_collapse_to_local_without_agent_run() {
         let _env_lock = crate::config::config_env_test_lock();
         let _env_snapshot = EnvVarSnapshot::clear(&[
             "CODESTORY_RETRIEVAL_PROFILE",
-            "CODESTORY_SIDECAR_PROFILE",
-            "CODESTORY_AGENT_RUN_ID",
-            "CODESTORY_SIDECAR_RUN_ID",
-            "CODESTORY_AGENT",
-            "CODESTORY_AGENT_RUN",
+            "CODESTORY_RETRIEVAL_RUN_ID",
             "CI",
             "GITHUB_ACTIONS",
         ]);
@@ -9814,21 +8457,8 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_readiness_binds_broker_to_selected_shared_run() {
-        assert_eq!(
-            selected_agent_broker_run_id(Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID), None,)
-                .as_deref(),
-            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-        );
-        assert_eq!(
-            selected_agent_broker_run_id(Some("selected-run"), Some("requested-run")).as_deref(),
-            Some("selected-run")
-        );
-    }
-
-    #[test]
-    fn readiness_lane_keeps_agent_full_separate_from_local_handoff_mismatch() {
-        let sidecar = DoctorSidecarStatusOutput {
+    fn readiness_lane_prefers_live_agent_status_over_aggregate_failure() {
+        let sidecar = RetrievalStatusOutput {
             profile: Some("agent".to_string()),
             run_id: Some("run".to_string()),
             retrieval_mode: "full".to_string(),
@@ -9852,9 +8482,9 @@ mod tests {
         let aggregate_verdict = codestory_contracts::api::ReadinessVerdictDto {
             goal: ReadinessGoalDto::AgentPacketSearch,
             status: ReadinessStatusDto::RepairRetrieval,
-            summary: "profile_handoff_mismatch: local/default is unavailable".to_string(),
+            summary: "retrieval is unavailable".to_string(),
             minimum_next: vec![
-                "codestory-cli ready --goal agent --repair --project C:/repo --format json"
+                "codestory-cli retrieval index --project C:/repo --profile agent --refresh auto --format json"
                     .to_string(),
             ],
             full_repair: Vec::new(),
@@ -9871,7 +8501,7 @@ mod tests {
         );
 
         assert_eq!(lane.status, ReadinessStatusDto::Ready);
-        assert_eq!(lane.sidecar_mode, "full");
+        assert_eq!(lane.retrieval_mode, "full");
         assert_eq!(lane.profile, "agent");
         assert_eq!(lane.run_id.as_deref(), Some("run"));
         assert!(
@@ -9885,153 +8515,15 @@ mod tests {
     }
 
     #[test]
-    fn dead_agent_endpoint_emits_repair_retrieval_even_with_blocked_aggregate_verdict() {
-        let sidecar = DoctorSidecarStatusOutput {
-            profile: Some("agent".to_string()),
-            run_id: Some("run".to_string()),
-            retrieval_mode: "full".to_string(),
-            degraded_reason: Some("embedding_runtime_unavailable: connection refused".to_string()),
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "accelerated".to_string(),
-            embedding_device_observation_source: "sidecar_log".to_string(),
-            embedding_detected_provider: Some("metal".to_string()),
-            embedding_detected_gpu: Some("Apple GPU".to_string()),
-            embedding_accelerator_requested: true,
-            embedding_accelerator_request_provider: Some("metal".to_string()),
-            embedding_accelerator_request_device: Some("Metal".to_string()),
-            embedding_cpu_allowed: false,
-            manifest_generation: Some("generation".to_string()),
-            manifest_input_hash: Some("hash".to_string()),
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
-        let aggregate_verdict = codestory_contracts::api::ReadinessVerdictDto {
-            goal: ReadinessGoalDto::AgentPacketSearch,
-            status: ReadinessStatusDto::Blocked,
-            summary: "aggregate sidecar unavailable".to_string(),
-            minimum_next: vec![
-                "codestory-cli ready --goal agent --repair --project C:/repo --format json"
-                    .to_string(),
-            ],
-            full_repair: Vec::new(),
-            setup: None,
-            index: None,
-            sidecar: None,
-        };
-
-        let lane = readiness_lane_output(
-            "agent_packet_search",
-            &sidecar,
-            Some(&aggregate_verdict),
-            "C:/repo",
-        );
-
-        assert_eq!(lane.status, ReadinessStatusDto::RepairRetrieval);
-        assert_eq!(lane.sidecar_mode, "full");
-        assert!(
-            lane.degraded_reason
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("embedding_runtime_unavailable:"))
-        );
-        assert!(
-            lane.next_command
-                .as_deref()
-                .is_some_and(|command| command.contains("ready --goal agent --repair"))
-        );
-    }
-
-    #[test]
-    fn agent_goal_readiness_uses_full_agent_lane_despite_local_handoff_mismatch() {
-        let fallback = DoctorSidecarStatusOutput {
-            profile: Some("agent".to_string()),
-            run_id: Some("run".to_string()),
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
-                    .to_string(),
-            ),
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "sidecar_unobserved".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: None,
-            manifest_input_hash: None,
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
-        let agent_status = DoctorSidecarStatusOutput {
-            profile: Some("agent".to_string()),
-            run_id: Some("run".to_string()),
-            retrieval_mode: "full".to_string(),
-            degraded_reason: None,
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "accelerated".to_string(),
-            embedding_device_observation_source: "manual_env".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: Some("generation".to_string()),
-            manifest_input_hash: Some("hash".to_string()),
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
-
-        let selected = lane_scoped_agent_readiness_sidecar(&fallback, agent_status);
-        let stats = StorageStatsDto {
-            node_count: 1,
-            edge_count: 0,
-            file_count: 1,
-            error_count: 0,
-            fatal_error_count: 0,
-        };
-        let verdicts = build_summary_readiness("C:/repo", &stats, None, &selected);
-        let agent = verdicts
-            .iter()
-            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
-            .expect("agent readiness verdict");
-
-        assert_eq!(agent.status, ReadinessStatusDto::Ready);
-        assert_eq!(
-            agent
-                .sidecar
-                .as_ref()
-                .and_then(|sidecar| sidecar.profile.as_deref()),
-            Some("agent")
-        );
-        assert_eq!(
-            agent
-                .sidecar
-                .as_ref()
-                .map(|sidecar| sidecar.retrieval_mode.as_str()),
-            Some("full")
-        );
-        assert_eq!(doctor_sidecar_check(&selected).status, "ok");
-    }
-
-    #[test]
     fn agent_preflight_allows_full_surfaces_from_full_agent_lane() {
-        let local_default = DoctorSidecarStatusOutput {
+        let local_default = RetrievalStatusOutput {
             profile: Some("local".to_string()),
             run_id: None,
             retrieval_mode: "unavailable".to_string(),
             degraded_reason: Some("retrieval_manifest_missing".to_string()),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "sidecar_unobserved".to_string(),
+            embedding_device_observation_source: "retrieval_unobserved".to_string(),
             embedding_detected_provider: None,
             embedding_detected_gpu: None,
             embedding_accelerator_requested: false,
@@ -10045,7 +8537,7 @@ mod tests {
             precise_semantic_import_revision: None,
             precise_semantic_import_producer: None,
         };
-        let agent_status = DoctorSidecarStatusOutput {
+        let agent_status = RetrievalStatusOutput {
             profile: Some("agent".to_string()),
             run_id: Some("run".to_string()),
             retrieval_mode: "full".to_string(),
@@ -10092,8 +8584,7 @@ mod tests {
             ),
         );
 
-        let output =
-            build_agent_preflight_output(&verdicts, Path::new("C:/repo"), readiness_lanes, None);
+        let output = build_agent_preflight_output(&verdicts, readiness_lanes, None);
 
         assert!(output.usable);
         assert_eq!(output.mode, "full_retrieval");
@@ -10143,64 +8634,8 @@ mod tests {
             );
         }
         assert!(
-            output.repair_command.is_none(),
-            "ready local graph plus ready agent retrieval should not emit an aggregate repair command: {output:#?}"
-        );
-    }
-
-    #[test]
-    fn agent_goal_readiness_keeps_handoff_mismatch_when_agent_lane_is_not_full() {
-        let fallback = DoctorSidecarStatusOutput {
-            profile: Some("agent".to_string()),
-            run_id: Some("run".to_string()),
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(
-                "profile_handoff_mismatch: local/default is unavailable".to_string(),
-            ),
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "sidecar_unobserved".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: None,
-            manifest_input_hash: None,
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
-        let agent_status = DoctorSidecarStatusOutput {
-            profile: Some("agent".to_string()),
-            run_id: Some("run".to_string()),
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some("sidecar_status_error: missing manifest".to_string()),
-            embedding_device_policy: "accelerator_required".to_string(),
-            embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "sidecar_unobserved".to_string(),
-            embedding_detected_provider: None,
-            embedding_detected_gpu: None,
-            embedding_accelerator_requested: false,
-            embedding_accelerator_request_provider: None,
-            embedding_accelerator_request_device: None,
-            embedding_cpu_allowed: false,
-            manifest_generation: None,
-            manifest_input_hash: None,
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
-
-        let selected = lane_scoped_agent_readiness_sidecar(&fallback, agent_status);
-
-        assert_eq!(selected.retrieval_mode, "unavailable");
-        assert_eq!(
-            selected.degraded_reason.as_deref(),
-            Some("profile_handoff_mismatch: local/default is unavailable")
+            output.next_command.is_none(),
+            "ready local graph plus ready agent retrieval should not emit an aggregate next command: {output:#?}"
         );
     }
 
@@ -10303,12 +8738,10 @@ mod tests {
         let commands = index_next_commands("C:/repo", Some(&retrieval), None, true);
         let joined = commands.join("\n");
 
-        assert!(joined.contains("codestory-cli retrieval bootstrap --project"));
         assert!(
             joined.contains("codestory-cli retrieval index --project")
                 && joined.contains("--refresh full")
         );
-        assert!(!joined.contains("setup embeddings"));
     }
 
     #[test]
@@ -10317,9 +8750,9 @@ mod tests {
         retrieval.semantic_ready = false;
         retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
         retrieval.current_embedding = Some(codestory_contracts::api::EmbeddingProfileContractDto {
-            profile: "bge-base-en-v1.5".to_string(),
-            backend: "llamacpp".to_string(),
-            model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
+            profile: "coderank-embed".to_string(),
+            backend: "per_user_server".to_string(),
+            model_id: "nomic-ai/CodeRankEmbed".to_string(),
             cache_key: "current".to_string(),
             dimension: Some(768),
             doc_shape: "current-shape".to_string(),
@@ -10327,8 +8760,8 @@ mod tests {
         retrieval.stored_embedding =
             Some(codestory_contracts::api::StoredSemanticDocsContractDto {
                 doc_count: 1,
-                embedding_profile: Some("bge-base-en-v1.5".to_string()),
-                embedding_backend: Some("onnx".to_string()),
+                embedding_profile: Some("unexpected-profile".to_string()),
+                embedding_backend: Some("per_user_server".to_string()),
                 cache_key: Some("old".to_string()),
                 dimension: Some(768),
                 doc_version: Some(5),
@@ -10345,9 +8778,12 @@ mod tests {
 
         let check = semantic_contract_check(&retrieval);
 
-        assert!(check.message.contains("retrieval bootstrap"));
         assert!(check.message.contains("retrieval index --refresh full"));
-        assert!(!check.message.contains("setup embeddings"));
+        assert!(
+            check
+                .message
+                .contains("embedded engine initializes automatically")
+        );
     }
 
     #[test]
@@ -10362,6 +8798,7 @@ mod tests {
                 visible_file_count: 1,
                 incomplete_file_count: 1,
                 error_file_count: 0,
+                policy_exclusion_count: 0,
                 incomplete_reason_counts: vec![IndexedFileIncompleteReasonCountDto {
                     reason: "unknown".to_string(),
                     file_count: 1,
@@ -10373,6 +8810,8 @@ mod tests {
                 framework_route_coverage: Vec::new(),
                 coverage_notes: Vec::new(),
             },
+            coverage_gaps: Vec::new(),
+            policy_exclusions: Vec::new(),
             files: vec![IndexedFileDto {
                 path: "src/lib.rs".to_string(),
                 language: "rust".to_string(),
@@ -10394,6 +8833,60 @@ mod tests {
             markdown.contains("run a full reindex"),
             "incomplete counts need operator-actionable reason text: {markdown}"
         );
+    }
+
+    #[test]
+    fn files_markdown_labels_verified_policy_exclusions_as_non_graph_evidence() {
+        let output = IndexedFilesDto {
+            project_root: "/repo".into(),
+            usable: true,
+            summary: IndexedFilesSummaryDto {
+                file_count: 1,
+                indexed_file_count: 1,
+                filtered_file_count: 1,
+                visible_file_count: 1,
+                incomplete_file_count: 0,
+                error_file_count: 0,
+                policy_exclusion_count: 1,
+                incomplete_reason_counts: Vec::new(),
+                truncated: false,
+                language_counts: Vec::new(),
+                framework_route_coverage: Vec::new(),
+                coverage_notes: vec![
+                    "1 verified source policy exclusion has no parser-backed graph or semantic coverage"
+                        .into(),
+                ],
+            },
+            coverage_gaps: Vec::new(),
+            policy_exclusions: vec![SourcePolicyExclusionDto {
+                path: "vendor/registers.h".into(),
+                role: IndexedFileRoleDto::Vendor,
+                content_hash: "a".repeat(64),
+                observed_size: 279_751,
+                observed_unit_count: 4_514,
+                policy_version: "bounded-source-exclusion-v2".into(),
+                byte_cap: 1_000_000,
+                structural_unit_cap:
+                    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+                project_id: "project".into(),
+                workspace_id: "workspace".into(),
+                core_generation_id: "generation".into(),
+                core_run_id: "run".into(),
+                graph_coverage: false,
+                semantic_coverage: false,
+            }],
+            files: Vec::new(),
+        };
+
+        let markdown = render_files_markdown(&output);
+        assert!(markdown.contains("policy exclusions: 1"), "{markdown}");
+        assert!(
+            markdown.contains("source inventory only; no graph or semantic coverage"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("vendor/registers.h"), "{markdown}");
+        assert!(markdown.contains("4514 structural units"), "{markdown}");
+        assert!(markdown.contains("unit_cap=2048"), "{markdown}");
     }
 
     #[test]
@@ -10463,6 +8956,7 @@ mod tests {
             graphs: vec![graph],
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "context-test".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -10502,6 +8996,7 @@ mod tests {
                     query: "task brief packet surface".to_string(),
                     purpose: "find packet entry points".to_string(),
                 }],
+                probe_resolutions: Vec::new(),
                 trace: Vec::new(),
             },
             answer: AgentAnswerDto {
@@ -10516,6 +9011,7 @@ mod tests {
                 graphs: Vec::new(),
                 retrieval_trace: AgentRetrievalTraceDto {
                     request_id: "trace-task-brief".to_string(),
+                    retrieval_publication: None,
                     resolved_profile: AgentRetrievalPresetDto::Architecture,
                     policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                     total_latency_ms: 1,
@@ -10564,7 +9060,7 @@ mod tests {
                 avoid_opening_paths: Vec::new(),
                 gaps: vec!["verify `changed` files after editing".to_string()],
                 follow_up_commands: vec![
-                    "codestory-cli ready --goal agent --repair --project . --format json"
+                    "codestory-cli retrieval index --project . --profile agent --refresh auto --format json"
                         .to_string(),
                 ],
                 coverage_report: None,
@@ -10572,6 +9068,7 @@ mod tests {
             retrieval_trace_summary: PacketRetrievalTraceSummaryDto {
                 retrieval_trace: AgentRetrievalTraceDto {
                     request_id: "trace-task-brief".to_string(),
+                    retrieval_publication: None,
                     resolved_profile: AgentRetrievalPresetDto::Architecture,
                     policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                     total_latency_ms: 1,
@@ -10642,10 +9139,90 @@ mod tests {
             edge_resolution_ms: 30,
             error_flush_ms: 4,
             cleanup_ms: 5,
+            full_refresh_wall: Some(FullRefreshWallTimings {
+                core_refresh_ms: 1_000,
+                live_inspection_ms: 10,
+                source_discovery_ms: 20,
+                stage_open_ms: 30,
+                indexer_execution_ms: 400,
+                coverage_validation_ms: 40,
+                copy_forward_ms: 50,
+                semantic_stage_ms: 150,
+                snapshot_stage_ms: 100,
+                publication_prepare_ms: 50,
+                search_generation_ms: 100,
+                catalog_publication_ms: 30,
+                unattributed_ms: 20,
+            }),
+            source_prepare_ms: Some(41),
+            projection_batch_wall_ms: Some(50),
+            projection_batch_transactions: Some(2),
+            projection_persistence: Some(ProjectionPersistenceTimings {
+                transactions: 2,
+                row_attempts: 40,
+                bound_bytes: 4096,
+                statement_executions: 35,
+                transaction_wall_ms: 48,
+                transaction_setup_ms: 1,
+                commit_ms: 7,
+                files: ProjectionPersistenceFamilyTimings {
+                    row_attempts: 4,
+                    bound_bytes: 512,
+                    statement_executions: 4,
+                    wall_ms: 3,
+                },
+                dirty_state: ProjectionPersistenceFamilyTimings {
+                    row_attempts: 8,
+                    bound_bytes: 96,
+                    statement_executions: 8,
+                    wall_ms: 2,
+                },
+                ..Default::default()
+            }),
+            artifact_cache_write_ms: Some(6),
+            artifact_cache_writes: Some(24),
+            artifact_cache_write_transactions: Some(1),
+            parser_artifact_cache: None,
+            structural_artifact_cache: None,
+            full_refresh_chunks_produced: Some(2),
+            full_refresh_chunks_persisted: Some(2),
+            full_refresh_queue_capacity: Some(1),
+            full_refresh_queue_high_water: Some(1),
+            full_refresh_producer_blocked_ms: Some(3),
+            full_refresh_writer_idle_ms: Some(4),
+            full_refresh_chunk_target_bytes: Some(8_388_608),
+            full_refresh_chunk_target_nodes: Some(120_000),
+            full_refresh_chunk_file_ceiling: Some(512),
+            full_refresh_chunk_max_files: Some(384),
+            full_refresh_chunk_max_planned_bytes: Some(7_500_000),
+            full_refresh_chunk_max_nodes: Some(98_000),
+            full_refresh_chunk_budget_overruns: Some(0),
+            full_refresh_chunk_planning_ms: Some(5),
             cache_refresh_ms: Some(6),
             search_projection_rebuild_ms: Some(61),
+            search_symbol_stream_ms: Some(60),
+            search_symbol_stream_rows: Some(8192),
+            search_symbol_stream_batches: Some(2),
             search_symbol_index_ms: Some(62),
+            search_symbol_index_docs_written: Some(8192),
+            search_symbol_index_writer_count: Some(1),
+            search_symbol_index_commit_count: Some(1),
+            search_symbol_index_commit_ms: Some(64),
+            search_symbol_index_reload_count: Some(1),
+            search_symbol_index_reload_ms: Some(65),
             runtime_cache_publish_ms: Some(63),
+            semantic_context_index_ms: Some(59),
+            semantic_node_load_ms: Some(66),
+            semantic_node_load_rows: Some(8_192),
+            semantic_node_stream_batches: Some(2),
+            semantic_endpoint_load_ms: Some(6),
+            semantic_endpoint_load_rows: Some(4_096),
+            semantic_endpoint_load_batches: Some(21),
+            semantic_selected_nodes: Some(2_048),
+            semantic_context_file_count: Some(128),
+            semantic_context_path_bytes: Some(16_384),
+            semantic_node_lookup_entries: Some(8_192),
+            semantic_context_ms: Some(67),
             semantic_doc_build_ms: Some(7),
             semantic_embedding_ms: Some(8),
             semantic_db_upsert_ms: Some(9),
@@ -10667,6 +9244,33 @@ mod tests {
             summary_snapshot_ms: Some(8),
             detail_snapshot_ms: Some(9),
             publish_ms: Some(10),
+            staged_sqlite_wal_autocheckpoint_bytes: Some(67_108_864),
+            staged_sqlite_checkpoint_ms: Some(11),
+            staged_sqlite_sync_ms: Some(12),
+            staged_snapshot_copy: Some(DatabaseSnapshotCopyTimings {
+                copy_ms: 13,
+                source_bytes: 1_024,
+                target_bytes: 1_024,
+            }),
+            core_promotion: Some(CorePromotionTimings {
+                total_ms: 89,
+                lock_recovery_ms: 1,
+                candidate_validation_ms: 11,
+                previous_validation_ms: 12,
+                rollback_backup_copy_ms: Some(13),
+                backup_validation_ms: Some(14),
+                prepared_journal_write_ms: 2,
+                prepared_journal_file_sync_ms: 3,
+                prepared_journal_directory_sync_ms: 4,
+                staged_to_live_restore_ms: 15,
+                promoted_validation_ms: 10,
+                committed_journal_ms: 2,
+                cleanup_ms: 1,
+                unattributed_ms: 1,
+                candidate_bytes: 2_048,
+                previous_live_bytes: Some(1_024),
+                rollback_backup_bytes: Some(1_024),
+            }),
             setup_existing_projection_ids_ms: Some(11),
             setup_seed_symbol_table_ms: Some(12),
             flush_files_ms: Some(13),
@@ -10690,6 +9294,9 @@ mod tests {
             resolution_import_candidate_index_ms: Some(31),
             resolution_call_semantic_index_ms: Some(32),
             resolution_import_semantic_index_ms: Some(33),
+            resolution_support_snapshot_limit_bytes: Some(1_000_000_000),
+            resolution_support_snapshot_stored: Some(true),
+            resolution_support_snapshot_skipped_oversize: Some(false),
             resolution_call_semantic_candidates_ms: Some(34),
             resolution_import_semantic_candidates_ms: Some(35),
             resolution_call_semantic_requests: Some(36),
@@ -10730,6 +9337,9 @@ mod tests {
             end_col: None,
             member_access: None,
             route_endpoint: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
         }
     }
 
@@ -10804,48 +9414,35 @@ mod tests {
     }
 
     #[test]
-    fn auto_refresh_uses_full_for_empty_index() {
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(0)),
-            Some(IndexMode::Full)
-        );
-    }
+    fn dry_run_reports_requested_effective_and_compatibility_reason() {
+        let dry_run = IndexDryRunDto {
+            root: "/tmp/project".to_string(),
+            storage_path: "/tmp/cache/codestory.db".to_string(),
+            refresh: IndexMode::Full,
+            files_to_index: 4,
+            files_to_remove: 0,
+            sample_files_to_index: Vec::new(),
+            sample_file_ids_to_remove: Vec::new(),
+            members: Vec::new(),
+        };
+        let output = IndexDryRunOutput {
+            requested_refresh: "auto",
+            effective_refresh: "full",
+            compatibility_reason: Some("structural_publication_incompatible"),
+            dry_run: &dry_run,
+        };
 
-    #[test]
-    fn auto_refresh_uses_incremental_for_existing_index() {
+        let json = serde_json::to_value(&output).expect("serialize dry-run decision");
+        assert_eq!(json["requested_refresh"], "auto");
+        assert_eq!(json["effective_refresh"], "full");
         assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
-            Some(IndexMode::Incremental)
+            json["compatibility_reason"],
+            "structural_publication_incompatible"
         );
-    }
-
-    #[test]
-    fn interrupted_incremental_resolves_and_labels_staged_full_recovery() {
-        let mut summary = summary_with_files(3);
-        summary.freshness = Some(IndexFreshnessDto {
-            status: IndexFreshnessStatusDto::Stale,
-            changed_file_count: 0,
-            new_file_count: 0,
-            removed_file_count: 0,
-            checked_file_count: 0,
-            indexed_file_count: 3,
-            duration_ms: 0,
-            reason: Some("previous_incremental_run_incomplete_full_refresh_required".to_string()),
-            samples: Vec::new(),
-        });
-
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Auto, &summary),
-            Some(IndexMode::Full)
-        );
-        assert_eq!(
-            resolve_refresh_request(RefreshMode::Incremental, &summary),
-            Some(IndexMode::Full)
-        );
-        assert_eq!(
-            refresh_label(RefreshMode::Incremental, Some(IndexMode::Full)),
-            "incremental(recovery-full)"
-        );
+        let markdown = render_index_dry_run_markdown(&output);
+        assert!(markdown.contains("requested_refresh: `auto`"));
+        assert!(markdown.contains("effective_refresh: `full`"));
+        assert!(markdown.contains("compatibility_reason: `structural_publication_incompatible`"));
     }
 
     #[test]
@@ -10856,7 +9453,8 @@ mod tests {
         let output = IndexOutput {
             project: &summary.root,
             storage_path: "C:/repo/.cache/index.sqlite",
-            refresh: "full",
+            refresh: "auto(full)",
+            refresh_reason: Some("structural_publication_incompatible"),
             summary: &summary,
             retrieval: &retrieval,
             phase_timings: Some(&timings),
@@ -10867,16 +9465,59 @@ mod tests {
 
         let markdown = render_index_markdown(&output);
 
-        assert!(
-            markdown.contains("cache_ms: search_projection=61 search_index=62 runtime_publish=63")
-        );
+        assert!(markdown.contains("refresh: `auto(full)`"));
+        assert!(markdown.contains("refresh_reason: `structural_publication_incompatible`"));
+
+        assert!(markdown.contains(
+            "cache_ms: artifact_write=6 search_projection=61 search_index=62 runtime_publish=63"
+        ));
+        assert!(markdown.contains("artifact_cache: writes=24 transactions=1"));
+        assert!(markdown.contains(
+            "full_refresh_pipeline: produced=2 persisted=2 queue_capacity=1 queue_high_water=1 producer_blocked_ms=3 writer_idle_ms=4"
+        ));
+        assert!(markdown.contains(
+            "full_refresh_chunking: target_bytes=8388608 target_nodes=120000 file_ceiling=512 max_files=384 max_planned_bytes=7500000 max_nodes=98000 overruns=0 planning_ms=5"
+        ));
+        assert!(markdown.contains(
+            "symbol_index: stream_ms=60 stream_rows=8192 stream_batches=2 docs=8192 writers=1 commits=1 commit_ms=64 reloads=1 reload_ms=65"
+        ));
+        assert!(markdown.contains(
+            "full_refresh_wall_ms: core_refresh=1000 live_inspection=10 source_discovery=20 stage_open=30 indexer_execution=400 coverage_validation=40 copy_forward=50 semantic_stage=150 snapshot_stage=100 publication_prepare=50 search_generation=100 catalog_publication=30 unattributed=20"
+        ));
+        assert!(markdown.contains("indexer_io_ms: source_prepare=41 projection_batch_wall=50"));
+        assert!(markdown.contains("projection_batches: transactions=2"));
+        assert!(markdown.contains(
+            "projection_persistence: transactions=2 rows=40 bound_bytes=4096 statements=35 transaction_wall_ms=48 setup_ms=1 commit_ms=7"
+        ));
+        assert!(markdown.contains(
+            "projection_persistence.files: rows=4 bound_bytes=512 statements=4 wall_ms=3"
+        ));
+        assert!(markdown.contains(
+            "projection_persistence.dirty_state: rows=8 bound_bytes=96 statements=8 wall_ms=2"
+        ));
         assert!(
             markdown
-                .contains("semantic_ms: doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
+                .contains("semantic_ms: context_index=59 node_load=66 endpoint_load=6 context=67 doc_build=7 embedding=8 db_upsert=9 reload=10 prune=64")
         );
+        assert!(markdown.contains(
+            "semantic_context: node_rows=8192 node_batches=2 endpoint_rows=4096 endpoint_batches=21 selected_nodes=2048 files=128 path_bytes=16384 lookup_peak=8192"
+        ));
         assert!(markdown.contains("semantic_docs: reused=11 embedded=12 pending=13 stale=14"));
         assert!(markdown.contains(
             "staged_publish_ms: deferred_indexes=7 summary_snapshot=8 detail_snapshot=9 publish=10"
+        ));
+        assert!(markdown.contains(
+            "staged_sqlite: wal_autocheckpoint_bytes=67108864 checkpoint_ms=11 sync_ms=12"
+        ));
+        assert!(
+            markdown
+                .contains("staged_snapshot_copy: copy_ms=13 source_bytes=1024 target_bytes=1024")
+        );
+        assert!(markdown.contains(
+            "core_promotion_ms: total=89 lock_recovery=1 candidate_validation=11 previous_validation=12 rollback_backup_copy=13 backup_validation=14 prepared_journal_write=2 prepared_journal_file_sync=3 prepared_journal_directory_sync=4 staged_to_live_restore=15 promoted_validation=10 committed_journal=2 cleanup=1 unattributed=1"
+        ));
+        assert!(markdown.contains(
+            "core_promotion_bytes: candidate=2048 previous_live=1024 rollback_backup=1024"
         ));
         assert!(markdown.contains("setup_ms: existing_projection_ids=11 seed_symbol_table=12"));
         assert!(
@@ -10889,6 +9530,9 @@ mod tests {
         ));
         assert!(markdown.contains(
             "resolution_indexes_ms: call_candidate=30 import_candidate=31 call_semantic=32 import_semantic=33"
+        ));
+        assert!(markdown.contains(
+            "resolution_support_snapshot: limit_bytes=1000000000 stored=true skipped_oversize=false"
         ));
         assert!(markdown.contains(
             "resolution_detail_ms: call_semantic_candidates=34 import_semantic_candidates=35 call_compute=42 import_compute=43 call_apply=44 import_apply=45 overrides=46"
@@ -10959,6 +9603,147 @@ mod tests {
             output.repo_text_hits[0].origin,
             codestory_contracts::api::SearchHitOrigin::TextMatch
         );
+    }
+
+    #[test]
+    fn cli_search_and_resolution_keep_structural_evidence_metadata() {
+        let root = Path::new("C:/repo");
+        let manifest = SearchHit {
+            node_id: NodeId("cargo-package".to_string()),
+            display_name: "demo".to_string(),
+            kind: NodeKind::PACKAGE,
+            file_path: Some("C:/repo/Cargo.toml".to_string()),
+            line: Some(2),
+            score: 0.9,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_cargo_manifest_collector".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            eligible_for_sufficiency: Some(false),
+            ..test_search_hit_defaults()
+        };
+        let workflow = SearchHit {
+            node_id: NodeId("workflow-job".to_string()),
+            display_name: "test".to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some("C:/repo/.github/workflows/ci.yml".to_string()),
+            line: Some(12),
+            score: 0.8,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText),
+            evidence_producer: Some("structural_github_actions_workflow_collector".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            eligible_for_sufficiency: Some(false),
+            ..test_search_hit_defaults()
+        };
+        let output = build_search_output(SearchOutputParts {
+            project_root: root,
+            query: "demo",
+            retrieval: &sample_retrieval(),
+            retrieval_shadow: None,
+            freshness: None,
+            symbol_hits: &[manifest.clone(), workflow.clone()],
+            repo_text_hits: &[],
+            repo_text_stats: None,
+            query_assessment: None,
+            search_plan: None,
+            suggestions: &[],
+            occurrences_by_node: &HashMap::new(),
+            limit_per_source: 5,
+            repo_text: RepoTextOutputConfig {
+                mode: RepoTextMode::Off,
+                enabled: false,
+            },
+            explain: false,
+        });
+
+        let search_json = serde_json::to_value(&output).expect("serialize CLI search output");
+        for (index, producer) in [
+            (0, "structural_cargo_manifest_collector"),
+            (1, "structural_github_actions_workflow_collector"),
+        ] {
+            let hit = &search_json["indexed_symbol_hits"][index];
+            assert_eq!(hit["evidence_tier"], "structural_text");
+            assert_eq!(hit["evidence_producer"], producer);
+            assert_eq!(hit["resolution_status"], "source_range_only");
+            assert_eq!(hit["eligible_for_sufficiency"], false);
+        }
+        let markdown = render_search_markdown(root, &output);
+        assert!(
+            markdown.contains("evidence_tier=structural_text"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("resolution_status=source_range_only"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("eligible_for_sufficiency=false"),
+            "{markdown}"
+        );
+
+        let target = runtime::ResolvedTarget {
+            selector: QuerySelectorOutput::Query,
+            requested: "demo".to_string(),
+            file_filter: None,
+            selected: manifest.clone(),
+            alternatives: vec![manifest, workflow.clone()],
+        };
+        let resolution = build_query_resolution_output(root, &target);
+        let resolution_json =
+            serde_json::to_value(&resolution).expect("serialize CLI query resolution output");
+        assert_eq!(
+            resolution_json["resolved"]["evidence_tier"],
+            "structural_text"
+        );
+        assert_eq!(
+            resolution_json["resolved"]["resolution_status"],
+            "source_range_only"
+        );
+        assert_eq!(
+            resolution_json["resolved"]["eligible_for_sufficiency"],
+            false
+        );
+        assert_eq!(
+            resolution_json["alternatives"][0]["evidence_producer"],
+            "structural_github_actions_workflow_collector"
+        );
+
+        let citation = AgentCitationDto {
+            node_id: workflow.node_id.clone(),
+            display_name: workflow.display_name.clone(),
+            kind: workflow.kind,
+            file_path: workflow.file_path.clone(),
+            line: workflow.line,
+            score: workflow.score,
+            origin: workflow.origin,
+            resolvable: workflow.resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: workflow.evidence_tier,
+            evidence_producer: workflow.evidence_producer.clone(),
+            resolution_status: workflow.resolution_status,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: workflow.eligible_for_sufficiency,
+        };
+        let drill_hit = drill_search_hit_from_packet_citation(root, "test", &citation);
+        assert_eq!(
+            drill_hit.evidence_producer.as_deref(),
+            Some("structural_github_actions_workflow_collector")
+        );
+        assert_eq!(
+            drill_hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(drill_hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]
@@ -11033,6 +9818,12 @@ mod tests {
             ),
         });
         let output = serde_json::json!({
+            "_meta": {
+                "codestory_publication": {
+                    "served_from": "complete_publication",
+                    "operation": {"operation_id": "public-context", "attempt": 1}
+                }
+            },
             "target": {"selector": "id", "requested": "big-mermaid"},
             "context": crate::output::context_packet_json(&answer),
         });
@@ -11063,6 +9854,10 @@ mod tests {
             "{manifest}"
         );
         assert_eq!(context_json["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(
+            context_json.pointer("/_meta/codestory_publication/operation/operation_id"),
+            Some(&serde_json::json!("public-context"))
+        );
         assert!(
             !temp.path().join("big-mermaid.mmd").exists(),
             "oversized Mermaid artifact should be omitted"
@@ -11753,6 +10548,7 @@ mod tests {
             question: packet.question.clone(),
             budget: PacketBudgetModeDto::Standard,
             task_class: None,
+            probes: Vec::new(),
             extra_probes: vec!["WorkspaceIndexer".to_string()],
             include_evidence: true,
             latency_budget_ms: None,
@@ -11806,10 +10602,11 @@ mod tests {
             question: Some(packet.question.clone()),
             output_dir: "artifacts/drill".to_string(),
             mechanical: DrillMechanicalOutput {
-                before_files: 2,
-                before_nodes: 4,
-                before_edges: 2,
-                before_errors: 0,
+                before_files: Some(2),
+                before_nodes: Some(4),
+                before_edges: Some(2),
+                before_errors: Some(0),
+                before_unavailable_reason: None,
                 after_files: 2,
                 after_nodes: 4,
                 after_edges: 2,
@@ -11843,7 +10640,14 @@ mod tests {
             evidence_packet: packet,
         };
         let output_dir = tempdir().expect("output dir");
-        write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &output)
+        let mut operation = codestory_runtime::PublicOperation {
+            value: output,
+            core_publication: None,
+            retrieval_publication: None,
+            operation_id: "test-drill".to_string(),
+            attempt: 1,
+        };
+        write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &operation)
             .expect("write drill fixtures");
 
         let report: serde_json::Value = serde_json::from_slice(
@@ -11903,6 +10707,54 @@ mod tests {
                 .map(|value| value.as_str().expect("artifact name").to_string())
                 .collect::<Vec<_>>()
         );
+
+        operation.value.mechanical.before_files = None;
+        operation.value.mechanical.before_nodes = None;
+        operation.value.mechanical.before_edges = None;
+        operation.value.mechanical.before_errors = None;
+        operation.value.mechanical.before_unavailable_reason =
+            Some("core_schema_upgrade_required".to_string());
+        operation.value.mechanical.refresh = "auto->full".to_string();
+        let unavailable_dir = tempdir().expect("unavailable output dir");
+        write_drill_outputs(args::OutputFormat::Json, unavailable_dir.path(), &operation)
+            .expect("write unavailable-before drill fixtures");
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(unavailable_dir.path().join("drill-report.json"))
+                .expect("read unavailable-before report"),
+        )
+        .expect("parse unavailable-before report");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(unavailable_dir.path().join("drill-summary.json"))
+                .expect("read unavailable-before summary"),
+        )
+        .expect("parse unavailable-before summary");
+        let markdown = fs::read_to_string(unavailable_dir.path().join("drill-report.md"))
+            .expect("read unavailable-before markdown");
+
+        for field in [
+            "/mechanical/before_files",
+            "/mechanical/before_nodes",
+            "/mechanical/before_edges",
+            "/mechanical/before_errors",
+        ] {
+            assert!(report.pointer(field).is_none(), "unexpected {field}");
+        }
+        assert_eq!(
+            report.pointer("/mechanical/before_unavailable_reason"),
+            Some(&serde_json::json!("core_schema_upgrade_required"))
+        );
+        assert!(summary.pointer("/mechanical/before").is_none());
+        assert!(summary.pointer("/mechanical/error_delta").is_none());
+        assert_eq!(
+            summary.pointer("/mechanical/before_unavailable_reason"),
+            Some(&serde_json::json!("core_schema_upgrade_required"))
+        );
+        assert!(
+            markdown.contains("index_before: unavailable reason=core_schema_upgrade_required"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("index_before: files="), "{markdown}");
     }
 
     #[test]
@@ -11931,6 +10783,48 @@ mod tests {
             &[citation],
         );
         assert!(anchors[0].chosen_anchor.is_none());
+    }
+
+    #[test]
+    fn drill_packet_keeps_structural_source_ranges_navigable_but_not_typed() {
+        let project_root = Path::new("C:/repo");
+        let mut structural =
+            sample_task_brief_citation("Cargo package", NodeKind::PACKAGE, "Cargo.toml", 2);
+        structural.evidence_tier =
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText);
+        structural.evidence_producer = Some("structural_cargo_manifest_collector".to_string());
+        structural.resolution_status =
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly);
+
+        let navigable =
+            drill_search_hit_from_packet_citation(project_root, "Cargo package", &structural);
+        assert!(navigable.resolvable);
+        assert!(!drill_packet_citation_is_typed_resolvable(&structural));
+
+        let anchors = drill_packet_anchors(
+            project_root,
+            &["Cargo package".to_string()],
+            std::slice::from_ref(&structural),
+        );
+        assert_eq!(anchors[0].typed_hit_count, 0);
+        assert!(anchors[0].chosen_anchor.is_none());
+        assert!(anchors[0].verification_targets.is_empty());
+        assert!(drill_packet_verification_targets(project_root, &[structural.clone()]).is_empty());
+
+        let mut packet = sample_task_brief_packet();
+        packet.sufficiency.covered_claims[0].citations = vec![
+            structural,
+            sample_task_brief_citation("SearchService", NodeKind::STRUCT, "src/search.rs", 24),
+        ];
+        assert!(drill_packet_bridges(project_root, &packet).is_empty());
+
+        let mut source_range_only =
+            sample_task_brief_citation("source range", NodeKind::FUNCTION, "src/lib.rs", 8);
+        source_range_only.resolution_status =
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly);
+        assert!(!drill_packet_citation_is_typed_resolvable(
+            &source_range_only
+        ));
     }
 
     #[test]
@@ -11980,6 +10874,26 @@ mod tests {
     }
 
     #[test]
+    fn affected_structured_invocation_is_quoted_only_when_cli_renders_it() {
+        let invocation = AffectedFollowUpInvocationDto {
+            program: "codestory-cli".to_string(),
+            args: vec![
+                "files".to_string(),
+                "--project".to_string(),
+                "C:/repo/$hidden".to_string(),
+                "--path".to_string(),
+                "src/quoted'file.rs".to_string(),
+            ],
+        };
+
+        let rendered = render_affected_invocation(&invocation);
+        assert!(rendered.starts_with("codestory-cli "));
+        assert!(rendered.contains(&quote_command_argument_value("C:/repo/$hidden")));
+        assert!(rendered.contains(&quote_command_argument_value("src/quoted'file.rs")));
+        assert!(!rendered.contains("{program}"));
+    }
+
+    #[test]
     fn stdio_metadata_lists_tools_resources_and_prompts() {
         let tools = stdio_tools_list_json();
         let tool_names = tools["result"]["tools"]
@@ -11997,7 +10911,24 @@ mod tests {
                 .as_array()
                 .expect("resources")
                 .iter()
-                .any(|resource| resource["uri"] == "codestory://grounding")
+                .any(|resource| resource["uri"] == "codestory://agent-guide")
+        );
+        assert_eq!(
+            resources["result"]["resources"]
+                .as_array()
+                .expect("resources")
+                .len(),
+            1,
+            "only static project-free resources belong in resources/list"
+        );
+
+        let templates = stdio_resource_templates_list_json();
+        assert!(
+            templates["result"]["resourceTemplates"]
+                .as_array()
+                .expect("resource templates")
+                .iter()
+                .any(|resource| { resource["uriTemplate"] == "codestory://grounding{?project}" })
         );
 
         let prompts = stdio_prompts_list_json();
@@ -12097,23 +11028,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cache_dir_is_not_hashed() {
-        let root = Path::new("C:/repo");
-        let cache_dir = Path::new("C:/cache/custom");
-        assert_eq!(
-            cache_root_for_project(root, Some(cache_dir)).expect("cache dir"),
-            cache_dir
-        );
-    }
-
-    #[test]
-    fn default_cache_root_uses_project_hash() {
+    fn default_cache_root_uses_workspace_identity() {
         let root = Path::new("C:/repo");
         let cache_root = cache_root_for_project(root, None).expect("cache root");
         let cache_root = cache_root.to_string_lossy();
         assert!(
-            cache_root.ends_with(&fnv1a_hex(b"C:/repo")),
-            "default cache root should end with the project hash"
+            cache_root.ends_with(&codestory_workspace::workspace_id_v3_for_root(root)),
+            "default cache root should end with the workspace identity"
         );
     }
 
@@ -12165,7 +11086,7 @@ mod tests {
             alternatives: vec![alternative],
         };
 
-        let promoted = prefer_function_body_target(temp.path(), target);
+        let promoted = runtime::prefer_function_body_target(temp.path(), target);
 
         assert_eq!(promoted.selected.node_id.0, "posts");
         assert_eq!(promoted.selected.display_name, "Posts");
@@ -12205,7 +11126,7 @@ mod tests {
             alternatives: vec![alternative],
         };
 
-        let promoted = prefer_function_body_target(temp.path(), target);
+        let promoted = runtime::prefer_function_body_target(temp.path(), target);
 
         assert_eq!(promoted.selected.node_id.0, "implementation");
     }
@@ -12254,6 +11175,40 @@ mod tests {
         assert_eq!(
             relative_path(root, "\\\\?\\UNC\\server\\share\\file.rs"),
             "//server/share/file.rs"
+        );
+    }
+
+    #[test]
+    fn embedding_preflight_preserves_typed_capacity_for_json_failures() {
+        let error = anyhow::Error::new(codestory_retrieval::PerUserEmbeddingError {
+            code: "embedding_capacity".into(),
+            message: "query queue is full".into(),
+            retry_class: "after_capacity_change".into(),
+            retry_after_ms: 25,
+            retry_condition: "a query slot becomes available".into(),
+            capacity: Some(codestory_retrieval::EmbeddingCapacityPressureWire {
+                reason: "queue_full".into(),
+                queue_class: "query".into(),
+                capacity: 64,
+                depth: 64,
+                retry_after_ms: 25,
+                retry_condition: "a query slot becomes available".into(),
+                owner_state: "ready".into(),
+                active_scope_id: None,
+                active_request_id: None,
+                active_request_class: None,
+            }),
+        });
+
+        let mapped = map_embedding_preflight_error(error);
+        let api = runtime::api_error_in_chain(&mapped).expect("typed CLI API error");
+        assert_eq!(api.code, "embedding_capacity");
+        assert_eq!(
+            api.details
+                .as_deref()
+                .and_then(|details| details.embedding_capacity.as_ref())
+                .map(|pressure| pressure.retry_condition.as_str()),
+            Some("a query slot becomes available")
         );
     }
 

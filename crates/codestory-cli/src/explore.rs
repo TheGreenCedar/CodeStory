@@ -19,8 +19,8 @@ use crate::args::{
     QueryItemOutput, SearchHitOutput, TrailCommand,
 };
 use crate::output::{
-    emit, render_retrieval_state, render_snippet_markdown, render_symbol_markdown,
-    render_trail_markdown,
+    RenderedPublicOutput, emit_rendered_public_operation, render_retrieval_state,
+    render_snippet_markdown, render_symbol_markdown, render_trail_markdown,
 };
 use crate::runtime::{self, RuntimeContext, ensure_index_ready, map_api_error, refresh_label};
 use crate::{
@@ -28,6 +28,21 @@ use crate::{
     preflight_output_file, resolve_target_or_emit_ambiguity,
 };
 use crate::{display, output};
+
+struct BuiltExplore {
+    target: runtime::ResolvedTarget,
+    symbol: SymbolContextDto,
+    trail: TrailContextDto,
+    snippet: Option<SnippetContextDto>,
+    snippet_layer_note: String,
+    status: ExploreStatusOutput,
+    search: ExploreSearchOutput,
+    navigation: NavigationOutput,
+    relationship_evidence: ExploreRelationshipEvidenceOutput,
+    route_context: Option<codestory_contracts::api::RouteEndpointMetadataDto>,
+    source_packet: ExploreSourcePacketOutput,
+    rendered: RenderedPublicOutput,
+}
 
 pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "explore")?;
@@ -37,98 +52,129 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     ensure_index_ready(&opened, "explore")?;
     let profile = resolve_explore_profile(cmd.profile, cmd.depth, cmd.max_nodes);
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let symbol = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-    let trail = runtime
-        .browser
-        .trail_context(TrailConfigDto {
-            root_id: target.selected.node_id.clone(),
-            mode: TrailMode::Neighborhood,
-            target_id: None,
-            depth: profile.output.depth,
-            direction: TrailDirection::Both,
-            caller_scope: profile.caller_scope,
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            hide_speculative: false,
-            story: false,
-            node_filter: Vec::new(),
-            max_nodes: profile.output.max_nodes.clamp(1, 120),
-            layout_direction: LayoutDirection::Horizontal,
-        })
-        .map_err(map_api_error)?;
-    let snippet_result = runtime
-        .browser
-        .snippet_context(target.selected.node_id.clone(), 4);
-    let (snippet, snippet_layer_note) = match snippet_result {
-        Ok(snippet) => (Some(snippet), "snippet_context: available".to_string()),
-        Err(error) => (
-            None,
-            format!(
-                "snippet_context: unavailable: {}: {}",
-                error.code, error.message
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
+    };
+    let operation = runtime.run_public_operation(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let symbol = runtime
+            .browser
+            .symbol_context(target.selected.node_id.clone())
+            .map_err(map_api_error)?;
+        let trail = runtime
+            .browser
+            .trail_context(TrailConfigDto {
+                root_id: target.selected.node_id.clone(),
+                mode: TrailMode::Neighborhood,
+                target_id: None,
+                depth: profile.output.depth,
+                direction: TrailDirection::Both,
+                caller_scope: profile.caller_scope,
+                edge_filter: Vec::new(),
+                show_utility_calls: false,
+                hide_speculative: false,
+                story: false,
+                node_filter: Vec::new(),
+                max_nodes: profile.output.max_nodes.clamp(1, 120),
+                layout_direction: LayoutDirection::Horizontal,
+            })
+            .map_err(map_api_error)?;
+        let snippet_result = runtime
+            .browser
+            .snippet_context(target.selected.node_id.clone(), 4);
+        let (snippet, snippet_layer_note) = match snippet_result {
+            Ok(snippet) => (Some(snippet), "snippet_context: available".to_string()),
+            Err(error) => (
+                None,
+                format!(
+                    "snippet_context: unavailable: {}: {}",
+                    error.code, error.message
+                ),
             ),
-        ),
-    };
-    let status = build_explore_status_output(
-        &runtime,
-        &opened,
-        &target,
-        cmd.refresh,
-        cmd.output_file.as_deref(),
-        &snippet_layer_note,
-    );
-    let search = build_explore_search_output(&runtime.project_root, &target);
-    let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
-    let relationship_evidence =
-        build_explore_relationship_evidence(&profile.output, &trail, &navigation);
-    let route_context = symbol.node.route_endpoint.clone();
-    let source_packet = build_explore_source_packet(
-        &runtime,
-        &opened,
-        &symbol,
-        &trail,
-        &snippet,
-        &profile.output,
-    );
-    let output = ExploreOutput {
-        profile: profile.output.clone(),
-        status,
-        search,
-        resolution: build_query_resolution_output(&runtime.project_root, &target),
-        navigation,
-        relationship_evidence,
-        route_context,
-        source_packet,
-        symbol: &symbol,
-        trail: &trail,
-        snippet: snippet.as_ref(),
-    };
-    let render_context = ExploreRenderContext {
-        project_root: &runtime.project_root,
-        target: &target,
-        profile: &output.profile,
-        status: &output.status,
-        search: &output.search,
-        navigation: &output.navigation,
-        relationship_evidence: &output.relationship_evidence,
-        route_context: output.route_context.as_ref(),
-        source_packet: &output.source_packet,
-        symbol: &symbol,
-        trail: &trail,
-        snippet: snippet.as_ref(),
-        snippet_layer_note: &snippet_layer_note,
-    };
-    let markdown = render_explore_markdown(&render_context);
+        };
+        let pinned_opened = runtime::OpenedProject {
+            summary: runtime.active_project_summary()?,
+            refresh_mode: opened.refresh_mode,
+            refresh_reason: opened.refresh_reason.clone(),
+            phase_timings: opened.phase_timings.clone(),
+        };
+        let status = build_explore_status_output(
+            &runtime,
+            &pinned_opened,
+            &target,
+            cmd.refresh,
+            cmd.output_file.as_deref(),
+            &snippet_layer_note,
+        );
+        let search = build_explore_search_output(&runtime.project_root, &target);
+        let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
+        let relationship_evidence =
+            build_explore_relationship_evidence(&profile.output, &trail, &navigation);
+        let route_context = symbol.node.route_endpoint.clone();
+        let source_packet = build_explore_source_packet(
+            &runtime,
+            &pinned_opened,
+            &symbol,
+            &trail,
+            &snippet,
+            &profile.output,
+        );
+        let rendered = {
+            let output = ExploreOutput {
+                profile: profile.output.clone(),
+                status: status.clone(),
+                search: search.clone(),
+                resolution: build_query_resolution_output(&runtime.project_root, &target),
+                navigation: navigation.clone(),
+                relationship_evidence: relationship_evidence.clone(),
+                route_context: route_context.clone(),
+                source_packet: source_packet.clone(),
+                symbol: &symbol,
+                trail: &trail,
+                snippet: snippet.as_ref(),
+            };
+            let render_context = ExploreRenderContext {
+                project_root: &runtime.project_root,
+                target: &target,
+                profile: &output.profile,
+                status: &output.status,
+                search: &output.search,
+                navigation: &output.navigation,
+                relationship_evidence: &output.relationship_evidence,
+                route_context: output.route_context.as_ref(),
+                source_packet: &output.source_packet,
+                symbol: &symbol,
+                trail: &trail,
+                snippet: snippet.as_ref(),
+                snippet_layer_note: &snippet_layer_note,
+            };
+            let markdown = render_explore_markdown(&render_context);
+            RenderedPublicOutput::structured(&output, markdown)?
+        };
+        Ok(BuiltExplore {
+            target,
+            symbol,
+            trail,
+            snippet,
+            snippet_layer_note,
+            status,
+            search,
+            navigation,
+            relationship_evidence,
+            route_context,
+            source_packet,
+            rendered,
+        })
+    })?;
+    let built = &operation.value;
     if cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && !explore_plain_requested(&cmd)
@@ -137,9 +183,29 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
         eprintln!(
             "Opening interactive explore TUI; use --no-tui, --plain, or CODESTORY_NO_TUI=1 for plain markdown."
         );
+        let render_context = ExploreRenderContext {
+            project_root: &runtime.project_root,
+            target: &built.target,
+            profile: &profile.output,
+            status: &built.status,
+            search: &built.search,
+            navigation: &built.navigation,
+            relationship_evidence: &built.relationship_evidence,
+            route_context: built.route_context.as_ref(),
+            source_packet: &built.source_packet,
+            symbol: &built.symbol,
+            trail: &built.trail,
+            snippet: built.snippet.as_ref(),
+            snippet_layer_note: &built.snippet_layer_note,
+        };
         return run_explore_tui(&render_context);
     }
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    emit_rendered_public_operation(
+        cmd.format,
+        &operation,
+        &built.rendered,
+        cmd.output_file.as_deref(),
+    )
 }
 
 fn explore_plain_requested(cmd: &ExploreCommand) -> bool {

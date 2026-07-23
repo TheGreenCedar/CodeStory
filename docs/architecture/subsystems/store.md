@@ -1,37 +1,105 @@
 # Store Subsystem
 
-`codestory-store` is the only persistence crate.
+`codestory-store` is the only SQLite persistence layer. It owns durable core
+publication and read consistency; callers own neither raw SQL nor database-file
+recovery.
 
-## Ownership
+## Durable state
 
-- SQLite open/build lifecycle
-- schema setup and migrations
-- graph rows, file rows, occurrence rows, and projection state
-- search-doc persistence
-- bookmarks and trail queries
-- summary/detail grounding snapshots and staged publish lifecycle
+- file, node, edge, occurrence, component, callable, bookmark, and trail rows;
+- grounding snapshots and canonical paged search-symbol reads from the node
+  table; the legacy materialized search projection remains compatibility-only;
+- graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
+- verified source-policy exclusion rows and their project/workspace/core-bound
+  count-and-digest manifest;
+- versioned structural text units, per-file complete projections, their
+  dedicated artifact cache, and a core-generation-bound publication manifest;
+- core `generation_id`/`run_id` and retrieval-manifest records;
+- schema migrations and a versioned promotion journal.
 
-## Entry Points
+## Publication and reads
 
-- `crates/codestory-store/src/lib.rs`
-- `crates/codestory-store/src/storage_impl/mod.rs`
-- `crates/codestory-store/src/storage_impl/trail.rs`
-- `crates/codestory-store/src/snapshot_store.rs`
-- `crates/codestory-store/src/file_store.rs`
+Full refresh builds and validates a staged database. Promotion durably records a
+prepared journal with previous and candidate identities, installs and validates
+the candidate, records committed, then performs best-effort cleanup. Recovery
+may restore only a valid recorded prepared backup; a committed publication is
+never rolled back merely because a backup remains.
 
-`GraphStore`, `TrailStore`, and `SearchDocStore` wrapper facades were removed;
-callers should use the direct `Store` methods or the surviving focused stores
-listed above.
+The fresh full-refresh stage is explicitly disposable until publication. It
+keeps WAL so a bounded artifact-cache reader can be opened when verified
+structural rows were copied forward, uses relaxed synchronous writes with a
+bounded nonzero checkpoint window, and is never served or resumed. Parser rows
+are not copied, and a stage with no copied structural rows opens no cache
+reader. Its consuming publish path restores NORMAL synchronization, completes a
+TRUNCATE checkpoint, syncs the standalone database and directory, and permits
+no later stage writes before entering the promotion journal. Live stores,
+generic build callers, and staged incremental clones remain WAL/NORMAL.
 
-## Extension Points
+Incremental refresh writes a durable clone and promotes the completed
+replacement through the same journal. Readers that need publication coherence
+use store read snapshots and compare the recorded generation/run identity;
+retrieval owns the session that combines that transaction with immutable
+generation leases before returning evidence.
 
-- add new read/write surfaces as focused sub-stores only when they own behavior
-  beyond forwarding to `Store`
-- keep snapshot lifecycle changes inside `snapshot_store.rs`
-- keep SQL-heavy persistence logic inside `storage_impl/`
+The dense-anchor manifest is part of the core publication boundary. It binds
+the complete row count and digest, policy version, migration state, and every
+row's source identity to the current core generation/run. A migrated cache has
+no complete manifest until core indexing republishes it.
 
-## Failure Signatures
+The source-policy exclusion manifest follows the same fail-closed rule. Rows
+and manifest replace together in one SQLite transaction, and staged promotion
+records their candidate and rollback identities. A schema migration creates no
+synthetic manifest; runtime must republish from a complete verified inventory.
+Each row binds observed bytes and structural-unit count plus both active caps.
+A unit-bound row has no file, graph, structural-text, typed-target, or semantic
+projection.
 
-- callers try to reach a raw storage object instead of `Store`
-- snapshot promotion or invalidation is reimplemented outside the store
-- runtime or CLI starts owning SQL or SQLite file management
+The structural-unit manifest binds descriptor schema, migration state, complete
+unit and projection counts and digests, and exact core generation/run. Each
+structural file has a verified source hash and a count-and-digest projection
+that carries its producer, including zero-unit files. Replacing one file's
+hash, graph rows, units, projection, and dedicated cache entry is atomic and
+invalidates the complete manifest until runtime republishes it. Schema migration
+creates the tables but no synthetic completeness claim.
+
+The projection transaction also replaces file-scoped errors and marks
+grounding summary/detail plus resolution-support state dirty. Those writes do
+not follow the graph commit as independent autocommits. Store telemetry counts
+logical row attempts, prepared-statement executions, and estimated raw bind
+payload bytes by family; the byte count describes input shape, not database,
+WAL, or physical-write bytes.
+
+Promotion journals record candidate and rollback structural identities.
+Prepared install, committed recovery, and rollback validate the recorded
+manifest and current row digest before accepting a database. Missing, legacy,
+or corrupt structural publication state therefore cannot become the current
+core generation.
+
+Schema v25 also stores the current retrieval manifest and its deeply verified
+rollback record in the same SQLite row. They change in one transaction. The
+filesystem retention marker is derived after commit and can only make cleanup
+more conservative; it is not a publication authority.
+
+## Entry points
+
+- `src/storage_impl/mod.rs`: schema lifecycle, reads/writes, publication journal,
+  recovery, and staged promotion
+- `src/snapshot_store.rs`: staged and live grounding snapshots
+- `src/file_store.rs`: focused file persistence
+- `src/storage_impl/trail.rs`: trail queries
+
+## Extension rules
+
+- add SQL and recovery behavior here, with fault coverage at the durable fence;
+- expose typed store methods rather than raw connections;
+- keep retrieval artifact files in `codestory-retrieval` and product
+  orchestration in runtime.
+
+## Failure signatures
+
+- backup existence alone authorizes rollback;
+- callers reopen current storage during a pinned publication read;
+- runtime or CLI manages SQLite files or writes SQL;
+- a structural cache row is copied through the generic parser cache or is
+  published without matching source and projection identities;
+- a partial promotion can be reported as successful.

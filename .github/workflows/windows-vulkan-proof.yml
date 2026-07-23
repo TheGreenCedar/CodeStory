@@ -1,0 +1,493 @@
+name: Windows Vulkan proof
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+      proof_key:
+        required: false
+        default: ""
+        type: string
+      use_packaged_cli_artifact:
+        required: false
+        default: false
+        type: boolean
+      quality_evidence_artifact:
+        required: false
+        default: ""
+        type: string
+      calibration_bundle_artifact:
+        required: false
+        default: ""
+        type: string
+      calibration_bundle_run_id:
+        required: false
+        default: ""
+        type: string
+      candidate_installed_proof:
+        description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
+        required: false
+        default: false
+        type: boolean
+      candidate_installed_only:
+        description: Run only the CPU-acceptable candidate-installed behavior proof; do not claim Vulkan execution.
+        required: false
+        default: false
+        type: boolean
+      candidate_producer_workflow_path:
+        description: Top-level workflow path authenticated as the candidate artifact producer.
+        required: false
+        default: ".github/workflows/packaged-platform-pr.yml"
+        type: string
+      server_behavior_only:
+        description: Prove bounded server behavior without making packet-quality or release-readiness claims.
+        required: false
+        default: false
+        type: boolean
+      emit_release_cells:
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+      proof_key:
+        required: false
+        type: string
+      quality_evidence_artifact:
+        required: false
+        type: string
+      calibration_bundle_artifact:
+        required: true
+        type: string
+      calibration_bundle_run_id:
+        required: true
+        type: string
+      candidate_installed_proof:
+        description: Stage and qualify the exact package through the private candidate-managed launcher boundary.
+        required: false
+        default: false
+        type: boolean
+      candidate_installed_only:
+        description: Run only the CPU-acceptable candidate-installed behavior proof; do not claim Vulkan execution.
+        required: false
+        default: false
+        type: boolean
+      candidate_producer_workflow_path:
+        description: Top-level workflow path authenticated as the candidate artifact producer.
+        required: false
+        default: ".github/workflows/windows-vulkan-proof.yml"
+        type: string
+      server_behavior_only:
+        description: Prove bounded server behavior without making packet-quality or release-readiness claims.
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: windows-vulkan-proof-${{ inputs.proof_key || inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packaged-vulkan:
+    name: Packaged Windows Vulkan engine
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    environment: windows-vulkan-proof
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+        env:
+          PSExecutionPolicyPreference: Bypass
+
+      - name: Capture host evidence
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          New-Item -ItemType Directory -Force target/windows-vulkan-proof | Out-Null
+          Get-ComputerInfo | Out-File target/windows-vulkan-proof/host.txt
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterCompatibility, DriverVersion, VideoMemoryType |
+            Format-List | Out-File -Append target/windows-vulkan-proof/host.txt
+
+      - name: Validate candidate-installed-only mode
+        if: inputs.candidate_installed_only
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          if (
+            "${{ inputs.candidate_installed_proof }}" -ne "true" -or
+            "${{ inputs.server_behavior_only }}" -ne "true"
+          ) {
+            throw "candidate_installed_only requires candidate_installed_proof and server_behavior_only"
+          }
+
+      - name: Capture source build tool evidence
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          "CMAKE_GENERATOR=Ninja" | Out-File -Append target/windows-vulkan-proof/host.txt
+          cmake --version | Out-File -Append target/windows-vulkan-proof/host.txt
+          ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
+
+      - name: Install pinned Rust
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+
+      - name: Prepare checksum-pinned embedded model
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        run: node scripts/prepare-embedded-model.mjs
+
+      - name: Build and package native CLI
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          VERSION: ${{ inputs.version }}
+          CMAKE_GENERATOR: Ninja
+        run: |
+          $version = $env:VERSION.TrimStart('v')
+          cargo build --release --locked -p codestory-cli
+          python .github/scripts/package-codestory-release.py `
+            --version $version `
+            --target windows-x64 `
+            --binary target/release/codestory-cli.exe `
+            --out-dir target/release-dist
+
+      - name: Download packaged CLI artifact
+        if: inputs.use_packaged_cli_artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-cli-windows-x64
+          path: target/release-dist
+
+      - name: Download exact-head publishable packet quality evidence
+        if: inputs.quality_evidence_artifact != ''
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.quality_evidence_artifact }}
+          path: target/release-quality-evidence
+
+      - name: Authenticate calibration bundle producer
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
+        run: |
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CALIBRATION_RUN_ID" |
+            ConvertFrom-Json
+          if (
+            $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY -or
+            $run.path -ne ".github/workflows/packaged-platform-pr.yml" -or
+            $run.event -ne "workflow_dispatch" -or
+            $run.conclusion -ne "success" -or
+            $env:CALIBRATION_ARTIFACT -ne "embedding-calibration-bundle-$($run.head_sha)"
+          ) {
+            throw "calibration bundle producer is not the trusted exact-head coordinator run"
+          }
+          $artifacts = gh api `
+            "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CALIBRATION_RUN_ID/artifacts?per_page=100" |
+            ConvertFrom-Json
+          $artifactCount = @(
+            $artifacts.artifacts | Where-Object {
+              $_.name -eq $env:CALIBRATION_ARTIFACT -and $_.expired -eq $false
+            }
+          ).Count
+          if ($artifactCount -ne 1) {
+            throw "expected exactly one unexpired calibration bundle artifact"
+          }
+
+      - name: Download frozen calibration bundle
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.calibration_bundle_artifact }}
+          path: target/calibration-bundle
+          run-id: ${{ inputs.calibration_bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Prove offline Vulkan and multi-repository reuse
+        if: ${{ !inputs.candidate_installed_only }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+          SERVER_BEHAVIOR_ONLY: ${{ inputs.server_behavior_only }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:VERSION.TrimStart('v')
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $calibrationBundles = @(
+            Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
+          )
+          if ($calibrationBundles.Count -ne 1) {
+            throw "expected exactly one frozen calibration-bundle.json"
+          }
+          $claimArgs = @()
+          $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
+          if ($env:SERVER_BEHAVIOR_ONLY -eq "true") {
+            $claimArgs = @("--server-behavior-only")
+          } else {
+            if (-not (Test-Path $qualityPath)) {
+              throw "protected Windows proof requires exact-head quality evidence"
+            }
+            $claimArgs = @(
+              "--produce-qualification-evidence",
+              "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
+              "--retrieval-quality-evidence", $qualityPath
+            )
+          }
+          python .github/scripts/check-packaged-agent-proof.py `
+            --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
+            --checksum-file "target/release-dist/codestory-cli-v$version-windows-x64.zip.sha256" `
+            --expected-version $version `
+            --project "${{ github.workspace }}" `
+            --plugin-root plugins/codestory `
+            --plugin-handoff `
+            --engine-policy accelerated `
+            --expected-backend Vulkan `
+            --offline `
+            --proof-tier protected_hardware `
+            --qualification-matrix-cell protected_windows_x64_vulkan `
+            @claimArgs `
+            --calibration-bundle $calibrationBundles[0].FullName `
+            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
+            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
+            --expected-source-sha $sourceSha `
+            --expected-source-tree $sourceTree `
+            --timeout-secs 1800 `
+            --out-dir target/windows-vulkan-proof/packaged-agent
+
+      - name: Stage isolated candidate-managed Windows install
+        if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([String]::IsNullOrWhiteSpace($env:CANDIDATE_PRODUCER_WORKFLOW_PATH)) {
+            throw "candidate producer workflow path is required"
+          }
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" |
+            ConvertFrom-Json
+          if (
+            $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY -or
+            $run.path -ne $env:CANDIDATE_PRODUCER_WORKFLOW_PATH -or
+            $run.head_sha -ne (git rev-parse HEAD).Trim() -or
+            [string]$run.run_attempt -ne $env:GITHUB_RUN_ATTEMPT
+          ) {
+            throw "candidate producer run does not authenticate the checked-out package source"
+          }
+          $version = $env:VERSION.TrimStart('v')
+          $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
+          $candidateRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            ("codestory-candidate-installed-windows." + [Guid]::NewGuid().ToString("N"))
+          $candidateRoot = [IO.Path]::GetFullPath($candidateRoot)
+          $workspaceRoot = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          if ($candidateRoot.StartsWith(
+            $workspaceRoot + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw "candidate-managed root must be outside the source checkout"
+          }
+          New-Item -ItemType Directory -Path $candidateRoot | Out-Null
+          "CODESTORY_CANDIDATE_WINDOWS_ROOT=$candidateRoot" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force target/candidate-installed-windows | Out-Null
+          python .github/scripts/check-packaged-agent-proof.py `
+            --prepare-candidate-installed-proof `
+            --archive $archive `
+            --checksum-file "target/release-dist/codestory-cli-v$version-windows-x64.zip.sha256" `
+            --expected-version $version `
+            --plugin-root plugins/codestory `
+            --candidate-plugin-root-output (Join-Path $candidateRoot "plugin") `
+            --candidate-plugin-data-output (Join-Path $candidateRoot "data") `
+            --installed-plugin-provenance-output target/candidate-installed-windows/provenance.json `
+            --candidate-producer-repository $env:GITHUB_REPOSITORY `
+            --candidate-producer-workflow-path $env:CANDIDATE_PRODUCER_WORKFLOW_PATH `
+            --candidate-producer-run-id $env:GITHUB_RUN_ID `
+            --candidate-producer-run-attempt $env:GITHUB_RUN_ATTEMPT `
+            --candidate-artifact-name (Split-Path -Leaf $archive)
+
+      - name: Prove two-host candidate-installed Windows runtime
+        if: ${{ inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '') }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "1"
+          CANDIDATE_PRODUCER_WORKFLOW_PATH: ${{ inputs.candidate_producer_workflow_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:VERSION.TrimStart('v')
+          $archive = "target/release-dist/codestory-cli-v$version-windows-x64.zip"
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $sourceTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $calibrationBundles = @(
+            Get-ChildItem target/calibration-bundle -Recurse -File -Filter calibration-bundle.json
+          )
+          if ($calibrationBundles.Count -ne 1) {
+            throw "expected exactly one frozen calibration-bundle.json"
+          }
+          $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
+          $claimArgs = @()
+          if ("${{ inputs.server_behavior_only }}" -eq "true") {
+            $claimArgs = @("--ground-only")
+          } else {
+            if (-not (Test-Path $qualityPath)) {
+              throw "candidate-installed Windows proof requires exact-head quality evidence"
+            }
+            $claimArgs = @(
+              "--produce-qualification-evidence",
+              "--qualification-evidence", "target/candidate-installed-windows/qualification.json",
+              "--retrieval-quality-evidence", $qualityPath
+            )
+          }
+          $pluginRoot = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "plugin"
+          $pluginData = Join-Path $env:CODESTORY_CANDIDATE_WINDOWS_ROOT "data"
+          python .github/scripts/check-packaged-agent-proof.py `
+            --archive $archive `
+            --checksum-file "target/release-dist/codestory-cli-v$version-windows-x64.zip.sha256" `
+            --expected-version $version `
+            --project $env:GITHUB_WORKSPACE `
+            --plugin-root $pluginRoot `
+            --plugin-handoff `
+            --engine-policy cpu_explicit `
+            --expected-backend CPU `
+            --offline `
+            --proof-tier installed_runtime `
+            --qualification-matrix-cell candidate_installed_windows_x64_cpu `
+            @claimArgs `
+            --calibration-bundle $calibrationBundles[0].FullName `
+            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
+            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
+            --installed-plugin-source candidate `
+            --installed-plugin-provenance target/candidate-installed-windows/provenance.json `
+            --installed-plugin-data $pluginData `
+            --candidate-producer-repository $env:GITHUB_REPOSITORY `
+            --candidate-producer-workflow-path $env:CANDIDATE_PRODUCER_WORKFLOW_PATH `
+            --candidate-producer-run-id $env:GITHUB_RUN_ID `
+            --candidate-producer-run-attempt $env:GITHUB_RUN_ATTEMPT `
+            --candidate-artifact-name (Split-Path -Leaf $archive) `
+            --expected-source-sha $sourceSha `
+            --expected-source-tree $sourceTree `
+            --timeout-secs 1800 `
+            --out-dir target/candidate-installed-windows/proof
+
+      - name: Upload candidate-installed Windows proof
+        if: always() && inputs.candidate_installed_proof && (inputs.server_behavior_only || inputs.quality_evidence_artifact != '')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: candidate-installed-windows-${{ inputs.version }}-attempt-${{ github.run_attempt }}
+          path: target/candidate-installed-windows
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Emit authenticated Vulkan release cell
+        if: inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          jq -n \
+            --arg native_engine coderank_q8_embedded \
+            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
+            '{native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            > target/windows-vulkan-proof/release-cell-identity.json
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "$version" \
+            --cell-id accelerator_execution:windows-x64-vulkan \
+            --producer-workflow .github/workflows/windows-vulkan-proof.yml \
+            --producer-job packaged-vulkan \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-prepublish-windows-x64-vulkan-attempt-$GITHUB_RUN_ATTEMPT" \
+            --identity target/windows-vulkan-proof/release-cell-identity.json \
+            --archive "target/release-dist/codestory-cli-v${version}-windows-x64.zip" \
+            --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
+
+      - name: Upload authenticated Vulkan release cell
+        if: success() && inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
+          path: target/release-cells/accelerator_execution-windows-x64-vulkan.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Emit authenticated candidate-installed Windows release cell
+        if: inputs.emit_release_cells && inputs.candidate_installed_proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          jq -n \
+            --arg installer candidate_managed_plugin \
+            --arg runtime_version "$version" \
+            --arg native_engine coderank_q8_embedded \
+            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
+            '{installer: $installer, runtime_version: $runtime_version, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            > target/candidate-installed-windows/release-cell-identity.json
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "$version" \
+            --cell-id candidate_installed_behavior:windows-x64 \
+            --producer-workflow .github/workflows/windows-vulkan-proof.yml \
+            --producer-job packaged-vulkan \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-prepublish-candidate-installed-windows-x64-attempt-$GITHUB_RUN_ATTEMPT" \
+            --identity target/candidate-installed-windows/release-cell-identity.json \
+            --archive "target/release-dist/codestory-cli-v${version}-windows-x64.zip" \
+            --out target/release-cells/candidate_installed_behavior-windows-x64.json
+
+      - name: Upload authenticated candidate-installed Windows release cell
+        if: success() && inputs.emit_release_cells && inputs.candidate_installed_proof
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-candidate-installed-windows-x64-attempt-${{ github.run_attempt }}
+          path: target/release-cells/candidate_installed_behavior-windows-x64.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Vulkan proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-x64-vulkan-proof-${{ inputs.version }}-attempt-${{ github.run_attempt }}
+          path: target/windows-vulkan-proof
+          if-no-files-found: error
+          retention-days: 30

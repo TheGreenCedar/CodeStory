@@ -59,6 +59,7 @@ configuration smoke check.
 The language-support promotion packet-runtime suite is:
 
 ```powershell
+$env:CODESTORY_EMBED_MODEL_SOURCE = (node scripts/prepare-embedded-model.mjs).Trim()
 cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs `
   --packet-runtime `
@@ -149,7 +150,7 @@ gate, the wrapper emits `packet_gate_*` metrics and exits non-zero before
 nested agents run. Pass `--allow-empty-packet-gate` only for exploratory
 diagnostics where an empty nested A/B run is intentional.
 Rows that fail because the packet process temporarily cannot reach mandatory
-sidecars are retried once, serially, in `packet-probes-retry`; the wrapper
+retrievals are retried once, serially, in `packet-probes-retry`; the wrapper
 emits `packet_gate_retry_tasks` plus retry artifact paths and uses the merged
 quality-debug rows for A/B selection. Content-quality failures are not retried.
 Use `--packet-gate-improved-from <previous-run-dir>` when iterating on runtime

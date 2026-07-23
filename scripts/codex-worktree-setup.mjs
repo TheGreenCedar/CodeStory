@@ -37,6 +37,7 @@ const usage = `Usage: node scripts/codex-worktree-setup.mjs [options]
   --pr-head-ref <ref>          Optional PR head used in the proof summary
   --branch-head-proof          Prove only the PR branch head
   --resolve-cli-only           Resolve/install the CLI without indexing
+  --full-retrieval-proof       Prepare and verify full retrieval (maintainers only)
   --self-test                  Run the shared Node setup test suite
   --help                       Show this help`;
 
@@ -51,6 +52,7 @@ export function parseArguments(argv, env = process.env) {
     prHeadRef: env.CODESTORY_PR_HEAD_REF || "",
     branchHeadProof: truthy(env.CODESTORY_BRANCH_HEAD_PROOF),
     resolveCliOnly: false,
+    fullRetrievalProof: false,
     selfTest: false,
     help: false,
   };
@@ -60,6 +62,7 @@ export function parseArguments(argv, env = process.env) {
     ["-PrHeadRef", "--pr-head-ref"],
     ["-BranchHeadProof", "--branch-head-proof"],
     ["-ResolveCliOnly", "--resolve-cli-only"],
+    ["-FullRetrievalProof", "--full-retrieval-proof"],
     ["-SelfTest", "--self-test"],
     ["-Help", "--help"],
   ]);
@@ -81,6 +84,7 @@ export function parseArguments(argv, env = process.env) {
     }
     if (argument === "--branch-head-proof") options.branchHeadProof = true;
     else if (argument === "--resolve-cli-only") options.resolveCliOnly = true;
+    else if (argument === "--full-retrieval-proof") options.fullRetrievalProof = true;
     else if (argument === "--self-test") options.selfTest = true;
     else if (["--help", "-h"].includes(argument)) options.help = true;
     else {
@@ -112,11 +116,11 @@ function outputText(value) {
   return Buffer.isBuffer(value) ? value.toString("utf8") : String(value);
 }
 
-function invoke(context, command, args, { cwd, capture = false } = {}) {
+function invoke(context, command, args, { cwd, capture = false, env = context.env } = {}) {
   const shell = context.platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
   return context.spawnSync(command, args, {
     cwd,
-    env: context.env,
+    env,
     encoding: "utf8",
     shell,
     stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
@@ -544,8 +548,16 @@ function resolveCli(context, projectPath, expectedVersion, resolveCliOnly) {
       `Current-release install failed: ${installError}.`,
       "Building release CLI with cargo.",
     ].join(" "));
+    const modelSource = runRequired(
+      context,
+      process.execPath,
+      [join(projectPath, "scripts", "prepare-embedded-model.mjs")],
+      { cwd: projectPath, capture: true },
+    ).trim();
+    if (!modelSource) throw new Error("Embedded model preparation returned no source path.");
     runRequired(context, "cargo", ["build", "--release", "--locked", "-p", "codestory-cli"], {
       cwd: projectPath,
+      env: { ...context.env, CODESTORY_EMBED_MODEL_SOURCE: modelSource },
     });
   });
   return findCli(projectPath, expectedVersion, context);
@@ -566,51 +578,39 @@ function findRehydrateSource(context, projectPath) {
     .find(candidate => existsSync(join(candidate, "Cargo.toml"))) || null;
 }
 
-export function agentRepairArguments(projectPath) {
+function fullRetrievalProofArguments(projectPath) {
   return [
-    "ready",
-    "--goal",
-    "agent",
-    "--repair",
+    "retrieval",
+    "index",
     "--project",
     projectPath,
+    "--refresh",
+    "full",
     "--format",
     "json",
-    "--run-id",
-    "shared-agent",
   ];
 }
 
-export function doctorSummaryLines(doctor) {
+export function setupSummaryLines(doctor, cliVersion, fullRetrievalProof) {
   const verdict = goal => (doctor.readiness || []).find(item => item.goal === goal);
   const local = verdict("local_navigation");
   const agent = verdict("agent_packet_search");
-  const ready = item => item?.status === "ready";
-  const minimumNext = [local, agent]
-    .filter(item => !ready(item))
-    .flatMap(item => item?.minimum_next || [])
-    .concat(doctor.next_commands || [])
-    .find(Boolean);
+  const repositoryMap = local?.status === "ready" ? "ready" : "needs_attention";
+  const retrieval = agent?.status === "ready" && doctor.retrieval_mode === "full"
+    ? "ready"
+    : fullRetrievalProof
+      ? "needs_attention"
+      : "not_requested";
   const lines = [
-    "CodeStory worktree readiness",
-    `  local_navigation: ${local?.status || "unknown"}`,
+    "CodeStory worktree setup complete",
+    `  cli_version: ${cliVersion}`,
+    `  repository_map: ${repositoryMap}`,
+    `  retrieval: ${retrieval}`,
   ];
-  if (local?.summary) lines.push(`    reason: ${local.summary}`);
-  lines.push(`  agent_packet_search: ${agent?.status || "unknown"}`);
-  if (agent?.summary) lines.push(`    reason: ${agent.summary}`);
-  lines.push(`  retrieval_mode: ${doctor.retrieval_mode || "unknown"}`);
-  lines.push(`  degraded_reason: ${doctor.degraded_reason || "none"}`);
-  if (minimumNext) lines.push(`  minimum_next: ${minimumNext}`);
-  if (!ready(agent)) {
-    lines.push([
-      "  handoff: CodeStory packet/search is unavailable; use direct source reads until",
-      "the minimum_next command repairs readiness.",
-    ].join(" "));
-  }
   return lines;
 }
 
-function doctorSummary(context, cli, projectPath) {
+function setupSummary(context, cli, cliVersion, projectPath, fullRetrievalProof) {
   const result = invoke(context, cli, ["doctor", "--project", projectPath, "--format", "json"], {
     cwd: projectPath,
     capture: true,
@@ -619,7 +619,11 @@ function doctorSummary(context, cli, projectPath) {
     throw new Error(commandFailure(cli, ["doctor", "--project", projectPath, "--format", "json"], result));
   }
   const doctor = JSON.parse(outputText(result.stdout));
-  for (const line of doctorSummaryLines(doctor)) context.log(line);
+  const agent = (doctor.readiness || []).find(item => item.goal === "agent_packet_search");
+  if (fullRetrievalProof && (agent?.status !== "ready" || doctor.retrieval_mode !== "full")) {
+    throw new Error("Full retrieval proof did not reach the ready state.");
+  }
+  for (const line of setupSummaryLines(doctor, cliVersion, fullRetrievalProof)) context.log(line);
 }
 
 export function runSetup(options, contextOverrides = {}) {
@@ -635,41 +639,42 @@ export function runSetup(options, contextOverrides = {}) {
   }
 
   const cli = resolveCli(context, projectPath, expectedVersion, options.resolveCliOnly);
-  context.log(`CODESTORY_CLI=${cli}`);
   if (options.resolveCliOnly) return { cli, projectPath };
 
   const source = findRehydrateSource(context, projectPath);
   if (source) {
     step(
       context,
-      `Rehydrate CodeStory cache from ${source}`,
+      `Reuse repository map from ${source}`,
       () => runRequired(context, cli, ["cache", "rehydrate", "--from-project", source, "--project", projectPath], {
         cwd: projectPath,
+        capture: true,
       }),
       true,
     );
   } else {
     context.log("");
-    context.log("==> Rehydrate CodeStory cache");
-    context.log("No sibling source worktree found; refreshing this worktree directly.");
+    context.log("==> Reuse repository map");
+    context.log("No sibling repository map found; preparing this worktree directly.");
   }
-  step(context, "Refresh SQLite graph/search/doc cache", () => runRequired(
+  step(context, "Prepare repository map", () => runRequired(
     context,
     cli,
     ["index", "--project", projectPath, "--refresh", "auto"],
-    { cwd: projectPath },
+    { cwd: projectPath, capture: true },
   ));
+  if (options.fullRetrievalProof) {
+    step(context, "Prepare full retrieval proof", () => runRequired(
+      context,
+      cli,
+      fullRetrievalProofArguments(projectPath),
+      { cwd: projectPath, capture: true },
+    ));
+  }
   step(
     context,
-    "Repair agent sidecar readiness",
-    () => runRequired(context, cli, agentRepairArguments(projectPath), { cwd: projectPath }),
-    true,
-  );
-  step(
-    context,
-    "Doctor readiness handoff",
-    () => doctorSummary(context, cli, projectPath),
-    true,
+    "Check setup state",
+    () => setupSummary(context, cli, expectedVersion, projectPath, options.fullRetrievalProof),
   );
   return { cli, projectPath };
 }

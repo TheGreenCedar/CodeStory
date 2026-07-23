@@ -3,8 +3,8 @@
   "fixtures": [
     {
       "id": "readiness-boundary",
-      "prompt": "Explain how LiveSidecarSearch::qdrant_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
-      "query": "LiveSidecarSearch::qdrant_search",
+      "prompt": "Explain how LiveSidecarSearch::semantic_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
+      "query": "LiveSidecarSearch::semantic_search",
       "category": "readiness_boundary",
       "mode": "packet_search",
       "expected": {
@@ -12,10 +12,10 @@
           "crates/codestory-retrieval/src/sidecar_search.rs"
         ],
         "symbols": [
-          "LiveSidecarSearch::qdrant_search"
+          "LiveSidecarSearch::semantic_search"
         ],
         "anchors": [
-          "LiveSidecarSearch::qdrant_search",
+          "LiveSidecarSearch::semantic_search",
           "sidecar_search"
         ]
       },
@@ -63,8 +63,8 @@
   "diagnostic_fixtures": [
     {
       "id": "readiness-boundary-broad-query-diagnostic",
-      "prompt": "Explain how LiveSidecarSearch::qdrant_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
-      "query": "LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable",
+      "prompt": "Explain how LiveSidecarSearch::semantic_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
+      "query": "LiveSidecarSearch semantic_search retrieval_mode full sidecar unavailable",
       "category": "readiness_boundary_broad_query",
       "mode": "packet_search",
       "expected": {
@@ -73,11 +73,11 @@
           "crates/codestory-retrieval/src/lib.rs"
         ],
         "symbols": [
-          "LiveSidecarSearch::qdrant_search",
+          "LiveSidecarSearch::semantic_search",
           "LiveSidecarSearch::layout"
         ],
         "anchors": [
-          "LiveSidecarSearch::qdrant_search",
+          "LiveSidecarSearch::semantic_search",
           "sidecar_search"
         ]
       },

@@ -7,10 +7,14 @@ on:
       - Cargo.toml
       - crates/**
       - .github/scripts/check-runtime-config-boundary.mjs
+      - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/route-ci-proof.mjs
       - .github/workflows/rust-ci.yml
       - .github/workflows/source-proof.yml
+      - plugins/codestory/generated-mcp-catalog.json
+      - plugins/codestory/skills/codestory-grounding/**
+      - scripts/generate-codestory-skill-syntax.mjs
   workflow_dispatch:
 
 permissions:
@@ -33,6 +37,9 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
+      - name: Install Linux Vulkan build dependencies
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
+
       - name: Capture Rust cache identity
         id: rust-cache-key
         shell: bash
@@ -49,9 +56,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-draft-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-draft-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
+            ${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-
 
       - name: Check formatting
         run: cargo fmt --check
@@ -62,17 +71,24 @@ jobs:
       - name: Check the workspace
         run: cargo check --workspace --locked
 
+      - name: Check generated CodeStory syntax and MCP catalog
+        run: |
+          cargo build --locked -p codestory-cli
+          node scripts/generate-codestory-skill-syntax.mjs --check
+
       - name: Lint workspace libraries
         run: cargo clippy --workspace --lib --locked -- -D warnings
 
       - name: Prove focused publication contracts
         run: |
+          cargo test --locked -p codestory-llama-sys --test native_staging
+          cargo test --locked -p codestory-llama-sys --test model_staging
           cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture
           cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture
           cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture
 
       - name: Save Cargo inputs and output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

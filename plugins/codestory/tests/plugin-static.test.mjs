@@ -17,6 +17,8 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
 const launcherTest = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"))._test;
+const devCliContract = require(join(pluginRoot, "scripts", "codestory-dev-cli-contract.cjs"));
+const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
   dirtyMarkerPathForProject,
   dirtyHookStatus,
@@ -24,8 +26,135 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
-const genericBaselineHook = join(pluginRoot, "tests", "fixtures", "hook-generic-baseline.cjs");
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function launcherHandoffInput() {
+  return [
+    {
+      jsonrpc: "2.0",
+      id: "initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "plugin-static", version: "1" },
+      },
+    },
+    { jsonrpc: "2.0", id: "native-tools", method: "tools/list" },
+  ].map((request) => JSON.stringify(request)).join("\n") + "\n";
+}
+
+async function stopChildProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const closed = once(child, "close").catch(() => []);
+  try {
+    child.stdin?.end();
+  } catch {
+    // Continue to the bounded signal path.
+  }
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  await Promise.race([closed, delay(500)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      return;
+    }
+    await Promise.race([closed, delay(500)]);
+  }
+}
+
+test("fail-open tool schemas are the generated canonical MCP catalog", async () => {
+  const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
+  assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
+  assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
+  assert.ok(
+    catalog.resourceTemplates.some(({ uriTemplate }) =>
+      uriTemplate === "codestory://status{?project}"),
+  );
+  assert.ok(
+    catalog.resourceTemplates.every(({ uriTemplate }) => uriTemplate.endsWith("{?project}")),
+    "every advertised repository resource template must carry a project selector",
+  );
+  const snippet = catalog.tools.find(({ name }) => name === "snippet");
+  assert.deepEqual(
+    Object.keys(snippet.inputSchema.properties).sort(),
+    ["choose", "context", "function_body", "id", "lines", "project", "query", "scope"],
+  );
+});
+
+test("fail-open project resource URIs use the native strict encoding contract", () => {
+  for (const project of ["/tmp/Code Story/%/café", String.raw`C:\Code Story\100% data\Δ`]) {
+    const encoded = launcherTest.strictUriComponentEncode(project);
+    assert.equal(launcherTest.strictUriComponentDecode(encoded, "resource project"), project);
+    const publicProject = launcherTest.cleanPublicProjectPath(project);
+    assert.equal(
+      launcherTest.projectBoundResourceUri("codestory://status", project),
+      `codestory://status?project=${launcherTest.strictUriComponentEncode(publicProject)}`,
+    );
+  }
+  assert.equal(
+    launcherTest.cleanPublicProjectPath(String.raw`\\?\C:\Code Story\repo`, "win32"),
+    "C:/Code Story/repo",
+  );
+  assert.equal(
+    launcherTest.cleanPublicProjectPath(String.raw`/tmp/a\b`, "linux"),
+    String.raw`/tmp/a\b`,
+  );
+  for (const uri of [
+    "codestory://status",
+    "codestory://status?project=%2ftmp%2Frepo",
+    "codestory://status?project=/tmp/repo",
+    "codestory://status?project=%2Ftmp%2Frepo&project=%2Fother",
+    "codestory://status?project=%ZZ",
+  ]) {
+    assert.throws(
+      () => launcherTest.parseFailOpenResourceRequest(uri, undefined),
+      /project|canonical|unknown/u,
+      uri,
+    );
+  }
+  assert.throws(
+    () => launcherTest.parseFailOpenResourceRequest("codestory://agent-guide", "/tmp/repo"),
+    /resource_project_unexpected/u,
+  );
+  const bound = launcherTest.parseFailOpenResourceRequest(statusUri, undefined);
+  const legacy = launcherTest.parseFailOpenResourceRequest("codestory://status", repoRoot);
+  assert.equal(bound.projectSource, "resource_uri");
+  assert.equal(legacy.projectSource, "request_argument");
+  assert.equal(bound.uri, legacy.uri);
+});
+
+test("fail-open handoff shutdown is bounded for a child that ignores stdin and SIGTERM", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGKILL") {
+      child.signalCode = signal;
+      child.emit("exit", null, signal);
+      child.emit("close", null, signal);
+    }
+    return true;
+  };
+
+  launcherTest.shutdownHandoffChild(child, {
+    handoffTerminationGraceMs: 1,
+    handoffForceKillGraceMs: 1,
+  });
+  await delay(25);
+
+  assert.equal(child.stdin.writableEnded, true);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
   return join(dataDir, `.codestory-active-thread-${key}.json`);
@@ -235,7 +364,7 @@ function spawnLauncher(launcher, env) {
   let stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: statusUri } })}\n`);
   const runtimeMetadata = env.PLUGIN_DATA && join(env.PLUGIN_DATA, ".codestory-mcp-runtime.json");
   let handoffRequestId = 2;
   const handoffPoll = runtimeMetadata && setInterval(() => {
@@ -270,7 +399,12 @@ async function waitForPath(pathname, timeoutMs = 10000) {
 }
 
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n',()=>process.exit(0))})}else{if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))}";
+  const script = [
+    "const fs=require('fs');const args=process.argv.slice(1);",
+    "if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n',()=>process.exit(0))})}",
+    "else if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}",
+    "else{fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,args}))}",
+  ].join("");
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -305,16 +439,6 @@ async function writeLifecycleCli(cliPath) {
   await chmod(cliPath, 0o755);
 }
 
-async function writeRecordingCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'&&args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
-  if (process.platform === "win32") {
-    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
-    return;
-  }
-  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
-  await chmod(cliPath, 0o755);
-}
-
 async function writeVersionOnlyCli(cliPath) {
   if (process.platform === "win32") {
     await writeFile(cliPath, "@echo off\r\necho codestory-cli %TEST_CODESTORY_VERSION%\r\n", "utf8");
@@ -337,6 +461,55 @@ async function writeManagedCliFixture(dataDir, version, body = version) {
     "utf8",
   );
   return { cliPath, versionDir };
+}
+
+async function writeAttestedDevPluginFixture(root, version) {
+  const { cp } = await import("node:fs/promises");
+  const installRoot = join(
+    root,
+    ".codex",
+    "plugins",
+    "cache",
+    "CodeStoryDev",
+    "codestory",
+    version,
+  );
+  await cp(pluginRoot, installRoot, { recursive: true });
+  const sourcePackageSha256 = devCliContract.directoryContractSha256(installRoot);
+  const cliName = devCliContract.expectedBinaryName();
+  const cliPath = join(installRoot, "bin", cliName);
+  await mkdir(dirname(cliPath), { recursive: true });
+  await writeFakeCli(cliPath);
+  const cliBytes = await readFile(cliPath);
+  const cliSha256 = createHash("sha256").update(cliBytes).digest("hex");
+  await writeFile(
+    join(installRoot, devCliContract.receiptName),
+    `${JSON.stringify({
+      schema_version: devCliContract.receiptSchemaVersion,
+      purpose: devCliContract.receiptPurpose,
+      plugin_id: devCliContract.receiptPluginId,
+      plugin_name: devCliContract.receiptPluginName,
+      plugin_version: version,
+      source_commit: "a".repeat(40),
+      source_package_sha256: sourcePackageSha256,
+      target: devCliContract.assetTarget(),
+      cli: {
+        path: `bin/${cliName}`,
+        name: cliName,
+        bytes: cliBytes.length,
+        sha256: cliSha256,
+        version,
+      },
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  return {
+    cliPath,
+    cliSha256,
+    installRoot,
+    launcher: join(installRoot, "scripts", "codestory-mcp.cjs"),
+    sourcePackageSha256,
+  };
 }
 
 test("plugin metadata maps skill and direct stdio server", async () => {
@@ -367,29 +540,35 @@ test("plugin metadata maps skill and direct stdio server", async () => {
     "./scripts/codestory-mcp.cjs",
   ]);
   assert.equal(mcp.mcpServers.codestory.cwd, ".");
-  assert.deepEqual(mcp.mcpServers.codestory.env, {
-    CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS: "15000",
-  });
+  assert.deepEqual(mcp.mcpServers.codestory.env, {});
 });
 
-test("agent-facing guidance does not send agents to CLI fallback repair", async () => {
+test("agent-facing guidance keeps embedding lifecycle internal", async () => {
   const guidanceFiles = [
-    join(pluginRoot, "hooks", "codestory-instructions.cjs"),
+    join(pluginRoot, "hooks", "codestory-activate.cjs"),
     join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
     join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
     join(pluginRoot, "skills", "codestory-grounding", "references", "status-contract.md"),
     join(pluginRoot, "skills", "codestory-grounding", "references", "doctor.md"),
     join(pluginRoot, "skills", "codestory-grounding", "references", "serve.md"),
     join(repoRoot, "docs", "users", "troubleshooting.md"),
-    join(repoRoot, "docs", "ops", "retrieval-sidecars.md"),
+    join(repoRoot, "docs", "ops", "retrieval-engine.md"),
   ];
 
   for (const file of guidanceFiles) {
     const text = await readFile(file, "utf8");
-    assert.doesNotMatch(text, /CLI Fallback/u, file);
-    assert.doesNotMatch(text, /CLI fallback/u, file);
-    assert.doesNotMatch(text, /managed CLI or local-dev CODESTORY_CLI preflight/u, file);
-    assert.doesNotMatch(text, /Call `sidecar_setup`/u, file);
+    assert.doesNotMatch(text, /llama-server|sidecar setup|consent|ready --goal agent --repair/iu, file);
+  }
+
+  for (const file of [
+    join(repoRoot, ".github", "copilot-instructions.md"),
+    join(repoRoot, ".cursor", "rules", "codestory.mdc"),
+    join(pluginRoot, ".cursor", "rules", "codestory.mdc"),
+  ]) {
+    const text = await readFile(file, "utf8");
+    assert.match(text, /Call the CodeStory tool that matches the task/u, file);
+    assert.doesNotMatch(text, /read `codestory:\/\/status` first/u, file);
+    assert.doesNotMatch(text, /codestory-cli ready/u, file);
   }
 });
 
@@ -408,6 +587,20 @@ test("plugin package version tracks the codestory-cli release version", async ()
   for (const manifestPath of manifestPaths) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     assert.equal(manifest.version, expectedVersion);
+  }
+});
+
+test("source setup adapters prepare and pass the canonical embedded model", async () => {
+  const [powershell, posix] = await Promise.all([
+    readFile(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.ps1"), "utf8"),
+    readFile(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"), "utf8"),
+  ]);
+
+  for (const source of [powershell, posix]) {
+    assert.match(source, /prepare-embedded-model\.mjs/u);
+    assert.match(source, /CODESTORY_EMBED_MODEL_SOURCE/u);
+    assert.match(source, /build[" ]*,?[" ]*--release/u);
+    assert.match(source, /--locked/u);
   }
 });
 
@@ -605,6 +798,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
     });
 
@@ -622,30 +816,190 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(retention.reclaimable_bytes, 0);
     assert.equal(observed.pluginRoot, pluginRoot);
     assert.equal(observed.pluginCacheVersion, "");
-    assert.equal(observed.activeStatePath, undefined);
-    assert.equal(observed.sidecarPolicy, "ask");
-    assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
-    assert.match(observed.sidecarEnable, /--policy-file/u);
-    assert.equal(observed.sidecarRepair, undefined);
-    assert.equal(observed.dirtyMarkerRoot, undefined);
-    assert.equal(observed.dirtyMarkerPath, undefined);
     assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
 
-    const enable = spawnSync(observed.sidecarEnable, {
-      shell: true,
+test("mcp launcher uses an attested CodeStoryDev CLI from the installed cache without PATH", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "codestory-attested-dev-cli-"));
+  const dataDir = join(root, "plugin-data");
+  const outFile = join(root, "env.json");
+  const version = await readPluginVersion();
+  try {
+    const fixture = await writeAttestedDevPluginFixture(root, version);
+    await mkdir(dataDir, { recursive: true });
+    const result = spawnSync(process.execPath, [fixture.launcher], {
       env: {
         ...process.env,
-        PLUGIN_DATA: "",
-        COPILOT_PLUGIN_DATA: "",
+        CODESTORY_CLI: "",
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: outFile,
+        PATH: "",
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
     });
-    assert.equal(enable.status, 0, enable.stderr);
-    const policy = JSON.parse(
-      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
-    );
-    assert.equal(policy.state, "enabled");
+
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(await readFile(outFile, "utf8"));
+    assert.equal(observed.source, "local_dev_override");
+    assert.equal(observed.buildSource, "codestory_dev_receipt");
+    assert.equal(observed.sha256, fixture.cliSha256);
+    assert.equal(await realpath(observed.path), await realpath(fixture.cliPath));
+    assert.equal(await realpath(observed.pluginRoot), await realpath(fixture.installRoot));
+    assert.equal(observed.pluginCacheVersion, version);
+    assert.match(observed.warnings, /codestory_dev_receipt:verified/u);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("declared CodeStoryDev receipt failures never fall through to raw or managed CLI selection", async () => {
+  if (process.platform === "win32") return;
+  const version = await readPluginVersion();
+  for (const variant of ["invalid-receipt", "ambiguous-raw-override"]) {
+    const root = await mkdtemp(join(tmpdir(), "codestory-dev-receipt-no-fallback-"));
+    const dataDir = join(root, "plugin-data");
+    const runtimeOut = join(root, "runtime.json");
+    try {
+      const fixture = await writeAttestedDevPluginFixture(root, version);
+      const managedDir = join(dataDir, "codestory-cli", version);
+      const managedCli = join(managedDir, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+      await mkdir(managedDir, { recursive: true });
+      await writeFakeCli(managedCli);
+      const managedSha256 = createHash("sha256").update(await readFile(managedCli)).digest("hex");
+      await writeFile(
+        join(managedDir, "manifest.json"),
+        JSON.stringify(managedReleaseManifest(version, managedCli.slice(managedDir.length + 1), managedSha256)),
+        "utf8",
+      );
+      if (variant === "invalid-receipt") {
+        await writeFile(join(fixture.installRoot, "README.md"), "changed package bytes", "utf8");
+      }
+      const input = `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: variant,
+        method: "resources/read",
+        params: { uri: statusUri },
+      })}\n`;
+      const result = spawnSync(process.execPath, [fixture.launcher], {
+        env: {
+          ...process.env,
+          CODESTORY_CLI: variant === "ambiguous-raw-override" ? fixture.cliPath : "",
+          CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_OUT: runtimeOut,
+          PATH: "",
+        },
+        input,
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const response = JSON.parse(result.stdout.trim());
+      const status = JSON.parse(response.result.contents[0].text);
+      assert.equal(status.plugin_runtime.cli_source, "local_dev_receipt_invalid");
+      assert.equal(status.plugin_runtime.cli_path, null);
+      assert.equal(status.plugin_runtime.managed_binary_path, null);
+      if (variant === "invalid-receipt") {
+        assert.equal(
+          status.degraded_reason,
+          "codestory_dev_receipt_invalid:codestory_dev_receipt_package_digest",
+        );
+      } else {
+        assert.equal(status.degraded_reason, "codestory_dev_cli_ambiguous_override");
+      }
+      assert.equal(fs.existsSync(runtimeOut), false, `${variant} unexpectedly launched a runtime`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("candidate managed CLI metadata is accepted only for the exact proof archive", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-candidate-cli-"));
+  const version = "0.0.1";
+  const archiveSha256 = "a".repeat(64);
+  const qualificationNonce = "c".repeat(64);
+  const qualificationDir = join(dataDir, "qualification");
+  const target = releaseAssetForPlatform(version).archiveName
+    .slice(`codestory-cli-v${version}-`.length)
+    .replace(/\.(?:zip|tar\.gz)$/u, "");
+  try {
+    const fixture = await writeManagedCliFixture(dataDir, version);
+    const manifest = managedReleaseManifest(
+      version,
+      fixture.cliPath.slice(fixture.versionDir.length + 1),
+      createHash("sha256").update(await readFile(fixture.cliPath)).digest("hex"),
+    );
+    manifest.build_source = "candidate_archive";
+    manifest.repo_ref = "b".repeat(40);
+    manifest.archive_sha256 = archiveSha256;
+    manifest.archive_url = `candidate-archive:${archiveSha256}`;
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(manifest),
+      "utf8",
+    );
+    const probe = () => ({
+      status: 0,
+      error: null,
+      version,
+      stdout: "",
+      stderr: "",
+    });
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(
+        fixture.versionDir,
+        version,
+        target,
+        probe,
+      ).verified,
+      false,
+    );
+    process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256 = archiveSha256;
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(
+        fixture.versionDir,
+        version,
+        target,
+        probe,
+      ).verified,
+      false,
+    );
+    await mkdir(qualificationDir, { mode: 0o700 });
+    await writeFile(
+      join(qualificationDir, "candidate-managed-install.json"),
+      JSON.stringify({
+        schema_version: 1,
+        purpose: "codestory-candidate-managed-install",
+        archive_sha256: archiveSha256,
+        qualification_nonce_sha256: createHash("sha256")
+          .update(qualificationNonce)
+          .digest("hex"),
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    process.env.CODESTORY_EMBED_QUALIFICATION_DIR = await realpath(qualificationDir);
+    process.env.CODESTORY_EMBED_QUALIFICATION_NONCE = qualificationNonce;
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(
+        fixture.versionDir,
+        version,
+        target,
+        probe,
+      ).verified,
+      true,
+    );
+  } finally {
+    delete process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256;
+    delete process.env.CODESTORY_EMBED_QUALIFICATION_DIR;
+    delete process.env.CODESTORY_EMBED_QUALIFICATION_NONCE;
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -1452,18 +1806,11 @@ test("mcp launcher starts projectless when host launches from plugin root", asyn
         "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify({",
         "  cwd: process.cwd(),",
         "  args,",
-        "  projectRoot: process.env.CODESTORY_PLUGIN_PROJECT_ROOT || '',",
-        "  projectRootSource: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE || '',",
         "  launchCwd: process.env.CODESTORY_PLUGIN_LAUNCH_CWD || '',",
         "  runtimeCwd: process.env.CODESTORY_PLUGIN_RUNTIME_CWD || '',",
-        "  dirtyMarkerPath: process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH || '',",
-        "  dirtyMarkerRoot: process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT || ''",
+        "  multiProject: process.env.CODESTORY_PLUGIN_MULTI_PROJECT || ''",
         "}) + '\\n');",
         "if (command === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
-        "if (command === 'ready' && args.includes('--wait-fresh') && !args.includes('--repair') && !args.includes('agent')) {",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'ready', summary: 'ready', minimum_next: [], full_repair: [] }], local_refresh: { state: 'fresh', reason: 'already_fresh', blocks_local_surfaces: false, readiness_status: 'ready', changed_file_count: 0, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
-        "  process.exit(0);",
-        "}",
         "if (command === 'serve') { fs.writeFileSync(process.env.TEST_OUT, 'serve-called'); process.exit(0); }",
         "process.exit(2);",
         "",
@@ -1488,6 +1835,7 @@ test("mcp launcher starts projectless when host launches from plugin root", asyn
         TEST_LOG: logFile,
         TEST_OUT: marker,
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
       timeout: 15000,
     });
@@ -1495,19 +1843,14 @@ test("mcp launcher starts projectless when host launches from plugin root", asyn
     assert.equal(result.status, 0, result.stderr);
     assert.equal(await readFile(marker, "utf8"), "serve-called");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    const readyCalls = calls.filter((call) => call.args[0] === "ready");
     const serve = calls.find((call) => call.args[0] === "serve");
-    assert.deepEqual(readyCalls, []);
     assert.ok(serve, "expected serve call");
     assert.deepEqual(serve.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
     assert.match(serve.cwd, /runtime-cwd/u);
-    assert.equal(serve.projectRoot, "");
-    assert.equal(serve.projectRootSource, "");
+    assert.equal(serve.multiProject, "1");
     assert.equal(serve.launchCwd, pluginRoot);
     assert.notEqual(serve.runtimeCwd, pluginRoot);
     assert.match(serve.runtimeCwd, /runtime-cwd/u);
-    assert.equal(serve.dirtyMarkerRoot, "");
-    assert.equal(serve.dirtyMarkerPath, "");
     const runtimeState = JSON.parse(await readFile(join(dataDir, ".codestory-mcp-runtime.json"), "utf8"));
     assert.equal(runtimeState.launchCwd, pluginRoot);
     assert.equal(runtimeState.runtimeCwd, serve.runtimeCwd);
@@ -1526,30 +1869,15 @@ test("multi-project stdio ignores mutable active-workspace state", async () => {
   assert.match(launcher, /\['serve', '--stdio', '--multi-project', '--refresh', 'none'\]/u);
   assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
   assert.match(transport, /CODESTORY_PLUGIN_MULTI_PROJECT/u);
-  assert.match(transport, /project_required: pass the caller's repository root/u);
+  assert.match(transport, /project_required: `project` must be the caller's absolute repository root/u);
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
-  const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-exit-"));
   const binDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-bin-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const realRepoRoot = await realpath(repoRoot);
-  const input = [
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: "status",
-      method: "resources/read",
-      params: { uri: "codestory://status" },
-    }),
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: "sidecar-status",
-      method: "tools/call",
-      params: { name: "sidecar_setup", arguments: { action: "status" } },
-    }),
-  ].join("\n") + "\n";
   const cliPath = await writeNodeCli(
     binDir,
     [
@@ -1560,6 +1888,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     ].join("\n"),
   );
 
+  let child = null;
   try {
     await writeFile(
       join(dataDir, ".codestory-active"),
@@ -1570,27 +1899,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
       }),
       "utf8",
     );
-    const staleCliPath = join(
-      binDir,
-      version,
-      process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-    );
-    await writeFile(
-      join(dataDir, "sidecar-setup-policy.json"),
-      JSON.stringify({
-        state: "ask",
-        updated_at: "2026-07-09T00:00:00.000Z",
-        last_repair: {
-          state: "completed",
-          updated_at: "2026-07-09T00:00:00.000Z",
-          project_root: realRepoRoot,
-          command: `${JSON.stringify(staleCliPath)} ready --goal agent --repair`,
-        },
-      }),
-      "utf8",
-    );
-
-    const result = spawnSync(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       cwd: pluginRoot,
       env: {
         ...process.env,
@@ -1599,31 +1908,74 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
         PLUGIN_DATA: dataDir,
         TEST_CODESTORY_VERSION: version,
       },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    const responses = [];
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      const lines = stdout.split(/\r?\n/u);
+      stdout = lines.pop() || "";
+      for (const line of lines) {
+        if (line) responses.push(JSON.parse(line));
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const responseFor = async (id) => {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const response = responses.find((candidate) => candidate.id === id);
+        if (response) return response;
+        await delay(10);
+      }
+      assert.fail(`timed out waiting for ${id}: ${stderr}`);
+    };
+    const completed = once(child, "close");
 
-    assert.equal(result.status, 0, result.stderr);
-    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 2, result.stdout);
-    const status = JSON.parse(responses[0].result.contents[0].text);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: "initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "plugin-static", version: "1" },
+      },
+    })}\n`);
+    assert.equal((await responseFor("initialize")).result.serverInfo.version, version);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: "delegate",
+      method: "tools/list",
+    })}\n`);
+    assert.match(
+      (await responseFor("delegate")).error.message,
+      /stdio handoff exited before completing the request/u,
+    );
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: "status",
+      method: "resources/read",
+      params: { uri: statusUri },
+    })}\n`);
+    const status = JSON.parse((await responseFor("status")).result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "request_argument");
+    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root_source, "resource_uri");
     assert.equal(status.readiness[0].setup.probe_status, 17);
     assert.match(
       status.readiness[0].setup.probe_error,
       /codestory-cli serve --stdio exited with status 17/u,
     );
-    assert.equal(status.sidecar_setup.last_repair.current, false);
-    assert.equal(status.sidecar_setup.last_repair.stale_reason, "last_repair_cli_path_mismatch");
-    assert.equal(responses[1].result.structuredContent.last_repair.current, false);
-    assert.equal(
-      responses[1].result.structuredContent.last_repair.stale_reason,
-      "last_repair_cli_path_mismatch",
-    );
+    assert.equal(status.managed_retrieval.automatic, true);
+    child.stdin.end();
+    assert.equal((await completed)[0], 0);
+    child = null;
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });
   }
@@ -1646,7 +1998,7 @@ test("mcp launcher does not route from another thread's global active project st
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -1787,6 +2139,7 @@ test("mcp launcher ignores thread-scoped and global project state", async () => 
         TEST_LOG: logFile,
         TEST_OUT: marker,
       },
+      input: launcherHandoffInput(),
       encoding: "utf8",
       timeout: 5000,
     });
@@ -1823,7 +2176,7 @@ test("mcp launcher ignores fresh global active project state when current thread
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -1906,7 +2259,7 @@ test("mcp launcher ignores unscoped global active project state", async () => {
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -1986,7 +2339,7 @@ test("mcp launcher uses fresh active project state from before launcher start", 
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2062,7 +2415,7 @@ test("mcp launcher ignores stale active project state from plugin root", async (
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2165,8 +2518,8 @@ test("projectless mcp hands off to stdio without active project state", async ()
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { serverInfo: { name: 'codestory' } } }) + '\\n');",
       "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
-      "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'sidecar_setup') {",
-      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { state: 'runtime-sidecar-setup' } } }) + '\\n');",
+      "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'ground') {",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { state: 'ready' } } }) + '\\n');",
       "      } else if (request.method === 'resources/read') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { contents: [{ uri: request.params.uri, mimeType: 'application/json', text: JSON.stringify({ project_root: process.env.CODESTORY_PLUGIN_PROJECT_ROOT, project_root_source: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE }) }] } }) + '\\n');",
       "      }",
@@ -2237,13 +2590,13 @@ test("projectless mcp hands off to stdio without active project state", async ()
     });
     assert.equal(init.result.serverInfo.name, "codestory");
 
-    const repaired = await sendRequest({
+    const grounded = await sendRequest({
       jsonrpc: "2.0",
-      id: "repair",
+      id: "ground",
       method: "tools/call",
-      params: { name: "sidecar_setup", arguments: { project: realRepoRoot, action: "repair" } },
+      params: { name: "ground", arguments: { project: realRepoRoot } },
     });
-    assert.equal(repaired.result.structuredContent.state, "runtime-sidecar-setup");
+    assert.equal(grounded.result.structuredContent.state, "ready");
 
     const tools = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
     assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["ground"]);
@@ -2263,198 +2616,6 @@ test("projectless mcp hands off to stdio without active project state", async ()
       if (!child.killed) child.kill();
     }
     await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("bootstrap-status rejects missing and invalid project selection", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-no-project-"));
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-  const cliScript = join(dataDir, "recording-codestory-cli.cjs");
-  const cliPath = join(
-    dataDir,
-    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
-  );
-  const logFile = join(dataDir, "calls.jsonl");
-  const marker = join(dataDir, "serve-called.txt");
-
-  try {
-    await writeFile(
-      cliScript,
-      [
-        "const fs = require('node:fs');",
-        "const args = process.argv.slice(2);",
-        "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify({ args, cwd: process.cwd() }) + '\\n');",
-        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
-        "if (args[0] === 'ready' || args[0] === 'serve') { fs.writeFileSync(process.env.TEST_OUT, args[0]); process.exit(0); }",
-        "process.exit(2);",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
-    } else {
-      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
-      await chmod(cliPath, 0o755);
-    }
-
-    const result = spawnSync(process.execPath, [launcher, "bootstrap-status"], {
-      cwd: pluginRoot,
-      env: {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
-        TEST_LOG: logFile,
-        TEST_OUT: marker,
-      },
-      encoding: "utf8",
-      timeout: 5000,
-    });
-
-    assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
-    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const status = JSON.parse(result.stdout.trim());
-    assert.equal(status.ready, false);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "request_argument_missing");
-    assert.equal(status.readiness[0].goal, "project_root");
-
-    for (const explicit of [
-      { args: ["--project", join(dataDir, "missing-project")], env: {}, source: "argument_invalid" },
-      { args: [], env: { CODESTORY_PROJECT_ROOT: join(dataDir, "missing-project") }, source: "env_invalid" },
-    ]) {
-      const invalid = spawnSync(process.execPath, [launcher, "bootstrap-status", ...explicit.args], {
-        cwd: repoRoot,
-        env: {
-          ...process.env,
-          ...explicit.env,
-          CODESTORY_CLI: cliPath,
-          PLUGIN_DATA: dataDir,
-          TEST_CODESTORY_VERSION: version,
-          TEST_LOG: logFile,
-          TEST_OUT: marker,
-        },
-        encoding: "utf8",
-        timeout: 5000,
-      });
-      assert.equal(invalid.status, 0, invalid.stderr);
-      const invalidStatus = JSON.parse(invalid.stdout.trim());
-      assert.equal(invalidStatus.ready, false);
-      assert.equal(invalidStatus.degraded_reason, "project_root_invalid");
-      assert.equal(invalidStatus.project_root, null);
-      assert.equal(invalidStatus.project_root_source, explicit.source);
-    }
-    await assert.rejects(access(marker));
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("bootstrap-status binds Rust readiness to request-scoped project identity", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-agent-ready-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-agent-ready-bin-"));
-  const logFile = join(dataDir, "calls.jsonl");
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-  const cliPath = await writeNodeCli(
-    binDir,
-    [
-      "const fs = require('node:fs');",
-      "const args = process.argv.slice(2);",
-      "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
-      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
-      "if (args[0] === 'cache' && args[1] === 'identity') {",
-      "  const project = args[args.indexOf('--project') + 1];",
-      "  console.log(JSON.stringify({ project, project_identity_schema_version: 3, project_id: 'project-123', workspace_id: 'workspace-123', artifact_scope_id: 'project-123', portable_reuse_eligible: true, legacy_alias_disposition: 'unavailable_without_provenance', legacy_project_id: null }));",
-      "  process.exit(0);",
-      "}",
-      "if (args[0] === 'ready' && args.includes('--goal') && args.includes('local')) {",
-      "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'ready', summary: 'ready', minimum_next: [], full_repair: [] }], local_refresh: { state: 'fresh', reason: 'already_fresh', blocks_local_surfaces: false, readiness_status: 'ready', changed_file_count: 0, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
-      "  process.exit(0);",
-      "}",
-      "if (args[0] === 'ready' && args.includes('--goal') && args.includes('agent')) {",
-      "  const workspaceId = process.env.TEST_STALE_IDENTITY === '1' ? 'workspace-stale' : 'workspace-123';",
-      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'lexical_shard_unavailable' } }, readiness_broker: { schema_version: 3, identity: { project_identity_schema_version: 3, project_id: 'project-123', workspace_id: workspaceId }, project_id: 'project-123', persistence_status: 'observed' } }));",
-      "  process.exit(0);",
-      "}",
-      "process.exit(2);",
-    ].join("\n"),
-  );
-
-  try {
-    const result = spawnSync(process.execPath, [launcher, "bootstrap-status", "--project", dataDir], {
-      cwd: pluginRoot,
-      env: {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
-        TEST_LOG: logFile,
-      },
-      encoding: "utf8",
-      timeout: 5000,
-    });
-
-    assert.equal(result.status, 0, result.stderr);
-    const status = JSON.parse(result.stdout.trim());
-    assert.equal(status.ready, true);
-    assert.equal(status.runtime_truth.sidecar_status_ref, "readiness_lanes.agent_packet_search");
-    assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
-    assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
-    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
-    assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
-    assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
-    assert.equal(status.project_identity.project_identity_schema_version, 3);
-    assert.equal(status.project_identity.project_id, "project-123");
-    assert.equal(status.project_identity.workspace_id, "workspace-123");
-    assert.deepEqual(status.readiness_broker, {
-      schema_version: 3,
-      identity: {
-        project_identity_schema_version: 3,
-        project_id: "project-123",
-        workspace_id: "workspace-123",
-      },
-      project_id: "project-123",
-      persistence_status: "observed",
-    });
-    assert.equal(status.readiness.some((verdict) => verdict.goal === "agent_packet_search" && verdict.status === "ready"), true);
-    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((args) => args.slice(0, 3)), [
-      ["--version"],
-      ["cache", "identity", "--project"],
-      ["ready", "--goal", "local"],
-      ["ready", "--goal", "agent"],
-    ]);
-    assert.equal(calls.some((args) => args.includes("--repair")), false);
-
-    const stale = spawnSync(process.execPath, [launcher, "bootstrap-status", "--project", dataDir], {
-      cwd: pluginRoot,
-      env: {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
-        TEST_LOG: logFile,
-        TEST_STALE_IDENTITY: "1",
-      },
-      encoding: "utf8",
-      timeout: 5000,
-    });
-    assert.equal(stale.status, 0, stale.stderr);
-    const staleStatus = JSON.parse(stale.stdout.trim());
-    assert.equal(staleStatus.ready, false);
-    assert.equal(staleStatus.degraded_reason, "readiness_broker_identity_mismatch");
-    assert.equal(staleStatus.project_root, await realpath(dataDir));
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
   }
 });
 
@@ -2481,6 +2642,14 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
       launcher,
       await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8"),
       "utf8",
+    );
+    await copyFile(
+      join(pluginRoot, "scripts", "codestory-dev-cli-contract.cjs"),
+      join(installRoot, "scripts", "codestory-dev-cli-contract.cjs"),
+    );
+    await copyFile(
+      join(pluginRoot, "generated-mcp-catalog.json"),
+      join(installRoot, "generated-mcp-catalog.json"),
     );
     await writeFile(
       join(installRoot, "hooks", "codestory-runtime.cjs"),
@@ -2524,6 +2693,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
       cwd: repoRoot,
+      input: launcherHandoffInput(),
       encoding: "utf8",
       timeout: 5000,
     });
@@ -2544,33 +2714,20 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
 test("mcp launcher blocks when managed runtime is unavailable", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
-  const sourceVersion = readCargoVersion(await readFile(join(repoRoot, "crates", "codestory-cli", "Cargo.toml"), "utf8"));
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-mcp-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = [
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: statusUri } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
-    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "status" } } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "repair" } } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "ground", arguments: { project: "." } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "ground", arguments: { project: join(dataDir, "missing") } } }),
   ].join("\n") + "\n";
 
   try {
-    await writeFile(
-      join(dataDir, "sidecar-setup-policy.json"),
-      JSON.stringify({
-        state: "ask",
-        updated_at: "2026-07-09T00:00:00.000Z",
-        last_repair: {
-          state: "completed",
-          updated_at: "2026-07-09T00:00:00.000Z",
-          project_root: repoRoot,
-          command: '"C:\\Users\\alber\\.codex\\plugins\\data\\codestory-TheGreenCedar\\codestory-cli\\0.12.3\\bin\\codestory-cli.exe" ready --goal agent --repair',
-        },
-      }),
-      "utf8",
-    );
+    const realRepoRoot = await realpath(repoRoot);
     const result = spawnSync(process.execPath, [launcher], {
       env: {
         PLUGIN_DATA: "",
@@ -2588,107 +2745,118 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 6, result.stdout);
+    assert.equal(responses.length, 7, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root_source, "resource_uri");
+    assert.equal(status.degraded_reason, "managed_cli_unavailable");
+    assert.equal(status.project_selection, undefined);
     assert.equal(status.plugin_runtime.plugin_version, version);
-    assert.equal(status.source_checkout_version, null);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
     assert.equal(status.plugin_runtime.cli_path, null);
-    assert.equal(status.runtime_truth.runtime_source, "managed_unavailable");
-    assert.equal(status.runtime_truth.plugin_root, pluginRoot);
-    assert.equal(status.runtime_truth.sidecar_policy, "ask");
-    assert.equal(status.runtime_truth.sidecar_status_ref, null);
-    assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
-    assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
-    assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "local_default"), false);
-    assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "agent_packet_search"), false);
-    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
-    assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
-    assert.equal(status.readiness[0].status, "repair_setup");
-    assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
-    for (const key of [
-      "schema_version",
-      "install_id",
-      "project_id",
-      "canonical_root_hash",
-      "workspace_root",
-      "cli_version",
-      "updated_at_epoch_ms",
-      "snapshot_path",
-      "persistence_status",
-      "persistence_error",
-      "operations",
-      "resources",
-      "reconciliation",
-      "gpu_proof",
-    ]) {
-      assert.ok(Object.hasOwn(status.readiness_broker, key), `readiness_broker missing ${key}`);
-    }
-    assert.equal(status.readiness_broker.persistence_status, "unavailable");
-    assert.equal(typeof status.readiness_broker.gpu_proof, "object");
-    assert.notEqual(status.readiness_broker.gpu_proof, null);
-    for (const key of [
-      "requested",
-      "requested_provider",
-      "requested_device",
-      "policy",
-      "observed_state",
-      "observation_source",
-      "detected_provider",
-      "detected_gpu",
-      "cpu_allowed",
-      "proof_status",
-      "meaningful_accelerator_work_proven",
-      "embed_smoke_ok",
-      "embed_smoke_ms",
-      "degraded_reason",
-    ]) {
-      assert.ok(
-        Object.hasOwn(status.readiness_broker.gpu_proof, key),
-        `readiness_broker.gpu_proof missing ${key}`,
-      );
-    }
-    assert.equal(status.readiness_broker.gpu_proof.embed_smoke_ok, null);
-    assert.equal(status.readiness_broker.gpu_proof.embed_smoke_ms, null);
+    assert.deepEqual(status.runtime, {
+      source: "managed_unavailable",
+      state: "unavailable",
+      automatic: true,
+    });
+    assert.equal(status.readiness[0].status, "unavailable");
+    assert.equal(status.readiness[0].reason, "managed_cli_unavailable");
+    assert.equal(Object.hasOwn(status, "readiness_broker"), false);
     assert.equal(status.allowed_surfaces.ground.allowed, false);
-    assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
-    assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);
-    assert.deepEqual(status.allowed_surfaces.sidecar_setup.canonical_arguments, { action: "status" });
-    assert.equal(status.sidecar_setup.last_repair.current, false);
-    assert.match(
-      status.sidecar_setup.last_repair.stale_reason,
-      /last_repair_cli_version_mismatch:0\.12\.3!=/,
+    assert.equal(status.managed_retrieval.automatic, true);
+    assert.deepEqual(status.recommended_next_calls, [
+      { method: "resources/read", uri: statusUri },
+    ]);
+    const toolNames = responses[2].result.tools.map((tool) => tool.name);
+    const catalogSource = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_catalog.rs"), "utf8");
+    const canonicalTools = catalogSource.slice(
+      catalogSource.indexOf("static TOOLS: &[ToolSpec]"),
+      catalogSource.indexOf("static RESOURCES: &[ResourceSpec]"),
     );
-    assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
-    assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
-    assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
-    assert.deepEqual(
-      responses[2].result.tools[0].inputSchema.properties.action.enum,
-      ["status", "enable", "disable", "ask"],
-    );
-    assert.equal(responses[3].result.structuredContent.last_repair.current, false);
-    assert.match(
-      responses[3].result.structuredContent.last_repair.stale_reason,
-      /last_repair_cli_version_mismatch:0\.12\.3!=/,
-    );
-    assert.equal(responses[4].result.isError, true);
-    assert.equal(
-      responses[4].result.structuredContent.code,
-      "repair_unavailable_diagnostic_fail_open",
-    );
-    assert.equal(responses[5].error.code, -32602);
-    assert.match(responses[5].error.message, /grounding tools are unavailable/u);
-    assert.match(responses[5].error.message, /restore a compatible stdio runtime/u);
+    const canonicalToolNames = [...canonicalTools.matchAll(/\bname:\s*"([^"]+)"/gu)]
+      .map((match) => match[1]);
+    assert.deepEqual([...toolNames].sort(), [...canonicalToolNames].sort());
+    const coldGroundTool = responses[2].result.tools.find((tool) => tool.name === "ground");
+    assert.equal(coldGroundTool.safety.effect, "managed_activation");
+    assert.equal(coldGroundTool.safety.requiresConfirmation, false);
+    assert.equal(coldGroundTool.safety.localOnly, false);
+    assert.equal(coldGroundTool.safety.openWorld, true);
+    assert.equal(coldGroundTool.annotations.readOnlyHint, false);
+    assert.equal(coldGroundTool.annotations.openWorldHint, true);
+    assert.equal(responses[3].result.isError, true);
+    assert.equal(responses[3].result.structuredContent.code, "project_required");
+    assert.equal(responses[3].result.structuredContent.tool, "ground");
+    assert.equal(responses[3].result.structuredContent.retry_tool, undefined);
+    assert.match(responses[3].result.structuredContent.message, /absolute repository root/u);
+    assert.equal(responses[4].result.structuredContent.current_operation, null);
+    assert.equal(responses[5].result.isError, true);
+    assert.equal(responses[5].result.structuredContent.code, "project_required");
+    assert.equal(responses[6].result.isError, true);
+    assert.equal(responses[6].result.structuredContent.code, "project_unavailable");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("mcp launcher starts stdio without local or agent repair", async () => {
+test("mcp launcher owns initialize before handing off to the native runtime", async () => {
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-initialize-owner-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-initialize-owner-bin-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const marker = join(dataDir, "serve-called.txt");
+  const cliPath = await writeNodeCli(
+    binDir,
+    [
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'serve') { fs.writeFileSync(process.env.TEST_OUT, 'serve-called'); setInterval(() => {}, 1000); }",
+      "else process.exit(2);",
+    ].join("\n"),
+  );
+  const initialize = {
+    jsonrpc: "2.0",
+    id: "initialize",
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "plugin-static", version: "1" },
+    },
+  };
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: dataDir,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: marker,
+      },
+      input: `${JSON.stringify(initialize)}\n`,
+      encoding: "utf8",
+      timeout: 2000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.error, undefined);
+    const response = JSON.parse(result.stdout.trim());
+    assert.equal(response.id, initialize.id);
+    assert.equal(response.result.serverInfo.version, version);
+    await assert.rejects(access(marker));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher starts the multi-project stdio runtime through its bridge", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-repair-index-"));
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-direct-stdio-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const cliScript = join(dataDir, "fake-codestory-cli.cjs");
   const cliPath = join(
@@ -2708,14 +2876,41 @@ test("mcp launcher starts stdio without local or agent repair", async () => {
         "const marker = process.env.TEST_OUT;",
         "const args = process.argv.slice(2);",
         "const command = args[0];",
-        "fs.appendFileSync(logFile, JSON.stringify({ args, sidecarRepair: process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR === '1' }) + '\\n');",
+        "fs.appendFileSync(logFile, JSON.stringify({ args }) + '\\n');",
         "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
-        "if (command === 'ready') {",
-        "  const ready = args.includes('--wait-fresh') && !args.includes('--repair') && !args.includes('agent');",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: ready ? 'ready' : 'repair_index', summary: ready ? 'ready' : 'stale local graph', minimum_next: [], full_repair: [] }], local_refresh: { state: ready ? 'fresh' : 'stale', reason: ready ? 'refreshed' : 'index_changed', blocks_local_surfaces: !ready, readiness_status: ready ? 'ready' : 'repair_index', changed_file_count: ready ? 0 : 1, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
-        "  process.exit(0);",
+        "if (command === 'serve') {",
+        "  fs.writeFileSync(marker, 'serve-called');",
+        "  let input = '';",
+        "  process.stdin.setEncoding('utf8');",
+        "  process.stdin.on('data', (chunk) => {",
+        "    input += chunk;",
+        "    const lines = input.split(/\\r?\\n/u);",
+        "    input = lines.pop() || '';",
+        "    for (const line of lines) {",
+        "      if (!line) continue;",
+        "      const request = JSON.parse(line);",
+        "      if (request.method === 'initialize') {",
+        "        console.log(JSON.stringify({",
+        "          jsonrpc: '2.0',",
+        "          id: request.id,",
+        "          result: {",
+        "            protocolVersion: request.params.protocolVersion,",
+        "            capabilities: {},",
+        "            serverInfo: { name: 'codestory', version },",
+        "          },",
+        "        }));",
+        "      } else if (request.method === 'tools/list') {",
+        "        console.log(JSON.stringify({",
+        "          jsonrpc: '2.0',",
+        "          id: request.id,",
+        "          result: { tools: [{ name: 'native-runtime' }] },",
+        "        }));",
+        "      }",
+        "    }",
+        "  });",
+        "  process.stdin.on('end', () => process.exit(0));",
+        "  return;",
         "}",
-        "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(0); }",
         "process.exit(2);",
         "",
       ].join("\n"),
@@ -2734,23 +2929,41 @@ test("mcp launcher starts stdio without local or agent repair", async () => {
         ...process.env,
         CODESTORY_CLI: cliPath,
         PLUGIN_DATA: dataDir,
-        CODESTORY_PLUGIN_SIDECAR_POLICY: "ask",
         TEST_CODESTORY_VERSION: version,
         TEST_LOG: logFile,
         TEST_OUT: marker,
       },
+      input: [
+        {
+          jsonrpc: "2.0",
+          id: "initialize",
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "plugin-static", version: "1" },
+          },
+        },
+        { jsonrpc: "2.0", id: "native-tools", method: "tools/list" },
+      ].map((request) => JSON.stringify(request)).join("\n") + "\n",
       encoding: "utf8",
       timeout: 15000,
     });
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(await readFile(marker, "utf8"), "serve-called");
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(responses.filter((response) => response.id === "initialize").length, 1);
+    assert.equal(
+      responses.find((response) => response.id === "initialize")?.result.serverInfo.version,
+      version,
+    );
+    assert.deepEqual(
+      responses.find((response) => response.id === "native-tools")?.result.tools,
+      [{ name: "native-runtime" }],
+    );
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    const readyCalls = calls.filter((call) => call.args[0] === "ready");
-    assert.deepEqual(readyCalls, []);
-    assert.equal(calls.some((call) => call.args.includes("agent")), false);
-    assert.equal(calls.some((call) => call.args.includes("--repair")), false);
-    assert.equal(calls.some((call) => call.sidecarRepair), false);
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
     assert.ok(calls.some((call) => {
       return JSON.stringify(call.args) === JSON.stringify([
         "serve",
@@ -2775,7 +2988,7 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
 
   try {
@@ -2795,11 +3008,9 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
-    assert.equal(status.readiness[0].repair_reason, "local_dev_override_cli_unspawnable");
+    assert.equal(status.readiness[0].reason, "local_dev_override_cli_unspawnable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
-    assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
-    assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);
-    assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
+    assert.equal(status.managed_retrieval.automatic, true);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2818,8 +3029,9 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     jsonrpc: "2.0",
     id: "status",
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
+  let child;
 
   try {
     await mkdir(cliDir, { recursive: true });
@@ -2842,7 +3054,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       "utf8",
     );
 
-    const child = spawn(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         PLUGIN_DATA: dataDir,
@@ -2883,119 +3095,15 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     const response = responses.find((entry) => entry.id === "terminal") || responses[0];
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
-      status.readiness[0].repair_reason,
+      status.readiness[0].reason,
       "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
     );
     assert.equal(
       status.plugin_runtime.plugin_version,
       version,
     );
-    assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("mcp launcher persists sidecar setup policy in plugin data", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-policy-"));
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-
-  try {
-    const enable = spawnSync(process.execPath, [launcher, "sidecar-policy", "enable"], {
-      env: { PLUGIN_DATA: dataDir },
-      encoding: "utf8",
-    });
-    assert.equal(enable.status, 0, enable.stderr);
-    assert.equal(JSON.parse(enable.stdout).state, "enabled");
-
-    const disable = spawnSync(process.execPath, [launcher, "sidecar-policy", "disable"], {
-      env: { PLUGIN_DATA: dataDir },
-      encoding: "utf8",
-    });
-    assert.equal(disable.status, 0, disable.stderr);
-    assert.equal(JSON.parse(disable.stdout).state, "disabled");
-
-    const repair = spawnSync(process.execPath, [launcher, "sidecar-policy", "repair"], {
-      env: { PLUGIN_DATA: dataDir },
-      encoding: "utf8",
-    });
-    assert.equal(repair.status, 0, repair.stderr);
-    assert.equal(JSON.parse(repair.stdout).state, "enabled");
-
-    const policy = JSON.parse(
-      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
-    );
-    assert.equal(policy.state, "enabled");
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("enabled sidecar policy defers repair until after MCP startup", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
-  const logFile = join(dataDir, "calls.jsonl");
-  const cliDir = join(dataDir, "codestory-cli", version);
-  const cliPath = join(
-    cliDir,
-    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-  );
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-
-  try {
-    await mkdir(cliDir, { recursive: true });
-    await writeRecordingCli(cliPath);
-    const sha256 = createHash("sha256")
-      .update(await readFile(cliPath))
-      .digest("hex");
-    await writeFile(
-      join(cliDir, "manifest.json"),
-      JSON.stringify(managedReleaseManifest(
-        version,
-        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-        sha256,
-      )),
-      "utf8",
-    );
-    await writeFile(
-      join(dataDir, "sidecar-setup-policy.json"),
-      JSON.stringify({ state: "enabled" }),
-      "utf8",
-    );
-
-    const result = spawnSync(process.execPath, [launcher], {
-      env: {
-        PLUGIN_DATA: dataDir,
-        TEST_LOG: logFile,
-        TEST_CODESTORY_VERSION: version,
-        PATH: "",
-        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
-      },
-      encoding: "utf8",
-    });
-    assert.equal(result.status, 0, result.stderr);
-
-    const text = await readFile(logFile, "utf8");
-    const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
-    const repairCalls = calls.filter((call) => call.repair);
-    assert.equal(repairCalls.length, 0, text);
-    const serveCall = calls.find((call) => {
-      return JSON.stringify(call.args) === JSON.stringify([
-        "serve",
-        "--stdio",
-        "--multi-project",
-        "--refresh",
-        "none",
-      ]);
-    });
-    assert.ok(serveCall, text);
-    assert.equal(serveCall.policy, "enabled");
-    const policy = JSON.parse(await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"));
-    assert.equal(policy.state, "enabled");
-    assert.equal(policy.last_repair, undefined);
-  } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -3164,15 +3272,82 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(initialized.result.serverInfo.name, "codestory");
     assert.equal(initialized.result.capabilities.tools.listChanged, true);
     assert.equal(initialized.result.capabilities.prompts.listChanged, true);
+    const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
     const statusResponse = await request({
       jsonrpc: "2.0",
       id: 2,
       method: "resources/read",
-      params: { uri: "codestory://status" },
+      params: { uri: statusUri },
     });
     const status = JSON.parse(statusResponse.result.contents[0].text);
+    assert.equal(status.project_root, repoRoot);
+    assert.equal(status.project_root_source, "resource_uri");
+    assert.equal(statusResponse.result.contents[0].uri, statusUri);
+    assert.ok(
+      status.recommended_next_calls.every((call) =>
+        call.method !== "resources/read" || call.uri === statusUri),
+    );
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
-    assert.equal(status.runtime_boundary.restart_required_for_runtime_change, false);
+    assert.equal(status.runtime.state, "preparing");
+    const coldResources = await request({
+      jsonrpc: "2.0",
+      id: "cold-resources",
+      method: "resources/list",
+    });
+    assert.deepEqual(
+      coldResources.result.resources.map(({ uri }) => uri),
+      ["codestory://agent-guide"],
+    );
+    const coldGuideResponse = await request({
+      jsonrpc: "2.0",
+      id: "cold-guide",
+      method: "resources/read",
+      params: { uri: "codestory://agent-guide" },
+    });
+    const coldGuide = JSON.parse(coldGuideResponse.result.contents[0].text);
+    assert.equal(coldGuide.project, undefined);
+    assert.equal(coldGuide.diagnostics_uri_template, "codestory://status{?project}");
+    const coldTemplates = await request({
+      jsonrpc: "2.0",
+      id: "cold-templates",
+      method: "resources/templates/list",
+    });
+    assert.deepEqual(
+      coldTemplates.result.resourceTemplates.map(({ uriTemplate }) => uriTemplate),
+      ["codestory://status{?project}"],
+    );
+    const coldPrompts = await request({
+      jsonrpc: "2.0",
+      id: "cold-prompts",
+      method: "prompts/list",
+    });
+    assert.deepEqual(coldPrompts.result.prompts, []);
+    const coldTools = await request({
+      jsonrpc: "2.0",
+      id: "cold-tools",
+      method: "tools/list",
+    });
+    assert.equal(coldTools.result.tools.length, 20);
+    assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
+    const coldGround = await request({
+      jsonrpc: "2.0",
+      id: "cold-ground",
+      method: "tools/call",
+      params: { name: "ground", arguments: { project: repoRoot } },
+    });
+    assert.equal(coldGround.result.isError, true);
+    assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
+    assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
+    assert.equal(coldGround.result.structuredContent.project, repoRoot);
+    assert.deepEqual(coldGround.result.structuredContent.operation, {
+      operation_id: "managed-runtime-provisioning",
+      state: "preparing",
+      stage: "dense_preparation",
+      attempt: 1,
+      retry_after_ms: 1500,
+      failure: null,
+    });
+    assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
 
     releaseAssets();
     const runtimeMetadata = join(dataDir, ".codestory-mcp-runtime.json");
@@ -3183,7 +3358,8 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       if (metadata.source === "managed") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(JSON.parse(await readFile(runtimeMetadata, "utf8")).source, "managed");
+    const publishedRuntime = JSON.parse(await readFile(runtimeMetadata, "utf8"));
+    assert.equal(publishedRuntime.source, "managed", JSON.stringify(publishedRuntime));
     assert.equal(
       responses.some((response) => response.method === "notifications/tools/list_changed"),
       false,
@@ -3224,7 +3400,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       jsonrpc: "2.0",
       id: 5,
       method: "resources/read",
-      params: { uri: "codestory://status" },
+      params: { uri: statusUri },
     })}\n`);
     const recoveryDeadline = Date.now() + 2000;
     while (Date.now() < recoveryDeadline && !responses.some((response) => response.id === 5)) {
@@ -3286,7 +3462,7 @@ test("managed publication waiter keeps diagnostic MCP responsive", { timeout: 15
     waiter.stdout.on("data", (chunk) => { output += chunk; });
     waiter.stdin.write([
       JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
-      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/read", params: { uri: "codestory://status" } }),
+      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/read", params: { uri: statusUri } }),
       "",
     ].join("\n"));
     const deadline = Date.now() + 2000;
@@ -3339,13 +3515,88 @@ test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async
     jsonrpc: "2.0",
     id: 3,
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   })}\n`);
   assert.equal((await completed)[0], 0);
   const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
   assert.equal(responses.find((response) => response.id === 2)?.error.code, -32000);
   const status = JSON.parse(responses.find((response) => response.id === 3).result.contents[0].text);
   assert.equal(status.degraded_reason, "managed_cli_handoff_unspawnable");
+});
+
+test("fail-open status tool preserves primary runtime failures and no-project precedence", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const failures = [
+    ["managed_cli_asset_fetch_failed", "asset archive checksum failed", 1],
+    ["managed_cli_probe_failed", "version probe exited with status 2", 2],
+    ["managed_cli_handoff_unspawnable", "spawn EACCES", null],
+    ["runtime_stdio_child_exit", "codestory-cli serve --stdio exited with status 17", 17],
+  ];
+  const statuses = failures.map(([reason, failure, status]) => ({
+    plugin_runtime: { plugin_version: "test" },
+    managed_retrieval: { state: "unavailable" },
+    degraded_reason: reason,
+    readiness: [{
+      reason,
+      summary: `runtime unavailable: ${reason}`,
+      setup: { probe_error: failure, probe_status: status },
+    }],
+    recommended_next_calls: [],
+  }));
+  statuses.push(statuses[0], statuses[0]);
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `const statuses=${JSON.stringify(statuses)};`,
+    "run(()=>statuses.shift()||statuses.at(-1));",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.end([
+    ...failures.map((_, index) => JSON.stringify({
+      jsonrpc: "2.0",
+      id: index + 1,
+      method: "tools/call",
+      params: { name: "status", arguments: { project: repoRoot } },
+    })),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: failures.length + 1,
+      method: "tools/call",
+      params: { name: "status", arguments: {} },
+    }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: failures.length + 2,
+      method: "tools/call",
+      params: {
+        name: "status",
+        arguments: { project: join(repoRoot, "missing-project-for-fail-open-proof") },
+      },
+    }),
+    "",
+  ].join("\n"));
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  failures.forEach(([reason, failure], index) => {
+    const structured = responses.find((response) => response.id === index + 1)?.result.structuredContent;
+    assert.equal(structured.degraded_reason, reason);
+    assert.equal(structured.failure, failure);
+    assert.equal(structured.current_operation, null);
+  });
+  const noProject = responses.find((response) => response.id === failures.length + 1)?.result.structuredContent;
+  assert.equal(noProject.code, "project_required");
+  assert.equal(noProject.state, "no_project");
+  assert.equal(noProject.degraded_reason, undefined);
+  assert.equal(noProject.diagnostics_uri, undefined);
+  const unavailableProject = responses.find(
+    (response) => response.id === failures.length + 2,
+  )?.result.structuredContent;
+  assert.equal(unavailableProject.code, "project_unavailable");
+  assert.equal(unavailableProject.state, "unavailable");
+  assert.equal(unavailableProject.diagnostics_uri, undefined);
 });
 
 test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
@@ -3655,8 +3906,9 @@ test("startup hook records active project without runtime bootstrap", async () =
     const output = JSON.parse(result.stdout);
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY SESSION ROUTING ACTIVE/u);
-    assert.match(context, /Task router: orientation/u);
+    assert.match(context, /CODESTORY GROUNDING AVAILABLE/u);
+    assert.match(context, /Call status only for diagnostics/u);
+    assert.match(context, /retry that same tool/u);
     assert.match(context, /tool_search/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
@@ -3790,11 +4042,12 @@ test("mcp launcher keeps managed provision failures primary", async () => {
     jsonrpc: "2.0",
     id: 1,
     method: "resources/read",
-    params: { uri: "codestory://status" },
+    params: { uri: statusUri },
   }) + "\n";
+  let child;
 
   try {
-    const child = spawn(process.execPath, [launcher], {
+    child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         CODESTORY_CLI: "",
@@ -3841,14 +4094,8 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       status.plugin_runtime.warnings.includes("managed_cli_unavailable"),
       true,
     );
-    assert.match(status.readiness[0].minimum_next[0], /^Restart\/reload/u);
-    assert.equal(
-      status.readiness[0].minimum_next.some((step) => {
-        return /codestory-cli --version/u.test(step);
-      }),
-      false,
-    );
   } finally {
+    await stopChildProcess(child);
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
   }
@@ -3868,7 +4115,7 @@ test("session-start hooks are thin and host manifests point at them", async () =
   const hookScript = /hooks[\\/]([\w.-]+\.(?:js|mjs|cjs|ps1|sh))/u;
 
   assert.equal(copilotHookConfig.hooks.sessionStart.length, 1);
-  assert.equal(hookConfig.hooks.UserPromptSubmit.length, 1);
+  assert.equal(Object.hasOwn(hookConfig.hooks, "UserPromptSubmit"), false);
 
   for (const hook of hookCommands) {
     assert.match(hook.command, /codestory-activate\.cjs/u);
@@ -3975,258 +4222,7 @@ function runCodexHook(input, env) {
   return runHookProcess(join(pluginRoot, "hooks", "codestory-activate.cjs"), input, env);
 }
 
-async function runCodexHookAsync(input, env) {
-  const child = spawn(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
-    env: {
-      ...process.env,
-      COPILOT_PLUGIN_DATA: "",
-      ...env,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdin.end(JSON.stringify(input));
-  const [status] = await once(child, "close");
-  assert.equal(status, 0, stderr);
-  return JSON.parse(stdout);
-}
-
-test("hook emits MCP activation guidance without running CLI", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-mcp-guidance-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-unused-cli-"));
-  const marker = join(dataDir, "cli-called.txt");
-
-  try {
-    const cliPath = await writeNodeCli(binDir, "require(\"fs\").writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(\" \"));");
-    const output = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is RefreshMode defined?",
-      cwd: repoRoot,
-    }, {
-      CODESTORY_CLI: cliPath,
-      PLUGIN_DATA: dataDir,
-      TEST_MARKER: marker,
-      PATH: "",
-    });
-
-    const context = output.hookSpecificOutput.additionalContext;
-    assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY REQUEST ROUTING ACTIVE/u);
-    assert.match(context, /Route: Symbol ownership/u);
-    assert.match(context, /codestory mcp ground status packet search/u);
-    assert.match(context, /absolute repository cwd/u);
-    assert.match(context, /local graph surfaces before source/u);
-    assert.match(context, /Repair only when packet\/search is required/u);
-    assert.match(context, /Hook text routes; only live MCP or verified source is evidence/u);
-    assert.doesNotMatch(context, /CodeStory hook output truncated/u);
-    assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
-    assert.doesNotMatch(context, /managed_bootstrap/u);
-    assert.doesNotMatch(context, /packet ok/u);
-    await assert.rejects(readFile(marker, "utf8"), /ENOENT/u);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
-  }
-});
-
-test("hook routing is stateless across repeated and parallel processes", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-stateless-"));
-  const input = {
-    hook_event_name: "UserPromptSubmit",
-    prompt: "Where is RefreshMode defined?",
-    cwd: repoRoot,
-  };
-
-  try {
-    const serial = [runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" }), runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" })];
-    const parallel = await Promise.all(Array.from({ length: 6 }, () => runCodexHookAsync(input, {
-      CODEX_THREAD_ID: "shared-task",
-      PLUGIN_DATA: dataDir,
-      PATH: "",
-    })));
-    for (const output of [...serial, ...parallel]) {
-      assert.match(output.hookSpecificOutput.additionalContext, /Route: Symbol ownership/u);
-      assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /Where is RefreshMode defined/u);
-    }
-    await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("hook qualification compares executable policies with sourced MCP observations", async (t) => {
-  const fixture = JSON.parse(await readFile(
-    join(pluginRoot, "tests", "fixtures", "hook-route-qualification.json"),
-    "utf8",
-  ));
-  const observedDrills = JSON.parse(await readFile(
-    join(pluginRoot, "tests", "fixtures", "hook-observed-mcp-drills.json"),
-    "utf8",
-  ));
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-qualification-"));
-  const toolVocabulary = new Set([
-    "affected", "callees", "callers", "definition", "files", "ground", "packet",
-    "search", "sidecar_setup", "snippet", "status", "symbol", "trace", "trail",
-  ]);
-  const record = (output) => {
-    const context = output.hookSpecificOutput?.additionalContext || "";
-    const plan = context.match(/^Plan: category=([a-z_]+); tools=([a-z_,]+)$/mu);
-    const instructedTools = plan
-      ? [...new Set(plan[2].split(","))].sort()
-      : [];
-    assert.ok(instructedTools.every((tool) => toolVocabulary.has(tool)));
-    return {
-      suppressed: !context,
-      category: plan?.[1] || null,
-      instructed_tools: instructedTools,
-    };
-  };
-  const failures = (actual, expected) => {
-    const result = [];
-    if (actual.suppressed !== Boolean(expected.suppressed)) result.push("suppression");
-    if (!expected.suppressed && actual.category !== expected.category) result.push("category");
-    const expectedTools = [...(expected.instructed_tools || [])].sort();
-    if (!expected.suppressed && actual.instructed_tools.join("\0") !== expectedTools.join("\0")) {
-      result.push(`tools:${actual.instructed_tools.join(",")}`);
-    }
-    for (const tool of expected.forbidden_tools || []) {
-      if (actual.instructed_tools.includes(tool)) result.push(`forbidden:${tool}`);
-    }
-    return result;
-  };
-
-  try {
-    const cases = fixture.cases.map((entry) => {
-      const currentOutput = runCodexHook({
-        hook_event_name: "UserPromptSubmit",
-        prompt: entry.prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" });
-      const context = currentOutput.hookSpecificOutput?.additionalContext || "";
-      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.equal(context.includes(entry.prompt), false);
-      assert.doesNotMatch(context, /hook output truncated/u);
-      const current = record(currentOutput);
-      const baseline = record(runHookProcess(genericBaselineHook, {
-        hook_event_name: "UserPromptSubmit",
-        prompt: entry.prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" }));
-      return {
-        slug: entry.slug,
-        current,
-        baseline,
-        current_failures: failures(current, entry),
-        baseline_failures: failures(baseline, entry),
-      };
-    });
-
-    const requiredObservedTools = {
-      orientation: ["ground", "files"],
-      symbol_ownership: ["symbol", "definition"],
-      call_flow: ["symbol", "callers", "callees"],
-      change_impact: ["affected"],
-      broad_question: ["ground", "symbol", "trace"],
-    };
-    assert.equal(observedDrills.artifact_kind, "sourced_observed_mcp_drill_traces");
-    assert.equal(observedDrills.test_execution.executes_mcp, false);
-    for (const drill of observedDrills.observations) {
-      const emitted = record(runCodexHook({
-        hook_event_name: "UserPromptSubmit",
-        prompt: drill.prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" }));
-      const observedTools = drill.steps.map(({ tool }) => tool);
-      const sourceIndex = observedTools.indexOf("source");
-      const graphIndex = observedTools.findIndex((tool) =>
-        ["ground", "symbol", "callers", "callees", "trace", "trail", "affected"].includes(tool));
-      assert.ok(
-        observedTools.every((tool) => tool === "source" || toolVocabulary.has(tool)),
-        drill.source.location,
-      );
-      assert.equal(drill.source_fallback.used, sourceIndex >= 0, drill.source.location);
-      assert.equal(emitted.category, drill.category);
-      assert.equal(observedTools[0], "status");
-      assert.equal(drill.source.kind, "agent_observation");
-      assert.equal(drill.source.url, "https://github.com/TheGreenCedar/CodeStory/pull/982");
-      assert.match(drill.source.commit, /^[0-9a-f]{40}$/u);
-      assert.ok(requiredObservedTools[drill.category].every((tool) =>
-        observedTools.includes(tool)), drill.source.location);
-      if (sourceIndex >= 0) {
-        assert.equal(drill.source_fallback.used, true);
-        assert.equal(drill.source_fallback.after_graph, true);
-        assert.ok(graphIndex > 0 && sourceIndex > graphIndex, drill.source.location);
-      }
-      if (drill.blocked_tools) {
-        assert.deepEqual([...drill.blocked_tools].sort(), ["packet", "search"]);
-      }
-      const affected = drill.steps.find(({ tool }) => tool === "affected");
-      if (affected) {
-        assert.deepEqual(affected.arguments.paths, [
-          "plugins/codestory/hooks/codestory-activate.cjs",
-          "plugins/codestory/tests/plugin-static.test.mjs",
-        ]);
-        assert.equal(affected.result_kind, "explicit_path_match");
-      }
-      assert.equal(observedTools.includes("sidecar_setup"), false);
-      assert.equal(drill.repair_attempted, false);
-    }
-
-    t.diagnostic(JSON.stringify({
-      cases,
-      observed_drills: observedDrills.observations.map(({ slug, source, steps }) => ({
-        slug,
-        source,
-        observed_tools: steps.map(({ tool }) => tool),
-      })),
-    }));
-    assert.deepEqual(cases.flatMap(({ slug, current_failures }) =>
-      current_failures.map((failure) => `${slug}:${failure}`)), []);
-    assert.deepEqual(cases.filter(({ baseline_failures }) => baseline_failures.length === 0), []);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("suppressed hook events write no active or thread state", async () => {
-  for (const input of [
-    { hook_event_name: "UserPromptSubmit", prompt: "Can you review this restaurant?", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Explain the egg method.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "I registered for semester classes.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Tell me about compiler design.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "What is the movie runtime?", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "I bought an iPhone.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Search for eBay.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Please update my social_security_number.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Help me build a birdhouse.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Explain liver function tests.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Organize my grocery list.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Update issue #897.", cwd: repoRoot },
-    { hook_event_name: "GoalLoopHeartbeat", cwd: repoRoot },
-  ]) {
-    const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-state-"));
-    try {
-      const output = runCodexHook(input, {
-        CODEX_THREAD_ID: "suppressed-task",
-        PLUGIN_DATA: dataDir,
-        PATH: "",
-      });
-      assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
-      await assert.rejects(access(join(dataDir, ".codestory-active")), /ENOENT/u);
-      await assert.rejects(access(threadActiveStatePath(dataDir, "suppressed-task")), /ENOENT/u);
-      await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
-    } finally {
-      await rm(dataDir, { recursive: true, force: true });
-    }
-  }
-});
-
-test("compact and resume session starts re-inject complete bounded routing", async () => {
+test("session hooks inject one bounded contract and prompt hooks stay silent", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-reinject-"));
   const longCwd = `C:\\${"very-long-directory\\".repeat(200)}repo`;
   try {
@@ -4238,20 +4234,19 @@ test("compact and resume session starts re-inject complete bounded routing", asy
       }, { PLUGIN_DATA: dataDir, PATH: "" });
       const context = output.hookSpecificOutput.additionalContext;
       assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.match(context, /absolute repository cwd/u);
-      assert.match(context, /codestory mcp ground status packet search/u);
+      assert.match(context, /target repository root/u);
+      assert.match(context, /starting hint/u);
+      assert.match(context, /search only for that tool by name/u);
+      assert.doesNotMatch(context, /status first|poll status/u);
       assert.doesNotMatch(context, /truncated/u);
-      assert.equal(context.endsWith("tools."), true);
+      assert.equal(context.endsWith("directly."), true);
     }
-    const promptContext = runCodexHook({
+    const promptOutput = runCodexHook({
       hook_event_name: "UserPromptSubmit",
       prompt: "Where is RuntimeContext defined?",
       cwd: longCwd,
-    }, { PLUGIN_DATA: dataDir, PATH: "" }).hookSpecificOutput.additionalContext;
-    assert.ok(promptContext.length <= 900, `hook output was ${promptContext.length} characters`);
-    assert.match(promptContext, /absolute repository cwd/u);
-    assert.doesNotMatch(promptContext, /truncated/u);
-    assert.equal(promptContext.endsWith("evidence."), true);
+    }, { PLUGIN_DATA: dataDir, PATH: "" });
+    assert.equal(Object.hasOwn(promptOutput, "hookSpecificOutput"), false);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -4318,8 +4313,8 @@ test("hook script executes under Codex home module scope", async () => {
           PATH: "",
         },
         input: JSON.stringify({
-          hook_event_name: "UserPromptSubmit",
-          prompt: "Explain CodeStory hook loading.",
+          hook_event_name: "SessionStart",
+          source: "startup",
           cwd: repoRoot,
         }),
         encoding: "utf8",
@@ -4330,7 +4325,7 @@ test("hook script executes under Codex home module scope", async () => {
     assert.doesNotMatch(result.stderr, /require is not defined/u);
     assert.match(
       JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-      /CODESTORY REQUEST ROUTING ACTIVE/u,
+      /CODESTORY GROUNDING AVAILABLE/u,
     );
   } finally {
     await rm(codexHome, { recursive: true, force: true });

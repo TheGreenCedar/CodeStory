@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +16,14 @@ detector = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = detector
 SPEC.loader.exec_module(detector)
+
+CHECK_SCRIPT = Path(__file__).with_name("check-codestory-release.py")
+CHECK_SPEC = importlib.util.spec_from_file_location("check_codestory_release", CHECK_SCRIPT)
+assert CHECK_SPEC is not None
+checker = importlib.util.module_from_spec(CHECK_SPEC)
+assert CHECK_SPEC.loader is not None
+sys.modules[CHECK_SPEC.name] = checker
+CHECK_SPEC.loader.exec_module(checker)
 
 
 class AutoReleaseDecisionTest(unittest.TestCase):
@@ -74,6 +84,21 @@ class AutoReleaseDecisionTest(unittest.TestCase):
                 tag_exists=True,
                 release_exists=False,
             )
+
+
+class ReleaseSynchronizationTest(unittest.TestCase):
+    def test_refuses_embedded_model_producer_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            contract = Path(directory) / checker.MODEL_CONTRACT
+            contract.parent.mkdir(parents=True)
+            for producer, message in (
+                ({"name": "wrong", "version": "0.16.0"}, "producer.name"),
+                ({"name": "codestory-llama-sys", "version": "0.15.0"}, "producer.version"),
+            ):
+                with self.subTest(message=message):
+                    contract.write_text(json.dumps({"producer": producer}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        checker.validate_model_producer(Path(directory), "0.16.0")
 
 
 if __name__ == "__main__":

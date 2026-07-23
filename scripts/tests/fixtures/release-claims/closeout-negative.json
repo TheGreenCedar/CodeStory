@@ -1,0 +1,95 @@
+{
+  "schema": "codestory.release-closeout-negative-fixtures/v1",
+  "cases": [
+    {
+      "id": "missing-cell",
+      "operation": {
+        "kind": "remove_cell",
+        "cell": "source_behavior"
+      },
+      "expected_missing_cells": [
+        "source_behavior"
+      ]
+    },
+    {
+      "id": "duplicate-cell",
+      "operation": {
+        "kind": "duplicate_cell",
+        "cell": "candidate_installed_behavior:macos-arm64"
+      },
+      "expected_input_error": "duplicate manifest"
+    },
+    {
+      "id": "cross-sha",
+      "operation": {
+        "kind": "set_identity",
+        "cell": "source_behavior",
+        "key": "commit",
+        "value": "3333333333333333333333333333333333333333"
+      },
+      "expected_failed_cells": [
+        "source_behavior"
+      ]
+    },
+    {
+      "id": "cross-tree",
+      "operation": {
+        "kind": "set_identity",
+        "cell": "package_identity:windows-x64",
+        "key": "source_tree",
+        "value": "4444444444444444444444444444444444444444"
+      },
+      "expected_failed_cells": [
+        "package_identity:windows-x64"
+      ]
+    },
+    {
+      "id": "expired",
+      "operation": {
+        "kind": "set_evidence",
+        "cell": "candidate_installed_behavior:windows-x64",
+        "key": "expires_at",
+        "value": "2026-07-18T12:00:00.000Z"
+      },
+      "expected_failed_cells": [
+        "candidate_installed_behavior:windows-x64"
+      ]
+    },
+    {
+      "id": "failed-evidence",
+      "operation": {
+        "kind": "set_evidence",
+        "cell": "candidate_installed_behavior:macos-arm64",
+        "key": "status",
+        "value": "fail"
+      },
+      "expected_failed_cells": [
+        "candidate_installed_behavior:macos-arm64"
+      ]
+    },
+    {
+      "id": "aggregate-host",
+      "operation": {
+        "kind": "set_identity",
+        "cell": "candidate_installed_behavior:macos-arm64",
+        "key": "host_os",
+        "value": "matrix"
+      },
+      "expected_failed_cells": [
+        "candidate_installed_behavior:macos-arm64"
+      ]
+    },
+    {
+      "id": "reused-evidence",
+      "operation": {
+        "kind": "reuse_evidence",
+        "cell": "candidate_installed_behavior:windows-x64",
+        "source_cell": "candidate_installed_behavior:macos-arm64"
+      },
+      "expected_failed_cells": [
+        "candidate_installed_behavior:windows-x64",
+        "candidate_installed_behavior:macos-arm64"
+      ]
+    }
+  ]
+}

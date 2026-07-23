@@ -10,8 +10,13 @@ on:
       - CHANGELOG.md
       - AGENTS.md
       - docs/contributors/testing-matrix.md
-      - .github/workflows/auto-release.yml
-      - .github/workflows/release.yml
+      - release-claims.json
+      - benchmarks/release-evidence/**
+      - scripts/codestory-release-*.mjs
+      - scripts/tests/codestory-release-*.test.mjs
+      - scripts/tests/fixtures/release-claims/**
+      - .github/actionlint.yaml
+      - .github/workflows/**
       - .github/scripts/**
       - package.json
       - package-lock.json
@@ -36,8 +41,23 @@ jobs:
       - name: Install workflow policy dependencies
         run: npm ci --ignore-scripts
 
+      - name: Check workflow syntax
+        run: |
+          node --test .github/scripts/run-actionlint.test.mjs
+          node .github/scripts/run-actionlint.mjs
+
+      - name: Check release claim and evidence contracts
+        run: >-
+          node --test
+          scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-cell-manifest.test.mjs
+          scripts/tests/codestory-release-closeout.test.mjs
+          scripts/tests/codestory-release-evidence-gate.test.mjs
+
       - name: Enforce workflow policy
-        run: node .github/scripts/check-workflow-policy.mjs
+        run: |
+          node .github/scripts/check-workflow-policy.mjs
+          node --test .github/scripts/check-workflow-policy.test.mjs
 
   detect-version:
     name: Detect codestory-cli version change
@@ -76,6 +96,10 @@ jobs:
     permissions:
       actions: read
       contents: write
+      pull-requests: read
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.detect-version.outputs.version }}
+      calibration_bundle_artifact: ${{ vars.CODESTORY_CALIBRATION_BUNDLE_ARTIFACT }}
+      calibration_bundle_run_id: ${{ vars.CODESTORY_CALIBRATION_BUNDLE_RUN_ID }}
+      publish_release: true

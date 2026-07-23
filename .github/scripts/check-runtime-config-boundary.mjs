@@ -9,10 +9,6 @@ const roots = [
 const forbidden = [
   "std::env::set_var",
   "std::env::remove_var",
-  "activate_embed_url",
-  "prepare_bundled_llamacpp_client_env_defaults",
-  "activate_retrieval_profile_env",
-  "CODESTORY_EMBED_LLAMACPP_URL_MANAGED",
 ];
 const lateStartupReads = [
   'std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)',

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -20,7 +21,7 @@ import {
   retrievalContractSummary,
   retrievalEnv as benchmarkRetrievalEnv,
   shouldPrepareRetrievalIndex,
-  unsupportedSidecarContractRequests,
+  unsupportedRetrievalContractRequests,
 } from "./codestory-benchmark-contract.mjs";
 import {
   cacheProvenanceBlockers,
@@ -38,6 +39,7 @@ const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
@@ -128,7 +130,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. CODESTORY_CLI is set to the executable for this run. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use CodeStory grounding first. CODESTORY_CLI is set to the executable for this run. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. Full retrieval is mandatory; if CodeStory is unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -173,9 +175,9 @@ Options:
                   Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
-                  Packet-runtime mode enables this by default because sidecar-primary packets require prepared local indexes.
+                  Packet-runtime mode enables this by default because packets require prepared local indexes.
   --no-prepare-codestory-cache
-                  Unsupported; sidecar preparation is mandatory.
+                  Unsupported; retrieval preparation is mandatory.
   --prepare-codestory-jobs
                   Parallel jobs for CodeStory cache preparation across independent repos. Default: 1.
   --prepare-codestory-timeout-ms
@@ -190,8 +192,8 @@ Options:
   --publishable   Fail unless every run succeeds and reports token usage.
 
 Environment (parity / promotion — see docs/testing/retrieval-architecture.md):
-  CODESTORY_RETRIEVAL unset|1 Sidecar-primary packet retrieval (benchmark default)
-  CODESTORY_RETRIEVAL=0       Unsupported; sidecar retrieval is mandatory
+  CODESTORY_RETRIEVAL unset|1 Full packet retrieval (benchmark default)
+  CODESTORY_RETRIEVAL=0       Unsupported; full retrieval is mandatory
   CODESTORY_EVAL_PROBES=1        Explicit diagnostic only; product benchmark runs do not inject it
 `);
 }
@@ -281,7 +283,7 @@ function parseArgs(argv) {
     process.exit(0);
   }
   if (values["no-prepare-codestory-cache"]) {
-    throw new Error("--no-prepare-codestory-cache is unsupported; sidecar preparation is mandatory");
+    throw new Error("--no-prepare-codestory-cache is unsupported; retrieval preparation is mandatory");
   }
   opts.list = values.list === true;
   opts.selfTest = values["self-test"] === true;
@@ -417,15 +419,6 @@ function selectedBenchmarkChildEnv(opts = {}) {
   return { ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)) };
 }
 
-function selectedSidecarArgs(opts = {}) {
-  const profile = opts.packetSidecarProfile ?? "local";
-  const args = ["--profile", profile];
-  if (profile === "agent" && opts.packetSidecarRunId) {
-    args.push("--run-id", opts.packetSidecarRunId);
-  }
-  return args;
-}
-
 function runnerCommand(opts, repoPath, prompt) {
   if (opts.runner !== "codex") {
     return {
@@ -520,6 +513,44 @@ function assertPathInside(base, candidate, label) {
   return path.resolve(candidate);
 }
 
+function sha256Bytes(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function normalizeSha256(value, label) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!SHA256_PATTERN.test(normalized)) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest`);
+  }
+  return normalized;
+}
+
+function normalizeCodestoryProjectManifest(filePath, value) {
+  if (value == null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Task manifest codestory_project_manifest must be an object: ${filePath}`);
+  }
+  const declaredPath = String(value.path ?? "").trim();
+  if (!declaredPath || path.isAbsolute(declaredPath) || path.win32.isAbsolute(declaredPath)) {
+    throw new Error(`Task manifest codestory_project_manifest.path must be relative: ${filePath}`);
+  }
+  const sourcePath = assertPathInside(
+    path.dirname(filePath),
+    path.resolve(path.dirname(filePath), declaredPath),
+    "Task manifest codestory_project_manifest.path",
+  );
+  if (!existsSync(sourcePath) || !statSync(sourcePath).isFile()) {
+    throw new Error(`Task manifest codestory_project_manifest.path does not name a file: ${filePath}`);
+  }
+  return {
+    declared_path: declaredPath.replaceAll(path.sep, "/"),
+    source_path: sourcePath,
+    sha256: normalizeSha256(value.sha256, `Task manifest codestory_project_manifest.sha256: ${filePath}`),
+  };
+}
+
 function normalizeWorkspaceRoot(filePath, value) {
   if (value == null || String(value).trim() === "" || String(value).trim() === ".") {
     return "";
@@ -566,6 +597,7 @@ function repoConfigFromManifest(repo, opts = {}) {
     ref: repo.ref ?? null,
     languages: Array.isArray(repo.languages) ? repo.languages : [],
     setup: Array.isArray(repo.setup) ? repo.setup : [],
+    codestory_project_manifest: normalizeCodestoryProjectManifest(filePath, repo.codestory_project_manifest),
     prompt: "",
   };
 }
@@ -596,6 +628,7 @@ function registerManifestRepo(repo, opts = {}) {
     manifest_ref: config.ref,
     manifest_workspace_root: config.workspace_root,
     manifest_checkout_path: config.checkout_path,
+    manifest_codestory_project_manifest: config.codestory_project_manifest,
     manifest_overridden_by_builtin: manifestOverriddenByBuiltIn,
     languages: activeConfig.languages?.length ? activeConfig.languages : config.languages,
     setup: activeConfig.setup?.length ? activeConfig.setup : config.setup,
@@ -856,6 +889,118 @@ async function loadTasks(opts) {
   return tasks;
 }
 
+function sortedUniqueStrings(values, label) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`${label} must be a non-empty array`);
+  }
+  const normalized = values.map((value) => String(value ?? "").trim());
+  if (normalized.some((value) => !MANIFEST_TASK_ID_PATTERN.test(value))) {
+    throw new Error(`${label} must contain benchmark task IDs`);
+  }
+  const sorted = [...new Set(normalized)].sort();
+  if (sorted.length !== normalized.length || JSON.stringify(sorted) !== JSON.stringify(normalized)) {
+    throw new Error(`${label} must be sorted and unique`);
+  }
+  return sorted;
+}
+
+async function loadReleaseEvidenceCorpusContract(tasks, opts) {
+  const declaredPath = process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT?.trim();
+  if (!process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT) {
+    if (declaredPath) {
+      throw new Error("CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT requires CODESTORY_RELEASE_EVIDENCE_COMMIT");
+    }
+    return null;
+  }
+  if (!declaredPath) {
+    throw new Error("release evidence requires CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT");
+  }
+  const contractPath = assertPathInside(repoRoot, path.resolve(repoRoot, declaredPath), "Release evidence corpus contract");
+  if (!existsSync(contractPath) || !statSync(contractPath).isFile()) {
+    throw new Error(`Release evidence corpus contract does not exist: ${declaredPath}`);
+  }
+  const bytes = await readFile(contractPath);
+  const contract = JSON.parse(bytes.toString("utf8"));
+  if (contract?.schema_version !== 1 || typeof contract?.corpus_id !== "string") {
+    throw new Error("Release evidence corpus contract must use schema_version 1 and name a corpus_id");
+  }
+  if (contract.corpus_id !== process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID) {
+    throw new Error("Release evidence corpus contract corpus_id does not match CODESTORY_RELEASE_EVIDENCE_CORPUS_ID");
+  }
+  const taskIds = sortedUniqueStrings(contract.task_ids, "Release evidence corpus contract task_ids");
+  const loadedTaskIds = [...new Set(tasks.map((task) => task.id))].sort();
+  if (JSON.stringify(taskIds) !== JSON.stringify(loadedTaskIds)) {
+    throw new Error(
+      `Release evidence task selection does not match corpus contract: expected ${taskIds.join(", ")}, got ${loadedTaskIds.join(", ")}`,
+    );
+  }
+  const selectedRuntimeModes = opts.packetRuntimeMode === "both"
+    ? ["cold_cli_packet", "warm_stdio_packet"]
+    : [`${opts.packetRuntimeMode.replaceAll("-", "_")}_packet`];
+  if (JSON.stringify(contract.runtime_modes) !== JSON.stringify(selectedRuntimeModes)) {
+    throw new Error("Release evidence packet runtime modes do not match corpus contract");
+  }
+  if (!Number.isInteger(contract.repeats) || contract.repeats < 1 || contract.repeats !== opts.repeats) {
+    throw new Error("Release evidence repeat count does not match corpus contract");
+  }
+  if (!contract.task_manifests || typeof contract.task_manifests !== "object" || Array.isArray(contract.task_manifests)) {
+    throw new Error("Release evidence corpus contract must bind task_manifests");
+  }
+  const taskManifests = {};
+  const taskRepositories = {};
+  for (const task of tasks) {
+    const declaration = contract.task_manifests[task.id];
+    if (!declaration || typeof declaration !== "object") {
+      throw new Error(`Release evidence corpus contract is missing task manifest for ${task.id}`);
+    }
+    const manifestPath = assertPathInside(repoRoot, path.resolve(repoRoot, declaration.path ?? ""), `Task manifest contract path for ${task.id}`);
+    if (path.resolve(task.manifest_path) !== manifestPath) {
+      throw new Error(`Release evidence task manifest path does not match loaded task for ${task.id}`);
+    }
+    const manifestBytes = await readFile(manifestPath);
+    const manifestSha256 = sha256Bytes(manifestBytes);
+    if (manifestSha256 !== normalizeSha256(declaration.sha256, `Task manifest contract hash for ${task.id}`)) {
+      throw new Error(`Release evidence task manifest hash does not match for ${task.id}`);
+    }
+    taskManifests[task.id] = {
+      path: path.relative(repoRoot, manifestPath).replaceAll(path.sep, "/"),
+      sha256: manifestSha256,
+    };
+    taskRepositories[task.id] = task.repo;
+  }
+  if (Object.keys(contract.task_manifests).some((taskId) => !taskIds.includes(taskId))) {
+    throw new Error("Release evidence corpus contract binds an unselected task manifest");
+  }
+  const projectManifests = {};
+  for (const task of tasks) {
+    const manifest = task.repo_metadata?.codestory_project_manifest;
+    if (!manifest) continue;
+    const config = ALL_REPOS[task.repo];
+    const normalized = config?.manifest_codestory_project_manifest;
+    if (!normalized || normalized.sha256 !== manifest.sha256) {
+      throw new Error(`Release evidence project manifest declaration is inconsistent for ${task.id}`);
+    }
+    projectManifests[task.id] = {
+      path: path.relative(repoRoot, normalized.source_path).replaceAll(path.sep, "/"),
+      sha256: normalized.sha256,
+    };
+  }
+  if (JSON.stringify(contract.project_manifests ?? {}) !== JSON.stringify(projectManifests)) {
+    throw new Error("Release evidence corpus contract project manifest bindings do not match selected tasks");
+  }
+  return {
+    path: path.relative(repoRoot, contractPath).replaceAll(path.sep, "/"),
+    sha256: sha256Bytes(bytes),
+    corpus_id: contract.corpus_id,
+    task_ids: taskIds,
+    runtime_modes: selectedRuntimeModes,
+    repeats: contract.repeats,
+    task_manifests: taskManifests,
+    task_repositories: taskRepositories,
+    project_manifests: projectManifests,
+  };
+}
+
 function publicCoreCorpusAudit(tasks) {
   const classCounts = new Map();
   const repos = new Set();
@@ -898,7 +1043,7 @@ function validatePublishableShape(opts, tasks) {
       blockers.push(`public-core needs at least 3 tasks per class; underfilled: ${audit.underfilled_classes.join(", ")}`);
     }
   }
-  blockers.push(...unsupportedSidecarContractRequests(process.env));
+  blockers.push(...unsupportedRetrievalContractRequests(process.env));
   if (blockers.length) {
     throw new Error(`Publishable benchmark shape is incomplete:\n- ${blockers.join("\n- ")}`);
   }
@@ -1056,6 +1201,88 @@ function assertManifestRepoMaterializationAllowed(tasks, opts = {}) {
   }
 }
 
+async function gitCheckedOutput(args, cwd, timeoutMs) {
+  const result = await runCheckedProcess("git", args, { cwd, timeoutMs });
+  return result.stdout.trim();
+}
+
+async function installCodestoryProjectManifest(config, checkoutPath, opts) {
+  const manifest = config.manifest_codestory_project_manifest ?? null;
+  if (!manifest) {
+    return null;
+  }
+  const workspacePath = path.resolve(config.path);
+  assertPathInside(checkoutPath, workspacePath, "CodeStory project manifest workspace path");
+  const destination = assertPathInside(
+    workspacePath,
+    path.join(workspacePath, "codestory_project.json"),
+    "CodeStory project manifest destination",
+  );
+  const relativeDestination = path.relative(checkoutPath, destination).replaceAll(path.sep, "/");
+  if (!relativeDestination || relativeDestination.startsWith("../") || path.isAbsolute(relativeDestination)) {
+    throw new Error(`CodeStory project manifest destination escapes checkout: ${destination}`);
+  }
+  const tracked = await runProcess("git", ["-C", checkoutPath, "ls-files", "--error-unmatch", "--", relativeDestination], {
+    timeoutMs: opts.timeoutMs,
+  });
+  if (tracked.exitCode === 0) {
+    throw new Error(`Refusing to replace upstream-tracked ${relativeDestination} in ${config.name}`);
+  }
+  const sourceBytes = await readFile(manifest.source_path);
+  const sourceSha256 = sha256Bytes(sourceBytes);
+  if (sourceSha256 !== manifest.sha256) {
+    throw new Error(
+      `CodeStory project manifest hash mismatch for ${config.name}: expected ${manifest.sha256}, got ${sourceSha256}`,
+    );
+  }
+  const infoExclude = path.join(checkoutPath, ".git", "info", "exclude");
+  const ignoreEntry = `/${relativeDestination}`;
+  const currentExclude = existsSync(infoExclude) ? await readFile(infoExclude, "utf8") : "";
+  if (!currentExclude.split(/\r?\n/u).includes(ignoreEntry)) {
+    await writeFile(infoExclude, `${currentExclude}${currentExclude.endsWith("\n") || !currentExclude ? "" : "\n"}${ignoreEntry}\n`, "utf8");
+  }
+  await writeFile(destination, sourceBytes);
+  const installedBytes = await readFile(destination);
+  const installedSha256 = sha256Bytes(installedBytes);
+  if (installedSha256 !== manifest.sha256) {
+    throw new Error(`Installed CodeStory project manifest hash mismatch for ${config.name}`);
+  }
+  await gitCheckedOutput(["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination], repoRoot, opts.timeoutMs);
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  if (dirty) {
+    throw new Error(`Installing CodeStory project manifest dirtied ${config.name}: ${dirty}`);
+  }
+  return {
+    source_path: path.relative(repoRoot, manifest.source_path).replaceAll(path.sep, "/"),
+    declared_sha256: manifest.sha256,
+    installed_path: relativeDestination,
+    installed_sha256: installedSha256,
+    ignored: true,
+  };
+}
+
+async function scrubMaterializedCheckout(config, checkoutPath, opts) {
+  await runCheckedProcess("git", ["-C", checkoutPath, "reset", "--hard", config.ref], {
+    timeoutMs: opts.timeoutMs,
+  });
+  await runCheckedProcess("git", ["-C", checkoutPath, "clean", "-ffdqx"], {
+    timeoutMs: opts.timeoutMs,
+  });
+  const head = (await gitCheckedOutput(["-C", checkoutPath, "rev-parse", "HEAD"], repoRoot, opts.timeoutMs)).toLowerCase();
+  if (head !== String(config.ref).toLowerCase()) {
+    throw new Error(`Materialized repo ${config.name} HEAD ${head} does not match pinned ref ${config.ref}`);
+  }
+  const dirty = await gitCheckedOutput(["-C", checkoutPath, "status", "--porcelain"], repoRoot, opts.timeoutMs);
+  if (dirty) {
+    throw new Error(`Materialized repo ${config.name} is dirty after scrub: ${dirty}`);
+  }
+  const remaining = await gitCheckedOutput(["-C", checkoutPath, "clean", "-ffdqx", "-n"], repoRoot, opts.timeoutMs);
+  if (remaining) {
+    throw new Error(`Materialized repo ${config.name} retains untracked or ignored files after scrub: ${remaining}`);
+  }
+  config.installed_codestory_project_manifest = null;
+}
+
 async function materializeRepos(tasks, opts) {
   const repos = uniqueTaskRepos(tasks);
   if (!repos.size) {
@@ -1089,9 +1316,11 @@ async function materializeRepos(tasks, opts) {
     await runCheckedProcess("git", ["-C", checkoutPath, "checkout", "--detach", "FETCH_HEAD"], {
       timeoutMs: opts.timeoutMs,
     });
+    await scrubMaterializedCheckout(config, checkoutPath, opts);
     if (!existsSync(config.path)) {
       throw new Error(`Materialized repo ${name} is missing workspace path: ${config.path}`);
     }
+    config.installed_codestory_project_manifest = await installCodestoryProjectManifest(config, checkoutPath, opts);
   }
 }
 
@@ -2232,16 +2461,46 @@ function estimateCost(usage) {
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
 }
 
+const BENCHMARK_AGENT_RUN_ID = "shared-agent";
+
+function benchmarkAgentScopeArgs() {
+  return ["--profile", "agent", "--run-id", BENCHMARK_AGENT_RUN_ID];
+}
+
+function retrievalStatusCommandArgs(project) {
+  return [
+    "retrieval",
+    "status",
+    "--project",
+    project,
+    ...benchmarkAgentScopeArgs(),
+    "--format",
+    "json",
+  ];
+}
+
+function retrievalIndexCommandArgs(project) {
+  return [
+    "retrieval",
+    "index",
+    "--project",
+    project,
+    ...benchmarkAgentScopeArgs(),
+    "--refresh",
+    "auto",
+  ];
+}
+
 function packetCommandArgs(repoConfig, task, opts = {}) {
   const args = [
     "packet",
     "--project",
     repoConfig.path,
+    ...benchmarkAgentScopeArgs(),
     "--question",
     task?.prompt ?? repoConfig.prompt,
     "--budget",
     "compact",
-    ...selectedSidecarArgs(opts),
     "--format",
     "json",
   ];
@@ -2971,6 +3230,12 @@ async function repoProvenance(config) {
       ref: config.manifest_ref ?? null,
       workspace_root: config.manifest_workspace_root ?? null,
       checkout_path: config.manifest_checkout_path ?? null,
+      codestory_project_manifest: config.manifest_codestory_project_manifest
+        ? {
+            path: config.manifest_codestory_project_manifest.declared_path,
+            sha256: config.manifest_codestory_project_manifest.sha256,
+          }
+        : null,
     },
     configured: {
       url: config.url ?? null,
@@ -2984,6 +3249,7 @@ async function repoProvenance(config) {
     ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
+    installed_codestory_project_manifest: config.installed_codestory_project_manifest ?? null,
   };
 }
 
@@ -3022,7 +3288,6 @@ function doctorSnapshotFromOutput(result, output, parseError, wallMs) {
 }
 
 function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
-  const locality = semanticRuntimeLocalityFromRetrievalStatus(output);
   return {
     status: result.status === "pass" && !parseError ? "pass" : result.status,
     exit_code: result.exitCode,
@@ -3033,15 +3298,23 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     degraded_reason: output?.degraded_reason ?? null,
     manifest_embedding_backend: output?.manifest?.embedding_backend ?? null,
     manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
-    sidecar_generation: output?.manifest?.sidecar_generation ?? null,
-    qdrant_collection: output?.manifest?.qdrant_collection ?? null,
-    embedding_endpoint_origin: output?.ownership?.embedding_endpoint_origin ?? null,
-    embedding_endpoint: output?.ownership?.ports?.embed_url ?? null,
-    local_only: locality.local_only,
-    locality_kind: locality.locality_kind,
-    locality_evidence: locality.locality_evidence,
+    semantic_generation: output?.manifest?.semantic_generation ?? null,
+    embedding_model_sha256: output?.embedding_model_sha256 ?? null,
+    embedding_ggml_build_identity: output?.embedding_ggml_build_identity ?? null,
+    embedding_backend: output?.embedding_backend ?? null,
+    embedding_adapter: output?.embedding_adapter ?? null,
+    embedding_policy: output?.embedding_policy ?? null,
+    embedding_engine_instance_id: output?.embedding_engine_instance_id ?? null,
+    embedding_model_load_count: output?.embedding_model_load_count ?? null,
+    embedding_smoke_ms: output?.embedding_smoke_ms ?? null,
+    embedding_initialization_ms: output?.embedding_initialization_ms ?? null,
+    embedding_materialized_reused: output?.embedding_materialized_reused ?? null,
+    embedding_accelerator_execution_verified: output?.embedding_accelerator_execution_verified ?? null,
+    local_only: true,
+    locality_kind: "same_user_local_ipc",
+    locality_evidence: "retrieval embeddings execute in the authenticated per-user CodeStory server",
     lexical_capabilities: output?.lexical?.capabilities ?? null,
-    qdrant_capabilities: output?.qdrant?.capabilities ?? null,
+    semantic_capabilities: output?.semantic?.capabilities ?? null,
     scip_capabilities: output?.scip?.capabilities ?? null,
     stdout_tail: result.status === "pass" ? null : trimTail(result.stdout),
     stderr_tail: result.status === "pass" ? null : trimTail(result.stderr),
@@ -3073,12 +3346,11 @@ async function codestoryRetrievalStatusSnapshot(
   project,
   timeoutMs,
   env = benchmarkChildEnv(process.env),
-  sidecarArgs = [],
 ) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
-    ["retrieval", "status", "--project", project, ...sidecarArgs, "--format", "json"],
+    retrievalStatusCommandArgs(project),
     { timeoutMs, env },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -3128,7 +3400,9 @@ function compactCachePreparation(preparation) {
     retrieval_index_wall_ms: preparation.retrieval_index_wall_ms ?? null,
     retrieval_mode: preparation.retrieval_status?.retrieval_mode ?? null,
     retrieval_degraded_reason: preparation.retrieval_status?.degraded_reason ?? null,
-    sidecar_generation: preparation.retrieval_status?.sidecar_generation ?? null,
+    semantic_generation: preparation.retrieval_status?.semantic_generation ?? null,
+    embedding_engine_instance_id: preparation.retrieval_status?.embedding_engine_instance_id ?? null,
+    embedding_policy: preparation.retrieval_status?.embedding_policy ?? null,
     manifest_embedding_backend: preparation.retrieval_status?.manifest_embedding_backend ?? null,
     before_freshness_status: preparation.before?.freshness_status ?? null,
     after_freshness_status: preparation.after?.freshness_status ?? null,
@@ -3163,7 +3437,6 @@ async function prepareCodeStoryCaches(opts, tasks) {
     console.log(`preparing CodeStory cache for ${repo}`);
     const preparationStarted = performance.now();
     const childEnv = selectedBenchmarkChildEnv(opts);
-    const sidecarArgs = selectedSidecarArgs(opts);
     const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
     const preparation = {
       repo,
@@ -3188,15 +3461,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       const retrievalStarted = performance.now();
       const retrievalIndex = await runProcess(
         codestoryCli,
-        [
-          "retrieval",
-          "index",
-          "--project",
-          config.path,
-          ...sidecarArgs,
-          "--refresh",
-          "auto",
-        ],
+        retrievalIndexCommandArgs(config.path),
         {
           env: childEnv,
           timeoutMs: opts.prepareCodestoryTimeoutMs,
@@ -3220,7 +3485,6 @@ async function prepareCodeStoryCaches(opts, tasks) {
         config.path,
         60_000,
         childEnv,
-        sidecarArgs,
       );
       if (preparation.retrieval_status.retrieval_mode !== "full") {
         throw new Error(
@@ -3246,30 +3510,6 @@ function semanticBackendName(retrieval) {
   );
 }
 
-function doctorEnvironmentValue(output, name) {
-  const row = (output?.environment ?? []).find((item) => item?.name === name);
-  if (!row || row.status !== "ok") {
-    return null;
-  }
-  const match = String(row.message ?? "").match(/`([^`]*)`/);
-  return match ? match[1] : null;
-}
-
-function isLoopbackUrl(value) {
-  try {
-    const url = new URL(value);
-    const hostname = url.hostname.toLowerCase();
-    return (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      hostname.endsWith(".localhost")
-    );
-  } catch {
-    return false;
-  }
-}
-
 function semanticRuntimeLocality(output) {
   const retrieval = output?.retrieval ?? {};
   const backend = semanticBackendName(retrieval);
@@ -3280,56 +3520,10 @@ function semanticRuntimeLocality(output) {
       locality_evidence: "semantic retrieval unavailable; no embedding runtime was used",
     };
   }
-  if (backend === "llamacpp") {
-    const endpoint = doctorEnvironmentValue(output, "CODESTORY_EMBED_LLAMACPP_URL");
-    if (!endpoint) {
-      return {
-        local_only: null,
-        locality_kind: "unknown_llamacpp_endpoint",
-        locality_evidence: "llama.cpp backend did not expose a configured endpoint",
-      };
-    }
-    const loopback = isLoopbackUrl(endpoint);
-    return {
-      local_only: loopback,
-      locality_kind: loopback ? "loopback_endpoint" : "remote_endpoint",
-      locality_evidence: "semantic backend is llama.cpp",
-    };
-  }
-  if (backend === "hash" || backend === "lexical") {
-    return {
-      local_only: true,
-      locality_kind: "local_deterministic_backend",
-      locality_evidence: `semantic backend is ${backend}`,
-    };
-  }
   return {
-    local_only: null,
-    locality_kind: "unknown_backend",
-    locality_evidence: `semantic backend is ${backend}`,
-  };
-}
-
-function semanticRuntimeLocalityFromRetrievalStatus(output) {
-  const origin = output?.ownership?.embedding_endpoint_origin ?? null;
-  const endpoint = output?.ownership?.ports?.embed_url ?? null;
-  if (!origin || !endpoint) {
-    return {
-      local_only: null,
-      locality_kind: "unknown_sidecar_endpoint",
-      locality_evidence: "retrieval status did not expose sidecar endpoint ownership",
-    };
-  }
-  const loopback = isLoopbackUrl(endpoint);
-  return {
-    local_only: loopback,
-    locality_kind:
-      origin === "managed_sidecar" && loopback
-        ? "managed_sidecar_loopback"
-        : loopback
-          ? "loopback_endpoint"
-          : "remote_endpoint",
-    locality_evidence: `retrieval status reports ${origin} embedding ownership`,
+    local_only: true,
+    locality_kind: "same_user_local_ipc",
+    locality_evidence: `semantic backend ${backend} executes in the authenticated per-user CodeStory server`,
   };
 }
 
@@ -3337,7 +3531,7 @@ function cachePolicyForRun(observations = {}) {
   if (observations.indexing_in_timed_run) {
     return "timed-run-indexed-cache";
   }
-  return observations.cache_prepared ? "prepared-sidecar-cache-read-only" : "unprepared-cache-blocked";
+  return observations.cache_prepared ? "prepared-retrieval-cache-read-only" : "unprepared-cache-blocked";
 }
 
 function cachePreparationForRepo(opts, repoName) {
@@ -3359,6 +3553,51 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
     cache_prepared: Boolean(cachePreparation),
     cache_preparation: cachePreparation,
     transport_mode: transportMode,
+  };
+}
+
+function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
+  const trace = packet?.answer?.retrieval_trace ?? null;
+  const diagnostics = Array.isArray(trace?.packet_sidecar_diagnostics)
+    ? trace.packet_sidecar_diagnostics
+    : [];
+  const stageTimings = Array.isArray(trace?.retrieval_shadow?.stage_timings)
+    ? trace.retrieval_shadow.stage_timings
+    : [];
+  const semanticStages = stageTimings.filter(
+    (timing) => timing?.stage === "stage1b_semantic",
+  );
+  const completedSemanticStages = semanticStages.filter(
+    (timing) =>
+      timing?.completion_status === "completed"
+      && timing?.degraded !== true
+      && !timing?.stub_reason
+      && !timing?.cancel_reason,
+  );
+  const fullDiagnosticCount = diagnostics.filter(
+    (diagnostic) => diagnostic?.retrieval_mode === "full",
+  ).length;
+  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
+  return {
+    source: "packet.answer.retrieval_trace",
+    transport_mode: transportMode,
+    retrieval_contract: retrievalContract?.retrieval_contract ?? null,
+    embedding_engine: retrievalContract?.embedding_engine ?? null,
+    embedding_policy: retrievalContract?.execution_policy ?? null,
+    retrieval_mode:
+      diagnostics.length > 0 && fullDiagnosticCount === diagnostics.length ? "full" : null,
+    diagnostic_count: diagnostics.length,
+    full_diagnostic_count: fullDiagnosticCount,
+    semantic_stage_count: semanticStages.length,
+    completed_semantic_stage_count: completedSemanticStages.length,
+    invalid_semantic_stage_count: semanticStages.length - completedSemanticStages.length,
+    shadow_degraded_reason: trace?.retrieval_shadow?.degraded_reason ?? null,
+    shadow_error: trace?.retrieval_shadow?.error ?? null,
+    shadow_cancel_reason: trace?.retrieval_shadow?.cancel_reason ?? null,
+    semantic_fallback_count: trace?.semantic_fallback_count ?? null,
+    semantic_generation: trace?.retrieval_publication?.semantic_generation ?? null,
+    prepared_semantic_generation:
+      cachePreparation?.retrieval_status?.semantic_generation ?? null,
   };
 }
 
@@ -3390,7 +3629,6 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
       config.path,
       Math.min(opts.timeoutMs ?? 600_000, 60_000),
       selectedBenchmarkChildEnv(opts),
-      selectedSidecarArgs(opts),
     );
   return {
     codestory_cli: path.resolve(codestoryCli),
@@ -3409,10 +3647,16 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
     codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
     cache_preparation: compactCachePreparation(observations.cache_preparation),
+    packet_embedding_execution: observations.packet_embedding_execution ?? null,
     transport_mode: observations.transport_mode ?? null,
     retrieval_status: retrievalStatus,
     retrieval_mode: retrievalStatus.retrieval_mode ?? null,
-    sidecar_generation: retrievalStatus.sidecar_generation ?? null,
+    semantic_generation: retrievalStatus.semantic_generation ?? null,
+    embedding_engine_instance_id: retrievalStatus.embedding_engine_instance_id ?? null,
+    embedding_policy:
+      retrievalStatus.embedding_policy
+      ?? observations.packet_embedding_execution?.embedding_policy
+      ?? null,
     manifest_embedding_backend: retrievalStatus.manifest_embedding_backend ?? null,
     doctor_status: doctor.status,
     doctor_exit_code: doctor.exit_code,
@@ -4017,11 +4261,7 @@ function packetSearchStepTelemetry(steps) {
       mode: packetTraceField(step.output, "mode") ?? "unclassified_search",
       duration_ms: finiteNumber(step.duration_ms),
       hits: packetTraceNumber(step.output, "hits"),
-      sidecar_query_ms: packetTraceNumber(step.output, "sidecar_query_ms"),
       candidate_resolution_ms: packetTraceNumber(step.output, "candidate_resolution_ms"),
-      sidecar_total_ms: packetTraceNumber(step.output, "sidecar_total_ms"),
-      sidecar_stage_count: packetTraceNumber(step.output, "sidecar_stage_count"),
-      sidecar_stage_total_ms: packetTraceNumber(step.output, "sidecar_stage_total_ms"),
       message: step.message ?? null,
     }));
 }
@@ -4181,7 +4421,6 @@ function packetLatencyTelemetry(packet, wallMs) {
     top_step_message: topStep?.message ?? null,
     retrieval_step_count: steps.length,
     packet_search_total_ms: searchSteps.reduce((sum, step) => sum + (finiteNumber(step.duration_ms) ?? 0), 0),
-    packet_initial_sidecar_query_ms: packetSearchPhaseTotal(searchSteps, "packet_initial_sidecar_query"),
     packet_anchor_probe_search_total_ms: packetSearchPhaseTotal(searchSteps, "symbolic_packet_anchor_probe"),
     packet_lexical_subquery_search_total_ms: packetSearchPhaseTotal(searchSteps, "packet_lexical_batch"),
     packet_semantic_subquery_search_total_ms: packetSearchPhaseTotal(searchSteps, "packet_semantic_batch"),
@@ -4220,11 +4459,6 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(
-    opts,
-    repoConfig,
-    packetRuntimeCacheObservations(opts, task.repo, "cold_cli_packet"),
-  );
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -4241,6 +4475,21 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
       parseError = error.message;
     }
   }
+  const cacheObservations = packetRuntimeCacheObservations(
+    opts,
+    task.repo,
+    "cold_cli_packet",
+  );
+  cacheObservations.packet_embedding_execution = packetEmbeddingExecutionProof(
+    packet,
+    cacheObservations.cache_preparation,
+    cacheObservations.transport_mode,
+  );
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    cacheObservations,
+  );
   const quality = packet
     ? scoreQualityFromText(packetPayloadText(packet), JSON.stringify(packet), task)
     : null;
@@ -5127,98 +5376,12 @@ function packetCompositionMarkdown(payload) {
   return `${lines.join("\n")}\n`;
 }
 
-function configurePacketRuntimeSidecar(opts) {
-  const commit = String(process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT ?? "adhoc")
-    .replace(/[^0-9a-f]/gi, "")
-    .slice(0, 12) || "adhoc";
-  const runId = `packet-runtime-${commit}-${process.pid}-${Date.now().toString(36)}`;
-  opts.packetSidecarProfile = "agent";
-  opts.packetSidecarRunId = runId;
-  const childEnv = benchmarkChildEnv(process.env, {
-    CODESTORY_RETRIEVAL_PROFILE: "agent",
-    CODESTORY_SIDECAR_RUN_ID: runId,
-    CODESTORY_EMBED_SERVER_LAUNCH: "",
-  });
-  childEnv.CODESTORY_EMBED_LLAMACPP_URL = "";
-  opts.packetRuntimeChildEnv = childEnv;
-}
-
-async function bootstrapPacketRuntimeSidecars(opts, tasks, attemptedRepos) {
-  const codestoryCli = resolveCodeStoryCli(opts);
-  const repoNames = [...new Set(tasks.map((task) => task.repo))];
-  for (const repo of repoNames) {
-    const config = ALL_REPOS[repo];
-    if (!config || !existsSync(config.path)) {
-      throw new Error(`cannot bootstrap packet sidecar for missing repo ${repo}`);
-    }
-    attemptedRepos.push({ repo, project: config.path });
-    const result = await runProcess(
-      codestoryCli,
-      [
-        "retrieval",
-        "bootstrap",
-        "--project",
-        config.path,
-        ...selectedSidecarArgs(opts),
-        "--format",
-        "json",
-      ],
-      {
-        env: selectedBenchmarkChildEnv(opts),
-        timeoutMs: Math.min(opts.prepareCodestoryTimeoutMs, 180_000),
-      },
-    );
-    if (result.status !== "pass") {
-      throw new Error(
-        `packet sidecar bootstrap failed for ${repo}: ${trimTail(result.stderr || result.stdout)}`,
-      );
-    }
-  }
-}
-
-async function cleanupPacketRuntimeSidecars(opts, attemptedRepos) {
-  const codestoryCli = resolveCodeStoryCli(opts);
-  const failures = [];
-  for (const { repo, project } of [...attemptedRepos].reverse()) {
-    const result = await runProcess(
-      codestoryCli,
-      ["retrieval", "down", "--project", project, ...selectedSidecarArgs(opts)],
-      {
-        env: selectedBenchmarkChildEnv(opts),
-        timeoutMs: 120_000,
-      },
-    );
-    if (result.status !== "pass") {
-      failures.push(`${repo}: ${trimTail(result.stderr || result.stdout)}`);
-    }
-  }
-  return failures;
-}
-
 async function runPacketRuntimeBenchmark(opts, tasks) {
   if (!tasks.length) {
     throw new Error("--packet-runtime requires --task-suite or --task-manifest");
   }
-  configurePacketRuntimeSidecar(opts);
-  const attemptedRepos = [];
-  let primaryError = null;
-  try {
-    await bootstrapPacketRuntimeSidecars(opts, tasks, attemptedRepos);
-    return await runPacketRuntimeBenchmarkBody(opts, tasks);
-  } catch (error) {
-    primaryError = error;
-    throw error;
-  } finally {
-    const cleanupFailures = await cleanupPacketRuntimeSidecars(opts, attemptedRepos);
-    if (cleanupFailures.length) {
-      const message = `packet sidecar cleanup failed: ${cleanupFailures.join("; ")}`;
-      if (primaryError) {
-        console.error(message);
-      } else {
-        throw new Error(message);
-      }
-    }
-  }
+  opts.packetRuntimeChildEnv = benchmarkChildEnv(process.env);
+  return runPacketRuntimeBenchmarkBody(opts, tasks);
 }
 
 async function runPacketRuntimeBenchmarkBody(opts, tasks) {
@@ -5277,10 +5440,9 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
     output_dir: outDir,
     retrieval_env: benchmarkRetrievalEnv(selectedBenchmarkChildEnv(opts)),
     retrieval_contract: retrievalContractSummary(selectedBenchmarkChildEnv(opts)),
-    sidecar_lifecycle: {
-      profile: opts.packetSidecarProfile,
-      run_id: opts.packetSidecarRunId,
-      cleanup: "retrieval down",
+    embedding_engine: {
+      ownership: "process_shared",
+      lifecycle: "codestory_process",
     },
     benchmark_contract: benchmarkRunContract({
       opts,
@@ -5294,6 +5456,8 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
       ? {
           release_evidence: {
             commit: process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT,
+            source_tree: process.env.CODESTORY_RELEASE_EVIDENCE_TREE,
+            evaluation_contract: "publishable-three-repeat-packet/v1",
             profile: process.env.CODESTORY_RELEASE_EVIDENCE_PROFILE,
             evidence_identity: {
               corpus_id: process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID,
@@ -5301,6 +5465,7 @@ async function runPacketRuntimeBenchmarkBody(opts, tasks) {
               machine_fingerprint:
                 process.env.CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT,
             },
+            corpus_contract: opts.releaseEvidenceCorpusContract,
             publishable: opts.publishable === true,
             repeats: opts.repeats,
             quality_gate_status:
@@ -6446,19 +6611,21 @@ function runSelfTest() {
     }),
     "already-ready",
   );
-  assert.deepEqual(
-    semanticRuntimeLocalityFromRetrievalStatus({
-      ownership: {
-        embedding_endpoint_origin: "managed_sidecar",
-        ports: { embed_url: "http://127.0.0.1:8080/v1/embeddings" },
-      },
-    }),
+  const engineStatus = retrievalStatusSnapshotFromOutput(
+    { status: "pass", exitCode: 0, timedOut: false },
     {
-      local_only: true,
-      locality_kind: "managed_sidecar_loopback",
-      locality_evidence: "retrieval status reports managed_sidecar embedding ownership",
+      retrieval_mode: "full",
+      embedding_backend: "Metal",
+      embedding_policy: "accelerated",
+      embedding_engine_instance_id: "engine-1",
     },
+    null,
+    1,
   );
+  assert.equal(engineStatus.locality_kind, "same_user_local_ipc");
+  assert.equal(engineStatus.embedding_backend, "Metal");
+  assert.equal(engineStatus.embedding_policy, "accelerated");
+  assert.equal(engineStatus.embedding_engine_instance_id, "engine-1");
   const packetRuntimePreparation = [
     {
       repo: "codestory",
@@ -6471,7 +6638,7 @@ function runSelfTest() {
       "codestory",
       transportMode,
     );
-    assert.equal(cachePolicyForRun(observations), "prepared-sidecar-cache-read-only");
+    assert.equal(cachePolicyForRun(observations), "prepared-retrieval-cache-read-only");
     assert.equal(observations.cache_preparation, packetRuntimePreparation[0]);
   }
 
@@ -6743,6 +6910,7 @@ async function main() {
     return;
   }
   const tasks = await loadTasks(opts);
+  opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(tasks, opts);
   if (opts.publishable) {
     validatePublishableShape(opts, tasks);
   }
@@ -6878,12 +7046,16 @@ export {
   isPathInside,
   isTrustedPublishableRepoUrl,
   loadTaskForResult,
+  loadReleaseEvidenceCorpusContract,
   loadTasks,
   manifestRepoMaterializationBlockers,
   materializeRepos,
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  benchmarkAgentScopeArgs,
+  retrievalIndexCommandArgs,
+  retrievalStatusCommandArgs,
   packetComposition,
   packetCommandArgs,
   packetForAgentPrompt,
@@ -6892,6 +7064,7 @@ export {
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimeCacheObservations,
+  packetEmbeddingExecutionProof,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   cacheProvenanceBlockers,

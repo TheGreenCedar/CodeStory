@@ -1,15 +1,57 @@
 use super::*;
+use crate::agent::packet_evidence::{decorate_search_hit_evidence, diagnostic_source_evidence};
 use crate::trail_story::build_trail_story;
-use codestory_contracts::api::SearchHitOrigin;
-#[cfg(test)]
-use codestory_store::FileRole;
-use std::cmp::Ordering;
+use codestory_contracts::api::{
+    PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
+};
+use codestory_store::{FileRole, StructuralTextUnit};
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 const RECOMMENDED_QUERY_LIMIT: usize = 5;
 const FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES: usize = 400;
 const FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES: usize = 40;
+const ROOT_CANDIDATE_MULTIPLIER: usize = 8;
+const ARCHITECTURE_ROOT_FILE_LIMIT: usize = 48;
+const ARCHITECTURE_ROOT_SYMBOL_SCAN_LIMIT: usize = 16;
+const ARCHITECTURE_NAMED_ROOTS_PER_FILE: usize = 8;
+const ARCHITECTURE_ROOT_EXACT_NAMES: &[&str] = &[
+    "main",
+    "run",
+    "start",
+    "bootstrap",
+    "launch",
+    "mount",
+    "serve",
+    "init",
+    "initialize",
+    "createapp",
+    "createapplication",
+    "createserver",
+    "createrouter",
+    "createruntime",
+    "runapp",
+    "runapplication",
+    "runserver",
+    "runruntime",
+    "runservice",
+    "runcli",
+    "startapp",
+    "startapplication",
+    "startserver",
+    "startruntime",
+    "startservice",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "options",
+];
+const ARCHITECTURE_ROOT_UPPERCASE_GLOBS: &[&str] =
+    &["Page", "Layout", "[A-Z]*Page", "[A-Z]*Layout"];
 
 #[derive(Debug, Clone, Copy)]
 struct GroundingBudgetConfig {
@@ -218,30 +260,38 @@ fn build_coverage_buckets(
     buckets
 }
 
+struct SymbolDigestContext<'a> {
+    member_counts: &'a HashMap<codestory_contracts::graph::NodeId, u32>,
+    fallback_lines: &'a HashMap<codestory_contracts::graph::NodeId, u32>,
+    edge_digests: &'a HashMap<codestory_contracts::graph::NodeId, Vec<String>>,
+    summaries: &'a HashMap<codestory_contracts::graph::NodeId, SymbolSummaryRecord>,
+    structural_units: &'a HashMap<codestory_contracts::graph::NodeId, StructuralTextUnit>,
+}
+
 fn symbol_digest(
     node: &codestory_contracts::graph::Node,
     display_name: &str,
     relative_file_path: Option<&str>,
-    member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
-    fallback_lines: &HashMap<codestory_contracts::graph::NodeId, u32>,
-    edge_digests: &HashMap<codestory_contracts::graph::NodeId, Vec<String>>,
-    summaries: &HashMap<codestory_contracts::graph::NodeId, SymbolSummaryRecord>,
+    context: &SymbolDigestContext<'_>,
 ) -> GroundingSymbolDigestDto {
     let member_count = if is_structural_kind(node.kind) {
-        Some(*member_counts.get(&node.id).unwrap_or(&0))
+        Some(*context.member_counts.get(&node.id).unwrap_or(&0))
     } else {
         None
     };
 
     let line = node
         .start_line
-        .or_else(|| fallback_lines.get(&node.id).copied());
+        .or_else(|| context.fallback_lines.get(&node.id).copied());
 
     let label = if let Some(file_path) = relative_file_path {
         format!("{display_name} @ {file_path}")
     } else {
         display_name.to_string()
     };
+    let diagnostic_evidence =
+        diagnostic_source_evidence(relative_file_path, node.canonical_id.as_deref());
+    let structural_unit = context.structural_units.get(&node.id);
 
     GroundingSymbolDigestDto {
         id: NodeId::from(node.id),
@@ -252,8 +302,24 @@ fn symbol_digest(
         kind: NodeKind::from(node.kind),
         line,
         member_count,
-        summary: summaries.get(&node.id).map(|record| record.summary.clone()),
-        edge_digest: edge_digests.get(&node.id).cloned().unwrap_or_default(),
+        summary: context
+            .summaries
+            .get(&node.id)
+            .map(|record| record.summary.clone()),
+        edge_digest: context
+            .edge_digests
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_default(),
+        evidence_tier: structural_unit
+            .map(|_| PacketEvidenceTierDto::StructuralText)
+            .or_else(|| diagnostic_evidence.map(|evidence| evidence.tier)),
+        evidence_producer: structural_unit
+            .map(|unit| unit.producer.clone())
+            .or_else(|| diagnostic_evidence.map(|evidence| evidence.producer.to_string())),
+        resolution_status: structural_unit
+            .map(|_| PacketEvidenceResolutionDto::SourceRangeOnly)
+            .or_else(|| diagnostic_evidence.map(|evidence| evidence.resolution)),
     }
 }
 
@@ -271,6 +337,392 @@ fn dedupe_grounding_node_records(nodes: Vec<GroundingNodeRecord>) -> Vec<Groundi
         }
     }
     deduped
+}
+
+fn is_production_file_role(role: Option<FileRole>) -> bool {
+    matches!(role, Some(FileRole::Source | FileRole::Entrypoint))
+}
+
+fn grounding_root_file_role_rank(role: Option<FileRole>) -> u8 {
+    match role {
+        Some(FileRole::Entrypoint) => 0,
+        Some(FileRole::Source) => 1,
+        _ => 2,
+    }
+}
+
+fn grounding_root_terminal_name(record: &GroundingNodeRecord) -> String {
+    let terminal = terminal_symbol_segment(&record.display_name);
+    if terminal.is_empty() {
+        normalize_symbol_query(&record.display_name)
+    } else {
+        terminal
+    }
+}
+
+fn grounding_root_path_rank(root: &Path, record: &GroundingNodeRecord) -> u8 {
+    record
+        .file_path
+        .as_deref()
+        .map(|path| relative_path(root, path))
+        .as_deref()
+        .map_or(3, |path| architecture_path_rank(Some(path)))
+}
+
+fn grounding_root_subsystem_key(
+    root: &Path,
+    record: &GroundingNodeRecord,
+    file_languages: &HashMap<i64, String>,
+) -> String {
+    let language = record
+        .node
+        .file_node_id
+        .and_then(|file_id| file_languages.get(&file_id.0))
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    let Some(path) = record.file_path.as_deref() else {
+        return format!("{language}:unknown");
+    };
+    let relative = relative_path(root, path).to_ascii_lowercase();
+    let segments = relative
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some(index) = segments.iter().position(|segment| *segment == "crates")
+        && let Some(crate_name) = segments.get(index + 1)
+    {
+        return format!("{language}:crates/{crate_name}");
+    }
+    if let Some(index) = segments.iter().position(|segment| *segment == "plugins")
+        && let Some(plugin_name) = segments.get(index + 1)
+    {
+        return format!("{language}:plugins/{plugin_name}");
+    }
+    if segments.contains(&"src-tauri") {
+        return format!("{language}:src-tauri");
+    }
+    if let Some(index) = segments.iter().rposition(|segment| *segment == "src") {
+        if let Some(next) = segments.get(index + 1)
+            && !next.contains('.')
+        {
+            return format!("{language}:{}", segments[..=index + 1].join("/"));
+        }
+        return format!("{language}:{}", segments[..=index].join("/"));
+    }
+
+    let top = segments.first().copied().unwrap_or("root");
+    format!("{language}:{top}")
+}
+
+fn build_grounding_edge_degree_map(
+    counts: Vec<GroundingEdgeKindCount>,
+) -> HashMap<codestory_contracts::graph::NodeId, u32> {
+    let mut degrees = HashMap::new();
+    for count in counts {
+        degrees
+            .entry(count.node_id)
+            .and_modify(|total: &mut u32| *total = total.saturating_add(count.count))
+            .or_insert(count.count);
+    }
+    degrees
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GroundingRootSortKey {
+    import_like: bool,
+    entrypoint: Reverse<bool>,
+    file_role_rank: u8,
+    path_rank: u8,
+    edge_degree: Reverse<u32>,
+    member_count: Reverse<u32>,
+    node_rank: u8,
+    start_line: u32,
+    relative_path: Option<String>,
+    display_name: String,
+    node_id: i64,
+}
+
+impl GroundingRootSortKey {
+    fn new(
+        record: &GroundingNodeRecord,
+        root: &Path,
+        file_roles: &HashMap<i64, FileRole>,
+        edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
+        member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
+    ) -> Self {
+        let role = record
+            .node
+            .file_node_id
+            .and_then(|file_id| file_roles.get(&file_id.0).copied());
+        Self {
+            import_like: is_import_like_symbol(&record.node),
+            entrypoint: Reverse(is_grounding_entrypoint_root(root, record, file_roles)),
+            file_role_rank: grounding_root_file_role_rank(role),
+            path_rank: grounding_root_path_rank(root, record),
+            edge_degree: Reverse(edge_degrees.get(&record.node.id).copied().unwrap_or(0)),
+            member_count: Reverse(member_counts.get(&record.node.id).copied().unwrap_or(0)),
+            node_rank: node_rank(&record.node),
+            start_line: record.node.start_line.unwrap_or(u32::MAX),
+            relative_path: record
+                .file_path
+                .as_deref()
+                .map(|path| relative_path(root, path)),
+            display_name: record.display_name.clone(),
+            node_id: record.node.id.0,
+        }
+    }
+}
+
+fn append_diversified_grounding_root_tier(
+    records: Vec<GroundingNodeRecord>,
+    root: &Path,
+    file_languages: &HashMap<i64, String>,
+    seen_surfaces: &mut HashSet<String>,
+    seen_names: &mut HashSet<String>,
+    diversified: &mut Vec<GroundingNodeRecord>,
+) {
+    let mut repeated_surfaces = Vec::new();
+    for record in records {
+        let surface = grounding_root_subsystem_key(root, &record, file_languages);
+        let name = grounding_root_terminal_name(&record);
+        if !seen_surfaces.contains(&surface) && !seen_names.contains(&name) {
+            seen_surfaces.insert(surface);
+            seen_names.insert(name);
+            diversified.push(record);
+        } else {
+            repeated_surfaces.push(record);
+        }
+    }
+
+    let mut duplicate_names = Vec::new();
+    for record in repeated_surfaces {
+        if seen_names.insert(grounding_root_terminal_name(&record)) {
+            diversified.push(record);
+        } else {
+            duplicate_names.push(record);
+        }
+    }
+    diversified.extend(duplicate_names);
+}
+
+fn diversify_grounding_root_records(
+    mut records: Vec<GroundingNodeRecord>,
+    root: &Path,
+    file_roles: &HashMap<i64, FileRole>,
+    file_languages: &HashMap<i64, String>,
+    edge_degrees: &HashMap<codestory_contracts::graph::NodeId, u32>,
+    member_counts: &HashMap<codestory_contracts::graph::NodeId, u32>,
+) -> Vec<GroundingNodeRecord> {
+    records.sort_by_cached_key(|record| {
+        GroundingRootSortKey::new(record, root, file_roles, edge_degrees, member_counts)
+    });
+    let (production, secondary): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| {
+        is_production_file_role(
+            record
+                .node
+                .file_node_id
+                .and_then(|file_id| file_roles.get(&file_id.0).copied()),
+        )
+    });
+
+    // Spend the compact budget on distinct production language/subsystem
+    // surfaces, then distinct names, before compatibility-only candidates.
+    // Every budget truncates this one stable order.
+    let mut seen_surfaces = HashSet::new();
+    let mut seen_names = HashSet::new();
+    let mut diversified = Vec::with_capacity(production.len() + secondary.len());
+    append_diversified_grounding_root_tier(
+        production,
+        root,
+        file_languages,
+        &mut seen_surfaces,
+        &mut seen_names,
+        &mut diversified,
+    );
+    append_diversified_grounding_root_tier(
+        secondary,
+        root,
+        file_languages,
+        &mut seen_surfaces,
+        &mut seen_names,
+        &mut diversified,
+    );
+    diversified
+}
+
+fn is_grounding_entrypoint_root(
+    root: &Path,
+    record: &GroundingNodeRecord,
+    file_roles: &HashMap<i64, FileRole>,
+) -> bool {
+    let role = record
+        .node
+        .file_node_id
+        .and_then(|file_id| file_roles.get(&file_id.0).copied());
+    if is_import_like_symbol(&record.node)
+        || !is_production_file_role(role)
+        || !matches!(
+            record.node.kind,
+            codestory_contracts::graph::NodeKind::FUNCTION
+                | codestory_contracts::graph::NodeKind::METHOD
+        )
+    {
+        return false;
+    }
+    let has_entrypoint_file_evidence =
+        role == Some(FileRole::Entrypoint) || grounding_root_path_rank(root, record) == 0;
+    if !has_entrypoint_file_evidence {
+        return false;
+    }
+
+    let name = grounding_root_terminal_name(record)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    if [
+        "main",
+        "run",
+        "start",
+        "bootstrap",
+        "launch",
+        "mount",
+        "serve",
+        "init",
+        "initialize",
+        "createapp",
+        "createapplication",
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+    ]
+    .iter()
+    .any(|candidate| name == *candidate)
+    {
+        return true;
+    }
+
+    [
+        (
+            "start",
+            &["app", "application", "server", "runtime", "service"][..],
+        ),
+        (
+            "run",
+            &["app", "application", "server", "runtime", "service", "cli"][..],
+        ),
+        (
+            "create",
+            &["app", "application", "server", "router", "runtime"][..],
+        ),
+    ]
+    .iter()
+    .any(|(prefix, suffixes)| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| suffixes.contains(&suffix))
+    }) || {
+        let terminal = record
+            .display_name
+            .rsplit([':', '.', '/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        terminal
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+            && (name.ends_with("page") || name.ends_with("layout"))
+    }
+}
+
+fn grounding_orientation(
+    root: &Path,
+    evaluated: &[GroundingNodeRecord],
+    selected: &[GroundingNodeRecord],
+    total_root_candidates: usize,
+    compressed_files: u32,
+    file_roles: &HashMap<i64, FileRole>,
+    file_languages: &HashMap<i64, String>,
+) -> GroundingOrientationDto {
+    let candidate_entrypoint_roots = evaluated
+        .iter()
+        .filter(|record| is_grounding_entrypoint_root(root, record, file_roles))
+        .count();
+    let selected_entrypoint_roots = selected
+        .iter()
+        .filter(|record| is_grounding_entrypoint_root(root, record, file_roles))
+        .count();
+    let candidate_subsystems = evaluated
+        .iter()
+        .filter(|record| {
+            is_production_file_role(
+                record
+                    .node
+                    .file_node_id
+                    .and_then(|file_id| file_roles.get(&file_id.0).copied()),
+            )
+        })
+        .map(|record| grounding_root_subsystem_key(root, record, file_languages))
+        .collect::<HashSet<_>>()
+        .len();
+    let selected_subsystems = selected
+        .iter()
+        .filter(|record| {
+            is_production_file_role(
+                record
+                    .node
+                    .file_node_id
+                    .and_then(|file_id| file_roles.get(&file_id.0).copied()),
+            )
+        })
+        .map(|record| grounding_root_subsystem_key(root, record, file_languages))
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut uncertainty = Vec::new();
+    if evaluated.len() < total_root_candidates {
+        uncertainty.push(GroundingOrientationUncertaintyDto::BoundedCandidateWindow);
+    }
+    if candidate_entrypoint_roots == 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::NoEntrypointEvidence);
+    } else if selected_entrypoint_roots == 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::EntrypointEvidenceOmitted);
+    }
+    if candidate_subsystems > 1 && selected_subsystems < candidate_subsystems.min(selected.len()) {
+        uncertainty.push(GroundingOrientationUncertaintyDto::LimitedSubsystemBreadth);
+    }
+    if compressed_files > 0 {
+        uncertainty.push(GroundingOrientationUncertaintyDto::CompressedPresentation);
+    }
+
+    let confidence = if selected.is_empty()
+        || candidate_entrypoint_roots == 0
+        || (candidate_subsystems > 1 && selected_subsystems <= 1)
+    {
+        GroundingOrientationConfidenceDto::Weak
+    } else if evaluated.len() < total_root_candidates
+        || selected_entrypoint_roots == 0
+        || (candidate_subsystems > 1 && selected_subsystems < 2)
+    {
+        GroundingOrientationConfidenceDto::Partial
+    } else {
+        GroundingOrientationConfidenceDto::Strong
+    };
+
+    GroundingOrientationDto {
+        confidence,
+        total_root_candidates: total_root_candidates.min(u32::MAX as usize) as u32,
+        evaluated_root_candidates: evaluated.len().min(u32::MAX as usize) as u32,
+        candidate_entrypoint_roots: candidate_entrypoint_roots.min(u32::MAX as usize) as u32,
+        selected_entrypoint_roots: selected_entrypoint_roots.min(u32::MAX as usize) as u32,
+        candidate_subsystems: candidate_subsystems.min(u32::MAX as usize) as u32,
+        selected_subsystems: selected_subsystems.min(u32::MAX as usize) as u32,
+        uncertainty,
+    }
 }
 
 fn build_edge_digest_map(
@@ -399,6 +851,14 @@ fn architecture_path_rank(path: Option<&str>) -> u8 {
         || path.ends_with("/src/mod.rs")
         || path == "src/lib.rs"
         || path == "src/main.rs"
+        || path.ends_with("/main.ts")
+        || path.ends_with("/main.tsx")
+        || path.ends_with("/main.js")
+        || path.ends_with("/main.jsx")
+        || path.ends_with("/app.svelte")
+        || path.ends_with("/page.tsx")
+        || path.ends_with("/layout.tsx")
+        || path.ends_with("/route.ts")
         || path.ends_with("payload.config.ts")
         || path.ends_with("next.config.ts")
     {
@@ -408,6 +868,7 @@ fn architecture_path_rank(path: Option<&str>) -> u8 {
         || path.contains("/src/collections/")
         || path.contains("/src/components/")
         || path.contains("/src/runtime/")
+        || path.contains("/src-tauri/src/")
         || path.contains("/src/index")
     {
         return 1;
@@ -556,7 +1017,15 @@ pub(crate) fn grounding_explanation_search_hits(
 }
 
 fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<'_>) -> SearchHit {
-    SearchHit {
+    let evidence_tier = candidate
+        .symbol
+        .evidence_tier
+        .unwrap_or(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph);
+    let resolution_status = candidate
+        .symbol
+        .resolution_status
+        .unwrap_or(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved);
+    let mut hit = SearchHit {
         node_id: candidate.symbol.id.clone(),
         display_name: candidate.name.clone(),
         kind: candidate.symbol.kind,
@@ -566,12 +1035,16 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         origin: SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
-        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        evidence_producer: Some("grounding_recommendation".to_string()),
-        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        evidence_tier: Some(evidence_tier),
+        evidence_producer: candidate
+            .symbol
+            .evidence_producer
+            .clone()
+            .or_else(|| Some("grounding_recommendation".to_string())),
+        resolution_status: Some(resolution_status),
         loss_reason: None,
         coverage_role: None,
-        eligible_for_sufficiency: Some(true),
+        eligible_for_sufficiency: None,
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.45,
             semantic: 0.0,
@@ -583,7 +1056,9 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
             final_rank_reason: None,
             provenance: Vec::new(),
         }),
-    }
+    };
+    decorate_search_hit_evidence(&mut hit);
+    hit
 }
 
 impl AppController {
@@ -614,6 +1089,46 @@ impl AppController {
         let file_summaries = storage.get_grounding_file_summaries().map_err(|e| {
             ApiError::internal(format!("Failed to load grounding file summaries: {e}"))
         })?;
+        let file_languages = file_summaries
+            .iter()
+            .map(|summary| (summary.file.id, summary.file.language.clone()))
+            .collect::<HashMap<_, _>>();
+        let file_roles = file_summaries
+            .iter()
+            .filter_map(|summary| summary.file_role.map(|role| (summary.file.id, role)))
+            .collect::<HashMap<_, _>>();
+        let mut architecture_root_files = file_summaries
+            .iter()
+            .filter_map(|summary| {
+                let relative = relative_path(&root, &summary.file.path);
+                let path_rank = architecture_path_rank(Some(&relative));
+                let role = file_roles.get(&summary.file.id).copied();
+                (is_production_file_role(role)
+                    && (role == Some(FileRole::Entrypoint) || path_rank <= 1))
+                    .then_some((
+                        grounding_root_file_role_rank(role),
+                        path_rank,
+                        summary.best_node_rank,
+                        summary.symbol_count,
+                        relative,
+                        summary.file.id,
+                    ))
+            })
+            .collect::<Vec<_>>();
+        architecture_root_files.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+                .then(right.3.cmp(&left.3))
+                .then(left.4.cmp(&right.4))
+                .then(left.5.cmp(&right.5))
+        });
+        architecture_root_files.truncate(ARCHITECTURE_ROOT_FILE_LIMIT);
+        let architecture_root_file_ids = architecture_root_files
+            .into_iter()
+            .map(|candidate| candidate.5)
+            .collect::<Vec<_>>();
         let derived_file_count = if stats.file_count > 0 {
             stats.file_count
         } else {
@@ -692,29 +1207,84 @@ impl AppController {
             .iter()
             .map(|bucket| bucket.symbol_count)
             .sum::<u32>();
-        let root_fetch_limit = config
-            .root_symbols
-            .saturating_mul(8)
-            .max(config.root_symbols);
-        let mut root_records = Vec::new();
-        let mut root_offset = 0usize;
-        loop {
-            let page = storage
-                .get_grounding_root_symbol_candidates(root_fetch_limit, root_offset)
+        // Every budget truncates the same bounded universe so stricter output
+        // remains an exact prefix as role and name diversity are applied.
+        let max_root_symbols = budget_config(GroundingBudgetDto::Max).root_symbols;
+        let total_root_candidates = storage
+            .get_grounding_root_symbol_candidate_count()
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to count grounding root symbols: {e}"))
+            })?;
+        let root_fetch_limit = max_root_symbols
+            .saturating_mul(ROOT_CANDIDATE_MULTIPLIER)
+            .max(max_root_symbols);
+        let architecture_exact_names = ARCHITECTURE_ROOT_EXACT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let architecture_uppercase_globs = ARCHITECTURE_ROOT_UPPERCASE_GLOBS
+            .iter()
+            .map(|glob| (*glob).to_string())
+            .collect::<Vec<_>>();
+        let mut root_records = storage
+            .get_grounding_named_root_symbols_for_files(
+                &architecture_root_file_ids,
+                &architecture_exact_names,
+                &architecture_uppercase_globs,
+                ARCHITECTURE_NAMED_ROOTS_PER_FILE,
+            )
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to load named architecture grounding roots: {e}"
+                ))
+            })?;
+        root_records.extend(
+            storage
+                .get_grounding_root_symbols_for_files(
+                    &architecture_root_file_ids,
+                    ARCHITECTURE_ROOT_SYMBOL_SCAN_LIMIT,
+                )
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to load architecture grounding root symbols: {e}"
+                    ))
+                })?,
+        );
+        root_records.extend(
+            storage
+                .get_grounding_root_symbol_candidates(root_fetch_limit, 0)
                 .map_err(|e| {
                     ApiError::internal(format!("Failed to load grounding root symbols: {e}"))
-                })?;
-            if page.is_empty() {
-                break;
-            }
-            let fetched = page.len();
-            root_offset = root_offset.saturating_add(page.len());
-            root_records.extend(page);
-            root_records = dedupe_grounding_node_records(root_records);
-            if root_records.len() >= config.root_symbols || fetched < root_fetch_limit {
-                break;
-            }
-        }
+                })?,
+        );
+        root_records = dedupe_grounding_node_records(root_records);
+        let evaluated_root_records = root_records.clone();
+        let candidate_node_ids = root_records
+            .iter()
+            .map(|record| record.node.id)
+            .collect::<Vec<_>>();
+        let candidate_edge_degrees = build_grounding_edge_degree_map(
+            storage
+                .get_grounding_edge_digest_counts(&candidate_node_ids)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to load grounding root graph evidence: {e}"))
+                })?,
+        );
+        let candidate_member_counts = storage
+            .get_grounding_member_counts(&candidate_node_ids)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to load grounding root member evidence: {e}"
+                ))
+            })?;
+        root_records = diversify_grounding_root_records(
+            root_records,
+            &root,
+            &file_roles,
+            &file_languages,
+            &candidate_edge_degrees,
+            &candidate_member_counts,
+        );
         root_records.truncate(config.root_symbols);
 
         let mut structural_ids = displayed_file_nodes
@@ -761,6 +1331,23 @@ impl AppController {
         let summaries = storage
             .get_current_symbol_summaries_by_node_ids(&displayed_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
+        let structural_units = storage
+            .get_structural_text_units_for_nodes(&displayed_node_ids)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to load structural grounding provenance: {e}"
+                ))
+            })?
+            .into_iter()
+            .map(|unit| (unit.node_id, unit))
+            .collect::<HashMap<_, _>>();
+        let symbol_digest_context = SymbolDigestContext {
+            member_counts: &member_counts,
+            fallback_lines: &fallback_lines,
+            edge_digests: &edge_digests,
+            summaries: &summaries,
+            structural_units: &structural_units,
+        };
 
         for coverage in selected_coverages {
             let mut symbols = Vec::with_capacity(coverage.represented_symbol_count as usize);
@@ -774,10 +1361,7 @@ impl AppController {
                         &record.node,
                         &record.display_name,
                         relative_file_path.as_deref(),
-                        &member_counts,
-                        &fallback_lines,
-                        &edge_digests,
-                        &summaries,
+                        &symbol_digest_context,
                     ));
                 }
             }
@@ -801,6 +1385,15 @@ impl AppController {
             .map(|file| file.symbol_count)
             .sum::<u32>()
             .saturating_add(bucketed_symbols);
+        let orientation = grounding_orientation(
+            &root,
+            &evaluated_root_records,
+            &root_records,
+            total_root_candidates,
+            compressed_files,
+            &file_roles,
+            &file_languages,
+        );
 
         let mut root_symbols = Vec::new();
         for record in &root_records {
@@ -812,10 +1405,7 @@ impl AppController {
                 &record.node,
                 &record.display_name,
                 relative_file_path.as_deref(),
-                &member_counts,
-                &fallback_lines,
-                &edge_digests,
-                &summaries,
+                &symbol_digest_context,
             ));
         }
 
@@ -892,6 +1482,7 @@ impl AppController {
                 represented_symbols,
                 compressed_files,
             },
+            orientation,
             root_symbols,
             files: file_digests,
             coverage_buckets,
@@ -1258,15 +1849,36 @@ mod tests {
         path: &Path,
         child: Node,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        insert_file_node_with_role(storage, file_id, path, FileRole::Source, child)
+    }
+
+    fn insert_file_node_with_role(
+        storage: &mut Storage,
+        file_id: i64,
+        path: &Path,
+        file_role: FileRole,
+        child: Node,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        insert_file_node_with_role_and_language(storage, file_id, path, file_role, "rust", child)
+    }
+
+    fn insert_file_node_with_role_and_language(
+        storage: &mut Storage,
+        file_id: i64,
+        path: &Path,
+        file_role: FileRole,
+        language: &str,
+        child: Node,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         storage.insert_file(&FileInfo {
             id: file_id,
             path: path.to_path_buf(),
-            language: "rust".to_string(),
+            language: language.to_string(),
             modification_time: 0,
             indexed: true,
             complete: true,
             line_count: 10,
-            file_role: FileRole::Source,
+            file_role,
         })?;
         storage.insert_nodes_batch(&[
             Node {
@@ -1278,6 +1890,129 @@ mod tests {
             child,
         ])?;
         Ok(())
+    }
+
+    #[test]
+    fn grounding_root_diversity_does_not_consume_duplicate_name_subsystems() {
+        let root = Path::new("/repo");
+        let record = |node_id, file_id, name: &str, path: &str| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(node_id),
+                kind: NodeKind::STRUCT,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            display_name: name.to_string(),
+            file_path: Some(root.join(path)),
+        };
+        let records = vec![
+            record(101, 10, "SharedRoot", "packages/a/src/lib.ts"),
+            record(201, 20, "SharedRoot", "packages/b/src/lib.ts"),
+            record(202, 20, "UniqueB", "packages/b/src/lib.ts"),
+            record(301, 30, "UniqueC", "packages/c/src/lib.ts"),
+        ];
+        let file_roles = [
+            (10, FileRole::Source),
+            (20, FileRole::Source),
+            (30, FileRole::Source),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let file_languages = [
+            (10, "typescript".to_string()),
+            (20, "typescript".to_string()),
+            (30, "typescript".to_string()),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        assert_ne!(
+            grounding_root_subsystem_key(root, &records[0], &file_languages),
+            grounding_root_subsystem_key(root, &records[1], &file_languages)
+        );
+        let diversified = diversify_grounding_root_records(
+            records,
+            root,
+            &file_roles,
+            &file_languages,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            diversified
+                .iter()
+                .take(3)
+                .map(|record| (
+                    grounding_root_terminal_name(record),
+                    grounding_root_subsystem_key(root, record, &file_languages)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "sharedroot".to_string(),
+                    "typescript:packages/a/src".to_string()
+                ),
+                (
+                    "uniqueb".to_string(),
+                    "typescript:packages/b/src".to_string()
+                ),
+                (
+                    "uniquec".to_string(),
+                    "typescript:packages/c/src".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn grounding_entrypoint_evidence_requires_production_callable_name_evidence() {
+        let root = Path::new("/repo");
+        let record = |name: &str| GroundingNodeRecord {
+            node: Node {
+                id: CoreNodeId(101),
+                kind: NodeKind::FUNCTION,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(10)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            display_name: name.to_string(),
+            file_path: Some(root.join("src/main.ts")),
+        };
+        let mut roles = [(10, FileRole::Entrypoint)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        assert!(is_grounding_entrypoint_root(
+            root,
+            &record("startApplication"),
+            &roles
+        ));
+        assert!(!is_grounding_entrypoint_root(
+            root,
+            &record("helper"),
+            &roles
+        ));
+        assert!(!is_grounding_entrypoint_root(
+            root,
+            &record("startupCache"),
+            &roles
+        ));
+        assert!(is_grounding_entrypoint_root(
+            root,
+            &record("ComicPage"),
+            &roles
+        ));
+        assert!(!is_grounding_entrypoint_root(
+            root,
+            &record("isHomepage"),
+            &roles
+        ));
+
+        roles.insert(10, FileRole::Test);
+        assert!(!is_grounding_entrypoint_root(root, &record("main"), &roles));
     }
 
     fn grounding_symbol(
@@ -1297,6 +2032,9 @@ mod tests {
             member_count,
             summary: None,
             edge_digest: Vec::new(),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
         }
     }
 
@@ -1446,6 +2184,154 @@ mod tests {
         assert_eq!(snapshot.coverage.represented_files, 2);
         assert_eq!(snapshot.files.len(), 2);
         assert!(snapshot.coverage_buckets.is_empty());
+    }
+
+    #[test]
+    fn grounding_snapshot_publishes_structural_text_metadata_without_graph_claims() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let manifest = temp.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"demo\"\n").expect("write manifest");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let projected = codestory_indexer::structural::index_structural_file(&manifest)
+                .expect("collect manifest");
+            storage
+                .projections()
+                .flush_projection_batch(codestory_store::ProjectionBatch {
+                    files: &projected.files,
+                    file_content_hashes: &projected.file_content_hashes,
+                    nodes: &projected.nodes,
+                    structural_text_units: &projected.structural_text_units,
+                    structural_text_projections: &projected.structural_text_projections,
+                    structural_text_cache_writes: &[],
+                    edges: &projected.edges,
+                    occurrences: &projected.occurrences,
+                    component_access: &projected.component_access,
+                    callable_projection_states: &projected.callable_projection_states,
+                    file_errors: &[],
+                })
+                .expect("insert verified manifest projection");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("grounding snapshot");
+        let symbol = snapshot
+            .files
+            .iter()
+            .flat_map(|file| file.symbols.iter())
+            .find(|symbol| symbol.label.starts_with("demo"))
+            .expect("manifest symbol");
+
+        assert_eq!(
+            symbol.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            symbol.evidence_producer.as_deref(),
+            Some("structural_cargo_manifest_collector")
+        );
+        assert_eq!(
+            symbol.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+
+        let hit = grounding_explanation_search_hits(&snapshot, 8)
+            .into_iter()
+            .find(|hit| hit.node_id == symbol.id)
+            .expect("grounding explanation hit");
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn grounding_snapshot_preserves_openapi_endpoint_source_identity() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let schema = temp.path().join("openapi.json");
+        std::fs::write(&schema, "{\"openapi\":\"3.0.0\"}\n").expect("write schema");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                12,
+                &schema,
+                Node {
+                    id: CoreNodeId(102),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    canonical_id: Some("openapi:endpoint:GET /api/users".to_string()),
+                    file_node_id: Some(CoreNodeId(12)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert OpenAPI endpoint node");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("grounding snapshot");
+        let symbol = snapshot
+            .files
+            .iter()
+            .flat_map(|file| file.symbols.iter())
+            .find(|symbol| symbol.label.starts_with("GET /api/users"))
+            .expect("OpenAPI endpoint symbol");
+
+        assert_eq!(
+            symbol.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+        );
+        assert_eq!(
+            symbol.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(
+            symbol.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+
+        let candidate = RecommendationCandidate {
+            symbol,
+            name: "GET /api/users".to_string(),
+            path: Some("openapi.json".to_string()),
+            order: 0,
+        };
+        let hit = search_hit_from_grounding_recommendation(&candidate);
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]
@@ -1736,6 +2622,576 @@ mod tests {
                 .root_symbols
                 .first()
                 .is_some_and(|symbol| symbol.label.starts_with("Widget"))
+        );
+    }
+
+    #[test]
+    fn grounding_snapshot_prefers_production_and_diversifies_fixture_roots() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            for fixture_index in 0..10_i64 {
+                let path = temp
+                    .path()
+                    .join("crates/codestory-indexer/tests/fixtures")
+                    .join(format!("fixture_{fixture_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                    .expect("create fixture parent");
+                std::fs::write(&path, "struct FixtureRoot;\n").expect("write fixture");
+                let name = if fixture_index < 7 {
+                    "Notifier".to_string()
+                } else {
+                    format!("FixtureRoot{fixture_index}")
+                };
+                let file_role = match fixture_index {
+                    7 => FileRole::Vendor,
+                    8 => FileRole::Generated,
+                    9 => FileRole::Benchmark,
+                    _ => FileRole::Test,
+                };
+                insert_file_node_with_role(
+                    &mut storage,
+                    100 + fixture_index,
+                    &path,
+                    file_role,
+                    Node {
+                        id: CoreNodeId(1_000 + fixture_index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: name,
+                        file_node_id: Some(CoreNodeId(100 + fixture_index)),
+                        start_line: Some(1 + fixture_index as u32),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert fixture root");
+            }
+            for source_index in 0..20_i64 {
+                let path = temp
+                    .path()
+                    .join("crates/codestory-runtime/src")
+                    .join(format!("production_{source_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("source parent"))
+                    .expect("create source parent");
+                std::fs::write(&path, "struct ProductionRoot;\n").expect("write source");
+                insert_file_node_with_role(
+                    &mut storage,
+                    200 + source_index,
+                    &path,
+                    if source_index == 0 {
+                        FileRole::Entrypoint
+                    } else {
+                        FileRole::Source
+                    },
+                    Node {
+                        id: CoreNodeId(2_000 + source_index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: format!("ProductionRoot{source_index}"),
+                        file_node_id: Some(CoreNodeId(200 + source_index)),
+                        start_line: Some(11 + source_index as u32),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert production root");
+            }
+
+            let node_only_path = temp.path().join("src/compatibility_only.rs");
+            storage
+                .insert_nodes_batch(&[
+                    Node {
+                        id: CoreNodeId(400),
+                        kind: NodeKind::FILE,
+                        serialized_name: node_only_path.to_string_lossy().to_string(),
+                        ..Default::default()
+                    },
+                    Node {
+                        id: CoreNodeId(4_000),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: "CompatibilityRoot".to_string(),
+                        file_node_id: Some(CoreNodeId(400)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert node-only compatibility root");
+            assert!(
+                storage
+                    .get_file_roles_by_paths(&[node_only_path.to_string_lossy().to_string()])
+                    .expect("load node-only role")
+                    .is_empty()
+            );
+
+            let production_file_ids = (200..220).collect::<Vec<_>>();
+            let architecture_candidates = storage
+                .get_grounding_root_symbols_for_files(&production_file_ids, 16)
+                .expect("load architecture root candidates");
+            assert_eq!(architecture_candidates.len(), 20);
+            assert!(
+                architecture_candidates.iter().all(|record| {
+                    record.file_path.as_deref().is_some_and(|path| {
+                        path.to_string_lossy()
+                            .replace('\\', "/")
+                            .contains("crates/codestory-runtime/src/production_")
+                    })
+                }),
+                "the bounded architecture window should retain verified production roots"
+            );
+
+            storage
+                .snapshots()
+                .refresh_summary()
+                .expect("refresh summary snapshot");
+            storage
+                .snapshots()
+                .refresh_detail()
+                .expect("refresh detail snapshot");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        let strict = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+        let balanced = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let max = controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+        let balanced_again = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("repeat balanced snapshot");
+
+        assert_eq!(strict.root_symbols.len(), 8);
+        assert_eq!(balanced.root_symbols.len(), 16);
+        assert_eq!(max.root_symbols.len(), 28);
+        assert!(
+            balanced.root_symbols.iter().all(|symbol| {
+                symbol
+                    .label
+                    .contains("crates/codestory-runtime/src/production_")
+            }),
+            "{:?}",
+            balanced
+                .root_symbols
+                .iter()
+                .map(|symbol| &symbol.label)
+                .collect::<Vec<_>>()
+        );
+        assert!(max.root_symbols.iter().take(20).all(|symbol| {
+            symbol
+                .label
+                .contains("crates/codestory-runtime/src/production_")
+        }));
+        assert!(
+            max.root_symbols
+                .iter()
+                .position(|symbol| symbol.label.starts_with("CompatibilityRoot @ "))
+                .is_some_and(|index| index >= 20)
+        );
+        assert_eq!(
+            strict
+                .root_symbols
+                .iter()
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>(),
+            balanced
+                .root_symbols
+                .iter()
+                .take(strict.root_symbols.len())
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            balanced
+                .root_symbols
+                .iter()
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>(),
+            max.root_symbols
+                .iter()
+                .take(balanced.root_symbols.len())
+                .map(|symbol| &symbol.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            balanced
+                .root_symbols
+                .iter()
+                .map(|symbol| (&symbol.id, &symbol.label))
+                .collect::<Vec<_>>(),
+            balanced_again
+                .root_symbols
+                .iter()
+                .map(|symbol| (&symbol.id, &symbol.label))
+                .collect::<Vec<_>>()
+        );
+
+        let notifier_positions = max
+            .root_symbols
+            .iter()
+            .enumerate()
+            .filter_map(|(index, symbol)| {
+                symbol
+                    .label
+                    .split_once(" @ ")
+                    .is_some_and(|(name, _)| name == "Notifier")
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let first_notifier = *notifier_positions.first().expect("retained notifier root");
+        assert!(first_notifier >= 20);
+        assert!(
+            notifier_positions
+                .iter()
+                .skip(1)
+                .all(|index| *index >= first_notifier + 4)
+        );
+    }
+
+    #[test]
+    fn grounding_snapshot_ranks_cross_language_architecture_and_reports_orientation() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            let frontend = temp.path().join("src/main.ts");
+            insert_file_node_with_role_and_language(
+                &mut storage,
+                101,
+                &frontend,
+                FileRole::Entrypoint,
+                "typescript",
+                Node {
+                    id: CoreNodeId(1_001),
+                    kind: NodeKind::INTERFACE,
+                    serialized_name: "AppConfig".to_string(),
+                    file_node_id: Some(CoreNodeId(101)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert frontend entrypoint");
+            let mut frontend_nodes = vec![Node {
+                id: CoreNodeId(1_002),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "startApplication".to_string(),
+                file_node_id: Some(CoreNodeId(101)),
+                start_line: Some(100),
+                ..Default::default()
+            }];
+            for offset in 0..20_i64 {
+                frontend_nodes.push(Node {
+                    id: CoreNodeId(1_200 + offset),
+                    kind: NodeKind::INTERFACE,
+                    serialized_name: format!("LeafType{offset}"),
+                    file_node_id: Some(CoreNodeId(101)),
+                    start_line: Some(2 + offset as u32),
+                    ..Default::default()
+                });
+            }
+            frontend_nodes.push(Node {
+                id: CoreNodeId(1_003),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "helper".to_string(),
+                file_node_id: Some(CoreNodeId(101)),
+                start_line: Some(30),
+                ..Default::default()
+            });
+            let mut frontend_edges = Vec::new();
+            for offset in 0..4_i64 {
+                frontend_nodes.push(Node {
+                    id: CoreNodeId(1_100 + offset),
+                    kind: NodeKind::VARIABLE,
+                    serialized_name: format!("runtimeDependency{offset}"),
+                    file_node_id: Some(CoreNodeId(101)),
+                    start_line: Some(101 + offset as u32),
+                    ..Default::default()
+                });
+                frontend_edges.push(Edge {
+                    id: EdgeId(1_500 + offset),
+                    source: CoreNodeId(1_002),
+                    target: CoreNodeId(1_100 + offset),
+                    kind: EdgeKind::MEMBER,
+                    file_node_id: Some(CoreNodeId(101)),
+                    line: Some(101 + offset as u32),
+                    resolved_source: None,
+                    resolved_target: None,
+                    confidence: None,
+                    certainty: None,
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                });
+            }
+            storage
+                .insert_nodes_batch(&frontend_nodes)
+                .expect("insert frontend graph");
+            storage
+                .insert_edges_batch(&frontend_edges)
+                .expect("insert frontend graph evidence");
+
+            for (file_id, node_id, path, language, name) in [
+                (
+                    201,
+                    2_001,
+                    "crates/engine/src/lib.rs",
+                    "rust",
+                    "EngineRuntime",
+                ),
+                (
+                    301,
+                    3_001,
+                    "src/core/service.ts",
+                    "typescript",
+                    "DomainService",
+                ),
+                (401, 4_001, "src/db/store.ts", "typescript", "ProjectStore"),
+            ] {
+                insert_file_node_with_role_and_language(
+                    &mut storage,
+                    file_id,
+                    &temp.path().join(path),
+                    FileRole::classify_path(Path::new(path)),
+                    language,
+                    Node {
+                        id: CoreNodeId(node_id),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: name.to_string(),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(4),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert architecture boundary");
+            }
+
+            for index in 0..12_i64 {
+                let file_id = 500 + index;
+                insert_file_node_with_role_and_language(
+                    &mut storage,
+                    file_id,
+                    &temp.path().join(format!("src/types/leaf_{index}.ts")),
+                    FileRole::Source,
+                    "typescript",
+                    Node {
+                        id: CoreNodeId(5_000 + index),
+                        kind: NodeKind::TYPEDEF,
+                        serialized_name: format!("LeafAlias{index}"),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert leaf alias");
+            }
+
+            storage
+                .snapshots()
+                .refresh_summary()
+                .expect("refresh summary snapshot");
+            storage
+                .snapshots()
+                .refresh_detail()
+                .expect("refresh detail snapshot");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let strict = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+        let balanced = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("balanced snapshot");
+        let max = controller
+            .grounding_snapshot(GroundingBudgetDto::Max)
+            .expect("max snapshot");
+        let balanced_again = controller
+            .grounding_snapshot(GroundingBudgetDto::Balanced)
+            .expect("repeat balanced snapshot");
+
+        let strict_names = strict
+            .root_symbols
+            .iter()
+            .map(grounding_symbol_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            strict_names.first().map(String::as_str),
+            Some("startApplication"),
+            "graph-connected entrypoint should outrank the leaf declaration in the same file"
+        );
+        for boundary in ["EngineRuntime", "DomainService", "ProjectStore"] {
+            assert!(
+                strict_names.iter().any(|name| name == boundary),
+                "strict grounding omitted architecture boundary {boundary}: {strict_names:?}"
+            );
+        }
+        let root_refs = |snapshot: &GroundingSnapshotDto| {
+            snapshot
+                .root_symbols
+                .iter()
+                .map(|symbol| symbol.node_ref.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            root_refs(&strict),
+            root_refs(&balanced)[..strict.root_symbols.len()]
+        );
+        assert_eq!(
+            root_refs(&balanced),
+            root_refs(&max)[..balanced.root_symbols.len()]
+        );
+        assert_eq!(root_refs(&balanced), root_refs(&balanced_again));
+        assert_eq!(
+            strict.orientation.confidence,
+            GroundingOrientationConfidenceDto::Strong,
+            "{:?}",
+            strict.orientation
+        );
+        assert_eq!(strict.orientation.selected_entrypoint_roots, 1);
+        assert_eq!(strict.orientation.candidate_entrypoint_roots, 1);
+        assert!(strict.orientation.selected_subsystems >= 4);
+        assert!(
+            strict
+                .orientation
+                .uncertainty
+                .contains(&GroundingOrientationUncertaintyDto::CompressedPresentation)
+        );
+        assert!(
+            !strict
+                .orientation
+                .uncertainty
+                .contains(&GroundingOrientationUncertaintyDto::NoEntrypointEvidence)
+        );
+    }
+
+    #[test]
+    fn grounding_snapshot_reports_weak_orientation_without_entrypoint_evidence() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            for index in 0..3_i64 {
+                let file_id = 700 + index;
+                insert_file_node_with_role(
+                    &mut storage,
+                    file_id,
+                    &temp.path().join(format!("src/helpers/helper_{index}.rs")),
+                    FileRole::Source,
+                    Node {
+                        id: CoreNodeId(7_000 + index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: format!("Helper{index}"),
+                        file_node_id: Some(CoreNodeId(file_id)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert helper root");
+            }
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+
+        assert_eq!(
+            snapshot.orientation.confidence,
+            GroundingOrientationConfidenceDto::Weak
+        );
+        assert_eq!(snapshot.orientation.candidate_entrypoint_roots, 0);
+        assert_eq!(snapshot.orientation.selected_entrypoint_roots, 0);
+        assert!(
+            snapshot
+                .orientation
+                .uncertainty
+                .contains(&GroundingOrientationUncertaintyDto::NoEntrypointEvidence)
+        );
+    }
+
+    #[test]
+    fn grounding_snapshot_keeps_diversified_fixture_fallback_without_production_roots() {
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            for fixture_index in 0..12_i64 {
+                let path = temp
+                    .path()
+                    .join("tests/fixtures")
+                    .join(format!("fixture_{fixture_index}.rs"));
+                std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                    .expect("create fixture parent");
+                std::fs::write(&path, "struct FixtureRoot;\n").expect("write fixture");
+                let name = if fixture_index < 7 {
+                    "Notifier".to_string()
+                } else {
+                    format!("Harness{fixture_index}")
+                };
+                insert_file_node_with_role(
+                    &mut storage,
+                    300 + fixture_index,
+                    &path,
+                    FileRole::Test,
+                    Node {
+                        id: CoreNodeId(3_000 + fixture_index),
+                        kind: NodeKind::STRUCT,
+                        serialized_name: name,
+                        file_node_id: Some(CoreNodeId(300 + fixture_index)),
+                        start_line: Some(1 + fixture_index as u32),
+                        ..Default::default()
+                    },
+                )
+                .expect("insert fixture root");
+            }
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        let snapshot = controller
+            .grounding_snapshot(GroundingBudgetDto::Strict)
+            .expect("strict snapshot");
+
+        assert_eq!(snapshot.root_symbols.len(), 8);
+        assert!(
+            snapshot
+                .root_symbols
+                .iter()
+                .all(|symbol| symbol.label.contains("tests/fixtures/"))
+        );
+        assert_eq!(
+            snapshot
+                .root_symbols
+                .iter()
+                .take(6)
+                .map(|symbol| {
+                    symbol
+                        .label
+                        .split_once(" @ ")
+                        .map(|(name, _)| name)
+                        .expect("symbol label path")
+                })
+                .collect::<HashSet<_>>()
+                .len(),
+            6
         );
     }
 

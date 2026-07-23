@@ -11,10 +11,8 @@ repository=$(get '.repository')
 runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
+data_root=$(get '.runner.data_root')
 guest_owner_path="$runner_root/artifacts/ownership.json"
-model_name=$(get '.assets.model.name')
-model_sha=$(get '.assets.model.sha256')
-model_source=${CODESTORY_RELEASE_EVIDENCE_MODEL_SEED:-"$HOME/Library/Caches/dev.codestory.codestory/retrieval/models/$model_name"}
 base_image_url=$(get '.vm.base_image.url')
 base_image_sha=$(get '.vm.base_image.sha512')
 base_image_path="$HOME/Library/Caches/dev.codestory.codestory/release-evidence-runner/$(basename "$base_image_url")"
@@ -202,6 +200,7 @@ assert_vm_config() {
     .cpu == $contract[0].vm.cpus and .memory == $contract[0].vm.memory_gib and
     .disk == $contract[0].vm.data_disk_gib and .arch == $contract[0].vm.architecture and
     .runtime == $contract[0].vm.runtime and .vmType == $contract[0].vm.type and
+    .binfmt == $contract[0].vm.binfmt and
     .autoActivate == $contract[0].vm.activate_host_context and
     .mountType == $contract[0].vm.mount_type and (.mounts // []) == []
     ' <<<"$colima" >/dev/null
@@ -219,11 +218,40 @@ start_profile() {
       --memory "$(get '.vm.memory_gib')" --disk "$(get '.vm.data_disk_gib')" \
       --root-disk "$(get '.vm.root_disk_gib')" --runtime "$(get '.vm.runtime')" \
       --arch "$(get '.vm.architecture')" --vm-type "$(get '.vm.type')" \
+      "--binfmt=$(get '.vm.binfmt')" \
       --mount-type "$(get '.vm.mount_type')" --mount none \
       --disk-image "$base_image_path"
   fi
   assert_vm_config
   if test "$fresh" = true; then write_ownership null; fi
+}
+
+prepare_runner_root() {
+  local validation_root="$data_root/validation/codestory"
+  assert_not_busy
+  if colima ssh --profile "$profile" -- sudo test -f \
+      "$validation_root/scripts/release-evidence/guest-runner.sh"; then
+    colima ssh --profile "$profile" -- sudo bash \
+      "$validation_root/scripts/release-evidence/guest-runner.sh" stop \
+      "$validation_root/scripts/release-evidence/machine-contract.json"
+  fi
+  wait_offline
+  colima ssh --profile "$profile" -- sudo bash -s -- \
+    "$data_root" "$runner_root" "$(get '.vm.data_disk_mount')" <<'SCRIPT'
+set -euo pipefail
+data_root=$1
+runner_root=$2
+data_disk_mount=$3
+install -d -m 0750 "$data_root"
+install -d -m 0755 "$runner_root"
+test "$(findmnt -rn -o TARGET -T "$data_root")" = "$data_disk_mount"
+while mountpoint -q "$runner_root"; do
+  umount "$runner_root"
+done
+mount --bind "$data_root" "$runner_root"
+test "$(findmnt -rn --mountpoint "$runner_root" | wc -l | tr -d ' ')" = 1
+test "$(stat -c %d "$data_root")" = "$(stat -c %d "$runner_root")"
+SCRIPT
 }
 
 sync_validation_source() {
@@ -236,26 +264,13 @@ sync_validation_source() {
   printf '%s\n' "$source_sha"
 }
 
-sync_model_seed() {
-  local guest_seed=/tmp/codestory-release-evidence-model-seed
-  colima ssh --profile "$profile" -- rm -f "$guest_seed"
-  if test -f "$model_source"; then
-    printf '%s  %s\n' "$model_sha" "$model_source" | shasum -a 256 -c - >/dev/null
-    colima ssh --profile "$profile" -- tee "$guest_seed" <"$model_source" >/dev/null
-    printf '%s\n' "$guest_seed"
-  else
-    printf '%s\n' -
-  fi
-}
-
 provision_guest() {
   local source_sha=$1
-  local model_seed=$2
   colima ssh --profile "$profile" -- sudo bash \
     /tmp/codestory-provision/scripts/release-evidence/guest-provision.sh \
     /tmp/codestory-provision/scripts/release-evidence/machine-contract.json \
     "$contract_sha" "$source_sha" "$(get '.guest.apt_snapshot')" \
-    "$(get '.guest.apt_packages.jq')" "$model_seed"
+    "$(get '.guest.apt_packages.jq')"
 }
 
 runner_inspect() {
@@ -304,6 +319,7 @@ write_host_attestation() {
     --arg lima "$(limactl --version | awk '{print $3}')" \
     --arg profile "$profile" --arg type "$(get '.vm.type')" \
     --arg vm_arch "$(get '.vm.architecture')" --arg runtime "$(get '.vm.runtime')" \
+    --argjson binfmt "$(get '.vm.binfmt')" \
     --arg mount_type "$(get '.vm.mount_type')" --argjson cpus "$(get '.vm.cpus')" \
     --argjson memory_gib "$(get '.vm.memory_gib')" \
     --argjson data_disk_gib "$(get '.vm.data_disk_gib')" \
@@ -315,7 +331,7 @@ write_host_attestation() {
       host:{architecture:$architecture,model:$model,chip:$chip,macos_version:$macos,
         memory_bytes:$memory,colima_version:$colima,colima_git_commit:$colima_commit,
         lima_version:$lima},
-      vm:{profile:$profile,type:$type,architecture:$vm_arch,runtime:$runtime,
+      vm:{profile:$profile,type:$type,architecture:$vm_arch,runtime:$runtime,binfmt:$binfmt,
         mount_type:$mount_type,host_mounts:[],cpus:$cpus,memory_gib:$memory_gib,
         data_disk_gib:$data_disk_gib,root_disk_gib:$root_disk_gib,
         base_image_url:$image_url,base_image_sha512:$image_sha,boot_id:$boot_id}}
@@ -331,17 +347,6 @@ guest_verify() {
     RUSTUP_HOME="$runner_root/rustup" PATH="/usr/local/bin:/usr/bin:/bin" \
     bash "$runner_root/validation/codestory/scripts/release-evidence/guest-verify.sh" \
     "$runner_root/validation/codestory/scripts/release-evidence/machine-contract.json"
-}
-
-assert_guest_idle() {
-  local containers
-  containers=$(colima ssh --profile "$profile" -- docker ps \
-    --format '{{.ID}} {{.Names}} {{.Image}}')
-  if test -n "$containers"; then
-    echo "dedicated evidence VM has running containers; refusing to continue:" >&2
-    printf '%s\n' "$containers" >&2
-    return 1
-  fi
 }
 
 start_runner() {
@@ -388,9 +393,7 @@ wait_offline() {
 verify_runner() {
   owner_json >/dev/null
   profile_running
-  assert_not_busy
-  assert_guest_idle
-  quiesce_runner
+  prepare_runner_root
   write_host_attestation
   guest_verify
   start_runner
@@ -422,7 +425,8 @@ unregister_runner() {
   local confirmed_absent
   profile_exists || return 0
   owner_json >/dev/null
-  if ! profile_running; then colima start --profile "$profile" --activate=false; fi
+  if ! profile_running; then start_profile; fi
+  prepare_runner_root
   if ! state=$(runner_inspect); then return 1; fi
   if test "$(jq -r '.configured' <<<"$state")" != true; then
     if test "$(jq -r '.runner_id' "$owner_path")" != null; then
@@ -497,11 +501,9 @@ case "$command" in
     ensure_base_image
     assert_not_busy
     start_profile
-    assert_guest_idle
-    quiesce_runner
+    prepare_runner_root
     source_sha=$(sync_validation_source)
-    model_seed=$(sync_model_seed)
-    provision_guest "$source_sha" "$model_seed"
+    provision_guest "$source_sha"
     configure_runner
     write_host_attestation
     guest_verify
@@ -516,9 +518,7 @@ case "$command" in
     require_provisioning_eligibility
     ensure_base_image
     start_profile
-    assert_not_busy
-    assert_guest_idle
-    quiesce_runner
+    prepare_runner_root
     write_host_attestation
     guest_verify
     start_runner
@@ -529,7 +529,7 @@ case "$command" in
     if profile_exists; then
       owner_json >/dev/null
       if profile_running; then
-        quiesce_runner
+        prepare_runner_root
         colima stop --profile "$profile"
       else
         assert_not_busy

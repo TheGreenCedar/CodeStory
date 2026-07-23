@@ -1,22 +1,28 @@
 use codestory_contracts::graph::{
-    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeKind,
-    EnumConversionError, Node, NodeId, NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty,
-    TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
+    AccessKind, Bookmark, BookmarkCategory, CallableProjectionState, Edge, EdgeId, EdgeKind,
+    EnumConversionError, FileCoverageReason, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
+    ResolutionCertainty, TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
+};
+use codestory_contracts::workspace::OversizedSourceExclusionCandidate;
+#[cfg(test)]
+use codestory_contracts::workspace::{
+    DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_VERSION,
 };
 use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
-    Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, params, params_from_iter,
-    types::Value,
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, limits::Limit, params,
+    params_from_iter, types::Value,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod bookmarks;
@@ -31,7 +37,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 21;
+const SCHEMA_VERSION: u32 = 30;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -48,14 +54,190 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
                  FROM edge e
                  JOIN node t ON t.id = e.target_node_id
                  LEFT JOIN node f ON f.id = e.file_node_id";
-const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
+pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
+const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
+const INDEX_ARTIFACT_CACHE_UPSERT_SQL: &str = "INSERT INTO index_artifact_cache (
+    file_path,
+    cache_key,
+    artifact_blob,
+    updated_at_epoch_ms
+ )
+ VALUES (?1, ?2, ?3, ?4)
+ ON CONFLICT(file_path) DO UPDATE SET
+    cache_key = excluded.cache_key,
+    artifact_blob = excluded.artifact_blob,
+    updated_at_epoch_ms = excluded.updated_at_epoch_ms";
+const INDEX_ARTIFACT_CACHE_SELECT_SQL: &str = "SELECT artifact_blob
+     FROM index_artifact_cache
+     WHERE file_path = ?1
+       AND cache_key = ?2";
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
-const PROMOTION_JOURNAL_VERSION: u32 = 1;
+const LEGACY_PROMOTION_JOURNAL_VERSION: u32 = 1;
+const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
+const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
+const STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 4;
+const PROMOTION_JOURNAL_VERSION: u32 = 5;
+// Snapshot promotion first shipped with schema 21. Journal v2 added the
+// source-policy identity at schema 27, and journal v3 added structural-text
+// identity at schema 28. Journal v4 binds the structural-unit source-policy
+// identity added at schema 29. Journal v5 admits the semantic-projection
+// publication mode added at schema 30. Recovery runs before schema migration, so these
+// boundaries are part of the durable journal contract.
+const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
+const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
+const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
+const STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 29;
+const SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION: u32 = 30;
+const DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Successful SQLite backup timing and logical database-image sizes.
+///
+/// Logical bytes are SQLite `page_count * page_size` for the source snapshot
+/// and copied target. They are not filesystem allocation or physical-write
+/// telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatabaseSnapshotCopyStats {
+    pub copy_ms: u32,
+    pub source_bytes: u64,
+    pub target_bytes: u64,
+}
+
+/// Successful core promotion timing and logical database-image sizes.
+///
+/// These phases are nested within the caller's publication wall. Optional
+/// backup phases are present only when a previous live publication existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CorePromotionStats {
+    pub total_ms: u32,
+    pub lock_recovery_ms: u32,
+    pub candidate_validation_ms: u32,
+    pub previous_validation_ms: u32,
+    pub rollback_backup_copy_ms: Option<u32>,
+    pub backup_validation_ms: Option<u32>,
+    pub prepared_journal_write_ms: u32,
+    pub prepared_journal_file_sync_ms: u32,
+    pub prepared_journal_directory_sync_ms: u32,
+    pub staged_to_live_restore_ms: u32,
+    pub promoted_validation_ms: u32,
+    pub committed_journal_ms: u32,
+    pub cleanup_ms: u32,
+    pub unattributed_ms: u32,
+    pub candidate_bytes: u64,
+    pub previous_live_bytes: Option<u64>,
+    pub rollback_backup_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PromotionJournalWriteStats {
+    write: Duration,
+    file_sync: Duration,
+    directory_sync: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CorePromotionDurations {
+    lock_recovery: Duration,
+    candidate_validation: Duration,
+    previous_validation: Duration,
+    rollback_backup_copy: Option<Duration>,
+    backup_validation: Option<Duration>,
+    prepared_journal_write: Duration,
+    prepared_journal_file_sync: Duration,
+    prepared_journal_directory_sync: Duration,
+    staged_to_live_restore: Duration,
+    promoted_validation: Duration,
+    committed_journal: Duration,
+    cleanup: Duration,
+}
+
+impl CorePromotionDurations {
+    fn finish(
+        self,
+        total: Duration,
+        candidate_bytes: u64,
+        previous_live_bytes: Option<u64>,
+        rollback_backup_bytes: Option<u64>,
+    ) -> CorePromotionStats {
+        let total_ms = duration_ms(total);
+        let lock_recovery_ms = duration_ms(self.lock_recovery);
+        let candidate_validation_ms = duration_ms(self.candidate_validation);
+        let previous_validation_ms = duration_ms(self.previous_validation);
+        let rollback_backup_copy_ms = self.rollback_backup_copy.map(duration_ms);
+        let backup_validation_ms = self.backup_validation.map(duration_ms);
+        let prepared_journal_write_ms = duration_ms(self.prepared_journal_write);
+        let prepared_journal_file_sync_ms = duration_ms(self.prepared_journal_file_sync);
+        let prepared_journal_directory_sync_ms = duration_ms(self.prepared_journal_directory_sync);
+        let staged_to_live_restore_ms = duration_ms(self.staged_to_live_restore);
+        let promoted_validation_ms = duration_ms(self.promoted_validation);
+        let committed_journal_ms = duration_ms(self.committed_journal);
+        let cleanup_ms = duration_ms(self.cleanup);
+        let named_ms = lock_recovery_ms
+            .saturating_add(candidate_validation_ms)
+            .saturating_add(previous_validation_ms)
+            .saturating_add(rollback_backup_copy_ms.unwrap_or_default())
+            .saturating_add(backup_validation_ms.unwrap_or_default())
+            .saturating_add(prepared_journal_write_ms)
+            .saturating_add(prepared_journal_file_sync_ms)
+            .saturating_add(prepared_journal_directory_sync_ms)
+            .saturating_add(staged_to_live_restore_ms)
+            .saturating_add(promoted_validation_ms)
+            .saturating_add(committed_journal_ms)
+            .saturating_add(cleanup_ms);
+        CorePromotionStats {
+            total_ms,
+            lock_recovery_ms,
+            candidate_validation_ms,
+            previous_validation_ms,
+            rollback_backup_copy_ms,
+            backup_validation_ms,
+            prepared_journal_write_ms,
+            prepared_journal_file_sync_ms,
+            prepared_journal_directory_sync_ms,
+            staged_to_live_restore_ms,
+            promoted_validation_ms,
+            committed_journal_ms,
+            cleanup_ms,
+            unattributed_ms: total_ms.saturating_sub(named_ms),
+            candidate_bytes,
+            previous_live_bytes,
+            rollback_backup_bytes,
+        }
+    }
+}
+
+fn duration_ms(duration: Duration) -> u32 {
+    duration.as_millis().min(u32::MAX as u128) as u32
+}
+
+fn database_logical_bytes(connection: &Connection) -> Result<u64, StorageError> {
+    let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count = u64::try_from(page_count).map_err(|_| {
+        promotion_error(format!(
+            "SQLite reported an invalid negative page_count: {page_count}"
+        ))
+    })?;
+    let page_size = u64::try_from(page_size).map_err(|_| {
+        promotion_error(format!(
+            "SQLite reported an invalid negative page_size: {page_size}"
+        ))
+    })?;
+    page_count.checked_mul(page_size).ok_or_else(|| {
+        promotion_error(format!(
+            "SQLite logical database bytes overflowed: page_count={page_count}, page_size={page_size}"
+        ))
+    })
+}
+
+fn database_logical_bytes_at_path(path: &Path) -> Result<u64, StorageError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    database_logical_bytes(&connection)
+}
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -65,6 +247,47 @@ fn clamp_i64_to_u32(value: i64) -> u32 {
     } else {
         value as u32
     }
+}
+
+fn canonical_search_symbol_batch_limit(
+    operation: &'static str,
+    limit: usize,
+) -> Result<i64, StorageError> {
+    if limit == 0 {
+        return Err(StorageError::InvalidBatchLimit(operation));
+    }
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
+fn build_node_batch_limit(operation: &'static str, limit: usize) -> Result<i64, StorageError> {
+    if limit == 0 {
+        return Err(StorageError::InvalidBatchLimit(operation));
+    }
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
+fn accepted_node_kind_values(accepted_kinds: &[NodeKind]) -> Vec<i64> {
+    let mut values = accepted_kinds
+        .iter()
+        .map(|kind| i64::from(*kind as i32))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn nodes_by_kinds_batch_sql(accepted_kind_count: usize, has_after_node_id: bool) -> String {
+    let kind_placeholders = question_placeholders(accepted_kind_count);
+    let mut sql = format!(
+        "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col
+         FROM node NOT INDEXED
+         WHERE kind IN ({kind_placeholders})"
+    );
+    if has_after_node_id {
+        sql.push_str(" AND id > ?");
+    }
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    sql
 }
 
 fn uniform_optional_string(
@@ -178,11 +401,419 @@ struct PromotionLock {
     file: File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDatabaseContract {
+    CurrentPromotion,
+    Journal(u32),
+    LegacyBackup,
+}
+
+impl RecoveryDatabaseContract {
+    fn supports_complete_schema(self, schema_version: u32) -> bool {
+        match self {
+            Self::CurrentPromotion => (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+                ..=SCHEMA_VERSION)
+                .contains(&schema_version),
+            Self::Journal(LEGACY_PROMOTION_JOURNAL_VERSION) => (LEGACY_PROMOTION_MIN_SCHEMA_VERSION
+                ..=SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+                .contains(&schema_version),
+            Self::Journal(SOURCE_POLICY_PROMOTION_JOURNAL_VERSION) => {
+                schema_version == SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION) => {
+                schema_version == STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION) => {
+                schema_version == STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
+                    ..=SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
+                    .contains(&schema_version)
+            }
+            Self::Journal(_) => false,
+            Self::LegacyBackup => {
+                (LEGACY_PROMOTION_MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema_version)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PromotionJournal {
     version: u32,
     previous: Option<IndexPublicationRecord>,
     candidate: IndexPublicationRecord,
+    #[serde(default)]
+    previous_source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+    #[serde(default)]
+    candidate_source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+    #[serde(default)]
+    previous_structural_text: Option<StructuralTextUnitRollbackIdentity>,
+    #[serde(default)]
+    candidate_structural_text: Option<StructuralTextUnitRollbackIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourcePolicyExclusionRollbackIdentity {
+    project_id: String,
+    workspace_id: String,
+    core_generation_id: String,
+    core_run_id: String,
+    core_published_at_epoch_ms: i64,
+    exclusion_count: u64,
+    exclusion_digest: String,
+    policy_version: String,
+    byte_cap: u64,
+    #[serde(default = "default_structural_unit_cap")]
+    structural_unit_cap: u64,
+}
+
+fn default_structural_unit_cap() -> u64 {
+    codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StructuralTextUnitRollbackIdentity {
+    core_generation_id: String,
+    core_run_id: String,
+    core_published_at_epoch_ms: i64,
+    unit_count: u64,
+    unit_digest: String,
+    projection_count: u64,
+    projection_digest: String,
+    descriptor_version: u32,
+    migration_state: String,
+}
+
+fn read_source_policy_exclusion_rollback_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<Option<SourcePolicyExclusionRollbackIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'source_policy_exclusion_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(None);
+    }
+    let source_policy_columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(source_policy_exclusion)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let publication_columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(source_policy_exclusion_publication)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let has_structural_policy_identity = source_policy_columns
+        .iter()
+        .any(|column| column == "observed_unit_count")
+        && source_policy_columns
+            .iter()
+            .any(|column| column == "structural_unit_cap")
+        && publication_columns
+            .iter()
+            .any(|column| column == "structural_unit_cap");
+    let manifest_schema_version = conn
+        .query_row(
+            "SELECT schema_version
+             FROM source_policy_exclusion_publication
+             WHERE id = 1 AND complete = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(manifest_schema_version) = manifest_schema_version else {
+        return Ok(None);
+    };
+    let manifest_schema_version = u32::try_from(manifest_schema_version)
+        .map_err(|_| promotion_error("Source policy exclusion rollback schema is invalid"))?;
+    let format = match manifest_schema_version {
+        LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION => {
+            SourcePolicyExclusionPublicationFormat::LegacyV1
+        }
+        SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION => {
+            if !has_structural_policy_identity {
+                return Err(promotion_error(
+                    "Current source policy exclusion rollback schema is missing structural identity",
+                ));
+            }
+            SourcePolicyExclusionPublicationFormat::Current
+        }
+        _ => {
+            return Err(promotion_error(
+                "Source policy exclusion rollback schema is unsupported",
+            ));
+        }
+    };
+    let structural_unit_cap_expression = if has_structural_policy_identity {
+        "structural_unit_cap"
+    } else {
+        "2048"
+    };
+    let identity_query = format!(
+        "SELECT project_id, workspace_id, core_generation_id, core_run_id,
+                published_at_epoch_ms, exclusion_count, exclusion_digest,
+                policy_version, byte_cap, {structural_unit_cap_expression}
+         FROM source_policy_exclusion_publication
+         WHERE id = 1 AND complete = 1 AND schema_version = ?1"
+    );
+    let identity = conn
+        .query_row(
+            &identity_query,
+            params![manifest_schema_version as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        project_id,
+        workspace_id,
+        core_generation_id,
+        core_run_id,
+        core_published_at_epoch_ms,
+        exclusion_count,
+        exclusion_digest,
+        policy_version,
+        byte_cap,
+        structural_unit_cap,
+    )) = identity
+    else {
+        return Ok(None);
+    };
+    let identity = SourcePolicyExclusionRollbackIdentity {
+        project_id,
+        workspace_id,
+        core_generation_id,
+        core_run_id,
+        core_published_at_epoch_ms,
+        exclusion_count: u64::try_from(exclusion_count)
+            .map_err(|_| promotion_error("Source policy exclusion rollback count is invalid"))?,
+        exclusion_digest,
+        policy_version,
+        byte_cap: u64::try_from(byte_cap)
+            .map_err(|_| promotion_error("Source policy exclusion rollback cap is invalid"))?,
+        structural_unit_cap: u64::try_from(structural_unit_cap).map_err(|_| {
+            promotion_error("Source policy exclusion rollback structural unit cap is invalid")
+        })?,
+    };
+    let records = if has_structural_policy_identity {
+        read_source_policy_exclusions(&conn)?
+    } else {
+        read_legacy_source_policy_exclusions(&conn)?
+    };
+    let records_digest = format.digest(&records);
+    if identity.core_generation_id != publication.generation_id
+        || identity.core_run_id != publication.run_id
+        || identity.core_published_at_epoch_ms != publication.published_at_epoch_ms
+        || identity.exclusion_count != records.len() as u64
+        || identity.exclusion_digest != records_digest
+        || records.iter().any(|record| {
+            record.project_id != identity.project_id
+                || record.workspace_id != identity.workspace_id
+                || record.core_generation_id != identity.core_generation_id
+                || record.core_run_id != identity.core_run_id
+                || record.policy_version != identity.policy_version
+                || record.byte_cap != identity.byte_cap
+                || record.structural_unit_cap != identity.structural_unit_cap
+                || !format.qualifies(record)
+        })
+    {
+        return Err(promotion_error(format!(
+            "Source policy exclusion rollback identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(Some(identity))
+}
+
+fn require_recorded_source_policy_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<SourcePolicyExclusionRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Ok(());
+    }
+    if &read_source_policy_exclusion_rollback_identity(path, publication)? != expected {
+        return Err(promotion_error(format!(
+            "{role} source policy exclusion identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_candidate_source_policy_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<SourcePolicyExclusionRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Err(promotion_error(format!(
+            "{role} source policy exclusion manifest is missing for {}",
+            path.display()
+        )));
+    }
+    require_recorded_source_policy_identity(path, publication, expected, role)
+}
+
+fn read_structural_text_unit_rollback_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<Option<StructuralTextUnitRollbackIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'structural_text_unit_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(None);
+    }
+    let identity = conn
+        .query_row(
+            "SELECT core_generation_id, core_run_id, published_at_epoch_ms,
+                    unit_count, unit_digest, projection_count, projection_digest,
+                    descriptor_version, migration_state
+             FROM structural_text_unit_publication
+             WHERE id = 1 AND complete = 1 AND schema_version = ?1",
+            params![STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION as i64],
+            |row| {
+                Ok(StructuralTextUnitRollbackIdentity {
+                    core_generation_id: row.get(0)?,
+                    core_run_id: row.get(1)?,
+                    core_published_at_epoch_ms: row.get(2)?,
+                    unit_count: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                    unit_digest: row.get(4)?,
+                    projection_count: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                    projection_digest: row.get(6)?,
+                    descriptor_version: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    migration_state: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    let (unit_count, unit_digest, unit_versions) = structural_text_unit_content_summary(&conn)?;
+    let (projection_count, projection_digest, projection_versions) =
+        structural_text_projection_content_summary(&conn)?;
+    validate_structural_text_projection_rows(&conn)?;
+    validate_structural_text_artifact_cache_rows(&conn).map_err(|error| {
+        promotion_error(format!(
+            "Structural artifact cache rollback identity does not match {}: {error}",
+            path.display()
+        ))
+    })?;
+    let invalid_rows: i64 = conn.query_row(
+        "SELECT
+            (SELECT COUNT(*)
+             FROM structural_text_projection p
+             LEFT JOIN file f ON f.id = p.file_id
+             WHERE f.id IS NULL
+                OR f.complete <> 1
+                OR f.content_hash IS NULL
+                OR length(f.content_hash) <> 64
+                OR f.content_hash <> p.source_content_hash
+                OR f.language <> p.language
+                OR f.file_role <> p.file_role
+                OR p.descriptor_version <> ?1)
+          + (SELECT COUNT(*)
+             FROM structural_text_unit u
+             LEFT JOIN file f ON f.id = u.file_id
+             WHERE f.id IS NULL
+                OR f.content_hash IS NULL
+                OR f.content_hash <> u.source_content_hash
+                OR u.descriptor_version <> ?1)",
+        params![STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+        |row| row.get(0),
+    )?;
+    if identity.core_generation_id != publication.generation_id
+        || identity.core_run_id != publication.run_id
+        || identity.core_published_at_epoch_ms != publication.published_at_epoch_ms
+        || identity.unit_count != unit_count
+        || identity.unit_digest != unit_digest
+        || identity.projection_count != projection_count
+        || identity.projection_digest != projection_digest
+        || identity.descriptor_version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+        || identity.migration_state != STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+        || invalid_rows != 0
+        || unit_versions
+            .iter()
+            .chain(projection_versions.iter())
+            .any(|version| *version != identity.descriptor_version)
+    {
+        return Err(promotion_error(format!(
+            "Structural text unit rollback identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(Some(identity))
+}
+
+fn require_recorded_structural_text_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<StructuralTextUnitRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Ok(());
+    }
+    if &read_structural_text_unit_rollback_identity(path, publication)? != expected {
+        return Err(promotion_error(format!(
+            "{role} structural text unit identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_candidate_structural_text_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<StructuralTextUnitRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if expected.is_none() {
+        return Err(promotion_error(format!(
+            "{role} structural text unit manifest is missing for {}",
+            path.display()
+        )));
+    }
+    require_recorded_structural_text_identity(path, publication, expected, role)
 }
 
 fn promotion_lock_path(path: &Path) -> PathBuf {
@@ -273,13 +904,13 @@ fn read_complete_promotion_database_identity(
 
 fn read_recovery_database_identity(
     path: &Path,
+    contract: RecoveryDatabaseContract,
 ) -> Result<Option<IndexPublicationRecord>, StorageError> {
     let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
         return Ok(None);
     };
     match schema_version {
         0 => Ok(None),
-        SCHEMA_VERSION => read_complete_index_publication(&conn),
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
             read_index_publication(&conn)
         }
@@ -287,9 +918,12 @@ fn read_recovery_database_identity(
             "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
             path.display()
         ))),
+        version if contract.supports_complete_schema(version) => {
+            read_complete_index_publication(&conn)
+        }
         _ => Err(promotion_error(format!(
-            "SQLite recovery artifact {} has unsupported schema version {schema_version}",
-            path.display()
+            "SQLite recovery artifact {} has unsupported schema version {schema_version} for {contract:?}",
+            path.display(),
         ))),
     }
 }
@@ -309,8 +943,9 @@ fn require_complete_promotion_database_identity(
 fn require_recovery_database_identity(
     path: &Path,
     role: &str,
+    contract: RecoveryDatabaseContract,
 ) -> Result<IndexPublicationRecord, StorageError> {
-    read_recovery_database_identity(path)?.ok_or_else(|| {
+    read_recovery_database_identity(path, contract)?.ok_or_else(|| {
         promotion_error(format!(
             "{role} {} has no complete publication identity",
             path.display()
@@ -322,7 +957,14 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
     let bytes = fs::read(path).map_err(|error| promotion_path_error("read", path, error))?;
     let journal: PromotionJournal = serde_json::from_slice(&bytes)
         .map_err(|error| promotion_path_error("parse", path, error))?;
-    if journal.version != PROMOTION_JOURNAL_VERSION {
+    if !matches!(
+        journal.version,
+        LEGACY_PROMOTION_JOURNAL_VERSION
+            | SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
+            | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
+            | STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION
+            | PROMOTION_JOURNAL_VERSION
+    ) {
         return Err(promotion_error(format!(
             "Unsupported promotion journal {}: version={}",
             path.display(),
@@ -344,7 +986,11 @@ fn sync_promotion_parent(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn write_promotion_journal(path: &Path, journal: &PromotionJournal) -> Result<(), StorageError> {
+fn write_promotion_journal(
+    path: &Path,
+    journal: &PromotionJournal,
+) -> Result<PromotionJournalWriteStats, StorageError> {
+    let write_started = Instant::now();
     let bytes = serde_json::to_vec(journal)
         .map_err(|error| promotion_path_error("serialize", path, error))?;
     let mut file = OpenOptions::new()
@@ -352,19 +998,34 @@ fn write_promotion_journal(path: &Path, journal: &PromotionJournal) -> Result<()
         .write(true)
         .open(path)
         .map_err(|error| promotion_path_error("create", path, error))?;
-    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = write_result {
+    if let Err(error) = file.write_all(&bytes) {
+        drop(file);
         let _ = fs::remove_file(path);
         let _ = sync_promotion_parent(path);
         return Err(promotion_path_error("persist", path, error));
     }
+    let write = write_started.elapsed();
+    let file_sync_started = Instant::now();
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        let _ = sync_promotion_parent(path);
+        return Err(promotion_path_error("persist", path, error));
+    }
+    let file_sync = file_sync_started.elapsed();
+    drop(file);
+    let directory_sync_started = Instant::now();
     if let Err(error) = sync_promotion_parent(path) {
         let _ = fs::remove_file(path);
         let _ = sync_promotion_parent(path);
         return Err(error);
     }
-    Ok(())
+    let directory_sync = directory_sync_started.elapsed();
+    Ok(PromotionJournalWriteStats {
+        write,
+        file_sync,
+        directory_sync,
+    })
 }
 
 fn commit_promotion_journal(
@@ -471,13 +1132,44 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
 
     if committed_path.exists() {
         let committed = read_promotion_journal(&committed_path)?;
+        let recovery_contract = RecoveryDatabaseContract::Journal(committed.version);
         let live_identity =
-            require_complete_promotion_database_identity(path, "Committed live database")?;
+            require_recovery_database_identity(path, "Committed live database", recovery_contract)?;
         if live_identity != committed.candidate {
             return Err(promotion_error(format!(
                 "Committed promotion identity does not match live database {}",
                 path.display()
             )));
+        }
+        if committed.version >= SOURCE_POLICY_PROMOTION_JOURNAL_VERSION {
+            require_candidate_source_policy_identity(
+                path,
+                &live_identity,
+                &committed.candidate_source_policy,
+                "Committed live database",
+            )?;
+        } else {
+            require_recorded_source_policy_identity(
+                path,
+                &live_identity,
+                &committed.candidate_source_policy,
+                "Legacy committed live database",
+            )?;
+        }
+        if committed.version >= STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION {
+            require_candidate_structural_text_identity(
+                path,
+                &live_identity,
+                &committed.candidate_structural_text,
+                "Committed live database",
+            )?;
+        } else {
+            require_recorded_structural_text_identity(
+                path,
+                &live_identity,
+                &committed.candidate_structural_text,
+                "Legacy committed live database",
+            )?;
         }
         if let Err(error) = cleanup_committed_promotion_artifacts(path) {
             tracing::warn!(
@@ -511,9 +1203,26 @@ fn rollback_prepared_promotion(
     live_path: &Path,
     prepared: &PromotionJournal,
 ) -> Result<(), StorageError> {
+    if prepared.version >= SOURCE_POLICY_PROMOTION_JOURNAL_VERSION
+        && prepared.candidate_source_policy.is_none()
+    {
+        return Err(promotion_error(format!(
+            "Prepared promotion candidate source policy identity is missing for {}",
+            live_path.display()
+        )));
+    }
+    if prepared.version >= STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
+        && prepared.candidate_structural_text.is_none()
+    {
+        return Err(promotion_error(format!(
+            "Prepared promotion candidate structural text identity is missing for {}",
+            live_path.display()
+        )));
+    }
     let backup_path = live_path.with_extension("sqlite.backup");
     let prepared_path = promotion_prepared_journal_path(live_path);
-    let live_identity = read_recovery_database_identity(live_path)?;
+    let recovery_contract = RecoveryDatabaseContract::Journal(prepared.version);
+    let live_identity = read_recovery_database_identity(live_path, recovery_contract)?;
     if live_identity
         .as_ref()
         .is_some_and(|live| live != &prepared.candidate && Some(live) != prepared.previous.as_ref())
@@ -523,27 +1232,91 @@ fn rollback_prepared_promotion(
             live_path.display()
         )));
     }
+    if let Some(live_identity) = live_identity.as_ref() {
+        if live_identity == &prepared.candidate {
+            if prepared.candidate_source_policy.is_some() {
+                require_candidate_source_policy_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.candidate_source_policy,
+                    "Prepared candidate",
+                )?;
+            }
+            if prepared.candidate_structural_text.is_some() {
+                require_candidate_structural_text_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.candidate_structural_text,
+                    "Prepared candidate",
+                )?;
+            }
+        } else if prepared.previous.as_ref() == Some(live_identity) {
+            require_recorded_source_policy_identity(
+                live_path,
+                live_identity,
+                &prepared.previous_source_policy,
+                "Prepared previous live database",
+            )?;
+            require_recorded_structural_text_identity(
+                live_path,
+                live_identity,
+                &prepared.previous_structural_text,
+                "Prepared previous live database",
+            )?;
+        }
+    }
 
     match prepared.previous.as_ref() {
         Some(expected_previous) => {
-            let backup_identity =
-                require_recovery_database_identity(&backup_path, "Prepared recovery backup")?;
+            let backup_identity = require_recovery_database_identity(
+                &backup_path,
+                "Prepared recovery backup",
+                recovery_contract,
+            )?;
             if &backup_identity != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion backup identity does not match {}",
                     live_path.display()
                 )));
             }
+            require_recorded_source_policy_identity(
+                &backup_path,
+                &backup_identity,
+                &prepared.previous_source_policy,
+                "Prepared recovery backup",
+            )?;
+            require_recorded_structural_text_identity(
+                &backup_path,
+                &backup_identity,
+                &prepared.previous_structural_text,
+                "Prepared recovery backup",
+            )?;
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
-            let restored = require_recovery_database_identity(live_path, "Restored live database")?;
+            let restored = require_recovery_database_identity(
+                live_path,
+                "Restored live database",
+                recovery_contract,
+            )?;
             if &restored != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion rollback did not restore the recorded identity for {}",
                     live_path.display()
                 )));
             }
+            require_recorded_source_policy_identity(
+                live_path,
+                &restored,
+                &prepared.previous_source_policy,
+                "Restored live database",
+            )?;
+            require_recorded_structural_text_identity(
+                live_path,
+                &restored,
+                &prepared.previous_structural_text,
+                "Restored live database",
+            )?;
             remove_promotion_file(&prepared_path)?;
             cleanup_sqlite_sidecars(&backup_path)
         }
@@ -562,13 +1335,70 @@ fn rollback_prepared_promotion(
     }
 }
 
+fn read_journal_less_recovery_auxiliary_identities(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    schema_version: u32,
+    role: &str,
+) -> Result<
+    (
+        Option<SourcePolicyExclusionRollbackIdentity>,
+        Option<StructuralTextUnitRollbackIdentity>,
+    ),
+    StorageError,
+> {
+    let source_policy = if schema_version >= SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION {
+        read_source_policy_exclusion_rollback_identity(path, publication)?
+    } else {
+        None
+    };
+    if schema_version == SCHEMA_VERSION && source_policy.is_none() {
+        return Err(promotion_error(format!(
+            "Current-schema {role} {} has no complete source policy exclusion manifest",
+            path.display()
+        )));
+    }
+    let structural_text = if schema_version == SCHEMA_VERSION {
+        let identity = read_structural_text_unit_rollback_identity(path, publication)?;
+        if identity.is_none() {
+            return Err(promotion_error(format!(
+                "Current-schema {role} {} has no complete structural text unit manifest",
+                path.display()
+            )));
+        }
+        identity
+    } else {
+        None
+    };
+    Ok((source_policy, structural_text))
+}
+
 fn recover_legacy_promotion_backup(
     live_path: &Path,
     backup_path: &Path,
 ) -> Result<(), StorageError> {
-    let backup_identity =
-        require_recovery_database_identity(backup_path, "Legacy promotion backup")?;
-    let live_identity = read_recovery_database_identity(live_path);
+    let recovery_contract = RecoveryDatabaseContract::LegacyBackup;
+    let backup_schema_version = inspect_promotion_database(backup_path)?
+        .map(|(_, schema_version)| schema_version)
+        .ok_or_else(|| {
+            promotion_error(format!(
+                "Legacy promotion backup {} is missing",
+                backup_path.display()
+            ))
+        })?;
+    let backup_identity = require_recovery_database_identity(
+        backup_path,
+        "Legacy promotion backup",
+        recovery_contract,
+    )?;
+    let (backup_source_policy, backup_structural_text) =
+        read_journal_less_recovery_auxiliary_identities(
+            backup_path,
+            &backup_identity,
+            backup_schema_version,
+            "legacy promotion backup",
+        )?;
+    let live_identity = read_recovery_database_identity(live_path, recovery_contract);
     let restore_backup = match live_identity {
         Ok(None) => true,
         Err(error) => {
@@ -577,8 +1407,47 @@ fn recover_legacy_promotion_backup(
                 live_path.display()
             )));
         }
-        Ok(Some(ref live)) if live == &backup_identity => false,
-        Ok(Some(ref live)) if live.generation > backup_identity.generation => false,
+        Ok(Some(ref live)) if live == &backup_identity => {
+            let live_schema_version = inspect_promotion_database(live_path)?
+                .map(|(_, schema_version)| schema_version)
+                .ok_or_else(|| {
+                    promotion_error(format!("Live database {} is missing", live_path.display()))
+                })?;
+            match read_journal_less_recovery_auxiliary_identities(
+                live_path,
+                live,
+                live_schema_version,
+                "live database",
+            ) {
+                Ok((live_source_policy, live_structural_text))
+                    if live_source_policy == backup_source_policy
+                        && live_structural_text == backup_structural_text =>
+                {
+                    false
+                }
+                Ok(_) | Err(_) => true,
+            }
+        }
+        Ok(Some(ref live)) if live.generation > backup_identity.generation => {
+            let live_schema_version = inspect_promotion_database(live_path)?
+                .map(|(_, schema_version)| schema_version)
+                .ok_or_else(|| {
+                    promotion_error(format!("Live database {} is missing", live_path.display()))
+                })?;
+            read_journal_less_recovery_auxiliary_identities(
+                live_path,
+                live,
+                live_schema_version,
+                "newer live database",
+            )
+            .map_err(|error| {
+                promotion_error(format!(
+                    "Cannot validate newer live database {} while a legacy promotion backup exists: {error}",
+                    live_path.display()
+                ))
+            })?;
+            false
+        }
         Ok(Some(_)) => {
             return Err(promotion_error(format!(
                 "Ambiguous legacy promotion backup for {}; refusing to overwrite the live database",
@@ -588,13 +1457,29 @@ fn recover_legacy_promotion_backup(
     };
     if restore_backup {
         restore_promotion_database(backup_path, live_path)?;
-        let restored = require_recovery_database_identity(live_path, "Recovered live database")?;
+        let restored = require_recovery_database_identity(
+            live_path,
+            "Recovered live database",
+            recovery_contract,
+        )?;
         if restored != backup_identity {
             return Err(promotion_error(format!(
                 "Legacy promotion recovery produced an unexpected identity for {}",
                 live_path.display()
             )));
         }
+        require_recorded_source_policy_identity(
+            live_path,
+            &restored,
+            &backup_source_policy,
+            "Recovered live database",
+        )?;
+        require_recorded_structural_text_identity(
+            live_path,
+            &restored,
+            &backup_structural_text,
+            "Recovered live database",
+        )?;
     }
     cleanup_sqlite_sidecars(backup_path)
 }
@@ -708,6 +1593,122 @@ fn grounding_node_rank_sql(alias: &str) -> String {
     )
 }
 
+fn grounding_node_snapshot_insert_sql() -> String {
+    let rank_sql = grounding_node_rank_sql("n");
+    let display_name = grounding_display_name_expr("n");
+    let indexable = grounding_indexable_predicate("n");
+    format!(
+        "WITH ranked_nodes AS (
+            SELECT
+                n.id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY n.file_node_id
+                    ORDER BY
+                        {rank_sql},
+                        COALESCE(n.start_line, 2147483647),
+                        {display_name},
+                        n.id
+                ) AS file_symbol_rank
+            FROM node n
+            WHERE {indexable}
+        )
+        INSERT INTO grounding_node_snapshot (
+            node_id,
+            kind,
+            serialized_name,
+            qualified_name,
+            canonical_id,
+            file_node_id,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            display_name,
+            file_path,
+            node_rank,
+            sort_start_line,
+            is_root,
+            file_symbol_rank
+        )
+        SELECT
+            n.id,
+            n.kind,
+            n.serialized_name,
+            n.qualified_name,
+            n.canonical_id,
+            n.file_node_id,
+            n.start_line,
+            n.start_col,
+            n.end_line,
+            n.end_col,
+            {display_name},
+            COALESCE(f.path, file_node.serialized_name),
+            {rank_sql},
+            COALESCE(n.start_line, 2147483647),
+            CASE
+                WHEN n.id IN (
+                    SELECT e.target_node_id
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                ) THEN 0
+                ELSE 1
+            END,
+            ranked_nodes.file_symbol_rank
+        FROM ranked_nodes
+        JOIN node n ON n.id = ranked_nodes.id
+        LEFT JOIN file f ON f.id = n.file_node_id
+        LEFT JOIN node file_node
+            ON file_node.id = n.file_node_id
+           AND file_node.kind = {file_kind}",
+        member_kind = EdgeKind::MEMBER as i32,
+        file_kind = NodeKind::FILE as i32,
+    )
+}
+
+fn grounding_file_snapshot_cte_sql() -> String {
+    format!(
+        "WITH all_files AS (
+            SELECT id, path, language, modification_time, indexed, complete, line_count
+            FROM file
+            UNION ALL
+            SELECT
+                n.id,
+                n.serialized_name,
+                '',
+                0,
+                1,
+                1,
+                0
+            FROM node n
+            WHERE n.kind = {file_kind}
+              AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
+        )",
+        file_kind = NodeKind::FILE as i32,
+    )
+}
+
+const GROUNDING_FILE_SNAPSHOT_SELECT_SQL: &str = "SELECT
+    f.id,
+    f.path,
+    f.language,
+    f.modification_time,
+    f.indexed,
+    f.complete,
+    f.line_count,
+    COUNT(gs.node_id) AS symbol_count,
+    MIN(CASE WHEN gs.node_id IS NULL THEN 255 ELSE gs.node_rank END) AS best_node_rank
+FROM all_files f
+LEFT JOIN grounding_node_snapshot gs
+  ON gs.file_node_id = f.id
+GROUP BY
+    f.id,
+    f.path,
+    f.language,
+    f.modification_time,
+    f.indexed,
+    f.complete,
+    f.line_count";
+
 fn outside_related_file_edge_predicate(file_param: &str) -> String {
     format!(
         "source_node_id NOT IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
@@ -721,15 +1722,111 @@ fn outside_file_node_predicate(file_param: &str) -> String {
     format!("(file_node_id IS NULL OR file_node_id != {file_param})")
 }
 
+fn get_index_artifact_cache_from_connection(
+    connection: &Connection,
+    path: &Path,
+    cache_key: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    Ok(connection
+        .query_row(
+            INDEX_ARTIFACT_CACHE_SELECT_SQL,
+            params![path.to_string_lossy().to_string(), cache_key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn get_structural_text_artifact_cache_from_connection(
+    connection: &Connection,
+    path: &Path,
+    cache_key: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let cached = connection
+        .query_row(
+            "SELECT artifact_blob, artifact_digest
+             FROM structural_text_artifact_cache
+             WHERE file_path = ?1 AND cache_key = ?2",
+            params![path.to_string_lossy().to_string(), cache_key],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(cached.and_then(|(blob, digest)| {
+        (format!("{:x}", Sha256::digest(&blob)) == digest).then_some(blob)
+    }))
+}
+
+fn upsert_index_artifact_cache_row(
+    statement: &mut rusqlite::Statement<'_>,
+    write: IndexArtifactCacheWrite<'_>,
+) -> Result<usize, StorageError> {
+    Ok(statement.execute(params![
+        write.path.to_string_lossy().to_string(),
+        write.cache_key,
+        write.artifact_blob,
+        current_epoch_ms()
+    ])?)
+}
+
+fn structural_text_unit_from_row(row: &Row<'_>) -> Result<StructuralTextUnit> {
+    let descriptor_version = u32::try_from(row.get::<_, i64>(5)?)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, i64::MAX))?;
+    Ok(StructuralTextUnit {
+        node_id: NodeId(row.get(0)?),
+        file_id: row.get(1)?,
+        placement_id: row.get(2)?,
+        content_hash: row.get(3)?,
+        source_content_hash: row.get(4)?,
+        descriptor_version,
+        producer: row.get(6)?,
+        evidence_tier: row.get(7)?,
+        resolution: row.get(8)?,
+        language: row.get(9)?,
+        kind: NodeKind::try_from(row.get::<_, i32>(10)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, i64::MAX))?,
+        start_line: row.get(11)?,
+        start_col: row.get(12)?,
+        end_line: row.get(13)?,
+        end_col: row.get(14)?,
+        file_role: FileRole::from_db_value(&row.get::<_, String>(15)?),
+    })
+}
+
 /// Errors returned by storage facade operations.
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("Database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("{0} requires a non-zero batch limit")]
+    InvalidBatchLimit(&'static str),
+    #[error("{0} requires build-mode storage")]
+    BuildModeRequired(&'static str),
+    #[error("{operation} accepts at most {maximum} seed nodes per query, but received {actual}")]
+    BuildEdgeSeedBatchTooLarge {
+        operation: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    #[error("Resolution support snapshot exceeds the current SQLite value limit")]
+    ResolutionSupportSnapshotTooBig,
     #[error("Invalid enum value: {0}")]
     EnumConversion(#[from] EnumConversionError),
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// One reusable parser artifact to persist in the index artifact cache.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexArtifactCacheWrite<'a> {
+    pub path: &'a Path,
+    pub cache_key: &'a str,
+    pub artifact_blob: &'a [u8],
+}
+
+/// Nodes loaded directly from a build store without consulting or populating its cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildNodeLookup {
+    pub nodes: HashMap<NodeId, Node>,
+    pub query_batches: usize,
 }
 
 /// SQLite-backed graph, search, file, and snapshot store.
@@ -742,6 +1839,31 @@ pub struct Storage {
     conn: Connection,
     cache: StorageCache,
     deferred_secondary_indexes: bool,
+    durability_profile: SqliteDurabilityProfile,
+}
+
+/// Narrow query-only view used while a staged store has one active writer.
+///
+/// Unlike the published-store openers, this reader never runs promotion
+/// recovery, migrations, initialization, or immutable-file checks. Each cache
+/// lookup owns only its statement transaction so it cannot pin the staged WAL
+/// across parse chunks.
+pub struct IndexArtifactCacheReader {
+    conn: Connection,
+}
+
+impl IndexArtifactCacheReader {
+    pub fn get(&self, path: &Path, cache_key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn get_structural(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        get_structural_text_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
 }
 
 /// One coherent read view of a live SQLite store.
@@ -812,25 +1934,199 @@ pub enum StorageOpenMode {
     Build,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteDurabilityProfile {
+    Durable,
+    DisposableFullBuild,
+}
+
+pub(crate) struct DisposableFullBuildSealStats {
+    pub(crate) wal_autocheckpoint_bytes: u64,
+    pub(crate) checkpoint_ms: u32,
+    pub(crate) sync_ms: u32,
+}
+
 /// Per-table timing breakdown for a projection flush.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectionFlushBreakdown {
     pub files_ms: u32,
     pub nodes_ms: u32,
+    pub structural_text_units_ms: u32,
     pub edges_ms: u32,
     pub occurrences_ms: u32,
     pub component_access_ms: u32,
     pub callable_projection_ms: u32,
+    pub persistence: ProjectionPersistenceStats,
+}
+
+/// Deterministic shape and wall telemetry for one persisted row family.
+///
+/// `row_attempts` counts logical row targets supplied to SQLite. `bound_bytes`
+/// estimates the raw text, blob, and fixed-width scalar payload supplied as
+/// statement parameters; it is not a database, WAL, or physical-write byte
+/// count. `statement_executions` counts prepared statement executions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectionPersistenceFamilyStats {
+    pub row_attempts: u64,
+    pub bound_bytes: u64,
+    pub statement_executions: u64,
+    pub wall_ms: u32,
+}
+
+impl ProjectionPersistenceFamilyStats {
+    pub fn accumulate(&mut self, other: Self) {
+        self.row_attempts = self.row_attempts.saturating_add(other.row_attempts);
+        self.bound_bytes = self.bound_bytes.saturating_add(other.bound_bytes);
+        self.statement_executions = self
+            .statement_executions
+            .saturating_add(other.statement_executions);
+        self.wall_ms = self.wall_ms.saturating_add(other.wall_ms);
+    }
+}
+
+/// Non-double-counted projection transaction diagnostics.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectionPersistenceStats {
+    pub transactions: u64,
+    pub transaction_wall_ms: u32,
+    pub transaction_setup_ms: u32,
+    pub commit_ms: u32,
+    pub files: ProjectionPersistenceFamilyStats,
+    pub nodes: ProjectionPersistenceFamilyStats,
+    pub structural_text: ProjectionPersistenceFamilyStats,
+    pub edges: ProjectionPersistenceFamilyStats,
+    pub occurrences: ProjectionPersistenceFamilyStats,
+    pub component_access: ProjectionPersistenceFamilyStats,
+    pub callable_projection: ProjectionPersistenceFamilyStats,
+    pub file_errors: ProjectionPersistenceFamilyStats,
+    pub dirty_state: ProjectionPersistenceFamilyStats,
+}
+
+impl ProjectionPersistenceStats {
+    pub fn accumulate(&mut self, other: Self) {
+        self.transactions = self.transactions.saturating_add(other.transactions);
+        self.transaction_wall_ms = self
+            .transaction_wall_ms
+            .saturating_add(other.transaction_wall_ms);
+        self.transaction_setup_ms = self
+            .transaction_setup_ms
+            .saturating_add(other.transaction_setup_ms);
+        self.commit_ms = self.commit_ms.saturating_add(other.commit_ms);
+        self.files.accumulate(other.files);
+        self.nodes.accumulate(other.nodes);
+        self.structural_text.accumulate(other.structural_text);
+        self.edges.accumulate(other.edges);
+        self.occurrences.accumulate(other.occurrences);
+        self.component_access.accumulate(other.component_access);
+        self.callable_projection
+            .accumulate(other.callable_projection);
+        self.file_errors.accumulate(other.file_errors);
+        self.dirty_state.accumulate(other.dirty_state);
+    }
+
+    pub fn row_attempts(&self) -> u64 {
+        [
+            self.files,
+            self.nodes,
+            self.structural_text,
+            self.edges,
+            self.occurrences,
+            self.component_access,
+            self.callable_projection,
+            self.file_errors,
+            self.dirty_state,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, family| {
+            total.saturating_add(family.row_attempts)
+        })
+    }
+
+    pub fn bound_bytes(&self) -> u64 {
+        [
+            self.files,
+            self.nodes,
+            self.structural_text,
+            self.edges,
+            self.occurrences,
+            self.component_access,
+            self.callable_projection,
+            self.file_errors,
+            self.dirty_state,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, family| {
+            total.saturating_add(family.bound_bytes)
+        })
+    }
+
+    pub fn statement_executions(&self) -> u64 {
+        [
+            self.files,
+            self.nodes,
+            self.structural_text,
+            self.edges,
+            self.occurrences,
+            self.component_access,
+            self.callable_projection,
+            self.file_errors,
+            self.dirty_state,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, family| {
+            total.saturating_add(family.statement_executions)
+        })
+    }
 }
 
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub file_content_hashes: &'a [FileContentHash],
     pub nodes: &'a [Node],
+    pub structural_text_units: &'a [StructuralTextUnit],
+    pub structural_text_projections: &'a [StructuralTextProjection],
+    pub structural_text_cache_writes: &'a [StructuralTextArtifactCacheWrite<'a>],
     pub edges: &'a [Edge],
     pub occurrences: &'a [Occurrence],
     pub component_access: &'a [(NodeId, AccessKind)],
     pub callable_projection_states: &'a [CallableProjectionState],
+    pub file_errors: &'a [codestory_contracts::graph::ErrorInfo],
+}
+
+const SQLITE_SCALAR_BIND_BYTES: u64 = 8;
+
+fn projection_text_bind_bytes(value: &str) -> u64 {
+    value.len().min(u64::MAX as usize) as u64
+}
+
+fn projection_path_bind_bytes(value: &Path) -> u64 {
+    projection_text_bind_bytes(value.to_string_lossy().as_ref())
+}
+
+fn projection_optional_text_bind_bytes(value: Option<&str>) -> u64 {
+    value.map(projection_text_bind_bytes).unwrap_or(0)
+}
+
+fn projection_optional_scalar_bind_bytes<T>(value: Option<T>) -> u64 {
+    if value.is_some() {
+        SQLITE_SCALAR_BIND_BYTES
+    } else {
+        0
+    }
+}
+
+fn projection_scalar_binds(count: usize) -> u64 {
+    (count.min(u64::MAX as usize) as u64).saturating_mul(SQLITE_SCALAR_BIND_BYTES)
+}
+
+fn record_projection_statement(
+    family: &mut ProjectionPersistenceFamilyStats,
+    row_attempts: u64,
+    bound_bytes: u64,
+) {
+    family.row_attempts = family.row_attempts.saturating_add(row_attempts);
+    family.bound_bytes = family.bound_bytes.saturating_add(bound_bytes);
+    family.statement_executions = family.statement_executions.saturating_add(1);
 }
 
 #[derive(Default)]
@@ -857,11 +2153,331 @@ pub struct FileInfo {
     pub file_role: FileRole,
 }
 
-/// Verified content identity for one parser-backed file projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Verified content identity for one parser-backed or structural file projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileContentHash {
     pub file_id: i64,
     pub content_hash: String,
+}
+
+pub const STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION: u32 = 1;
+pub const STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+pub const STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE: &str = "native_v1";
+const STRUCTURAL_TEXT_UNIT_DIGEST_DOMAIN: &[u8] =
+    b"codestory-structural-text-unit-publication-v1\0";
+
+/// Verified structural source evidence attached to one file-scoped graph node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralTextUnit {
+    pub node_id: NodeId,
+    pub file_id: i64,
+    pub placement_id: String,
+    pub content_hash: String,
+    pub source_content_hash: String,
+    pub descriptor_version: u32,
+    pub producer: String,
+    pub evidence_tier: String,
+    pub resolution: String,
+    pub language: String,
+    pub kind: NodeKind,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub file_role: FileRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralTextProjection {
+    pub file_id: i64,
+    pub source_content_hash: String,
+    pub descriptor_version: u32,
+    pub producer: String,
+    pub language: String,
+    pub file_role: FileRole,
+    pub unit_count: u64,
+    pub unit_digest: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructuralTextArtifactCacheWrite<'a> {
+    pub path: &'a Path,
+    pub file_id: i64,
+    pub cache_key: &'a str,
+    pub artifact_blob: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuralTextUnitPublicationManifest {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub unit_count: u64,
+    pub unit_digest: String,
+    pub projection_count: u64,
+    pub projection_digest: String,
+    pub descriptor_version: u32,
+    pub migration_state: String,
+    pub published_at_epoch_ms: i64,
+}
+
+/// Structural publication state accepted by an explicit projection-only writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuralTextPublicationCompatibility {
+    Published(StructuralTextUnitPublicationManifest),
+    /// A pre-manifest core with no structural units, projections, or cache rows.
+    LegacyEmpty,
+}
+
+fn hash_structural_text_unit_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn structural_text_unit_content_summary(
+    conn: &Connection,
+) -> Result<(u64, String, HashSet<u32>), StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                descriptor_version, producer, evidence_tier, resolution, language,
+                kind, start_line, start_col, end_line, end_col, file_role
+         FROM structural_text_unit ORDER BY node_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    hasher.update(STRUCTURAL_TEXT_UNIT_DIGEST_DOMAIN);
+    let mut count = 0_u64;
+    let mut descriptor_versions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+            StorageError::Other("structural text unit descriptor version is invalid".into())
+        })?;
+        descriptor_versions.insert(descriptor_version);
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            row.get::<_, i64>(1)?.to_string(),
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?.to_string(),
+            row.get::<_, i64>(11)?.to_string(),
+            row.get::<_, i64>(12)?.to_string(),
+            row.get::<_, i64>(13)?.to_string(),
+            row.get::<_, i64>(14)?.to_string(),
+            row.get::<_, String>(15)?,
+        ];
+        for value in values {
+            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((
+        count,
+        format!("{:x}", hasher.finalize()),
+        descriptor_versions,
+    ))
+}
+
+pub fn structural_text_unit_digest(units: &[StructuralTextUnit]) -> String {
+    let mut units = units.to_vec();
+    units.sort_by_key(|unit| unit.node_id.0);
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-structural-text-file-units-v1\0");
+    for unit in units {
+        for value in [
+            unit.node_id.0.to_string(),
+            unit.file_id.to_string(),
+            unit.placement_id,
+            unit.content_hash,
+            unit.source_content_hash,
+            unit.descriptor_version.to_string(),
+            unit.producer,
+            unit.evidence_tier,
+            unit.resolution,
+            unit.language,
+            (unit.kind as i32).to_string(),
+            unit.start_line.to_string(),
+            unit.start_col.to_string(),
+            unit.end_line.to_string(),
+            unit.end_col.to_string(),
+            unit.file_role.as_str().to_string(),
+        ] {
+            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn read_all_structural_text_units(
+    conn: &Connection,
+) -> Result<Vec<StructuralTextUnit>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                descriptor_version, producer, evidence_tier, resolution, language,
+                kind, start_line, start_col, end_line, end_col, file_role
+         FROM structural_text_unit ORDER BY node_id ASC",
+    )?;
+    let rows = stmt.query_map([], structural_text_unit_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn read_structural_text_projections(
+    conn: &Connection,
+) -> Result<Vec<StructuralTextProjection>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT file_id, source_content_hash, descriptor_version, producer,
+                language, file_role, unit_count, unit_digest
+         FROM structural_text_projection ORDER BY file_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(StructuralTextProjection {
+            file_id: row.get(0)?,
+            source_content_hash: row.get(1)?,
+            descriptor_version: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+            producer: row.get(3)?,
+            language: row.get(4)?,
+            file_role: FileRole::from_db_value(&row.get::<_, String>(5)?),
+            unit_count: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+            unit_digest: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn structural_text_artifact_cache_key_is_valid(cache_key: &str) -> bool {
+    let Some((version, identity)) = cache_key
+        .strip_prefix('v')
+        .and_then(|key| key.split_once(':'))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+        && version.parse::<u32>().is_ok_and(|version| version > 0)
+        && !identity.is_empty()
+}
+
+fn validate_structural_text_artifact_cache_rows(conn: &Connection) -> Result<(), StorageError> {
+    let orphaned_rows = conn.query_row(
+        "SELECT COUNT(*)
+         FROM structural_text_artifact_cache c
+         LEFT JOIN structural_text_projection p ON p.file_id = c.file_id
+         WHERE p.file_id IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if orphaned_rows != 0 {
+        return Err(StorageError::Other(
+            "structural artifact cache contains rows without verified projections".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT c.file_id, c.cache_key, c.source_content_hash,
+                c.descriptor_version, c.producer, c.artifact_digest, c.artifact_blob,
+                p.source_content_hash, p.descriptor_version, p.producer
+         FROM structural_text_artifact_cache c
+         INNER JOIN structural_text_projection p ON p.file_id = c.file_id
+         ORDER BY c.file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let file_id = row.get::<_, i64>(0)?;
+        let cache_key = row.get::<_, String>(1)?;
+        let source_content_hash = row.get::<_, String>(2)?;
+        let descriptor_version = row.get::<_, i64>(3)?;
+        let producer = row.get::<_, String>(4)?;
+        let artifact_digest = row.get::<_, String>(5)?;
+        let artifact_blob = row.get::<_, Vec<u8>>(6)?;
+        let projection_source_content_hash = row.get::<_, String>(7)?;
+        let projection_descriptor_version = row.get::<_, i64>(8)?;
+        let projection_producer = row.get::<_, String>(9)?;
+        let expected_digest = format!("{:x}", Sha256::digest(&artifact_blob));
+        if source_content_hash != projection_source_content_hash
+            || descriptor_version != projection_descriptor_version
+            || producer != projection_producer
+            || !structural_text_artifact_cache_key_is_valid(&cache_key)
+            || artifact_digest != expected_digest
+        {
+            return Err(StorageError::Other(format!(
+                "structural artifact cache row {file_id} does not match its verified projection"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_structural_text_projection_rows(conn: &Connection) -> Result<(), StorageError> {
+    let units = read_all_structural_text_units(conn)?;
+    let projections = read_structural_text_projections(conn)?;
+    let mut units_by_file = HashMap::<i64, Vec<StructuralTextUnit>>::new();
+    for unit in units {
+        units_by_file.entry(unit.file_id).or_default().push(unit);
+    }
+    for projection in projections {
+        let units = units_by_file
+            .remove(&projection.file_id)
+            .unwrap_or_default();
+        if projection.unit_count != units.len() as u64
+            || projection.unit_digest != structural_text_unit_digest(&units)
+        {
+            return Err(StorageError::Other(format!(
+                "structural text projection {} does not match its unit set",
+                projection.file_id
+            )));
+        }
+    }
+    if !units_by_file.is_empty() {
+        return Err(StorageError::Other(
+            "structural text units exist without owning projections".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn structural_text_projection_content_summary(
+    conn: &Connection,
+) -> Result<(u64, String, HashSet<u32>), StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT file_id, source_content_hash, descriptor_version, producer,
+                language, file_role, unit_count, unit_digest
+         FROM structural_text_projection ORDER BY file_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-structural-text-projection-publication-v1\0");
+    let mut count = 0_u64;
+    let mut descriptor_versions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let descriptor_version = u32::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+            StorageError::Other("structural text projection descriptor version is invalid".into())
+        })?;
+        descriptor_versions.insert(descriptor_version);
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            row.get::<_, String>(1)?,
+            descriptor_version.to_string(),
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?.to_string(),
+            row.get::<_, String>(7)?,
+        ];
+        for value in values {
+            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((
+        count,
+        format!("{:x}", hasher.finalize()),
+        descriptor_versions,
+    ))
 }
 
 /// Heuristic role assigned to a file for ranking and summaries.
@@ -1022,6 +2638,7 @@ pub struct StorageStats {
 pub enum IndexPublicationMode {
     Full,
     Incremental,
+    SemanticProjection,
 }
 
 impl IndexPublicationMode {
@@ -1029,6 +2646,7 @@ impl IndexPublicationMode {
         match self {
             Self::Full => "full",
             Self::Incremental => "incremental",
+            Self::SemanticProjection => "semantic_projection",
         }
     }
 
@@ -1036,6 +2654,7 @@ impl IndexPublicationMode {
         match value {
             "full" => Ok(Self::Full),
             "incremental" => Ok(Self::Incremental),
+            "semantic_projection" => Ok(Self::SemanticProjection),
             _ => Err(StorageError::Other(format!(
                 "Unsupported index publication mode: {value}"
             ))),
@@ -1348,6 +2967,7 @@ impl GroundingSnapshotMetadata {
 #[derive(Debug, Clone)]
 pub struct GroundingFileSummary {
     pub file: FileInfo,
+    pub file_role: Option<FileRole>,
     pub symbol_count: u32,
     pub best_node_rank: u8,
 }
@@ -1487,6 +3107,369 @@ pub struct DenseReasonCounts {
     pub unstructured_doc: u32,
 }
 
+/// Graph-derived input for dense retrieval, published without an embedding.
+///
+/// `document_hash`, `policy_version`, and `source_identity` are the stable
+/// reuse boundary. Vector producers add their own versioned evidence later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorInput {
+    pub node_id: NodeId,
+    pub file_node_id: Option<NodeId>,
+    pub kind: NodeKind,
+    pub display_name: String,
+    pub qualified_name: Option<String>,
+    pub file_path: Option<String>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub file_role: FileRole,
+    pub source_provenance: String,
+    pub text: String,
+    pub document_hash: String,
+    pub selection_reason: String,
+    pub policy_version: String,
+    pub source_identity: String,
+    pub updated_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorInputReuseMetadata {
+    pub node_id: NodeId,
+    pub document_hash: String,
+    pub selection_reason: String,
+    pub policy_version: String,
+    pub source_identity: String,
+}
+
+pub const DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+pub const DENSE_ANCHOR_MIGRATION_STATE_NATIVE: &str = "native_v1";
+const DENSE_ANCHOR_DIGEST_DOMAIN: &[u8] = b"codestory-dense-anchor-publication-v1\0";
+
+/// Complete dense-anchor input publication bound to one core generation.
+///
+/// Absence is meaningful: migrated databases remain unpublished until core
+/// indexing has deterministically rebuilt or adopted the complete anchor set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorPublicationManifest {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub anchor_count: u64,
+    pub anchor_digest: String,
+    pub policy_version: String,
+    pub migration_state: String,
+    pub published_at_epoch_ms: i64,
+}
+
+fn hash_dense_anchor_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn dense_anchor_content_summary(
+    conn: &Connection,
+) -> Result<(u64, String, HashSet<String>), StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_node_id, kind, display_name, qualified_name,
+                file_path, start_line, end_line, file_role, source_provenance,
+                document_text, document_hash, selection_reason, policy_version
+         FROM dense_anchor_input ORDER BY node_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    hasher.update(DENSE_ANCHOR_DIGEST_DOMAIN);
+    let mut count = 0_u64;
+    let mut policies = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            row.get::<_, Option<i64>>(1)?
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, i64>(2)?.to_string(),
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            row.get::<_, Option<i64>>(6)?
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, Option<i64>>(7)?
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, String>(13)?,
+        ];
+        policies.insert(values[13].clone());
+        for value in values {
+            hash_dense_anchor_part(&mut hasher, value.as_bytes());
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((count, format!("{:x}", hasher.finalize()), policies))
+}
+
+pub const SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+const SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
+    b"codestory-source-policy-exclusion-publication-v2\0";
+const LEGACY_SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN: &[u8] =
+    b"codestory-source-policy-exclusion-publication-v1\0";
+
+/// One verified source excluded from parser scheduling by an explicit policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourcePolicyExclusionRecord {
+    pub normalized_path: String,
+    pub project_id: String,
+    pub workspace_id: String,
+    pub content_hash: String,
+    pub observed_size: u64,
+    pub observed_unit_count: u64,
+    pub policy_version: String,
+    pub byte_cap: u64,
+    pub structural_unit_cap: u64,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+}
+
+/// Immutable policy identity bound to one complete exclusion publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePolicyExclusionPolicyIdentity<'a> {
+    pub policy_version: &'a str,
+    pub byte_cap: u64,
+    pub structural_unit_cap: u64,
+}
+
+impl<'a> SourcePolicyExclusionPolicyIdentity<'a> {
+    pub const fn new(policy_version: &'a str, byte_cap: u64, structural_unit_cap: u64) -> Self {
+        Self {
+            policy_version,
+            byte_cap,
+            structural_unit_cap,
+        }
+    }
+}
+
+/// Complete exclusion set published with one core generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourcePolicyExclusionManifest {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub project_id: String,
+    pub workspace_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub exclusion_count: u64,
+    pub exclusion_digest: String,
+    pub policy_version: String,
+    pub byte_cap: u64,
+    pub structural_unit_cap: u64,
+    pub published_at_epoch_ms: i64,
+}
+
+fn source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN);
+    for record in records {
+        for value in [
+            record.normalized_path.as_bytes(),
+            record.project_id.as_bytes(),
+            record.workspace_id.as_bytes(),
+            record.content_hash.as_bytes(),
+            record.policy_version.as_bytes(),
+            record.core_generation_id.as_bytes(),
+            record.core_run_id.as_bytes(),
+        ] {
+            hash_dense_anchor_part(&mut hasher, value);
+        }
+        hash_dense_anchor_part(&mut hasher, &record.observed_size.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.observed_unit_count.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.byte_cap.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.structural_unit_cap.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn legacy_source_policy_exclusion_digest(records: &[SourcePolicyExclusionRecord]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(LEGACY_SOURCE_POLICY_EXCLUSION_DIGEST_DOMAIN);
+    for record in records {
+        for value in [
+            record.normalized_path.as_bytes(),
+            record.project_id.as_bytes(),
+            record.workspace_id.as_bytes(),
+            record.content_hash.as_bytes(),
+            record.policy_version.as_bytes(),
+            record.core_generation_id.as_bytes(),
+            record.core_run_id.as_bytes(),
+        ] {
+            hash_dense_anchor_part(&mut hasher, value);
+        }
+        hash_dense_anchor_part(&mut hasher, &record.observed_size.to_le_bytes());
+        hash_dense_anchor_part(&mut hasher, &record.byte_cap.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcePolicyExclusionPublicationFormat {
+    Current,
+    LegacyV1,
+}
+
+impl SourcePolicyExclusionPublicationFormat {
+    fn schema_version(self) -> u32 {
+        match self {
+            Self::Current => SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+            Self::LegacyV1 => LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+        }
+    }
+
+    fn digest(self, records: &[SourcePolicyExclusionRecord]) -> String {
+        match self {
+            Self::Current => source_policy_exclusion_digest(records),
+            Self::LegacyV1 => legacy_source_policy_exclusion_digest(records),
+        }
+    }
+
+    fn qualifies(self, record: &SourcePolicyExclusionRecord) -> bool {
+        match self {
+            Self::Current => {
+                (record.observed_size > record.byte_cap && record.observed_unit_count == 0)
+                    || (record.observed_size <= record.byte_cap
+                        && record.observed_unit_count > record.structural_unit_cap)
+            }
+            Self::LegacyV1 => {
+                record.observed_size > record.byte_cap && record.observed_unit_count == 0
+            }
+        }
+    }
+}
+
+fn read_legacy_source_policy_exclusions(
+    conn: &Connection,
+) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_path, project_id, workspace_id, content_hash,
+                observed_size, policy_version, byte_cap, core_generation_id, core_run_id
+         FROM source_policy_exclusion ORDER BY normalized_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size,
+            policy_version,
+            byte_cap,
+            core_generation_id,
+            core_run_id,
+        ) = row?;
+        Ok(SourcePolicyExclusionRecord {
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size: u64::try_from(observed_size).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid observed size".into())
+            })?,
+            observed_unit_count: 0,
+            policy_version,
+            byte_cap: u64::try_from(byte_cap).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid byte cap".into())
+            })?,
+            structural_unit_cap: default_structural_unit_cap(),
+            core_generation_id,
+            core_run_id,
+        })
+    })
+    .collect()
+}
+
+fn read_source_policy_exclusions(
+    conn: &Connection,
+) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_path, project_id, workspace_id, content_hash,
+                observed_size, observed_unit_count, policy_version, byte_cap,
+                structural_unit_cap, core_generation_id, core_run_id
+         FROM source_policy_exclusion ORDER BY normalized_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size,
+            observed_unit_count,
+            policy_version,
+            byte_cap,
+            structural_unit_cap,
+            core_generation_id,
+            core_run_id,
+        ) = row?;
+        Ok(SourcePolicyExclusionRecord {
+            normalized_path,
+            project_id,
+            workspace_id,
+            content_hash,
+            observed_size: u64::try_from(observed_size).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid observed size".into())
+            })?,
+            observed_unit_count: u64::try_from(observed_unit_count).map_err(|_| {
+                StorageError::Other(
+                    "source policy exclusion has invalid observed unit count".into(),
+                )
+            })?,
+            policy_version,
+            byte_cap: u64::try_from(byte_cap).map_err(|_| {
+                StorageError::Other("source policy exclusion has invalid byte cap".into())
+            })?,
+            structural_unit_cap: u64::try_from(structural_unit_cap).map_err(|_| {
+                StorageError::Other(
+                    "source policy exclusion has invalid structural unit cap".into(),
+                )
+            })?,
+            core_generation_id,
+            core_run_id,
+        })
+    })
+    .collect()
+}
+
 /// Graph-native symbol-search document used by retrieval sidecars.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolSearchDoc {
@@ -1514,7 +3497,26 @@ pub struct SymbolSummaryRecord {
     pub updated_at_epoch_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonmutatingOpenPolicy {
+    StrictCurrentSchema,
+    FreshnessFence,
+    SchemaVersion,
+}
+
 impl Storage {
+    /// Reports whether this handle owns a disposable staged build.
+    pub fn is_staged_build(&self) -> bool {
+        self.deferred_secondary_indexes
+    }
+
+    fn require_build_mode(&self, operation: &'static str) -> Result<(), StorageError> {
+        if !self.is_staged_build() {
+            return Err(StorageError::BuildModeRequired(operation));
+        }
+        Ok(())
+    }
+
     /// Open a live store, applying schema migrations and secondary indexes.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_with_mode(path, StorageOpenMode::Live)
@@ -1542,6 +3544,114 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
+        })
+    }
+
+    /// Open a store for diagnostics without repairing, migrating, or
+    /// materializing SQLite sidecars. Recovery and schema changes belong to an
+    /// activating writer; an observer reports those states instead.
+    pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
+    }
+
+    /// Open storage only to inspect index freshness without repairing,
+    /// migrating, or exposing a fenced database as a readable publication.
+    ///
+    /// This narrow observer accepts the current schema or the exact incomplete
+    /// incremental sentinel when its durable marker exists. General read and
+    /// observational entry points remain current-schema-only.
+    pub fn open_freshness_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::FreshnessFence)
+    }
+
+    /// Read the durable SQLite schema version without migrations, promotion
+    /// recovery, or sidecar creation.
+    pub fn database_schema_version_observational(path: &Path) -> Result<u32, StorageError> {
+        let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::SchemaVersion)?;
+        storage.schema_version()
+    }
+
+    fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
+        if promotion_artifacts_exist(path) {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} while promotion recovery is pending",
+                path.display()
+            )));
+        }
+        if !path.is_file() {
+            return Err(StorageError::Other(format!(
+                "Observational storage requires an existing database: {}",
+                path.display()
+            )));
+        }
+        let wal_path = sqlite_sidecar_path(path, "-wal");
+        let shm_path = sqlite_sidecar_path(path, "-shm");
+        let journal_path = sqlite_sidecar_path(path, "-journal");
+        if journal_path.exists() {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} while rollback recovery is pending",
+                path.display()
+            )));
+        }
+        let wal_exists = wal_path.is_file();
+        let shm_exists = shm_path.is_file();
+        if wal_exists != shm_exists {
+            return Err(StorageError::Other(format!(
+                "Observational storage cannot inspect {} with an incomplete WAL sidecar pair",
+                path.display()
+            )));
+        }
+        // `immutable=1` guarantees that a standalone database cannot acquire
+        // locks or sidecars, but it intentionally ignores committed WAL state.
+        // When a complete WAL/SHM pair already exists, a normal read-only
+        // connection observes it without materializing either sidecar. SQLite
+        // may update transient reader marks inside the existing SHM wal-index;
+        // durable database and WAL bytes remain observationally unchanged.
+        let uri = observational_sqlite_uri(path, !wal_exists);
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        if policy == NonmutatingOpenPolicy::FreshnessFence {
+            // The freshness decision combines the schema sentinel, durable
+            // fence, stored inventory, and workspace comparison. Pin one
+            // SQLite snapshot before the first read so a concurrent writer
+            // cannot split those database observations across generations.
+            // Closing the read-only connection releases this transaction.
+            conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        match policy {
+            NonmutatingOpenPolicy::StrictCurrentSchema if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::FreshnessFence
+                if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+                    && !has_incomplete_incremental_marker(&conn)? =>
+            {
+                return Err(StorageError::Other(format!(
+                    "Freshness observation requires the durable incomplete-run marker for schema sentinel {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::FreshnessFence
+                if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION => {}
+            NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::SchemaVersion => {}
+            _ => {}
+        }
+        Ok(Self {
+            conn,
+            cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
         })
     }
 
@@ -1568,10 +3678,35 @@ impl Storage {
         Self::open_with_mode(path, StorageOpenMode::Build)
     }
 
+    /// Open a fresh, repeatable full-refresh stage with relaxed write durability.
+    ///
+    /// The resulting database is never publishable until the consuming staged
+    /// snapshot path seals its WAL and syncs the standalone database. Generic
+    /// build stores and incremental clones retain the durable profile.
+    pub(crate) fn open_disposable_full_build<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        cleanup_sqlite_sidecars(path)?;
+        Self::open_with_mode_and_durability(
+            path,
+            StorageOpenMode::Build,
+            SqliteDurabilityProfile::DisposableFullBuild,
+        )
+    }
+
     /// Open a store with explicit live or build indexing behavior.
     pub fn open_with_mode<P: AsRef<Path>>(
         path: P,
         mode: StorageOpenMode,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_mode_and_durability(path, mode, SqliteDurabilityProfile::Durable)
+    }
+
+    fn open_with_mode_and_durability<P: AsRef<Path>>(
+        path: P,
+        mode: StorageOpenMode,
+        durability_profile: SqliteDurabilityProfile,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
         if matches!(mode, StorageOpenMode::Live) {
@@ -1583,7 +3718,20 @@ impl Storage {
         conn.busy_timeout(Duration::from_millis(2_500))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        match durability_profile {
+            SqliteDurabilityProfile::Durable => {
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+            }
+            SqliteDurabilityProfile::DisposableFullBuild => {
+                conn.pragma_update(None, "synchronous", "OFF")?;
+                let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+                let page_size = page_size.max(1);
+                let checkpoint_pages = (DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES as i64)
+                    .saturating_add(page_size - 1)
+                    / page_size;
+                conn.pragma_update(None, "wal_autocheckpoint", checkpoint_pages)?;
+            }
+        }
         if matches!(mode, StorageOpenMode::Build) {
             // Favor fewer temp-file round trips and larger page caches while building
             // the staged full-refresh snapshot.
@@ -1595,6 +3743,7 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: matches!(mode, StorageOpenMode::Build),
+            durability_profile,
         };
         storage.init(mode)?;
         Ok(storage)
@@ -1649,7 +3798,7 @@ impl Storage {
     pub fn copy_database_snapshot(
         source_path: &Path,
         target_path: &Path,
-    ) -> Result<(), StorageError> {
+    ) -> Result<DatabaseSnapshotCopyStats, StorageError> {
         recover_interrupted_promotion(source_path)?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -1660,8 +3809,17 @@ impl Storage {
             })?;
         }
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let source_bytes = database_logical_bytes(&source)?;
+        let copy_started = Instant::now();
         source.backup(MAIN_DB, target_path, None::<fn(rusqlite::backup::Progress)>)?;
-        Ok(())
+        let copy_ms = duration_ms(copy_started.elapsed());
+        let target = Connection::open_with_flags(target_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let target_bytes = database_logical_bytes(&target)?;
+        Ok(DatabaseSnapshotCopyStats {
+            copy_ms,
+            source_bytes,
+            target_bytes,
+        })
     }
 
     /// Create an in-memory store for tests and short-lived callers.
@@ -1672,6 +3830,7 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
+            durability_profile: SqliteDurabilityProfile::Durable,
         };
         storage.init(StorageOpenMode::Live)?;
         Ok(storage)
@@ -1685,22 +3844,49 @@ impl Storage {
         &self.conn
     }
 
+    /// Open a query-only artifact-cache reader for this file-backed store.
+    ///
+    /// The reader is intentionally narrower than `open_read_only`: it does not
+    /// recover promotion state or retain a read snapshot between lookups. An
+    /// in-memory store has no second connection and returns `None` so callers
+    /// can keep their existing serial path.
+    pub fn index_artifact_cache_reader(
+        &self,
+    ) -> Result<Option<IndexArtifactCacheReader>, StorageError> {
+        let Some(path) = self
+            .conn
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+        else {
+            return Ok(None);
+        };
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(2_500))?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Artifact-cache reader requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Some(IndexArtifactCacheReader { conn }))
+    }
+
     pub fn get_index_artifact_cache(
         &self,
         path: &Path,
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT artifact_blob
-             FROM index_artifact_cache
-             WHERE file_path = ?1
-               AND cache_key = ?2",
-        )?;
-        let mut rows = stmt.query(params![path.to_string_lossy().to_string(), cache_key])?;
-        if let Some(row) = rows.next()? {
-            return Ok(Some(row.get(0)?));
-        }
-        Ok(None)
+        get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn get_structural_text_artifact_cache(
+        &self,
+        path: &Path,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        get_structural_text_artifact_cache_from_connection(&self.conn, path, cache_key)
     }
 
     pub fn upsert_index_artifact_cache(
@@ -1710,17 +3896,7 @@ impl Storage {
         artifact_blob: &[u8],
     ) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO index_artifact_cache (
-                file_path,
-                cache_key,
-                artifact_blob,
-                updated_at_epoch_ms
-             )
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(file_path) DO UPDATE SET
-                cache_key = excluded.cache_key,
-                artifact_blob = excluded.artifact_blob,
-                updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            INDEX_ARTIFACT_CACHE_UPSERT_SQL,
             params![
                 path.to_string_lossy().to_string(),
                 cache_key,
@@ -1729,6 +3905,30 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist one ordered artifact-cache chunk in a single transaction.
+    ///
+    /// Duplicate paths retain ordered single-row semantics: the last entry wins.
+    /// An empty chunk does not open a transaction, and any row failure rolls the
+    /// complete chunk back.
+    pub fn upsert_index_artifact_cache_batch(
+        &self,
+        writes: &[IndexArtifactCacheWrite<'_>],
+    ) -> Result<usize, StorageError> {
+        if writes.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.conn.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(INDEX_ARTIFACT_CACHE_UPSERT_SQL)?;
+            for write in writes {
+                upsert_index_artifact_cache_row(&mut statement, *write)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(writes.len())
     }
 
     pub fn copy_index_artifact_cache_from(
@@ -1793,6 +3993,40 @@ impl Storage {
         Ok(copied)
     }
 
+    /// Copy only versioned structural artifacts into a disposable full stage.
+    pub fn copy_structural_text_artifact_cache_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        drop(Storage::open(source_path)?);
+        let source = source_path.to_string_lossy().to_string();
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS structural_cache_source",
+            params![source],
+        )?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO structural_text_artifact_cache (
+                file_path, file_id, cache_key, source_content_hash,
+                descriptor_version, producer, artifact_digest, artifact_blob,
+                updated_at_epoch_ms
+             )
+             SELECT file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
+             FROM structural_cache_source.structural_text_artifact_cache",
+            [],
+        );
+        let detach_result = self
+            .conn
+            .execute("DETACH DATABASE structural_cache_source", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
+    }
+
     pub fn has_ready_resolution_support_snapshot(
         &self,
         snapshot_version: i64,
@@ -1818,8 +4052,25 @@ impl Storage {
             snapshot_version,
             GroundingSnapshotState::Ready.db_value()
         ])?;
-        if let Some(row) = rows.next()? {
-            return Ok(Some(row.get(0)?));
+        let row = match rows.next() {
+            Ok(row) => row,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ffi::ErrorCode::TooBig =>
+            {
+                return Err(StorageError::ResolutionSupportSnapshotTooBig);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(row) = row {
+            return match row.get(0) {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ffi::ErrorCode::TooBig =>
+                {
+                    Err(StorageError::ResolutionSupportSnapshotTooBig)
+                }
+                Err(error) => Err(error.into()),
+            };
         }
         Ok(None)
     }
@@ -1829,7 +4080,7 @@ impl Storage {
         snapshot_version: i64,
         snapshot_blob: &[u8],
     ) -> Result<(), StorageError> {
-        self.conn.execute(
+        let result = self.conn.execute(
             "INSERT INTO resolution_support_snapshot (
                 id,
                 snapshot_version,
@@ -1849,12 +4100,22 @@ impl Storage {
                 snapshot_blob,
                 current_epoch_ms()
             ],
-        )?;
-        Ok(())
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ffi::ErrorCode::TooBig =>
+            {
+                Err(StorageError::ResolutionSupportSnapshotTooBig)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
-    pub fn invalidate_resolution_support_snapshot(&self) -> Result<(), StorageError> {
-        self.conn.execute(
+    fn invalidate_resolution_support_snapshot_on(
+        connection: &Connection,
+    ) -> Result<usize, StorageError> {
+        Ok(connection.execute(
             "INSERT INTO resolution_support_snapshot (
                 id,
                 snapshot_version,
@@ -1868,7 +4129,11 @@ impl Storage {
                 snapshot_blob = NULL,
                 built_at_epoch_ms = NULL",
             params![GroundingSnapshotState::Dirty.db_value()],
-        )?;
+        )?)
+    }
+
+    pub fn invalidate_resolution_support_snapshot(&self) -> Result<(), StorageError> {
+        Self::invalidate_resolution_support_snapshot_on(&self.conn)?;
         Ok(())
     }
 
@@ -1895,8 +4160,10 @@ impl Storage {
         self.grounding_snapshot_metadata()
     }
 
-    fn ensure_grounding_snapshot_meta_row(&self) -> Result<(), StorageError> {
-        self.conn.execute(
+    fn ensure_grounding_snapshot_meta_row_on(
+        connection: &Connection,
+    ) -> Result<usize, StorageError> {
+        Ok(connection.execute(
             "INSERT OR IGNORE INTO grounding_snapshot_meta (
                 id,
                 snapshot_version,
@@ -1910,19 +4177,23 @@ impl Storage {
                 GROUNDING_SNAPSHOT_VERSION,
                 GroundingSnapshotState::Dirty.db_value()
             ],
-        )?;
+        )?)
+    }
+
+    fn ensure_grounding_snapshot_meta_row(&self) -> Result<(), StorageError> {
+        Self::ensure_grounding_snapshot_meta_row_on(&self.conn)?;
         Ok(())
     }
 
-    fn write_grounding_snapshot_states(
-        &self,
+    fn write_grounding_snapshot_states_on(
+        connection: &Connection,
         summary_state: GroundingSnapshotState,
         detail_state: GroundingSnapshotState,
         summary_built_at_epoch_ms: Option<i64>,
         detail_built_at_epoch_ms: Option<i64>,
-    ) -> Result<(), StorageError> {
-        self.ensure_grounding_snapshot_meta_row()?;
-        self.conn.execute(
+    ) -> Result<usize, StorageError> {
+        let mut affected = Self::ensure_grounding_snapshot_meta_row_on(connection)?;
+        affected = affected.saturating_add(connection.execute(
             "UPDATE grounding_snapshot_meta
              SET snapshot_version = ?1,
                  summary_state = ?2,
@@ -1937,6 +4208,23 @@ impl Storage {
                 summary_built_at_epoch_ms,
                 detail_built_at_epoch_ms,
             ],
+        )?);
+        Ok(affected)
+    }
+
+    fn write_grounding_snapshot_states(
+        &self,
+        summary_state: GroundingSnapshotState,
+        detail_state: GroundingSnapshotState,
+        summary_built_at_epoch_ms: Option<i64>,
+        detail_built_at_epoch_ms: Option<i64>,
+    ) -> Result<(), StorageError> {
+        Self::write_grounding_snapshot_states_on(
+            &self.conn,
+            summary_state,
+            detail_state,
+            summary_built_at_epoch_ms,
+            detail_built_at_epoch_ms,
         )?;
         Ok(())
     }
@@ -1967,8 +4255,14 @@ impl Storage {
     }
 
     pub fn invalidate_grounding_snapshots(&self) -> Result<(), StorageError> {
-        self.mark_grounding_snapshots_dirty()?;
-        self.invalidate_resolution_support_snapshot()?;
+        Self::write_grounding_snapshot_states_on(
+            &self.conn,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        Self::invalidate_resolution_support_snapshot_on(&self.conn)?;
         Ok(())
     }
 
@@ -2102,6 +4396,54 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    /// Whether one file owns a complete dedicated OpenAPI endpoint projection.
+    ///
+    /// This stays file-scoped and bounded in SQLite rather than loading graph
+    /// rows into memory. The member edge and definition occurrence authenticate
+    /// the endpoint node as output from the dedicated collector.
+    pub fn has_file_owned_openapi_endpoint_projection(
+        &self,
+        file_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM file f
+                    JOIN node file_node
+                      ON file_node.id = f.id
+                     AND file_node.kind = ?2
+                     AND file_node.serialized_name = f.path
+                    JOIN node endpoint
+                      ON endpoint.file_node_id = file_node.id
+                     AND endpoint.kind = ?3
+                     AND endpoint.canonical_id LIKE 'openapi:endpoint:%'
+                     AND length(endpoint.canonical_id) > length('openapi:endpoint:')
+                    JOIN edge member
+                      ON member.source_node_id = file_node.id
+                     AND member.target_node_id = endpoint.id
+                     AND member.file_node_id = file_node.id
+                     AND member.kind = ?4
+                    JOIN occurrence definition
+                      ON definition.element_id = endpoint.id
+                     AND definition.file_node_id = file_node.id
+                     AND definition.kind = ?5
+                    WHERE f.id = ?1
+                    LIMIT 1
+                 )",
+                params![
+                    file_id,
+                    NodeKind::FILE as i32,
+                    NodeKind::FUNCTION as i32,
+                    EdgeKind::MEMBER as i32,
+                    OccurrenceKind::DEFINITION as i32,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(StorageError::from)
+    }
+
     pub(crate) fn get_file_content_hashes(&self) -> Result<HashMap<i64, String>, StorageError> {
         let mut stmt = self
             .conn
@@ -2112,9 +4454,20 @@ impl Storage {
     }
 
     pub fn refresh_grounding_summary_snapshots(&self) -> Result<(), StorageError> {
-        let rank_sql = grounding_node_rank_sql("n");
-        let display_name = grounding_display_name_expr("n");
-        let indexable = grounding_indexable_predicate("n");
+        self.refresh_grounding_summary_snapshots_impl(false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn refresh_grounding_summary_snapshots_for_staged_finalize(
+        &self,
+    ) -> Result<Duration, StorageError> {
+        self.refresh_grounding_summary_snapshots_impl(self.deferred_secondary_indexes)
+    }
+
+    fn refresh_grounding_summary_snapshots_impl(
+        &self,
+        build_node_file_rank_index: bool,
+    ) -> Result<Duration, StorageError> {
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
@@ -2145,105 +4498,19 @@ impl Storage {
         tx.execute("DELETE FROM grounding_node_summary_snapshot", [])?;
         tx.execute("DELETE FROM grounding_node_edge_digest_snapshot", [])?;
 
-        let node_snapshot_sql = format!(
-            "WITH indexable_nodes AS (
-                SELECT
-                    n.id,
-                    n.kind,
-                    n.serialized_name,
-                    n.qualified_name,
-                    n.canonical_id,
-                    n.file_node_id,
-                    n.start_line,
-                    n.start_col,
-                    n.end_line,
-                    n.end_col,
-                    {display_name} AS display_name,
-                    COALESCE(f.path, file_node.serialized_name) AS file_path,
-                    {rank_sql} AS node_rank,
-                    COALESCE(n.start_line, 2147483647) AS sort_start_line,
-                    CASE
-                        WHEN EXISTS (
-                            SELECT 1
-                            FROM edge e
-                            WHERE e.kind = {member_kind}
-                              AND e.target_node_id = n.id
-                        ) THEN 0
-                        ELSE 1
-                    END AS is_root,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY n.file_node_id
-                        ORDER BY
-                            {rank_sql},
-                            COALESCE(n.start_line, 2147483647),
-                            {display_name},
-                            n.id
-                    ) AS file_symbol_rank
-                FROM node n
-                LEFT JOIN file f ON f.id = n.file_node_id
-                LEFT JOIN node file_node
-                    ON file_node.id = n.file_node_id
-                   AND file_node.kind = {file_kind}
-                WHERE {indexable}
-            )
-            INSERT INTO grounding_node_snapshot (
-                node_id,
-                kind,
-                serialized_name,
-                qualified_name,
-                canonical_id,
-                file_node_id,
-                start_line,
-                start_col,
-                end_line,
-                end_col,
-                display_name,
-                file_path,
-                node_rank,
-                sort_start_line,
-                is_root,
-                file_symbol_rank
-            )
-            SELECT
-                id,
-                kind,
-                serialized_name,
-                qualified_name,
-                canonical_id,
-                file_node_id,
-                start_line,
-                start_col,
-                end_line,
-                end_col,
-                display_name,
-                file_path,
-                node_rank,
-                sort_start_line,
-                is_root,
-                file_symbol_rank
-            FROM indexable_nodes",
-            member_kind = EdgeKind::MEMBER as i32,
-            file_kind = NodeKind::FILE as i32,
-        );
+        let node_snapshot_sql = grounding_node_snapshot_insert_sql();
         tx.execute(&node_snapshot_sql, [])?;
 
+        let node_file_rank_index_duration = if build_node_file_rank_index {
+            let started = Instant::now();
+            schema::create_grounding_node_file_rank_index(&tx)?;
+            started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+
         let file_snapshot_sql = format!(
-            "WITH all_files AS (
-                SELECT id, path, language, modification_time, indexed, complete, line_count
-                FROM file
-                UNION ALL
-                SELECT
-                    n.id,
-                    n.serialized_name,
-                    '',
-                    0,
-                    1,
-                    1,
-                    0
-                FROM node n
-                WHERE n.kind = {file_kind}
-                  AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
-            )
+            "{}
             INSERT INTO grounding_file_snapshot (
                 file_id,
                 path,
@@ -2255,28 +4522,9 @@ impl Storage {
                 symbol_count,
                 best_node_rank
             )
-            SELECT
-                f.id,
-                f.path,
-                f.language,
-                f.modification_time,
-                f.indexed,
-                f.complete,
-                f.line_count,
-                COUNT(gs.node_id) AS symbol_count,
-                MIN(CASE WHEN gs.node_id IS NULL THEN 255 ELSE gs.node_rank END) AS best_node_rank
-            FROM all_files f
-            LEFT JOIN grounding_node_snapshot gs
-              ON gs.file_node_id = f.id
-            GROUP BY
-                f.id,
-                f.path,
-                f.language,
-                f.modification_time,
-                f.indexed,
-                f.complete,
-                f.line_count",
-            file_kind = NodeKind::FILE as i32,
+            {}",
+            grounding_file_snapshot_cte_sql(),
+            GROUNDING_FILE_SNAPSHOT_SELECT_SQL,
         );
         tx.execute(&file_snapshot_sql, [])?;
 
@@ -2296,7 +4544,7 @@ impl Storage {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(node_file_rank_index_duration)
     }
 
     pub fn hydrate_grounding_detail_snapshots(&self) -> Result<(), StorageError> {
@@ -2482,9 +4730,17 @@ impl Storage {
     pub fn clear(&self) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM callable_projection_state", [])?;
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        tx.execute("DELETE FROM structural_text_unit", [])?;
+        tx.execute("DELETE FROM structural_text_projection", [])?;
+        tx.execute("DELETE FROM structural_text_artifact_cache", [])?;
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
+        tx.execute("DELETE FROM dense_anchor_input", [])?;
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion", [])?;
         tx.execute("DELETE FROM symbol_search_doc", [])?;
         tx.execute("DELETE FROM symbol_summary", [])?;
         tx.execute("DELETE FROM search_symbol_projection", [])?;
@@ -2602,6 +4858,18 @@ impl Storage {
                 OR instr(COALESCE(file_path, ''), ?1) > 0
                 OR instr(doc_text, ?1) > 0
                 OR instr(source_provenance, ?1) > 0",
+            "UPDATE dense_anchor_input
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                source_provenance = replace(source_provenance, ?1, ?2),
+                document_text = replace(document_text, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(source_provenance, ?1) > 0
+                OR instr(document_text, ?1) > 0",
             "UPDATE search_symbol_projection
              SET display_name = replace(display_name, ?1, ?2)
              WHERE instr(display_name, ?1) > 0",
@@ -2624,6 +4892,16 @@ impl Storage {
             updated =
                 updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
         }
+        // Dense anchor rows have been rebound to a different project identity. Keep them
+        // available as incremental inputs, but require core indexing to publish a new,
+        // internally consistent manifest before retrieval can consume them.
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        // Structural placement identity is file-scoped. A rehydrated project must
+        // recollect verified units rather than relabel path-bound rows.
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        tx.execute("DELETE FROM structural_text_unit", [])?;
+        tx.execute("DELETE FROM structural_text_projection", [])?;
+        tx.execute("DELETE FROM structural_text_artifact_cache", [])?;
         tx.commit()?;
         Ok(updated)
     }
@@ -2674,6 +4952,7 @@ impl Storage {
             "SELECT COUNT(*) FROM error WHERE message LIKE ?1",
             "SELECT COUNT(*) FROM llm_symbol_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1",
             "SELECT COUNT(*) FROM symbol_search_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1 OR source_provenance LIKE ?1",
+            "SELECT COUNT(*) FROM dense_anchor_input WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR source_provenance LIKE ?1 OR document_text LIKE ?1",
             "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
             "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
             "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
@@ -2687,11 +4966,60 @@ impl Storage {
     }
 
     pub fn finalize_staged_snapshot(&self) -> Result<(), StorageError> {
-        self.refresh_grounding_summary_snapshots()?;
         if self.deferred_secondary_indexes {
-            schema::create_deferred_indexes(&self.conn)?;
+            self.prepare_deferred_secondary_indexes_for_summary()?;
+            self.refresh_grounding_summary_snapshots_for_staged_finalize()?;
+            self.complete_deferred_secondary_indexes_after_summary()?;
+        } else {
+            self.refresh_grounding_summary_snapshots()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn seal_disposable_full_build(
+        &self,
+    ) -> Result<Option<DisposableFullBuildSealStats>, StorageError> {
+        if self.durability_profile != SqliteDurabilityProfile::DisposableFullBuild {
+            return Ok(None);
+        }
+
+        let checkpoint_started = Instant::now();
+        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 || log_frames != 0 || checkpointed_frames != 0 {
+            return Err(StorageError::Other(format!(
+                "Disposable full-refresh WAL seal did not complete: busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}"
+            )));
+        }
+        let checkpoint_ms = checkpoint_started
+            .elapsed()
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+
+        let path = self.conn.path().ok_or_else(|| {
+            StorageError::Other(
+                "Disposable full-refresh WAL seal requires file-backed storage".to_string(),
+            )
+        })?;
+        let sync_started = Instant::now();
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                promotion_path_error("sync staged database", Path::new(path), error)
+            })?;
+        sync_promotion_parent(Path::new(path))?;
+        let sync_ms = sync_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        Ok(Some(DisposableFullBuildSealStats {
+            wal_autocheckpoint_bytes: DISPOSABLE_FULL_BUILD_WAL_AUTOCHECKPOINT_BYTES,
+            checkpoint_ms,
+            sync_ms,
+        }))
     }
 
     pub fn create_deferred_secondary_indexes(&self) -> Result<(), StorageError> {
@@ -2701,10 +5029,44 @@ impl Storage {
         Ok(())
     }
 
+    /// Create only the edge endpoint indexes needed by staged semantic context reads.
+    ///
+    /// Live stores already have the complete secondary schema. Build stores defer
+    /// these indexes until semantic projection to keep the ingestion write path lean.
+    pub fn create_semantic_context_endpoint_indexes_for_build(&self) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::create_semantic_context_endpoint_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_deferred_secondary_indexes_for_summary(
+        &self,
+    ) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::drop_grounding_summary_destination_indexes(&self.conn)?;
+            schema::create_pre_summary_secondary_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_deferred_secondary_indexes_after_summary(
+        &self,
+    ) -> Result<(), StorageError> {
+        if self.deferred_secondary_indexes {
+            schema::create_post_summary_destination_indexes(&self.conn)?;
+        }
+        Ok(())
+    }
+
     pub fn promote_staged_snapshot(
         staged_path: &Path,
         live_path: &Path,
-    ) -> Result<(), StorageError> {
+    ) -> Result<CorePromotionStats, StorageError> {
+        let promotion_started = Instant::now();
+        let mut durations = CorePromotionDurations::default();
+
+        let lock_recovery_started = Instant::now();
         let _promotion_lock = PromotionLock::acquire(live_path)?;
         recover_interrupted_promotion_locked(live_path)?;
         if promotion_artifacts_exist(live_path) {
@@ -2716,14 +5078,53 @@ impl Storage {
         let backup_path = live_path.with_extension("sqlite.backup");
         let prepared_path = promotion_prepared_journal_path(live_path);
         let committed_path = promotion_committed_journal_path(live_path);
+        durations.lock_recovery = lock_recovery_started.elapsed();
+
+        let candidate_validation_started = Instant::now();
         let candidate = require_complete_promotion_database_identity(
             staged_path,
             "Staged promotion candidate",
         )?;
-        let previous = read_recovery_database_identity(live_path)?;
-        cleanup_sqlite_sidecars(&backup_path)?;
+        let candidate_source_policy =
+            read_source_policy_exclusion_rollback_identity(staged_path, &candidate)?;
+        if candidate_source_policy.is_none() {
+            return Err(promotion_error(format!(
+                "Staged promotion candidate {} has no complete source policy exclusion manifest",
+                staged_path.display()
+            )));
+        }
+        let candidate_structural_text =
+            read_structural_text_unit_rollback_identity(staged_path, &candidate)?;
+        if candidate_structural_text.is_none() {
+            return Err(promotion_error(format!(
+                "Staged promotion candidate {} has no complete structural text unit manifest",
+                staged_path.display()
+            )));
+        }
+        let candidate_bytes = database_logical_bytes_at_path(staged_path)?;
+        durations.candidate_validation = candidate_validation_started.elapsed();
 
+        let previous_validation_started = Instant::now();
+        let recovery_contract = RecoveryDatabaseContract::CurrentPromotion;
+        let previous = read_recovery_database_identity(live_path, recovery_contract)?;
+        let previous_source_policy = match previous.as_ref() {
+            Some(previous) => read_source_policy_exclusion_rollback_identity(live_path, previous)?,
+            None => None,
+        };
+        let previous_structural_text = match previous.as_ref() {
+            Some(previous) => read_structural_text_unit_rollback_identity(live_path, previous)?,
+            None => None,
+        };
+        cleanup_sqlite_sidecars(&backup_path)?;
+        let previous_live_bytes = previous
+            .as_ref()
+            .map(|_| database_logical_bytes_at_path(live_path))
+            .transpose()?;
+        durations.previous_validation = previous_validation_started.elapsed();
+
+        let mut rollback_backup_bytes = None;
         if previous.is_some() {
+            let rollback_backup_copy_started = Instant::now();
             let live_conn = Connection::open(live_path)?;
             let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
             live_conn.backup(
@@ -2732,30 +5133,62 @@ impl Storage {
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
             drop(live_conn);
-            let backup_identity =
-                require_recovery_database_identity(&backup_path, "Promotion backup")?;
+            durations.rollback_backup_copy = Some(rollback_backup_copy_started.elapsed());
+
+            let backup_validation_started = Instant::now();
+            let backup_identity = require_recovery_database_identity(
+                &backup_path,
+                "Promotion backup",
+                recovery_contract,
+            )?;
             if Some(&backup_identity) != previous.as_ref() {
                 return Err(promotion_error(format!(
                     "Promotion backup identity does not match live database {}",
                     live_path.display()
                 )));
             }
+            require_recorded_source_policy_identity(
+                &backup_path,
+                &backup_identity,
+                &previous_source_policy,
+                "Promotion backup",
+            )?;
+            require_recorded_structural_text_identity(
+                &backup_path,
+                &backup_identity,
+                &previous_structural_text,
+                "Promotion backup",
+            )?;
+            rollback_backup_bytes = Some(database_logical_bytes_at_path(&backup_path)?);
+            durations.backup_validation = Some(backup_validation_started.elapsed());
         }
 
         let prepared = PromotionJournal {
             version: PROMOTION_JOURNAL_VERSION,
             previous: previous.clone(),
             candidate: candidate.clone(),
+            previous_source_policy,
+            candidate_source_policy: candidate_source_policy.clone(),
+            previous_structural_text,
+            candidate_structural_text: candidate_structural_text.clone(),
         };
-        if let Err(error) = write_promotion_journal(&prepared_path, &prepared) {
-            if !prepared_path.exists() {
-                let _ = cleanup_sqlite_sidecars(&backup_path);
+        let journal_write_stats = match write_promotion_journal(&prepared_path, &prepared) {
+            Ok(stats) => stats,
+            Err(error) => {
+                if !prepared_path.exists() {
+                    let _ = cleanup_sqlite_sidecars(&backup_path);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
+        durations.prepared_journal_write = journal_write_stats.write;
+        durations.prepared_journal_file_sync = journal_write_stats.file_sync;
+        durations.prepared_journal_directory_sync = journal_write_stats.directory_sync;
 
+        let staged_to_live_restore_started = Instant::now();
         let mut live_conn = Connection::open(live_path)?;
         let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
+        live_conn.pragma_update(None, "synchronous", "FULL")?;
 
         #[cfg(test)]
         let restore_result = if let Some(sentinel_path) =
@@ -2791,7 +5224,9 @@ impl Storage {
             )));
         }
         drop(live_conn);
+        durations.staged_to_live_restore = staged_to_live_restore_started.elapsed();
 
+        let promoted_validation_started = Instant::now();
         let published =
             require_complete_promotion_database_identity(live_path, "Promoted live database")?;
         if published != candidate {
@@ -2801,14 +5236,36 @@ impl Storage {
                 staged_path.display()
             )));
         }
+        if let Err(error) = require_candidate_source_policy_identity(
+            live_path,
+            &published,
+            &candidate_source_policy,
+            "Promoted live database",
+        ) {
+            let _ = rollback_prepared_promotion(live_path, &prepared);
+            return Err(error);
+        }
+        if let Err(error) = require_candidate_structural_text_identity(
+            live_path,
+            &published,
+            &candidate_structural_text,
+            "Promoted live database",
+        ) {
+            let _ = rollback_prepared_promotion(live_path, &prepared);
+            return Err(error);
+        }
+        durations.promoted_validation = promoted_validation_started.elapsed();
 
+        let committed_journal_started = Instant::now();
         if let Err(error) = commit_promotion_journal(&prepared_path, &committed_path) {
             if !committed_path.exists() {
                 let _ = rollback_prepared_promotion(live_path, &prepared);
             }
             return Err(error);
         }
+        durations.committed_journal = committed_journal_started.elapsed();
 
+        let cleanup_started = Instant::now();
         if let Err(error) = cleanup_sqlite_sidecars(staged_path) {
             tracing::warn!(
                 staged_path = %staged_path.display(),
@@ -2823,7 +5280,13 @@ impl Storage {
                 "committed promotion retained recovery artifacts"
             );
         }
-        Ok(())
+        durations.cleanup = cleanup_started.elapsed();
+        Ok(durations.finish(
+            promotion_started.elapsed(),
+            candidate_bytes,
+            previous_live_bytes,
+            rollback_backup_bytes,
+        ))
     }
 
     pub fn discard_staged_snapshot(staged_path: &Path) -> Result<(), StorageError> {
@@ -2914,6 +5377,9 @@ impl Storage {
     }
 
     fn grounding_file_summary_from_row(row: &Row) -> Result<GroundingFileSummary, StorageError> {
+        let file_role = row
+            .get::<_, Option<String>>(9)?
+            .map(|value| FileRole::from_db_value(&value));
         Ok(GroundingFileSummary {
             file: FileInfo {
                 id: row.get(0)?,
@@ -2923,8 +5389,9 @@ impl Storage {
                 indexed: row.get::<_, i32>(4)? != 0,
                 complete: row.get::<_, i32>(5)? != 0,
                 line_count: row.get(6)?,
-                file_role: FileRole::Source,
+                file_role: file_role.unwrap_or_default(),
             },
+            file_role,
             symbol_count: clamp_i64_to_u32(row.get::<_, i64>(7)?),
             best_node_rank: row.get::<_, i64>(8)?.min(u8::MAX as i64) as u8,
         })
@@ -3112,6 +5579,7 @@ impl Storage {
                 Self::insert_node_with_stmt(&mut stmt, node)?;
             }
         }
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
         tx.commit()?;
 
         // Update cache
@@ -3233,6 +5701,22 @@ impl Storage {
                )",
             [],
         )?;
+        let removed_anchor_inputs = tx.execute(
+            "DELETE FROM dense_anchor_input
+             WHERE node_id IN (
+                 SELECT id FROM node
+                 WHERE serialized_name LIKE 'component_report:%'
+                    OR canonical_id LIKE 'codestory:component_report:%'
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM temp.retrieval_artifact_dense_keep keep
+                   WHERE keep.node_id = dense_anchor_input.node_id
+               )",
+            [],
+        )?;
+        if removed_anchor_inputs > 0 {
+            tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        }
         let removed_symbol = tx.execute(
             "DELETE FROM symbol_search_doc
              WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
@@ -3269,7 +5753,9 @@ impl Storage {
         }
         drop(cache);
         self.invalidate_grounding_snapshots()?;
-        Ok(removed_dense.saturating_add(removed_symbol))
+        Ok(removed_dense
+            .saturating_add(removed_anchor_inputs)
+            .saturating_add(removed_symbol))
     }
 
     pub fn copy_retrieval_artifact_nodes_from(
@@ -3396,6 +5882,75 @@ impl Storage {
         Ok(nodes)
     }
 
+    /// Reads one deterministic page of accepted node kinds from a staged build.
+    ///
+    /// `NOT INDEXED` keeps the keyset traversal on the node table's integer
+    /// primary key even after deferred secondary indexes are created. This
+    /// method neither consults nor populates `StorageCache`.
+    pub fn get_nodes_by_kinds_batch_after_for_build(
+        &self,
+        accepted_kinds: &[NodeKind],
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<Node>, StorageError> {
+        const OPERATION: &str = "get_nodes_by_kinds_batch_after_for_build";
+        self.require_build_mode(OPERATION)?;
+        let limit = build_node_batch_limit(OPERATION, limit)?;
+        let accepted_kind_values = accepted_node_kind_values(accepted_kinds);
+        if accepted_kind_values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = nodes_by_kinds_batch_sql(accepted_kind_values.len(), after_node_id.is_some());
+        let mut query_params = accepted_kind_values
+            .into_iter()
+            .map(Value::Integer)
+            .collect::<Vec<_>>();
+        if let Some(after_node_id) = after_node_id {
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        query_params.push(Value::Integer(limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(Self::node_from_row(row)?);
+        }
+        Ok(nodes)
+    }
+
+    /// Returns the complete sorted file-node ID set for accepted staged-build nodes.
+    ///
+    /// The table scan projects only integer IDs and deduplicates them in a
+    /// bounded set rather than loading node payloads or touching `StorageCache`.
+    pub fn get_node_file_ids_by_kinds_for_build(
+        &self,
+        accepted_kinds: &[NodeKind],
+    ) -> Result<Vec<NodeId>, StorageError> {
+        const OPERATION: &str = "get_node_file_ids_by_kinds_for_build";
+        self.require_build_mode(OPERATION)?;
+        let accepted_kind_values = accepted_node_kind_values(accepted_kinds);
+        if accepted_kind_values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let kind_placeholders = question_placeholders(accepted_kind_values.len());
+        let sql = format!(
+            "SELECT file_node_id
+             FROM node NOT INDEXED
+             WHERE kind IN ({kind_placeholders})
+               AND file_node_id IS NOT NULL"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(accepted_kind_values))?;
+        let mut file_node_ids = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            file_node_ids.insert(NodeId(row.get(0)?));
+        }
+        Ok(file_node_ids.into_iter().collect())
+    }
+
     pub fn get_edges(&self) -> Result<Vec<Edge>, StorageError> {
         let mut stmt = self
             .conn
@@ -3486,6 +6041,89 @@ impl Storage {
         }
 
         Ok(edges_by_node)
+    }
+
+    /// Reads one edge-ID-ordered batch incident to at most 200 staged-build seed nodes.
+    ///
+    /// Runtime callers keyset through one seed chunk until it is exhausted, then
+    /// discard the edge and endpoint payload before advancing. CALL resolution
+    /// filtering is identical to [`Self::get_edges_for_node_ids`].
+    pub fn get_edges_for_node_ids_batch_after_for_build(
+        &self,
+        node_ids: &[NodeId],
+        after_edge_id: Option<EdgeId>,
+        limit: usize,
+    ) -> Result<Vec<Edge>, StorageError> {
+        const OPERATION: &str = "get_edges_for_node_ids_batch_after_for_build";
+        self.require_build_mode(OPERATION)?;
+        let limit = build_node_batch_limit(OPERATION, limit)?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|node_id| node_id.0);
+        unique_node_ids.dedup();
+        if unique_node_ids.len() > BUILD_EDGE_SEED_BATCH_SIZE {
+            return Err(StorageError::BuildEdgeSeedBatchTooLarge {
+                operation: OPERATION,
+                actual: unique_node_ids.len(),
+                maximum: BUILD_EDGE_SEED_BATCH_SIZE,
+            });
+        }
+
+        let seed_count = unique_node_ids.len();
+        let source_placeholders = numbered_placeholders(1, seed_count);
+        let target_placeholders = numbered_placeholders(1 + seed_count, seed_count);
+        let resolved_source_placeholders = numbered_placeholders(1 + seed_count * 2, seed_count);
+        let resolved_target_placeholders = numbered_placeholders(1 + seed_count * 3, seed_count);
+        let after_placeholder = seed_count * 4 + 1;
+        let limit_placeholder = after_placeholder + usize::from(after_edge_id.is_some());
+        let after_clause = if after_edge_id.is_some() {
+            format!("AND e.id > ?{after_placeholder}")
+        } else {
+            String::new()
+        };
+        let query = format!(
+            "{EDGE_SELECT_BASE}
+             WHERE (
+                    e.source_node_id IN ({source_placeholders})
+                 OR e.target_node_id IN ({target_placeholders})
+                 OR e.resolved_source_node_id IN ({resolved_source_placeholders})
+                 OR e.resolved_target_node_id IN ({resolved_target_placeholders})
+             )
+               {after_clause}
+             ORDER BY e.id
+             LIMIT ?{limit_placeholder}"
+        );
+        let mut params = unique_node_ids
+            .iter()
+            .map(|id| Value::from(id.0))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .chain(unique_node_ids.iter().map(|id| Value::from(id.0)))
+            .collect::<Vec<_>>();
+        if let Some(after_edge_id) = after_edge_id {
+            params.push(Value::from(after_edge_id.0));
+        }
+        params.push(Value::from(limit));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut edge = Self::edge_from_row(row)?;
+            let target_symbol: String = row.get(12)?;
+            if edge.kind == EdgeKind::CALL
+                && edge.resolved_target.is_some()
+                && should_ignore_call_resolution(&target_symbol, edge.certainty, edge.confidence)
+            {
+                edge.resolved_target = None;
+                edge.confidence = None;
+                edge.certainty = None;
+            }
+            edges.push(edge);
+        }
+        Ok(edges)
     }
 
     pub fn get_present_node_kinds(&self) -> Result<Vec<NodeKind>, StorageError> {
@@ -3624,12 +6262,32 @@ impl Storage {
         if batch.files.is_empty()
             && batch.file_content_hashes.is_empty()
             && batch.nodes.is_empty()
+            && batch.structural_text_units.is_empty()
+            && batch.structural_text_projections.is_empty()
+            && batch.structural_text_cache_writes.is_empty()
             && batch.edges.is_empty()
             && batch.occurrences.is_empty()
             && batch.component_access.is_empty()
             && batch.callable_projection_states.is_empty()
+            && batch.file_errors.is_empty()
         {
             return Ok(breakdown);
+        }
+
+        let batch_file_ids = batch
+            .files
+            .iter()
+            .map(|file| file.id)
+            .collect::<HashSet<_>>();
+        if let Some(error) = batch.file_errors.iter().find(|error| {
+            error
+                .file_id
+                .is_none_or(|file_id| !batch_file_ids.contains(&file_id.0))
+        }) {
+            return Err(StorageError::Other(format!(
+                "projection file error {:?} does not belong to a file in its batch",
+                error.file_id.map(|file_id| file_id.0)
+            )));
         }
 
         let nodes_prepare_started = std::time::Instant::now();
@@ -3649,20 +6307,37 @@ impl Storage {
             .iter()
             .map(|identity| (identity.file_id, identity.content_hash.as_str()))
             .collect::<HashMap<_, _>>();
+        let transaction_started = std::time::Instant::now();
+        let transaction_setup_started = std::time::Instant::now();
         let tx = self.conn.transaction()?;
+        breakdown.persistence.transactions = 1;
+        breakdown.persistence.transaction_setup_ms =
+            clamp_i64_to_u32(transaction_setup_started.elapsed().as_millis() as i64);
 
         if !batch.files.is_empty() {
+            let file_errors_started = std::time::Instant::now();
             let placeholders = question_placeholders(batch.files.len());
             tx.execute(
                 &format!("DELETE FROM error WHERE file_id IN ({placeholders})"),
                 params_from_iter(batch.files.iter().map(|file| file.id)),
             )?;
+            record_projection_statement(
+                &mut breakdown.persistence.file_errors,
+                batch.files.len().min(u64::MAX as usize) as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
+            breakdown.persistence.file_errors.wall_ms =
+                clamp_i64_to_u32(file_errors_started.elapsed().as_millis() as i64);
 
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
                 "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role, content_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
+                    language=CASE
+                        WHEN excluded.complete = 1 THEN excluded.language
+                        ELSE file.language
+                    END,
                     modification_time=excluded.modification_time,
                     indexed=excluded.indexed,
                     complete=excluded.complete,
@@ -3682,8 +6357,20 @@ impl Storage {
                     info.file_role.as_str(),
                     file_content_hashes.get(&info.id).copied(),
                 ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.files,
+                    1,
+                    projection_scalar_binds(5)
+                        .saturating_add(projection_path_bind_bytes(&info.path))
+                        .saturating_add(projection_text_bind_bytes(&info.language))
+                        .saturating_add(projection_text_bind_bytes(info.file_role.as_str()))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            file_content_hashes.get(&info.id).copied(),
+                        )),
+                );
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.files.wall_ms = breakdown.files_ms;
         }
 
         if !prepared_nodes.is_empty() {
@@ -3717,11 +6404,221 @@ impl Storage {
                         node.id.0, node.kind, node.serialized_name, node.file_node_id.map(|id| id.0)
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.nodes,
+                    1,
+                    projection_scalar_binds(2)
+                        .saturating_add(projection_text_bind_bytes(&node.serialized_name))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            node.qualified_name.as_deref(),
+                        ))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            node.canonical_id.as_deref(),
+                        ))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.file_node_id))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.start_line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.start_col))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.end_line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(node.end_col)),
+                );
             }
-            breakdown.nodes_ms = nodes_prepare_ms.saturating_add(clamp_i64_to_u32(
-                nodes_insert_started.elapsed().as_millis() as i64,
-            ));
+            let nodes_insert_ms =
+                clamp_i64_to_u32(nodes_insert_started.elapsed().as_millis() as i64);
+            breakdown.nodes_ms = nodes_prepare_ms.saturating_add(nodes_insert_ms);
+            breakdown.persistence.nodes.wall_ms = nodes_insert_ms;
         }
+
+        let structural_started = std::time::Instant::now();
+        if !batch.files.is_empty() {
+            let placeholders = question_placeholders(batch.files.len());
+            tx.execute(
+                &format!("DELETE FROM structural_text_unit WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+            record_projection_statement(
+                &mut breakdown.persistence.structural_text,
+                batch.files.len().min(u64::MAX as usize) as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
+            tx.execute(
+                &format!(
+                    "DELETE FROM structural_text_projection WHERE file_id IN ({placeholders})"
+                ),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+            record_projection_statement(
+                &mut breakdown.persistence.structural_text,
+                batch.files.len().min(u64::MAX as usize) as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
+        }
+        if !batch.structural_text_units.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_text_unit (
+                    node_id, file_id, placement_id, content_hash, source_content_hash,
+                    descriptor_version, producer, evidence_tier, resolution, language,
+                    kind, start_line, start_col, end_line, end_col, file_role
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                 )",
+            )?;
+            for unit in batch.structural_text_units {
+                let Some(expected_source_hash) = file_content_hashes.get(&unit.file_id) else {
+                    return Err(StorageError::Other(format!(
+                        "structural text unit {} has no verified file hash in its projection batch",
+                        unit.node_id.0
+                    )));
+                };
+                if *expected_source_hash != unit.source_content_hash {
+                    return Err(StorageError::Other(format!(
+                        "structural text unit {} does not match its verified file hash",
+                        unit.node_id.0
+                    )));
+                }
+                stmt.execute(params![
+                    unit.node_id.0,
+                    unit.file_id,
+                    &unit.placement_id,
+                    &unit.content_hash,
+                    &unit.source_content_hash,
+                    unit.descriptor_version as i64,
+                    &unit.producer,
+                    &unit.evidence_tier,
+                    &unit.resolution,
+                    &unit.language,
+                    unit.kind as i32,
+                    unit.start_line,
+                    unit.start_col,
+                    unit.end_line,
+                    unit.end_col,
+                    unit.file_role.as_str(),
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.structural_text,
+                    1,
+                    projection_scalar_binds(8)
+                        .saturating_add(projection_text_bind_bytes(&unit.placement_id))
+                        .saturating_add(projection_text_bind_bytes(&unit.content_hash))
+                        .saturating_add(projection_text_bind_bytes(&unit.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&unit.producer))
+                        .saturating_add(projection_text_bind_bytes(&unit.evidence_tier))
+                        .saturating_add(projection_text_bind_bytes(&unit.resolution))
+                        .saturating_add(projection_text_bind_bytes(&unit.language))
+                        .saturating_add(projection_text_bind_bytes(unit.file_role.as_str())),
+                );
+            }
+            breakdown.structural_text_units_ms =
+                clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+        }
+        if !batch.structural_text_projections.is_empty() {
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_text_projection (
+                    file_id, source_content_hash, descriptor_version, producer,
+                    language, file_role, unit_count, unit_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for projection in batch.structural_text_projections {
+                let units = batch
+                    .structural_text_units
+                    .iter()
+                    .filter(|unit| unit.file_id == projection.file_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if projection.unit_count != units.len() as u64
+                    || projection.unit_digest != structural_text_unit_digest(&units)
+                    || file_content_hashes
+                        .get(&projection.file_id)
+                        .is_none_or(|hash| *hash != projection.source_content_hash.as_str())
+                {
+                    return Err(StorageError::Other(format!(
+                        "structural text projection {} is inconsistent with its batch",
+                        projection.file_id
+                    )));
+                }
+                stmt.execute(params![
+                    projection.file_id,
+                    &projection.source_content_hash,
+                    projection.descriptor_version as i64,
+                    &projection.producer,
+                    &projection.language,
+                    projection.file_role.as_str(),
+                    projection.unit_count.min(i64::MAX as u64) as i64,
+                    &projection.unit_digest,
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.structural_text,
+                    1,
+                    projection_scalar_binds(3)
+                        .saturating_add(projection_text_bind_bytes(&projection.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&projection.producer))
+                        .saturating_add(projection_text_bind_bytes(&projection.language))
+                        .saturating_add(projection_text_bind_bytes(projection.file_role.as_str()))
+                        .saturating_add(projection_text_bind_bytes(&projection.unit_digest)),
+                );
+            }
+        }
+        if !batch.structural_text_cache_writes.is_empty() {
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_text_artifact_cache (
+                    file_path, file_id, cache_key, source_content_hash,
+                    descriptor_version, producer, artifact_digest, artifact_blob,
+                    updated_at_epoch_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(file_path) DO UPDATE SET
+                    file_id = excluded.file_id,
+                    cache_key = excluded.cache_key,
+                    source_content_hash = excluded.source_content_hash,
+                    descriptor_version = excluded.descriptor_version,
+                    producer = excluded.producer,
+                    artifact_digest = excluded.artifact_digest,
+                    artifact_blob = excluded.artifact_blob,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+            for write in batch.structural_text_cache_writes {
+                let projection = batch
+                    .structural_text_projections
+                    .iter()
+                    .find(|projection| projection.file_id == write.file_id)
+                    .ok_or_else(|| {
+                        StorageError::Other(format!(
+                            "structural cache write {} has no matching projection",
+                            write.file_id
+                        ))
+                    })?;
+                if !structural_text_artifact_cache_key_is_valid(write.cache_key) {
+                    return Err(StorageError::Other(format!(
+                        "structural cache write {} has an invalid cache key",
+                        write.file_id
+                    )));
+                }
+                let artifact_digest = format!("{:x}", Sha256::digest(write.artifact_blob));
+                stmt.execute(params![
+                    write.path.to_string_lossy().to_string(),
+                    write.file_id,
+                    write.cache_key,
+                    &projection.source_content_hash,
+                    projection.descriptor_version as i64,
+                    &projection.producer,
+                    artifact_digest,
+                    write.artifact_blob,
+                    current_epoch_ms(),
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.structural_text,
+                    1,
+                    projection_scalar_binds(3)
+                        .saturating_add(projection_path_bind_bytes(write.path))
+                        .saturating_add(projection_text_bind_bytes(write.cache_key))
+                        .saturating_add(projection_text_bind_bytes(&projection.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&projection.producer))
+                        .saturating_add(projection_text_bind_bytes(&artifact_digest))
+                        .saturating_add(write.artifact_blob.len().min(u64::MAX as usize) as u64),
+                );
+            }
+        }
+        breakdown.persistence.structural_text.wall_ms =
+            clamp_i64_to_u32(structural_started.elapsed().as_millis() as i64);
 
         if !batch.edges.is_empty() {
             let started = std::time::Instant::now();
@@ -3730,6 +6627,8 @@ impl Storage {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO NOTHING",
             )?;
             for edge in batch.edges {
+                let candidate_targets = serialize_candidate_targets(&edge.candidate_targets)?;
+                let certainty = row_mapping::certainty_db_value(edge.certainty);
                 stmt.execute(params![
                     edge.id.0,
                     edge.source.0,
@@ -3741,8 +6640,8 @@ impl Storage {
                     edge.resolved_target.map(|id| id.0),
                     edge.confidence,
                     edge.callsite_identity.as_deref(),
-                    row_mapping::certainty_db_value(edge.certainty),
-                    serialize_candidate_targets(&edge.candidate_targets)?
+                    certainty,
+                    &candidate_targets
                 ])
                 .map_err(|err| {
                     let source_label = pending_node_labels
@@ -3771,8 +6670,26 @@ impl Storage {
                         edge.resolved_target.map(|id| id.0)
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.edges,
+                    1,
+                    projection_scalar_binds(4)
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.file_node_id))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.resolved_source))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.resolved_target))
+                        .saturating_add(projection_optional_scalar_bind_bytes(edge.confidence))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            edge.callsite_identity.as_deref(),
+                        ))
+                        .saturating_add(projection_optional_scalar_bind_bytes(certainty))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            candidate_targets.as_deref(),
+                        )),
+                );
             }
             breakdown.edges_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.edges.wall_ms = breakdown.edges_ms;
         }
 
         if !batch.occurrences.is_empty() {
@@ -3803,8 +6720,14 @@ impl Storage {
                         occ.location.end_col
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.occurrences,
+                    1,
+                    projection_scalar_binds(7),
+                );
             }
             breakdown.occurrences_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.occurrences.wall_ms = breakdown.occurrences_ms;
         }
 
         if !batch.component_access.is_empty() {
@@ -3825,8 +6748,14 @@ impl Storage {
                         node_id.0, access
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.component_access,
+                    1,
+                    projection_scalar_binds(2),
+                );
             }
             breakdown.component_access_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.component_access.wall_ms = breakdown.component_access_ms;
         }
 
         if !batch.callable_projection_states.is_empty() {
@@ -3862,12 +6791,89 @@ impl Storage {
                         state.end_line
                     ))
                 })?;
+                record_projection_statement(
+                    &mut breakdown.persistence.callable_projection,
+                    1,
+                    projection_scalar_binds(6)
+                        .saturating_add(projection_text_bind_bytes(&state.symbol_key)),
+                );
             }
             breakdown.callable_projection_ms =
                 clamp_i64_to_u32(started.elapsed().as_millis() as i64);
+            breakdown.persistence.callable_projection.wall_ms = breakdown.callable_projection_ms;
         }
 
+        if !batch.file_errors.is_empty() {
+            let started = std::time::Instant::now();
+            let mut stmt = tx.prepare(
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for error in batch.file_errors {
+                stmt.execute(params![
+                    error.message,
+                    error.file_id.map(|id| id.0),
+                    error.line,
+                    error.column,
+                    error.is_fatal as i32,
+                    (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                    error.coverage_reason.map(FileCoverageReason::as_str),
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.file_errors,
+                    1,
+                    projection_scalar_binds(2)
+                        .saturating_add(projection_text_bind_bytes(&error.message))
+                        .saturating_add(projection_optional_scalar_bind_bytes(error.file_id))
+                        .saturating_add(projection_optional_scalar_bind_bytes(error.line))
+                        .saturating_add(projection_optional_scalar_bind_bytes(error.column))
+                        .saturating_add(projection_optional_text_bind_bytes(
+                            error.coverage_reason.map(FileCoverageReason::as_str),
+                        )),
+                );
+            }
+            breakdown.persistence.file_errors.wall_ms = breakdown
+                .persistence
+                .file_errors
+                .wall_ms
+                .saturating_add(clamp_i64_to_u32(started.elapsed().as_millis() as i64));
+        }
+
+        let dirty_started = std::time::Instant::now();
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+        record_projection_statement(&mut breakdown.persistence.dirty_state, 1, 0);
+        Self::write_grounding_snapshot_states_on(
+            &tx,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        record_projection_statement(
+            &mut breakdown.persistence.dirty_state,
+            1,
+            projection_scalar_binds(2),
+        );
+        record_projection_statement(
+            &mut breakdown.persistence.dirty_state,
+            1,
+            projection_scalar_binds(3),
+        );
+        Self::invalidate_resolution_support_snapshot_on(&tx)?;
+        record_projection_statement(
+            &mut breakdown.persistence.dirty_state,
+            1,
+            projection_scalar_binds(1),
+        );
+        breakdown.persistence.dirty_state.wall_ms =
+            clamp_i64_to_u32(dirty_started.elapsed().as_millis() as i64);
+
+        let commit_started = std::time::Instant::now();
         tx.commit()?;
+        breakdown.persistence.commit_ms =
+            clamp_i64_to_u32(commit_started.elapsed().as_millis() as i64);
+        breakdown.persistence.transaction_wall_ms =
+            clamp_i64_to_u32(transaction_started.elapsed().as_millis() as i64);
 
         if !prepared_nodes.is_empty() {
             let mut cache = self.cache.nodes.write();
@@ -3876,7 +6882,6 @@ impl Storage {
             }
         }
 
-        self.invalidate_grounding_snapshots()?;
         Ok(breakdown)
     }
 
@@ -3992,16 +6997,36 @@ impl Storage {
             return Ok(HashMap::new());
         }
 
-        let placeholders = question_placeholders(node_ids.len());
-        let sql =
-            format!("SELECT node_id, type FROM component_access WHERE node_id IN ({placeholders})");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(node_ids.iter().map(|id| id.0)))?;
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for component-access lookup"
+                        .to_string(),
+                )
+            })?;
+        if variable_limit == 0 {
+            return Err(StorageError::Other(
+                "SQLite bind-variable limit 0 cannot support component-access lookup".to_string(),
+            ));
+        }
+
+        let mut unique_node_ids = node_ids.to_vec();
+        unique_node_ids.sort_unstable_by_key(|id| id.0);
+        unique_node_ids.dedup();
+
         let mut map = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let node_id: i64 = row.get(0)?;
-            let raw: i32 = row.get(1)?;
-            map.insert(NodeId(node_id), row_mapping::access_kind_from_db(raw));
+        for batch in unique_node_ids.chunks(variable_limit) {
+            let placeholders = question_placeholders(batch.len());
+            let sql = format!(
+                "SELECT node_id, type FROM component_access WHERE node_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let node_id: i64 = row.get(0)?;
+                let raw: i32 = row.get(1)?;
+                map.insert(NodeId(node_id), row_mapping::access_kind_from_db(raw));
+            }
         }
         Ok(map)
     }
@@ -4101,6 +7126,1133 @@ impl Storage {
                     row.get::<_, i64>(0)
                 })?;
         Ok(clamp_i64_to_u32(count))
+    }
+
+    /// Reads one ordered page of lexical-search symbols from the canonical node table.
+    pub fn get_canonical_search_symbol_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SearchSymbolProjection>, StorageError> {
+        let limit =
+            canonical_search_symbol_batch_limit("get_canonical_search_symbol_batch_after", limit)?;
+        let mut sql = String::from(
+            "SELECT
+                node.id,
+                CASE
+                    WHEN node.qualified_name IS NOT NULL
+                         AND TRIM(node.qualified_name) != ''
+                    THEN node.qualified_name
+                    ELSE node.serialized_name
+                END
+             FROM node",
+        );
+        let mut query_params = Vec::with_capacity(2);
+        if let Some(after_node_id) = after_node_id {
+            sql.push_str(" WHERE node.id > ?");
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        sql.push_str(" ORDER BY node.id ASC LIMIT ?");
+        query_params.push(Value::Integer(limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut symbols = Vec::new();
+        while let Some(row) = rows.next()? {
+            symbols.push(SearchSymbolProjection {
+                node_id: NodeId(row.get(0)?),
+                display_name: row.get(1)?,
+            });
+        }
+        Ok(symbols)
+    }
+
+    /// Reads one ordered page of canonical lexical-search symbols with source details.
+    pub fn get_canonical_search_symbol_detail_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SearchSymbolProjectionDetail>, StorageError> {
+        let limit = canonical_search_symbol_batch_limit(
+            "get_canonical_search_symbol_detail_batch_after",
+            limit,
+        )?;
+        let mut sql = String::from(
+            "SELECT
+                node.id,
+                CASE
+                    WHEN node.qualified_name IS NOT NULL
+                         AND TRIM(node.qualified_name) != ''
+                    THEN node.qualified_name
+                    ELSE node.serialized_name
+                END,
+                node.kind,
+                file.serialized_name,
+                node.start_line,
+                node.end_line
+             FROM node
+             LEFT JOIN node file ON file.id = node.file_node_id",
+        );
+        let mut query_params = Vec::with_capacity(2);
+        if let Some(after_node_id) = after_node_id {
+            sql.push_str(" WHERE node.id > ?");
+            query_params.push(Value::Integer(after_node_id.0));
+        }
+        sql.push_str(" ORDER BY node.id ASC LIMIT ?");
+        query_params.push(Value::Integer(limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(query_params))?;
+        let mut symbols = Vec::new();
+        while let Some(row) = rows.next()? {
+            symbols.push(SearchSymbolProjectionDetail {
+                node_id: NodeId(row.get(0)?),
+                display_name: row.get(1)?,
+                node_kind: row.get(2)?,
+                file_path: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+            });
+        }
+        Ok(symbols)
+    }
+
+    /// Counts lexical-search symbols in the canonical node table.
+    pub fn get_canonical_search_symbol_count(&self) -> Result<u32, StorageError> {
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get::<_, i64>(0))?;
+        Ok(clamp_i64_to_u32(count))
+    }
+
+    pub fn upsert_dense_anchor_inputs_batch(
+        &mut self,
+        inputs: &[DenseAnchorInput],
+    ) -> Result<(), StorageError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO dense_anchor_input (
+                    node_id, file_node_id, kind, display_name, qualified_name,
+                    file_path, start_line, end_line, file_role, source_provenance,
+                    document_text, document_hash, selection_reason, policy_version,
+                    source_identity, updated_at_epoch_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16
+                 )
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    file_node_id = excluded.file_node_id,
+                    kind = excluded.kind,
+                    display_name = excluded.display_name,
+                    qualified_name = excluded.qualified_name,
+                    file_path = excluded.file_path,
+                    start_line = excluded.start_line,
+                    end_line = excluded.end_line,
+                    file_role = excluded.file_role,
+                    source_provenance = excluded.source_provenance,
+                    document_text = excluded.document_text,
+                    document_hash = excluded.document_hash,
+                    selection_reason = excluded.selection_reason,
+                    policy_version = excluded.policy_version,
+                    source_identity = excluded.source_identity,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+            for input in inputs {
+                stmt.execute(params![
+                    input.node_id.0,
+                    input.file_node_id.map(|id| id.0),
+                    input.kind as i32,
+                    input.display_name,
+                    input.qualified_name,
+                    input.file_path,
+                    input.start_line,
+                    input.end_line,
+                    input.file_role.as_str(),
+                    input.source_provenance,
+                    input.text,
+                    input.document_hash,
+                    input.selection_reason,
+                    input.policy_version,
+                    input.source_identity,
+                    input.updated_at_epoch_ms,
+                ])?;
+            }
+        }
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_dense_anchor_inputs_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<DenseAnchorInput>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, file_node_id, kind, display_name, qualified_name,
+                    file_path, start_line, end_line, file_role, source_provenance,
+                    document_text, document_hash, selection_reason, policy_version,
+                    source_identity, updated_at_epoch_ms
+             FROM dense_anchor_input
+             WHERE (?1 IS NULL OR node_id > ?1)
+             ORDER BY node_id ASC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![
+            after_node_id.map(|id| id.0),
+            limit.min(i64::MAX as usize) as i64
+        ])?;
+        let mut inputs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: i32 = row.get(2)?;
+            let file_role: String = row.get(8)?;
+            inputs.push(DenseAnchorInput {
+                node_id: NodeId(row.get(0)?),
+                file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                kind: NodeKind::try_from(kind)?,
+                display_name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                file_path: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
+                file_role: FileRole::from_db_value(&file_role),
+                source_provenance: row.get(9)?,
+                text: row.get(10)?,
+                document_hash: row.get(11)?,
+                selection_reason: row.get(12)?,
+                policy_version: row.get(13)?,
+                source_identity: row.get(14)?,
+                updated_at_epoch_ms: row.get(15)?,
+            });
+        }
+        Ok(inputs)
+    }
+
+    pub fn get_dense_anchor_input_reuse_metadata(
+        &self,
+    ) -> Result<Vec<DenseAnchorInputReuseMetadata>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, document_hash, selection_reason, policy_version, source_identity
+             FROM dense_anchor_input ORDER BY node_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DenseAnchorInputReuseMetadata {
+                node_id: NodeId(row.get(0)?),
+                document_hash: row.get(1)?,
+                selection_reason: row.get(2)?,
+                policy_version: row.get(3)?,
+                source_identity: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_dense_anchor_publication_manifest(
+        &self,
+    ) -> Result<Option<DenseAnchorPublicationManifest>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT schema_version, complete, core_generation_id, core_run_id,
+                        anchor_count, anchor_digest, policy_version, migration_state,
+                        published_at_epoch_ms
+                 FROM dense_anchor_publication WHERE id = 1",
+                [],
+                |row| {
+                    let schema_version = row.get::<_, i64>(0)?;
+                    let anchor_count = row.get::<_, i64>(4)?;
+                    Ok(DenseAnchorPublicationManifest {
+                        schema_version: schema_version.max(0).min(u32::MAX as i64) as u32,
+                        complete: row.get::<_, i64>(1)? == 1,
+                        core_generation_id: row.get(2)?,
+                        core_run_id: row.get(3)?,
+                        anchor_count: anchor_count.max(0) as u64,
+                        anchor_digest: row.get(5)?,
+                        policy_version: row.get(6)?,
+                        migration_state: row.get(7)?,
+                        published_at_epoch_ms: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_structural_text_unit(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<StructuralTextUnit>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                        descriptor_version, producer, evidence_tier, resolution, language,
+                        kind, start_line, start_col, end_line, end_col, file_role
+                 FROM structural_text_unit WHERE node_id = ?1",
+                params![node_id.0],
+                structural_text_unit_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_structural_text_units_for_nodes(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<StructuralTextUnit>, StorageError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut units = Vec::new();
+        for chunk in node_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            let placeholders = question_placeholders(chunk.len());
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT node_id, file_id, placement_id, content_hash, source_content_hash,
+                        descriptor_version, producer, evidence_tier, resolution, language,
+                        kind, start_line, start_col, end_line, end_col, file_role
+                 FROM structural_text_unit
+                 WHERE node_id IN ({placeholders})
+                 ORDER BY node_id ASC"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(chunk.iter().map(|node_id| node_id.0)),
+                structural_text_unit_from_row,
+            )?;
+            units.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        Ok(units)
+    }
+
+    pub fn get_structural_text_projection_file_ids(&self) -> Result<Vec<i64>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id
+             FROM structural_text_projection
+             WHERE descriptor_version = ?1
+             ORDER BY file_id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+            |row| row.get(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_structural_text_unit_publication_manifest(
+        &self,
+    ) -> Result<Option<StructuralTextUnitPublicationManifest>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT schema_version, complete, core_generation_id, core_run_id,
+                        unit_count, unit_digest, projection_count, projection_digest,
+                        descriptor_version, migration_state, published_at_epoch_ms
+                 FROM structural_text_unit_publication WHERE id = 1",
+                [],
+                |row| {
+                    Ok(StructuralTextUnitPublicationManifest {
+                        schema_version: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                        complete: row.get::<_, i64>(1)? == 1,
+                        core_generation_id: row.get(2)?,
+                        core_run_id: row.get(3)?,
+                        unit_count: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        unit_digest: row.get(5)?,
+                        projection_count: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                        projection_digest: row.get(7)?,
+                        descriptor_version: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+                        migration_state: row.get(9)?,
+                        published_at_epoch_ms: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn publish_structural_text_unit_generation(
+        &mut self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextUnitPublicationManifest, StorageError> {
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || publication.published_at_epoch_ms < 0
+        {
+            return Err(StorageError::Other(
+                "structural text unit publication identity is invalid".into(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM structural_text_artifact_cache
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM structural_text_projection p
+                WHERE p.file_id = structural_text_artifact_cache.file_id
+                  AND p.source_content_hash =
+                      structural_text_artifact_cache.source_content_hash
+                  AND p.descriptor_version =
+                      structural_text_artifact_cache.descriptor_version
+                  AND p.producer = structural_text_artifact_cache.producer
+             )",
+            [],
+        )?;
+        validate_structural_text_artifact_cache_rows(&tx)?;
+        let invalid_structural_files = tx.query_row(
+            "SELECT COUNT(*)
+             FROM structural_text_projection p
+             LEFT JOIN file f ON f.id = p.file_id
+             WHERE f.id IS NULL
+                OR f.complete <> 1
+                OR f.content_hash IS NULL
+                OR length(f.content_hash) <> 64
+                OR f.content_hash <> p.source_content_hash
+                OR f.language <> p.language
+                OR f.file_role <> p.file_role",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if invalid_structural_files != 0 {
+            return Err(StorageError::Other(
+                "complete structural projections contain unverified source identity".into(),
+            ));
+        }
+        validate_structural_text_projection_rows(&tx)?;
+        let mismatched_sources = tx.query_row(
+            "SELECT COUNT(*)
+             FROM structural_text_unit u
+             LEFT JOIN file f ON f.id = u.file_id
+             WHERE f.id IS NULL
+                OR f.content_hash IS NULL
+                OR f.content_hash <> u.source_content_hash
+                OR u.descriptor_version <> ?1",
+            params![STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if mismatched_sources != 0 {
+            return Err(StorageError::Other(
+                "structural text units do not match their verified sources".into(),
+            ));
+        }
+        let (unit_count, unit_digest, descriptor_versions) =
+            structural_text_unit_content_summary(&tx)?;
+        let (projection_count, projection_digest, projection_versions) =
+            structural_text_projection_content_summary(&tx)?;
+        if descriptor_versions
+            .iter()
+            .any(|version| *version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION)
+            || projection_versions
+                .iter()
+                .any(|version| *version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION)
+        {
+            return Err(StorageError::Other(
+                "structural text unit descriptor versions are incompatible".into(),
+            ));
+        }
+        let manifest = StructuralTextUnitPublicationManifest {
+            schema_version: STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            unit_count,
+            unit_digest,
+            projection_count,
+            projection_digest,
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            migration_state: STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE.to_string(),
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        tx.execute(
+            "INSERT INTO structural_text_unit_publication (
+                id, schema_version, complete, core_generation_id, core_run_id,
+                unit_count, unit_digest, projection_count, projection_digest,
+                descriptor_version, migration_state, published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                complete = excluded.complete,
+                core_generation_id = excluded.core_generation_id,
+                core_run_id = excluded.core_run_id,
+                unit_count = excluded.unit_count,
+                unit_digest = excluded.unit_digest,
+                projection_count = excluded.projection_count,
+                projection_digest = excluded.projection_digest,
+                descriptor_version = excluded.descriptor_version,
+                migration_state = excluded.migration_state,
+                published_at_epoch_ms = excluded.published_at_epoch_ms",
+            params![
+                manifest.schema_version as i64,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.unit_count.min(i64::MAX as u64) as i64,
+                &manifest.unit_digest,
+                manifest.projection_count.min(i64::MAX as u64) as i64,
+                &manifest.projection_digest,
+                manifest.descriptor_version as i64,
+                &manifest.migration_state,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(manifest)
+    }
+
+    pub fn validate_structural_text_unit_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextUnitPublicationManifest, StorageError> {
+        let manifest = self
+            .get_structural_text_unit_publication_manifest()?
+            .ok_or_else(|| {
+                StorageError::Other("structural text unit publication is missing".into())
+            })?;
+        if manifest.schema_version != STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION
+            || !manifest.complete
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.descriptor_version != STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION
+            || manifest.migration_state != STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+        {
+            return Err(StorageError::Other(
+                "structural text unit publication does not match the complete core publication"
+                    .into(),
+            ));
+        }
+        let (unit_count, unit_digest, descriptor_versions) =
+            structural_text_unit_content_summary(&self.conn)?;
+        let (projection_count, projection_digest, projection_versions) =
+            structural_text_projection_content_summary(&self.conn)?;
+        if unit_count != manifest.unit_count
+            || unit_digest != manifest.unit_digest
+            || projection_count != manifest.projection_count
+            || projection_digest != manifest.projection_digest
+            || descriptor_versions
+                .iter()
+                .any(|version| *version != manifest.descriptor_version)
+            || projection_versions
+                .iter()
+                .any(|version| *version != manifest.descriptor_version)
+        {
+            return Err(StorageError::Other(
+                "structural text unit rows do not match their complete manifest".into(),
+            ));
+        }
+        let mismatched_sources = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM structural_text_unit u
+             LEFT JOIN file f ON f.id = u.file_id
+             WHERE f.id IS NULL
+                OR f.content_hash IS NULL
+                OR f.content_hash <> u.source_content_hash",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if mismatched_sources != 0 {
+            return Err(StorageError::Other(
+                "structural text unit rows do not match their verified file projections".into(),
+            ));
+        }
+        validate_structural_text_projection_rows(&self.conn)?;
+        validate_structural_text_artifact_cache_rows(&self.conn)?;
+        Ok(manifest)
+    }
+
+    /// Validate the structural state admitted by semantic projection republish.
+    ///
+    /// A missing manifest is compatible only for a legacy core that has no
+    /// structural rows of any kind. This proves absence of structural coverage;
+    /// it does not infer or carry forward any structural evidence.
+    pub fn validate_structural_text_unit_publication_or_legacy_empty(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<StructuralTextPublicationCompatibility, StorageError> {
+        if self
+            .get_structural_text_unit_publication_manifest()?
+            .is_some()
+        {
+            return self
+                .validate_structural_text_unit_publication(publication)
+                .map(StructuralTextPublicationCompatibility::Published);
+        }
+
+        let (unit_count, projection_count, artifact_cache_count) = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM structural_text_unit),
+                (SELECT COUNT(*) FROM structural_text_projection),
+                (SELECT COUNT(*) FROM structural_text_artifact_cache)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        if unit_count == 0 && projection_count == 0 && artifact_cache_count == 0 {
+            return Ok(StructuralTextPublicationCompatibility::LegacyEmpty);
+        }
+
+        Err(StorageError::Other(format!(
+            "structural text unit publication is missing for nonempty state: units={unit_count}, projections={projection_count}, artifact_cache={artifact_cache_count}"
+        )))
+    }
+
+    pub fn get_source_policy_exclusions(
+        &self,
+    ) -> Result<Vec<SourcePolicyExclusionRecord>, StorageError> {
+        read_source_policy_exclusions(&self.conn)
+    }
+
+    pub fn get_source_policy_exclusion_manifest(
+        &self,
+    ) -> Result<Option<SourcePolicyExclusionManifest>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT schema_version, complete, project_id, workspace_id,
+                        core_generation_id, core_run_id, exclusion_count,
+                        exclusion_digest, policy_version, byte_cap, structural_unit_cap,
+                        published_at_epoch_ms
+                 FROM source_policy_exclusion_publication WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    schema_version,
+                    complete,
+                    project_id,
+                    workspace_id,
+                    core_generation_id,
+                    core_run_id,
+                    exclusion_count,
+                    exclusion_digest,
+                    policy_version,
+                    byte_cap,
+                    structural_unit_cap,
+                    published_at_epoch_ms,
+                )| {
+                    Ok(SourcePolicyExclusionManifest {
+                        schema_version: u32::try_from(schema_version).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid schema".into(),
+                            )
+                        })?,
+                        complete: complete == 1,
+                        project_id,
+                        workspace_id,
+                        core_generation_id,
+                        core_run_id,
+                        exclusion_count: u64::try_from(exclusion_count).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid count".into(),
+                            )
+                        })?,
+                        exclusion_digest,
+                        policy_version,
+                        byte_cap: u64::try_from(byte_cap).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid byte cap".into(),
+                            )
+                        })?,
+                        structural_unit_cap: u64::try_from(structural_unit_cap).map_err(|_| {
+                            StorageError::Other(
+                                "source policy exclusion manifest has invalid structural unit cap"
+                                    .into(),
+                            )
+                        })?,
+                        published_at_epoch_ms,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    /// Atomically replace and publish the complete policy-exclusion set in the staged core.
+    pub fn publish_source_policy_exclusion_generation(
+        &mut self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
+        candidates: &[OversizedSourceExclusionCandidate],
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || project_id.trim().is_empty()
+            || workspace_id.trim().is_empty()
+            || policy.policy_version.trim().is_empty()
+            || policy.byte_cap == 0
+            || policy.byte_cap > i64::MAX as u64
+            || policy.structural_unit_cap == 0
+            || policy.structural_unit_cap > i64::MAX as u64
+        {
+            return Err(StorageError::Other(
+                "source policy exclusion publication identity is invalid".into(),
+            ));
+        }
+        let mut candidates = candidates.to_vec();
+        candidates.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        let mut records = Vec::with_capacity(candidates.len());
+        let mut previous_path: Option<&str> = None;
+        for candidate in &candidates {
+            let path = candidate.normalized_path.as_str();
+            if path.trim().is_empty()
+                || path.starts_with('/')
+                || path.contains('\\')
+                || path
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "..")
+                || previous_path == Some(path)
+                || candidate.content_hash.len() != 64
+                || !candidate
+                    .content_hash
+                    .bytes()
+                    .all(|value| value.is_ascii_hexdigit())
+                || candidate.observed_size > i64::MAX as u64
+                || candidate.observed_unit_count > i64::MAX as u64
+                || !((candidate.observed_size > policy.byte_cap
+                    && candidate.observed_unit_count == 0)
+                    || (candidate.observed_size <= policy.byte_cap
+                        && candidate.observed_unit_count > policy.structural_unit_cap))
+                || candidate.policy_version != policy.policy_version
+                || candidate.byte_cap != policy.byte_cap
+                || candidate.structural_unit_cap != policy.structural_unit_cap
+            {
+                return Err(StorageError::Other(format!(
+                    "invalid source policy exclusion candidate: {path}"
+                )));
+            }
+            previous_path = Some(path);
+            records.push(SourcePolicyExclusionRecord {
+                normalized_path: candidate.normalized_path.clone(),
+                project_id: project_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                content_hash: candidate.content_hash.clone(),
+                observed_size: candidate.observed_size,
+                observed_unit_count: candidate.observed_unit_count,
+                policy_version: candidate.policy_version.clone(),
+                byte_cap: candidate.byte_cap,
+                structural_unit_cap: candidate.structural_unit_cap,
+                core_generation_id: publication.generation_id.clone(),
+                core_run_id: publication.run_id.clone(),
+            });
+        }
+
+        let exclusion_digest = source_policy_exclusion_digest(&records);
+        let manifest = SourcePolicyExclusionManifest {
+            schema_version: SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            project_id: project_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            exclusion_count: records.len() as u64,
+            exclusion_digest,
+            policy_version: policy.policy_version.to_string(),
+            byte_cap: policy.byte_cap,
+            structural_unit_cap: policy.structural_unit_cap,
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM source_policy_exclusion_publication", [])?;
+        tx.execute("DELETE FROM source_policy_exclusion", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO source_policy_exclusion (
+                    normalized_path, project_id, workspace_id, content_hash,
+                    observed_size, observed_unit_count, policy_version, byte_cap,
+                    structural_unit_cap, core_generation_id, core_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            for record in &records {
+                stmt.execute(params![
+                    &record.normalized_path,
+                    &record.project_id,
+                    &record.workspace_id,
+                    &record.content_hash,
+                    record.observed_size as i64,
+                    record.observed_unit_count as i64,
+                    &record.policy_version,
+                    record.byte_cap as i64,
+                    record.structural_unit_cap as i64,
+                    &record.core_generation_id,
+                    &record.core_run_id,
+                ])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO source_policy_exclusion_publication (
+                id, schema_version, complete, project_id, workspace_id,
+                core_generation_id, core_run_id, exclusion_count, exclusion_digest,
+                policy_version, byte_cap, structural_unit_cap, published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                manifest.schema_version as i64,
+                &manifest.project_id,
+                &manifest.workspace_id,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.exclusion_count as i64,
+                &manifest.exclusion_digest,
+                &manifest.policy_version,
+                manifest.byte_cap as i64,
+                manifest.structural_unit_cap as i64,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(manifest)
+    }
+
+    pub fn validate_source_policy_exclusion_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        self.validate_source_policy_exclusion_publication_format(
+            publication,
+            project_id,
+            workspace_id,
+            policy,
+            SourcePolicyExclusionPublicationFormat::Current,
+        )
+    }
+
+    /// Validate an authentic schema-v1 oversized-source publication after its
+    /// database has been structurally migrated, without rewriting its identity.
+    pub fn validate_legacy_v1_source_policy_exclusion_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        self.validate_source_policy_exclusion_publication_format(
+            publication,
+            project_id,
+            workspace_id,
+            policy,
+            SourcePolicyExclusionPublicationFormat::LegacyV1,
+        )
+    }
+
+    fn validate_source_policy_exclusion_publication_format(
+        &self,
+        publication: &IndexPublicationRecord,
+        project_id: &str,
+        workspace_id: &str,
+        policy: SourcePolicyExclusionPolicyIdentity<'_>,
+        format: SourcePolicyExclusionPublicationFormat,
+    ) -> Result<SourcePolicyExclusionManifest, StorageError> {
+        let manifest = self
+            .get_source_policy_exclusion_manifest()?
+            .ok_or_else(|| {
+                StorageError::Other("source policy exclusion manifest is missing".into())
+            })?;
+        if manifest.schema_version != format.schema_version()
+            || !manifest.complete
+            || manifest.project_id != project_id
+            || manifest.workspace_id != workspace_id
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.policy_version != policy.policy_version
+            || manifest.byte_cap != policy.byte_cap
+            || manifest.structural_unit_cap != policy.structural_unit_cap
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+        {
+            return Err(StorageError::Other(
+                "source policy exclusion manifest does not match the complete core publication"
+                    .into(),
+            ));
+        }
+        let records = read_source_policy_exclusions(&self.conn)?;
+        if manifest.exclusion_count != records.len() as u64
+            || manifest.exclusion_digest != format.digest(&records)
+            || records.iter().any(|record| {
+                record.project_id != manifest.project_id
+                    || record.workspace_id != manifest.workspace_id
+                    || record.core_generation_id != manifest.core_generation_id
+                    || record.core_run_id != manifest.core_run_id
+                    || record.policy_version != manifest.policy_version
+                    || record.byte_cap != manifest.byte_cap
+                    || record.structural_unit_cap != manifest.structural_unit_cap
+                    || !format.qualifies(record)
+            })
+        {
+            return Err(StorageError::Other(
+                "source policy exclusion rows do not match their complete manifest".into(),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// Rebind every carried-forward row and atomically publish its complete manifest.
+    pub fn publish_dense_anchor_generation(
+        &mut self,
+        publication: &IndexPublicationRecord,
+        policy_version: &str,
+    ) -> Result<DenseAnchorPublicationManifest, StorageError> {
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || policy_version.trim().is_empty()
+        {
+            return Err(StorageError::Other(
+                "dense anchor publication identity and policy must be non-empty".into(),
+            ));
+        }
+        let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE dense_anchor_input SET source_identity = ?1",
+            params![source_identity],
+        )?;
+        let (anchor_count, anchor_digest, policies) = dense_anchor_content_summary(&tx)?;
+        if policies.iter().any(|policy| policy != policy_version)
+            || (anchor_count > 0 && policies.len() != 1)
+        {
+            return Err(StorageError::Other(format!(
+                "dense anchor publication contains policies {:?}, expected {policy_version}",
+                policies
+            )));
+        }
+        let manifest = DenseAnchorPublicationManifest {
+            schema_version: DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            anchor_count,
+            anchor_digest,
+            policy_version: policy_version.to_string(),
+            migration_state: DENSE_ANCHOR_MIGRATION_STATE_NATIVE.to_string(),
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        tx.execute(
+            "INSERT INTO dense_anchor_publication (
+                id, schema_version, complete, core_generation_id, core_run_id,
+                anchor_count, anchor_digest, policy_version, migration_state,
+                published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                complete = excluded.complete,
+                core_generation_id = excluded.core_generation_id,
+                core_run_id = excluded.core_run_id,
+                anchor_count = excluded.anchor_count,
+                anchor_digest = excluded.anchor_digest,
+                policy_version = excluded.policy_version,
+                migration_state = excluded.migration_state,
+                published_at_epoch_ms = excluded.published_at_epoch_ms",
+            params![
+                manifest.schema_version as i64,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.anchor_count.min(i64::MAX as u64) as i64,
+                &manifest.anchor_digest,
+                &manifest.policy_version,
+                &manifest.migration_state,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(manifest)
+    }
+
+    /// Validate the manifest against both the pinned publication and current rows.
+    pub fn validate_dense_anchor_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<DenseAnchorPublicationManifest, StorageError> {
+        let manifest = self
+            .get_dense_anchor_publication_manifest()?
+            .ok_or_else(|| StorageError::Other("dense anchor publication is missing".into()))?;
+        if manifest.schema_version != DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+            || !manifest.complete
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.migration_state != DENSE_ANCHOR_MIGRATION_STATE_NATIVE
+            || manifest.policy_version.trim().is_empty()
+        {
+            return Err(StorageError::Other(
+                "dense anchor publication does not match the complete core publication".into(),
+            ));
+        }
+        let (anchor_count, anchor_digest, policies) = dense_anchor_content_summary(&self.conn)?;
+        if manifest.anchor_count != anchor_count
+            || manifest.anchor_digest != anchor_digest
+            || policies
+                .iter()
+                .any(|policy| policy != &manifest.policy_version)
+            || (anchor_count > 0 && policies.len() != 1)
+        {
+            return Err(StorageError::Other(
+                "dense anchor publication rows do not match their manifest".into(),
+            ));
+        }
+        let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        let mismatched_sources = self.conn.query_row(
+            "SELECT COUNT(*) FROM dense_anchor_input WHERE source_identity <> ?1",
+            params![expected_source],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if mismatched_sources != 0 {
+            return Err(StorageError::Other(
+                "dense anchor publication contains stale source identities".into(),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    pub fn clear_dense_anchor_inputs(&mut self) -> Result<usize, StorageError> {
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute("DELETE FROM dense_anchor_input", [])?;
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn copy_dense_anchor_inputs_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        drop(Storage::open(source_path)?);
+        let source = source_path.to_string_lossy().to_string();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS dense_anchor_source", params![source])?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO dense_anchor_input
+             SELECT source.* FROM dense_anchor_source.dense_anchor_input source
+             WHERE EXISTS (SELECT 1 FROM node WHERE node.id = source.node_id)
+               AND (source.file_node_id IS NULL OR EXISTS (
+                    SELECT 1 FROM node WHERE node.id = source.file_node_id
+               ))",
+            [],
+        );
+        if copy_result.is_ok() {
+            self.conn
+                .execute("DELETE FROM dense_anchor_publication", [])?;
+        }
+        let detach_result = self.conn.execute("DETACH DATABASE dense_anchor_source", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
+    }
+
+    pub fn prune_dense_anchor_inputs_to_node_ids(
+        &mut self,
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if keep_node_ids.is_empty() {
+            return self.clear_dense_anchor_inputs();
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS dense_anchor_input_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.dense_anchor_input_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.dense_anchor_input_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM dense_anchor_input
+             WHERE NOT EXISTS (
+                SELECT 1 FROM temp.dense_anchor_input_keep keep
+                WHERE keep.node_id = dense_anchor_input.node_id
+             )",
+            [],
+        )?;
+        if removed > 0 {
+            tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        }
+        tx.execute("DROP TABLE temp.dense_anchor_input_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn delete_dense_anchor_inputs_for_files_except_node_ids(
+        &mut self,
+        file_node_ids: &[NodeId],
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if file_node_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS dense_anchor_input_scope (
+                file_node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS dense_anchor_input_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.dense_anchor_input_scope", [])?;
+        tx.execute("DELETE FROM temp.dense_anchor_input_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.dense_anchor_input_scope (file_node_id) VALUES (?1)",
+            )?;
+            for file_node_id in file_node_ids {
+                stmt.execute(params![file_node_id.0])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.dense_anchor_input_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM dense_anchor_input
+             WHERE file_node_id IN (SELECT file_node_id FROM temp.dense_anchor_input_scope)
+               AND NOT EXISTS (
+                    SELECT 1 FROM temp.dense_anchor_input_keep keep
+                    WHERE keep.node_id = dense_anchor_input.node_id
+               )",
+            [],
+        )?;
+        if removed > 0 {
+            tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        }
+        tx.execute("DROP TABLE temp.dense_anchor_input_scope", [])?;
+        tx.execute("DROP TABLE temp.dense_anchor_input_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn upsert_symbol_search_docs_batch(
@@ -4218,6 +8370,56 @@ impl Storage {
         Ok(docs)
     }
 
+    /// Load the persisted semantic documents for one bounded node page.
+    ///
+    /// Projection-only publication uses this to pin document text to the verified
+    /// core database instead of reopening source files while policy metadata and
+    /// dense-anchor selection are recomputed.
+    pub fn get_symbol_search_docs_for_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<SymbolSearchDoc>, StorageError> {
+        let mut docs = Vec::with_capacity(node_ids.len());
+        for batch in node_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = question_placeholders(batch.len());
+            let sql = format!(
+                "SELECT
+                    node_id, file_node_id, kind, display_name, qualified_name,
+                    file_path, start_line, doc_text, doc_version, doc_hash,
+                    policy_version, source_provenance, updated_at_epoch_ms
+                 FROM symbol_search_doc
+                 WHERE node_id IN ({placeholders})
+                 ORDER BY node_id ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| id.0)))?;
+            while let Some(row) = rows.next()? {
+                let kind: i32 = row.get(2)?;
+                let doc_version: i64 = row.get(8)?;
+                docs.push(SymbolSearchDoc {
+                    node_id: NodeId(row.get(0)?),
+                    file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                    kind: NodeKind::try_from(kind)?,
+                    display_name: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    file_path: row.get(5)?,
+                    start_line: row.get(6)?,
+                    doc_text: row.get(7)?,
+                    doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
+                    doc_hash: row.get(9)?,
+                    policy_version: row.get(10)?,
+                    source_provenance: row.get(11)?,
+                    updated_at_epoch_ms: row.get(12)?,
+                });
+            }
+        }
+        docs.sort_unstable_by_key(|doc| doc.node_id.0);
+        Ok(docs)
+    }
+
     pub fn get_symbol_search_doc_count(&self) -> Result<u32, StorageError> {
         let count = self
             .conn
@@ -4227,18 +8429,19 @@ impl Storage {
         Ok(clamp_i64_to_u32(count))
     }
 
-    pub fn has_symbol_search_doc_version_mismatch(
+    pub fn has_symbol_search_doc_contract_mismatch(
         &self,
         expected_version: u32,
+        expected_policy_version: &str,
     ) -> Result<bool, StorageError> {
         let mismatch = self.conn.query_row(
             "SELECT EXISTS(
                 SELECT 1
                 FROM symbol_search_doc
-                WHERE doc_version <> ?1
+                WHERE doc_version <> ?1 OR policy_version <> ?2
                 LIMIT 1
             )",
-            params![expected_version as i64],
+            params![expected_version as i64, expected_policy_version],
             |row| row.get::<_, bool>(0),
         )?;
         Ok(mismatch)
@@ -5289,6 +9492,48 @@ impl Storage {
         Ok(nodes_by_id)
     }
 
+    /// Loads bounded endpoint nodes from a staged build without using `StorageCache`.
+    pub fn get_nodes_by_ids_no_cache_for_build(
+        &self,
+        ids: &[NodeId],
+    ) -> Result<BuildNodeLookup, StorageError> {
+        const OPERATION: &str = "get_nodes_by_ids_no_cache_for_build";
+        self.require_build_mode(OPERATION)?;
+        if ids.is_empty() {
+            return Ok(BuildNodeLookup {
+                nodes: HashMap::new(),
+                query_batches: 0,
+            });
+        }
+
+        let mut unique_ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        let mut nodes = HashMap::with_capacity(unique_ids.len());
+        let mut query_batches = 0;
+        for chunk in unique_ids.chunks(NODE_LOOKUP_BATCH_SIZE) {
+            let placeholders = question_placeholders(chunk.len());
+            let query = format!(
+                "SELECT id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col
+                 FROM node
+                 WHERE id IN ({placeholders})
+                 ORDER BY id ASC"
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter().copied()))?;
+            query_batches += 1;
+            while let Some(row) = rows.next()? {
+                let node = Self::node_from_row(row)?;
+                nodes.insert(node.id, node);
+            }
+        }
+
+        Ok(BuildNodeLookup {
+            nodes,
+            query_batches,
+        })
+    }
+
     pub fn get_occurrences_for_node_ids(
         &self,
         node_ids: &[NodeId],
@@ -5568,17 +9813,19 @@ impl Storage {
         if self.has_ready_grounding_summary_snapshots()? {
             let mut stmt = self.conn.prepare(
                 "SELECT
-                    file_id,
-                    path,
-                    language,
-                    modification_time,
-                    indexed,
-                    complete,
-                    line_count,
-                    symbol_count,
-                    best_node_rank
-                 FROM grounding_file_snapshot
-                 ORDER BY path",
+                    g.file_id,
+                    g.path,
+                    g.language,
+                    g.modification_time,
+                    g.indexed,
+                    g.complete,
+                    g.line_count,
+                    g.symbol_count,
+                    g.best_node_rank,
+                    f.file_role
+                 FROM grounding_file_snapshot g
+                 LEFT JOIN file f ON f.id = g.file_id
+                 ORDER BY g.path",
             )?;
             let mut rows = stmt.query([])?;
             let mut summaries = Vec::new();
@@ -5592,7 +9839,15 @@ impl Storage {
         let indexable = grounding_indexable_predicate("n");
         let query = format!(
             "WITH all_files AS (
-                SELECT id, path, language, modification_time, indexed, complete, line_count
+                SELECT
+                    id,
+                    path,
+                    language,
+                    modification_time,
+                    indexed,
+                    complete,
+                    line_count,
+                    file_role
                 FROM file
                 UNION ALL
                 SELECT
@@ -5602,7 +9857,8 @@ impl Storage {
                     0,
                     1,
                     1,
-                    0
+                    0,
+                    NULL
                 FROM node n
                 WHERE n.kind = {file_kind}
                     AND NOT EXISTS (SELECT 1 FROM file f WHERE f.id = n.id)
@@ -5616,7 +9872,8 @@ impl Storage {
                 f.complete,
                 f.line_count,
                 COUNT(n.id) AS symbol_count,
-                MIN(CASE WHEN n.id IS NULL THEN 255 ELSE {rank_sql} END) AS best_node_rank
+                MIN(CASE WHEN n.id IS NULL THEN 255 ELSE {rank_sql} END) AS best_node_rank,
+                f.file_role
             FROM all_files f
             LEFT JOIN node n
                 ON n.file_node_id = f.id
@@ -5628,7 +9885,8 @@ impl Storage {
                 f.modification_time,
                 f.indexed,
                 f.complete,
-                f.line_count
+                f.line_count,
+                f.file_role
             ORDER BY f.path",
             file_kind = NodeKind::FILE as i32,
         );
@@ -5653,20 +9911,22 @@ impl Storage {
         if self.has_ready_grounding_summary_snapshots()? {
             let mut stmt = self.conn.prepare(
                 "SELECT
-                    file_id,
-                    path,
-                    language,
-                    modification_time,
-                    indexed,
-                    complete,
-                    line_count,
-                    symbol_count,
-                    best_node_rank
-                 FROM grounding_file_snapshot
+                    g.file_id,
+                    g.path,
+                    g.language,
+                    g.modification_time,
+                    g.indexed,
+                    g.complete,
+                    g.line_count,
+                    g.symbol_count,
+                    g.best_node_rank,
+                    f.file_role
+                 FROM grounding_file_snapshot g
+                 LEFT JOIN file f ON f.id = g.file_id
                  ORDER BY
-                    best_node_rank ASC,
-                    symbol_count DESC,
-                    path ASC
+                    g.best_node_rank ASC,
+                    g.symbol_count DESC,
+                    g.path ASC
                  LIMIT ?1 OFFSET ?2",
             )?;
             let mut rows = stmt.query(params![
@@ -5712,7 +9972,7 @@ impl Storage {
                     end_col,
                     display_name,
                     file_path
-                 FROM grounding_node_snapshot
+                 FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
                  WHERE file_symbol_rank <= ?1
                    AND file_node_id IN ({placeholders})
                  ORDER BY file_node_id, file_symbol_rank"
@@ -5791,6 +10051,341 @@ impl Storage {
         params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
         let mut stmt = self.conn.prepare(&query)?;
         let mut rows = stmt.query(params_from_iter(params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(GroundingNodeRecord {
+                node: Self::node_from_row(row)?,
+                display_name: row.get(10)?,
+                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Return root symbols from a bounded top-symbol window for exact files.
+    ///
+    /// The snapshot path stays on the persistent per-file rank index. The
+    /// caller selects a bounded architecture-relevant file set and performs
+    /// the final cross-file ranking, so this query never sorts every root in
+    /// the repository.
+    pub fn get_grounding_root_symbols_for_files(
+        &self,
+        file_ids: &[i64],
+        per_file_candidate_limit: usize,
+    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
+        if file_ids.is_empty() || per_file_candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        if self.has_ready_grounding_summary_snapshots()? {
+            let placeholders = numbered_placeholders(2, file_ids.len());
+            let query = format!(
+                "SELECT
+                    node_id,
+                    kind,
+                    serialized_name,
+                    qualified_name,
+                    canonical_id,
+                    file_node_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    display_name,
+                    file_path
+                 FROM grounding_node_snapshot INDEXED BY idx_grounding_node_snapshot_file_rank
+                 WHERE file_symbol_rank <= ?1
+                   AND is_root = 1
+                   AND file_node_id IN ({placeholders})
+                 ORDER BY file_node_id, file_symbol_rank, node_id"
+            );
+            let mut params = Vec::with_capacity(file_ids.len() + 1);
+            params.push(Value::Integer(
+                per_file_candidate_limit.min(i64::MAX as usize) as i64,
+            ));
+            params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            let mut nodes = Vec::new();
+            while let Some(row) = rows.next()? {
+                nodes.push(GroundingNodeRecord {
+                    node: Self::node_from_row(row)?,
+                    display_name: row.get(10)?,
+                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                });
+            }
+            return Ok(nodes);
+        }
+
+        let placeholders = numbered_placeholders(2, file_ids.len());
+        let rank_sql = grounding_node_rank_sql("n");
+        let indexable = grounding_indexable_predicate("n");
+        let display_name = grounding_display_name_expr("n");
+        let query = format!(
+            "WITH ranked AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS row_num
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE {indexable}
+                  AND n.file_node_id IN ({placeholders})
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path
+            FROM ranked
+            WHERE row_num <= ?1
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                      AND e.target_node_id = ranked.id
+                )
+            ORDER BY file_node_id, row_num, id",
+            file_kind = NodeKind::FILE as i32,
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let mut params = Vec::with_capacity(file_ids.len() + 1);
+        params.push(Value::Integer(
+            per_file_candidate_limit.min(i64::MAX as usize) as i64,
+        ));
+        params.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(GroundingNodeRecord {
+                node: Self::node_from_row(row)?,
+                display_name: row.get(10)?,
+                file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Return a bounded set of root symbols whose serialized names match
+    /// caller-owned architecture patterns inside exact files.
+    ///
+    /// This complements the per-file structural window when a leaf-heavy
+    /// entrypoint file ranks its executable root below that window. The
+    /// runtime remains responsible for validating the name and file evidence.
+    pub fn get_grounding_named_root_symbols_for_files(
+        &self,
+        file_ids: &[i64],
+        normalized_exact_names: &[String],
+        uppercase_name_globs: &[String],
+        per_file_limit: usize,
+    ) -> Result<Vec<GroundingNodeRecord>, StorageError> {
+        if file_ids.is_empty()
+            || (normalized_exact_names.is_empty() && uppercase_name_globs.is_empty())
+            || per_file_limit == 0
+        {
+            return Ok(Vec::new());
+        }
+
+        let file_placeholders = question_placeholders(file_ids.len());
+        let mut name_conditions = Vec::new();
+        if !normalized_exact_names.is_empty() {
+            name_conditions.push(format!(
+                "LOWER(REPLACE(serialized_name, '_', '')) IN ({})",
+                question_placeholders(normalized_exact_names.len())
+            ));
+        }
+        name_conditions.extend(
+            uppercase_name_globs
+                .iter()
+                .map(|_| "serialized_name GLOB ?".to_string()),
+        );
+        let name_conditions = name_conditions.join(" OR ");
+        if self.has_ready_grounding_summary_snapshots()? {
+            let query = format!(
+                "WITH matched AS (
+                    SELECT
+                        node_id,
+                        kind,
+                        serialized_name,
+                        qualified_name,
+                        canonical_id,
+                        file_node_id,
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                        display_name,
+                        file_path,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY file_node_id
+                            ORDER BY file_symbol_rank, node_id
+                        ) AS named_rank
+                    FROM grounding_node_snapshot
+                         INDEXED BY idx_grounding_node_snapshot_file_rank
+                    WHERE file_node_id IN ({file_placeholders})
+                      AND is_root = 1
+                      AND kind IN ({function_kind}, {method_kind})
+                      AND ({name_conditions})
+                )
+                SELECT
+                    node_id,
+                    kind,
+                    serialized_name,
+                    qualified_name,
+                    canonical_id,
+                    file_node_id,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    display_name,
+                    file_path
+                FROM matched
+                WHERE named_rank <= ?",
+                function_kind = NodeKind::FUNCTION as i32,
+                method_kind = NodeKind::METHOD as i32,
+            );
+            let mut values = Vec::with_capacity(
+                file_ids
+                    .len()
+                    .saturating_add(normalized_exact_names.len())
+                    .saturating_add(uppercase_name_globs.len())
+                    .saturating_add(1),
+            );
+            values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+            values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
+            values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
+            values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
+            let mut stmt = self.conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(values))?;
+            let mut nodes = Vec::new();
+            while let Some(row) = rows.next()? {
+                nodes.push(GroundingNodeRecord {
+                    node: Self::node_from_row(row)?,
+                    display_name: row.get(10)?,
+                    file_path: row.get::<_, Option<String>>(11)?.map(PathBuf::from),
+                });
+            }
+            return Ok(nodes);
+        }
+
+        let rank_sql = grounding_node_rank_sql("n");
+        let indexable = grounding_indexable_predicate("n");
+        let display_name = grounding_display_name_expr("n");
+        let mut fallback_name_conditions = Vec::new();
+        if !normalized_exact_names.is_empty() {
+            fallback_name_conditions.push(format!(
+                "LOWER(REPLACE(n.serialized_name, '_', '')) IN ({})",
+                question_placeholders(normalized_exact_names.len())
+            ));
+        }
+        fallback_name_conditions.extend(
+            uppercase_name_globs
+                .iter()
+                .map(|_| "n.serialized_name GLOB ?".to_string()),
+        );
+        let fallback_name_conditions = fallback_name_conditions.join(" OR ");
+        let query = format!(
+            "WITH matched AS (
+                SELECT
+                    n.id,
+                    n.kind,
+                    n.serialized_name,
+                    n.qualified_name,
+                    n.canonical_id,
+                    n.file_node_id,
+                    n.start_line,
+                    n.start_col,
+                    n.end_line,
+                    n.end_col,
+                    {display_name} AS display_name,
+                    COALESCE(f.path, file_node.serialized_name) AS file_path,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.file_node_id
+                        ORDER BY
+                            {rank_sql},
+                            COALESCE(n.start_line, 2147483647),
+                            {display_name},
+                            n.id
+                    ) AS named_rank
+                FROM node n
+                LEFT JOIN file f ON f.id = n.file_node_id
+                LEFT JOIN node file_node
+                    ON file_node.id = n.file_node_id
+                   AND file_node.kind = {file_kind}
+                WHERE n.file_node_id IN ({file_placeholders})
+                  AND {indexable}
+                  AND n.kind IN ({function_kind}, {method_kind})
+                  AND ({fallback_name_conditions})
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM edge e
+                        WHERE e.kind = {member_kind}
+                          AND e.target_node_id = n.id
+                    )
+            )
+            SELECT
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                display_name,
+                file_path
+            FROM matched
+            WHERE named_rank <= ?",
+            file_kind = NodeKind::FILE as i32,
+            function_kind = NodeKind::FUNCTION as i32,
+            method_kind = NodeKind::METHOD as i32,
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let mut values = Vec::with_capacity(
+            file_ids
+                .len()
+                .saturating_add(normalized_exact_names.len())
+                .saturating_add(uppercase_name_globs.len())
+                .saturating_add(1),
+        );
+        values.extend(file_ids.iter().map(|id| Value::Integer(*id)));
+        values.extend(normalized_exact_names.iter().cloned().map(Value::Text));
+        values.extend(uppercase_name_globs.iter().cloned().map(Value::Text));
+        values.push(Value::Integer(per_file_limit.min(i64::MAX as usize) as i64));
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(values))?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
             nodes.push(GroundingNodeRecord {
@@ -5902,6 +10497,35 @@ impl Storage {
             });
         }
         Ok(nodes)
+    }
+
+    pub fn get_grounding_root_symbol_candidate_count(&self) -> Result<usize, StorageError> {
+        if self.has_ready_grounding_summary_snapshots()? {
+            let count = self.conn.query_row(
+                "SELECT COUNT(*) FROM grounding_node_snapshot WHERE is_root = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            return Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX));
+        }
+
+        let indexable = grounding_indexable_predicate("n");
+        let query = format!(
+            "SELECT COUNT(*)
+             FROM node n
+             WHERE {indexable}
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM edge e
+                    WHERE e.kind = {member_kind}
+                      AND e.target_node_id = n.id
+                )",
+            member_kind = EdgeKind::MEMBER as i32,
+        );
+        let count = self
+            .conn
+            .query_row(&query, [], |row| row.get::<_, i64>(0))?;
+        Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
     }
 
     pub fn get_grounding_member_counts(
@@ -6110,28 +10734,52 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let file_placeholders = question_placeholders(file_ids.len());
-        let sql = format!(
-            "SELECT id, kind
-             FROM node
-             WHERE id IN ({file_placeholders})
-                OR file_node_id IN ({file_placeholders})"
-        );
-        let params = file_ids
-            .iter()
-            .copied()
-            .chain(file_ids.iter().copied())
-            .collect::<Vec<_>>();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let raw_kind: i32 = row.get(1)?;
-            if let Ok(kind) = NodeKind::try_from(raw_kind) {
-                out.push((NodeId(row.get(0)?), kind));
+        let variable_limit = usize::try_from(self.conn.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?)
+            .map_err(|_| {
+                StorageError::Other(
+                    "SQLite reported a negative bind-variable limit for file identity lookup"
+                        .to_string(),
+                )
+            })?;
+        let file_ids_per_batch = variable_limit / 2;
+        if file_ids_per_batch == 0 {
+            return Err(StorageError::Other(format!(
+                "SQLite bind-variable limit {variable_limit} cannot support the two file identity predicates"
+            )));
+        }
+
+        let mut unique_file_ids = file_ids.to_vec();
+        unique_file_ids.sort_unstable();
+        unique_file_ids.dedup();
+
+        // A row can match `id` in one batch and `file_node_id` in another. Keep
+        // one result per node, matching the set semantics of the former single
+        // SELECT, and return stable node-id order regardless of batch layout.
+        let mut node_kinds = BTreeMap::new();
+        for batch in unique_file_ids.chunks(file_ids_per_batch) {
+            let file_placeholders = question_placeholders(batch.len());
+            let sql = format!(
+                "SELECT id, kind
+                 FROM node
+                 WHERE id IN ({file_placeholders})
+                    OR file_node_id IN ({file_placeholders})"
+            );
+            let params = batch
+                .iter()
+                .copied()
+                .chain(batch.iter().copied())
+                .collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                let raw_kind: i32 = row.get(1)?;
+                if let Ok(kind) = NodeKind::try_from(raw_kind) {
+                    let node_id = NodeId(row.get(0)?);
+                    node_kinds.entry(node_id.0).or_insert((node_id, kind));
+                }
             }
         }
-        Ok(out)
+        Ok(node_kinds.into_values().collect())
     }
 
     pub fn get_nodes_for_file_line(
@@ -6158,7 +10806,7 @@ impl Storage {
         error: &codestory_contracts::graph::ErrorInfo,
     ) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT INTO error (message, file_id, line, column, fatal, indexed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 error.message,
                 error.file_id.map(|id| id.0),
@@ -6166,6 +10814,7 @@ impl Storage {
                 error.column,
                 error.is_fatal as i32,
                 (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                error.coverage_reason.map(FileCoverageReason::as_str),
             ],
         )?;
         self.invalidate_grounding_snapshots()?;
@@ -6183,8 +10832,8 @@ impl Storage {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for error in errors {
                 stmt.execute(params![
@@ -6194,6 +10843,7 @@ impl Storage {
                     error.column,
                     error.is_fatal as i32,
                     (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                    error.coverage_reason.map(FileCoverageReason::as_str),
                 ])?;
             }
         }
@@ -6383,6 +11033,25 @@ impl Storage {
             params![file_node_id],
         )?;
 
+        tx.execute(
+            &format!(
+                "DELETE FROM structural_text_unit
+                 WHERE file_id = ?1
+                    OR node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
+            ),
+            params![file_node_id],
+        )?;
+        tx.execute(
+            "DELETE FROM structural_text_projection WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+        tx.execute(
+            "DELETE FROM structural_text_artifact_cache
+             WHERE file_id = ?1",
+            params![file_node_id],
+        )?;
+        tx.execute("DELETE FROM structural_text_unit_publication", [])?;
+
         let removed_local_symbols = tx.execute(
             "DELETE FROM local_symbol WHERE file_id = ?1",
             params![file_node_id],
@@ -6396,6 +11065,15 @@ impl Storage {
             ),
             params![file_node_id],
         )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM dense_anchor_input
+                 WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 OR file_node_id = ?1"
+            ),
+            params![file_node_id],
+        )?;
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
         tx.execute(
             &format!(
                 "DELETE FROM symbol_search_doc
@@ -6480,7 +11158,8 @@ impl Storage {
         &self,
         filter: Option<&codestory_contracts::graph::ErrorFilter>,
     ) -> Result<Vec<codestory_contracts::graph::ErrorInfo>, StorageError> {
-        let base_query = "SELECT id, message, file_id, line, column, fatal, indexed FROM error";
+        let base_query =
+            "SELECT id, message, file_id, line, column, fatal, indexed, coverage_reason FROM error";
         let mut conditions = Vec::new();
 
         if let Some(f) = filter {
@@ -6505,6 +11184,11 @@ impl Storage {
         while let Some(row) = rows.next()? {
             let fatal: i32 = row.get(5)?;
             let indexed: i32 = row.get(6)?;
+            let coverage_reason = row
+                .get::<_, Option<String>>(7)?
+                .as_deref()
+                .map(FileCoverageReason::try_from)
+                .transpose()?;
             errors.push(codestory_contracts::graph::ErrorInfo {
                 message: row.get(1)?,
                 file_id: row.get::<_, Option<i64>>(2)?.map(NodeId),
@@ -6516,6 +11200,7 @@ impl Storage {
                 } else {
                     codestory_contracts::graph::IndexStep::Collection
                 },
+                coverage_reason,
             });
         }
         Ok(errors)
@@ -6555,8 +11240,8 @@ impl Storage {
         }
         {
             let mut insert = tx.prepare(
-                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed, coverage_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for error in errors {
                 insert.execute(params![
@@ -6566,6 +11251,7 @@ impl Storage {
                     error.column,
                     error.is_fatal as i32,
                     (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                    error.coverage_reason.map(FileCoverageReason::as_str),
                 ])?;
             }
         }
@@ -6685,6 +11371,40 @@ impl Storage {
             show_utility_calls,
         )
     }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn observational_sqlite_uri(path: &Path, immutable: bool) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
+
+    let mut encoded = String::with_capacity(bytes.len() + 24);
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    #[cfg(windows)]
+    if encoded.len() >= 3 && encoded.as_bytes()[1] == b':' && encoded.as_bytes()[2] == b'/' {
+        encoded.insert(0, '/');
+    }
+    format!(
+        "file:{encoded}?mode=ro{}",
+        if immutable { "&immutable=1" } else { "" }
+    )
 }
 
 fn neighbor_for_direction(
@@ -6910,6 +11630,7 @@ mod grounding_snapshot_fast_path_tests {
         assert_eq!(storage.get_grounding_file_summary_count()?, 1);
         assert_eq!(storage.get_stats()?.file_count, 1);
         assert_eq!(storage.get_grounding_file_summaries()?.len(), 1);
+        assert_eq!(storage.get_grounding_file_summaries()?[0].file_role, None);
         Ok(())
     }
 
@@ -6953,6 +11674,217 @@ mod grounding_snapshot_fast_path_tests {
             .map(|summary| summary.file.id)
             .collect::<Vec<_>>();
         assert_eq!(snapshot_ids, vec![30, 10]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_grounding_root_symbols_for_files_uses_bounded_file_rank_window()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "src/main.rs",
+            &[
+                (101, NodeKind::INTERFACE, "AppConfig", 1),
+                (102, NodeKind::FUNCTION, "start_application", 2),
+                (103, NodeKind::FIELD, "port", 3),
+            ],
+        )?;
+        storage.insert_edges_batch(&[Edge {
+            id: codestory_contracts::graph::EdgeId(1),
+            source: NodeId(101),
+            target: NodeId(103),
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        }])?;
+        insert_grounding_test_file(&mut storage, 5, "src/noise/main.ts", &[])?;
+        storage.insert_nodes_batch(
+            &(0..12_i64)
+                .map(|offset| Node {
+                    id: NodeId(500 + offset),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "run_app".to_string(),
+                    file_node_id: Some(NodeId(5)),
+                    start_line: Some(1 + offset as u32),
+                    ..Default::default()
+                })
+                .chain((0..192_i64).map(|offset| Node {
+                    id: NodeId(600 + offset),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("create_noise_{offset}"),
+                    file_node_id: Some(NodeId(5)),
+                    start_line: Some(20 + offset as u32),
+                    ..Default::default()
+                }))
+                .collect::<Vec<_>>(),
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            20,
+            "src/second/main.ts",
+            &[(201, NodeKind::FUNCTION, "main", 1)],
+        )?;
+        insert_grounding_test_file(
+            &mut storage,
+            30,
+            "src/app/page.tsx",
+            &[(301, NodeKind::FUNCTION, "Page", 40)],
+        )?;
+
+        let fallback = storage
+            .get_grounding_root_symbols_for_files(&[10], 1)?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(fallback, vec!["AppConfig"]);
+        let named_exact = [
+            "runapp".to_string(),
+            "startapplication".to_string(),
+            "main".to_string(),
+        ];
+        let uppercase_globs = [
+            "Page".to_string(),
+            "Layout".to_string(),
+            "[A-Z]*Page".to_string(),
+            "[A-Z]*Layout".to_string(),
+        ];
+        let mut named_fallback = storage
+            .get_grounding_named_root_symbols_for_files(
+                &[5, 10, 20, 30],
+                &named_exact,
+                &uppercase_globs,
+                2,
+            )?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        named_fallback.sort();
+        assert_eq!(
+            named_fallback,
+            vec!["Page", "main", "run_app", "run_app", "start_application"]
+        );
+
+        storage.refresh_grounding_summary_snapshots()?;
+
+        let snapshot = storage
+            .get_grounding_root_symbols_for_files(&[10], 1)?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot, fallback);
+        let mut named_snapshot = storage
+            .get_grounding_named_root_symbols_for_files(
+                &[5, 10, 20, 30],
+                &named_exact,
+                &uppercase_globs,
+                2,
+            )?
+            .into_iter()
+            .map(|record| record.display_name)
+            .collect::<Vec<_>>();
+        named_snapshot.sort();
+        assert_eq!(named_snapshot, named_fallback);
+
+        let base_plan = storage
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT node_id
+                 FROM grounding_node_snapshot
+                 WHERE is_root = 1
+                 ORDER BY node_rank, sort_start_line, display_name, node_id
+                 LIMIT ?1 OFFSET ?2",
+            )?
+            .query_map(params![16_i64, 0_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            base_plan
+                .iter()
+                .any(|line| line.contains("idx_grounding_node_snapshot_root_rank")),
+            "base root window lost the root-rank index: {base_plan:?}"
+        );
+        assert!(
+            base_plan
+                .iter()
+                .all(|line| !line.contains("USE TEMP B-TREE")),
+            "base root window sorted outside the root-rank index: {base_plan:?}"
+        );
+
+        let file_plan = storage
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT node_id
+                 FROM grounding_node_snapshot
+                      INDEXED BY idx_grounding_node_snapshot_file_rank
+                 WHERE file_symbol_rank <= ?1
+                   AND is_root = 1
+                   AND file_node_id IN (?2)
+                 ORDER BY file_node_id, file_symbol_rank, node_id",
+            )?
+            .query_map(params![16_i64, 10_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            file_plan
+                .iter()
+                .any(|line| line.contains("idx_grounding_node_snapshot_file_rank")),
+            "architecture root window lost the file-rank index: {file_plan:?}"
+        );
+        assert!(
+            file_plan
+                .iter()
+                .all(|line| !line.contains("USE TEMP B-TREE")),
+            "architecture root window sorted outside the file-rank index: {file_plan:?}"
+        );
+
+        let named_plan = storage
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 WITH matched AS (
+                    SELECT
+                        node_id,
+                        file_node_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY file_node_id
+                            ORDER BY file_symbol_rank, node_id
+                        ) AS named_rank
+                    FROM grounding_node_snapshot
+                         INDEXED BY idx_grounding_node_snapshot_file_rank
+                    WHERE file_node_id IN (?1)
+                      AND is_root = 1
+                      AND kind IN (?2, ?3)
+                      AND LOWER(REPLACE(serialized_name, '_', '')) IN (?4)
+                 )
+                 SELECT node_id
+                 FROM matched
+                 WHERE named_rank <= ?5",
+            )?
+            .query_map(
+                params![
+                    10_i64,
+                    NodeKind::FUNCTION as i32,
+                    NodeKind::METHOD as i32,
+                    "startapplication",
+                    8_i64
+                ],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            named_plan
+                .iter()
+                .any(|line| line.contains("idx_grounding_node_snapshot_file_rank")),
+            "named architecture root window lost the file-rank index: {named_plan:?}"
+        );
+        assert!(
+            named_plan
+                .iter()
+                .all(|line| !line.contains("USE TEMP B-TREE")),
+            "named architecture root window sorted outside the file-rank index: {named_plan:?}"
+        );
 
         Ok(())
     }
@@ -7008,7 +11940,7 @@ mod grounding_snapshot_fast_path_tests {
     }
 }
 
-pub use retrieval_manifest::RetrievalIndexManifest;
+pub use retrieval_manifest::{RetrievalIndexManifest, RetrievalIndexRollbackRecord};
 
 #[cfg(test)]
 mod tests;

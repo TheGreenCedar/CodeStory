@@ -147,10 +147,10 @@ fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
         }
         Err(error) => ReportSidecarStatus {
             retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            degraded_reason: Some(format!("retrieval_status_error: {error}")),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
-            embedding_device_observation_source: "sidecar_unobserved".to_string(),
+            embedding_device_observation_source: "retrieval_unobserved".to_string(),
             embedding_detected_provider: None,
             embedding_detected_gpu: None,
             embedding_accelerator_requested: false,

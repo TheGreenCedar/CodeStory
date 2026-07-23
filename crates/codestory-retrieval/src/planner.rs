@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 pub enum RetrievalStageKind {
     Stage0ScipAnchor,
     Stage1Lexical,
-    Stage1bQdrantSemantic,
+    #[serde(rename = "stage1b_semantic")]
+    Stage1bSemantic,
     Stage2ScipExpand,
     Stage3RepoTextFallback,
 }
@@ -22,7 +23,7 @@ impl RetrievalStageKind {
         match self {
             RetrievalStageKind::Stage0ScipAnchor => "stage0_scip_anchor",
             RetrievalStageKind::Stage1Lexical => "stage1_lexical",
-            RetrievalStageKind::Stage1bQdrantSemantic => "stage1b_qdrant_semantic",
+            RetrievalStageKind::Stage1bSemantic => "stage1b_semantic",
             RetrievalStageKind::Stage2ScipExpand => "stage2_scip_expand",
             RetrievalStageKind::Stage3RepoTextFallback => "stage3_repo_text_fallback",
         }
@@ -32,7 +33,7 @@ impl RetrievalStageKind {
         match self {
             RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
             RetrievalStageKind::Stage1Lexical => Some("lexical_source"),
-            RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
+            RetrievalStageKind::Stage1bSemantic => Some("dense_anchor"),
             RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
             RetrievalStageKind::Stage3RepoTextFallback => None,
         }
@@ -42,7 +43,7 @@ impl RetrievalStageKind {
         match self {
             RetrievalStageKind::Stage0ScipAnchor
             | RetrievalStageKind::Stage1Lexical
-            | RetrievalStageKind::Stage1bQdrantSemantic
+            | RetrievalStageKind::Stage1bSemantic
             | RetrievalStageKind::Stage2ScipExpand => u32::try_from(elapsed_ms).ok(),
             RetrievalStageKind::Stage3RepoTextFallback => None,
         }
@@ -111,13 +112,13 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         });
     }
 
-    let qdrant_stage = if mode.runs_qdrant_stage() && features.shape != QueryShape::PathLike {
+    let semantic_stage = if mode.runs_semantic_stage() && features.shape != QueryShape::PathLike {
         let semantic_top_k = match features.shape {
             QueryShape::NaturalLanguage | QueryShape::Mixed => top_k.saturating_mul(2).min(40),
             _ => top_k,
         };
         Some(PlannedStage {
-            kind: RetrievalStageKind::Stage1bQdrantSemantic,
+            kind: RetrievalStageKind::Stage1bSemantic,
             budget_ms: stage1b_budget_ms(features.shape),
             top_k: semantic_top_k,
         })
@@ -143,11 +144,11 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         features.shape,
         QueryShape::NaturalLanguage | QueryShape::Mixed
     ) {
-        stages.extend(qdrant_stage);
+        stages.extend(semantic_stage);
         stages.extend(scip_expand_stage);
     } else {
         stages.extend(scip_expand_stage);
-        stages.extend(qdrant_stage);
+        stages.extend(semantic_stage);
     }
 
     let total_budget_ms = stages
@@ -217,14 +218,14 @@ mod tests {
         assert!(kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage1Lexical));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1bSemantic));
         assert!(
             kinds
                 .iter()
                 .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
                 < kinds
                     .iter()
-                    .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+                    .position(|kind| *kind == RetrievalStageKind::Stage1bSemantic)
         );
     }
 
@@ -238,7 +239,7 @@ mod tests {
                 true,
             ),
             (
-                RetrievalStageKind::Stage1bQdrantSemantic,
+                RetrievalStageKind::Stage1bSemantic,
                 Some("dense_anchor"),
                 true,
             ),
@@ -291,11 +292,11 @@ mod tests {
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1bSemantic));
         assert!(
             kinds
                 .iter()
-                .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+                .position(|kind| *kind == RetrievalStageKind::Stage1bSemantic)
                 < kinds
                     .iter()
                     .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
@@ -310,11 +311,11 @@ mod tests {
         assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
         assert!(kinds.contains(&RetrievalStageKind::Stage1Lexical));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1bSemantic));
         assert!(
             kinds
                 .iter()
-                .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+                .position(|kind| *kind == RetrievalStageKind::Stage1bSemantic)
                 < kinds
                     .iter()
                     .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)

@@ -1,0 +1,22 @@
+{
+  "name": "serde-json-release-evidence",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "00000000-0000-4000-8000-000000000016",
+      "language": "Rust",
+      "standard": "Default",
+      "source_paths": [
+        "."
+      ],
+      "exclude_patterns": [
+        "**/.git/**",
+        "**/target/**",
+        "tests/ui/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

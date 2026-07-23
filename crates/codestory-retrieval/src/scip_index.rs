@@ -1,6 +1,6 @@
 //! Emit SCIP-shaped symbol artifacts from the CodeStory SQLite graph.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::graph::NodeKind;
 use codestory_store::Store;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ impl ScipProofAdapterContract {
             producer: "codestory-retrieval".into(),
             producer_version: env!("CARGO_PKG_VERSION").into(),
             producer_args: vec!["emit_scip_artifacts_from_store".into()],
-            producer_config: "search_symbol_projection".into(),
+            producer_config: "canonical_node_pages".into(),
             revision: revision.into(),
             package: ScipPackageIdentity {
                 manager: "codestory".into(),
@@ -277,20 +277,26 @@ pub fn emit_scip_artifacts_from_store(
 ) -> Result<Option<String>> {
     std::fs::create_dir_all(project_dir)
         .with_context(|| format!("create scip dir {}", project_dir.display()))?;
-    let mut storage = Store::open(storage_path).context("open storage for scip emit")?;
-    if storage.get_search_symbol_projection_count().unwrap_or(0) == 0 {
-        let _ = storage.rebuild_search_symbol_projection_from_node_table();
-    }
+    let storage = Store::open(storage_path).context("open storage for scip emit")?;
+    let expected_symbol_rows = u64::from(
+        storage
+            .get_canonical_search_symbol_count()
+            .context("count canonical symbols for scip")?,
+    );
 
     let mut symbols = Vec::new();
+    let mut scanned_symbol_rows = 0_u64;
     let mut after = None;
     loop {
         let batch = storage
-            .get_search_symbol_projection_detail_batch_after(after, 4096)
+            .get_canonical_search_symbol_detail_batch_after(after, 4096)
             .context("load symbols for scip")?;
         if batch.is_empty() {
             break;
         }
+        scanned_symbol_rows = scanned_symbol_rows
+            .checked_add(u64::try_from(batch.len()).context("canonical SCIP page size overflow")?)
+            .context("canonical SCIP symbol count overflow")?;
         after = batch.last().map(|row| row.node_id);
         for row in batch {
             if row.node_kind == Some(NodeKind::UNKNOWN as i64) {
@@ -309,6 +315,11 @@ pub fn emit_scip_artifacts_from_store(
                 end_line,
             });
         }
+    }
+    if scanned_symbol_rows != expected_symbol_rows {
+        bail!(
+            "canonical SCIP symbol count changed while streaming: expected {expected_symbol_rows}, scanned {scanned_symbol_rows}"
+        );
     }
 
     if symbols.is_empty() {
@@ -389,7 +400,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn scip_emit_does_not_stop_at_legacy_smoke_cap() {
+    fn scip_emit_streams_canonical_pages_independent_of_legacy_projection() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let mut storage = Store::open(&storage_path).expect("open store");
@@ -422,7 +433,6 @@ mod tests {
             .expect("insert file node");
 
         let mut nodes = Vec::new();
-        let mut projections = Vec::new();
         for index in 0..4_100_i64 {
             let id = NodeId(index + 2);
             nodes.push(Node {
@@ -436,10 +446,6 @@ mod tests {
                 start_col: Some(0),
                 end_line: Some((index + 1) as u32),
                 end_col: Some(10),
-            });
-            projections.push(SearchSymbolProjection {
-                node_id: id,
-                display_name: format!("symbol_{index:04}"),
             });
         }
         let unknown_node_id = NodeId(5_000);
@@ -455,28 +461,51 @@ mod tests {
             end_line: Some(4_101),
             end_col: Some(10),
         });
-        projections.push(SearchSymbolProjection {
-            node_id: unknown_node_id,
-            display_name: "import_alias".to_string(),
-        });
         storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        storage
-            .upsert_search_symbol_projection_batch(&projections)
-            .expect("insert projections");
         drop(storage);
 
-        let scip_dir = project.path().join("scip");
-        emit_scip_artifacts_from_store(&storage_path, &scip_dir).expect("emit scip");
-        let symbols = load_scip_symbols(&scip_dir)
+        let empty_projection_dir = project.path().join("scip-empty-projection");
+        emit_scip_artifacts_from_store(&storage_path, &empty_projection_dir)
+            .expect("emit scip without legacy projection");
+        let symbols = load_scip_symbols(&empty_projection_dir)
             .expect("load scip")
             .expect("symbols");
+
+        let mut storage = Store::open(&storage_path).expect("reopen store");
+        storage
+            .upsert_search_symbol_projection_batch(&[
+                SearchSymbolProjection {
+                    node_id: NodeId(2),
+                    display_name: "stale_wrong_name".into(),
+                },
+                SearchSymbolProjection {
+                    node_id: unknown_node_id,
+                    display_name: "stale_unknown_name".into(),
+                },
+            ])
+            .expect("seed stale legacy projection");
+        drop(storage);
+
+        let stale_projection_dir = project.path().join("scip-stale-projection");
+        emit_scip_artifacts_from_store(&storage_path, &stale_projection_dir)
+            .expect("emit scip with stale legacy projection");
+        let stale_projection_symbols = load_scip_symbols(&stale_projection_dir)
+            .expect("load stale-projection scip")
+            .expect("stale-projection symbols");
 
         assert_eq!(
             symbols.contract.evidence_source,
             SCIP_GRAPH_PROJECTION_PROVENANCE
         );
+        assert_eq!(symbols.contract.producer_config, "canonical_node_pages");
         assert_eq!(symbols.contract.freshness, "fresh");
         assert_eq!(symbols.proofs.len(), symbols.symbols.len());
+        assert_eq!(
+            serde_json::to_value(&symbols).expect("serialize empty-projection symbols"),
+            serde_json::to_value(&stale_projection_symbols)
+                .expect("serialize stale-projection symbols"),
+            "legacy projection contents must not change canonical SCIP output"
+        );
         assert!(
             symbols
                 .symbols
@@ -491,10 +520,7 @@ mod tests {
                 .all(|symbol| symbol.node_id.as_deref() != Some("5000")),
             "unresolvable UNKNOWN nodes should not enter the SCIP candidate lane"
         );
-        assert!(
-            symbols.symbols.len() >= 4_100,
-            "SCIP emit should not truncate at the old 4096-symbol smoke cap"
-        );
+        assert_eq!(symbols.symbols.len(), 4_100);
         assert!(
             symbols
                 .symbols

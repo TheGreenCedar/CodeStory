@@ -1,6 +1,9 @@
-use crate::{FileContentHash, FileInfo, ProjectionFlushBreakdown, StorageError, Store};
+use crate::{
+    FileContentHash, FileInfo, ProjectionFlushBreakdown, StorageError, Store,
+    StructuralTextArtifactCacheWrite, StructuralTextProjection, StructuralTextUnit,
+};
 use codestory_contracts::graph::{
-    AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
+    AccessKind, CallableProjectionState, Edge, ErrorInfo, Node, NodeId, Occurrence,
 };
 
 /// Mutable graph/search projection facade.
@@ -18,10 +21,14 @@ pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub file_content_hashes: &'a [FileContentHash],
     pub nodes: &'a [Node],
+    pub structural_text_units: &'a [StructuralTextUnit],
+    pub structural_text_projections: &'a [StructuralTextProjection],
+    pub structural_text_cache_writes: &'a [StructuralTextArtifactCacheWrite<'a>],
     pub edges: &'a [Edge],
     pub occurrences: &'a [Occurrence],
     pub component_access: &'a [(NodeId, AccessKind)],
     pub callable_projection_states: &'a [CallableProjectionState],
+    pub file_errors: &'a [ErrorInfo],
 }
 
 impl<'a> ProjectionStore<'a> {
@@ -48,10 +55,14 @@ impl<'a> ProjectionStore<'a> {
                 files: batch.files,
                 file_content_hashes: batch.file_content_hashes,
                 nodes: batch.nodes,
+                structural_text_units: batch.structural_text_units,
+                structural_text_projections: batch.structural_text_projections,
+                structural_text_cache_writes: batch.structural_text_cache_writes,
                 edges: batch.edges,
                 occurrences: batch.occurrences,
                 component_access: batch.component_access,
                 callable_projection_states: batch.callable_projection_states,
+                file_errors: batch.file_errors,
             })
     }
 }

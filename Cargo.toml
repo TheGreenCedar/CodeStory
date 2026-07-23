@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/codestory-llama-sys",
     "crates/codestory-contracts",
     "crates/codestory-workspace",
     "crates/codestory-store",
@@ -10,41 +11,44 @@ members = [
     "crates/codestory-cli",
     "crates/codestory-bench",
 ]
+exclude = ["vendor/tree-sitter-graph"]
 
 [workspace.dependencies]
 # Internal crates
+codestory-llama-sys = { path = "crates/codestory-llama-sys" }
 codestory-contracts = { path = "crates/codestory-contracts" }
 codestory-workspace = { path = "crates/codestory-workspace" }
 codestory-store = { path = "crates/codestory-store" }
 codestory-indexer = { path = "crates/codestory-indexer" }
 codestory-retrieval = { path = "crates/codestory-retrieval" }
 codestory-runtime = { path = "crates/codestory-runtime" }
+codestory-cli = { path = "crates/codestory-cli" }
 codestory-bench = { path = "crates/codestory-bench" }
 
-# Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23.3"
-tree-sitter-python = "0.23.6"
-tree-sitter-java = "0.23"
-tree-sitter-cpp = "0.23"
-tree-sitter-c = "0.23"
-tree-sitter-javascript = "0.23.1"
-tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.23.4"
+# Parsing (tree-sitter)
+tree-sitter = "0.26.11"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25.0"
 tree-sitter-ruby = "0.23.1"
-tree-sitter-php = "0.23.11"
-tree-sitter-c-sharp = "=0.23.0"
+tree-sitter-php = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
 tree-sitter-kotlin-ng = "1.1.0"
-tree-sitter-swift = "0.7.0"
-tree-sitter-dart-orchard = "0.3.2"
-tree-sitter-bash = "0.23.3"
+tree-sitter-swift = "0.7.3"
+tree-sitter-dart-orchard = "0.4.0"
+tree-sitter-bash = "0.25.1"
 
 # Semantic Analysis
-tree-sitter-graph = "0.12"
+tree-sitter-graph = { path = "vendor/tree-sitter-graph" }
 streaming-iterator = "0.1"
 
 # Storage
-rusqlite = { version = "0.38", features = ["backup", "bundled", "hooks"] }
+rusqlite = { version = "0.38", features = ["backup", "bundled", "hooks", "limits"] }
 
 # Search
 nucleo-matcher = "0.3"
@@ -53,7 +57,7 @@ tantivy = "0.26"
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_with = "3.15.1"
+serde_with = "3.21.0"
 specta = { version = "2.0.0-rc.22", features = ["derive", "serde"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
 fs4 = "0.13.1"
@@ -82,8 +86,9 @@ toml = "0.8"
 sha2 = "0.10"
 ring = "0.17.14"
 ureq = "2.12"
-turbovec = "0.9.0"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+llama-cpp-2 = { version = "=0.1.151", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.151", default-features = false }
 
 criterion = "0.8.2"
 proptest = "1.5"

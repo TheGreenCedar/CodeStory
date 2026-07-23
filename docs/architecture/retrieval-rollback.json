@@ -1,11 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CodeStory sidecar retrieval promotion guards",
-  "description": "When sidecar retrieval is promotion-ready, block promotion if any trigger fires on consecutive full local-real benchmark runs.",
+  "title": "CodeStory retrieval promotion guards",
+  "description": "When retrieval is promotion-ready, block promotion if any trigger fires on consecutive full local-real benchmark runs.",
   "version": 1,
   "env": {
-    "shadow_mode": "CODESTORY_RETRIEVAL_SHADOW",
-    "qdrant": "CODESTORY_QDRANT_ENABLED"
+    "shadow_mode": "CODESTORY_RETRIEVAL_SHADOW"
   },
   "baseline_artifact_dir": "target/agent-benchmark/baseline-pre-retrieval",
   "comparison_artifact": "packet-runtime-summary.json",
@@ -22,7 +21,7 @@
       "id": "retrieval_p99_regression",
       "metric": "retrieval_p99_ms",
       "threshold": "+50%",
-      "baseline": "baseline-pre-retrieval/shadow-sidecar",
+      "baseline": "baseline-pre-retrieval/shadow-retrieval",
       "measurement": "trace aggregates"
     },
     {
@@ -43,7 +42,7 @@
       "id": "degraded_mode_rate",
       "metric": "degraded_mode_rate",
       "threshold": ">5%",
-      "baseline": "baseline-pre-retrieval/shadow-sidecar",
+      "baseline": "baseline-pre-retrieval/shadow-retrieval",
       "measurement": "retrieval_shadow traces"
     },
     {

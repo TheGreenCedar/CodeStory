@@ -1,0 +1,8 @@
+name: Controlled invalid syntax
+
+on:
+  workflow_dispatch:
+
+jobs:
+  syntax-error:
+    runs-on: [ubuntu-latest

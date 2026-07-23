@@ -18,9 +18,8 @@ pages, runbooks, and workflows own detailed mechanics.
 - Before source claims, planning edits, choosing tests, or reviewing changes,
   use the canonical CodeStory grounding skill when its MCP tools are visible.
   Every MCP call must carry the target repository's absolute `project` root.
-  Reuse current status until repository, runtime, or index state changes.
-- Obey `allowed_surfaces` and `retrieval_mode`. Use `packet`, `search`, or
-  `context` only when that surface is allowed and retrieval is `full`. If the
+  Call the tool that matches the task directly; tool gating owns readiness and
+  managed preparation. Read status only after a call fails to converge. If the
   MCP tools are not visible, use ordinary source inspection and report the
   visibility gap. CLI diagnostics do not prove that the packaged plugin MCP is
   live in the agent host.
@@ -78,8 +77,8 @@ adapter to compensate for incorrect upstream state.
 
 - Status, doctor, and other read surfaces are observational. They must not
   download assets, refresh indexes, start repair, or mutate sidecar state.
-  Grounding and explicit project-scoped setup or repair operations own
-  activation.
+  Project-scoped product tool calls own activation and automatic managed
+  preparation.
 - Writers stage and validate a complete generation before publishing it.
   Current and rollback pointers change atomically; readers pin one complete
   old-or-new generation. Failure, cancellation, or concurrent source drift
@@ -125,7 +124,7 @@ adapter to compensate for incorrect upstream state.
   independently accepted exact head.
 - CLI integration tests must launch through
   `tests/test_support::cli_command` or its supplied-binary variant, use
-  isolated cache/install/plugin state roots, and drain spawned repair workers.
+  isolated cache/install/plugin state roots.
   Never clean or write the real user cache to make a test pass, and never
   serialize the suite to hide state leakage.
 - Docs-only scope is `README.md`, `docs/**`, `plugins/codestory/README.md`,
@@ -185,7 +184,9 @@ adapter to compensate for incorrect upstream state.
 ## Release Rules
 
 - `crates/codestory-cli/Cargo.toml` is the release version source. Synchronize
-  every `codestory-*` workspace crate, `Cargo.lock`, and these plugin manifests:
+  every `codestory-*` workspace crate, `Cargo.lock`, the
+  `producer.version` in `crates/codestory-llama-sys/model-contract.json`, and
+  these plugin manifests:
   - `plugins/codestory/.codex-plugin/plugin.json`
   - `plugins/codestory/.claude-plugin/plugin.json`
   - `plugins/codestory/.github/plugin/plugin.json`
@@ -196,7 +197,7 @@ adapter to compensate for incorrect upstream state.
   `main` triggers the release workflow that creates the tag, GitHub release,
   native archives, and `SHA256SUMS.txt`.
 - Source checks, built binaries, packaged archives, installed plugin launchers,
-  fresh host sessions, and live full-sidecar behavior are distinct proof tiers.
+  fresh host sessions, and live full-retrieval behavior are distinct proof tiers.
   A lower tier cannot support a higher-tier claim. Use the named testing-matrix
   lane for packet/search readiness, accelerator execution, signing/notarization
   and Gatekeeper, restart survival, host visibility, or another architecture.
@@ -219,6 +220,13 @@ adapter to compensate for incorrect upstream state.
 
 - On Windows, invoke the Codex npm shim as `codex.cmd`; the extensionless shim
   can fail with `os error 193`.
+- On many Windows development hosts, source builds use Visual Studio 18
+  Community's bundled CMake and Ninja. Prepend its
+  `Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin` and
+  `Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja` directories to `PATH`,
+  set `CMAKE_GENERATOR=Ninja`, and set `CARGO_TARGET_DIR` to a short path such
+  as `C:\tmp\codestory-target`; the repository-local target path can exceed the
+  nested Vulkan build's CMake path limit.
 - Keep secrets out of the repository. Pass credentials through approved
   environment or protected CI secret surfaces, and keep private material out
   of logs, fixtures, generated artifacts, and comments.
@@ -233,7 +241,7 @@ adapter to compensate for incorrect upstream state.
   `docs/contributors/testing-matrix.md`
 - Retrieval design and operations: `docs/architecture/retrieval-design.md`,
   `docs/testing/retrieval-architecture.md`, and
-  `docs/ops/retrieval-sidecars.md`
+  `docs/ops/retrieval-engine.md`
 - Language claim tiers: `docs/architecture/language-support.md`
 - Agent operational contract:
   `plugins/codestory/skills/codestory-grounding/SKILL.md` and its references

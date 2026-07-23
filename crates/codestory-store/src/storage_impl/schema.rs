@@ -62,8 +62,64 @@ const TABLE_STATEMENTS: &[&str] = &[
         generation INTEGER NOT NULL CHECK (generation > 0),
         generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
         run_id TEXT NOT NULL CHECK (length(run_id) > 0),
-        mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+        mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental', 'semantic_projection')),
         published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_unit (
+        node_id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL,
+        placement_id TEXT NOT NULL UNIQUE CHECK(length(placement_id) = 64),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        evidence_tier TEXT NOT NULL CHECK(evidence_tier = 'structural_text'),
+        resolution TEXT NOT NULL CHECK(resolution = 'source_range_only'),
+        language TEXT NOT NULL CHECK(length(language) > 0),
+        kind INTEGER NOT NULL,
+        start_line INTEGER NOT NULL CHECK(start_line > 0),
+        start_col INTEGER NOT NULL CHECK(start_col > 0),
+        end_line INTEGER NOT NULL CHECK(end_line > 0),
+        end_col INTEGER NOT NULL CHECK(end_col > 0),
+        file_role TEXT NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id),
+        FOREIGN KEY(file_id) REFERENCES file(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_projection (
+        file_id INTEGER PRIMARY KEY,
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        language TEXT NOT NULL CHECK(length(language) > 0),
+        file_role TEXT NOT NULL,
+        unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+        unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+        FOREIGN KEY(file_id) REFERENCES file(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_artifact_cache (
+        file_path TEXT PRIMARY KEY,
+        file_id INTEGER NOT NULL UNIQUE,
+        cache_key TEXT NOT NULL,
+        source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        producer TEXT NOT NULL CHECK(length(producer) > 0),
+        artifact_digest TEXT NOT NULL CHECK(length(artifact_digest) = 64),
+        artifact_blob BLOB NOT NULL,
+        updated_at_epoch_ms INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS structural_text_unit_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+        unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+        projection_count INTEGER NOT NULL CHECK(projection_count >= 0),
+        projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64),
+        descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+        migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
     )",
     "CREATE TABLE IF NOT EXISTS local_symbol (
         id INTEGER PRIMARY KEY,
@@ -84,6 +140,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         column INTEGER,
         fatal INTEGER DEFAULT 0,
         indexed INTEGER DEFAULT 0,
+        coverage_reason TEXT,
         FOREIGN KEY(file_id) REFERENCES file(id)
     )",
     "CREATE TABLE IF NOT EXISTS bookmark_category (
@@ -120,6 +177,66 @@ const TABLE_STATEMENTS: &[&str] = &[
         updated_at_epoch_ms INTEGER NOT NULL,
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS dense_anchor_input (
+        node_id INTEGER PRIMARY KEY,
+        file_node_id INTEGER,
+        kind INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        qualified_name TEXT,
+        file_path TEXT,
+        start_line INTEGER,
+        end_line INTEGER,
+        file_role TEXT NOT NULL,
+        source_provenance TEXT NOT NULL,
+        document_text TEXT NOT NULL,
+        document_hash TEXT NOT NULL CHECK(length(document_hash) > 0),
+        selection_reason TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        source_identity TEXT NOT NULL CHECK(length(source_identity) > 0),
+        updated_at_epoch_ms INTEGER NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id),
+        FOREIGN KEY(file_node_id) REFERENCES node(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS dense_anchor_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
+        anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
+    "CREATE TABLE IF NOT EXISTS source_policy_exclusion (
+        normalized_path TEXT PRIMARY KEY CHECK(length(normalized_path) > 0),
+        project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+        workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        observed_size INTEGER NOT NULL CHECK(observed_size > 0),
+        observed_unit_count INTEGER NOT NULL DEFAULT 0 CHECK(observed_unit_count >= 0),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+        structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0)
+    )",
+    "CREATE TABLE IF NOT EXISTS source_policy_exclusion_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+        workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        exclusion_count INTEGER NOT NULL CHECK(exclusion_count >= 0),
+        exclusion_digest TEXT NOT NULL CHECK(length(exclusion_digest) = 64),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+        structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
     )",
     "CREATE TABLE IF NOT EXISTS symbol_search_doc (
         node_id INTEGER PRIMARY KEY,
@@ -242,7 +359,7 @@ const TABLE_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
         project_id TEXT PRIMARY KEY,
         lexical_version TEXT NOT NULL,
-        qdrant_collection TEXT NOT NULL,
+        semantic_generation TEXT NOT NULL,
         scip_revision TEXT,
         built_at_epoch_ms INTEGER NOT NULL,
         disk_bytes INTEGER,
@@ -261,7 +378,8 @@ const TABLE_STATEMENTS: &[&str] = &[
         precise_semantic_import_status TEXT,
         precise_semantic_import_reason TEXT,
         precise_semantic_import_revision TEXT,
-        precise_semantic_import_producer TEXT
+        precise_semantic_import_producer TEXT,
+        rollback_record_json TEXT
     )",
 ];
 
@@ -271,12 +389,17 @@ const LOAD_TIME_INDEX_STATEMENTS: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_component_access_node ON component_access(node_id)",
 ];
 
-const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
+const SEMANTIC_CONTEXT_ENDPOINT_INDEX_STATEMENTS: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_edge_source ON edge(source_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_target ON edge(target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
+];
+
+const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element ON occurrence(element_id)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_element_start_line ON occurrence(element_id, start_line)",
     "CREATE INDEX IF NOT EXISTS idx_occurrence_file ON occurrence(file_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_source ON edge(source_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_target ON edge(target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_file ON edge(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_scope_unresolved
      ON edge(kind, resolved_target_node_id, source_node_id, file_node_id)",
@@ -287,8 +410,6 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_category ON bookmark_node(category_id)",
     "CREATE INDEX IF NOT EXISTS idx_bookmark_node_node ON bookmark_node(node_id)",
     "CREATE INDEX IF NOT EXISTS idx_node_kind_serialized_name ON node(kind, serialized_name)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_source ON edge(resolved_source_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_edge_resolved_target ON edge(resolved_target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_source ON edge(kind, source_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_target ON edge(kind, target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_kind_resolved_target ON edge(kind, resolved_target_node_id)",
@@ -299,6 +420,12 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_policy_reason
      ON llm_symbol_doc(semantic_policy_version, dense_reason)",
+    "CREATE INDEX IF NOT EXISTS idx_dense_anchor_input_file_node
+     ON dense_anchor_input(file_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_dense_anchor_input_reuse
+     ON dense_anchor_input(policy_version, document_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_dense_anchor_input_source
+     ON dense_anchor_input(source_identity)",
     "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_file_node ON symbol_search_doc(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_kind ON symbol_search_doc(kind)",
     "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_policy ON symbol_search_doc(policy_version)",
@@ -307,17 +434,50 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
      ON search_symbol_projection(display_name)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_rank
-     ON grounding_file_snapshot(best_node_rank, symbol_count DESC, path)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_file_rank
-     ON grounding_node_snapshot(file_node_id, file_symbol_rank, node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_root_rank
-     ON grounding_node_snapshot(is_root, node_rank, sort_start_line, display_name, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_file
+     ON structural_text_unit(file_id)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_content
+     ON structural_text_unit(content_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_artifact_cache_key
+     ON structural_text_artifact_cache(cache_key)",
+    "CREATE INDEX IF NOT EXISTS idx_structural_text_artifact_cache_file
+     ON structural_text_artifact_cache(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_retrieval_index_manifest_built_at
      ON retrieval_index_manifest(built_at_epoch_ms)",
+];
+
+const GROUNDING_FILE_SNAPSHOT_PATH_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_path ON grounding_file_snapshot(path)";
+const GROUNDING_FILE_SNAPSHOT_RANK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_file_snapshot_rank
+     ON grounding_file_snapshot(best_node_rank, symbol_count DESC, path)";
+const GROUNDING_NODE_SNAPSHOT_FILE_RANK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_file_rank
+     ON grounding_node_snapshot(file_node_id, file_symbol_rank, node_id)";
+const GROUNDING_NODE_SNAPSHOT_ROOT_RANK_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_grounding_node_snapshot_root_rank
+     ON grounding_node_snapshot(is_root, node_rank, sort_start_line, display_name, node_id)";
+
+const GROUNDING_SUMMARY_DESTINATION_INDEX_STATEMENTS: &[&str] = &[
+    GROUNDING_FILE_SNAPSHOT_PATH_INDEX,
+    GROUNDING_FILE_SNAPSHOT_RANK_INDEX,
+    GROUNDING_NODE_SNAPSHOT_FILE_RANK_INDEX,
+    GROUNDING_NODE_SNAPSHOT_ROOT_RANK_INDEX,
+];
+
+const POST_SUMMARY_DESTINATION_INDEX_STATEMENTS: &[&str] = &[
+    GROUNDING_FILE_SNAPSHOT_PATH_INDEX,
+    GROUNDING_FILE_SNAPSHOT_RANK_INDEX,
+    GROUNDING_NODE_SNAPSHOT_ROOT_RANK_INDEX,
+];
+
+const GROUNDING_SUMMARY_DESTINATION_INDEX_NAMES: &[&str] = &[
+    "idx_grounding_file_snapshot_path",
+    "idx_grounding_file_snapshot_rank",
+    "idx_grounding_node_snapshot_file_rank",
+    "idx_grounding_node_snapshot_root_rank",
 ];
 
 pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
@@ -335,7 +495,48 @@ pub(super) fn create_load_indexes(conn: &Connection) -> Result<(), StorageError>
 }
 
 pub(super) fn create_secondary_indexes(conn: &Connection) -> Result<(), StorageError> {
-    for statement in SECONDARY_INDEX_STATEMENTS {
+    create_pre_summary_secondary_indexes(conn)?;
+    for statement in GROUNDING_SUMMARY_DESTINATION_INDEX_STATEMENTS {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn create_pre_summary_secondary_indexes(conn: &Connection) -> Result<(), StorageError> {
+    create_semantic_context_endpoint_indexes(conn)?;
+    for statement in PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn create_semantic_context_endpoint_indexes(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    for statement in SEMANTIC_CONTEXT_ENDPOINT_INDEX_STATEMENTS {
+        conn.execute(statement, [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn drop_grounding_summary_destination_indexes(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    for index_name in GROUNDING_SUMMARY_DESTINATION_INDEX_NAMES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {index_name}"), [])?;
+    }
+    Ok(())
+}
+
+pub(super) fn create_grounding_node_file_rank_index(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(GROUNDING_NODE_SNAPSHOT_FILE_RANK_INDEX, [])?;
+    Ok(())
+}
+
+pub(super) fn create_post_summary_destination_indexes(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    for statement in POST_SUMMARY_DESTINATION_INDEX_STATEMENTS {
         conn.execute(statement, [])?;
     }
     Ok(())
@@ -461,6 +662,42 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v21_retrieval_manifest_lexical_version(&storage.conn)?;
     if stored_version < 21 {
         storage.set_schema_version(21)?;
+    }
+    migrate_v22_retrieval_manifest_semantic_generation(&storage.conn)?;
+    if stored_version < 22 {
+        storage.set_schema_version(22)?;
+    }
+    migrate_v23_dense_anchor_input(&storage.conn)?;
+    if stored_version < 23 {
+        storage.set_schema_version(23)?;
+    }
+    migrate_v24_dense_anchor_publication(&storage.conn)?;
+    if stored_version < 24 {
+        storage.set_schema_version(24)?;
+    }
+    migrate_v25_retrieval_rollback(&storage.conn)?;
+    if stored_version < 25 {
+        storage.set_schema_version(25)?;
+    }
+    migrate_v26_error_coverage_reason(&storage.conn)?;
+    if stored_version < 26 {
+        storage.set_schema_version(26)?;
+    }
+    migrate_v27_source_policy_exclusions(&storage.conn)?;
+    if stored_version < 27 {
+        storage.set_schema_version(27)?;
+    }
+    migrate_v28_structural_text_units(&storage.conn)?;
+    if stored_version < 28 {
+        storage.set_schema_version(28)?;
+    }
+    migrate_v29_structural_policy_exclusions(&storage.conn)?;
+    if stored_version < 29 {
+        storage.set_schema_version(29)?;
+    }
+    migrate_v30_semantic_projection_publication_mode(&storage.conn)?;
+    if stored_version < 30 {
+        storage.set_schema_version(30)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -672,7 +909,7 @@ pub(super) fn migrate_v14_retrieval_index_manifest(conn: &Connection) -> Result<
         "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
             project_id TEXT PRIMARY KEY,
             zoekt_version TEXT NOT NULL,
-            qdrant_collection TEXT NOT NULL,
+            semantic_generation TEXT NOT NULL,
             scip_revision TEXT,
             built_at_epoch_ms INTEGER NOT NULL,
             disk_bytes INTEGER,
@@ -714,6 +951,282 @@ pub(super) fn migrate_v21_retrieval_manifest_lexical_version(
             "retrieval_index_manifest is missing lexical_version".to_string(),
         )),
     }
+}
+
+pub(super) fn migrate_v22_retrieval_manifest_semantic_generation(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    let columns = table_columns(conn, "retrieval_index_manifest")?;
+    let has_old_name = columns.iter().any(|column| column == "qdrant_collection");
+    let has_semantic = columns.iter().any(|column| column == "semantic_generation");
+    match (has_old_name, has_semantic) {
+        (true, false) => {
+            conn.execute(
+                "ALTER TABLE retrieval_index_manifest RENAME COLUMN qdrant_collection TO semantic_generation",
+                [],
+            )?;
+            Ok(())
+        }
+        (false, true) => Ok(()),
+        (true, true) => Err(StorageError::Other(
+            "retrieval_index_manifest contains both old and semantic generation columns".into(),
+        )),
+        (false, false) => Err(StorageError::Other(
+            "retrieval_index_manifest is missing semantic_generation".into(),
+        )),
+    }
+}
+
+pub(super) fn migrate_v23_dense_anchor_input(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dense_anchor_input (
+            node_id INTEGER PRIMARY KEY,
+            file_node_id INTEGER,
+            kind INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            qualified_name TEXT,
+            file_path TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            file_role TEXT NOT NULL,
+            source_provenance TEXT NOT NULL,
+            document_text TEXT NOT NULL,
+            document_hash TEXT NOT NULL CHECK(length(document_hash) > 0),
+            selection_reason TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            source_identity TEXT NOT NULL CHECK(length(source_identity) > 0),
+            updated_at_epoch_ms INTEGER NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id),
+            FOREIGN KEY(file_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v24_dense_anchor_publication(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dense_anchor_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
+            anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "rollback_record_json TEXT",
+    )
+}
+
+pub(super) fn migrate_v26_error_coverage_reason(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(conn, "error", "coverage_reason TEXT")
+}
+
+pub(super) fn migrate_v27_source_policy_exclusions(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS source_policy_exclusion (
+            normalized_path TEXT PRIMARY KEY CHECK(length(normalized_path) > 0),
+            project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+            workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+            content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+            observed_size INTEGER NOT NULL CHECK(observed_size > 0),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS source_policy_exclusion_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            project_id TEXT NOT NULL CHECK(length(project_id) > 0),
+            workspace_id TEXT NOT NULL CHECK(length(workspace_id) > 0),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            exclusion_count INTEGER NOT NULL CHECK(exclusion_count >= 0),
+            exclusion_digest TEXT NOT NULL CHECK(length(exclusion_digest) = 64),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            byte_cap INTEGER NOT NULL CHECK(byte_cap > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v28_structural_text_units(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_unit (
+            node_id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            placement_id TEXT NOT NULL UNIQUE CHECK(length(placement_id) = 64),
+            content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            evidence_tier TEXT NOT NULL CHECK(evidence_tier = 'structural_text'),
+            resolution TEXT NOT NULL CHECK(resolution = 'source_range_only'),
+            language TEXT NOT NULL CHECK(length(language) > 0),
+            kind INTEGER NOT NULL,
+            start_line INTEGER NOT NULL CHECK(start_line > 0),
+            start_col INTEGER NOT NULL CHECK(start_col > 0),
+            end_line INTEGER NOT NULL CHECK(end_line > 0),
+            end_col INTEGER NOT NULL CHECK(end_col > 0),
+            file_role TEXT NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id),
+            FOREIGN KEY(file_id) REFERENCES file(id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_unit_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+            unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+            projection_count INTEGER NOT NULL CHECK(projection_count >= 0),
+            projection_digest TEXT NOT NULL CHECK(length(projection_digest) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_projection (
+            file_id INTEGER PRIMARY KEY,
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            language TEXT NOT NULL CHECK(length(language) > 0),
+            file_role TEXT NOT NULL,
+            unit_count INTEGER NOT NULL CHECK(unit_count >= 0),
+            unit_digest TEXT NOT NULL CHECK(length(unit_digest) = 64),
+            FOREIGN KEY(file_id) REFERENCES file(id)
+        )",
+        [],
+    )?;
+    let structural_cache_columns = table_columns(conn, "structural_text_artifact_cache")?;
+    if !structural_cache_columns.is_empty()
+        && ![
+            "file_id",
+            "source_content_hash",
+            "descriptor_version",
+            "producer",
+            "artifact_digest",
+        ]
+        .iter()
+        .all(|required| {
+            structural_cache_columns
+                .iter()
+                .any(|column| column == required)
+        })
+    {
+        // This cache is disposable. Rebuild the pre-binding v28 shape rather
+        // than preserving rows that cannot be tied to a verified projection.
+        conn.execute("DROP TABLE structural_text_artifact_cache", [])?;
+    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS structural_text_artifact_cache (
+            file_path TEXT PRIMARY KEY,
+            file_id INTEGER NOT NULL UNIQUE,
+            cache_key TEXT NOT NULL,
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            descriptor_version INTEGER NOT NULL CHECK(descriptor_version > 0),
+            producer TEXT NOT NULL CHECK(length(producer) > 0),
+            artifact_digest TEXT NOT NULL CHECK(length(artifact_digest) = 64),
+            artifact_blob BLOB NOT NULL,
+            updated_at_epoch_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v29_structural_policy_exclusions(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "source_policy_exclusion",
+        "observed_unit_count INTEGER NOT NULL DEFAULT 0 CHECK(observed_unit_count >= 0)",
+    )?;
+    try_add_column(
+        conn,
+        "source_policy_exclusion",
+        "structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0)",
+    )?;
+    try_add_column(
+        conn,
+        "source_policy_exclusion_publication",
+        "structural_unit_cap INTEGER NOT NULL DEFAULT 2048 CHECK(structural_unit_cap > 0)",
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v30_semantic_projection_publication_mode(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'index_publication'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if table_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("semantic_projection"))
+    {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "ALTER TABLE index_publication RENAME TO index_publication_v29",
+        [],
+    )?;
+    tx.execute(
+        "CREATE TABLE index_publication (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+            run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+            mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental', 'semantic_projection')),
+            published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO index_publication (
+            id, generation, generation_id, run_id, mode, published_at_epoch_ms
+         )
+         SELECT id, generation, generation_id, run_id, mode, published_at_epoch_ms
+         FROM index_publication_v29",
+        [],
+    )?;
+    tx.execute("DROP TABLE index_publication_v29", [])?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {

@@ -107,114 +107,150 @@ pub(crate) fn handle_http_request(
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(10)
                 .clamp(1, 100);
-            let results = match runtime.browser.search_results(SearchRequest {
-                query,
-                repo_text,
-                limit_per_source,
-                expand_search_plan: false,
-                hybrid_weights: None,
-                hybrid_limits: None,
+            let operation = match runtime.run_public_operation("search", || {
+                runtime
+                    .browser
+                    .search_results(SearchRequest {
+                        query: query.clone(),
+                        repo_text,
+                        limit_per_source,
+                        expand_search_plan: false,
+                        hybrid_weights: None,
+                        hybrid_limits: None,
+                    })
+                    .map_err(map_api_error)
             }) {
-                Ok(results) => results,
+                Ok(operation) => operation,
                 Err(error) => {
                     return write_http_error_json(
                         &mut stream,
                         400,
                         "search_unavailable",
-                        map_api_error(error).to_string(),
+                        error.to_string(),
                     );
                 }
             };
-            write_http_json(&mut stream, 200, &results)
+            write_http_json(
+                &mut stream,
+                200,
+                &runtime::public_operation_json_value(&operation, &operation.value)?,
+            )
         }
         "/symbol" => {
-            let Some(target) =
-                resolve_http_target_from_params(&mut stream, runtime, &params, None)?
-            else {
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
                 return Ok(());
             };
-            let context = runtime
-                .browser
-                .symbol_context(target.selected.node_id)
-                .map_err(map_api_error)?;
-            write_http_json(&mut stream, 200, &context)
+            match run_http_target_operation(runtime, selection, None, |target| {
+                runtime
+                    .browser
+                    .symbol_context(target.selected.node_id.clone())
+                    .map_err(map_api_error)
+            }) {
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
+                Err(error) => write_http_target_error(&mut stream, runtime, error),
+            }
         }
         "/definition" => {
-            let Some(target) =
-                resolve_http_target_from_params(&mut stream, runtime, &params, None)?
-            else {
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
                 return Ok(());
             };
-            let context = runtime
-                .browser
-                .definition_context(target.selected.node_id.clone())
-                .map_err(map_api_error)?;
-            write_http_json(
-                &mut stream,
-                200,
-                &serde_json::json!({
-                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
+            match run_http_target_operation(runtime, selection, None, |target| {
+                let context = runtime
+                    .browser
+                    .definition_context(target.selected.node_id.clone())
+                    .map_err(map_api_error)?;
+                Ok(serde_json::json!({
+                    "resolution": build_query_resolution_output(&runtime.project_root, target),
                     "definition": build_search_hit_output(&runtime.project_root, &target.selected, Some(&target.requested), false, &[]),
                     "symbol": context,
-                }),
-            )
+                }))
+            }) {
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
+                Err(error) => write_http_target_error(&mut stream, runtime, error),
+            }
         }
         "/references" => {
-            let Some(target) =
-                resolve_http_target_from_params(&mut stream, runtime, &params, None)?
-            else {
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
                 return Ok(());
             };
-            let context = runtime
-                .browser
-                .references_context(browser_references_config(target.selected.node_id.clone()))
-                .map_err(map_api_error)?;
-            write_http_json(
-                &mut stream,
-                200,
-                &serde_json::json!({
-                    "resolution": build_query_resolution_output(&runtime.project_root, &target),
+            match run_http_target_operation(runtime, selection, None, |target| {
+                let context = runtime
+                    .browser
+                    .references_context(browser_references_config(target.selected.node_id.clone()))
+                    .map_err(map_api_error)?;
+                Ok(serde_json::json!({
+                    "resolution": build_query_resolution_output(&runtime.project_root, target),
                     "references": context,
-                }),
-            )
+                }))
+            }) {
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
+                Err(error) => write_http_target_error(&mut stream, runtime, error),
+            }
         }
         "/symbols" => {
             let limit = browser_symbols_limit(params.get("limit").map(String::as_str));
-            if let Some(parent_id) = params.get("parent_id").filter(|value| !value.is_empty()) {
-                let symbols = runtime
-                    .browser
-                    .list_children_symbols(ListChildrenSymbolsRequest {
-                        parent_id: NodeId(parent_id.clone()),
-                    })
-                    .map_err(map_api_error)?;
-                write_http_json(&mut stream, 200, &symbols)
-            } else {
-                let symbols = runtime
-                    .browser
-                    .list_root_symbols(ListRootSymbolsRequest { limit })
-                    .map_err(map_api_error)?;
-                write_http_json(&mut stream, 200, &symbols)
-            }
+            let parent_id = params
+                .get("parent_id")
+                .filter(|value| !value.is_empty())
+                .cloned();
+            let operation = runtime.run_public_operation("graph", || {
+                if let Some(parent_id) = parent_id.as_ref() {
+                    runtime
+                        .browser
+                        .list_children_symbols(ListChildrenSymbolsRequest {
+                            parent_id: NodeId(parent_id.clone()),
+                        })
+                        .map_err(map_api_error)
+                } else {
+                    runtime
+                        .browser
+                        .list_root_symbols(ListRootSymbolsRequest { limit })
+                        .map_err(map_api_error)
+                }
+            })?;
+            write_http_json(
+                &mut stream,
+                200,
+                &runtime::public_operation_json_value(&operation, &operation.value)?,
+            )
         }
         "/trail" => {
-            let Some(target) =
-                resolve_http_target_from_params(&mut stream, runtime, &params, None)?
-            else {
+            let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
                 return Ok(());
             };
             let depth = browser_trail_depth(params.get("depth").map(String::as_str));
             let direction = browser_trail_direction(params.get("direction").map(String::as_str));
             let story = browser_bool_param(params.get("story").map(String::as_str));
-            let context = runtime
-                .browser
-                .trail_context(browser_trail_config(
-                    target.selected.node_id,
-                    depth,
-                    direction,
-                    story,
-                ))
-                .map_err(map_api_error)?;
-            write_http_json(&mut stream, 200, &context)
+            match run_http_target_operation(runtime, selection, None, |target| {
+                runtime
+                    .browser
+                    .trail_context(browser_trail_config(
+                        target.selected.node_id.clone(),
+                        depth,
+                        direction,
+                        story,
+                    ))
+                    .map_err(map_api_error)
+            }) {
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
+                Err(error) => write_http_target_error(&mut stream, runtime, error),
+            }
         }
         _ => write_http_json(&mut stream, 404, &serde_json::json!({"error": "not found"})),
     }
@@ -318,16 +354,24 @@ fn http_authority_host(authority: &str) -> Option<&str> {
     Some(authority)
 }
 
-fn resolve_http_target_from_params(
-    stream: &mut TcpStream,
+fn run_http_target_operation<T>(
     runtime: &RuntimeContext,
-    params: &HashMap<String, String>,
+    selection: args::TargetSelection,
     file_filter: Option<&str>,
-) -> Result<Option<runtime::ResolvedTarget>> {
-    let Some(selection) = http_target_selection_or_error(stream, params)? else {
-        return Ok(None);
-    };
-    resolve_http_target(stream, runtime, selection, file_filter)
+    mut build: impl FnMut(&runtime::ResolvedTarget) -> Result<T>,
+) -> Result<codestory_runtime::PublicOperation<T>> {
+    let operation = http_target_public_operation(&selection);
+    runtime.run_public_operation(operation, || {
+        let target = resolve_target(runtime, selection.clone(), file_filter)?;
+        build(&target)
+    })
+}
+
+fn http_target_public_operation(selection: &args::TargetSelection) -> &'static str {
+    match selection {
+        args::TargetSelection::Query { .. } => "graph_assisted",
+        args::TargetSelection::Id(_) => "graph",
+    }
 }
 
 pub(crate) fn browser_references_config(root_id: NodeId) -> TrailConfigDto {
@@ -415,23 +459,16 @@ fn http_target_selection_or_error(
     }
 }
 
-fn resolve_http_target(
+fn write_http_target_error(
     stream: &mut TcpStream,
     runtime: &RuntimeContext,
-    target: args::TargetSelection,
-    file_filter: Option<&str>,
-) -> Result<Option<runtime::ResolvedTarget>> {
-    match resolve_target(runtime, target, file_filter) {
-        Ok(target) => Ok(Some(target)),
-        Err(error) => {
-            if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
-                let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-                write_http_json(stream, 400, &output)?;
-            } else {
-                write_http_error_json(stream, 400, "target_resolution_failed", error.to_string())?;
-            }
-            Ok(None)
-        }
+    error: anyhow::Error,
+) -> Result<()> {
+    if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
+        let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
+        write_http_json(stream, 400, &output)
+    } else {
+        write_http_error_json(stream, 400, "target_resolution_failed", error.to_string())
     }
 }
 
@@ -538,4 +575,24 @@ fn write_http_error_json(
             }
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_resolved_graph_routes_use_the_complete_retrieval_operation() {
+        assert_eq!(
+            http_target_public_operation(&args::TargetSelection::Query {
+                query: "AppController".to_string(),
+                choose: None,
+            }),
+            "graph_assisted"
+        );
+        assert_eq!(
+            http_target_public_operation(&args::TargetSelection::Id(NodeId("node-1".to_string()))),
+            "graph"
+        );
+    }
 }

@@ -150,7 +150,7 @@ fn indexed_fixture() -> HttpFixture {
         .arg(workspace.path())
         .arg("--cache-dir")
         .arg(cache_dir.path())
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run index");
     assert!(
@@ -164,6 +164,62 @@ fn indexed_fixture() -> HttpFixture {
         workspace,
         cache_dir,
     }
+}
+
+fn indexed_zero_dense_fixture() -> HttpFixture {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    fs::write(
+        workspace.path().join("metadata.rs"),
+        "// HTTP_METADATA_ANCHOR\n",
+    )
+    .expect("write zero-dense HTTP fixture");
+
+    let output = test_support::cli_command()
+        .arg("index")
+        .arg("--refresh")
+        .arg("full")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path())
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .output()
+        .expect("run zero-dense index");
+    assert!(
+        output.status.success(),
+        "zero-dense index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    HttpFixture {
+        workspace,
+        cache_dir,
+    }
+}
+
+fn publish_zero_dense_agent_fixture(fixture: &HttpFixture) {
+    let project = fs::canonicalize(fixture.workspace.path()).expect("canonical project fixture");
+    let process_cache = test_support::test_state_root().join("stdio-cache");
+    fs::create_dir_all(&process_cache).expect("create process cache root");
+    let process_cache = fs::canonicalize(process_cache).expect("canonical process cache root");
+    let runtime = codestory_retrieval::with_test_cache_root(&process_cache, || {
+        let mut runtime = codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(&project),
+            codestory_retrieval::SidecarProfile::Agent,
+        );
+        runtime.embedding.allow_cpu = true;
+        runtime
+    });
+    codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+        &project,
+        &fixture.cache_dir.path().join("codestory.db"),
+        &runtime,
+    )
+    .expect("publish strict zero-dense HTTP fixture");
 }
 
 fn free_local_addr() -> String {
@@ -189,7 +245,7 @@ fn http_serve_rejects_non_loopback_addr_before_opening_runtime_state() {
         .arg(cache_dir.path())
         .arg("--addr")
         .arg("0.0.0.0:0")
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run serve");
     assert!(
@@ -217,7 +273,7 @@ fn spawn_http_server(fixture: &HttpFixture) -> (HttpServer, String) {
         .arg(fixture.cache_dir.path())
         .arg("--addr")
         .arg(&addr)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -436,6 +492,13 @@ fn symbol_id_by_label(symbols: &Value, label: &str) -> String {
         .to_string()
 }
 
+fn public_result_array<'a>(response: &'a Value, surface: &str) -> &'a Vec<Value> {
+    response
+        .pointer("/result")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{surface} should return an enveloped JSON array: {response}"))
+}
+
 #[test]
 fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
     let http = read_repo_file("crates/codestory-cli/src/http_transport.rs");
@@ -444,7 +507,7 @@ fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
     let http_handler = source_between(
         &http,
         "pub(crate) fn handle_http_request",
-        "fn resolve_http_target_from_params",
+        "fn run_http_target_operation",
     );
     let shared_browser_defaults = source_between(
         &http,
@@ -626,9 +689,26 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
             .body
             .pointer("/error/message")
             .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("sidecar retrieval primary")),
+            .is_some_and(|message| message.contains("retrieval")),
         "HTTP /search should explain the sidecar-primary boundary: {}",
         search.body
+    );
+
+    let search_fixture = indexed_zero_dense_fixture();
+    publish_zero_dense_agent_fixture(&search_fixture);
+    let (_search_server, search_addr) = spawn_http_server(&search_fixture);
+    let search = get_json(&search_addr, "/search?q=HTTP_METADATA_ANCHOR&repo_text=on");
+    assert_eq!(search["query"], "HTTP_METADATA_ANCHOR", "{search}");
+    assert!(
+        search["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
+            && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
+        "/search success must retain the complete core and retrieval publications plus operation identity: {search}"
+    );
+    assert_eq!(
+        search["_meta"]["codestory_publication"]["retrieval_publication"]["core_generation_id"],
+        search["_meta"]["codestory_publication"]["core_publication"]["generation_id"],
+        "/search retrieval evidence must bind the served core publication: {search}"
     );
 
     let definition = get_json(&addr, "/definition?q=AppController");
@@ -640,31 +720,55 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
         definition["resolution"].is_object() && definition["definition"].is_object(),
         "/definition should preserve resolution and definition objects: {definition}"
     );
+    assert!(
+        definition["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && definition["_meta"]["codestory_publication"]["operation"]["operation_id"]
+                .is_string()
+            && definition["_meta"]["codestory_publication"]
+                .as_object()
+                .is_some_and(|metadata| metadata.contains_key("retrieval_publication")),
+        "/definition query resolution and graph assembly must retain one complete publication identity and an explicit retrieval identity slot: {definition}"
+    );
 
     let symbols = get_json(&addr, "/symbols");
-    let symbol_count = symbols
-        .as_array()
-        .unwrap_or_else(|| panic!("/symbols should return a JSON array: {symbols}"))
-        .len();
+    let symbol_items = public_result_array(&symbols, "/symbols");
+    let symbol_count = symbol_items.len();
     assert!(
         (1..=300).contains(&symbol_count),
         "omitted /symbols limit should return a bounded nonempty root list: {symbols}"
     );
     assert!(
-        symbols
-            .as_array()
-            .expect("symbols array")
+        symbol_items
             .iter()
             .any(|symbol| symbol["label"] == "AppController"),
         "/symbols should include indexed root symbols: {symbols}"
     );
-    let step0_id = symbol_id_by_label(&symbols, "step0");
-    let step10_id = symbol_id_by_label(&symbols, "step10");
+    assert!(
+        symbols["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && symbols["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
+        "/symbols root success must retain the complete core publication and operation identity: {symbols}"
+    );
+    let app_controller_id = symbol_id_by_label(&symbols["result"], "AppController");
+    let step0_id = symbol_id_by_label(&symbols["result"], "step0");
+    let step10_id = symbol_id_by_label(&symbols["result"], "step10");
+
+    let child_symbols = get_json(&addr, &format!("/symbols?parent_id={app_controller_id}"));
+    assert!(
+        !public_result_array(&child_symbols, "/symbols?parent_id").is_empty()
+            && child_symbols["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && child_symbols["_meta"]["codestory_publication"]["operation"]["operation_id"]
+                .is_string(),
+        "/symbols child success must retain its result and complete publication identity: {child_symbols}"
+    );
 
     let references = get_json(&addr, &format!("/references?id={step10_id}"));
     assert!(
         references["resolution"].is_object() && references["references"]["focus"].is_object(),
         "/references should preserve resolution and references context: {references}"
+    );
+    assert!(
+        references["_meta"]["codestory_publication"]["core_publication"].is_object(),
+        "/references should retain the complete core publication through response assembly: {references}"
     );
     assert_nonempty_array(&references, "/references/trail/nodes");
     let reference_labels = graph_node_labels(&references, "/references/trail/nodes");
@@ -732,8 +836,8 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
 
     let one_symbol = get_json(&addr, "/symbols?limit=1");
     assert_eq!(
-        one_symbol.as_array().map(Vec::len),
-        Some(1),
+        public_result_array(&one_symbol, "/symbols?limit=1").len(),
+        1,
         "/symbols should honor an explicit bounded root limit: {one_symbol}"
     );
 }

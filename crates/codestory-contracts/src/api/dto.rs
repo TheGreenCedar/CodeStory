@@ -3,6 +3,7 @@ use super::types::{
     EdgeKind, IndexMode, LayoutDirection, MemberAccess, NodeKind, TrailCallerScope, TrailDirection,
     TrailMode,
 };
+use crate::graph::FileCoverageReason;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -67,6 +68,7 @@ pub struct IndexPublicationDto {
 pub enum IndexPublicationModeDto {
     Full,
     Incremental,
+    SemanticProjection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -136,15 +138,18 @@ pub enum SearchMatchQualityDto {
 
 /// Evidence provenance tier used by packet/search/citation surfaces.
 ///
-/// Tiers are compatibility values. `ExactSource`, `ResolvedGraph`,
-/// `LexicalSource`, `SymbolDoc`, `ComponentReport`, and `DenseSemantic` are
-/// product evidence from indexed or sidecar sources. `SyntheticSourceScan` and
-/// `GeneratedSummary` are diagnostic or presentation evidence and should not be
-/// treated as source truth without a follow-up read.
+/// Tiers are compatibility values. `ExactSource`, `StructuralText`,
+/// `ResolvedGraph`, `LexicalSource`, `SymbolDoc`, `ComponentReport`, and
+/// `DenseSemantic` are product evidence from indexed or sidecar sources.
+/// `StructuralText` identifies a collector-backed source span; it does not
+/// imply parser-backed graph coverage or semantic resolution. `SyntheticSourceScan`
+/// and `GeneratedSummary` are diagnostic or presentation evidence and should
+/// not be treated as source truth without a follow-up read.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketEvidenceTierDto {
     ExactSource,
+    StructuralText,
     ResolvedGraph,
     LexicalSource,
     SymbolDoc,
@@ -240,6 +245,256 @@ pub struct EmbeddingProfileContractDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimension: Option<u32>,
     pub doc_shape: String,
+}
+
+/// Current wire version for producer evidence attached to a vector publication.
+pub const EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION: u32 = 2;
+
+/// Versioned identity of the implementation that produced embedding vectors.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingProducerIdentityDto {
+    pub name: String,
+    pub version: String,
+}
+
+/// Immutable identity of the bytes that define an embedding model.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingModelIdentityDto {
+    pub model_id: String,
+    pub model_sha256: String,
+    pub model_size_bytes: u64,
+    pub tokenizer_sha256: String,
+    pub config_sha256: String,
+}
+
+/// Vector semantics that readers must agree on before consuming a publication.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorSemanticsDto {
+    pub dimension: u32,
+    pub query_prefix: String,
+    pub document_prefix: String,
+    pub pooling: String,
+    pub normalization: String,
+    pub element_type: String,
+    pub vector_schema_version: u32,
+}
+
+/// Versioned identity of the engine and device that produced vectors.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingEngineIdentityDto {
+    pub engine: String,
+    pub engine_build_id: String,
+    pub backend: String,
+    pub device_id: String,
+    pub device_class: String,
+    pub accelerator_kind: String,
+}
+
+/// Runtime evidence proving the declared producer was actually eligible.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingExecutionEvidenceDto {
+    pub eligibility: String,
+    pub observed_state: String,
+    pub observation_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke_elapsed_ms: Option<u64>,
+    pub observed_at_epoch_ms: i64,
+}
+
+/// Exact source and sidecar generations to which producer evidence applies.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorPublicationIdentityDto {
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub retrieval_generation: String,
+    pub retrieval_input_hash: String,
+    pub semantic_generation: String,
+}
+
+/// Unified, fail-closed evidence for an embedding/vector producer.
+///
+/// The contract intentionally contains no answer-quality claim. It proves only
+/// producer identity, vector compatibility, runtime eligibility, and the exact
+/// publication to which that evidence belongs.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorProducerEvidenceDto {
+    pub schema_version: u32,
+    pub producer: EmbeddingProducerIdentityDto,
+    pub model: EmbeddingModelIdentityDto,
+    pub semantics: EmbeddingVectorSemanticsDto,
+    pub engine: EmbeddingEngineIdentityDto,
+    pub execution: EmbeddingExecutionEvidenceDto,
+    pub publication: EmbeddingVectorPublicationIdentityDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorEvidenceCompatibilityDto {
+    pub compatible: bool,
+    pub migration_required: bool,
+    pub migration_disposition: EmbeddingVectorEvidenceMigrationDispositionDto,
+    pub mismatches: Vec<String>,
+}
+
+/// The only supported migration for immutable vector evidence is rebuilding a
+/// complete generation. Unknown future evidence is never rewritten or guessed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingVectorEvidenceMigrationDispositionDto {
+    Current,
+    RebuildRequired,
+    UnsupportedFutureVersion,
+}
+
+impl EmbeddingVectorProducerEvidenceDto {
+    /// Report incomplete or unsupported evidence without inferring defaults.
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION {
+            errors.push("schema_version".to_string());
+        }
+        for (field, value) in [
+            ("producer.name", self.producer.name.as_str()),
+            ("producer.version", self.producer.version.as_str()),
+            ("model.model_id", self.model.model_id.as_str()),
+            ("engine.engine", self.engine.engine.as_str()),
+            (
+                "engine.engine_build_id",
+                self.engine.engine_build_id.as_str(),
+            ),
+            ("engine.backend", self.engine.backend.as_str()),
+            ("engine.device_id", self.engine.device_id.as_str()),
+            ("engine.device_class", self.engine.device_class.as_str()),
+            (
+                "engine.accelerator_kind",
+                self.engine.accelerator_kind.as_str(),
+            ),
+            ("execution.eligibility", self.execution.eligibility.as_str()),
+            (
+                "execution.observed_state",
+                self.execution.observed_state.as_str(),
+            ),
+            (
+                "execution.observation_source",
+                self.execution.observation_source.as_str(),
+            ),
+            ("semantics.pooling", self.semantics.pooling.as_str()),
+            (
+                "semantics.normalization",
+                self.semantics.normalization.as_str(),
+            ),
+            (
+                "semantics.element_type",
+                self.semantics.element_type.as_str(),
+            ),
+            (
+                "publication.core_generation_id",
+                self.publication.core_generation_id.as_str(),
+            ),
+            (
+                "publication.core_run_id",
+                self.publication.core_run_id.as_str(),
+            ),
+            (
+                "publication.retrieval_generation",
+                self.publication.retrieval_generation.as_str(),
+            ),
+            (
+                "publication.retrieval_input_hash",
+                self.publication.retrieval_input_hash.as_str(),
+            ),
+            (
+                "publication.semantic_generation",
+                self.publication.semantic_generation.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(field.to_string());
+            }
+        }
+        for (field, value) in [
+            ("model.model_sha256", self.model.model_sha256.as_str()),
+            (
+                "model.tokenizer_sha256",
+                self.model.tokenizer_sha256.as_str(),
+            ),
+            ("model.config_sha256", self.model.config_sha256.as_str()),
+        ] {
+            if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                errors.push(field.to_string());
+            }
+        }
+        if self.model.model_size_bytes == 0 {
+            errors.push("model.model_size_bytes".to_string());
+        }
+        if self.semantics.dimension == 0 {
+            errors.push("semantics.dimension".to_string());
+        }
+        if self.semantics.vector_schema_version == 0 {
+            errors.push("semantics.vector_schema_version".to_string());
+        }
+        if self.execution.observed_at_epoch_ms < 0 {
+            errors.push("execution.observed_at_epoch_ms".to_string());
+        }
+        errors
+    }
+
+    /// Compare expected evidence with observed evidence, including publication identity.
+    pub fn compatibility_with(&self, observed: &Self) -> EmbeddingVectorEvidenceCompatibilityDto {
+        let mut mismatches = observed.validation_errors();
+        let future_schema = observed.schema_version > EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION;
+        macro_rules! compare {
+            ($field:literal, $left:expr, $right:expr) => {
+                if $left != $right && !mismatches.iter().any(|entry| entry == $field) {
+                    mismatches.push($field.to_string());
+                }
+            };
+        }
+        compare!(
+            "schema_version",
+            self.schema_version,
+            observed.schema_version
+        );
+        compare!("producer", self.producer, observed.producer);
+        compare!("model", self.model, observed.model);
+        compare!("semantics", self.semantics, observed.semantics);
+        compare!("engine", self.engine, observed.engine);
+        compare!(
+            "execution.eligibility",
+            self.execution.eligibility,
+            observed.execution.eligibility
+        );
+        compare!(
+            "execution.observed_state",
+            self.execution.observed_state,
+            observed.execution.observed_state
+        );
+        compare!(
+            "execution.observation_source",
+            self.execution.observation_source,
+            observed.execution.observation_source
+        );
+        compare!(
+            "execution.smoke_elapsed_ms_presence",
+            self.execution.smoke_elapsed_ms.is_some(),
+            observed.execution.smoke_elapsed_ms.is_some()
+        );
+        compare!("publication", self.publication, observed.publication);
+        let migration_disposition = if future_schema {
+            EmbeddingVectorEvidenceMigrationDispositionDto::UnsupportedFutureVersion
+        } else if mismatches.is_empty() {
+            EmbeddingVectorEvidenceMigrationDispositionDto::Current
+        } else {
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        };
+        let migration_required =
+            migration_disposition != EmbeddingVectorEvidenceMigrationDispositionDto::Current;
+        EmbeddingVectorEvidenceCompatibilityDto {
+            compatible: mismatches.is_empty(),
+            migration_required,
+            migration_disposition,
+            mismatches,
+        }
+    }
 }
 
 /// Semantic document profile stored in the index cache.
@@ -656,6 +911,9 @@ pub struct SearchPlanDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
+    /// Exact complete retrieval publication used to build this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub retrieval: RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_shadow: Option<RetrievalShadowDto>,
@@ -714,6 +972,41 @@ pub struct IndexedFileDto {
     pub error_count: u32,
 }
 
+/// One file-level coverage limitation or source-integrity failure.
+///
+/// Parser-partial entries may retain verified source and a usable projection;
+/// source-integrity failures remain publication blockers.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct FileCoverageDiagnosticDto {
+    pub path: String,
+    pub reason: FileCoverageReason,
+    pub retryable: bool,
+    pub verified_source: bool,
+    pub projection_available: bool,
+}
+
+/// Verified source intentionally excluded from parser scheduling.
+///
+/// These records are source-inventory evidence only. They never imply parser-backed graph or
+/// semantic coverage.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SourcePolicyExclusionDto {
+    pub path: String,
+    pub role: IndexedFileRoleDto,
+    pub content_hash: String,
+    pub observed_size: u64,
+    pub observed_unit_count: u64,
+    pub policy_version: String,
+    pub byte_cap: u64,
+    pub structural_unit_cap: u64,
+    pub project_id: String,
+    pub workspace_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub graph_coverage: bool,
+    pub semantic_coverage: bool,
+}
+
 /// Per-language file count and support claim shown in indexed-file summaries.
 ///
 /// `support_mode` and `evidence_tier` are product evidence from
@@ -745,6 +1038,8 @@ pub struct IndexedFilesSummaryDto {
     pub incomplete_file_count: u32,
     pub error_file_count: u32,
     #[serde(default)]
+    pub policy_exclusion_count: u32,
+    #[serde(default)]
     pub incomplete_reason_counts: Vec<IndexedFileIncompleteReasonCountDto>,
     pub truncated: bool,
     pub language_counts: Vec<IndexedFileLanguageCountDto>,
@@ -759,6 +1054,10 @@ pub struct IndexedFilesDto {
     pub project_root: String,
     pub usable: bool,
     pub summary: IndexedFilesSummaryDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_exclusions: Vec<SourcePolicyExclusionDto>,
     pub files: Vec<IndexedFileDto>,
 }
 
@@ -806,10 +1105,15 @@ pub struct AffectedChangeRecordDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedAnalysisInput {
+    Paths(Vec<String>),
+    ChangeRecords(Vec<AffectedChangeRecordDto>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedAnalysisRequest {
-    pub changed_paths: Vec<String>,
-    #[serde(default)]
-    pub change_records: Vec<AffectedChangeRecordDto>,
+    pub input: AffectedAnalysisInput,
     #[serde(default)]
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -848,16 +1152,80 @@ pub struct AffectedMatchedFileDto {
     pub error_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedInputClassificationDto {
+    ValidUncovered,
+    Missing,
+    ExpectedDeleted,
+    RenameUnresolved,
+    StaleIndex,
+    Malformed,
+    UnavailableEvidence,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedUnmatchedPathDto {
     pub path: String,
+    pub classification: AffectedInputClassificationDto,
     pub reason: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_kind: Option<AffectedChangeKindDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedUncoveredInputDto {
+    pub path: String,
+    pub classification: AffectedInputClassificationDto,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedAnalysisBoundsDto {
+    pub requested_depth: u32,
+    pub maximum_depth: u32,
+    pub visited_node_count: u32,
+    pub visited_edge_count: u32,
+    pub impacted_symbol_limit: u32,
+    pub impacted_route_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedAnalysisCompletenessDto {
+    pub complete: bool,
+    pub confidence: String,
+    pub direct_impact_count: u32,
+    pub propagated_impact_count: u32,
+    pub candidate_test_count: u32,
+    pub uncovered_input_count: u32,
+    pub unavailable_evidence_count: u32,
+    pub truncated: bool,
+    #[serde(default)]
+    pub truncation_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedFollowUpInvocationDto {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedFollowUpDto {
+    pub action: String,
+    pub reason: String,
+    pub confidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<AffectedFollowUpInvocationDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -897,16 +1265,20 @@ pub struct AffectedAnalysisDto {
     pub matched_files: Vec<AffectedMatchedFileDto>,
     #[serde(default)]
     pub unmatched_paths: Vec<AffectedUnmatchedPathDto>,
+    #[serde(default)]
+    pub uncovered_inputs: Vec<AffectedUncoveredInputDto>,
     pub matched_file_count: u32,
     pub depth: u32,
     pub impacted_symbols: Vec<AffectedSymbolDto>,
     #[serde(default)]
     pub impacted_routes: Vec<AffectedRouteDto>,
     pub impacted_tests: Vec<AffectedTestFileDto>,
+    pub bounds: AffectedAnalysisBoundsDto,
+    pub completeness: AffectedAnalysisCompletenessDto,
     #[serde(default)]
     pub blind_spots: Vec<String>,
     #[serde(default)]
-    pub next_commands: Vec<String>,
+    pub follow_ups: Vec<AffectedFollowUpDto>,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -945,6 +1317,15 @@ pub struct GroundingSymbolDigestDto {
     pub summary: Option<String>,
     #[serde(default)]
     pub edge_digest: Vec<String>,
+    /// Diagnostic source-range evidence metadata, when the symbol comes from
+    /// a structural collector or endpoint schema rather than parser-backed
+    /// graph coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -976,6 +1357,38 @@ pub struct GroundingCoverageDto {
     pub compressed_files: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingOrientationConfidenceDto {
+    Strong,
+    Partial,
+    #[default]
+    Weak,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingOrientationUncertaintyDto {
+    BoundedCandidateWindow,
+    NoEntrypointEvidence,
+    EntrypointEvidenceOmitted,
+    LimitedSubsystemBreadth,
+    CompressedPresentation,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct GroundingOrientationDto {
+    pub confidence: GroundingOrientationConfidenceDto,
+    pub total_root_candidates: u32,
+    pub evaluated_root_candidates: u32,
+    pub candidate_entrypoint_roots: u32,
+    pub selected_entrypoint_roots: u32,
+    pub candidate_subsystems: u32,
+    pub selected_subsystems: u32,
+    #[serde(default)]
+    pub uncertainty: Vec<GroundingOrientationUncertaintyDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct GroundingSnapshotDto {
     pub root: String,
@@ -985,6 +1398,8 @@ pub struct GroundingSnapshotDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalStateDto>,
     pub coverage: GroundingCoverageDto,
+    #[serde(default)]
+    pub orientation: GroundingOrientationDto,
     pub root_symbols: Vec<GroundingSymbolDigestDto>,
     pub files: Vec<GroundingFileDigestDto>,
     #[serde(default)]
@@ -1263,6 +1678,12 @@ pub struct NodeDetailsDto {
     pub start_col: Option<u32>,
     pub end_line: Option<u32>,
     pub end_col: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
     #[serde(default)]
     pub member_access: Option<MemberAccess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1825,6 +2246,9 @@ pub struct PacketSidecarQueryDiagnosticDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
+    /// Exact retrieval publication used by the pinned sidecar query session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub resolved_profile: AgentRetrievalPresetDto,
     pub policy_mode: AgentRetrievalPolicyModeDto,
     pub total_latency_ms: u32,
@@ -1899,12 +2323,167 @@ pub struct PacketPlanQueryDto {
     pub purpose: String,
 }
 
+pub const PACKET_PROBE_CONTRACT_VERSION: u32 = 1;
+pub const PACKET_PROBE_MAX_COUNT: usize = 16;
+pub const PACKET_PROBE_MAX_TEXT_LENGTH: usize = 240;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PacketProbeDto {
+    ExactPath {
+        path: String,
+    },
+    SymbolId {
+        id: String,
+    },
+    FileSymbol {
+        path: String,
+        symbol: String,
+    },
+    FreeQuery {
+        query: String,
+    },
+    Continuation {
+        contract_version: u32,
+        project_id: String,
+        core_generation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retrieval_generation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol_id: Option<String>,
+        query: String,
+    },
+}
+
+pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
+    match probe {
+        PacketProbeDto::ExactPath { path } => validate_packet_probe_text("path", path),
+        PacketProbeDto::SymbolId { id } => validate_packet_probe_text("id", id),
+        PacketProbeDto::FileSymbol { path, symbol } => {
+            validate_packet_probe_text("path", path)?;
+            validate_packet_probe_text("symbol", symbol)
+        }
+        PacketProbeDto::FreeQuery { query } => validate_packet_probe_text("query", query),
+        PacketProbeDto::Continuation {
+            project_id,
+            core_generation_id,
+            retrieval_generation,
+            symbol_id,
+            query,
+            ..
+        } => {
+            validate_packet_probe_text("project_id", project_id)?;
+            validate_packet_probe_text("core_generation_id", core_generation_id)?;
+            if let Some(retrieval_generation) = retrieval_generation {
+                validate_packet_probe_text("retrieval_generation", retrieval_generation)?;
+            }
+            if let Some(symbol_id) = symbol_id {
+                validate_packet_probe_text("symbol_id", symbol_id)?;
+            }
+            validate_packet_probe_text("query", query)
+        }
+    }
+}
+
+pub fn validate_packet_probe_request(
+    probes: &[PacketProbeDto],
+    legacy_probes: &[String],
+) -> Result<(), String> {
+    let count = probes.len().saturating_add(legacy_probes.len());
+    if count > PACKET_PROBE_MAX_COUNT {
+        return Err(format!(
+            "packet accepts at most {PACKET_PROBE_MAX_COUNT} typed and legacy probes combined; received {count}"
+        ));
+    }
+    for (index, probe) in probes.iter().enumerate() {
+        validate_packet_probe(probe)
+            .map_err(|error| format!("packet probe {index} is invalid: {error}"))?;
+    }
+    for (index, probe) in legacy_probes.iter().enumerate() {
+        validate_packet_probe_text("legacy probe", probe)
+            .map_err(|error| format!("legacy packet probe {index} is invalid: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_packet_probe_text(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    let length = value.chars().count();
+    if length > PACKET_PROBE_MAX_TEXT_LENGTH {
+        return Err(format!(
+            "{field} must be at most {PACKET_PROBE_MAX_TEXT_LENGTH} characters; received {length}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketProbeResolutionStatusDto {
+    ExactPath,
+    ValidUncoveredPath,
+    IndexedSymbol,
+    FileScopedSymbol,
+    TextHit,
+    FreeQuery,
+    Continuation,
+    Ambiguous,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketProbeRejectionCodeDto {
+    MalformedProbe,
+    MissingTarget,
+    OutOfProject,
+    StaleSymbolId,
+    StaleContinuation,
+    IncompatibleContinuation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketProbeRejectionDto {
+    pub code: PacketProbeRejectionCodeDto,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketProbeAmbiguityCandidateDto {
+    pub symbol_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub kind: NodeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketProbeResolutionDto {
+    pub input_index: u32,
+    pub probe: PacketProbeDto,
+    pub status: PacketProbeResolutionStatusDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<PacketProbeAmbiguityCandidateDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<PacketProbeRejectionDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketPlanDto {
     pub task_class: PacketTaskClassDto,
     pub inferred_task_class: bool,
     #[serde(default)]
     pub queries: Vec<PacketPlanQueryDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_resolutions: Vec<PacketProbeResolutionDto>,
     #[serde(default)]
     pub trace: Vec<String>,
 }
@@ -1916,6 +2495,8 @@ pub struct AgentPacketRequestDto {
     pub budget: PacketBudgetModeDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_class: Option<PacketTaskClassDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<PacketProbeDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_probes: Vec<String>,
     #[serde(default = "default_include_evidence")]
@@ -2061,12 +2642,260 @@ mod packet_tests {
     use super::*;
 
     #[test]
+    fn structural_text_evidence_tier_serializes_as_a_named_public_contract() {
+        assert_eq!(
+            serde_json::to_value(PacketEvidenceTierDto::StructuralText)
+                .expect("serialize structural-text evidence tier"),
+            serde_json::json!("structural_text")
+        );
+    }
+
+    fn producer_evidence() -> EmbeddingVectorProducerEvidenceDto {
+        EmbeddingVectorProducerEvidenceDto {
+            schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+            producer: EmbeddingProducerIdentityDto {
+                name: "codestory-llama-sys".to_string(),
+                version: "1.2.3".to_string(),
+            },
+            model: EmbeddingModelIdentityDto {
+                model_id: "model-v1".to_string(),
+                model_sha256: "a".repeat(64),
+                model_size_bytes: 1024,
+                tokenizer_sha256: "b".repeat(64),
+                config_sha256: "c".repeat(64),
+            },
+            semantics: EmbeddingVectorSemanticsDto {
+                dimension: 384,
+                query_prefix: "query: ".to_string(),
+                document_prefix: "passage: ".to_string(),
+                pooling: "mean".to_string(),
+                normalization: "l2".to_string(),
+                element_type: "f32".to_string(),
+                vector_schema_version: 2,
+            },
+            engine: EmbeddingEngineIdentityDto {
+                engine: "llama.cpp".to_string(),
+                engine_build_id: "build-v1".to_string(),
+                backend: "metal".to_string(),
+                device_id: "gpu-0".to_string(),
+                device_class: "apple-gpu".to_string(),
+                accelerator_kind: "metal".to_string(),
+            },
+            execution: EmbeddingExecutionEvidenceDto {
+                eligibility: "eligible".to_string(),
+                observed_state: "smoke_passed".to_string(),
+                observation_source: "runtime_probe".to_string(),
+                smoke_elapsed_ms: Some(8),
+                observed_at_epoch_ms: 123,
+            },
+            publication: EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-1".to_string(),
+                core_run_id: "run-1".to_string(),
+                retrieval_generation: "retrieval-1".to_string(),
+                retrieval_input_hash: "d".repeat(64),
+                semantic_generation: "semantic-1".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn vector_producer_evidence_round_trips_without_losing_identity() {
+        let evidence = producer_evidence();
+        let json = serde_json::to_string(&evidence).expect("serialize evidence");
+        let decoded: EmbeddingVectorProducerEvidenceDto =
+            serde_json::from_str(&json).expect("deserialize evidence");
+
+        assert_eq!(decoded, evidence);
+        assert!(decoded.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn vector_producer_evidence_fails_closed_on_incomplete_or_unknown_contracts() {
+        let expected = producer_evidence();
+        let mut evidence = expected.clone();
+        evidence.schema_version += 1;
+        evidence.producer.version.clear();
+        evidence.model.model_sha256 = "not-a-digest".to_string();
+        evidence.publication.core_run_id.clear();
+
+        assert_eq!(
+            evidence.validation_errors(),
+            vec![
+                "schema_version".to_string(),
+                "producer.version".to_string(),
+                "publication.core_run_id".to_string(),
+                "model.model_sha256".to_string(),
+            ]
+        );
+        let future = expected.compatibility_with(&evidence);
+        assert!(future.migration_required);
+        assert_eq!(
+            future.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::UnsupportedFutureVersion
+        );
+
+        let mut legacy = expected.clone();
+        legacy.schema_version = 0;
+        let legacy = expected.compatibility_with(&legacy);
+        assert!(legacy.migration_required);
+        assert_eq!(
+            legacy.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+    }
+
+    #[test]
+    fn vector_producer_compatibility_binds_engine_semantics_and_publication() {
+        let expected = producer_evidence();
+        let mut observed = expected.clone();
+        observed.execution.observed_at_epoch_ms += 1;
+        observed.execution.smoke_elapsed_ms = Some(99);
+        let compatible = expected.compatibility_with(&observed);
+        assert!(compatible.compatible);
+        assert_eq!(
+            compatible.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::Current
+        );
+
+        observed.semantics.dimension += 1;
+        observed.producer.version = "1.2.4".to_string();
+        observed.publication.semantic_generation = "semantic-2".to_string();
+        let compatibility = expected.compatibility_with(&observed);
+        assert!(!compatibility.compatible);
+        assert_eq!(
+            compatibility.mismatches,
+            vec![
+                "producer".to_string(),
+                "semantics".to_string(),
+                "publication".to_string()
+            ]
+        );
+        assert!(compatibility.migration_required);
+        assert_eq!(
+            compatibility.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+
+        let mut execution_mismatch = expected.clone();
+        execution_mismatch.execution.observation_source = "package_probe".to_string();
+        execution_mismatch.execution.smoke_elapsed_ms = None;
+        let compatibility = expected.compatibility_with(&execution_mismatch);
+        assert_eq!(
+            compatibility.mismatches,
+            vec![
+                "execution.observation_source".to_string(),
+                "execution.smoke_elapsed_ms_presence".to_string(),
+            ]
+        );
+        assert_eq!(
+            compatibility.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+    }
+
+    #[test]
+    fn package_runtime_sidecar_evidence_mismatch_requires_a_complete_rebuild() {
+        let package_expected = producer_evidence();
+        let mut sidecar_observed = package_expected.clone();
+        sidecar_observed.engine.engine_build_id = "different-linked-engine".into();
+        sidecar_observed.engine.device_id = "different-adapter".into();
+        sidecar_observed.execution.observation_source = "different-runtime-probe".into();
+
+        let compatibility = package_expected.compatibility_with(&sidecar_observed);
+
+        assert!(!compatibility.compatible);
+        assert!(compatibility.migration_required);
+        assert_eq!(
+            compatibility.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+        assert_eq!(
+            compatibility.mismatches,
+            vec![
+                "engine".to_string(),
+                "execution.observation_source".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn packet_request_uses_compact_budget_by_default() {
         let request: AgentPacketRequestDto =
             serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
 
         assert_eq!(request.budget, PacketBudgetModeDto::Compact);
         assert!(request.include_evidence);
+    }
+
+    #[test]
+    fn tagged_packet_probes_round_trip_deterministically() {
+        let probes = vec![
+            PacketProbeDto::ExactPath {
+                path: "assets/desk.svg".into(),
+            },
+            PacketProbeDto::SymbolId { id: "42".into() },
+            PacketProbeDto::FileSymbol {
+                path: "src/lib.rs".into(),
+                symbol: "AppController".into(),
+            },
+            PacketProbeDto::FreeQuery {
+                query: "runtime publication fence".into(),
+            },
+            PacketProbeDto::Continuation {
+                contract_version: PACKET_PROBE_CONTRACT_VERSION,
+                project_id: "project-v3".into(),
+                core_generation_id: "core-generation".into(),
+                retrieval_generation: Some("retrieval-generation".into()),
+                symbol_id: Some("42".into()),
+                query: "AppController".into(),
+            },
+        ];
+
+        for probe in probes {
+            let encoded = serde_json::to_string(&probe).expect("serialize probe");
+            let decoded: PacketProbeDto =
+                serde_json::from_str(&encoded).expect("deserialize probe");
+            assert_eq!(decoded, probe);
+            assert_eq!(
+                serde_json::to_string(&decoded).expect("reserialize probe"),
+                encoded
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_packet_probe_rejects_unknown_and_incomplete_forms() {
+        for malformed in [
+            r#"{"kind":"unknown","query":"x"}"#,
+            r#"{"kind":"exact_path"}"#,
+            r#"{"kind":"exact_path","path":"src/lib.rs","query":"ignored"}"#,
+            r#"{"kind":"file_symbol","path":"src/lib.rs"}"#,
+            r#"{"kind":"continuation","contract_version":1,"project_id":"p","core_generation_id":"g"}"#,
+        ] {
+            assert!(serde_json::from_str::<PacketProbeDto>(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn packet_probe_validation_enforces_shared_count_and_text_limits() {
+        let valid = PacketProbeDto::FreeQuery {
+            query: "x".repeat(PACKET_PROBE_MAX_TEXT_LENGTH),
+        };
+        assert!(validate_packet_probe(&valid).is_ok());
+        assert!(
+            validate_packet_probe(&PacketProbeDto::FreeQuery {
+                query: "x".repeat(PACKET_PROBE_MAX_TEXT_LENGTH + 1),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_packet_probe_request(
+                &vec![valid; PACKET_PROBE_MAX_COUNT],
+                &["overflow".to_string()]
+            )
+            .is_err()
+        );
+        assert!(validate_packet_probe_request(&[], &["   ".to_string()]).is_err());
     }
 
     #[test]
@@ -2177,6 +3006,13 @@ mod packet_tests {
     fn agent_retrieval_trace_round_trips_retrieval_shadow() {
         let trace = AgentRetrievalTraceDto {
             request_id: "r1".to_string(),
+            retrieval_publication: Some(EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-generation".to_string(),
+                core_run_id: "core-run".to_string(),
+                retrieval_generation: "retrieval-generation".to_string(),
+                retrieval_input_hash: "retrieval-input".to_string(),
+                semantic_generation: "semantic-generation".to_string(),
+            }),
             resolved_profile: AgentRetrievalPresetDto::Architecture,
             policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
             total_latency_ms: 10,
@@ -2206,8 +3042,19 @@ mod packet_tests {
             }),
         };
         let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(
+            value["retrieval_publication"]["retrieval_generation"],
+            "retrieval-generation"
+        );
         assert_eq!(value["retrieval_shadow"]["retrieval_mode"], "unavailable");
         let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        let publication = parsed
+            .retrieval_publication
+            .as_ref()
+            .expect("retrieval publication round trip");
+        assert_eq!(publication.core_generation_id, "core-generation");
+        assert_eq!(publication.retrieval_generation, "retrieval-generation");
+        assert_eq!(publication.semantic_generation, "semantic-generation");
         assert_eq!(
             parsed
                 .retrieval_shadow
@@ -2355,6 +3202,34 @@ mod packet_tests {
         assert_eq!(
             parsed.evidence_kind,
             SearchPlanBridgeEvidenceKindDto::GraphPath
+        );
+    }
+
+    #[test]
+    fn update_bookmark_preserves_omitted_null_and_present_comments() {
+        let omitted: UpdateBookmarkRequest =
+            serde_json::from_str(r#"{}"#).expect("deserialize omitted comment");
+        let cleared: UpdateBookmarkRequest =
+            serde_json::from_str(r#"{"comment":null}"#).expect("deserialize null comment");
+        let updated: UpdateBookmarkRequest =
+            serde_json::from_str(r#"{"comment":"note"}"#).expect("deserialize present comment");
+
+        assert_eq!(omitted.comment, None);
+        assert_eq!(cleared.comment, Some(None));
+        assert_eq!(
+            updated
+                .comment
+                .as_ref()
+                .and_then(|comment| comment.as_deref()),
+            Some("note")
+        );
+        assert_eq!(
+            serde_json::to_value(cleared).expect("serialize cleared comment")["comment"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(updated).expect("serialize updated comment")["comment"],
+            "note"
         );
     }
 }

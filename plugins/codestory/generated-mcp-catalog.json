@@ -1,0 +1,4238 @@
+{
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Read readiness for one explicit repository.",
+        "properties": {
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "status",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Compact capability state. Read codestory://status{?project} with the same absolute project root when full diagnostics are needed.",
+        "properties": {
+          "capabilities": {
+            "description": "Local navigation and broad-search states.",
+            "type": "object"
+          },
+          "current_operation": {
+            "description": "Current managed preparation operation.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnostics_uri": {
+            "description": "Optional full diagnostic resource URI.",
+            "type": "string"
+          },
+          "next_action": {
+            "description": "Direct next action for the caller.",
+            "type": "string"
+          },
+          "project": {
+            "description": "Requested repository root.",
+            "type": "string"
+          },
+          "retry_after_ms": {
+            "description": "Retry delay while preparing.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "Overall capability state.",
+            "enum": [
+              "ready",
+              "preparing",
+              "updating",
+              "working_locally",
+              "unavailable"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "project",
+          "state",
+          "capabilities",
+          "next_action",
+          "diagnostics_uri"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": false,
+        "destructive": false,
+        "effect": "read_only",
+        "idempotent": true,
+        "localOnly": true,
+        "openWorld": false,
+        "readOnly": true,
+        "requiresConfirmation": false,
+        "sideEffects": false,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 16
+                },
+                "probes": {
+                  "minItems": 1
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 15
+                },
+                "probes": {
+                  "minItems": 2
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 14
+                },
+                "probes": {
+                  "minItems": 3
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 13
+                },
+                "probes": {
+                  "minItems": 4
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 12
+                },
+                "probes": {
+                  "minItems": 5
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 11
+                },
+                "probes": {
+                  "minItems": 6
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 10
+                },
+                "probes": {
+                  "minItems": 7
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 9
+                },
+                "probes": {
+                  "minItems": 8
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 8
+                },
+                "probes": {
+                  "minItems": 9
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 7
+                },
+                "probes": {
+                  "minItems": 10
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 6
+                },
+                "probes": {
+                  "minItems": 11
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 5
+                },
+                "probes": {
+                  "minItems": 12
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 4
+                },
+                "probes": {
+                  "minItems": 13
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 3
+                },
+                "probes": {
+                  "minItems": 14
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 2
+                },
+                "probes": {
+                  "minItems": 15
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "extra_probes": {
+                  "minItems": 1
+                },
+                "probes": {
+                  "minItems": 16
+                }
+              },
+              "required": [
+                "probes",
+                "extra_probes"
+              ]
+            }
+          }
+        ],
+        "description": "Build a broad task packet with budget and sufficiency metadata.",
+        "properties": {
+          "budget": {
+            "default": "compact",
+            "description": "Packet budget.",
+            "enum": [
+              "tiny",
+              "compact",
+              "standard",
+              "deep"
+            ],
+            "type": "string"
+          },
+          "extra_probes": {
+            "description": "Legacy string probes normalized through the same typed runtime resolver.",
+            "items": {
+              "maxLength": 240,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "include_evidence": {
+            "default": true,
+            "description": "Include citation edge ids and score details.",
+            "type": "boolean"
+          },
+          "latency_budget_ms": {
+            "description": "Optional retrieval latency budget in milliseconds.",
+            "maximum": 120000,
+            "minimum": 1000,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "probes": {
+            "description": "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "description": "Exact project-relative path probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "exact_path"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "description": "Exact project-relative path.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Stable symbol-id probe.",
+                  "properties": {
+                    "id": {
+                      "description": "Stable symbol id.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "symbol_id"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "id"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Exact file-scoped symbol probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "file_symbol"
+                      ],
+                      "type": "string"
+                    },
+                    "path": {
+                      "description": "Exact project-relative path.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "symbol": {
+                      "description": "File-scoped symbol name.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "symbol"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Free-query probe.",
+                  "properties": {
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "free_query"
+                      ],
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Free query.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "query"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Project- and generation-bound continuation probe.",
+                  "properties": {
+                    "contract_version": {
+                      "description": "Continuation probe contract version.",
+                      "maximum": 1,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "core_generation_id": {
+                      "description": "Continuation core evidence generation.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "description": "Probe kind.",
+                      "enum": [
+                        "continuation"
+                      ],
+                      "type": "string"
+                    },
+                    "project_id": {
+                      "description": "Continuation project identity.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Continuation display query.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "retrieval_generation": {
+                      "description": "Optional continuation retrieval generation.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "symbol_id": {
+                      "description": "Optional exact continuation symbol id.",
+                      "maxLength": 240,
+                      "minLength": 1,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "contract_version",
+                    "project_id",
+                    "core_generation_id",
+                    "query"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "question": {
+            "description": "Broad repository question or task.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "task_class": {
+            "description": "Optional task class.",
+            "enum": [
+              "architecture_explanation",
+              "bug_localization",
+              "change_impact",
+              "route_tracing",
+              "symbol_ownership",
+              "data_flow",
+              "edit_planning"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "question",
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "packet",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory broad task packet DTO with graph/sidecar evidence, budget truncation, unsafe-to-claim gaps, and follow-up commands.",
+        "properties": {
+          "answer": {
+            "description": "Underlying DB-first answer packet.",
+            "type": "object"
+          },
+          "budget": {
+            "description": "Budget limits, usage, and truncation metadata.",
+            "type": "object"
+          },
+          "packet_id": {
+            "description": "Stable packet id.",
+            "type": "string"
+          },
+          "plan": {
+            "description": "Packet planner trace.",
+            "type": "object"
+          },
+          "question": {
+            "description": "Packet question.",
+            "type": "string"
+          },
+          "retrieval_trace_summary": {
+            "description": "Compact retrieval trace telemetry summary.",
+            "type": "object"
+          },
+          "sufficiency": {
+            "description": "Covered claims, gaps, and follow-up contract.",
+            "type": "object"
+          },
+          "task_class": {
+            "description": "Optional task class.",
+            "enum": [
+              "architecture_explanation",
+              "bug_localization",
+              "change_impact",
+              "route_tracing",
+              "symbol_ownership",
+              "data_flow",
+              "edit_planning"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "packet_id",
+          "question",
+          "plan",
+          "answer",
+          "budget",
+          "sufficiency",
+          "retrieval_trace_summary"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Discover candidate symbols and retrieval hits; for broad structural questions call packet before snippet/source reads. CodeStory prepares managed retrieval automatically.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Search indexed symbols and repo text.",
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Maximum hits returned.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Search query.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "repo_text": {
+            "default": "auto",
+            "description": "Repo text search mode.",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "search",
+      "outputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query",
+              "retrieval",
+              "limit_per_source",
+              "repo_text_mode",
+              "repo_text_enabled",
+              "hits"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
+        "description": "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
+        "properties": {
+          "code": {
+            "description": "Typed API error code.",
+            "type": "string"
+          },
+          "counts": {
+            "description": "Source counts before merged-result deduplication.",
+            "type": "object"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "hits": {
+            "description": "Merged hit list.",
+            "items": {
+              "additionalProperties": false,
+              "description": "CodeStory search hit DTO.",
+              "properties": {
+                "display_name": {
+                  "description": "Display name.",
+                  "type": "string"
+                },
+                "eligible_for_sufficiency": {
+                  "description": "Whether this hit may satisfy answer-sufficiency requirements.",
+                  "type": "boolean"
+                },
+                "evidence_producer": {
+                  "description": "Collector or retrieval producer that emitted the evidence.",
+                  "type": "string"
+                },
+                "evidence_tier": {
+                  "description": "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+                  "enum": [
+                    "exact_source",
+                    "structural_text",
+                    "resolved_graph",
+                    "lexical_source",
+                    "symbol_doc",
+                    "component_report",
+                    "dense_semantic",
+                    "synthetic_source_scan",
+                    "generated_summary"
+                  ],
+                  "type": "string"
+                },
+                "file_path": {
+                  "description": "Project-relative file path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "description": "Node kind.",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "One-based line number.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "links": {
+                  "description": "Bounded continuation resource links for this hit.",
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "Continuation resource link.",
+                    "properties": {
+                      "probe": {
+                        "description": "Optional generation-bound continuation probe for packet reuse.",
+                        "type": "object"
+                      },
+                      "rel": {
+                        "description": "Link relation.",
+                        "type": "string"
+                      },
+                      "uri": {
+                        "description": "CodeStory resource URI.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "rel",
+                      "uri"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "match_quality": {
+                  "description": "How exactly the hit matched the query: exact, normalized_exact, prefix, fuzzy, semantic_suggestion, or repo_text.",
+                  "type": "string"
+                },
+                "node_id": {
+                  "description": "Stable node id.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "origin": {
+                  "description": "Hit source.",
+                  "enum": [
+                    "indexed_symbol",
+                    "text_match"
+                  ],
+                  "type": "string"
+                },
+                "resolution_status": {
+                  "description": "Resolution state. source_range_only has a source span but no typed graph resolution.",
+                  "enum": [
+                    "resolved",
+                    "source_range_only",
+                    "unresolved",
+                    "diagnostic_only"
+                  ],
+                  "type": "string"
+                },
+                "resolvable": {
+                  "description": "Whether the hit can be used as a symbol target.",
+                  "type": "boolean"
+                },
+                "score": {
+                  "description": "Ranking score.",
+                  "type": "number"
+                },
+                "score_breakdown": {
+                  "description": "Optional retrieval score breakdown.",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "node_id",
+                "display_name",
+                "kind",
+                "score",
+                "origin",
+                "resolvable"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit_per_source": {
+            "description": "Per-source result limit.",
+            "type": "integer"
+          },
+          "message": {
+            "description": "Human-readable API error message.",
+            "type": "string"
+          },
+          "query": {
+            "description": "Search query.",
+            "type": "string"
+          },
+          "query_assessment": {
+            "description": "Exactness, weak-hit, repo-text diagnostic, and next-action assessment.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "repo_text_enabled": {
+            "description": "Whether repo text search was enabled.",
+            "type": "boolean"
+          },
+          "repo_text_mode": {
+            "description": "Repo text search mode.",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "type": "string"
+          },
+          "repo_text_stats": {
+            "description": "Repo text scan cap, byte, and truncation telemetry.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "retrieval": {
+            "description": "Retrieval readiness.",
+            "type": "object"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a compact repository map for orientation before packet/search; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Return the same compact repository orientation as codestory://grounding.",
+        "properties": {
+          "budget": {
+            "default": "balanced",
+            "description": "Grounding output budget.",
+            "enum": [
+              "strict",
+              "balanced",
+              "max"
+            ],
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "ground",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory grounding snapshot DTO for compact repository orientation.",
+        "properties": {
+          "budget": {
+            "description": "Grounding output budget.",
+            "enum": [
+              "strict",
+              "balanced",
+              "max"
+            ],
+            "type": "string"
+          },
+          "coverage": {
+            "description": "Grounding coverage summary.",
+            "type": "object"
+          },
+          "coverage_buckets": {
+            "description": "Compressed coverage buckets.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "files": {
+            "description": "File digests.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "generated_at_epoch_ms": {
+            "description": "Snapshot generation time.",
+            "type": "integer"
+          },
+          "notes": {
+            "description": "Grounding notes.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "orientation": {
+            "additionalProperties": false,
+            "description": "Typed architecture-orientation confidence and uncertainty.",
+            "properties": {
+              "candidate_entrypoint_roots": {
+                "description": "Evaluated roots with entrypoint evidence.",
+                "type": "integer"
+              },
+              "candidate_subsystems": {
+                "description": "Distinct architecture subsystems represented by evaluated roots.",
+                "type": "integer"
+              },
+              "confidence": {
+                "description": "Confidence that selected roots orient an agent to the repository architecture.",
+                "enum": [
+                  "strong",
+                  "partial",
+                  "weak"
+                ],
+                "type": "string"
+              },
+              "evaluated_root_candidates": {
+                "description": "Root symbols evaluated inside the bounded orientation candidate window.",
+                "type": "integer"
+              },
+              "selected_entrypoint_roots": {
+                "description": "Entrypoint-evidenced roots retained in the snapshot.",
+                "type": "integer"
+              },
+              "selected_subsystems": {
+                "description": "Distinct architecture subsystems retained in the snapshot.",
+                "type": "integer"
+              },
+              "total_root_candidates": {
+                "description": "Total root symbols available in the published repository map.",
+                "type": "integer"
+              },
+              "uncertainty": {
+                "description": "Typed reasons the compact orientation is incomplete or compressed.",
+                "items": {
+                  "enum": [
+                    "bounded_candidate_window",
+                    "no_entrypoint_evidence",
+                    "entrypoint_evidence_omitted",
+                    "limited_subsystem_breadth",
+                    "compressed_presentation"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "confidence",
+              "total_root_candidates",
+              "evaluated_root_candidates",
+              "candidate_entrypoint_roots",
+              "selected_entrypoint_roots",
+              "candidate_subsystems",
+              "selected_subsystems",
+              "uncertainty"
+            ],
+            "type": "object"
+          },
+          "recommended_queries": {
+            "description": "Suggested follow-up queries.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "root": {
+            "description": "Project root.",
+            "type": "string"
+          },
+          "root_symbols": {
+            "description": "Root symbol digests.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "stats": {
+            "description": "Indexed project stats.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "root",
+          "budget",
+          "generated_at_epoch_ms",
+          "stats",
+          "coverage",
+          "orientation",
+          "root_symbols",
+          "files"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "List indexed files and coverage from a locally fresh index; refreshes the repository map before dispatch and does not wait for broad search.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "List indexed files from the existing local index.",
+        "properties": {
+          "language": {
+            "description": "Only include files for this language.",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "description": "Maximum files returned.",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Only include files whose path contains this text.",
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "role": {
+            "description": "Only include files with this inferred role.",
+            "enum": [
+              "source",
+              "test",
+              "generated",
+              "vendor",
+              "unknown"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "files",
+      "outputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "project_root",
+              "usable",
+              "summary",
+              "files",
+              "policy_exclusions"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
+        "description": "Indexed file inventory and coverage summary.",
+        "properties": {
+          "code": {
+            "description": "Typed API error code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "files": {
+            "description": "Indexed file rows.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Indexed file coverage row.",
+              "properties": {
+                "complete": {
+                  "description": "Whether indexing completed for this file.",
+                  "type": "boolean"
+                },
+                "error_count": {
+                  "description": "File-level index error count.",
+                  "type": "integer"
+                },
+                "indexed": {
+                  "description": "Whether the file was indexed.",
+                  "type": "boolean"
+                },
+                "language": {
+                  "description": "Detected language.",
+                  "type": "string"
+                },
+                "line_count": {
+                  "description": "Line count.",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "Inferred file role.",
+                  "enum": [
+                    "source",
+                    "test",
+                    "generated",
+                    "vendor",
+                    "unknown"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "language",
+                "indexed",
+                "complete",
+                "line_count",
+                "role"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "Human-readable API error message.",
+            "type": "string"
+          },
+          "policy_exclusions": {
+            "description": "Verified policy exclusions without graph or semantic coverage.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Verified source intentionally excluded from parser scheduling without graph or semantic coverage.",
+              "properties": {
+                "byte_cap": {
+                  "description": "Bound source byte cap.",
+                  "type": "integer"
+                },
+                "content_hash": {
+                  "description": "Verified source content digest.",
+                  "type": "string"
+                },
+                "core_generation_id": {
+                  "description": "Bound source publication generation.",
+                  "type": "string"
+                },
+                "core_run_id": {
+                  "description": "Bound source publication run.",
+                  "type": "string"
+                },
+                "graph_coverage": {
+                  "description": "Always false for policy exclusions.",
+                  "type": "boolean"
+                },
+                "observed_size": {
+                  "description": "Observed source bytes.",
+                  "type": "integer"
+                },
+                "observed_unit_count": {
+                  "description": "Observed structural units, or zero for a byte-bound exclusion.",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "policy_version": {
+                  "description": "Bound exclusion policy version.",
+                  "type": "string"
+                },
+                "project_id": {
+                  "description": "Bound logical project identity.",
+                  "type": "string"
+                },
+                "role": {
+                  "description": "Inferred file role.",
+                  "enum": [
+                    "source",
+                    "test",
+                    "generated",
+                    "vendor",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "semantic_coverage": {
+                  "description": "Always false for policy exclusions.",
+                  "type": "boolean"
+                },
+                "structural_unit_cap": {
+                  "description": "Bound structural unit cap.",
+                  "type": "integer"
+                },
+                "workspace_id": {
+                  "description": "Bound workspace identity.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "role",
+                "content_hash",
+                "observed_size",
+                "observed_unit_count",
+                "policy_version",
+                "byte_cap",
+                "structural_unit_cap",
+                "project_id",
+                "workspace_id",
+                "core_generation_id",
+                "core_run_id",
+                "graph_coverage",
+                "semantic_coverage"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "project_root": {
+            "description": "Project root.",
+            "type": "string"
+          },
+          "summary": {
+            "description": "Indexed file summary DTO.",
+            "type": "object"
+          },
+          "usable": {
+            "description": "Whether the index has usable files.",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Analyze one explicit path source against the last complete local index while preserving bounded stale and error evidence. Cold or partial state may trigger managed indexing before dispatch. Prefer paths, use changed_paths for compatibility or change_records for status-rich input. Never discovers git changes and does not wait for broad search.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Analyze exactly one explicit path source against the last complete local index.",
+        "oneOf": [
+          {
+            "required": [
+              "paths"
+            ]
+          },
+          {
+            "required": [
+              "changed_paths"
+            ]
+          },
+          {
+            "required": [
+              "change_records"
+            ]
+          }
+        ],
+        "properties": {
+          "change_records": {
+            "description": "Changed file records with path, kind, optional status, and optional previous_path.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Changed file record.",
+              "properties": {
+                "kind": {
+                  "description": "Change kind.",
+                  "enum": [
+                    "added",
+                    "modified",
+                    "deleted",
+                    "renamed",
+                    "copied",
+                    "untracked",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Changed repo-relative path.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "previous_path": {
+                  "description": "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "maxItems": 200,
+            "minItems": 1,
+            "type": "array"
+          },
+          "changed_paths": {
+            "description": "Compatibility alias for project-relative paths to analyze.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 200,
+            "minItems": 1,
+            "type": "array"
+          },
+          "depth": {
+            "default": 2,
+            "description": "Dependent graph walk depth.",
+            "maximum": 8,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "filter": {
+            "description": "Optional impacted-symbol filter by path or display-name substring.",
+            "type": "string"
+          },
+          "paths": {
+            "description": "Preferred simple input: project-relative paths to analyze.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 200,
+            "minItems": 1,
+            "type": "array"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "affected",
+      "outputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "project_root",
+              "changed_paths",
+              "change_records",
+              "matched_files",
+              "uncovered_inputs",
+              "matched_file_count",
+              "depth",
+              "impacted_symbols",
+              "impacted_tests",
+              "bounds",
+              "completeness"
+            ]
+          },
+          {
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        ],
+        "description": "Changed-file impact analysis DTO from the last complete local index.",
+        "properties": {
+          "blind_spots": {
+            "description": "Known impact-analysis blind spots.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bounds": {
+            "additionalProperties": false,
+            "description": "Applied traversal and result bounds.",
+            "properties": {
+              "impacted_route_limit": {
+                "description": "Runtime impacted-route limit.",
+                "type": "integer"
+              },
+              "impacted_symbol_limit": {
+                "description": "Runtime impacted-symbol limit.",
+                "type": "integer"
+              },
+              "maximum_depth": {
+                "description": "Maximum allowed graph walk depth.",
+                "type": "integer"
+              },
+              "requested_depth": {
+                "description": "Applied dependent graph walk depth.",
+                "type": "integer"
+              },
+              "visited_edge_count": {
+                "description": "Visited graph edge count.",
+                "type": "integer"
+              },
+              "visited_node_count": {
+                "description": "Visited graph node count.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "requested_depth",
+              "maximum_depth",
+              "visited_node_count",
+              "visited_edge_count",
+              "impacted_symbol_limit",
+              "impacted_route_limit"
+            ],
+            "type": "object"
+          },
+          "change_records": {
+            "description": "Normalized changed file records.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Changed file record.",
+              "properties": {
+                "kind": {
+                  "description": "Change kind.",
+                  "enum": [
+                    "added",
+                    "modified",
+                    "deleted",
+                    "renamed",
+                    "copied",
+                    "untracked",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "description": "Changed repo-relative path.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "previous_path": {
+                  "description": "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "changed_paths": {
+            "description": "Changed repo-relative paths.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "code": {
+            "description": "Typed API error code.",
+            "type": "string"
+          },
+          "completeness": {
+            "additionalProperties": false,
+            "description": "Completeness, direct/propagated counts, confidence, and truncation evidence.",
+            "properties": {
+              "candidate_test_count": {
+                "description": "Candidate impacted-test count.",
+                "type": "integer"
+              },
+              "complete": {
+                "description": "Whether a complete impact claim is supported.",
+                "type": "boolean"
+              },
+              "confidence": {
+                "description": "Completeness confidence.",
+                "type": "string"
+              },
+              "direct_impact_count": {
+                "description": "Direct impacted-symbol count.",
+                "type": "integer"
+              },
+              "propagated_impact_count": {
+                "description": "Graph-propagated impacted-symbol count.",
+                "type": "integer"
+              },
+              "truncated": {
+                "description": "Whether runtime or transport bounds capped evidence.",
+                "type": "boolean"
+              },
+              "truncation_reasons": {
+                "description": "Field-specific runtime and transport truncation reasons.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "unavailable_evidence_count": {
+                "description": "Inputs whose absence could not be classified more strongly.",
+                "type": "integer"
+              },
+              "uncovered_input_count": {
+                "description": "Inputs without complete graph evidence.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "complete",
+              "confidence",
+              "direct_impact_count",
+              "propagated_impact_count",
+              "candidate_test_count",
+              "uncovered_input_count",
+              "unavailable_evidence_count",
+              "truncated",
+              "truncation_reasons"
+            ],
+            "type": "object"
+          },
+          "counts": {
+            "description": "Original result counts before response caps.",
+            "type": "object"
+          },
+          "depth": {
+            "description": "Applied dependent graph walk depth.",
+            "type": "integer"
+          },
+          "details": {
+            "description": "Structured API error repair guidance.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "follow_ups": {
+            "description": "Evidence-derived follow-up actions with optional structured invocations.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Evidence-derived follow-up action.",
+              "properties": {
+                "action": {
+                  "description": "Stable follow-up action label.",
+                  "type": "string"
+                },
+                "confidence": {
+                  "description": "Follow-up confidence.",
+                  "type": "string"
+                },
+                "invocation": {
+                  "additionalProperties": false,
+                  "description": "Optional structured command invocation.",
+                  "properties": {
+                    "args": {
+                      "description": "Unquoted argument vector.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "program": {
+                      "description": "Executable name.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "program",
+                    "args"
+                  ],
+                  "type": "object"
+                },
+                "reason": {
+                  "description": "Evidence-backed reason for the follow-up.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action",
+                "reason",
+                "confidence"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "impacted_routes": {
+            "description": "Impacted route or endpoint DTOs.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "impacted_symbols": {
+            "description": "Impacted symbol DTOs.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "impacted_tests": {
+            "description": "Likely impacted test file DTOs.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limits": {
+            "description": "Applied response caps.",
+            "type": "object"
+          },
+          "matched_file_count": {
+            "description": "Number of matched indexed files.",
+            "type": "integer"
+          },
+          "matched_files": {
+            "description": "Changed paths matched to indexed files.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Matched indexed file row.",
+              "properties": {
+                "change_kind": {
+                  "description": "Matched change kind.",
+                  "enum": [
+                    "added",
+                    "modified",
+                    "deleted",
+                    "renamed",
+                    "copied",
+                    "untracked",
+                    "unknown"
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "change_status": {
+                  "description": "Matched raw change status.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "complete": {
+                  "description": "Whether indexing completed for this file.",
+                  "type": "boolean"
+                },
+                "error_count": {
+                  "description": "File-level index error count.",
+                  "type": "integer"
+                },
+                "indexed": {
+                  "description": "Whether the file was indexed.",
+                  "type": "boolean"
+                },
+                "path": {
+                  "description": "Project-relative file path.",
+                  "type": "string"
+                },
+                "previous_path": {
+                  "description": "Previous rename/copy path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role": {
+                  "description": "Inferred file role.",
+                  "enum": [
+                    "source",
+                    "test",
+                    "generated",
+                    "vendor",
+                    "unknown"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "role",
+                "indexed",
+                "complete",
+                "error_count"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "Human-readable API error message.",
+            "type": "string"
+          },
+          "notes": {
+            "description": "Additional analysis notes.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_root": {
+            "description": "Project root.",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "Whether any result collection was capped.",
+            "type": "boolean"
+          },
+          "uncovered_inputs": {
+            "description": "All inputs without complete graph evidence, including malformed indexed files.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Input without complete graph evidence.",
+              "properties": {
+                "classification": {
+                  "description": "Evidence-backed coverage classification.",
+                  "enum": [
+                    "valid_uncovered",
+                    "missing",
+                    "expected_deleted",
+                    "rename_unresolved",
+                    "stale_index",
+                    "malformed",
+                    "unavailable_evidence"
+                  ],
+                  "type": "string"
+                },
+                "evidence": {
+                  "description": "Evidence supporting the classification.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "description": "Submitted project-relative path.",
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "Human-readable classification reason.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "classification",
+                "reason",
+                "evidence"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "unmatched_paths": {
+            "description": "Changed paths that did not match indexed file identity.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Input path that did not match indexed file identity.",
+              "properties": {
+                "change_kind": {
+                  "description": "Submitted change kind.",
+                  "enum": [
+                    "added",
+                    "modified",
+                    "deleted",
+                    "renamed",
+                    "copied",
+                    "untracked",
+                    "unknown"
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "change_status": {
+                  "description": "Submitted raw change status.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "classification": {
+                  "description": "Positive-evidence coverage classification.",
+                  "enum": [
+                    "valid_uncovered",
+                    "missing",
+                    "expected_deleted",
+                    "rename_unresolved",
+                    "stale_index",
+                    "malformed",
+                    "unavailable_evidence"
+                  ],
+                  "type": "string"
+                },
+                "evidence": {
+                  "description": "Evidence supporting the classification.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "path": {
+                  "description": "Submitted project-relative path.",
+                  "type": "string"
+                },
+                "previous_path": {
+                  "description": "Previous rename/copy path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "description": "Human-readable classification reason.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "classification",
+                "reason",
+                "evidence"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Resolve a symbol id or query and return details.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Resolve a symbol by query or stable node id.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "symbol",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory symbol context DTO.",
+        "properties": {
+          "children": {
+            "description": "Child symbol summaries.",
+            "items": {
+              "additionalProperties": false,
+              "description": "CodeStory symbol summary DTO.",
+              "properties": {
+                "file_path": {
+                  "description": "Project-relative file path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "has_children": {
+                  "description": "Whether children can be browsed.",
+                  "type": "boolean"
+                },
+                "id": {
+                  "description": "Stable node id.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "Node kind.",
+                  "type": "string"
+                },
+                "label": {
+                  "description": "Symbol label.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "kind",
+                "has_children"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "edge_digest": {
+            "description": "Readable edge digest entries.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": "object"
+          },
+          "related_hits": {
+            "description": "Related search hits.",
+            "items": {
+              "additionalProperties": false,
+              "description": "CodeStory search hit DTO.",
+              "properties": {
+                "display_name": {
+                  "description": "Display name.",
+                  "type": "string"
+                },
+                "eligible_for_sufficiency": {
+                  "description": "Whether this hit may satisfy answer-sufficiency requirements.",
+                  "type": "boolean"
+                },
+                "evidence_producer": {
+                  "description": "Collector or retrieval producer that emitted the evidence.",
+                  "type": "string"
+                },
+                "evidence_tier": {
+                  "description": "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+                  "enum": [
+                    "exact_source",
+                    "structural_text",
+                    "resolved_graph",
+                    "lexical_source",
+                    "symbol_doc",
+                    "component_report",
+                    "dense_semantic",
+                    "synthetic_source_scan",
+                    "generated_summary"
+                  ],
+                  "type": "string"
+                },
+                "file_path": {
+                  "description": "Project-relative file path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "description": "Node kind.",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "One-based line number.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "links": {
+                  "description": "Bounded continuation resource links for this hit.",
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "Continuation resource link.",
+                    "properties": {
+                      "probe": {
+                        "description": "Optional generation-bound continuation probe for packet reuse.",
+                        "type": "object"
+                      },
+                      "rel": {
+                        "description": "Link relation.",
+                        "type": "string"
+                      },
+                      "uri": {
+                        "description": "CodeStory resource URI.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "rel",
+                      "uri"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "match_quality": {
+                  "description": "How exactly the hit matched the query: exact, normalized_exact, prefix, fuzzy, semantic_suggestion, or repo_text.",
+                  "type": "string"
+                },
+                "node_id": {
+                  "description": "Stable node id.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "origin": {
+                  "description": "Hit source.",
+                  "enum": [
+                    "indexed_symbol",
+                    "text_match"
+                  ],
+                  "type": "string"
+                },
+                "resolution_status": {
+                  "description": "Resolution state. source_range_only has a source span but no typed graph resolution.",
+                  "enum": [
+                    "resolved",
+                    "source_range_only",
+                    "unresolved",
+                    "diagnostic_only"
+                  ],
+                  "type": "string"
+                },
+                "resolvable": {
+                  "description": "Whether the hit can be used as a symbol target.",
+                  "type": "boolean"
+                },
+                "score": {
+                  "description": "Ranking score.",
+                  "type": "number"
+                },
+                "score_breakdown": {
+                  "description": "Optional retrieval score breakdown.",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "node_id",
+                "display_name",
+                "kind",
+                "score",
+                "origin",
+                "resolvable"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "description": "Optional generated summary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node",
+          "children",
+          "related_hits",
+          "edge_digest"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a graph trail around a symbol.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Return a graph trail around a symbol id or query.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "depth": {
+            "default": 2,
+            "description": "Trail depth.",
+            "maximum": 10,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "direction": {
+            "default": "both",
+            "description": "Trail direction.",
+            "enum": [
+              "incoming",
+              "outgoing",
+              "both"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_nodes": {
+            "default": 120,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "story": {
+            "default": false,
+            "description": "Include a readable trail story DTO.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "trail",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory trail context DTO.",
+        "properties": {
+          "focus": {
+            "description": "Focused node details DTO.",
+            "type": "object"
+          },
+          "story": {
+            "description": "Optional readable trail story DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "trail": {
+            "description": "Graph response DTO.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "focus",
+          "trail"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a bounded incoming caller graph around a symbol.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Return a bounded local graph alias around one node.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "depth": {
+            "default": 1,
+            "description": "Graph depth.",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_nodes": {
+            "default": 50,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "callers",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Bounded CodeStory graph primitive output.",
+        "properties": {
+          "certainty": {
+            "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "edge_count": {
+            "description": "Returned edge count.",
+            "type": "integer"
+          },
+          "file_refs": {
+            "description": "Stable project-relative file references.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "Graph response DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "limits": {
+            "description": "Applied bounds for this graph primitive.",
+            "type": "object"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "node_count": {
+            "description": "Returned node count.",
+            "type": "integer"
+          },
+          "resolution": {
+            "description": "Optional query resolution metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "truncated": {
+            "description": "Whether the graph result was truncated.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "certainty",
+          "file_refs",
+          "limits",
+          "node_count",
+          "edge_count",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a bounded outgoing callee graph around a symbol.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Return a bounded local graph alias around one node.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "depth": {
+            "default": 1,
+            "description": "Graph depth.",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_nodes": {
+            "default": 50,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "callees",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Bounded CodeStory graph primitive output.",
+        "properties": {
+          "certainty": {
+            "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "edge_count": {
+            "description": "Returned edge count.",
+            "type": "integer"
+          },
+          "file_refs": {
+            "description": "Stable project-relative file references.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "Graph response DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "limits": {
+            "description": "Applied bounds for this graph primitive.",
+            "type": "object"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "node_count": {
+            "description": "Returned node count.",
+            "type": "integer"
+          },
+          "resolution": {
+            "description": "Optional query resolution metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "truncated": {
+            "description": "Whether the graph result was truncated.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "certainty",
+          "file_refs",
+          "limits",
+          "node_count",
+          "edge_count",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a readable trace around a symbol.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Return a readable trace around a symbol id or query.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "depth": {
+            "default": 2,
+            "description": "Trail depth.",
+            "maximum": 10,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "direction": {
+            "default": "both",
+            "description": "Trail direction.",
+            "enum": [
+              "incoming",
+              "outgoing",
+              "both"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_nodes": {
+            "default": 120,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "story": {
+            "default": true,
+            "description": "Include a readable trail story DTO.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "trace",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory trail context DTO.",
+        "properties": {
+          "focus": {
+            "description": "Focused node details DTO.",
+            "type": "object"
+          },
+          "story": {
+            "description": "Optional readable trail story DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "trail": {
+            "description": "Graph response DTO.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "focus",
+          "trail"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return one stable graph node with file refs before requesting a packet.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Resolve a single indexed graph node by stable id or query.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "get_node",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Bounded CodeStory graph primitive output.",
+        "properties": {
+          "certainty": {
+            "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "edge_count": {
+            "description": "Returned edge count.",
+            "type": "integer"
+          },
+          "file_refs": {
+            "description": "Stable project-relative file references.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "Graph response DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "limits": {
+            "description": "Applied bounds for this graph primitive.",
+            "type": "object"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "node_count": {
+            "description": "Returned node count.",
+            "type": "integer"
+          },
+          "resolution": {
+            "description": "Optional query resolution metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "truncated": {
+            "description": "Whether the graph result was truncated.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "certainty",
+          "file_refs",
+          "limits",
+          "node_count",
+          "edge_count",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a bounded graph neighborhood around one node.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Return a bounded graph neighborhood around one node.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "depth": {
+            "default": 1,
+            "description": "Graph depth.",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "direction": {
+            "default": "both",
+            "description": "Graph direction.",
+            "enum": [
+              "incoming",
+              "outgoing",
+              "both"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_nodes": {
+            "default": 50,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "neighbors",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Bounded CodeStory graph primitive output.",
+        "properties": {
+          "certainty": {
+            "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "edge_count": {
+            "description": "Returned edge count.",
+            "type": "integer"
+          },
+          "file_refs": {
+            "description": "Stable project-relative file references.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "Graph response DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "limits": {
+            "description": "Applied bounds for this graph primitive.",
+            "type": "object"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "node_count": {
+            "description": "Returned node count.",
+            "type": "integer"
+          },
+          "resolution": {
+            "description": "Optional query resolution metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "truncated": {
+            "description": "Whether the graph result was truncated.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "certainty",
+          "file_refs",
+          "limits",
+          "node_count",
+          "edge_count",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a bounded forward path graph between two node ids.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Return a bounded forward path graph between two stable node ids.",
+        "properties": {
+          "from_id": {
+            "description": "Stable source node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_depth": {
+            "default": 6,
+            "description": "Maximum path depth.",
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_nodes": {
+            "default": 80,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 2,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "to_id": {
+            "description": "Stable target node id.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "from_id",
+          "to_id",
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "shortest_path",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Bounded CodeStory graph primitive output.",
+        "properties": {
+          "certainty": {
+            "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "edge_count": {
+            "description": "Returned edge count.",
+            "type": "integer"
+          },
+          "file_refs": {
+            "description": "Stable project-relative file references.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "Graph response DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "limits": {
+            "description": "Applied bounds for this graph primitive.",
+            "type": "object"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "node_count": {
+            "description": "Returned node count.",
+            "type": "integer"
+          },
+          "resolution": {
+            "description": "Optional query resolution metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "truncated": {
+            "description": "Whether the graph result was truncated.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "certainty",
+          "file_refs",
+          "limits",
+          "node_count",
+          "edge_count",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Return a bounded graph subgraph around one resolved node.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "depth": {
+            "default": 2,
+            "description": "Graph depth.",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "direction": {
+            "default": "both",
+            "description": "Graph direction.",
+            "enum": [
+              "incoming",
+              "outgoing",
+              "both"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_nodes": {
+            "default": 80,
+            "description": "Maximum graph nodes returned.",
+            "maximum": 120,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "query_subgraph",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "Bounded CodeStory graph primitive output.",
+        "properties": {
+          "certainty": {
+            "description": "Overall certainty note.",
+            "type": "string"
+          },
+          "edge_count": {
+            "description": "Returned edge count.",
+            "type": "integer"
+          },
+          "file_refs": {
+            "description": "Stable project-relative file references.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "Graph response DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "limits": {
+            "description": "Applied bounds for this graph primitive.",
+            "type": "object"
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "node_count": {
+            "description": "Returned node count.",
+            "type": "integer"
+          },
+          "resolution": {
+            "description": "Optional query resolution metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "truncated": {
+            "description": "Whether the graph result was truncated.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "certainty",
+          "file_refs",
+          "limits",
+          "node_count",
+          "edge_count",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return definition metadata for a symbol id or query.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Resolve a symbol by query or stable node id.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "definition",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory definition tool output.",
+        "properties": {
+          "definition": {
+            "description": "Resolved definition search hit.",
+            "type": "object"
+          },
+          "links": {
+            "description": "Continuation resource links for the resolved definition.",
+            "items": {
+              "additionalProperties": false,
+              "description": "Continuation resource link.",
+              "properties": {
+                "probe": {
+                  "description": "Optional generation-bound continuation probe for packet reuse.",
+                  "type": "object"
+                },
+                "rel": {
+                  "description": "Link relation.",
+                  "type": "string"
+                },
+                "uri": {
+                  "description": "CodeStory resource URI.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rel",
+                "uri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "resolution": {
+            "description": "Query resolution metadata.",
+            "type": "object"
+          },
+          "symbol": {
+            "description": "Symbol context DTO.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "resolution",
+          "definition",
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return incoming references for a symbol id or query.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Resolve a symbol by query or stable node id.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "references",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory trail context DTO.",
+        "properties": {
+          "focus": {
+            "description": "Focused node details DTO.",
+            "type": "object"
+          },
+          "story": {
+            "description": "Optional readable trail story DTO.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "trail": {
+            "description": "Graph response DTO.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "focus",
+          "trail"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Browse root symbols or children for a parent id.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Browse root symbols or children for a parent id.",
+        "properties": {
+          "limit": {
+            "default": 300,
+            "description": "Maximum root symbols returned.",
+            "maximum": 2000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "parent_id": {
+            "description": "Parent node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "symbols",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory symbol list output.",
+        "properties": {
+          "limit": {
+            "description": "Applied result limit.",
+            "type": "integer"
+          },
+          "returned_count": {
+            "description": "Symbol rows included in this response.",
+            "type": "integer"
+          },
+          "symbols": {
+            "description": "Root or child symbol summaries.",
+            "items": {
+              "additionalProperties": false,
+              "description": "CodeStory symbol summary DTO.",
+              "properties": {
+                "file_path": {
+                  "description": "Project-relative file path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "has_children": {
+                  "description": "Whether children can be browsed.",
+                  "type": "boolean"
+                },
+                "id": {
+                  "description": "Stable node id.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "Node kind.",
+                  "type": "string"
+                },
+                "label": {
+                  "description": "Symbol label.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "kind",
+                "has_children"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "description": "Whether matching symbols exceeded the limit.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "symbols",
+          "returned_count",
+          "limit",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          }
+        ],
+        "description": "Resolve a symbol and return bounded line or function-body source context.",
+        "properties": {
+          "choose": {
+            "description": "Resolve by the 1-based alternative number from an ambiguity error.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "context": {
+            "default": 4,
+            "description": "Surrounding context lines above and below the selected source range.",
+            "maximum": 200,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "function_body": {
+            "description": "CLI-compatible scope selector; true requests `function_body`, false requests `line_context`.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Stable node id.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "lines": {
+            "description": "Agent-friendly compatibility alias for `context`.",
+            "maximum": 200,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Symbol query.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "scope": {
+            "default": "line_context",
+            "description": "Snippet scope.",
+            "enum": [
+              "line_context",
+              "function_body"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "snippet",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory snippet context DTO.",
+        "properties": {
+          "fallback_reason": {
+            "description": "Reason function-body selection fell back to line context, when applicable.",
+            "type": "string"
+          },
+          "line": {
+            "description": "One-based focused line.",
+            "type": "integer"
+          },
+          "max_snippet_bytes": {
+            "description": "Snippet byte cap.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node": {
+            "description": "Node details DTO.",
+            "type": "object"
+          },
+          "path": {
+            "description": "Project-relative file path.",
+            "type": "string"
+          },
+          "range_source": {
+            "description": "Source of the selected function-body range, when available.",
+            "type": "string"
+          },
+          "requested_context": {
+            "description": "Requested context line count.",
+            "type": "integer"
+          },
+          "scope": {
+            "description": "Snippet scope.",
+            "enum": [
+              "line_context",
+              "function_body"
+            ],
+            "type": "string"
+          },
+          "snippet": {
+            "description": "Source snippet text.",
+            "type": "string"
+          },
+          "snippet_truncated": {
+            "description": "Whether the snippet hit a byte cap.",
+            "type": "boolean"
+          },
+          "truncation_guidance": {
+            "description": "Follow-up guidance when the snippet hit its byte cap.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node",
+          "path",
+          "line",
+          "snippet",
+          "scope",
+          "requested_context",
+          "snippet_truncated"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "query"
+            ]
+          },
+          {
+            "required": [
+              "id"
+            ]
+          },
+          {
+            "required": [
+              "bookmark"
+            ]
+          }
+        ],
+        "description": "Build a deep evidence packet for one concrete retrieval target.",
+        "properties": {
+          "bookmark": {
+            "description": "Saved bookmark id to build context around.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable node id to build context around.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "include_evidence": {
+            "default": true,
+            "description": "Include citation edge ids and score details.",
+            "type": "boolean"
+          },
+          "max_results": {
+            "default": 8,
+            "description": "Maximum retrieval results.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "query": {
+            "description": "Concrete symbol, file, literal, API path, module, or behavior term.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "context",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "CodeStory context packet DTO.",
+        "properties": {
+          "citations": {
+            "description": "Evidence citations.",
+            "items": {
+              "additionalProperties": false,
+              "description": "CodeStory agent citation DTO.",
+              "properties": {
+                "display_name": {
+                  "description": "Display name.",
+                  "type": "string"
+                },
+                "eligible_for_sufficiency": {
+                  "description": "Whether this citation may satisfy answer-sufficiency requirements.",
+                  "type": "boolean"
+                },
+                "evidence_edge_ids": {
+                  "description": "Evidence edge ids.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "evidence_producer": {
+                  "description": "Collector or retrieval producer that emitted the evidence.",
+                  "type": "string"
+                },
+                "evidence_tier": {
+                  "description": "Evidence provenance tier. structural_text is collector-backed source-range evidence, not parser-backed graph coverage.",
+                  "enum": [
+                    "exact_source",
+                    "structural_text",
+                    "resolved_graph",
+                    "lexical_source",
+                    "symbol_doc",
+                    "component_report",
+                    "dense_semantic",
+                    "synthetic_source_scan",
+                    "generated_summary"
+                  ],
+                  "type": "string"
+                },
+                "file_path": {
+                  "description": "Project-relative file path.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "description": "Node kind.",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "One-based line number.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "node_id": {
+                  "description": "Stable node id.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "origin": {
+                  "description": "Citation origin, such as indexed_symbol or text_match.",
+                  "enum": [
+                    "indexed_symbol",
+                    "text_match"
+                  ],
+                  "type": "string"
+                },
+                "resolution_status": {
+                  "description": "Resolution state. source_range_only has a source span but no typed graph resolution.",
+                  "enum": [
+                    "resolved",
+                    "source_range_only",
+                    "unresolved",
+                    "diagnostic_only"
+                  ],
+                  "type": "string"
+                },
+                "resolvable": {
+                  "description": "Whether the citation can be resolved as a symbol.",
+                  "type": "boolean"
+                },
+                "retrieval_score_breakdown": {
+                  "description": "Optional retrieval score breakdown.",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "score": {
+                  "description": "Citation score.",
+                  "type": "number"
+                },
+                "subgraph_id": {
+                  "description": "Related subgraph id.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "node_id",
+                "display_name",
+                "kind",
+                "score",
+                "origin",
+                "resolvable"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graphs": {
+            "description": "Graph artifacts.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "packet_id": {
+            "description": "Stable context packet id.",
+            "type": "string"
+          },
+          "retrieval_trace": {
+            "description": "Retrieval trace and summary.",
+            "type": "object"
+          },
+          "retrieval_version": {
+            "description": "Retrieval version.",
+            "type": "string"
+          },
+          "sections": {
+            "description": "Context sections.",
+            "items": {
+              "additionalProperties": true,
+              "description": "Generic JSON object.",
+              "properties": {},
+              "required": [],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "subgraph_ids": {
+            "description": "Related graph ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "description": "Context packet summary.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Resolved retrieval target label.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "packet_id",
+          "target",
+          "summary",
+          "sections",
+          "citations",
+          "subgraph_ids",
+          "retrieval_version",
+          "graphs",
+          "retrieval_trace"
+        ],
+        "type": "object"
+      },
+      "safety": {
+        "activatesProject": true,
+        "destructive": false,
+        "effect": "managed_activation",
+        "idempotent": true,
+        "localOnly": false,
+        "openWorld": true,
+        "readOnly": false,
+        "requiresConfirmation": false,
+        "sideEffects": true,
+        "writesRepository": false
+      }
+    }
+  ],
+  "resources": [
+    {
+      "mimeType": "application/json",
+      "name": "Agent guide",
+      "uri": "codestory://agent-guide"
+    }
+  ],
+  "resourceTemplates": [
+    {
+      "mimeType": "application/json",
+      "name": "Status",
+      "uriTemplate": "codestory://status{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Project summary",
+      "uriTemplate": "codestory://project{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Grounding snapshot",
+      "uriTemplate": "codestory://grounding{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Root symbols",
+      "uriTemplate": "codestory://symbols/root{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Symbol details",
+      "uriTemplate": "codestory://symbol/{node_id}{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Symbol references",
+      "uriTemplate": "codestory://references/{node_id}{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Symbol snippet",
+      "uriTemplate": "codestory://snippet/{node_id}{?project}"
+    },
+    {
+      "mimeType": "application/json",
+      "name": "Symbol trail",
+      "uriTemplate": "codestory://trail/{node_id}{?project}"
+    }
+  ],
+  "prompts": [
+    {
+      "description": "Explain a symbol using definition, references, and snippet context.",
+      "name": "explain_symbol"
+    },
+    {
+      "description": "Trace the outgoing call flow for a symbol.",
+      "name": "trace_callflow"
+    },
+    {
+      "description": "Find incoming references and likely downstream impact.",
+      "name": "impact_analysis"
+    }
+  ]
+}

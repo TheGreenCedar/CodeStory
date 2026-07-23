@@ -1,12 +1,43 @@
 # Release-evidence runner
 
 CodeStory release-candidate measurements run on one repository-scoped Linux
-runner so baseline identity, cache state, model bytes, and sidecar images remain
+runner so baseline identity, cache state, model bytes, and toolchain remain
 stable between candidates. Ordinary pull requests must not target this runner.
+
+## v0.16 corpus boundary
+
+The v0.16 measurement workflow uses
+`codestory-release-corpus-v0.16-axios-js-ts-v2`: one release-only Axios
+JavaScript/TypeScript task with three cold CLI packet repeats. Its deterministic
+CodeStory project manifest schedules `index.js` and `lib/` as JavaScript plus
+`index.d.ts` and `index.d.cts` as TypeScript. That source boundary excludes
+Axios's JSON-with-comments compiler fixtures structurally; production parsing
+and malformed-source policy are unchanged. The checked corpus contract binds
+the exact task and project-manifest bytes and rejects missing, changed, escaped,
+substituted, extra, or task-inconsistent declarations. Ripgrep's pinned Rust
+task and project template remain available for follow-up diagnostics, but a
+retained three-repeat run
+did not meet its preregistered file and citation recall thresholds, so v0.16
+makes no Ripgrep or general Rust packet-quality claim. Redis/C, shell dialects,
+and general parser completeness are also outside this release-evidence claim.
+The retained v1 task, corpus contract, raw evidence, and approved baseline stay
+unchanged. The first protected v2 run may establish the three raw Axios rows,
+but it cannot become release evidence until those exact bytes receive a separate
+approved, release-eligible baseline. The evaluator therefore fails closed while
+the approved profile still names v1; it cannot silently widen, narrow, or
+replace that scope.
+
+Cold CLI packet provenance is taken from the packet process that actually ran.
+It binds the packet's executed semantic stage, full sidecar diagnostics, and
+zero semantic fallback to the exact semantic generation prepared by the
+harness. A later status process cannot supply the earlier process-local
+embedding-engine instance identity; warm-process evidence still requires that
+live identity directly.
 
 ## Machine contract
 
-The approved host shape for the first v0.15 baseline is:
+The approved host shape for the 0.16 per-user embedding-server retrieval
+baseline is:
 
 | Field | Value |
 | --- | --- |
@@ -15,14 +46,14 @@ The approved host shape for the first v0.15 baseline is:
 | Physical host | `Mac17,4`, Apple M5, 24 GiB, macOS 26.5.2 |
 | VM | Colima VZ profile `codestory-release-evidence`, Ubuntu 24.04 ARM64 |
 | Colima | 0.10.3 |
-| Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
+| Capacity | 4 vCPU, 8 GiB maximum memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
-| Host Docker context | never activated by the evidence profile |
-| Stable profile ID | `codestory-release-evidence-linux-arm64-v1` |
+| Guest container runtime | containerd from the checksum-pinned Colima image; foreign-architecture emulation is disabled and the host context is never activated |
+| Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
-| Model directory | `/srv/codestory-release-evidence/models` |
 | Drill manifest | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
+| Drill project manifest | `scripts/release-evidence/serde-json-codestory-project.json` |
 
 The profile ID is a stable comparison key, not evidence about the current
 machine. Provisioning records the observed host, generated Colima VM shape,
@@ -34,9 +65,9 @@ boot is rejected.
 ## Provision and verify
 
 The host needs macOS, Colima, and an authenticated `gh` with repository
-administration access. A 24 GiB Mac cannot safely run this 17 GiB profile beside
-the normal 8 GiB Colima profile; stop the normal profile first after confirming
-it has no active work.
+administration access. The proof VM is capped at 8 GiB and should run only for
+an accepted release head. Stop it immediately after collecting the final
+evidence; it is not a development service.
 
 From a clean trusted CodeStory checkout:
 
@@ -49,35 +80,38 @@ Provisioning is idempotent. It:
 
 - creates the dedicated VM and service account;
 - disables Colima's default writable host-home mount;
-- leaves the caller's active Docker context unchanged;
+- leaves the caller's active container context unchanged;
 - verifies the checksum-pinned Colima base image before VM creation;
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
+- uses the containerd runtime already owned by the checksum-pinned VM image;
+- binds the runner workspace from the dedicated 80 GiB data disk only after
+  Colima reports that disk ready, and verifies the single mount before accepting
+  evidence;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
-- streams a checksum-verified BGE model from the standard CodeStory cache when
-  present, otherwise downloads it, then verifies the contract checksum again
-  inside the guest;
-- prepares a source-backed `serde_json` drill at an exact commit;
-- pulls the digest-pinned ARM64 Qdrant and llama-server images;
+- verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and
+  linked embedding engine without provisioning either one;
+- prepares a source-backed `serde_json` drill at an exact commit and installs
+  the checksum-bound project manifest that excludes its intentionally malformed
+  compiler UI fixtures from the valid-source corpus;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
-- keeps Cargo, Rust, temp, XDG, CodeStory, model, drill, work, and artifact state
-  under the proof-owned volume.
+- keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
+  under the proof-owned volume. The Actions service receives a dedicated
+  runner-owned `XDG_RUNTIME_DIR` with mode `0700`; verification rejects a
+  missing, linked, broadly accessible, or differently owned runtime authority.
 
-The tracked CodeStory source used by provisioning checks is streamed into the
+The runner workspace is mounted by the owned host lifecycle instead of guest
+`fstab`; this avoids boot-order races between the root disk and Colima's data
+disk. The tracked CodeStory source used by provisioning checks is streamed into the
 guest over SSH. It replaces the previous validation tree atomically enough for
 the stopped runner, so untracked or modified validation files cannot survive a
 provisioning pass. No source or tool is executed through a host mount. `verify`
 prints the guest mount table and fails if it finds a host-backed VirtioFS, 9p,
 SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is also a hard
-failure. Provision, verify, start, and the workflow preflight also require the
-dedicated VM to have no running containers. CodeStory sidecars may start only
-after that preflight as part of the active evidence job.
-
-The model seed also crosses SSH rather than a host mount. Its default source is
-`~/Library/Caches/dev.codestory.codestory/retrieval/models/`; set
-`CODESTORY_RELEASE_EVIDENCE_MODEL_SEED` to an alternate exact file. The host
-and guest both reject bytes that do not match the machine contract.
+failure. The exact candidate under test owns model materialization, digest
+verification, and accelerator selection. Provisioning supplies no model or
+backend asset.
 
 Provisioning first proves that an existing owned runner is idle. It requests a
 GitHub registration token only when the runner is unconfigured, checks the
@@ -101,12 +135,12 @@ scripts/codestory-release-evidence-runner.sh verify
 ```
 
 After a host restart, use the script's `start` command rather than `colima
-start`. Require `verify` to show the runner online, both pinned images present
-as Linux ARM64, the exact model checksum, the clean drill commit, a current-boot
+start`. Require `verify` to show the runner online, the exact model checksum,
+the clean drill commit, a current-boot
 host attestation, the contract-derived fingerprint, and sufficient guest
 capacity.
 
-When intentionally changing the toolchain, runner, model, sidecar image, VM
+When intentionally changing the toolchain, runner, model, VM
 shape, or drill commit, update the pinned constants in the provisioning script
 and create a new approved baseline. Do not compare results across the identity
 change as though they came from the same machine profile.
@@ -141,9 +175,8 @@ evidence with:
 
 | Input | Value |
 | --- | --- |
-| `profile` | `codestory-release-evidence-linux-arm64-v1` |
+| `profile` | `codestory-release-evidence-linux-arm64-v2` |
 | `drill_manifest` | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
-| `embedding_model_dir` | `/srv/codestory-release-evidence/models` |
 | `source_run_id` | empty for measurement; a rejected run ID only for exact-artifact re-evaluation |
 
 If a measured candidate is rejected and receives an exact, expiring approval,
@@ -152,6 +185,15 @@ manually dispatch `release.yml` on the same SHA and version with
 artifact and evaluates it again without producing new measurements. Before the
 download, it requires a failed trusted evidence workflow from this repository
 whose head is the exact evidence SHA.
+
+The approval document uses schema v3, but none of the current full-product gate
+metrics is waivable. A model exception is admissible only through separately
+trusted model-microbenchmark evidence: more than 5% regression over at least
+three repeats, exact candidate and baseline hashes, the selected release key,
+passing same-run full-product answer-quality evidence, owner, rationale,
+rollback, and an expiry no more than 14 days after approval. The next release
+key invalidates it sooner. An accepted model exception remains
+`pass_with_exception`; approval never turns a regression into a plain pass.
 
 GitHub does not expose environment-only secrets across a reusable-workflow
 call. Store the short-lived approval as the repository Actions secret
@@ -167,3 +209,45 @@ candidate, approval when supplied, and report files that exist. Runner
 provisioning alone does not establish a baseline, execute the real-repo drill,
 or prove a candidate acceptable. The release remains blocked until the selected
 profile exists as an approved, release-eligible baseline.
+
+## Closeout handoff
+
+Release-evidence output is one input to the exact-head closeout ledger; it is
+not the ledger itself. Each producer supplies one
+`codestory.release-cell-manifest/v1` document for its graph-owned cell. The
+manifest carries the claim evidence row plus its workflow, run, attempt and
+artifact identity. Production cells are emitted only on producer success, and
+each immutable Actions artifact name includes its run attempt. The closeout
+coordinator queries artifact and per-attempt job metadata for the current run,
+selects each graph-owned job's latest execution, and requires that execution to
+be successful before binding the container id, digest, creation window and
+unflattened directory to its manifests. A failed newer execution cannot fall
+back to older evidence; jobs absent from a failed-job rerun may retain their
+last successful attempt. Manifests cannot authenticate themselves. Native
+cells also carry the applicable target, concrete
+host, runtime/native engine and calibration identities. The coordinator
+derives the required inventory from `release-claims.json`, so operators must
+not maintain a separate target checklist or combine multiple hosts into one
+manifest.
+
+First evaluate and retain the `pre_publish` ledger. Package rows preserve the
+archive name, byte count and SHA-256 used by publication. After the GitHub
+release exists, run the `post_publish` phase with that accepted ledger; every
+current package row and published download must match its retained manifest and
+archive digests exactly. Producer and runtime versions bind to the closeout
+version, and platform hosts bind to the package matrix target. Keep the per-cell
+manifests and evaluations with both ledgers. A missing, duplicate, expired, failed,
+cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
+an operator override.
+
+Approved model-microbenchmark exceptions use a separately authenticated
+`codestory.release-closeout-exceptions/v1` input from the selected
+release-evidence artifact. Performance closeout includes the same-run
+`answer_quality` cell and passes that trusted exception map to the claim
+evaluator. Flattened or loose manifest JSON is never a closeout input.
+
+The production pre-publish inventory is 12 cells and intentionally excludes a
+candidate-installed runtime. Publication is the prerequisite for the
+marketplace-catalog-resolved tier. The six installed-runtime cells appear only in the
+30-cell post-publish ledger, while #1221 continues to own the real
+two-session/one-server installed-runtime qualification.

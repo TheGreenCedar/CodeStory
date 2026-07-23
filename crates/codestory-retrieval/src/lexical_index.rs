@@ -136,11 +136,12 @@ pub fn lexical_input_fingerprint(
 ) -> Result<LexicalInputFingerprint> {
     let mut hasher = lexical_documents_hasher();
     let mut file_count = 0_u32;
-    let coverage = scan_lexical_documents(project_root, storage_path, &mut |document| {
-        hash_lexical_document(&mut hasher, document);
-        file_count = file_count.saturating_add(1);
-        Ok(())
-    })?;
+    let coverage =
+        scan_lexical_documents(project_root, storage_path, storage_path, &mut |document| {
+            hash_lexical_document(&mut hasher, document);
+            file_count = file_count.saturating_add(1);
+            Ok(())
+        })?;
     Ok(LexicalInputFingerprint {
         file_count,
         hash: finish_lexical_documents_hash(hasher, &coverage),
@@ -148,14 +149,18 @@ pub fn lexical_input_fingerprint(
     })
 }
 
-pub(crate) fn lexical_source_input(project_root: &Path) -> Result<LexicalSourceInput> {
+pub(crate) fn lexical_source_input(
+    project_root: &Path,
+    storage_path: &Path,
+) -> Result<LexicalSourceInput> {
     let mut hasher = lexical_documents_hasher();
     let mut file_count = 0_u32;
-    let coverage = scan_lexical_documents(project_root, None, &mut |document| {
-        hash_lexical_document(&mut hasher, document);
-        file_count = file_count.saturating_add(1);
-        Ok(())
-    })?;
+    let coverage =
+        scan_lexical_documents(project_root, Some(storage_path), None, &mut |document| {
+            hash_lexical_document(&mut hasher, document);
+            file_count = file_count.saturating_add(1);
+            Ok(())
+        })?;
     Ok(LexicalSourceInput {
         hasher,
         file_count,
@@ -201,7 +206,7 @@ pub fn build_lexical_shard(
             project_id,
             sidecar_input_hash,
             expected,
-            |visit| scan_lexical_documents(project_root, storage_path, visit),
+            |visit| scan_lexical_documents(project_root, storage_path, storage_path, visit),
         )?;
         validate_lexical_database(
             &temp_path,
@@ -578,13 +583,15 @@ where
             coverage,
         };
         if &actual != expected {
-            bail!(
-                "lexical input changed while building shard: expected {} documents with hash {}, collected {} documents with hash {}",
-                expected.file_count,
-                expected.hash,
-                actual.file_count,
-                actual.hash
-            );
+            return Err(crate::index::SidecarInputChanged::new(
+                "lexical shard build",
+                format!(
+                    "{} documents with hash {}",
+                    expected.file_count, expected.hash
+                ),
+                format!("{} documents with hash {}", actual.file_count, actual.hash),
+            )
+            .into());
         }
         let coverage_json = serde_json::to_string(&actual.coverage)?;
         let binding = metadata_binding(
@@ -838,11 +845,20 @@ fn metadata_binding(
 
 fn scan_lexical_documents(
     project_root: &Path,
-    storage_path: Option<&Path>,
+    source_storage_path: Option<&Path>,
+    symbol_storage_path: Option<&Path>,
     visit: &mut dyn FnMut(&LexicalDocument) -> Result<()>,
 ) -> Result<LexicalCoverage> {
-    let workspace = codestory_workspace::WorkspaceManifest::open(project_root.to_path_buf())
-        .context("open workspace for lexical discovery")?;
+    let workspace = match source_storage_path {
+        Some(storage_path) => {
+            codestory_workspace::WorkspaceManifest::open_with_storage_owned_exclusions(
+                project_root.to_path_buf(),
+                storage_path,
+            )
+        }
+        None => codestory_workspace::WorkspaceManifest::open(project_root.to_path_buf()),
+    }
+    .context("open workspace for lexical discovery")?;
     let discovered = workspace
         .source_files()
         .context("discover canonical workspace files for lexical index")?;
@@ -883,7 +899,7 @@ fn scan_lexical_documents(
         })?;
         coverage.indexed_files = coverage.indexed_files.saturating_add(1);
     }
-    scan_symbol_documents(project_root, storage_path, visit)?;
+    scan_symbol_documents(project_root, symbol_storage_path, visit)?;
     Ok(coverage)
 }
 
@@ -1552,7 +1568,7 @@ mod tests {
             .map(|path| lexical_relative_path(project.path(), &path))
             .collect::<std::collections::BTreeSet<_>>();
         let mut actual = std::collections::BTreeSet::new();
-        let coverage = scan_lexical_documents(project.path(), None, &mut |document| {
+        let coverage = scan_lexical_documents(project.path(), None, None, &mut |document| {
             if document.source == LexicalDocumentSource::LexicalSource {
                 actual.insert(document.path.clone());
             }
@@ -1562,6 +1578,74 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(coverage.complete());
+    }
+
+    #[test]
+    fn storage_owned_json_does_not_change_fingerprint_or_shard_materialization() {
+        let project = TempDir::new().expect("project");
+        let storage_path = project.path().join("cache").join("custom-core.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("storage parent");
+        let _storage = Store::open(&storage_path).expect("custom in-worktree store");
+        let sibling = project
+            .path()
+            .join("cache")
+            .join("custom-core.search-generations-user");
+        std::fs::create_dir_all(&sibling).expect("sibling user directory");
+        std::fs::write(
+            sibling.join("user-config.json"),
+            "{\"user_token\":\"admitted_user_json\"}\n",
+        )
+        .expect("user json");
+
+        let before =
+            lexical_input_fingerprint(project.path(), Some(&storage_path)).expect("fingerprint");
+
+        let legacy = codestory_workspace::legacy_search_directory_for_storage(&storage_path);
+        let generations =
+            codestory_workspace::search_generation_directory_for_storage(&storage_path);
+        std::fs::create_dir_all(&legacy).expect("legacy search directory");
+        std::fs::create_dir_all(generations.join("generation-1"))
+            .expect("search generation directory");
+        std::fs::write(
+            legacy.join("meta.json"),
+            "{\"generated_token\":\"legacy_owned_json\"}\n",
+        )
+        .expect("legacy metadata");
+        std::fs::write(
+            generations.join("generation-1").join("meta.json"),
+            "{\"generated_token\":\"generation_owned_json\"}\n",
+        )
+        .expect("generation metadata");
+
+        let after = lexical_input_fingerprint(project.path(), Some(&storage_path))
+            .expect("post-generation fingerprint");
+        assert_eq!(after, before);
+
+        let data = TempDir::new().expect("lexical data");
+        let rebuilt = build_lexical_shard(
+            project.path(),
+            Some(&storage_path),
+            data.path(),
+            "owned-exclusions",
+            &before,
+            "input",
+        )
+        .expect("materialize shard");
+        assert_eq!(rebuilt, before);
+        let shard = shard_dir_for(data.path(), "owned-exclusions");
+        assert!(
+            search_lexical_index(&shard, "input", "generation_owned_json", 8)
+                .expect("search owned token")
+                .is_empty()
+        );
+        assert_eq!(
+            search_lexical_index(&shard, "input", "admitted_user_json", 8)
+                .expect("search user token")
+                .first()
+                .map(|hit| hit.path.as_str()),
+            Some("cache/custom-core.search-generations-user/user-config.json")
+        );
     }
 
     #[test]

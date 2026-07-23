@@ -12,15 +12,17 @@
 
 use anyhow::{Result, bail};
 pub use codestory_contracts::workspace::{
-    BuildMode, IndexedFileRecord, RefreshExecutionPlan, RefreshInfo, RefreshInputs, RefreshMode,
-    RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
+    BuildMode, DEFAULT_SOURCE_FILE_BYTE_CAP, IndexedFileRecord, OVERSIZED_SOURCE_POLICY_VERSION,
+    OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInfo, RefreshInputs,
+    RefreshMode, RefreshPlan, SourceIndexPolicy, StoredFileRecord, StoredFileState,
+    WorkspaceInventory, process_source_index_policy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -30,10 +32,12 @@ mod repository_identity;
 pub use repository_identity::{
     PROJECT_IDENTITY_SCHEMA_VERSION, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV2,
     ProjectIdentityV3, REPOSITORY_IDENTITY_SCHEMA_VERSION, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
-    RepositoryIdentity, RepositoryIdentityV2, SidecarProjectIdentity, cached_project_identity_v2,
-    cached_project_identity_v3, inspect_repository_identity, inspect_repository_identity_v2,
-    project_identity_v2, project_identity_v3, project_identity_v3_from_repository,
-    same_workspace_path, sidecar_project_identity, workspace_id_for_root, workspace_id_v3_for_root,
+    RepositoryIdentity, RepositoryIdentityV2, SidecarProjectIdentity, WorkspacePathIdentity,
+    WorkspacePathLexicalIdentity, cached_project_identity_v2, cached_project_identity_v3,
+    inspect_repository_identity, inspect_repository_identity_v2, project_identity_v2,
+    project_identity_v3, project_identity_v3_from_repository, same_workspace_path,
+    sidecar_project_identity, workspace_file_identity, workspace_id_for_root,
+    workspace_id_v3_for_root, workspace_path_identity, workspace_path_lexical_identity,
 };
 
 /// Source-group language selector used during workspace discovery.
@@ -62,7 +66,12 @@ pub enum Language {
     Html,
     Css,
     Bash,
+    Shell,
     PowerShell,
+    Markdown,
+    Yaml,
+    Toml,
+    Json,
     Svelte,
     Vue,
     Astro,
@@ -154,6 +163,10 @@ pub struct WorkspaceManifest {
     is_synthetic_default: Cell<bool>,
     trusted_source_paths: Cell<bool>,
     members: Vec<PathBuf>,
+    discovery_excluded_files: Vec<PathBuf>,
+    discovery_excluded_directory_roots: Vec<PathBuf>,
+    #[cfg(test)]
+    discovery_exclusion_observation_count: Cell<usize>,
 }
 
 /// Multi-member workspace manifest.
@@ -203,6 +216,15 @@ pub struct WorkspaceFileInventory {
     pub issues: Vec<WorkspaceInventoryIssue>,
 }
 
+/// Complete discovery split into parser candidates and verified policy exclusions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePolicyFileInventory {
+    pub files: Vec<PathBuf>,
+    pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+    pub outcome: WorkspaceInventoryOutcome,
+    pub issues: Vec<WorkspaceInventoryIssue>,
+}
+
 /// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRefreshOutcome {
@@ -211,11 +233,45 @@ pub struct WorkspaceRefreshOutcome {
     pub inventory_issues: Vec<WorkspaceInventoryIssue>,
 }
 
+/// Refresh plan paired with the complete exclusion set for the same discovery pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePolicyRefreshOutcome {
+    pub refresh: WorkspaceRefreshOutcome,
+    pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+}
+
 #[derive(Debug, Clone)]
 struct CompiledExcludePattern {
     raw: String,
     patterns: Vec<glob::Pattern>,
     match_absolute: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedDiscoveryDirectoryRoot {
+    containment_paths: Vec<WorkspacePathLexicalIdentity>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservedDiscoveryExclusions {
+    file_identities: HashSet<WorkspacePathIdentity>,
+    file_lexical_paths: HashSet<WorkspacePathLexicalIdentity>,
+    directory_roots: Vec<ObservedDiscoveryDirectoryRoot>,
+}
+
+struct DiscoveryPathFilter<'a> {
+    workspace_root: &'a Path,
+    source_root: &'a Path,
+    filter_by_language: bool,
+    language: &'a Language,
+    exclude_patterns: &'a [CompiledExcludePattern],
+    discovery_exclusions: &'a ObservedDiscoveryExclusions,
+}
+
+#[derive(Debug)]
+struct DiscoveryExclusionObservationError {
+    path: PathBuf,
+    error: std::io::Error,
 }
 
 impl WorkspaceManifest {
@@ -230,6 +286,10 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(true),
             members: Vec::new(),
+            discovery_excluded_files: Vec::new(),
+            discovery_excluded_directory_roots: Vec::new(),
+            #[cfg(test)]
+            discovery_exclusion_observation_count: Cell::new(0),
         }
     }
 
@@ -243,6 +303,10 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(false),
             members: Vec::new(),
+            discovery_excluded_files: Vec::new(),
+            discovery_excluded_directory_roots: Vec::new(),
+            #[cfg(test)]
+            discovery_exclusion_observation_count: Cell::new(0),
         })
     }
 
@@ -269,6 +333,10 @@ impl WorkspaceManifest {
             is_synthetic_default: Cell::new(false),
             trusted_source_paths: Cell::new(false),
             members: Vec::new(),
+            discovery_excluded_files: Vec::new(),
+            discovery_excluded_directory_roots: Vec::new(),
+            #[cfg(test)]
+            discovery_exclusion_observation_count: Cell::new(0),
         }
     }
 
@@ -317,6 +385,25 @@ impl WorkspaceManifest {
         }
     }
 
+    /// Open a workspace while excluding the exact CodeStory core/search
+    /// artifacts owned by `storage_path`.
+    pub fn open_with_storage_owned_exclusions(
+        root_path: PathBuf,
+        storage_path: &Path,
+    ) -> Result<Self> {
+        let mut manifest = Self::open(root_path)?;
+        manifest.exclude_discovery_files([
+            storage_path.to_path_buf(),
+            storage_path.with_extension("db-wal"),
+            storage_path.with_extension("db-shm"),
+        ]);
+        manifest.exclude_discovery_directory_roots([
+            legacy_search_directory_for_storage(storage_path),
+            search_generation_directory_for_storage(storage_path),
+        ]);
+        Ok(manifest)
+    }
+
     fn load_workspace_members(root_path: PathBuf, manifest_path: PathBuf) -> Result<Self> {
         let content = fs::read_to_string(&manifest_path)?;
         let workspace: WorkspaceMembersManifest = serde_json::from_str(&content)?;
@@ -357,6 +444,27 @@ impl WorkspaceManifest {
     /// Return the effective manifest settings used by discovery.
     pub fn settings(&self) -> &WorkspaceSettings {
         &self.settings
+    }
+
+    /// Exclude caller-owned generated files from source discovery.
+    ///
+    /// These exclusions are runtime-only and are never persisted into a
+    /// project manifest.
+    pub fn exclude_discovery_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.discovery_excluded_files.extend(paths);
+    }
+
+    /// Exclude caller-owned generated directory trees from source discovery.
+    ///
+    /// These exclusions are runtime-only and are never persisted into a
+    /// project manifest.
+    pub fn exclude_discovery_directory_roots(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        self.discovery_excluded_directory_roots.extend(roots);
+    }
+
+    #[cfg(test)]
+    fn discovery_exclusion_observation_count(&self) -> usize {
+        self.discovery_exclusion_observation_count.get()
     }
 
     /// Return the manifest path that defines the workspace root.
@@ -402,6 +510,34 @@ impl WorkspaceManifest {
         WorkspaceDiscovery.source_inventory(self)
     }
 
+    /// Discover parser candidates and content-verified oversized policy exclusions.
+    pub fn source_inventory_with_oversized_policy(&self) -> Result<WorkspacePolicyFileInventory> {
+        self.source_inventory_with_policy(process_source_index_policy())
+    }
+
+    /// Discover candidates using one caller-owned immutable source-index policy.
+    pub fn source_inventory_with_policy(
+        &self,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyFileInventory> {
+        WorkspaceDiscovery.source_inventory_with_policy_inner(
+            self,
+            policy.byte_cap,
+            &policy.policy_version,
+            policy.structural_unit_cap,
+            None,
+        )
+    }
+
+    /// Re-read every classified exclusion at the publication fence.
+    pub fn revalidate_source_policy_exclusions(
+        &self,
+        candidates: &[OversizedSourceExclusionCandidate],
+        policy: &SourceIndexPolicy,
+    ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
+        WorkspaceDiscovery.revalidate_source_policy_exclusions(self, candidates, policy)
+    }
+
     /// Build a full-refresh plan that indexes every currently discovered file.
     pub fn full_refresh_plan(&self) -> Result<RefreshPlan> {
         Ok(RefreshPlan {
@@ -436,6 +572,51 @@ impl WorkspaceManifest {
         WorkspaceDiscovery.build_refresh_outcome(self, inputs)
     }
 
+    /// Build a refresh plan that removes verified oversized sources before parser scheduling.
+    pub fn build_execution_outcome_with_oversized_policy(
+        &self,
+        inputs: &RefreshInputs,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        self.build_execution_outcome_with_policy(inputs, process_source_index_policy())
+    }
+
+    /// Build a refresh outcome using one caller-owned immutable source-index policy.
+    pub fn build_execution_outcome_with_policy(
+        &self,
+        inputs: &RefreshInputs,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        WorkspaceDiscovery.build_refresh_outcome_with_index_policy(self, inputs, policy)
+    }
+
+    /// Build a policy-aware refresh outcome with the ordinary current-file discovery bound.
+    pub fn build_execution_outcome_bounded_with_oversized_policy(
+        &self,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        self.build_execution_outcome_bounded_with_policy(
+            inputs,
+            max_current_files,
+            process_source_index_policy(),
+        )
+    }
+
+    /// Build a bounded refresh outcome using one caller-owned immutable policy.
+    pub fn build_execution_outcome_bounded_with_policy(
+        &self,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        WorkspaceDiscovery.build_refresh_outcome_bounded_with_index_policy(
+            self,
+            inputs,
+            max_current_files,
+            policy,
+        )
+    }
+
     /// Build an incremental refresh plan with a current-file discovery bound.
     ///
     /// Returns `Ok(None)` when discovery exceeds `max_current_files`.
@@ -455,6 +636,25 @@ impl WorkspaceManifest {
     ) -> Result<WorkspaceRefreshOutcome> {
         WorkspaceDiscovery.build_refresh_outcome_inner(self, inputs, Some(max_current_files))
     }
+}
+
+/// Legacy mutable search directory associated with one core database.
+pub fn legacy_search_directory_for_storage(storage_path: &Path) -> PathBuf {
+    storage_owned_sibling_path(storage_path, "search")
+}
+
+/// Immutable search-generation directory associated with one core database.
+pub fn search_generation_directory_for_storage(storage_path: &Path) -> PathBuf {
+    storage_owned_sibling_path(storage_path, "search-generations")
+}
+
+fn storage_owned_sibling_path(storage_path: &Path, suffix: &str) -> PathBuf {
+    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory");
+    parent.join(format!("{stem}.{suffix}"))
 }
 
 impl WorkspaceDiscovery {
@@ -488,6 +688,167 @@ impl WorkspaceDiscovery {
         self.source_inventory_inner(manifest, None)
     }
 
+    /// Classify oversized sources only after complete discovery and stable content hashing.
+    pub fn source_inventory_with_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        byte_cap: u64,
+        policy_version: &str,
+    ) -> Result<WorkspacePolicyFileInventory> {
+        self.source_inventory_with_policy_inner(
+            manifest,
+            byte_cap,
+            policy_version,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            None,
+        )
+    }
+
+    /// Verify that classified exclusions still name the same stable bytes at publication time.
+    pub fn revalidate_source_policy_exclusions(
+        &self,
+        manifest: &WorkspaceManifest,
+        candidates: &[OversizedSourceExclusionCandidate],
+        policy: &SourceIndexPolicy,
+    ) -> Result<Vec<OversizedSourceExclusionCandidate>> {
+        if policy.byte_cap == 0
+            || policy.structural_unit_cap == 0
+            || policy.policy_version.trim().is_empty()
+        {
+            bail!("source index policy requires non-zero caps and a non-empty version");
+        }
+        let root = workspace_root(manifest);
+        let mut verified = candidates.to_vec();
+        verified.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        let mut previous_path: Option<&str> = None;
+        for candidate in &verified {
+            if candidate.policy_version != policy.policy_version
+                || candidate.byte_cap != policy.byte_cap
+                || candidate.structural_unit_cap != policy.structural_unit_cap
+                || previous_path == Some(candidate.normalized_path.as_str())
+            {
+                bail!(
+                    "source policy exclusion `{}` does not match the active policy",
+                    candidate.normalized_path
+                );
+            }
+            previous_path = Some(candidate.normalized_path.as_str());
+            let path = root.join(&candidate.normalized_path);
+            let normalized_path = normalized_policy_path(&root, &path)?;
+            if normalized_path != candidate.normalized_path {
+                bail!(
+                    "source policy exclusion path changed from `{}` to `{normalized_path}`",
+                    candidate.normalized_path
+                );
+            }
+            let (content_hash, observed_size) = current_content_identity(&path)?;
+            let byte_bound = observed_size > policy.byte_cap && candidate.observed_unit_count == 0;
+            let unit_bound = candidate.observed_unit_count > policy.structural_unit_cap
+                && observed_size <= policy.byte_cap;
+            if content_hash != candidate.content_hash
+                || observed_size != candidate.observed_size
+                || !(byte_bound || unit_bound)
+            {
+                bail!(
+                    "source policy exclusion `{}` changed before publication",
+                    candidate.normalized_path
+                );
+            }
+        }
+        Ok(verified)
+    }
+
+    fn source_inventory_with_policy_inner(
+        &self,
+        manifest: &WorkspaceManifest,
+        byte_cap: u64,
+        policy_version: &str,
+        structural_unit_cap: u64,
+        max_files: Option<usize>,
+    ) -> Result<WorkspacePolicyFileInventory> {
+        if byte_cap == 0 || structural_unit_cap == 0 || policy_version.trim().is_empty() {
+            bail!("bounded source policy requires non-zero caps and a non-empty version");
+        }
+        let inventory = self.source_inventory_inner(manifest, max_files)?;
+        if !inventory.outcome.is_complete() {
+            return Ok(WorkspacePolicyFileInventory {
+                files: inventory.files,
+                policy_exclusions: Vec::new(),
+                outcome: inventory.outcome,
+                issues: inventory.issues,
+            });
+        }
+
+        let root = workspace_root(manifest);
+        let mut files = Vec::with_capacity(inventory.files.len());
+        let mut policy_exclusions = Vec::new();
+        let mut issues = inventory.issues;
+        for path in inventory.files {
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: format!("failed to inspect policy candidate: {error}"),
+                    });
+                    files.push(path);
+                    continue;
+                }
+            };
+            if metadata.len() <= byte_cap {
+                files.push(path);
+                continue;
+            }
+            let normalized_path = match normalized_policy_path(&root, &path) {
+                Ok(path) => path,
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    });
+                    files.push(path);
+                    continue;
+                }
+            };
+            let (content_hash, observed_size) = match current_content_identity(&path) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: path.clone(),
+                        message: format!("failed to verify oversized policy candidate: {error}"),
+                    });
+                    files.push(path);
+                    continue;
+                }
+            };
+            if observed_size <= byte_cap {
+                files.push(path);
+                continue;
+            }
+            policy_exclusions.push(OversizedSourceExclusionCandidate {
+                normalized_path,
+                content_hash,
+                observed_size,
+                observed_unit_count: 0,
+                policy_version: policy_version.to_string(),
+                byte_cap,
+                structural_unit_cap,
+            });
+        }
+        policy_exclusions.sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+        let outcome = if issues.is_empty() {
+            WorkspaceInventoryOutcome::Complete
+        } else {
+            WorkspaceInventoryOutcome::Partial
+        };
+        Ok(WorkspacePolicyFileInventory {
+            files,
+            policy_exclusions,
+            outcome,
+            issues,
+        })
+    }
+
     fn source_inventory_inner(
         &self,
         manifest: &WorkspaceManifest,
@@ -498,12 +859,47 @@ impl WorkspaceDiscovery {
         let mut seen = HashSet::new();
         let mut issues = Vec::new();
         let mut inspected_source_roots = 0usize;
+        let discovery_exclusions = match observe_discovery_exclusions(manifest) {
+            Ok(exclusions) => exclusions,
+            Err(error) => {
+                return Ok(WorkspaceFileInventory {
+                    files: Vec::new(),
+                    outcome: WorkspaceInventoryOutcome::Unreadable,
+                    issues: vec![WorkspaceInventoryIssue {
+                        path: error.path,
+                        message: format!(
+                            "failed to observe caller-owned discovery exclusion: {}",
+                            error.error
+                        ),
+                    }],
+                });
+            }
+        };
 
         for group in &manifest.settings.source_groups {
             let exclude_patterns = compile_exclude_patterns(&group.exclude_patterns)?;
             let filter_by_language = manifest.should_filter_source_group_language();
             for source_path in &group.source_paths {
                 let full_path = resolve_manifest_source_path(manifest, source_path)?;
+                if discovery_exclusions.directory_contains(&full_path) {
+                    continue;
+                }
+                match discovery_exclusions.file_is_excluded(&full_path) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: full_path,
+                            message: format!(
+                                "failed to observe source identity against caller-owned exclusions: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                if workspace_structural_source_exclusion(&workspace_root, &full_path).is_some() {
+                    continue;
+                }
                 let source_root = discovery_root(&full_path);
 
                 let metadata = match fs::metadata(&full_path) {
@@ -526,15 +922,15 @@ impl WorkspaceDiscovery {
                 inspected_source_roots += 1;
 
                 if metadata.is_file() {
-                    if !should_include_discovered_path(
-                        &full_path,
-                        false,
-                        &workspace_root,
-                        &source_root,
+                    let path_filter = DiscoveryPathFilter {
+                        workspace_root: &workspace_root,
+                        source_root: &source_root,
                         filter_by_language,
-                        &group.language,
-                        &exclude_patterns,
-                    ) {
+                        language: &group.language,
+                        exclude_patterns: &exclude_patterns,
+                        discovery_exclusions: &discovery_exclusions,
+                    };
+                    if !should_include_discovered_path(&full_path, false, &path_filter) {
                         continue;
                     }
                     if !push_discovered_file_within_limit(
@@ -560,18 +956,19 @@ impl WorkspaceDiscovery {
                     let workspace_root_for_filter = workspace_root.clone();
                     let source_root_for_filter = source_root.clone();
                     let exclude_patterns = exclude_patterns.clone();
+                    let filter_discovery_exclusions = discovery_exclusions.clone();
                     let language = group.language.clone();
                     builder.filter_entry(move |entry| {
                         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-                        should_include_discovered_path(
-                            entry.path(),
-                            is_dir,
-                            &workspace_root_for_filter,
-                            &source_root_for_filter,
+                        let path_filter = DiscoveryPathFilter {
+                            workspace_root: &workspace_root_for_filter,
+                            source_root: &source_root_for_filter,
                             filter_by_language,
-                            &language,
-                            &exclude_patterns,
-                        )
+                            language: &language,
+                            exclude_patterns: &exclude_patterns,
+                            discovery_exclusions: &filter_discovery_exclusions,
+                        };
+                        should_include_discovered_path(entry.path(), is_dir, &path_filter)
                     });
                     for entry in builder.build() {
                         let entry = match entry {
@@ -586,6 +983,19 @@ impl WorkspaceDiscovery {
                         }
                         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                             continue;
+                        }
+                        match discovery_exclusions.file_is_excluded(entry.path()) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                issues.push(WorkspaceInventoryIssue {
+                                    path: entry.path().to_path_buf(),
+                                    message: format!(
+                                        "failed to observe source identity against caller-owned exclusions: {error}"
+                                    ),
+                                });
+                                continue;
+                            }
                         }
                         if !push_discovered_file_within_limit(
                             &mut all_files,
@@ -640,6 +1050,164 @@ impl WorkspaceDiscovery {
         self.build_refresh_outcome_inner(manifest, inputs, None)
     }
 
+    /// Build one refresh plan and complete exclusion set from the same inventory pass.
+    pub fn build_refresh_outcome_with_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        byte_cap: u64,
+        policy_version: &str,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let inventory = self.source_inventory_with_policy(manifest, byte_cap, policy_version)?;
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
+    /// Build one refresh plan using the complete caller-owned byte/unit policy.
+    pub fn build_refresh_outcome_with_index_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let mut inventory = self.source_inventory_with_policy_inner(
+            manifest,
+            policy.byte_cap,
+            &policy.policy_version,
+            policy.structural_unit_cap,
+            None,
+        )?;
+        self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
+    /// Build a bounded policy-aware refresh outcome without losing completeness evidence.
+    pub fn build_refresh_outcome_bounded_with_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+        byte_cap: u64,
+        policy_version: &str,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let inventory = self.source_inventory_with_policy_inner(
+            manifest,
+            byte_cap,
+            policy_version,
+            codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            Some(max_current_files),
+        )?;
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
+    /// Build a bounded refresh using the complete caller-owned byte/unit policy.
+    pub fn build_refresh_outcome_bounded_with_index_policy(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+        policy: &SourceIndexPolicy,
+    ) -> Result<WorkspacePolicyRefreshOutcome> {
+        let mut inventory = self.source_inventory_with_policy_inner(
+            manifest,
+            policy.byte_cap,
+            &policy.policy_version,
+            policy.structural_unit_cap,
+            Some(max_current_files),
+        )?;
+        self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
+        let refresh = build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )?;
+        Ok(WorkspacePolicyRefreshOutcome {
+            refresh,
+            policy_exclusions: inventory.policy_exclusions,
+        })
+    }
+
+    fn carry_forward_verified_policy_exclusions(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+        policy: &SourceIndexPolicy,
+        inventory: &mut WorkspacePolicyFileInventory,
+    ) {
+        if !inventory.outcome.is_complete() || inputs.policy_exclusions.is_empty() {
+            return;
+        }
+
+        let root = workspace_root(manifest);
+        let mut current_policy_paths = inventory
+            .policy_exclusions
+            .iter()
+            .map(|candidate| candidate.normalized_path.clone())
+            .collect::<HashSet<_>>();
+        for candidate in &inputs.policy_exclusions {
+            if current_policy_paths.contains(&candidate.normalized_path)
+                || candidate.observed_unit_count == 0
+                || self
+                    .revalidate_source_policy_exclusions(
+                        manifest,
+                        std::slice::from_ref(candidate),
+                        policy,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+
+            let candidate_key =
+                normalized_compare_key(&root, &root.join(&candidate.normalized_path));
+            let Some(position) = inventory
+                .files
+                .iter()
+                .position(|path| normalized_compare_key(&root, path) == candidate_key)
+            else {
+                continue;
+            };
+            inventory.files.swap_remove(position);
+            current_policy_paths.insert(candidate.normalized_path.clone());
+            inventory.policy_exclusions.push(candidate.clone());
+        }
+        inventory.files.sort();
+        inventory
+            .policy_exclusions
+            .sort_by(|left, right| left.normalized_path.cmp(&right.normalized_path));
+    }
+
     /// Compare current discovery with stored inventory unless discovery exceeds
     /// `max_current_files`.
     pub fn build_refresh_plan_bounded(
@@ -664,56 +1232,87 @@ impl WorkspaceDiscovery {
         max_current_files: Option<usize>,
     ) -> Result<WorkspaceRefreshOutcome> {
         let inventory = self.source_inventory_inner(manifest, max_current_files)?;
-        let current_files = inventory.files;
-        let workspace_root = manifest.root_dir();
-        let stored_map = inputs.inventory_map();
-        let normalized_stored_map = stored_map
-            .into_values()
-            .map(|file| (normalized_compare_key(&workspace_root, &file.path), file))
-            .collect::<HashMap<_, _>>();
-
-        let mut files_to_index = Vec::new();
-        let mut files_to_remove = Vec::new();
-        let mut existing_file_ids = HashMap::new();
-        let mut current_file_keys = HashSet::with_capacity(current_files.len());
-
-        for path in current_files {
-            let normalized_key = normalized_compare_key(&workspace_root, &path);
-            current_file_keys.insert(normalized_key.clone());
-            let needs_index = match normalized_stored_map.get(&normalized_key) {
-                Some(file) => {
-                    existing_file_ids.insert(path.clone(), file.id);
-                    stored_file_needs_index(&path, file)
-                }
-                None => true,
-            };
-
-            if needs_index {
-                files_to_index.push(path);
-            }
-        }
-
-        if inventory.outcome.is_complete() {
-            for (normalized_key, stored) in normalized_stored_map {
-                if !current_file_keys.contains(&normalized_key) {
-                    files_to_remove.push(stored.id);
-                }
-            }
-        }
-        files_to_remove.sort_unstable();
-        files_to_remove.dedup();
-
-        Ok(WorkspaceRefreshOutcome {
-            plan: RefreshPlan {
-                mode: RefreshMode::Incremental,
-                files_to_index,
-                files_to_remove,
-                existing_file_ids,
-            },
-            inventory_outcome: inventory.outcome,
-            inventory_issues: inventory.issues,
-        })
+        build_refresh_outcome_from_inventory(
+            manifest,
+            inputs,
+            inventory.files,
+            inventory.outcome,
+            inventory.issues,
+        )
     }
+}
+
+fn build_refresh_outcome_from_inventory(
+    manifest: &WorkspaceManifest,
+    inputs: &RefreshInputs,
+    current_files: Vec<PathBuf>,
+    inventory_outcome: WorkspaceInventoryOutcome,
+    inventory_issues: Vec<WorkspaceInventoryIssue>,
+) -> Result<WorkspaceRefreshOutcome> {
+    let workspace_root = manifest.root_dir();
+    let stored_map = inputs.inventory_map();
+    let normalized_stored_map = stored_map
+        .into_values()
+        .map(|file| (normalized_compare_key(&workspace_root, &file.path), file))
+        .collect::<HashMap<_, _>>();
+
+    let mut files_to_index = Vec::new();
+    let mut files_to_remove = Vec::new();
+    let mut existing_file_ids = HashMap::new();
+    let mut current_file_keys = HashSet::with_capacity(current_files.len());
+
+    for path in current_files {
+        let normalized_key = normalized_compare_key(&workspace_root, &path);
+        current_file_keys.insert(normalized_key.clone());
+        let needs_index = match normalized_stored_map.get(&normalized_key) {
+            Some(file) => {
+                existing_file_ids.insert(path.clone(), file.id);
+                stored_file_needs_index(&path, file)
+            }
+            None => true,
+        };
+
+        if needs_index {
+            files_to_index.push(path);
+        }
+    }
+
+    if inventory_outcome.is_complete() {
+        for (normalized_key, stored) in normalized_stored_map {
+            if !current_file_keys.contains(&normalized_key) {
+                files_to_remove.push(stored.id);
+            }
+        }
+    }
+    files_to_remove.sort_unstable();
+    files_to_remove.dedup();
+
+    Ok(WorkspaceRefreshOutcome {
+        plan: RefreshPlan {
+            mode: RefreshMode::Incremental,
+            files_to_index,
+            files_to_remove,
+            existing_file_ids,
+        },
+        inventory_outcome,
+        inventory_issues,
+    })
+}
+
+fn normalized_policy_path(workspace_root: &Path, path: &Path) -> Result<String> {
+    let relative = workspace_relative_path(workspace_root, path)
+        .ok_or_else(|| anyhow::anyhow!("oversized policy candidate escapes the workspace root"))?;
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("oversized policy candidate path is not valid UTF-8"))?
+        .replace('\\', "/");
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative.split('/').any(|component| component == "..")
+    {
+        bail!("oversized policy candidate has an invalid normalized path");
+    }
+    Ok(relative)
 }
 
 fn record_walk_error(
@@ -781,6 +1380,10 @@ fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
 }
 
 fn current_content_hash(path: &Path) -> Result<String> {
+    current_content_identity(path).map(|(content_hash, _)| content_hash)
+}
+
+fn current_content_identity(path: &Path) -> Result<(String, u64)> {
     let mut file = fs::File::open(path)?;
     let before = file.metadata()?;
     let mut hasher = Sha256::new();
@@ -796,7 +1399,7 @@ fn current_content_hash(path: &Path) -> Result<String> {
     if before.len() != after.len() || before.modified()? != after.modified()? {
         bail!("source metadata changed while hashing {}", path.display());
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok((format!("{:x}", hasher.finalize()), before.len()))
 }
 
 fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
@@ -884,28 +1487,170 @@ fn discovery_root(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| normalize_lexical_path(path))
 }
 
+fn observe_discovery_exclusions(
+    manifest: &WorkspaceManifest,
+) -> std::result::Result<ObservedDiscoveryExclusions, DiscoveryExclusionObservationError> {
+    #[cfg(test)]
+    manifest.discovery_exclusion_observation_count.set(0);
+
+    let mut observed = ObservedDiscoveryExclusions::default();
+    for path in &manifest.discovery_excluded_files {
+        #[cfg(test)]
+        manifest
+            .discovery_exclusion_observation_count
+            .set(manifest.discovery_exclusion_observation_count.get() + 1);
+        let identity =
+            workspace_path_identity(path).map_err(|error| DiscoveryExclusionObservationError {
+                path: path.clone(),
+                error,
+            })?;
+        observed.file_identities.insert(identity);
+        observed
+            .file_lexical_paths
+            .insert(workspace_path_lexical_identity(path).map_err(|error| {
+                DiscoveryExclusionObservationError {
+                    path: path.clone(),
+                    error,
+                }
+            })?);
+    }
+    for root in &manifest.discovery_excluded_directory_roots {
+        #[cfg(test)]
+        manifest
+            .discovery_exclusion_observation_count
+            .set(manifest.discovery_exclusion_observation_count.get() + 1);
+        workspace_path_identity(root).map_err(|error| DiscoveryExclusionObservationError {
+            path: root.clone(),
+            error,
+        })?;
+
+        let mut containment_paths =
+            vec![workspace_path_lexical_identity(root).map_err(|error| {
+                DiscoveryExclusionObservationError {
+                    path: root.clone(),
+                    error,
+                }
+            })?];
+        match root.canonicalize() {
+            Ok(canonical) => {
+                let canonical = workspace_path_lexical_identity(&canonical).map_err(|error| {
+                    DiscoveryExclusionObservationError {
+                        path: root.clone(),
+                        error,
+                    }
+                })?;
+                if !containment_paths.contains(&canonical) {
+                    containment_paths.push(canonical);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DiscoveryExclusionObservationError {
+                    path: root.clone(),
+                    error,
+                });
+            }
+        }
+        observed
+            .directory_roots
+            .push(ObservedDiscoveryDirectoryRoot { containment_paths });
+    }
+    Ok(observed)
+}
+
+impl ObservedDiscoveryExclusions {
+    fn file_is_excluded(&self, path: &Path) -> std::io::Result<bool> {
+        if self.file_identities.is_empty() {
+            return Ok(false);
+        }
+        if self
+            .file_lexical_paths
+            .contains(&workspace_path_lexical_identity(path)?)
+        {
+            return Ok(true);
+        }
+        workspace_path_identity(path).map(|identity| self.file_identities.contains(&identity))
+    }
+
+    fn directory_contains(&self, path: &Path) -> bool {
+        if self.directory_roots.is_empty() {
+            return false;
+        }
+        let Ok(lexical) = workspace_path_lexical_identity(path) else {
+            return true;
+        };
+        let canonical = path
+            .canonicalize()
+            .ok()
+            .and_then(|path| workspace_path_lexical_identity(&path).ok());
+        self.directory_contains_observed(&lexical, canonical.as_ref())
+    }
+
+    fn directory_contains_observed(
+        &self,
+        lexical: &WorkspacePathLexicalIdentity,
+        canonical: Option<&WorkspacePathLexicalIdentity>,
+    ) -> bool {
+        self.directory_roots
+            .iter()
+            .flat_map(|root| &root.containment_paths)
+            .any(|root| {
+                lexical.is_within(root) || canonical.is_some_and(|path| path.is_within(root))
+            })
+    }
+}
+
 fn should_include_discovered_path(
     path: &Path,
     is_dir: bool,
-    workspace_root: &Path,
-    source_root: &Path,
-    filter_by_language: bool,
-    language: &Language,
-    exclude_patterns: &[CompiledExcludePattern],
+    filter: &DiscoveryPathFilter<'_>,
 ) -> bool {
     let normalized = normalize_lexical_path(path);
-    if let Ok(canonical) = normalized.canonicalize()
-        && !canonical.starts_with(source_root)
+    let canonical = normalized.canonicalize().ok();
+    let Ok(exclusion_lexical) = workspace_path_lexical_identity(&normalized) else {
+        return false;
+    };
+    let exclusion_canonical = canonical
+        .as_deref()
+        .and_then(|path| workspace_path_lexical_identity(path).ok());
+    if filter
+        .discovery_exclusions
+        .directory_contains_observed(&exclusion_lexical, exclusion_canonical.as_ref())
     {
         return false;
     }
-    if is_excluded_path(&normalized, workspace_root, source_root, exclude_patterns) {
+    if !is_dir
+        && workspace_structural_source_exclusion(filter.workspace_root, &normalized).is_some()
+    {
+        return false;
+    }
+    if canonical.is_some_and(|canonical| !canonical.starts_with(filter.source_root)) {
+        return false;
+    }
+    if is_excluded_path(
+        &normalized,
+        filter.workspace_root,
+        filter.source_root,
+        filter.exclude_patterns,
+    ) {
         return false;
     }
     if is_dir {
         return true;
     }
-    !filter_by_language || matches_source_group_language(&normalized, language)
+    !filter.filter_by_language || matches_source_group_language(&normalized, filter.language)
+}
+
+fn workspace_structural_source_exclusion(
+    workspace_root: &Path,
+    path: &Path,
+) -> Option<&'static str> {
+    let relative = workspace_relative_path(workspace_root, path)?;
+    let relative = relative.to_str()?.replace('\\', "/");
+    if !codestory_contracts::language_support::is_structural_source_path(&relative) {
+        return None;
+    }
+    codestory_contracts::language_support::structural_source_path_exclusion(&relative)
 }
 
 fn is_excluded_path(
@@ -1024,6 +1769,12 @@ fn source_group_accepts_registry_language(language: &Language, registry_language
             | (&Language::Html, "html")
             | (&Language::Css, "css")
             | (&Language::Bash, "bash")
+            | (&Language::Shell, "shell")
+            | (&Language::PowerShell, "powershell")
+            | (&Language::Markdown, "markdown")
+            | (&Language::Yaml, "yaml")
+            | (&Language::Toml, "toml")
+            | (&Language::Json, "json")
     )
 }
 
@@ -1035,7 +1786,6 @@ fn compatibility_extension_matches_source_group(extension: &str, language: &Lang
             | (&Language::CSharp, "cshtml")
             | (&Language::Lua, "lua")
             | (&Language::Css, "scss" | "sass" | "less")
-            | (&Language::PowerShell, "ps1" | "psm1")
             | (&Language::Svelte, "svelte")
             | (&Language::Vue, "vue")
             | (&Language::Astro, "astro")
@@ -1095,6 +1845,97 @@ pub fn workspace_relative_path(workspace_root: &Path, path: &Path) -> Option<Pat
         .map(Path::to_path_buf)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectRelativePathResolution {
+    Existing {
+        absolute: PathBuf,
+        relative: PathBuf,
+    },
+    Missing {
+        absolute: PathBuf,
+        relative: PathBuf,
+    },
+    NotFile {
+        absolute: PathBuf,
+        relative: PathBuf,
+    },
+    OutOfProject,
+}
+
+/// Resolve an exact path against one project using the workspace's native
+/// containment rules.
+///
+/// Existing paths are checked after filesystem resolution so a symlink cannot
+/// turn an apparently project-relative spelling into an outside target.
+/// Missing paths use the operation-scoped native lexical identity contract.
+pub fn resolve_project_relative_path(
+    workspace_root: &Path,
+    requested: &Path,
+) -> io::Result<ProjectRelativePathResolution> {
+    if requested.as_os_str().is_empty() {
+        return Ok(ProjectRelativePathResolution::OutOfProject);
+    }
+    let root = normalize_lexical_path(workspace_root);
+    let candidate = normalize_lexical_path(&if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    });
+    let Some(relative) = workspace_relative_path(&root, &candidate) else {
+        return Ok(ProjectRelativePathResolution::OutOfProject);
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(ProjectRelativePathResolution::NotFile {
+            absolute: candidate,
+            relative,
+        });
+    }
+
+    match fs::metadata(&candidate) {
+        Ok(metadata) => {
+            let resolved = candidate.canonicalize()?;
+            let resolved_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if workspace_relative_path(&resolved_root, &resolved).is_none() {
+                return Ok(ProjectRelativePathResolution::OutOfProject);
+            }
+            if metadata.is_file() {
+                Ok(ProjectRelativePathResolution::Existing {
+                    absolute: candidate,
+                    relative,
+                })
+            } else {
+                Ok(ProjectRelativePathResolution::NotFile {
+                    absolute: candidate,
+                    relative,
+                })
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let resolved_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let mut ancestor = candidate.parent();
+            while let Some(path) = ancestor {
+                match path.canonicalize() {
+                    Ok(resolved) => {
+                        if workspace_relative_path(&resolved_root, &resolved).is_none() {
+                            return Ok(ProjectRelativePathResolution::OutOfProject);
+                        }
+                        break;
+                    }
+                    Err(ancestor_error) if ancestor_error.kind() == io::ErrorKind::NotFound => {
+                        ancestor = path.parent();
+                    }
+                    Err(ancestor_error) => return Err(ancestor_error),
+                }
+            }
+            Ok(ProjectRelativePathResolution::Missing {
+                absolute: candidate,
+                relative,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn normalize_path_key(path: &Path) -> String {
     #[cfg(windows)]
     {
@@ -1133,6 +1974,113 @@ mod tests {
     use std::io;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn exact_project_path_resolution_distinguishes_existing_missing_and_outside() -> Result<()> {
+        let project = tempdir()?;
+        let source = project.path().join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "pub fn exact() {}\n")?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("src/./lib.rs"))?,
+            ProjectRelativePathResolution::Existing {
+                absolute: source.clone(),
+                relative: PathBuf::from("src/lib.rs"),
+            }
+        );
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("src/missing.rs"))?,
+            ProjectRelativePathResolution::Missing {
+                absolute: project.path().join("src").join("missing.rs"),
+                relative: PathBuf::from("src/missing.rs"),
+            }
+        );
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("../outside.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_project_path_resolution_rejects_outside_symlink_targets() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir()?;
+        let outside = tempdir()?;
+        let target = outside.path().join("target.rs");
+        fs::write(&target, "pub fn outside() {}\n")?;
+        let link = project.path().join("inside.rs");
+        symlink(&target, &link)?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("inside.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_leaf_beneath_outside_symlink_is_out_of_project() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir()?;
+        let outside = tempdir()?;
+        let link = project.path().join("linked-out");
+        symlink(outside.path(), &link)?;
+
+        assert_eq!(
+            resolve_project_relative_path(project.path(), Path::new("linked-out/missing.rs"))?,
+            ProjectRelativePathResolution::OutOfProject
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_project_path_resolution_accepts_a_native_project_alias() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempdir()?;
+        let project = parent.path().join("project");
+        let alias = parent.path().join("project-alias");
+        let source = project.join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "pub fn exact() {}\n")?;
+        symlink(&project, &alias)?;
+
+        assert_eq!(
+            resolve_project_relative_path(&alias, Path::new("src/lib.rs"))?,
+            ProjectRelativePathResolution::Existing {
+                absolute: alias.join("src").join("lib.rs"),
+                relative: PathBuf::from("src/lib.rs"),
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_project_path_resolution_uses_windows_native_alias_identity() -> Result<()> {
+        let parent = tempdir()?;
+        let project = parent.path().join("CodeStory");
+        let source = project.join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(&source, "pub fn exact() {}\n")?;
+        let alias = parent.path().join("codestory").join("SRC").join("LIB.RS");
+
+        assert_eq!(
+            resolve_project_relative_path(&project, &alias)?,
+            ProjectRelativePathResolution::Existing {
+                absolute: alias,
+                relative: PathBuf::from("SRC").join("LIB.RS"),
+            }
+        );
+        Ok(())
+    }
 
     fn write_repo_manifest(root: &Path, source_paths: Vec<PathBuf>) -> Result<()> {
         let settings = WorkspaceSettings {
@@ -1177,6 +2125,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
         )?;
@@ -1184,6 +2133,226 @@ mod tests {
         assert_eq!(plan.mode, RefreshMode::Incremental);
         assert_eq!(plan.files_to_index, vec![file]);
         assert!(plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn structural_exclusion_uses_only_workspace_relative_descendants() -> Result<()> {
+        let temp = tempdir()?;
+        for ancestor in ["build", "target", "vendor", "secrets"] {
+            let root = temp.path().join(ancestor).join("repo");
+            fs::create_dir_all(&root)?;
+            let root_source = root.join("config.json");
+            fs::write(&root_source, "{\"root\":true}\n")?;
+            for excluded_dir in ["build", "target", "vendor", "secrets"] {
+                let excluded = root.join(excluded_dir).join("config.json");
+                fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+                fs::write(excluded, "{\"excluded\":true}\n")?;
+            }
+
+            let manifest = WorkspaceManifest::open(root.clone())?;
+            let inventory = manifest.source_inventory()?;
+            assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+            assert!(
+                inventory.files.contains(&root_source),
+                "workspace ancestor `{ancestor}` excluded the root source"
+            );
+            for excluded_dir in ["build", "target", "vendor", "secrets"] {
+                assert!(
+                    !inventory
+                        .files
+                        .contains(&root.join(excluded_dir).join("config.json")),
+                    "workspace-relative `{excluded_dir}` descendant remained admitted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_structural_inventory_entry_schedules_pre_policy_row_removal() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let excluded = root.join("vendor/config.json");
+        fs::create_dir_all(excluded.parent().expect("excluded parent"))?;
+        fs::write(&excluded, "{\"legacy\":true}\n")?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let outcome = WorkspaceDiscovery.build_refresh_outcome(
+            &manifest,
+            &RefreshInputs {
+                stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    excluded,
+                    IndexedFileRecord {
+                        file_id: 44,
+                        modification_time: 0,
+                        content_hash: Some("a".repeat(64)),
+                        indexed: true,
+                        complete: true,
+                        retry_required: false,
+                    },
+                )]),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert_eq!(outcome.plan.files_to_remove, vec![44]);
+        assert!(outcome.plan.existing_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn declared_json_lockfiles_are_excluded_without_hiding_ordinary_json() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let lockfile = root.join("skills-lock.json");
+        let ordinary = root.join("config.json");
+        fs::write(&lockfile, "{\"skills\":[]}\n")?;
+        fs::write(&ordinary, "{\"enabled\":true}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(!inventory.files.contains(&lockfile));
+        assert!(inventory.files.contains(&ordinary));
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_generated_vendor_and_ordinary_oversized_sources_before_scheduling() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("generated"))?;
+        fs::create_dir_all(root.join("vendor"))?;
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("generated/registers.h"), vec![b'g'; 96])?;
+        fs::write(root.join("vendor/bundle.js"), vec![b'v'; 80])?;
+        fs::write(root.join("src/ordinary.rs"), vec![b'o'; 65])?;
+        fs::write(root.join("src/small.rs"), b"fn small() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert_eq!(inventory.files, vec![root.join("src/small.rs")]);
+        assert_eq!(inventory.policy_exclusions.len(), 3);
+        assert_eq!(
+            inventory
+                .policy_exclusions
+                .iter()
+                .map(|entry| entry.normalized_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "generated/registers.h",
+                "src/ordinary.rs",
+                "vendor/bundle.js"
+            ]
+        );
+        assert!(inventory.policy_exclusions.iter().all(|entry| {
+            entry.content_hash.len() == 64
+                && entry.observed_size > entry.byte_cap
+                && entry.policy_version == "test-policy-v1"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_oversized_content_produces_a_new_verified_identity() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized = root.join("src/large.rs");
+        fs::write(&oversized, vec![b'a'; 65])?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let first =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+        fs::write(&oversized, vec![b'b'; 66])?;
+        let second =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+        let changed_policy =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v2")?;
+
+        assert_ne!(
+            first.policy_exclusions[0].content_hash,
+            second.policy_exclusions[0].content_hash
+        );
+        assert_eq!(second.policy_exclusions[0].observed_size, 66);
+        assert_eq!(
+            changed_policy.policy_exclusions[0].content_hash,
+            second.policy_exclusions[0].content_hash
+        );
+        assert_eq!(
+            changed_policy.policy_exclusions[0].policy_version,
+            "test-policy-v2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_carries_forward_unchanged_structural_unit_exclusions() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let path = root.join("evidence.json");
+        fs::write(&path, "{\"one\":1,\"two\":2,\"three\":3}\n")?;
+        let policy = SourceIndexPolicy {
+            policy_version: "test-structural-policy-v1".to_string(),
+            byte_cap: 1_000,
+            structural_unit_cap: 2,
+        };
+        let (content_hash, observed_size) = current_content_identity(&path)?;
+        let retained = OversizedSourceExclusionCandidate {
+            normalized_path: "evidence.json".to_string(),
+            content_hash,
+            observed_size,
+            observed_unit_count: 3,
+            policy_version: policy.policy_version.clone(),
+            byte_cap: policy.byte_cap,
+            structural_unit_cap: policy.structural_unit_cap,
+        };
+        let manifest = WorkspaceManifest::open(root)?;
+        let inputs = RefreshInputs {
+            stored_files: Vec::new(),
+            policy_exclusions: vec![retained.clone()],
+            inventory: WorkspaceInventory::default(),
+        };
+
+        let unchanged = manifest.build_execution_outcome_with_policy(&inputs, &policy)?;
+        assert!(unchanged.refresh.plan.files_to_index.is_empty());
+        assert_eq!(unchanged.policy_exclusions, vec![retained.clone()]);
+
+        fs::write(&path, "{\"one\":1,\"two\":2,\"three\":4}\n")?;
+        let changed = manifest.build_execution_outcome_with_policy(&inputs, &policy)?;
+        assert_eq!(changed.refresh.plan.files_to_index, vec![path]);
+        assert!(changed.policy_exclusions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_discovery_never_classifies_a_deletion_capable_exclusion_set() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let oversized = root.join("src/large.rs");
+        fs::write(&oversized, vec![b'a'; 65])?;
+        write_repo_manifest(&root, vec![PathBuf::from("src"), PathBuf::from("missing")])?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory =
+            WorkspaceDiscovery.source_inventory_with_policy(&manifest, 64, "test-policy-v1")?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
+        assert!(inventory.policy_exclusions.is_empty());
+        assert_eq!(inventory.files, vec![oversized]);
+        assert!(!inventory.issues.is_empty());
         Ok(())
     }
 
@@ -1208,6 +2377,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
         )?;
@@ -1243,6 +2413,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
         )?;
@@ -1272,10 +2443,12 @@ mod tests {
                     complete: false,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
             RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([(
                     file.clone(),
                     IndexedFileRecord {
@@ -1321,10 +2494,12 @@ mod tests {
                     complete: false,
                     retry_required: true,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
             RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([(
                     file.clone(),
                     IndexedFileRecord {
@@ -1362,6 +2537,7 @@ mod tests {
             &manifest,
             &RefreshInputs {
                 stored_files: Vec::new(),
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::from_records([
                     (
                         file.clone(),
@@ -1422,6 +2598,7 @@ mod tests {
                 complete: true,
                 retry_required: false,
             }],
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })?;
 
@@ -1453,6 +2630,7 @@ mod tests {
                 complete: true,
                 retry_required: false,
             }],
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })?;
 
@@ -1488,6 +2666,7 @@ mod tests {
                 complete: true,
                 retry_required: false,
             }],
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })?;
 
@@ -1540,6 +2719,7 @@ mod tests {
                     complete: true,
                     retry_required: false,
                 }],
+                policy_exclusions: Vec::new(),
                 inventory: WorkspaceInventory::default(),
             },
             1,
@@ -1568,6 +2748,187 @@ mod tests {
         assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
         assert!(inventory.files.iter().any(|path| path.ends_with("lib.rs")));
         assert!(!inventory.issues.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_generated_roots_exclude_descendants_without_hiding_siblings() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let generated = root.join("cache").join("search-generations");
+        let sibling = root.join("cache").join("search-generations-user");
+        fs::create_dir_all(&generated)?;
+        fs::create_dir_all(&sibling)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+        fs::write(generated.join("meta.json"), "{\"generated\":true}\n")?;
+        fs::write(sibling.join("config.json"), "{\"indexed\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::open(root.clone())?;
+        manifest.exclude_discovery_directory_roots([generated.clone()]);
+        let files = manifest.source_files()?;
+
+        assert!(files.contains(&root.join("config.json")));
+        assert!(files.contains(&sibling.join("config.json")));
+        assert!(!files.contains(&generated.join("meta.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_file_identity_excludes_hardlink_aliases() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let owned = root.join("cache").join("codestory.db");
+        let alias = root.join("looks-like-user-source.json");
+        fs::create_dir_all(owned.parent().expect("owned parent"))?;
+        fs::write(&owned, "{\"generated\":true}\n")?;
+        fs::hard_link(&owned, &alias)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::open(root.clone())?;
+        manifest.exclude_discovery_files([owned]);
+        let files = manifest.source_files()?;
+
+        assert!(!files.contains(&alias));
+        assert!(files.contains(&root.join("config.json")));
+
+        let mut direct = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![SourceGroupSettings {
+                    id: Uuid::new_v4(),
+                    language: Language::Json,
+                    standard: LanguageStandard::Default,
+                    source_paths: vec![alias],
+                    exclude_patterns: Vec::new(),
+                    include_paths: Vec::new(),
+                    defines: HashMap::new(),
+                    language_specific: LanguageSpecificSettings::Other,
+                }],
+            },
+            root.join("codestory_project.json"),
+        );
+        direct.exclude_discovery_files([root.join("cache").join("codestory.db")]);
+        let direct_inventory = direct.source_inventory()?;
+        assert_eq!(
+            direct_inventory.outcome,
+            WorkspaceInventoryOutcome::Complete
+        );
+        assert!(direct_inventory.files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_missing_file_uses_platform_lexical_identity() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("cache"))?;
+        let missing = root.join("cache").join("codestory.db-wal");
+        let dotted = root
+            .join("cache")
+            .join("nested")
+            .join("..")
+            .join("codestory.db-wal");
+        assert_eq!(
+            workspace_path_identity(&missing)?,
+            workspace_path_identity(&dotted)?
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            workspace_path_identity(&missing)?,
+            workspace_path_identity(&root.join("CACHE").join("CODESTORY.DB-WAL"))?
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            workspace_path_identity(&missing)?,
+            workspace_path_identity(&root.join("cache").join("CODESTORY.DB-WAL"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_directory_excludes_a_direct_configured_source() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let generated = root.join("cache").join("search-generations");
+        fs::create_dir_all(&generated)?;
+        fs::write(generated.join("meta.json"), "{\"generated\":true}\n")?;
+
+        let mut manifest = WorkspaceManifest::from_parts(
+            WorkspaceSettings {
+                name: "repo".to_string(),
+                version: 1,
+                source_groups: vec![SourceGroupSettings {
+                    id: Uuid::new_v4(),
+                    language: Language::Json,
+                    standard: LanguageStandard::Default,
+                    source_paths: vec![generated.clone()],
+                    exclude_patterns: Vec::new(),
+                    include_paths: Vec::new(),
+                    defines: HashMap::new(),
+                    language_specific: LanguageSpecificSettings::Other,
+                }],
+            },
+            root.join("codestory_project.json"),
+        );
+        manifest.exclude_discovery_directory_roots([generated]);
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+        assert!(inventory.files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_exclusion_roots_are_observed_once_per_inventory() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        for index in 0..256 {
+            fs::write(
+                root.join(format!("config-{index}.json")),
+                format!("{{\"index\":{index}}}\n"),
+            )?;
+        }
+
+        let storage_path = root.join("cache/custom-core.db");
+        let manifest =
+            WorkspaceManifest::open_with_storage_owned_exclusions(root.clone(), &storage_path)?;
+        assert_eq!(
+            legacy_search_directory_for_storage(&storage_path),
+            root.join("cache/custom-core.search")
+        );
+        assert_eq!(
+            search_generation_directory_for_storage(&storage_path),
+            root.join("cache/custom-core.search-generations")
+        );
+        let files = manifest.source_files()?;
+
+        assert_eq!(files.len(), 256);
+        assert_eq!(manifest.discovery_exclusion_observation_count(), 5);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_caller_owned_exclusion_fails_inventory_closed() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("config.json"), "{\"indexed\":true}\n")?;
+        let unavailable = root.join(std::ffi::OsString::from_vec(b"bad\0root".to_vec()));
+
+        let mut manifest = WorkspaceManifest::open(root)?;
+        manifest.exclude_discovery_directory_roots([unavailable.clone()]);
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Unreadable);
+        assert!(inventory.files.is_empty());
+        assert_eq!(inventory.issues.len(), 1);
+        assert_eq!(inventory.issues[0].path, unavailable);
         Ok(())
     }
 
@@ -1656,6 +3017,12 @@ mod tests {
             Language::Html,
             Language::Css,
             Language::Bash,
+            Language::Shell,
+            Language::PowerShell,
+            Language::Markdown,
+            Language::Yaml,
+            Language::Toml,
+            Language::Json,
         ];
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
@@ -1690,8 +3057,6 @@ mod tests {
             ("astro", Language::TypeScript),
             ("astro", Language::Astro),
             ("lua", Language::Lua),
-            ("ps1", Language::PowerShell),
-            ("psm1", Language::PowerShell),
             ("scss", Language::Css),
             ("sass", Language::Css),
             ("less", Language::Css),

@@ -1,49 +1,30 @@
 # Cursor
 
-Use CodeStory in Cursor with an always-on project rule and a manually configured
-MCP server pointing at the plugin adapter.
-
-## What you get
-
-| You | Agent |
-| --- | --- |
-| Copy the project rule and add MCP config | Rule tells the agent to read `codestory://status` first |
-| Open your repo in Cursor | Uses MCP tools when the server is connected |
-| Ask repo questions | Local graph and packet/search when [allowed](../glossary.md#allowed-surfaces) |
-
-Cursor provides the rule only; you configure MCP yourself. When MCP is
-connected, `scripts/codestory-mcp.cjs` can bootstrap a managed CLI like the
-Codex plugin.
+Cursor uses a project rule plus a manually configured CodeStory MCP server. The
+rule teaches the agent when to use CodeStory; MCP supplies the actual repository
+evidence.
 
 ## Install
 
-### 1. Project rule
+### 1. Add the project rule
 
-Ensure the repository includes the CodeStory rule (from the plugin package):
-
-```text
-plugins/codestory/.cursor/rules/codestory.mdc
-```
-
-For your own projects, copy that file to `.cursor/rules/codestory.mdc` at the
-project root, or symlink it from the plugin checkout.
-
-### 2. MCP server (copy shipped config)
-
-Copy the shipped MCP config into your project:
+Copy the shipped rule into the target repository:
 
 ```text
-plugins/codestory/.cursor/mcp.json  →  .cursor/mcp.json
+plugins/codestory/.cursor/rules/codestory.mdc -> .cursor/rules/codestory.mdc
 ```
 
-The shipped file looks like this:
+### 2. Configure MCP
+
+Copy `plugins/codestory/.cursor/mcp.json` to `.cursor/mcp.json`, or add the same
+server in Cursor user settings:
 
 ```json
 {
   "mcpServers": {
     "codestory": {
       "command": "node",
-      "args": ["./plugins/codestory/scripts/codestory-mcp.cjs"],
+      "args": ["/absolute/path/to/plugins/codestory/scripts/codestory-mcp.cjs"],
       "env": {
         "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
       },
@@ -53,106 +34,45 @@ The shipped file looks like this:
 }
 ```
 
-**Path adjustment:** The `./plugins/codestory/...` path assumes the plugin
-checkout lives inside your workspace root. If the plugin is elsewhere, change
-`args` to an absolute path to `codestory-mcp.cjs`. Replace
-`/absolute/path/to/codestory-plugin-data` with a real per-user data directory.
-On Windows, ensure `node` is on PATH.
-
-Set `CODESTORY_PLUGIN_DATA` to a persistent per-user directory outside the
-repository; the adapter stores the managed CLI, runtime state, and sidecar
-policy there. Set `CODESTORY_CLI` only for local development overrides.
-
-Alternatively, add the same server block in Cursor user settings instead of a
-project `.cursor/mcp.json`.
+Use an absolute adapter path unless the plugin checkout is inside the Cursor
+workspace. `CODESTORY_PLUGIN_DATA` must be a persistent per-user directory
+outside the repository. Set `CODESTORY_CLI` only when testing a local build.
 
 ### 3. Reload
 
-Restart Cursor or reload the MCP server after config changes. Open the
-repository root as the workspace folder.
+Reload the MCP server or restart Cursor after changing its configuration, then
+open the repository root as the workspace folder.
 
-## Install verification
+## Verify the install
 
-Run these three checks before your first real task:
-
-1. **Adapter present** — Confirm `.cursor/rules/codestory.mdc` (or the plugin
-   copy at `plugins/codestory/.cursor/rules/codestory.mdc`) exists and
-   `.cursor/mcp.json` points at `codestory-mcp.cjs`.
-2. **MCP live** — In Cursor, the CodeStory MCP server shows as connected after
-   reload.
-3. **First status read succeeds** — Use the readiness prompt in [First
-   session](#first-session). The agent should answer in plain English whether
-   your repo map is ready and whether broad search is available.
-
-## First session
-
-1. Confirm the CodeStory MCP server shows connected in Cursor.
-2. Start a new agent chat in the repository.
-3. Ask:
+Confirm the CodeStory MCP server is connected, then ask:
 
 ```text
-Read codestory://status, ground this checkout if allowed, and tell me which CodeStory surfaces are ready before I edit.
+Where is request validation implemented, who calls it, and which tests cover it?
 ```
 
-**Expected wait:** On a large repository, the first index build can take several
-minutes. Let the agent finish grounding before you ask it to edit files.
+The first request may prepare the repository and retry. A healthy answer cites
+real files and symbols. The rule alone cannot provide CodeStory evidence; if MCP
+is disconnected, the agent must fall back to ordinary source inspection and say
+so.
 
-**Success looks like:** The agent confirms your repo map is ready, says whether
-broad search is available, and does not report a missing CLI or broken MCP
-connection.
-
-Without MCP, the rule points the agent to repair fallbacks -- see
-[Troubleshooting](troubleshooting.md).
-
-## Example prompts
-
-**Readiness**
-
-```text
-Check CodeStory status and allowed_surfaces before I change [path/to/file].
-```
-
-**Find ownership**
-
-```text
-Where is [Feature] defined and who calls it? Use CodeStory and cite files.
-```
-
-**Plan a change**
-
-```text
-I am changing [path/to/file]. What symbols are affected and what tests should I run first?
-```
-
-**Subsystem**
-
-```text
-How does [subsystem] work? Start from CodeStory and cite concrete paths.
-```
-
-More pairs and anti-patterns: [Prompt patterns](prompt-patterns.md).
+Shared first-use behavior: [User guide](README.md#first-use).
 
 ## Troubleshooting
 
-| Symptom | What to try |
+| Symptom | Action |
 | --- | --- |
-| MCP server fails to start | Verify `node` and the path to `codestory-mcp.cjs`; use absolute path |
-| Tools missing in chat | Reload MCP; confirm workspace root contains the repo to ground |
-| Rule present but no grounding | MCP not connected -- configure server per Install above |
-| Stale runtime after update | Reload MCP; read fresh `codestory://status` |
+| MCP fails to start | Check that `node` is on `PATH` and use an absolute adapter path |
+| Tools are missing | Reload MCP and confirm the workspace root is the repository being queried |
+| Rule is present but no CodeStory evidence appears | The rule is instructions only; connect MCP |
+| Runtime is stale after an update | Replace the plugin checkout or package, then reload MCP |
+| A tool remains preparing | Retry that same tool after its returned delay |
 
-Shared steps: [Troubleshooting](troubleshooting.md).
+See [shared troubleshooting](troubleshooting.md) for readiness and cache
+problems.
 
-## Limitations vs Codex
+## Differences from Codex
 
-| Feature | Cursor | Codex |
-| --- | --- | --- |
-| MCP auto-start | Manual config | Yes |
-| Lifecycle hooks | No (rule only) | Session start + prompt hooks |
-| Grounding skill | Via rule text | Full `@CodeStory` skill |
-| Managed CLI bootstrap | When MCP adapter runs | Always via plugin |
-
-Request-aware packet injection on every prompt requires hook-capable hosts
-(Codex, Claude Code). Cursor relies on the rule and your prompts.
-
-Compare hosts: [capability matrix](README.md#capability-matrix).
+Cursor does not auto-start CodeStory MCP or install lifecycle hooks. Once MCP is
+connected, it uses the same project-scoped runtime and automatic repository
+preparation as Codex.

@@ -151,7 +151,7 @@ function usage() {
 
 Runs the real CodeStory agent A/B harness, reanalyzes it with the current
 transcript analyzer, and emits METRIC lines for Codex Autoresearch.
-Packet-gate mode automatically retries transient sidecar-unavailable packet
+Packet-gate mode automatically retries transient retrieval-unavailable packet
 probe rows once, serially, before selecting nested A/B tasks. It exits non-zero
 when no tasks are selected unless --allow-empty-packet-gate is present for an
 exploratory diagnostic run.
@@ -330,7 +330,7 @@ async function runPacketGate(opts, outDir) {
   if (retryableTaskIds.length) {
     retryDir = path.join(outDir, "packet-probes-retry");
     mkdirSync(retryDir, { recursive: true });
-    console.log(`packet gate retrying transient sidecar failures: ${retryableTaskIds.join(",")}`);
+    console.log(`packet gate retrying transient retrieval failures: ${retryableTaskIds.join(",")}`);
     await runPacketProbeBenchmark(opts, retryDir, retryableTaskIds.join(","), 1, 1);
     retryQualityDebugPath = path.join(retryDir, "quality-debug.json");
     const retryQualityDebug = readJsonFileIfPresent(retryQualityDebugPath);
@@ -508,12 +508,12 @@ function loadPacketGateBaselineRows(sourcePath) {
 
 const transientSidecarFailurePatterns = [
   /\bretrieval_unavailable\b/i,
-  /\bqdrant_unreachable\b/i,
+  /\bembedded_vector_index_unavailable\b/i,
   /\blexical_(?:shard_unavailable|source_coverage_incomplete)\b/i,
   /\bscip_unreachable\b/i,
-  /sidecar retrieval .* unavailable/i,
-  /sidecar retrieval .* failed/i,
-  /retrieval sidecar is mandatory/i,
+  /retrieval .* unavailable/i,
+  /retrieval .* failed/i,
+  /full retrieval is mandatory/i,
   /project is not in full mode/i,
 ];
 

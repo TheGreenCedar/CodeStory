@@ -4,25 +4,10 @@ Discovers project files, extracts symbols and edges, persists graph/search state
 to SQLite, writes graph-native symbol docs and component reports, and
 synchronizes selected dense anchors when embedding assets are available.
 
-## Usage
+## Syntax
 
-```text
-<codestory-cli> index [OPTIONS]
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` / `--path <path>` | `.` | Target repository root. Always pass this explicitly. |
-| `--cache-dir <path>` | auto | Override the per-project cache root. |
-| `--refresh <auto|full|incremental|none>` | `auto` | Choose the graph/snapshot/symbol-doc/dense-anchor refresh mode. |
-| `--format <markdown|json>` | `markdown` | Use JSON for automation and timing analysis. |
-| `--output-file <path>` | stdout | Write output to a file with an existing parent directory. |
-| `--dry-run` | off | Show workspace discovery and planned adds/removals without writing storage. |
-| `--summarize` | off | Generate cached symbol summaries; requires `CODESTORY_SUMMARY_ENDPOINT`, `local`, or `mock`. |
-| `--progress` | off | Print progress to stderr while preserving stdout output. |
-| `--watch` | off | Keep watching the project root and run incremental refreshes on changes. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Refresh Modes
 
@@ -43,23 +28,23 @@ not touched.
 ## Symbol Docs And Dense Anchors
 
 There is no `index --semantic off` flag. Graph-native `symbol_search_doc` rows
-are part of the default index contract. Under `graph_first_v1`, dense vectors
+are part of the default index contract. Under `graph_first_v2`, dense vectors
 are only written for selected anchors such as entrypoints, public APIs,
 documented nontrivial symbols, central graph nodes, component reports, and
-unstructured docs. Product packet/search readiness uses the llama.cpp
-retrieval sidecar path.
+unstructured docs. Product packet/search readiness uses the embedded
+CodeRankEmbed engine through its private per-user server.
 
 High-signal environment toggles:
 
 | Variable | Use |
 |----------|-----|
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol symbol-doc scope for diagnostics. Accepted aliases are `all`, `full`, `all-symbols`, and `all_symbols`; omitted or other values default to durable symbols. |
-| `CODESTORY_EMBED_BACKEND=llamacpp` | Use the mandatory local llama.cpp embedding sidecar. |
-| `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings` | Explicit external embedding endpoint override for bge-base sidecar vectors across profiles. When unset, managed Agent profiles allocate and persist a dynamic endpoint. |
+| `CODESTORY_EMBED_ALLOW_CPU=1` | Explicitly allow CPU embeddings for hosted CI or a maintainer diagnostic. Production never falls back to CPU silently. |
 | `CODESTORY_SUMMARY_ENDPOINT=local` | Enable deterministic local summaries with `--summarize`. |
 
-Use other embedding, alias, batch-size, provider, hash, and summary tuning
-variables only for focused diagnostics or historical comparisons.
+The model, tokenizer, pooling, normalization, and batching contract is compiled
+into the executable. There is no embedding endpoint or backend download to
+configure.
 Agent packet/search readiness requires `retrieval_mode=full`; see
 [status-contract.md](status-contract.md) and [retrieval-rollout.md](retrieval-rollout.md).
 

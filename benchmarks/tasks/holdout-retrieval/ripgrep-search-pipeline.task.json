@@ -14,7 +14,11 @@
     ],
     "setup": [
       "No dependency setup is required for read-only benchmark inspection."
-    ]
+    ],
+    "codestory_project_manifest": {
+      "path": "ripgrep-rust-codestory-project.json",
+      "sha256": "85b8ade56e2907ba78366a231cb11970f2b18830725771d9f435d3109bb1972a"
+    }
   },
   "prompt": "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components. Cite the source files that support the path.",
   "expected_files": [
@@ -98,6 +102,6 @@
     "generalization"
   ],
   "notes": [
-    "Generalization holdout for sidecar retrieval. Do not tune planner or ranker heuristics against this manifest."
+    "Generalization holdout for retrieval retrieval. Do not tune planner or ranker heuristics against this manifest."
   ]
 }

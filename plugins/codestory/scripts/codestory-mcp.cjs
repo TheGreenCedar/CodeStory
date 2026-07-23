@@ -9,16 +9,16 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { Transform, pipeline } = require('stream');
+const { TextDecoder } = require('util');
 const zlib = require('zlib');
-const { dirtyMarkerPathForProject } = require('../hooks/codestory-runtime.cjs');
+const {
+  validateDevCliReceipt,
+} = require('./codestory-dev-cli-contract.cjs');
 
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = process.cwd();
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
 const fallbackBinaryNames = [binaryName];
-const activeStateFile = '.codestory-active';
-const activeThreadStatePrefix = '.codestory-active-thread-';
-const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
@@ -69,6 +69,8 @@ function readJson(file) {
     return null;
   }
 }
+
+const canonicalMcpCatalog = readJson(path.join(pluginRoot, 'generated-mcp-catalog.json'));
 
 function fileSha256(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -134,268 +136,43 @@ function pluginDataDir() {
     || inferredCodexPluginDataDir();
 }
 
-function sidecarPolicyPath(dataDir = pluginDataDir()) {
-  return dataDir ? path.join(dataDir, 'sidecar-setup-policy.json') : null;
-}
-
-function activeStatePath(dataDir = pluginDataDir()) {
-  return dataDir ? path.join(dataDir, activeStateFile) : null;
-}
-
-function activeThreadStatePath(threadId, dataDir = pluginDataDir()) {
-  const normalized = String(threadId || '').trim();
-  if (!dataDir || !normalized) return null;
-  const key = createHash('sha256').update(normalized).digest('hex').slice(0, 16);
-  return path.join(dataDir, `${activeThreadStatePrefix}${key}.json`);
-}
-
-function normalizeProjectRoot(projectRoot) {
-  const resolved = path.resolve(projectRoot);
-  try {
-    return fs.realpathSync(resolved);
-  } catch {
-    return resolved;
+function candidateQualificationArchiveSha256() {
+  const archiveSha256 = process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256 || '';
+  const qualificationDir = process.env.CODESTORY_EMBED_QUALIFICATION_DIR || '';
+  const nonce = process.env.CODESTORY_EMBED_QUALIFICATION_NONCE || '';
+  if (
+    !/^[0-9a-f]{64}$/iu.test(archiveSha256) ||
+    !path.isAbsolute(qualificationDir) ||
+    !/^[0-9a-f]{64}$/iu.test(nonce)
+  ) {
+    return null;
   }
-}
-
-function existingProjectRoot(projectRoot) {
-  if (!projectRoot || typeof projectRoot !== 'string' || !projectRoot.trim()) return null;
-  const normalized = normalizeProjectRoot(projectRoot);
   try {
-    return fs.statSync(normalized).isDirectory() ? normalized : null;
+    const directoryStat = fs.lstatSync(qualificationDir);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return null;
+    if (process.platform !== 'win32' && (directoryStat.mode & 0o077) !== 0) return null;
+    if (fs.realpathSync(qualificationDir) !== path.resolve(qualificationDir)) return null;
+    const markerPath = path.join(qualificationDir, 'candidate-managed-install.json');
+    const markerStat = fs.lstatSync(markerPath);
+    if (!markerStat.isFile() || markerStat.isSymbolicLink()) return null;
+    const marker = readJson(markerPath);
+    const nonceSha256 = createHash('sha256').update(nonce, 'utf8').digest('hex');
+    if (
+      marker?.schema_version !== 1 ||
+      marker?.purpose !== 'codestory-candidate-managed-install' ||
+      marker?.archive_sha256 !== archiveSha256 ||
+      marker?.qualification_nonce_sha256 !== nonceSha256 ||
+      Object.keys(marker).sort().join(',') !==
+        'archive_sha256,purpose,qualification_nonce_sha256,schema_version'
+    ) {
+      return null;
+    }
+    return archiveSha256;
   } catch {
     return null;
   }
 }
 
-function activeProjectStateTimestamp(active, statePath) {
-  const parsed = Date.parse(active?.updatedAt || active?.updated_at || '');
-  if (Number.isFinite(parsed)) return parsed;
-  try {
-    return fs.statSync(statePath).mtimeMs;
-  } catch {
-    return null;
-  }
-}
-
-function activeProjectStateSummary(statePath, nowMs = Date.now()) {
-  const active = statePath ? readJson(statePath) : null;
-  const timestamp = activeProjectStateTimestamp(active, statePath);
-  return {
-    path: statePath,
-    cwd: active?.cwd || null,
-    updated_at: active?.updatedAt || active?.updated_at || null,
-    age_ms: timestamp === null ? null : Math.max(0, Math.round(nowMs - timestamp)),
-    codex_thread_id: active?.codexThreadId || null,
-  };
-}
-
-function projectResolutionDiagnostics(projectResolution, nowMs = Date.now()) {
-  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  const threadStatePath = activeThreadStatePath(currentThread);
-  return {
-    project_root_resolution_source: projectResolution.source || null,
-    project_root_resolution_state_path: projectResolution.statePath || null,
-    project_root_available_after_launch: Boolean(projectResolution.projectRoot),
-    active_state: activeProjectStateSummary(activeStatePath(), nowMs),
-    thread_state: activeProjectStateSummary(threadStatePath, nowMs),
-    codex_thread_id: currentThread || null,
-    launch_cwd: launchCwd,
-    runtime_cwd: process.cwd(),
-  };
-}
-
-function resolveProjectRoot(options = {}) {
-  const argumentProvided = options.projectRootProvided
-    || (options.projectRoot !== null && options.projectRoot !== undefined);
-  const envProvided = Object.hasOwn(process.env, 'CODESTORY_PROJECT_ROOT');
-  if (argumentProvided || envProvided) {
-    const source = argumentProvided ? 'argument' : 'env';
-    const requestedRoot = argumentProvided ? options.projectRoot : process.env.CODESTORY_PROJECT_ROOT;
-    const explicit = existingProjectRoot(requestedRoot);
-    return explicit
-      ? { projectRoot: explicit, source }
-      : {
-          projectRoot: null,
-          source: `${source}_invalid`,
-          statePath: null,
-          reason: 'project_root_invalid',
-        };
-  }
-
-  const cwd = existingProjectRoot(options.cwd || launchCwd);
-  if (cwd && !sameFilesystemPath(cwd, pluginRoot)) {
-    return { projectRoot: cwd, source: 'process_cwd' };
-  }
-
-  return {
-    projectRoot: null,
-    source: 'request_argument_missing',
-    statePath: null,
-    reason: 'project_root_unavailable',
-  };
-}
-
-function sidecarPolicyCommand(action, policyFile = sidecarPolicyPath()) {
-  const policyArg = policyFile ? ` --policy-file ${JSON.stringify(policyFile)}` : '';
-  return `node ${JSON.stringify(__filename)} sidecar-policy ${action}${policyArg}`;
-}
-
-function normalizeSidecarPolicyState(value) {
-  const state = String(value || '').trim().toLowerCase();
-  if (state === 'enabled' || state === 'disabled' || state === 'ask' || state === 'unknown') {
-    return state === 'unknown' ? 'ask' : state;
-  }
-  return 'ask';
-}
-
-function sidecarPolicyStateForAction(action) {
-  if (action === 'enable' || action === 'repair') return 'enabled';
-  if (action === 'disable') return 'disabled';
-  return 'ask';
-}
-
-function readSidecarPolicy(file = sidecarPolicyPath()) {
-  const policy = file ? readJson(file) : null;
-  const state = normalizeSidecarPolicyState(process.env.CODESTORY_PLUGIN_SIDECAR_POLICY || policy?.state);
-  return {
-    state,
-    path: file,
-    updatedAt: policy?.updated_at || null,
-    lastRepair: policy?.last_repair || null,
-  };
-}
-
-function firstSemverToken(value) {
-  const match = String(value || '').match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/u);
-  return match ? match[0] : null;
-}
-
-function sidecarLastRepairStaleReason(lastRepair, activeVersion = pluginVersion(), activePath = null) {
-  const command = lastRepair?.command;
-  if (!command) return null;
-  const version = firstSemverToken(command);
-  if (version && activeVersion && version !== activeVersion) {
-    return `last_repair_cli_version_mismatch:${version}!=${activeVersion}`;
-  }
-  if (activePath && command.includes('codestory-cli') && !command.includes(activePath)) {
-    return 'last_repair_cli_path_mismatch';
-  }
-  return null;
-}
-
-function normalizedSidecarLastRepair(lastRepair, activeVersion = pluginVersion(), activePath = null) {
-  if (!lastRepair) return null;
-  const staleReason = sidecarLastRepairStaleReason(lastRepair, activeVersion, activePath);
-  return {
-    ...lastRepair,
-    current: Boolean(lastRepair.command) && !staleReason,
-    stale_reason: staleReason,
-  };
-}
-
-function writeSidecarPolicy(state, patch = {}, file = sidecarPolicyPath()) {
-  if (!file) return null;
-  const current = readJson(file) || {};
-  const next = {
-    ...current,
-    ...patch,
-    state: normalizeSidecarPolicyState(state),
-    updated_at: new Date().toISOString(),
-  };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(next, null, 2));
-  return next;
-}
-
-function handleSidecarPolicyCommand(argv) {
-  if (argv[2] !== 'sidecar-policy') return;
-  const action = argv[3] || 'status';
-  const policyFileFlag = argv.indexOf('--policy-file');
-  const policyFile = policyFileFlag >= 0 ? argv[policyFileFlag + 1] : sidecarPolicyPath();
-  if (!['enable', 'disable', 'ask', 'repair', 'status'].includes(action)) {
-    process.stderr.write('usage: codestory-mcp.cjs sidecar-policy [enable|disable|ask|repair|status] [--policy-file PATH]\n');
-    process.exit(2);
-  }
-  if (policyFileFlag >= 0 && !policyFile) {
-    process.stderr.write('sidecar-policy --policy-file requires a path\n');
-    process.exit(2);
-  }
-  if (action !== 'status') {
-    if (!policyFile) {
-      process.stderr.write('sidecar-policy needs PLUGIN_DATA, COPILOT_PLUGIN_DATA, CODESTORY_PLUGIN_DATA, or --policy-file to remember the setting\n');
-      process.exit(2);
-    }
-    writeSidecarPolicy(sidecarPolicyStateForAction(action), {}, policyFile);
-  }
-  process.stdout.write(`${JSON.stringify(readSidecarPolicy(policyFile), null, 2)}\n`);
-  process.exit(0);
-}
-
-function repairCommandForProject(projectRoot = launchCwd) {
-  return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
-}
-
-function resolvedRepairCommandForProject(resolved, projectRoot = launchCwd) {
-  return `${JSON.stringify(resolved.path)} ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
-}
-
-function optionValue(argv, name) {
-  const index = argv.indexOf(name);
-  return index >= 0 ? argv[index + 1] : null;
-}
-
-function dirtyMarkerEnv(projectRoot = launchCwd) {
-  const markerPath = dirtyMarkerPathForProject(projectRoot, pluginDataDir());
-  const normalizedRoot = (() => {
-    try {
-      return fs.realpathSync(path.resolve(projectRoot));
-    } catch {
-      return path.resolve(projectRoot);
-    }
-  })();
-  return {
-    path: markerPath || '',
-    projectRoot: markerPath ? normalizedRoot : '',
-  };
-}
-
-function runtimeTruthStatus(plugin, options = {}) {
-  const readinessGoals = new Set(options.readinessGoals || []);
-  const readinessLanes = options.readinessLanes && typeof options.readinessLanes === 'object'
-    ? options.readinessLanes
-    : null;
-  const readinessRefs = {};
-  if (readinessGoals.has('local_navigation')) {
-    readinessRefs.local_graph = 'readiness[goal=local_navigation]';
-  }
-  if (readinessGoals.has('agent_packet_search')) {
-    readinessRefs.agent_packet_search = 'readiness[goal=agent_packet_search]';
-  }
-  if (readinessGoals.has('project_root')) {
-    readinessRefs.project_root = 'readiness[goal=project_root]';
-  }
-  if (options.localRefresh) readinessRefs.local_refresh = 'local_refresh';
-  if (readinessLanes?.local_default) readinessRefs.local_default = 'readiness_lanes.local_default';
-  if (readinessLanes?.agent_packet_search) {
-    readinessRefs.agent_packet_search = 'readiness_lanes.agent_packet_search';
-  }
-  const sidecarStatusRef = readinessLanes?.agent_packet_search
-    ? 'readiness_lanes.agent_packet_search'
-    : readinessGoals.has('agent_packet_search')
-      ? 'readiness[goal=agent_packet_search]'
-      : null;
-  return {
-    runtime_source: plugin.cli_source || 'unavailable',
-    plugin_root: plugin.plugin_root || null,
-    managed_cli_path: plugin.managed_binary_path || null,
-    launcher_source: plugin.cli_source || 'unavailable',
-    sidecar_policy: options.sidecarPolicy || 'unavailable',
-    sidecar_status_ref: sidecarStatusRef,
-    readiness_refs: readinessRefs,
-    readiness_broker_ref: options.hasReadinessBroker ? 'readiness_broker' : null,
-  };
-}
 
 function resolveManifest(manifestPath) {
   const manifest = readJson(manifestPath);
@@ -1276,14 +1053,23 @@ function verifyPublishedManagedCli(
   if (!verified.verified) return verified;
   const manifest = readJson(path.join(versionDir, 'manifest.json'));
   const expectedAsset = archiveName(version, expectedTarget);
+  const candidateArchiveSha256 = candidateQualificationArchiveSha256() || '';
+  const releaseMetadataValid =
+    manifest.build_source === 'github_release' &&
+    manifest.repo_ref === `v${version}` &&
+    manifest.archive_url === redactedReleaseFileUrl(version, expectedAsset);
+  const candidateMetadataValid =
+    /^[0-9a-f]{64}$/iu.test(candidateArchiveSha256) &&
+    manifest.build_source === 'candidate_archive' &&
+    /^[0-9a-f]{40}$/iu.test(String(manifest.repo_ref || '')) &&
+    manifest.archive_sha256 === candidateArchiveSha256 &&
+    manifest.archive_url === `candidate-archive:${candidateArchiveSha256}`;
   if (
-    manifest.build_source !== 'github_release' ||
-    manifest.repo_ref !== `v${version}` ||
+    (!releaseMetadataValid && !candidateMetadataValid) ||
     manifest.archive !== expectedAsset ||
     manifest.target !== expectedTarget ||
     manifest.stdio_initialize_verified !== true ||
-    !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || '')) ||
-    manifest.archive_url !== redactedReleaseFileUrl(version, expectedAsset)
+    !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || ''))
   ) {
     return { verified: false, reason: 'manifest_release_metadata_invalid' };
   }
@@ -1584,6 +1370,66 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
 async function resolveCli(options = {}) {
   const version = pluginVersion();
   const warnings = [];
+  const devReceipt = validateDevCliReceipt(pluginRoot, {
+    expectedPluginVersion: version,
+  });
+  if (process.env.CODESTORY_CLI && devReceipt.state !== 'absent') {
+    const reason = 'codestory_dev_cli_ambiguous_override';
+    warnings.push(reason);
+    return {
+      source: 'local_dev_receipt_invalid',
+      path: null,
+      sha256: null,
+      version,
+      cliVersion: null,
+      repoRef: null,
+      buildSource: 'local_dev_receipt_invalid',
+      sourcePackageSha256: null,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      localDevReceiptFailure: reason,
+      warnings,
+    };
+  }
+  if (devReceipt.state === 'verified') {
+    warnings.push('codestory_dev_receipt:verified');
+    return {
+      source: 'local_dev_override',
+      path: devReceipt.path,
+      sha256: devReceipt.sha256,
+      version,
+      cliVersion: devReceipt.cliVersion,
+      repoRef: devReceipt.sourceCommit,
+      buildSource: 'codestory_dev_receipt',
+      sourcePackageSha256: devReceipt.sourcePackageSha256,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      manifestPath: devReceipt.receiptPath,
+      warnings,
+    };
+  }
+  if (devReceipt.state === 'invalid') {
+    const reason = `codestory_dev_receipt_invalid:${devReceipt.reason}`;
+    warnings.push(reason);
+    return {
+      source: 'local_dev_receipt_invalid',
+      path: null,
+      sha256: null,
+      version,
+      cliVersion: null,
+      repoRef: null,
+      buildSource: 'local_dev_receipt_invalid',
+      sourcePackageSha256: null,
+      archiveSha256: null,
+      archiveUrl: null,
+      provisionedAt: null,
+      manifestPath: devReceipt.receiptPath,
+      localDevReceiptFailure: reason,
+      warnings,
+    };
+  }
   if (process.env.CODESTORY_CLI) {
     const cliPath = path.isAbsolute(process.env.CODESTORY_CLI)
       ? process.env.CODESTORY_CLI
@@ -1600,6 +1446,7 @@ async function resolveCli(options = {}) {
       cliVersion: null,
       repoRef: null,
       buildSource: 'local_dev_override',
+      sourcePackageSha256: null,
       archiveSha256: null,
       archiveUrl: null,
       provisionedAt: null,
@@ -1623,6 +1470,7 @@ async function resolveCli(options = {}) {
     cliVersion: null,
     repoRef: null,
     buildSource: 'managed_unavailable',
+    sourcePackageSha256: null,
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
@@ -1670,6 +1518,9 @@ function failOpenReasonForProbe(resolved, probe) {
   if (batchRejection) return batchRejection;
   if (resolved.source === 'managed_unavailable') {
     return resolved.managedProvisionFailure || 'managed_cli_unavailable';
+  }
+  if (resolved.source === 'local_dev_receipt_invalid') {
+    return resolved.localDevReceiptFailure || 'codestory_dev_receipt_invalid';
   }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
@@ -2092,311 +1943,6 @@ function removeManagedCliVersion(entry, options) {
   }
 }
 
-function localWaitFreshCommand(projectRoot = launchCwd) {
-  return `<managed codestory-cli> ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
-}
-
-function singleRepairNextCalls(commands) {
-  const needsHost = commands.some((command) => command.startsWith('Restart/reload') || command.startsWith('Refresh or reinstall'));
-  if (needsHost) {
-    return [
-      { method: 'host/restart', instruction: commands[0] },
-      { method: 'resources/read', uri: 'codestory://status' },
-    ];
-  }
-  const sidecarRepair = commands.find((command) => command.includes('ready --goal agent --repair'));
-  if (sidecarRepair) {
-    return [
-      {
-        method: 'resources/read',
-        uri: 'codestory://status',
-        instruction: 'Diagnostic MCP cannot run sidecar repair until a compatible stdio runtime starts; restore or reload the runtime before retrying grounding.',
-        debug_command: sidecarRepair,
-      },
-    ];
-  }
-  return [
-    {
-      method: 'resources/read',
-      uri: 'codestory://status',
-      instruction: 'Diagnostic MCP cannot run full repair until a compatible stdio runtime starts; restore the runtime before retrying grounding.',
-      debug_commands: commands,
-    },
-  ];
-}
-
-function localWaitFreshTimeoutMs() {
-  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
-}
-
-function runLocalNavigationWaitFresh(resolved, projectRoot) {
-  const args = ['ready', '--goal', 'local', '--wait-fresh'];
-  args.push('--project', projectRoot, '--format', 'json');
-  const result = spawnCodeStoryCliSync(resolved.path, args, {
-    cwd: projectRoot,
-    encoding: 'utf8',
-    timeout: localWaitFreshTimeoutMs(),
-    windowsHide: true,
-  });
-  return { args, result };
-}
-
-function runAgentReadiness(resolved, projectRoot) {
-  const args = ['ready', '--goal', 'agent'];
-  args.push('--project', projectRoot, '--format', 'json');
-  const result = spawnCodeStoryCliSync(resolved.path, args, {
-    cwd: projectRoot,
-    encoding: 'utf8',
-    timeout: localWaitFreshTimeoutMs(),
-    windowsHide: true,
-  });
-  return { args, result };
-}
-
-function runProjectIdentity(resolved, projectRoot) {
-  const args = ['cache', 'identity', '--project', projectRoot, '--format', 'json'];
-  const result = spawnCodeStoryCliSync(resolved.path, args, {
-    cwd: projectRoot,
-    encoding: 'utf8',
-    timeout: localWaitFreshTimeoutMs(),
-    windowsHide: true,
-  });
-  return { args, result };
-}
-
-function localReadySetup(prefix, args, result) {
-  return {
-    [`${prefix}_args`]: args,
-    [`${prefix}_status`]: result.status,
-    [`${prefix}_error`]: result.error ? result.error.message : null,
-    [`${prefix}_stdout`]: result.stdout || '',
-    [`${prefix}_stderr`]: result.stderr || '',
-  };
-}
-
-function parseLocalReadyResult(result) {
-  let parsed;
-  try {
-    parsed = JSON.parse(result.stdout || '{}');
-  } catch (error) {
-    return {
-      ok: false,
-      invalidJson: error.message,
-      verdict: null,
-    };
-  }
-  const verdict = Array.isArray(parsed.verdicts)
-    ? parsed.verdicts.find((item) => item && item.goal === 'local_navigation') || parsed.verdicts[0]
-    : null;
-  return {
-    ok: Boolean(verdict && verdict.status === 'ready'),
-    invalidJson: null,
-    verdict,
-    localRefresh: parsed.local_refresh || null,
-  };
-}
-
-function parseAgentReadinessResult(result) {
-  let parsed;
-  try {
-    parsed = JSON.parse(result.stdout || '{}');
-  } catch (error) {
-    return {
-      ok: false,
-      invalidJson: error.message,
-      parsed: null,
-      verdict: null,
-    };
-  }
-  const verdict = Array.isArray(parsed.verdicts)
-    ? parsed.verdicts.find((item) => item && item.goal === 'agent_packet_search') || null
-    : null;
-  const lane = parsed.readiness_lanes?.agent_packet_search || null;
-  return {
-    ok: Boolean((verdict && verdict.status === 'ready') || (lane && lane.status === 'ready')),
-    invalidJson: null,
-    parsed,
-    verdict,
-  };
-}
-
-function probeProjectIdentity(resolved, projectRoot) {
-  const probe = runProjectIdentity(resolved, projectRoot);
-  const setup = localReadySetup('project_identity', probe.args, probe.result);
-  if (probe.result.error || probe.result.status !== 0) {
-    return {
-      identity: null,
-      reason: probe.result.error
-        ? `project_identity_probe_failed:${probe.result.error.message}`
-        : `project_identity_probe_failed:${probe.result.status}`,
-      setup,
-    };
-  }
-  let identity;
-  try {
-    identity = JSON.parse(probe.result.stdout || '{}');
-  } catch (error) {
-    return { identity: null, reason: `project_identity_invalid_json:${error.message}`, setup };
-  }
-  if (!sameFilesystemPath(identity.project, projectRoot)) {
-    return { identity: null, reason: 'project_identity_root_mismatch', setup };
-  }
-  if (
-    identity.project_identity_schema_version !== 3
-    || typeof identity.project_id !== 'string'
-    || !identity.project_id
-    || typeof identity.workspace_id !== 'string'
-    || !identity.workspace_id
-  ) {
-    return { identity: null, reason: 'project_identity_schema_invalid', setup };
-  }
-  const expectedScope = identity.portable_reuse_eligible
-    ? identity.project_id
-    : identity.workspace_id;
-  if (identity.artifact_scope_id !== expectedScope) {
-    return { identity: null, reason: 'project_identity_scope_invalid', setup };
-  }
-  const legacySafe = identity.legacy_alias_disposition === 'safe'
-    && typeof identity.legacy_project_id === 'string'
-    && identity.legacy_project_id.length > 0;
-  const legacyUnavailable = identity.legacy_alias_disposition === 'unavailable_without_provenance'
-    && (identity.legacy_project_id === null || identity.legacy_project_id === undefined);
-  if (!legacySafe && !legacyUnavailable) {
-    return { identity: null, reason: 'project_identity_legacy_alias_invalid', setup };
-  }
-  return { identity, reason: null, setup };
-}
-
-function projectIdentityMismatch(identity, agentReadiness) {
-  const broker = agentReadiness.parsed?.readiness_broker;
-  if (!broker) return agentReadiness.ready ? 'readiness_broker_missing' : null;
-  const brokerIdentity = broker.identity;
-  if (!brokerIdentity) return agentReadiness.ready ? 'readiness_broker_identity_missing' : null;
-  if (
-    broker.schema_version !== 3
-    || brokerIdentity.project_identity_schema_version !== identity.project_identity_schema_version
-    || brokerIdentity.project_id !== identity.project_id
-    || brokerIdentity.workspace_id !== identity.workspace_id
-  ) {
-    return 'readiness_broker_identity_mismatch';
-  }
-  return null;
-}
-
-function localRefreshFailure(state, reason, readinessStatus = 'repair_setup') {
-  return {
-    state,
-    blocks_local_surfaces: true,
-    readiness_status: readinessStatus,
-    reason,
-    changed_file_count: 0,
-    new_file_count: 0,
-    removed_file_count: 0,
-    fatal_error_count: 0,
-  };
-}
-
-function localNavigationFailure(projectRoot, reason, status, summary, setup, verdict = null, localRefresh = null) {
-  const repair = localWaitFreshCommand(projectRoot);
-  return {
-    ready: false,
-    reason,
-    status,
-    summary,
-    localRefresh,
-    minimumNext: Array.isArray(verdict?.minimum_next) && verdict.minimum_next.length > 0
-      ? verdict.minimum_next
-      : [repair],
-    fullRepair: Array.isArray(verdict?.full_repair) && verdict.full_repair.length > 0
-      ? verdict.full_repair
-      : [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
-    setup: {
-      ...setup,
-      readiness_verdict: verdict,
-    },
-  };
-}
-
-function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
-  const probe = runLocalNavigationWaitFresh(resolved, projectRoot);
-  const setup = {
-    ...localReadySetup('local_wait_fresh', probe.args, probe.result),
-  };
-  if (probe.result.error || probe.result.status !== 0) {
-    const timeout = probe.result.error && probe.result.error.code === 'ETIMEDOUT';
-    return localNavigationFailure(
-      projectRoot,
-      timeout ? 'local_navigation_wait_fresh_timeout' : 'local_navigation_wait_fresh_failed',
-      'repair_setup',
-      timeout
-        ? 'CodeStory MCP timed out while refreshing local navigation before starting stdio.'
-        : 'CodeStory MCP could not refresh local navigation before starting stdio.',
-      setup,
-      null,
-      localRefreshFailure('failed', timeout ? 'wait_fresh_timeout' : 'wait_fresh_failed'),
-    );
-  }
-  const parsedProbe = parseLocalReadyResult(probe.result);
-  if (parsedProbe.invalidJson) {
-    return localNavigationFailure(
-      projectRoot,
-      'local_navigation_wait_fresh_invalid_json',
-      'repair_setup',
-      `CodeStory MCP local wait-fresh returned invalid JSON: ${parsedProbe.invalidJson}`,
-      setup,
-      null,
-      localRefreshFailure('failed', `invalid_json:${parsedProbe.invalidJson}`),
-    );
-  }
-  if (parsedProbe.ok) {
-    return {
-      ready: true,
-      setup,
-      verdict: parsedProbe.verdict || null,
-      localRefresh: parsedProbe.localRefresh || null,
-    };
-  }
-  const verdict = parsedProbe.verdict || null;
-  const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
-  const state = typeof parsedProbe.localRefresh?.state === 'string' ? parsedProbe.localRefresh.state : status;
-  return localNavigationFailure(
-    projectRoot,
-    `local_navigation_wait_fresh_${state}`,
-    status,
-    verdict?.summary || 'CodeStory local navigation is not ready after wait-fresh.',
-    setup,
-    verdict,
-    parsedProbe.localRefresh || null,
-  );
-}
-
-function probeAgentReadiness(resolved, projectRoot = process.cwd()) {
-  const probe = runAgentReadiness(resolved, projectRoot);
-  const setup = {
-    ...localReadySetup('agent_readiness', probe.args, probe.result),
-  };
-  if (probe.result.error || probe.result.status !== 0) {
-    return {
-      ready: false,
-      setup,
-      parsed: null,
-      verdict: null,
-      reason: probe.result.error
-        ? probe.result.error.message
-        : `agent_readiness_failed:${probe.result.status}`,
-    };
-  }
-  const parsedProbe = parseAgentReadinessResult(probe.result);
-  return {
-    ready: parsedProbe.ok,
-    setup,
-    parsed: parsedProbe.parsed,
-    verdict: parsedProbe.verdict,
-    reason: parsedProbe.invalidJson ? `agent_readiness_invalid_json:${parsedProbe.invalidJson}` : null,
-  };
-}
-
 function pluginRuntimeForResolved(resolved) {
   return {
     plugin_version: resolved.version,
@@ -2410,6 +1956,7 @@ function pluginRuntimeForResolved(resolved) {
     cli_sha256: resolved.sha256,
     build_source: resolved.buildSource,
     repo_ref: resolved.repoRef,
+    source_package_sha256: resolved.sourcePackageSha256 || null,
     local_dev_override: resolved.source === 'local_dev_override',
     managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
     managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
@@ -2420,29 +1967,14 @@ function pluginRuntimeForResolved(resolved) {
 }
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
-  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : launchCwd;
-  const managedProvisioning = reason === 'managed_cli_provisioning';
-  const managedProvisionFailed = String(reason || '').startsWith('managed_cli_provision_failed:');
-  const managedProvisionNext = [
-    'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
-    'Refresh or reinstall the CodeStory plugin after GitHub release assets are reachable, then restart/reload the Codex host/app and read codestory://status.',
-  ];
-  const minimumNext = options.minimumNext || (managedProvisionFailed ? managedProvisionNext : [
-    'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
-  ]);
-  const fullRepair = options.fullRepair || minimumNext;
-  const recommendedNext = options.recommendedNext || fullRepair;
-  const sidecarPolicy = readSidecarPolicy();
-  const lastRepair = normalizedSidecarLastRepair(sidecarPolicy.lastRepair, resolved.version, resolved.path);
+  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : null;
+  const preparing = reason === 'managed_cli_provisioning';
   const plugin = pluginRuntimeForResolved({ ...resolved, warnings: [...resolved.warnings, reason] });
-  const repair = {
-    goal: options.goal || 'local_navigation',
-    status: options.status || 'repair_setup',
+  const readiness = {
+    goal: 'runtime',
+    status: preparing ? 'preparing' : 'unavailable',
     summary: options.summary || 'CodeStory plugin MCP could not start a compatible codestory-cli stdio runtime.',
-    repair_reason: reason,
-    local_refresh: options.localRefresh || null,
-    minimum_next: minimumNext,
-    full_repair: fullRepair,
+    reason,
     setup: {
       active_path: resolved.path,
       active_version: probe.version,
@@ -2454,7 +1986,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
       ...(options.setup || {}),
     },
   };
-  const localSurfaces = [
+  const surfaces = [
     'ground',
     'files',
     'symbol',
@@ -2471,293 +2003,47 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'neighbors',
     'shortest_path',
     'query_subgraph',
+    'packet',
+    'search',
+    'context',
   ];
-  const sidecarSurfaces = ['packet', 'search', 'context'];
   const blockedSurface = () => ({
     allowed: false,
-    readiness_goal: repair.goal,
+    readiness_goal: readiness.goal,
     failed_layer: 'runtime_setup',
-    repair_reason: reason,
+    reason,
   });
-  const allowedSurfaces = Object.fromEntries([
-    ...localSurfaces.map((surface) => [surface, blockedSurface()]),
-    ...sidecarSurfaces.map((surface) => [surface, blockedSurface()]),
-  ]);
-  allowedSurfaces.repair_all = {
-    ...blockedSurface('repair_all', 'agent_packet_search'),
-    blocked_reason: 'diagnostic_fail_open',
-  };
-  const sidecarSetup = {
-    state: sidecarPolicy.state || 'unavailable',
-    auto_repair: false,
-    status_triggered_repair: false,
-    explicit_repair_enabled: sidecarPolicy.state === 'enabled',
-    repair_mode: 'diagnostic_fail_open',
-    prompt_required: sidecarPolicy.state === 'ask',
-    prompt: sidecarPolicy.state === 'ask'
-      ? 'CodeStory packet/search needs retrieval sidecars. MCP repair may start or download retrieval sidecars for this project. Enable MCP sidecar repair for this plugin install?'
-      : null,
-    last_repair: lastRepair,
-    active_repair: null,
-    abandoned_repair: null,
-  };
-  allowedSurfaces.sidecar_setup = {
-    allowed: true,
-    readiness_goal: repair.goal,
-    status: repair.status,
-    repair_reason: reason,
-    blocked_reason: 'diagnostic_fail_open_repair_unavailable',
-    summary: 'sidecar_setup status and policy actions are available in diagnostic fail-open mode; repair requires the real stdio runtime.',
-    allowed_actions: ['status', 'enable', 'disable', 'ask'],
-    canonical_arguments: { action: 'status' },
-    minimum_next: minimumNext,
-    full_repair: fullRepair,
-  };
-  const readinessBroker = {
-    schema_version: 2,
-    identity: null,
-    install_id: null,
-    project_id: null,
-    canonical_root_hash: null,
-    workspace_root: projectRoot,
-    cli_version: probe.version,
-    updated_at_epoch_ms: Date.now(),
-    snapshot_path: null,
-    persistence_status: 'unavailable',
-    persistence_error: 'diagnostic_fail_open',
-    operations: [],
-    resources: {},
-    reconciliation: {
-      status: 'diagnostic_fail_open',
-      cleanup_performed: false,
-      stale_status_paths_removed: [],
-      stale_lock_paths_removed: [],
-      abandoned_repairs: [],
-      local_refresh_cleanups: [],
-      active_repair: null,
-      unresolved_orphan_reason: reason,
-    },
-    gpu_proof: {
-      requested: false,
-      requested_provider: null,
-      requested_device: null,
-      policy: null,
-      observed_state: null,
-      observation_source: null,
-      detected_provider: null,
-      detected_gpu: null,
-      cpu_allowed: false,
-      proof_status: 'diagnostic_fail_open',
-      meaningful_accelerator_work_proven: false,
-      embed_smoke_ok: null,
-      embed_smoke_ms: null,
-      degraded_reason: reason,
-    },
-  };
   return {
-    server_version: null,
     cli_version: probe.version,
-    server_executable: null,
-    server_executable_sha256: null,
-    source_checkout_version: sourceCheckoutVersion(projectRoot),
-    sidecar_contract_version: null,
     plugin_runtime: plugin,
-    runtime_truth: runtimeTruthStatus(plugin, {
-      sidecarPolicy: sidecarPolicy.state || 'unavailable',
-      localRefresh: options.localRefresh || null,
-      readinessGoals: [repair.goal],
-      hasReadinessBroker: true,
-    }),
-    runtime_boundary: {
-      restart_required_for_runtime_change: !managedProvisioning,
-      message: managedProvisioning
-        ? 'Managed CLI provisioning is running in this launcher; the next request after verified publication hands off to the real stdio runtime.'
-        : 'A running MCP server keeps using the CLI process it was launched with; plugin refresh or CODESTORY_CLI changes require a host reload/restart and fresh codestory://status readback.',
+    runtime: {
+      source: plugin.cli_source || 'unavailable',
+      state: readiness.status,
+      automatic: true,
     },
     warnings: plugin.warnings,
     project_root: projectRoot,
     project_root_source: options.projectRootSource || null,
     retrieval_mode: 'unavailable',
     degraded_reason: reason,
-    local_refresh: options.localRefresh || null,
-    readiness: [repair],
-    sidecar_setup: sidecarSetup,
-    readiness_broker: readinessBroker,
-    allowed_surfaces: allowedSurfaces,
-    recommended_next_calls: singleRepairNextCalls(recommendedNext),
-  };
-}
-
-function projectRootUnavailableDiagnostic(resolved, probe, projectResolution) {
-  const projectRoot = projectResolution.projectRoot || null;
-  const reason = projectRoot ? 'project_root_recovered_after_launch' : projectResolution.reason;
-  return fallbackDiagnostic(resolved, probe, reason, {
-    projectRoot,
-    projectRootSource: projectResolution.source,
-    goal: 'project_root',
-    status: 'repair_setup',
-    summary: projectRoot
-      ? 'CodeStory plugin MCP found a target project root after diagnostic startup and will hand off to the real stdio runtime on the next request.'
-      : 'CodeStory plugin MCP could not determine the target project root before starting stdio.',
-    minimumNext: projectRoot
-      ? ['Retry the CodeStory MCP request; this diagnostic wrapper will hand off to codestory-cli serve --stdio.']
-      : ['Start or reload the Codex host from the target repo, then read codestory://status.'],
-    fullRepair: projectRoot
-      ? [
-          'Retry the CodeStory MCP request; this diagnostic wrapper will hand off to codestory-cli serve --stdio.',
-          'If the client cached the earlier tool list, restart/reload the Codex host and read codestory://status.',
-        ]
-      : [
-          'Start or resume the Codex session in the target repo so CodeStory can infer the active project root.',
-          'Restart/reload the Codex host from the target repo, then read codestory://status.',
-        ],
-    setup: projectResolutionDiagnostics(projectResolution),
-  });
-}
-
-async function bootstrapStatus(projectRoot = launchCwd) {
-  projectRoot = normalizeProjectRoot(projectRoot);
-  const resolved = await resolveCli();
-  const probe = probeResolvedCli(resolved);
-  const failOpenReason = failOpenReasonForProbe(resolved, probe);
-  if (failOpenReason) {
-    resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, { dryRun: true });
-    rememberLaunch(resolved);
-    return {
-      ready: false,
-      ...fallbackDiagnostic(resolved, probe, failOpenReason, { projectRoot }),
-    };
-  }
-  resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
-  rememberLaunch(resolved);
-
-  const projectIdentity = probeProjectIdentity(resolved, projectRoot);
-  if (!projectIdentity.identity) {
-    return {
-      ready: false,
-      ...fallbackDiagnostic(resolved, probe, projectIdentity.reason, {
-        projectRoot,
-        summary: 'CodeStory plugin MCP could not verify the request-scoped project identity.',
-        setup: projectIdentity.setup,
-      }),
-    };
-  }
-
-  const localReadiness = probeLocalNavigation(resolved, projectRoot);
-  if (!localReadiness.ready) {
-    return {
-      ready: false,
-      ...fallbackDiagnostic(resolved, probe, localReadiness.reason, {
-        projectRoot,
-        status: localReadiness.status,
-        summary: localReadiness.summary,
-        minimumNext: localReadiness.minimumNext,
-        fullRepair: localReadiness.fullRepair,
-        localRefresh: localReadiness.localRefresh,
-        setup: { ...projectIdentity.setup, ...localReadiness.setup },
-      }),
-    };
-  }
-
-  const sidecarPolicy = readSidecarPolicy();
-  const plugin = pluginRuntimeForResolved(resolved);
-  const agentReadiness = probeAgentReadiness(resolved, projectRoot);
-  const identityMismatch = projectIdentityMismatch(projectIdentity.identity, agentReadiness);
-  if (identityMismatch) {
-    return {
-      ready: false,
-      ...fallbackDiagnostic(resolved, probe, identityMismatch, {
-        projectRoot,
-        summary: 'CodeStory plugin MCP rejected stale or cross-project readiness evidence.',
-        localRefresh: localReadiness.localRefresh,
-        setup: {
-          ...projectIdentity.setup,
-          ...localReadiness.setup,
-          ...agentReadiness.setup,
-          project_identity: projectIdentity.identity,
-        },
-      }),
-    };
-  }
-  const localRefresh = localReadiness.localRefresh || {
-    state: 'fresh',
-    blocks_local_surfaces: false,
-    readiness_status: 'ready',
-  };
-  const repair = {
-    goal: 'local_navigation',
-    status: 'ready',
-    summary: localReadiness.verdict?.summary || 'CodeStory local navigation is ready.',
-    repair_reason: null,
-    local_refresh: localRefresh,
-    minimum_next: [{ method: 'resources/read', uri: 'codestory://status' }],
-    full_repair: [],
-    setup: {
-      ...projectIdentity.setup,
-      ...localReadiness.setup,
-      readiness_verdict: localReadiness.verdict,
-      ...agentReadiness.setup,
-      agent_readiness_verdict: agentReadiness.verdict,
-      agent_readiness_reason: agentReadiness.reason,
+    readiness: [readiness],
+    managed_retrieval: {
+      state: readiness.status,
+      automatic: true,
     },
+    allowed_surfaces: Object.fromEntries(surfaces.map((surface) => [surface, blockedSurface()])),
+    recommended_next_calls: preparing
+      ? [{ method: 'tools/call', instruction: 'Retry the intended CodeStory tool shortly.', retry_after_ms: 1500 }]
+      : projectRoot
+        ? [{
+            method: 'resources/read',
+            uri: projectBoundResourceUri('codestory://status', projectRoot),
+          }]
+        : [{
+            method: 'resources/read',
+            uri_template: 'codestory://status{?project}',
+          }],
   };
-  const readiness = [repair];
-  if (agentReadiness.verdict) readiness.push(agentReadiness.verdict);
-  return {
-    ready: true,
-    project_root: projectRoot,
-    project_identity: projectIdentity.identity,
-    server_version: resolved.version,
-    cli_version: probe.version,
-    plugin_runtime: plugin,
-    project_root_source: 'argument',
-    runtime_truth: runtimeTruthStatus(plugin, {
-      sidecarPolicy: sidecarPolicy.state || 'unavailable',
-      localRefresh,
-      readinessGoals: readiness.map((verdict) => verdict.goal),
-      readinessLanes: agentReadiness.parsed?.readiness_lanes || null,
-      hasReadinessBroker: Boolean(agentReadiness.parsed?.readiness_broker),
-    }),
-    local_refresh: localRefresh,
-    readiness,
-    readiness_lanes: agentReadiness.parsed?.readiness_lanes || null,
-    readiness_broker: agentReadiness.parsed?.readiness_broker || null,
-    recommended_next_calls: [{ method: 'resources/read', uri: 'codestory://status' }],
-  };
-}
-
-async function handleBootstrapStatusCommand(argv) {
-  if (argv[2] !== 'bootstrap-status') return false;
-  const resolution = resolveProjectRoot({
-    projectRoot: optionValue(argv, '--project'),
-    projectRootProvided: argv.includes('--project'),
-  });
-  try {
-    if (!resolution.projectRoot) {
-      const resolved = await resolveCli();
-      const probe = probeResolvedCli(resolved);
-      const failOpenReason = failOpenReasonForProbe(resolved, probe);
-      resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, {
-        dryRun: Boolean(failOpenReason),
-      });
-      rememberLaunch(resolved);
-      process.stdout.write(`${JSON.stringify({
-        ready: false,
-        ...projectRootUnavailableDiagnostic(resolved, probe, resolution),
-      })}\n`);
-      process.exit(0);
-    }
-    const projectRoot = resolution.projectRoot;
-    process.stdout.write(`${JSON.stringify(await bootstrapStatus(projectRoot))}\n`);
-  } catch (error) {
-    process.stdout.write(`${JSON.stringify({
-      ready: false,
-      degraded_reason: `launcher_error:${error.message}`,
-      project_root: resolution.projectRoot,
-      project_root_source: resolution.source,
-    })}\n`);
-  }
-  process.exit(0);
 }
 
 function sameFilesystemPath(left, right) {
@@ -2831,46 +2117,6 @@ function releasePluginCacheCwd() {
   }
 }
 
-function sourceCheckoutVersion(projectRoot) {
-  if (!projectRoot) return null;
-  try {
-    return cargoPackageVersion(fs.readFileSync(path.join(projectRoot, 'crates', 'codestory-cli', 'Cargo.toml'), 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function cargoPackageVersion(manifest) {
-  let inPackage = false;
-  for (const line of manifest.split(/\r?\n/u)) {
-    const trimmed = line.trim();
-    if (/^\[[^\]]+\]$/u.test(trimmed)) {
-      inPackage = trimmed === '[package]';
-      continue;
-    }
-    if (!inPackage) continue;
-    const match = trimmed.match(/^version\s*=\s*"([^"]+)"/u);
-    if (match) return match[1];
-  }
-  return null;
-}
-
-function diagnosticText(status) {
-  const setup = status.readiness[0].setup;
-  const next = status.recommended_next_calls?.[0] || status.readiness[0].minimum_next?.[0] || null;
-  return [
-    'CodeStory MCP runtime is not ready.',
-    `reason: ${status.degraded_reason}`,
-    `plugin_version: ${status.plugin_runtime.plugin_version || '<unknown>'}`,
-    `plugin_root: ${status.plugin_runtime.plugin_root}`,
-    `cli_source: ${status.plugin_runtime.cli_source}`,
-    `cli_path: ${setup.active_path}`,
-    `cli_version: ${setup.active_version || '<unknown>'}`,
-    `source_checkout_version: ${status.source_checkout_version || '<none>'}`,
-    `next: ${next ? JSON.stringify(next) : 'read codestory://status'}`,
-  ].join('\n');
-}
-
 function jsonrpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
@@ -2889,49 +2135,278 @@ function resourceContents(uri, value) {
   };
 }
 
-function failOpenSidecarSetupResult(request, status = null) {
-  const action = request.params?.arguments?.action || 'status';
-  if (action === 'repair') {
-    return {
-      isError: true,
-      content: [{ type: 'text', text: 'sidecar_setup repair is unavailable while CodeStory is in diagnostic fail-open mode; reload the host or restore the stdio runtime first.' }],
-      structuredContent: {
-        code: 'repair_unavailable_diagnostic_fail_open',
-        action,
-        recommended_next_calls: [{
-          method: 'resources/read',
-          uri: 'codestory://status',
-          instruction: 'Read status again after restoring the compatible stdio runtime.',
-        }],
-      },
-    };
+function strictUriComponentEncode(value) {
+  let encoded = '';
+  for (const byte of Buffer.from(String(value), 'utf8')) {
+    const unreserved =
+      (byte >= 0x30 && byte <= 0x39)
+      || (byte >= 0x41 && byte <= 0x5A)
+      || (byte >= 0x61 && byte <= 0x7A)
+      || [0x2D, 0x2E, 0x5F, 0x7E].includes(byte);
+    encoded += unreserved ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
   }
-  if (!['status', 'enable', 'disable', 'ask'].includes(action)) {
-    return {
-      isError: true,
-      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, or ask while the runtime is in diagnostic mode.' }],
-      structuredContent: { code: 'invalid_sidecar_setup_action', action },
-    };
+  return encoded;
+}
+
+function strictUriComponentDecode(value, label) {
+  const bytes = [];
+  for (let index = 0; index < value.length;) {
+    const code = value.charCodeAt(index);
+    const unreserved =
+      (code >= 0x30 && code <= 0x39)
+      || (code >= 0x41 && code <= 0x5A)
+      || (code >= 0x61 && code <= 0x7A)
+      || [0x2D, 0x2E, 0x5F, 0x7E].includes(code);
+    if (unreserved) {
+      bytes.push(code);
+      index += 1;
+      continue;
+    }
+    const escape = value.slice(index, index + 3);
+    if (!/^%[0-9A-F]{2}$/u.test(escape)) {
+      throw new Error(`${label} uses a non-canonical URI encoding`);
+    }
+    bytes.push(Number.parseInt(escape.slice(1), 16));
+    index += 3;
   }
-  if (action !== 'status') {
-    writeSidecarPolicy(sidecarPolicyStateForAction(action));
+  let decoded;
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
+  } catch {
+    throw new Error(`${label} is not valid UTF-8`);
   }
-  const policy = readSidecarPolicy();
-  const lastRepair = normalizedSidecarLastRepair(
-    policy.lastRepair,
-    status?.plugin_runtime?.plugin_version,
-    status?.plugin_runtime?.cli_path,
-  );
-  const statusPolicy = { ...policy, lastRepair };
+  if (strictUriComponentEncode(decoded) !== value) {
+    throw new Error(`${label} uses a non-canonical URI encoding`);
+  }
+  return decoded;
+}
+
+function cleanPublicProjectPath(value, platform = process.platform) {
+  if (platform !== 'win32') return String(value);
+  let project = String(value).replaceAll('\\', '/');
+  if (project.startsWith('//?/UNC/')) {
+    project = `//${project.slice('//?/UNC/'.length)}`;
+  } else if (project.startsWith('//?/')) {
+    project = project.slice('//?/'.length);
+  }
+  return project;
+}
+
+function projectBoundResourceUri(baseUri, project) {
+  return `${baseUri}?project=${strictUriComponentEncode(cleanPublicProjectPath(project))}`;
+}
+
+function parseFailOpenResourceRequest(uri, legacyProject) {
+  if (uri === 'codestory://agent-guide') {
+    if (legacyProject !== undefined) {
+      throw new Error('resource_project_unexpected: codestory://agent-guide is static and does not accept a project selector');
+    }
+    return { kind: 'agent-guide', project: null, uri };
+  }
+  const queryIndex = typeof uri === 'string' ? uri.indexOf('?') : -1;
+  const baseUri = queryIndex >= 0 ? uri.slice(0, queryIndex) : uri;
+  const query = queryIndex >= 0 ? uri.slice(queryIndex + 1) : null;
+  if (baseUri !== 'codestory://status') {
+    throw new Error(`unknown resource: ${uri || '<missing>'}`);
+  }
+  if (query !== null && (query.includes('?') || query.includes('&'))) {
+    throw new Error('resource_project_conflict: project-scoped resource URI must include exactly one `project` query selector');
+  }
+  if (query !== null && legacyProject !== undefined) {
+    throw new Error('resource_project_conflict: pass `project` exactly once, either in the resource URI or the legacy params field');
+  }
+  let projectValue = legacyProject;
+  if (query !== null) {
+    if (!query.startsWith('project=') || query.slice('project='.length).includes('=')) {
+      throw new Error('resource_project_malformed: expected one non-empty `project` query selector');
+    }
+    const encodedProject = query.slice('project='.length);
+    if (!encodedProject) {
+      throw new Error('resource_project_malformed: expected one non-empty `project` query selector');
+    }
+    projectValue = strictUriComponentDecode(encodedProject, 'resource project');
+  }
+  const selection = selectExplicitProject(projectValue);
+  if (!selection.ok) {
+    throw new Error(`${selection.code}: ${selection.message}`);
+  }
+  const project = cleanPublicProjectPath(selection.project);
   return {
-    content: [{ type: 'text', text: JSON.stringify(statusPolicy) }],
-    structuredContent: {
-      state: policy.state,
-      path: policy.path,
-      updated_at: policy.updatedAt,
-      last_repair: lastRepair,
-    },
+    kind: 'status',
+    project,
+    projectSource: query === null ? 'request_argument' : 'resource_uri',
+    uri: projectBoundResourceUri(baseUri, project),
   };
+}
+
+function failOpenToolCatalog() {
+  if (!Array.isArray(canonicalMcpCatalog?.tools)) {
+    throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
+  }
+  return JSON.parse(JSON.stringify(canonicalMcpCatalog.tools));
+}
+
+function selectExplicitProject(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return {
+      ok: false,
+      code: 'project_required',
+      message: 'Pass the caller\'s absolute repository root in the `project` argument.',
+      project: null,
+    };
+  }
+  if (!path.isAbsolute(value)) {
+    return {
+      ok: false,
+      code: 'project_required',
+      message: '`project` must be an absolute repository root.',
+      project: null,
+    };
+  }
+  const project = path.resolve(value);
+  try {
+    if (!fs.statSync(project).isDirectory()) {
+      throw Object.assign(new Error('project is not a directory'), { code: 'ENOTDIR' });
+    }
+    return { ok: true, project: fs.realpathSync(project) };
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'project_unavailable',
+      message: `Project root is unavailable: ${project} (${error.code || error.message})`,
+      project,
+    };
+  }
+}
+
+function failOpenToolResult(tool, status, argumentsValue = {}) {
+  const preparing = status.managed_retrieval?.state === 'preparing';
+  const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
+  const degradedReason = status.degraded_reason || readiness?.reason || (preparing ? 'managed_cli_provisioning' : 'runtime_unavailable');
+  const primaryFailure = readiness?.setup?.probe_error
+    || readiness?.setup?.probe_stderr
+    || readiness?.summary
+    || status.warnings?.find((warning) => String(warning || '').trim())
+    || degradedReason;
+  const selection = selectExplicitProject(argumentsValue.project);
+  if (!selection.ok) {
+    const structuredContent = {
+      code: selection.code,
+      message: selection.message,
+      tool,
+      project: selection.project,
+      state: selection.code === 'project_required' ? 'no_project' : 'unavailable',
+    };
+    if (tool === 'status' && selection.code === 'project_required') {
+      return {
+        content: [{ type: 'text', text: 'state: no_project\nresult: structured\n' }],
+        structuredContent,
+      };
+    }
+    return {
+      content: [{ type: 'text', text: structuredContent.message }],
+      structuredContent,
+      isError: true,
+    };
+  }
+  const project = selection.project;
+  if (tool === 'status') {
+    const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
+    const structuredContent = {
+      project,
+      state: preparing ? 'preparing' : 'unavailable',
+      degraded_reason: degradedReason,
+      capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
+      current_operation: preparing ? {
+        operation_id: 'managed-runtime-provisioning',
+        state: 'preparing',
+        stage: 'dense_preparation',
+        attempt: 1,
+        retry_after_ms: 1500,
+        failure: null,
+      } : null,
+      failure: preparing ? null : primaryFailure,
+      next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
+      retry_after_ms: preparing ? 1500 : null,
+      diagnostics_uri: diagnosticsUri,
+    };
+    return {
+      content: [{ type: 'text', text: `state: ${structuredContent.state}\nresult: structured\n` }],
+      structuredContent,
+    };
+  }
+  const diagnosticsUri = projectBoundResourceUri('codestory://status', project);
+  const structuredContent = preparing ? {
+    code: 'codestory_preparing',
+    message: 'CodeStory is preparing. Retry the same tool shortly.',
+    tool,
+    project,
+    state: 'preparing',
+    retry_tool: tool,
+    retry_after_ms: 1500,
+    operation: {
+      operation_id: 'managed-runtime-provisioning',
+      state: 'preparing',
+      stage: 'dense_preparation',
+      attempt: 1,
+      retry_after_ms: 1500,
+      failure: null,
+    },
+    diagnostics_uri: diagnosticsUri,
+  } : {
+    code: 'codestory_unavailable',
+    message: 'CodeStory is unavailable. Continue with focused source inspection.',
+    tool,
+    project,
+    state: 'unavailable',
+    diagnostics_uri: diagnosticsUri,
+  };
+  return {
+    content: [{ type: 'text', text: structuredContent.message }],
+    structuredContent,
+    isError: true,
+  };
+}
+
+const shuttingDownHandoffs = new WeakSet();
+
+function shutdownHandoffChild(child, options = {}) {
+  if (!child || typeof child !== 'object' || shuttingDownHandoffs.has(child)) return;
+  shuttingDownHandoffs.add(child);
+  try {
+    child.stdin?.end();
+  } catch {
+    // Continue to the bounded process shutdown below.
+  }
+  if (typeof child.kill !== 'function') return;
+  const isRunning = () => child.exitCode == null && child.signalCode == null;
+  const graceMs = options.handoffTerminationGraceMs ?? 500;
+  const forceGraceMs = options.handoffForceKillGraceMs ?? 500;
+  let forceTimer = null;
+  const terminateTimer = setTimeout(() => {
+    if (!isRunning()) return;
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      return;
+    }
+    forceTimer = setTimeout(() => {
+      if (!isRunning()) return;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // The child already left or the platform rejected the final signal.
+      }
+    }, forceGraceMs);
+    forceTimer.unref?.();
+  }, graceMs);
+  terminateTimer.unref?.();
+  const clearTimers = () => {
+    clearTimeout(terminateTimer);
+    if (forceTimer) clearTimeout(forceTimer);
+  };
+  child.once?.('exit', clearTimers);
+  child.once?.('close', clearTimers);
 }
 
 function runFailOpenMcp(status, options = {}) {
@@ -2970,7 +2445,9 @@ function runFailOpenMcp(status, options = {}) {
     const failHandoff = (reason, details = {}) => {
       if (handoffFailureHandled) return;
       handoffFailureHandled = true;
+      const failedHandoff = handoff;
       handoff = null;
+      shutdownHandoffChild(failedHandoff, options);
       if (typeof options.onRuntimeFailure !== 'function') {
         process.exit(details.code || 1);
         return;
@@ -3027,41 +2504,19 @@ function runFailOpenMcp(status, options = {}) {
     if (stdinEnded) handoff.stdin.end();
     return handoff;
   };
-  const tools = [{
-    name: 'sidecar_setup',
-    description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode. Repair requires the real stdio runtime.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask'], default: 'status' },
-      },
-      additionalProperties: false,
-    },
-    outputSchema: { type: 'object', additionalProperties: true },
-    safety: {
-      readOnly: false,
-      sideEffects: true,
-      localOnly: true,
-      openWorld: false,
-      mutation: 'local_plugin_configuration',
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  }];
-  const resources = [
-    { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
-    { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
-  ];
+  const tools = failOpenToolCatalog();
+  const resources = (canonicalMcpCatalog.resources || []).filter(({ uri }) =>
+    uri === 'codestory://agent-guide');
+  // Fail-open serves the project-bound status template and static guide. Do
+  // not advertise other generated templates or prompts until the native
+  // runtime owns their read/get handlers.
+  const resourceTemplates = (canonicalMcpCatalog.resourceTemplates || []).filter(({ uriTemplate }) =>
+    uriTemplate === 'codestory://status{?project}');
+  const prompts = [];
   const guide = () => {
-    const liveStatus = currentStatus();
     return {
-      status: 'repair_setup',
-      message: 'Read codestory://status, follow recommended_next_calls, restore a compatible stdio runtime, then retry grounding.',
-      recommended_next_calls: liveStatus.recommended_next_calls,
+      message: 'Call the tool that matches the task and pass its absolute repository root. If it reports preparing, retry that same tool after its delay.',
+      diagnostics_uri_template: 'codestory://status{?project}',
     };
   };
   let buffer = '';
@@ -3114,23 +2569,43 @@ function runFailOpenMcp(status, options = {}) {
         response = jsonrpcResult(request.id, { tools });
       } else if (request.method === 'resources/list') {
         response = jsonrpcResult(request.id, { resources });
+      } else if (request.method === 'resources/templates/list') {
+        response = jsonrpcResult(request.id, { resourceTemplates });
       } else if (request.method === 'prompts/list') {
-        response = jsonrpcResult(request.id, { prompts: [] });
+        response = jsonrpcResult(request.id, { prompts });
       } else if (request.method === 'resources/read') {
         const uri = request.params?.uri;
-        if (uri === 'codestory://status') {
-          response = jsonrpcResult(request.id, resourceContents(uri, currentStatus()));
-        } else if (uri === 'codestory://agent-guide') {
-          response = jsonrpcResult(request.id, resourceContents(uri, guide()));
-        } else {
-          response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
+        let parsedResource;
+        try {
+          parsedResource = parseFailOpenResourceRequest(uri, request.params?.project);
+        } catch (error) {
+          response = jsonrpcError(request.id, -32602, error.message);
+        }
+        if (parsedResource?.kind === 'status') {
+          const project = parsedResource.project;
+          const statusValue = { ...currentStatus() };
+          statusValue.project_root = project;
+          statusValue.project_root_source = parsedResource.projectSource;
+          statusValue.diagnostics_uri = parsedResource.uri;
+          if (Array.isArray(statusValue.recommended_next_calls)) {
+            statusValue.recommended_next_calls = statusValue.recommended_next_calls.map((call) =>
+              call?.method === 'resources/read'
+                && call?.uri_template === 'codestory://status{?project}'
+                ? { method: call.method, uri: parsedResource.uri }
+                : call);
+          }
+          response = jsonrpcResult(
+            request.id,
+            resourceContents(parsedResource.uri, statusValue),
+          );
+        } else if (parsedResource?.kind === 'agent-guide') {
+          response = jsonrpcResult(request.id, resourceContents(parsedResource.uri, guide()));
         }
       } else if (request.method === 'tools/call') {
-        if (request.params?.name === 'sidecar_setup') {
-          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(request, currentStatus()));
-        } else {
-          response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status and restore a compatible stdio runtime.');
-        }
+        const tool = request.params?.name;
+        response = tools.some((candidate) => candidate.name === tool)
+          ? jsonrpcResult(request.id, failOpenToolResult(tool, currentStatus(), request.params?.arguments))
+          : jsonrpcError(request.id, -32602, `unknown tool: ${tool || '<missing>'}`);
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }
@@ -3139,7 +2614,7 @@ function runFailOpenMcp(status, options = {}) {
   });
   process.stdin.on('end', () => {
     stdinEnded = true;
-    handoff?.stdin.end();
+    shutdownHandoffChild(handoff, options);
   });
   return { notifyRuntimeReady };
 }
@@ -3166,6 +2641,7 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
       cliVersion: resolved.cliVersion || null,
       repoRef: resolved.repoRef || null,
       buildSource: resolved.buildSource || null,
+      sourcePackageSha256: resolved.sourcePackageSha256 || null,
       archiveSha256: resolved.archiveSha256 || null,
       archiveUrl: resolved.archiveUrl || null,
       provisionedAt: resolved.provisionedAt || null,
@@ -3178,7 +2654,6 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
 }
 
 function stdioRuntimeEnv(resolved, runtimeCwd) {
-  const sidecarStatus = readSidecarPolicy();
   return {
     ...process.env,
     CODESTORY_PLUGIN_VERSION: resolved.version || '',
@@ -3193,6 +2668,7 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
     CODESTORY_PLUGIN_CLI_MANIFEST_PATH: resolved.manifestPath || '',
     CODESTORY_PLUGIN_CLI_BUILD_SOURCE: resolved.buildSource || '',
     CODESTORY_PLUGIN_CLI_REPO_REF: resolved.repoRef || '',
+    CODESTORY_PLUGIN_SOURCE_PACKAGE_SHA256: resolved.sourcePackageSha256 || '',
     CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256: resolved.archiveSha256 || '',
     CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
     CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
@@ -3200,15 +2676,6 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
     CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
     CODESTORY_PLUGIN_MULTI_PROJECT: '1',
     CODESTORY_PLUGIN_DATA: pluginDataDir() || '',
-    CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
-    CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
-    CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
-    CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
-    CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
   };
 }
 
@@ -3222,8 +2689,6 @@ function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
 }
 
 async function main() {
-  if (await handleBootstrapStatusCommand(process.argv)) return;
-  handleSidecarPolicyCommand(process.argv);
   const runtimeCwd = releasePluginCacheCwd();
   const installed = await resolveCli({ provision: false });
   if (
@@ -3235,9 +2700,7 @@ async function main() {
     let status = fallbackDiagnostic(installed, probeResolvedCli(installed), 'managed_cli_provisioning', {
       projectRoot: null,
       projectRootSource: 'request_argument',
-      summary: 'CodeStory managed CLI provisioning is running in the background.',
-      minimumNext: ['Read codestory://status again while managed CLI provisioning continues.'],
-      fullRepair: ['Read codestory://status again while managed CLI provisioning continues.'],
+      summary: 'CodeStory is preparing. The requested tool will be available shortly.',
     });
     setImmediate(() => {
       resolveCli().then((resolved) => {
@@ -3297,41 +2760,33 @@ async function main() {
   }
   resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
   rememberLaunch(resolved, runtimeCwd);
-  const child = spawnStdioRuntime(resolved, runtimeCwd, 'inherit');
-
-  child.on('exit', (code, signal) => {
-    if (signal) process.kill(process.pid, signal);
-    if (!code) {
-      process.exit(0);
-      return;
-    }
-    runFailOpenMcp(fallbackDiagnostic(resolved, {
-      ...probe,
-      status: code,
-      error: `codestory-cli serve --stdio exited with status ${code}`,
-      stderr: probe.stderr || '',
-    }, 'runtime_stdio_child_exit', {
-      projectRoot: null,
-      projectRootSource: 'request_argument',
-      summary: 'CodeStory plugin MCP launched codestory-cli, but the stdio runtime exited before it could serve requests.',
-      minimumNext: [
-        'Call the status tool with an explicit project for the active runtime diagnostic.',
-        'Restart/reload the Codex host/app after updating or repairing the CodeStory plugin runtime.',
-      ],
-    }));
+  let status = fallbackDiagnostic(resolved, probe, 'runtime_stdio_handoff', {
+    projectRoot: null,
+    projectRootSource: 'request_argument',
+    summary: 'CodeStory is handing the initialized MCP session to its verified stdio runtime.',
   });
-
-  child.on('error', (error) => {
-    runFailOpenMcp(fallbackDiagnostic(resolved, {
-      status: null,
-      error: error.message,
-      version: null,
-      stdout: '',
-      stderr: '',
-    }, `${resolved.source}_cli_unspawnable`, {
-      projectRoot: null,
-      projectRootSource: 'request_argument',
-    }));
+  let handoffReady = true;
+  runFailOpenMcp(() => status, {
+    shouldHandoff: () => handoffReady,
+    startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
+    onRuntimeFailure: (failure) => {
+      handoffReady = false;
+      const reason = failure.error ? `${resolved.source}_cli_unspawnable` : 'runtime_stdio_child_exit';
+      const error = failure.error?.message
+        || (failure.code != null
+          ? `codestory-cli serve --stdio exited with status ${failure.code}`
+          : failure.reason);
+      status = fallbackDiagnostic(resolved, {
+        ...probe,
+        status: failure.code ?? null,
+        error,
+        stderr: probe.stderr || '',
+      }, reason, {
+        projectRoot: null,
+        projectRootSource: 'request_argument',
+        summary: 'CodeStory launched its verified CLI, but the stdio runtime failed during handoff.',
+      });
+    },
   });
 }
 
@@ -3365,8 +2820,14 @@ if (require.main === module) {
   module.exports = {
     _test: {
       compareManagedCliVersions,
+      cleanPublicProjectPath,
       downloadFile,
       extractArchive,
+      failOpenToolCatalog,
+      parseFailOpenResourceRequest,
+      projectBoundResourceUri,
+      strictUriComponentDecode,
+      strictUriComponentEncode,
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,
@@ -3382,6 +2843,7 @@ if (require.main === module) {
       resolveManagedCli,
       runFailOpenMcp,
       sameFilesystemPath,
+      shutdownHandoffChild,
       managedCliRetentionReport,
       managedCliVersionEntries,
       removeManagedCliVersion,

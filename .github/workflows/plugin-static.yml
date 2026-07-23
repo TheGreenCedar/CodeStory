@@ -11,6 +11,22 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/fixtures/workflow-policy-invalid.json
+      - .github/scripts/fixtures/actionlint-invalid.yml
+      - .github/scripts/run-actionlint.mjs
+      - .github/scripts/run-actionlint.test.mjs
+      - .github/actionlint.yaml
+      - release-claims.json
+      - scripts/codestory-release-claims.mjs
+      - scripts/codestory-release-closeout.mjs
+      - scripts/codestory-release-evidence-gate.mjs
+      - scripts/tests/codestory-release-claims.test.mjs
+      - scripts/tests/codestory-release-closeout.test.mjs
+      - scripts/tests/codestory-release-evidence-gate.test.mjs
+      - scripts/tests/fixtures/release-claims/**
+      - benchmarks/release-evidence/**
+      - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/docker/**
       - package.json
       - package-lock.json
       - .github/scripts/route-ci-proof.mjs
@@ -22,13 +38,25 @@ on:
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/windows-vulkan-proof.yml
+      - '.github/workflows/retrieval-engine-smoke.yml'
       - .github/workflows/source-proof.yml
       - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
+      - .github/workflows/**
       - scripts/install-codestory.ps1
+      - scripts/prepare-embedded-model.mjs
+      - scripts/tests/prepare-embedded-model.test.mjs
+      - crates/codestory-llama-sys/model-contract.json
+      - crates/codestory-llama-sys/build.rs
+      - crates/codestory-llama-sys/model_staging.rs
+      - crates/codestory-llama-sys/Cargo.toml
+      - crates/codestory-llama-sys/tests/model_staging.rs
+      - scripts/release-evidence/**
+      - scripts/release-evidence/serde-json-codestory-project.json
+      - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
-      - scripts/setup-retrieval-env.*
       - .codex/environments/environment.toml
   push:
     branches:
@@ -43,6 +71,22 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/fixtures/workflow-policy-invalid.json
+      - .github/scripts/fixtures/actionlint-invalid.yml
+      - .github/scripts/run-actionlint.mjs
+      - .github/scripts/run-actionlint.test.mjs
+      - .github/actionlint.yaml
+      - release-claims.json
+      - scripts/codestory-release-claims.mjs
+      - scripts/codestory-release-closeout.mjs
+      - scripts/codestory-release-evidence-gate.mjs
+      - scripts/tests/codestory-release-claims.test.mjs
+      - scripts/tests/codestory-release-closeout.test.mjs
+      - scripts/tests/codestory-release-evidence-gate.test.mjs
+      - scripts/tests/fixtures/release-claims/**
+      - benchmarks/release-evidence/**
+      - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/docker/**
       - package.json
       - package-lock.json
       - .github/scripts/route-ci-proof.mjs
@@ -54,13 +98,25 @@ on:
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/windows-vulkan-proof.yml
+      - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/source-proof.yml
       - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
+      - .github/workflows/**
       - scripts/install-codestory.ps1
+      - scripts/prepare-embedded-model.mjs
+      - scripts/tests/prepare-embedded-model.test.mjs
+      - crates/codestory-llama-sys/model-contract.json
+      - crates/codestory-llama-sys/build.rs
+      - crates/codestory-llama-sys/model_staging.rs
+      - crates/codestory-llama-sys/Cargo.toml
+      - crates/codestory-llama-sys/tests/model_staging.rs
+      - scripts/release-evidence/**
+      - scripts/release-evidence/serde-json-codestory-project.json
+      - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
-      - scripts/setup-retrieval-env.*
       - .codex/environments/environment.toml
   workflow_dispatch:
 
@@ -84,6 +140,22 @@ jobs:
 
       - name: Check plugin static wiring
         run: node --test plugins/codestory/tests/plugin-static.test.mjs
+
+      - name: Check embedded model preparation
+        run: node --test scripts/tests/prepare-embedded-model.test.mjs
+
+      - name: Check workflow syntax
+        run: |
+          node --test .github/scripts/run-actionlint.test.mjs
+          node .github/scripts/run-actionlint.mjs
+
+      - name: Check release claim and evidence contracts
+        run: >-
+          node --test
+          scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-closeout.test.mjs
+          scripts/tests/codestory-release-evidence-gate.test.mjs
+          scripts/tests/release-evidence-runner-contract.test.mjs
 
       - name: Check workflow policy
         run: |

@@ -2,27 +2,10 @@
 
 Resolves a symbol by ID or query, then returns its full metadata: kind, file location, children, incoming references, and outgoing calls.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> symbol [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--id` | string | — | Node ID to inspect (conflicts with `--query`) |
-| `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
-| `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
-| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
-| `--mermaid` | flag | `false` | Render a Mermaid symbol graph instead of Markdown/JSON |
-
-> One of `--id` or `--query` is required. `--file` requires `--query`. If `--query` is ambiguous (multiple equally-ranked matches), the CLI will error and suggest a more qualified name or file filter.
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Target Resolution
 

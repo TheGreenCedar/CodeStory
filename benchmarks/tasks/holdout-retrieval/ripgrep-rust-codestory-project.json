@@ -1,0 +1,21 @@
+{
+  "name": "ripgrep-release-evidence-rust",
+  "version": 1,
+  "source_groups": [
+    {
+      "id": "9bf47d5a-7838-5f8d-b7ae-4a2cf12d14e6",
+      "language": "Rust",
+      "standard": "Default",
+      "source_paths": [
+        "."
+      ],
+      "exclude_patterns": [
+        "**/.git/**",
+        "**/target/**"
+      ],
+      "include_paths": [],
+      "defines": {},
+      "language_specific": "Other"
+    }
+  ]
+}

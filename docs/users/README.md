@@ -1,77 +1,100 @@
-# CodeStory user guides
+# CodeStory user guide
 
-You want your coding agent to answer from cited repo evidence instead of
-re-exploring the tree on every question. Pick your host below, install once, open
-your repository, and start a fresh session there.
-
-## Day-1 checklist
-
-1. **Pick a host** — if unsure, start with [Codex](codex.md) (recommended first install).
-2. **Install once** — follow your host guide; approve hooks when prompted.
-3. **Open the repo** you want grounded and start a **fresh** agent session there.
-4. **First prompt** — use the readiness prompt from your host guide, or ask a concrete repo question (see [prompt patterns](prompt-patterns.md)).
-5. **Success looks like** — the agent cites indexed files, names blocked surfaces if any, and does not guess from partial tree reads. Large repos may take several minutes to index on first open.
-6. **Something wrong?** — [Trust and readiness](trust-and-readiness.md), then [Troubleshooting](troubleshooting.md).
-
-You do not need the [CLI reference](cli-reference.md) or [glossary](../glossary.md) for first install.
+CodeStory gives a coding agent a local map of your checkout and a cited search
+index. Install the adapter for your host, open a repository, and ask an ordinary
+code question. Repository preparation happens on the first relevant tool call;
+there is no background service for you to configure or approve.
 
 ## Pick your host
 
-| Host | Guide | Best for |
+| Host | Setup | What is automatic |
 | --- | --- | --- |
-| Codex | [Codex](codex.md) | **Recommended first install** — full plugin path: MCP auto-start, hooks, skill, managed CLI bootstrap |
-| Cursor | [Cursor](cursor.md) | Project rule plus manual MCP config |
-| Claude Code | [Claude Code](claude-code.md) | Lifecycle hooks; MCP setup is manual |
-| GitHub Copilot CLI | [Copilot](copilot.md#copilot-cli) | Session-start hooks; no MCP auto-start |
-| GitHub Copilot editor | [Copilot](copilot.md#copilot-editor) | Repository instructions only |
+| [Codex](codex.md) | Install from `/plugins` | MCP, hooks, skill, matching CLI |
+| [Cursor](cursor.md) | Add the rule and MCP config | Repository preparation after MCP connects |
+| [Claude Code](claude-code.md) | Install the plugin and configure MCP | Hooks; preparation after MCP connects |
+| [Copilot CLI](copilot.md#copilot-cli) | Install hooks and configure MCP | Session instructions; preparation after MCP connects |
+| [Copilot editor](copilot.md#copilot-editor) | Add repository instructions and optionally MCP | CodeStory evidence only when MCP is connected |
 
-Shared references:
-
-- [Trust and readiness](trust-and-readiness.md) — when to trust agent output
-- [What to expect](what-to-expect.md) — coverage and quality limits in your repo
-- [Prompt patterns](prompt-patterns.md) — good shapes and anti-patterns
-- [Troubleshooting](troubleshooting.md) when a session is blocked or output looks stale
-- [CLI reference](cli-reference.md) for power-user repair and debug transcripts
-- [Glossary](../glossary.md) for terms used across these pages
+Codex is the reference experience. Other hosts use the same project-scoped MCP
+runtime but require more adapter setup.
 
 ## Capability matrix
 
-| Host | MCP auto-start | Hooks | Skill | Managed CLI bootstrap |
+| Host | MCP auto-start | Hooks | Grounding skill or rule | Managed CLI through adapter |
 | --- | --- | --- | --- | --- |
-| Codex | Yes | Yes | Yes | Yes |
-| Cursor | Manual MCP config | Rule only | Via rule | Via MCP adapter when configured |
-| Claude Code | Manual | Yes | Partial | Depends on MCP setup |
-| Copilot CLI | No | Session start only | Partial | Manual |
-| Copilot editor | No | Instructions only | No | Manual |
+| Codex | Yes | Yes | Full skill | Yes |
+| Cursor | No | Rule only | Project rule | Yes, after MCP connects |
+| Claude Code | Usually manual | Session hook | Host-dependent | Yes, after MCP connects |
+| Copilot CLI | No | Session hook | Partial | Yes, after MCP connects |
+| Copilot editor | No | No | Repository instructions | Only when MCP is configured |
 
-Codex is the reference experience. Other hosts reuse the same grounding rules
-through thin adapters; see each guide for honest gaps.
+## First use
 
-## What you do vs what the agent handles
+1. Install the plugin or adapter for your host.
+2. Start a fresh agent session in the repository.
+3. Ask a concrete repository question, such as:
 
-| You | Agent (with CodeStory) |
-| --- | --- |
-| Install the plugin or adapter for your host | Grounds the checkout, traces symbols, and cites sources |
-| Open the repository you want grounded | Uses local graph tools for navigation; uses packet/search only when broad search is ready |
-| Ask concrete questions with repo terms | Reports blocked surfaces and next repair steps |
-| Start a fresh session after install or repair | Reads runtime status and obeys allowed surfaces (agent detail — see trust page) |
+   ```text
+   Where is request authentication implemented, who calls it, and which tests cover it?
+   ```
 
-Readiness boundaries in plain language: [Trust and readiness](trust-and-readiness.md).
+The first call builds or refreshes the local repository map. A broad question
+may also initialize semantic search and publish its first complete retrieval
+generation. On a large checkout this can take several minutes. The agent should
+retry the same CodeStory tool after its returned delay while local navigation
+remains available.
+
+Success looks like an answer that names real files and symbols, cites its
+evidence, and says when coverage is incomplete. It should not ask you to install
+a model, start a service, choose a port, or run a repair command.
+
+## What runs locally
+
+The released CodeStory executable includes its search model and embedding
+engine. When semantic work is needed, that exact executable automatically runs
+one hidden server for the current OS user over private local IPC. It does not
+download a model or backend, expose a TCP port, or use Docker. Apple Silicon
+uses Metal; supported Windows hardware uses Vulkan. Production never silently
+changes from GPU to CPU.
+
+Each repository has its own cache and publication identity. Compatible host
+processes share one warm embedding server, but every request still names its
+repository explicitly and the server never receives that path. Repositories do
+not share indexes or readiness state.
+
+Source and index data stay local by default. Remote summaries are a separate,
+explicit trusted-operator feature; repository-controlled network configuration
+is disabled unless the process opts into it.
+
+## Platform summary
+
+| Platform | Local map | Broad search |
+| --- | --- | --- |
+| macOS 15+ on Apple Silicon | Yes | Metal |
+| macOS 15+ on Intel | Yes | Explicit CPU is maintainer/CI only; no Metal claim |
+| Windows x64 | Yes | Vulkan on supported physical hardware |
+| Windows arm64 | Yes | Vulkan only where the packaged hardware path is proved |
+| Linux x64 / arm64 | Yes | Vulkan requires real hardware proof; hosted jobs use explicit CPU and make no GPU claim |
+
+The release contains native packages for the listed architectures. Accelerator
+claims are narrower: they apply only to backends exercised by the protected
+hardware workflows.
+
+## Everyday use
+
+Ask about the code, not CodeStory's internal commands. Useful prompt shapes are
+collected in [Prompt patterns](prompt-patterns.md).
 
 ## Portable prompt shapes
 
-Use your project's symbols and paths, not CodeStory-internal names:
+Use the same ordinary questions on every host. The canonical examples and
+anti-patterns live in [Prompt patterns](prompt-patterns.md); host guides contain
+only installation details and host-specific limitations.
 
-```text
-Where is [Feature] defined and who calls it?
-```
+You do not need to check status before a normal question. If a call stays
+blocked, use:
 
-```text
-I am changing [path/to/file]. What symbols are affected and what tests should I run first?
-```
-
-```text
-How does [subsystem] work? Cite concrete files and flag gaps if coverage is incomplete.
-```
-
-More patterns: [Prompt patterns](prompt-patterns.md). Host-specific install steps and `@CodeStory` invocation: see your host guide.
+- [Trust and readiness](trust-and-readiness.md) to decide what counts as proof;
+- [Troubleshooting](troubleshooting.md) for the shortest recovery path;
+- [What to expect](what-to-expect.md) for language and repository-size limits;
+- [CLI reference](cli-reference.md) for maintainer diagnostics.

@@ -76,7 +76,7 @@ Use four-space indentation for nested code blocks. Do not nest triple-backtick f
     1. Install the plugin for your host (see guide above).
     2. Approve hooks when your host prompts for them.
     3. Open the repository you want to ground and start a fresh session.
-    4. Ask the readiness prompt from your host guide.
+    4. Ask a repository question from your host guide.
 
     ## Example prompts
 

@@ -1,0 +1,122 @@
+{
+  "cases": [
+    {
+      "id": "runner-labels",
+      "class_prefix": "[runner_labels]",
+      "workflow": "macos-metal-proof.yml",
+      "job": "packaged-metal",
+      "field": [
+        "runs-on"
+      ],
+      "value": [
+        "self-hosted",
+        "macOS",
+        "ARM64"
+      ]
+    },
+    {
+      "id": "protected-environment",
+      "class_prefix": "[protected_environment]",
+      "workflow": "windows-vulkan-proof.yml",
+      "job": "packaged-vulkan",
+      "field": [
+        "environment"
+      ],
+      "value": "release"
+    },
+    {
+      "id": "permissions-secrets",
+      "class_prefix": "[permissions_secrets]",
+      "workflow": "macos-metal-proof.yml",
+      "field": [
+        "permissions",
+        "contents"
+      ],
+      "op": "delete"
+    },
+    {
+      "id": "job-permissions-override",
+      "class_prefix": "[permissions_secrets]",
+      "workflow": "macos-metal-proof.yml",
+      "job": "packaged-metal",
+      "field": [
+        "permissions"
+      ],
+      "value": {
+        "contents": "write"
+      }
+    },
+    {
+      "id": "artifact-retention",
+      "class_prefix": "[artifact_retention]",
+      "workflow": "release-candidate-evidence.yml",
+      "job": "measure",
+      "step": "Upload release evidence",
+      "field": [
+        "with",
+        "retention-days"
+      ],
+      "value": 1
+    },
+    {
+      "id": "exact-sha",
+      "class_prefix": "[exact_sha]",
+      "workflow": "release.yml",
+      "job": "source-proof",
+      "field": [
+        "with",
+        "ref"
+      ],
+      "value": "${{ github.ref }}"
+    },
+    {
+      "id": "promotion-boundary",
+      "class_prefix": "[promotion_boundary]",
+      "workflow": "release.yml",
+      "job": "publish",
+      "field": [
+        "needs"
+      ],
+      "value": [
+        "preflight",
+        "packaged-proof"
+      ]
+    },
+    {
+      "id": "target-matrix",
+      "class_prefix": "[target_matrix]",
+      "workflow": "post-publish-release-smoke.yml",
+      "job": "smoke",
+      "field": [
+        "strategy",
+        "matrix",
+        "include"
+      ],
+      "value": []
+    },
+    {
+      "id": "synchronize-proof-trigger",
+      "class_prefix": "[proof_identity]",
+      "workflow": "source-proof.yml",
+      "field": [
+        "on",
+        "pull_request",
+        "types"
+      ],
+      "value": [
+        "labeled",
+        "synchronize"
+      ]
+    },
+    {
+      "id": "pr-number-only-proof-concurrency",
+      "class_prefix": "[proof_identity]",
+      "workflow": "packaged-platform-pr.yml",
+      "field": [
+        "concurrency",
+        "group"
+      ],
+      "value": "proof-${{ inputs.mode || 'platform' }}-${{ inputs.pr_number || github.event.pull_request.number || 'dev' }}"
+    }
+  ]
+}

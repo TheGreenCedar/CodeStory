@@ -384,7 +384,7 @@ fn packet_search_eval_readiness_fixture_uses_exact_symbol_search_anchor() {
         fixture
             .query
             .as_deref()
-            .is_some_and(|query| query == "LiveSidecarSearch::qdrant_search"),
+            .is_some_and(|query| query == "LiveSidecarSearch::semantic_search"),
         "readiness fixture search query must preserve the exact symbol anchor"
     );
 }
@@ -400,7 +400,7 @@ fn packet_search_eval_preserves_broad_readiness_query_diagnostic() {
 
     assert_eq!(
         fixture.query.as_deref(),
-        Some("LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable")
+        Some("LiveSidecarSearch semantic_search retrieval_mode full sidecar unavailable")
     );
     assert_eq!(fixture.provenance.issue, "#569");
     assert!(
@@ -408,7 +408,7 @@ fn packet_search_eval_preserves_broad_readiness_query_diagnostic() {
             .expected
             .symbols
             .iter()
-            .any(|symbol| symbol == "LiveSidecarSearch::qdrant_search"),
+            .any(|symbol| symbol == "LiveSidecarSearch::semantic_search"),
         "broad diagnostic must keep the missed symbol visible"
     );
 }
@@ -427,13 +427,13 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
                 "crates/codestory-retrieval/src/lib.rs".to_string(),
             ],
             ranked_symbols: vec![
-                "LiveSidecarSearch::qdrant_search".to_string(),
+                "LiveSidecarSearch::semantic_search".to_string(),
                 "LiveSidecarSearch::layout".to_string(),
             ],
-            packet_text: "LiveSidecarSearch::qdrant_search is defined in sidecar_search"
+            packet_text: "LiveSidecarSearch::semantic_search is defined in sidecar_search"
                 .to_string(),
             anchor_offsets: BTreeMap::from([
-                ("LiveSidecarSearch::qdrant_search".to_string(), 10),
+                ("LiveSidecarSearch::semantic_search".to_string(), 10),
                 ("sidecar_search".to_string(), 52),
             ]),
         },
@@ -557,16 +557,18 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         live_eval_env(),
         [
             ("CODESTORY_RETRIEVAL_PROFILE", "agent"),
-            ("CODESTORY_SIDECAR_RUN_ID", LIVE_EVAL_RUN_ID)
+            ("CODESTORY_RETRIEVAL_RUN_ID", LIVE_EVAL_RUN_ID)
         ]
     );
     assert_eq!(
         live_eval_ready_args(),
         [
-            "ready",
-            "--goal",
+            "retrieval",
+            "index",
+            "--profile",
             "agent",
-            "--repair",
+            "--refresh",
+            "auto",
             "--run-id",
             LIVE_EVAL_RUN_ID,
             "--format",
@@ -591,7 +593,7 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         &[
             "search",
             "--query",
-            "LiveSidecarSearch::qdrant_search",
+            "LiveSidecarSearch::semantic_search",
             "--profile",
             "agent",
             "--run-id",
@@ -604,7 +606,7 @@ fn packet_search_live_eval_uses_fixed_run_id() {
     assert!(
         search
             .get_envs()
-            .any(|(name, value)| name == "CODESTORY_SIDECAR_RUN_ID"
+            .any(|(name, value)| name == "CODESTORY_RETRIEVAL_RUN_ID"
                 && value == Some(std::ffi::OsStr::new(LIVE_EVAL_RUN_ID))),
         "search subprocess must inherit the fixed live eval run id"
     );
@@ -812,12 +814,14 @@ fn packet_search_eval_live_runs_production_cli_path() {
     );
 }
 
-fn live_eval_ready_args() -> [&'static str; 8] {
+fn live_eval_ready_args() -> [&'static str; 10] {
     [
-        "ready",
-        "--goal",
+        "retrieval",
+        "index",
+        "--profile",
         "agent",
-        "--repair",
+        "--refresh",
+        "auto",
         "--run-id",
         LIVE_EVAL_RUN_ID,
         "--format",
@@ -841,7 +845,7 @@ fn live_eval_status_args() -> [&'static str; 8] {
 fn live_eval_env() -> [(&'static str, &'static str); 2] {
     [
         ("CODESTORY_RETRIEVAL_PROFILE", "agent"),
-        ("CODESTORY_SIDECAR_RUN_ID", LIVE_EVAL_RUN_ID),
+        ("CODESTORY_RETRIEVAL_RUN_ID", LIVE_EVAL_RUN_ID),
     ]
 }
 

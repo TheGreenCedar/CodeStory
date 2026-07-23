@@ -4,8 +4,7 @@ Use CodeStory proactively for repository questions. Do not wait for the user to 
 
 Before making source claims, planning edits, choosing tests, or reviewing changes in this repository:
 
-1. If the CodeStory MCP server is live, read `codestory://status` first.
-2. Treat `server_version`, `server_executable`, `allowed_surfaces`, and `retrieval_mode` from status as runtime truth.
-3. Use local graph surfaces only when their own `allowed_surfaces` entry allows them.
-4. Use `packet`, `search`, or `context` only when that surface is allowed and `retrieval_mode=full`.
-5. If MCP is missing, use `codestory-cli ready` or `doctor` as a repair/debug fallback.
+1. Call the CodeStory tool that matches the task and pass the repository's absolute root as `project`.
+2. If it reports `preparing` or `updating`, retry that same tool after its reported delay. Do not poll status.
+3. Use `status` or `codestory://status` only to diagnose a failed or unexpectedly slow call.
+4. If MCP is missing, inspect source normally and report that CodeStory was unavailable for the task.

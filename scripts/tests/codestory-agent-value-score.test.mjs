@@ -224,18 +224,18 @@ test("rejects mixed run stamps", () => {
   assert.equal(extractRunStamp(packet), "2026-05-26");
 });
 
-test("uses benchmark_run_id metadata for coherent mandatory-sidecar artifact scoring", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-agent-value-sidecar-coherency-"));
+test("uses benchmark_run_id metadata for coherent mandatory-retrieval artifact scoring", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-agent-value-retrieval-coherency-"));
   const prompt = writeJson(root, "prompt/summary.json", {
-    benchmark_run_id: "segment43-sidecar",
+    benchmark_run_id: "segment43-retrieval",
     summary: { prompt_file_recall: 1 },
   });
   const symbol = writeJson(root, "symbol/summary.json", {
-    benchmark_run_id: "segment43-sidecar",
+    benchmark_run_id: "segment43-retrieval",
     summary: { symbol_path_hit_at_k: 1 },
   });
   const packet = writeJson(root, "packet/packet-runtime-summary.json", {
-    benchmark_run_id: "segment43-sidecar",
+    benchmark_run_id: "segment43-retrieval",
     summary: [],
   });
 
@@ -249,9 +249,9 @@ test("uses benchmark_run_id metadata for coherent mandatory-sidecar artifact sco
     { cwd: root },
   );
 
-  assert.equal(artifactRunStamp(prompt), "segment43-sidecar");
+  assert.equal(artifactRunStamp(prompt), "segment43-retrieval");
   assert.equal(summary.run_coherency.enforced, true);
-  assert.equal(summary.run_coherency.run_stamp, "segment43-sidecar");
+  assert.equal(summary.run_coherency.run_stamp, "segment43-retrieval");
 
   const mismatchedPacket = writeJson(root, "packet-mismatch/packet-runtime-summary.json", {
     benchmark_run_id: "segment43-other",
@@ -453,24 +453,24 @@ test("explicit score inputs do not backfill mixed-vintage default artifacts", ()
   assert.equal(inputs.abDoc, null);
 });
 
-test("aggregates sidecar diagnostics once for shared prompt and symbol scout summary", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-agent-value-sidecar-loss-"));
+test("aggregates retrieval diagnostics once for shared prompt and symbol scout summary", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-agent-value-retrieval-loss-"));
   const searchSummary = writeJson(root, "target/retrieval-golden/scout/summary.json", {
     benchmark_run_id: "segment58-loss-scout",
     summary: {
       prompt_file_recall: 0.5,
       symbol_path_hit_at_k: 1,
-      sidecar_expected_files_present_missing_from_search_count: 2,
-      sidecar_expected_symbols_present_missing_from_search_count: 1,
-      sidecar_query_trace_with_candidates_count: 1,
-      sidecar_query_trace_no_candidates_count: 0,
-      sidecar_prepare_count: 1,
-      sidecar_prepare_failed_count: 1,
-      sidecar_prepare_max_latency_ms: 90_070.026,
-      sidecar_shadow_candidate_count: 5,
-      sidecar_shadow_resolved_hit_count: 3,
-      sidecar_shadow_unresolved_candidate_count: 2,
-      sidecar_shadow_resolution_counts: [
+      retrieval_expected_files_present_missing_from_search_count: 2,
+      retrieval_expected_symbols_present_missing_from_search_count: 1,
+      retrieval_query_trace_with_candidates_count: 1,
+      retrieval_query_trace_no_candidates_count: 0,
+      retrieval_prepare_count: 1,
+      retrieval_prepare_failed_count: 1,
+      retrieval_prepare_max_latency_ms: 90_070.026,
+      retrieval_shadow_candidate_count: 5,
+      retrieval_shadow_resolved_hit_count: 3,
+      retrieval_shadow_unresolved_candidate_count: 2,
+      retrieval_shadow_resolution_counts: [
         { resolution: "node_unresolved", count: 2 },
         { resolution: "resolved", count: 3 },
       ],
@@ -496,23 +496,23 @@ test("aggregates sidecar diagnostics once for shared prompt and symbol scout sum
     { cwd: root },
   );
 
-  assert.equal(summary.metrics.sidecar_expected_files_present_missing_from_search_count, 2);
-  assert.equal(summary.metrics.sidecar_expected_symbols_present_missing_from_search_count, 1);
-  assert.equal(summary.metrics.sidecar_query_trace_with_candidates_count, 1);
-  assert.equal(summary.metrics.sidecar_prepare_count, 1);
-  assert.equal(summary.metrics.sidecar_prepare_failed_count, 1);
-  assert.equal(summary.metrics.sidecar_prepare_max_latency_ms, 90_070.026);
-  assert.equal(summary.metrics.sidecar_candidate_count, 5);
-  assert.equal(summary.metrics.sidecar_resolved_hit_count, 3);
-  assert.equal(summary.metrics.sidecar_unresolved_candidate_count, 2);
-  assert.equal(summary.metrics.sidecar_candidate_resolution_rate, 0.6);
-  assert.deepEqual(summary.contributors.sidecar_diagnostics.resolution_counts, [
+  assert.equal(summary.metrics.retrieval_expected_files_present_missing_from_search_count, 2);
+  assert.equal(summary.metrics.retrieval_expected_symbols_present_missing_from_search_count, 1);
+  assert.equal(summary.metrics.retrieval_query_trace_with_candidates_count, 1);
+  assert.equal(summary.metrics.retrieval_prepare_count, 1);
+  assert.equal(summary.metrics.retrieval_prepare_failed_count, 1);
+  assert.equal(summary.metrics.retrieval_prepare_max_latency_ms, 90_070.026);
+  assert.equal(summary.metrics.retrieval_candidate_count, 5);
+  assert.equal(summary.metrics.retrieval_resolved_hit_count, 3);
+  assert.equal(summary.metrics.retrieval_unresolved_candidate_count, 2);
+  assert.equal(summary.metrics.retrieval_candidate_resolution_rate, 0.6);
+  assert.deepEqual(summary.contributors.retrieval_diagnostics.resolution_counts, [
     { resolution: "node_unresolved", count: 2 },
     { resolution: "resolved", count: 3 },
   ]);
   assert.ok(
     metricEntries(summary).some(
-      ([name, value]) => name === "sidecar_unresolved_candidate_count" && value === 2,
+      ([name, value]) => name === "retrieval_unresolved_candidate_count" && value === 2,
     ),
   );
 });

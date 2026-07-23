@@ -7,21 +7,21 @@ const scopeRank = new Map([
   ["macos", 1],
   ["full", 2],
 ]);
-const coordinatorScopes = new Set(["windows", ...scopeRank.keys()]);
+const coordinatorScopes = new Set(["linux", "windows", ...scopeRank.keys()]);
 
 const macosSurfaces = [
   /^\.github\/workflows\/macos-/u,
   /^backend\/.*(?:darwin|macos|metal)/iu,
-  /^scripts\/setup-retrieval-env\./u,
   /^plugins\/codestory\/.*(?:darwin|macos|metal)/iu,
 ];
 
 const crossPlatformRuntimeSurfaces = [
   /^(?:Cargo\.toml|Cargo\.lock)$/u,
   /^crates\/[^/]+\/Cargo\.toml$/u,
-  /^crates\/codestory-cli\/src\/readiness_broker\//u,
+  /^crates\/codestory-llama-sys\//u,
   /^crates\/codestory-retrieval\/src\/(?:config|index|inventory|lib|query|sidecar)\.rs$/u,
   /^scripts\/install-codestory\.ps1$/u,
+  /^scripts\/prepare-embedded-model\.mjs$/u,
   /^scripts\/codex-worktree-setup\.(?:mjs|ps1|sh)$/u,
   /^scripts\/tests\/codex-worktree-setup\.test\.mjs$/u,
 ];
@@ -29,7 +29,7 @@ const crossPlatformRuntimeSurfaces = [
 const proofNeutralSurfaces = [
   /^CHANGELOG\.md$/u,
   /^docs\//u,
-  /^\.github\/workflows\/retrieval-sidecar-smoke\.yml$/u,
+  /^\.github\/workflows\/retrieval-engine-smoke\.yml$/u,
   /^crates\/codestory-runtime\/tests\/retrieval_generalization_guard\.rs$/u,
   /^scripts\/(?:codestory-agent-ab-benchmark|codestory-evidence-provenance|codestory-release-evidence-gate|lint-retrieval-generalization)\.mjs$/u,
 ];
@@ -59,7 +59,7 @@ export function selectProofScope(paths, requested = "auto") {
   if (!coordinatorScopes.has(requested)) {
     throw new Error(`unsupported proof scope: ${requested}`);
   }
-  if (requested === "windows") return requested;
+  if (requested === "linux" || requested === "windows") return requested;
   return scopeRank.get(requested) > scopeRank.get(inferred) ? requested : inferred;
 }
 
@@ -69,7 +69,7 @@ function selfTest() {
       name: "script and guard tests do not package",
       expected: "none",
       paths: [
-        ".github/workflows/retrieval-sidecar-smoke.yml",
+        ".github/workflows/retrieval-engine-smoke.yml",
         "crates/codestory-runtime/tests/retrieval_generalization_guard.rs",
         "scripts/lint-retrieval-generalization.mjs",
         "docs/testing/retrieval-architecture.md",
@@ -82,7 +82,6 @@ function selfTest() {
       paths: [
         ".github/scripts/check-packaged-agent-proof.py",
         ".github/workflows/macos-metal-proof.yml",
-        "crates/codestory-cli/src/ready_repair_status.rs",
         "crates/codestory-cli/src/stdio_transport.rs",
         "crates/codestory-retrieval/src/embeddings.rs",
       ],
@@ -92,9 +91,10 @@ function selfTest() {
       expected: "full",
       paths: [
         "Cargo.lock",
-        "crates/codestory-cli/src/readiness_broker/native_lease.rs",
+        "crates/codestory-llama-sys/src/lib.rs",
         "crates/codestory-retrieval/src/inventory.rs",
         "crates/codestory-retrieval/src/sidecar.rs",
+        "scripts/prepare-embedded-model.mjs",
       ],
     },
     {
@@ -120,6 +120,9 @@ function selfTest() {
   }
   if (selectProofScope(fixtures[2].paths, "windows") !== "windows") {
     throw new Error("coordinator Windows proof must select only Windows x64 packaging");
+  }
+  if (selectProofScope(fixtures[2].paths, "linux") !== "linux") {
+    throw new Error("coordinator Linux proof must select only Linux x64 packaging");
   }
 }
 

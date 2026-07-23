@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  FullSidecarBlockedError,
+  FullRetrievalBlockedError,
   evidenceStatusForError,
   verifyDrillPacketParity,
 } from "../prove-drill-packet-parity.mjs";
@@ -78,7 +78,7 @@ test("paired packet and drill proof accepts one matching packet execution", () =
 test("paired proof rejects generation drift and duplicate drill commands", () => {
   const drift = proof();
   drift.afterStatus.manifest_contract.generation = "next-generation";
-  assert.throws(() => verifyDrillPacketParity(drift), /sidecar generation changed/);
+  assert.throws(() => verifyDrillPacketParity(drift), /retrieval generation changed/);
 
   const duplicate = proof();
   duplicate.report.anchors[0].commands.push({ command: "search" });
@@ -87,14 +87,14 @@ test("paired proof rejects generation drift and duplicate drill commands", () =>
 
 test("question and anchor dedupe keeps executed probe provenance", () => {
   const duplicate = proof();
-  duplicate.packet.plan.queries[0].purpose = "original task phrasing for sidecar-primary source-backed retrieval";
+  duplicate.packet.plan.queries[0].purpose = "original task phrasing for retrieval-primary source-backed retrieval";
   duplicate.report.evidence_packet.plan.queries[0].purpose = duplicate.packet.plan.queries[0].purpose;
 
   assert.equal(verifyDrillPacketParity(duplicate).packet_execution_count, 1);
 });
 
 test("only observed non-full preflight is blocked", () => {
-  assert.equal(evidenceStatusForError(new FullSidecarBlockedError("not full")), "blocked");
+  assert.equal(evidenceStatusForError(new FullRetrievalBlockedError("not full")), "blocked");
   assert.equal(evidenceStatusForError(new Error("packet command failed")), "failed");
 
   const mismatch = proof();

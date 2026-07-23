@@ -134,6 +134,7 @@ impl TraceRecorder {
 
         AgentRetrievalTraceDto {
             request_id,
+            retrieval_publication: None,
             resolved_profile,
             policy_mode,
             total_latency_ms,

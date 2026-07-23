@@ -29,6 +29,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - name: Install Linux Vulkan build dependencies
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
       - name: Capture Rust cache identity
         id: rust-cache-key
         shell: bash
@@ -42,12 +44,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-repo-scale-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-codestory-cli-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-repo-scale-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-codestory-cli-default-features-
-      - name: Fetch the checksum-pinned embedding model
-        env:
-          CODESTORY_EMBED_MODEL_DIR: ${{ runner.temp }}/codestory-stats-models
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
+      - name: Prepare checksum-pinned embedded model
+        run: node scripts/prepare-embedded-model.mjs
       - name: Build the release CLI
         run: cargo build --release --locked -p codestory-cli
       - name: Run mandatory repo-scale stats once
@@ -55,7 +53,6 @@ jobs:
         env:
           CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES: "1"
           CODESTORY_EMBED_ALLOW_CPU: "1"
-          CODESTORY_EMBED_MODEL_DIR: ${{ runner.temp }}/codestory-stats-models
         run: |
           set -euo pipefail
           mkdir -p target/repo-scale-stats
@@ -68,3 +65,4 @@ jobs:
           name: repo-scale-stats-${{ inputs.proof_key }}
           path: target/repo-scale-stats
           if-no-files-found: error
+          retention-days: 30

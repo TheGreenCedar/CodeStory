@@ -6,7 +6,9 @@
 
 - language detection and parser or query selection
 - file-level parse and extract work
-- artifact-cache lookup and reuse
+- parser artifact-cache lookup and reuse
+- versioned structural text-unit collection, source revalidation, and
+  structural-only cache reuse
 - batching and projection flush timing
 - post-flush call, import, and override resolution
 - incremental cleanup for touched and removed files
@@ -16,7 +18,11 @@
 
 - `crates/codestory-indexer/src/lib.rs`: `WorkspaceIndexer`, feature flags, indexing phases, flush timing, and incremental cleanup
 - `crates/codestory-indexer/src/intermediate_storage.rs`: in-memory batch shape before a store flush
-- `crates/codestory-indexer/src/cache.rs`: serialized artifact-cache format and cache-key construction
+- `crates/codestory-indexer/src/cache.rs`: serialized parser and structural
+  artifact-cache formats and cache-key construction
+- `crates/codestory-indexer/src/structural/`: workflow, Compose, Cargo
+  manifest, HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser
+  shell, and PowerShell collectors plus structural unit finalization
 - `crates/codestory-indexer/src/compilation_database.rs`: `compile_commands.json` discovery and parsed compilation metadata
 - `crates/codestory-indexer/src/resolution/`: post-flush `ResolutionPass`, candidate selection, scoped resolution, and semantic fallback
 - `crates/codestory-indexer/src/semantic/`: language-aware semantic helpers used by resolution
@@ -26,7 +32,7 @@
 The runtime owns orchestration and chooses the store shape for a run:
 
 - full refresh: runtime opens a staged store, passes a full refresh plan to `WorkspaceIndexer`, then asks the store to finalize and publish the staged snapshot
-- incremental refresh: runtime opens the live store, passes a diff-based refresh plan to `WorkspaceIndexer`, then asks the store to refresh live summary and detail snapshots
+- incremental refresh: runtime clones the live database into a durable staged store, passes a diff-based refresh plan to `WorkspaceIndexer`, refreshes summary and detail snapshots on the clone, then publishes the completed replacement
 
 The indexer does not choose staged versus live storage. It only consumes a refresh plan plus a mutable store.
 
@@ -35,7 +41,10 @@ The indexer does not choose staged versus live storage. It only consumes a refre
 `WorkspaceIndexer::run` handles both full and incremental work, but the plan changes the behavior:
 
 - full refresh indexes every discovered source file, does not remove file rows, and runs unscoped resolution
-- incremental refresh only touches files whose mtime changed, whose verified parser source hash no longer matches, or that were previously not indexed; it tracks removed file IDs, seeds the symbol table from existing rows, and scopes resolution to touched files
+- incremental refresh only touches files whose mtime changed, whose verified
+  parser or structural source hash no longer matches, or that were previously
+  not indexed; it tracks removed file IDs, seeds the symbol table from existing
+  rows, and scopes resolution to touched files
 
 Incremental work also does more cleanup:
 
@@ -60,9 +69,57 @@ Projection flushes are broader than just graph rows. `IntermediateStorage` carri
 - component access tuples
 - callable projection state
 - impl anchor node IDs
+- verified structural source hashes
+- collector-owned structural text units with separate content and placement
+  identities
+- one structural projection per admitted structural file, including zero-unit
+  files
+- dedicated structural artifact-cache writes
 - indexing errors
 
-`flush_projection_batch` writes the projection payload through `codestory-store`. Resolution changes happen later, after those rows already exist.
+`flush_projection_batch` writes the projection payload through
+`codestory-store`. Source identity, graph rows, structural units and cache
+writes, errors owned by refreshed file rows, and derived-snapshot invalidation
+share one transaction. A cache-maintenance failure can produce a file-scoped
+error without a replacement file row; that error retains the separate
+file-outcome fallback and is not counted as projection persistence. Resolution
+changes happen later, after those rows already exist. Indexer telemetry keeps
+row-family work nested under the complete projection transaction wall and
+reports attempted rows, estimated bound-input bytes, statement executions,
+setup, and commit time without treating them as additive phases.
+
+## Structural Unit Identity
+
+The twelve structural unit collector families emit source-range-only evidence
+without claiming parser-backed graph resolution. Finalization slices the exact
+UTF-8 source span and records the collector producer, evidence tier, resolution
+status, language, kind, file role, descriptor version, source hash, and span.
+The content identity is stable for an equivalent descriptor and exact source
+slice; placement identity additionally includes file and node identity.
+
+Only collector-marked nodes become structural units. Delegated parser nodes,
+including HTML script or style descendants, remain parser-owned. Cache hits
+must reproduce the complete unit and projection digests after a fresh source
+read or the indexer recollects the file.
+
+Format routing is ordered. GitHub Actions, Docker Compose, and Cargo manifests
+keep their dedicated producers; OpenAPI JSON/YAML is checked on its dedicated
+schema path before generic collection; `.sh` and `.bash` remain parser-backed
+Bash. Generic shell structural fallback is limited to `.zsh`, `.ksh`, and
+`.command`.
+
+Structural admission applies one contracts-owned policy to workspace-relative
+inventory paths before metadata or content reads. Generated and vendor trees,
+secret-bearing conventions, lockfiles, minified/generated outputs, and
+declared high-noise forms do not create file, unit, projection, or cache rows;
+an excluded path already present in stored inventory is scheduled for normal
+incremental deletion. Repository ancestors are never policy inputs. Admitted
+files are capped at 1 MiB and 2,048 units. A bound failure rejects the whole
+file instead of publishing a truncated projection. Structural cache identity
+v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
+Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources
+retain distinct coverage reasons and do not create reusable structural cache
+entries.
 
 ## Resolution and Semantic Fallback
 
@@ -89,6 +146,8 @@ This keeps parse and extract logic in the indexer while leaving persistence and 
 - unsupported files are treated as runtime concerns instead of being skipped by the indexer
 - resolution logic is applied before graph data is flushed
 - projection flushes change without matching updates to cleanup or snapshot invalidation expectations
+- a structural-looking path is used to infer evidence provenance instead of
+  reading the persisted unit descriptor
 - new indexing behavior lands without a fidelity or regression test in `crates/codestory-indexer/tests/`
 
 ## Read Next

@@ -3,132 +3,62 @@ import { existsSync, readFileSync } from "node:fs";
 
 const RETRIEVAL_ENV_KEYS = [
   "CODESTORY_RETRIEVAL",
-  "CODESTORY_RETRIEVAL_PROFILE",
-  "CODESTORY_RETRIEVAL_SHADOW",
-  "CODESTORY_QDRANT_ENABLED",
-  "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS",
-  "CODESTORY_RETRIEVAL_COMPOSE_PROFILE",
-  "CODESTORY_EMBED_BACKEND",
-  "CODESTORY_EMBED_LLAMACPP_URL",
+  "CODESTORY_EMBED_ALLOW_CPU",
   "CODESTORY_EVAL_PROBES",
 ];
 
-const DEFAULT_LLAMACPP_EMBED_URL = "http://127.0.0.1:8080/v1/embeddings";
-const BENCHMARK_CONTRACT_VERSION = 1;
+const BENCHMARK_CONTRACT_VERSION = 2;
 
 function retrievalEnv(env = process.env) {
   return Object.fromEntries(RETRIEVAL_ENV_KEYS.map((key) => [key, env[key] ?? null]));
 }
 
-function unsupportedSidecarDisabledRequest(env = process.env) {
+function unsupportedRetrievalDisabledRequest(env = process.env) {
   return env.CODESTORY_RETRIEVAL === "0";
 }
 
-function unsupportedSidecarContractRequests(env = process.env) {
+function unsupportedRetrievalContractRequests(env = process.env) {
   const blockers = [];
-  if (unsupportedSidecarDisabledRequest(env)) {
-    blockers.push("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory");
+  if (unsupportedRetrievalDisabledRequest(env)) {
+    blockers.push("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory");
   }
-  const shadow = String(env.CODESTORY_RETRIEVAL_SHADOW ?? "").trim().toLowerCase();
-  if (shadow && !["0", "false", "no", "off"].includes(shadow)) {
-    blockers.push("CODESTORY_RETRIEVAL_SHADOW is unsupported in product benchmarks; sidecar retrieval is primary");
-  }
-  if (env.CODESTORY_QDRANT_ENABLED === "0" || env.CODESTORY_QDRANT_ENABLED === "false") {
-    blockers.push("CODESTORY_QDRANT_ENABLED=0 is unsupported; Qdrant sidecar is mandatory");
-  }
-  if (
-    env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === "0" ||
-    env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === "false"
-  ) {
-    blockers.push(
-      "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS=0 is unsupported; llama.cpp embedding sidecar is mandatory",
-    );
-  }
-  const composeProfile = String(env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE ?? "").trim().toLowerCase();
-  if (composeProfile && composeProfile !== "real") {
-    blockers.push(
-      `CODESTORY_RETRIEVAL_COMPOSE_PROFILE=${composeProfile} is unsupported; profile real is mandatory`,
-    );
-  }
-  const embeddingBackend = String(env.CODESTORY_EMBED_BACKEND ?? "").trim().toLowerCase();
-  if (embeddingBackend && !["llamacpp", "llama_cpp"].includes(embeddingBackend)) {
-    blockers.push(
-      `CODESTORY_EMBED_BACKEND=${embeddingBackend} is unsupported; llama.cpp embedding sidecar is mandatory`,
-    );
+  const cpuPolicy = String(env.CODESTORY_EMBED_ALLOW_CPU ?? "").trim();
+  if (cpuPolicy && cpuPolicy !== "0" && cpuPolicy !== "1") {
+    blockers.push("CODESTORY_EMBED_ALLOW_CPU must be 0 or 1");
   }
   return blockers;
 }
 
-function assertSidecarMandatoryEnv(env = process.env) {
-  const blockers = unsupportedSidecarContractRequests(env);
-  if (blockers.length) {
-    throw new Error(blockers.join("; "));
-  }
+function assertRetrievalEngineEnv(env = process.env) {
+  const blockers = unsupportedRetrievalContractRequests(env);
+  if (blockers.length) throw new Error(blockers.join("; "));
 }
 
 function retrievalContractSummary(env = process.env) {
-  const raw = env.CODESTORY_RETRIEVAL ?? null;
-  if (unsupportedSidecarDisabledRequest(env)) {
-    return {
-      retrieval_contract: "unsupported_sidecar_disabled",
-      sidecar_primary: false,
-      unsupported_sidecar_disabled_request: true,
-      code_story_retrieval: raw,
-    };
-  }
   return {
-    retrieval_contract: raw === "1" ? "sidecar_primary_forced" : "sidecar_primary_default",
-    sidecar_primary: true,
-    unsupported_sidecar_disabled_request: false,
-    code_story_retrieval: raw,
-    runtime_profile:
-      env.CODESTORY_RETRIEVAL_PROFILE ?? env.CODESTORY_SIDECAR_PROFILE ?? null,
-    embedding_backend: env.CODESTORY_EMBED_BACKEND ?? null,
-    compose_profile: env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE ?? null,
+    retrieval_contract: "in_process_v1",
+    retrieval_enabled: !unsupportedRetrievalDisabledRequest(env),
+    embedding_engine: "process_shared",
+    execution_policy: env.CODESTORY_EMBED_ALLOW_CPU === "1" ? "cpu_explicit" : "accelerated",
   };
 }
 
 function benchmarkChildEnv(baseEnv = process.env, additions = {}) {
   const env = { ...baseEnv, ...additions };
-  if (env.CODESTORY_RETRIEVAL == null || env.CODESTORY_RETRIEVAL === "") {
-    env.CODESTORY_RETRIEVAL = "1";
-  }
-  if (env.CODESTORY_RETRIEVAL_PROFILE == null || env.CODESTORY_RETRIEVAL_PROFILE === "") {
-    env.CODESTORY_RETRIEVAL_PROFILE = "local";
-  }
-  if (
-    env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS == null ||
-    env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === ""
-  ) {
-    env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS = "1";
-  }
-  if (env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE == null || env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE === "") {
-    env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE = "real";
-  }
-  if (env.CODESTORY_EMBED_BACKEND == null || env.CODESTORY_EMBED_BACKEND === "") {
-    env.CODESTORY_EMBED_BACKEND = "llamacpp";
-  }
-  if (env.CODESTORY_EMBED_LLAMACPP_URL == null || env.CODESTORY_EMBED_LLAMACPP_URL === "") {
-    env.CODESTORY_EMBED_LLAMACPP_URL = DEFAULT_LLAMACPP_EMBED_URL;
-  }
-  assertSidecarMandatoryEnv(env);
+  env.CODESTORY_RETRIEVAL ||= "1";
+  assertRetrievalEngineEnv(env);
   return env;
 }
 
 function shouldPrepareRetrievalIndex(env = process.env) {
-  assertSidecarMandatoryEnv(env);
+  assertRetrievalEngineEnv(env);
   return true;
 }
 
 function stableJson(value) {
-  if (Array.isArray(value)) {
-    return `[${value.map(stableJson).join(",")}]`;
-  }
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
-      .join(",")}}`;
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
 }
@@ -138,19 +68,12 @@ function sha256Text(value) {
 }
 
 function fileSha256(filePath) {
-  if (!filePath || !existsSync(filePath)) {
-    return null;
-  }
-  return sha256Text(readFileSync(filePath));
+  return filePath && existsSync(filePath) ? sha256Text(readFileSync(filePath)) : null;
 }
 
 function taskManifestHash(task) {
-  if (!task) {
-    return null;
-  }
-  if (task.manifest_path && existsSync(task.manifest_path)) {
-    return fileSha256(task.manifest_path);
-  }
+  if (!task) return null;
+  if (task.manifest_path && existsSync(task.manifest_path)) return fileSha256(task.manifest_path);
   return sha256Text(stableJson(task.task_manifest_snapshot ?? task));
 }
 
@@ -162,6 +85,7 @@ function benchmarkRunContract({
   scorerPath = null,
   cliIdentity = null,
 } = {}) {
+  const childEnv = benchmarkChildEnv(env);
   const contract = {
     contract_version: BENCHMARK_CONTRACT_VERSION,
     task_id: task?.id ?? null,
@@ -172,8 +96,8 @@ function benchmarkRunContract({
     model: opts.model ?? null,
     sandbox: opts.sandbox ?? null,
     codestory_cli: cliIdentity ?? opts.codestoryCli ?? null,
-    retrieval_contract: retrievalContractSummary(benchmarkChildEnv(env)),
-    retrieval_env: retrievalEnv(benchmarkChildEnv(env)),
+    retrieval_contract: retrievalContractSummary(childEnv),
+    retrieval_env: retrievalEnv(childEnv),
     packet_threshold_config: {
       task_suite: opts.taskSuite ?? null,
       max_source_reads_after_packet: opts.maxSourceReadsAfterPacket ?? null,
@@ -190,10 +114,7 @@ function benchmarkRunContract({
 
 function benchmarkContractCompatibility(current, previous) {
   if (!previous?.compatibility_fingerprint) {
-    return {
-      compatible: false,
-      mismatches: ["previous row is missing benchmark_contract.compatibility_fingerprint"],
-    };
+    return { compatible: false, mismatches: ["previous row is missing benchmark_contract.compatibility_fingerprint"] };
   }
   if (current.compatibility_fingerprint === previous.compatibility_fingerprint) {
     return { compatible: true, mismatches: [] };
@@ -216,7 +137,7 @@ function benchmarkContractCompatibility(current, previous) {
     stableJson(current.retrieval_contract) !== stableJson(previous.retrieval_contract)
     || stableJson(current.retrieval_env) !== stableJson(previous.retrieval_env)
   ) {
-    mismatches.push("retrieval sidecar contract/env differs");
+    mismatches.push("retrieval engine contract/env differs");
   }
   if (stableJson(current.packet_threshold_config) !== stableJson(previous.packet_threshold_config)) {
     mismatches.push("packet threshold config differs");
@@ -227,13 +148,13 @@ function benchmarkContractCompatibility(current, previous) {
 export {
   BENCHMARK_CONTRACT_VERSION,
   RETRIEVAL_ENV_KEYS,
-  assertSidecarMandatoryEnv,
+  assertRetrievalEngineEnv,
   benchmarkContractCompatibility,
   benchmarkChildEnv,
   benchmarkRunContract,
   retrievalContractSummary,
   retrievalEnv,
   shouldPrepareRetrievalIndex,
-  unsupportedSidecarDisabledRequest,
-  unsupportedSidecarContractRequests,
+  unsupportedRetrievalContractRequests,
+  unsupportedRetrievalDisabledRequest,
 };

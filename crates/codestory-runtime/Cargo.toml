@@ -1,9 +1,10 @@
 [package]
 name = "codestory-runtime"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 
 [features]
+benchmark-support = []
 test-support = []
 
 [dependencies]
@@ -27,4 +28,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["test-support"] }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }

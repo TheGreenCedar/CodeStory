@@ -54,8 +54,8 @@ below. Do not nest triple-backtick fences.
 
     CodeStory exists because agents otherwise rediscover the same repository on
     every question. When you change CodeStory itself, use the same grounding loop
-    you ship to users: check readiness, ground the checkout, then trace the owning
-    crate before editing.
+    you ship to users: ask the repository question directly, then trace the owning
+    crate from the returned grounding before editing.
 
     Example prompt (CodeStory repo):
 
@@ -63,7 +63,7 @@ below. Do not nest triple-backtick fences.
 
     ## Choose The Verification Lane First
 
-    Before running Cargo or setting up sidecars, answer two questions:
+    Before running Cargo or setting up retrievals, answer two questions:
 
     1. Which crate owns the behavior?
     2. What is the smallest proof that covers the change?

@@ -99,6 +99,7 @@ node scripts/codestory-agent-ab-benchmark.mjs `
 Run the promotion-eligible packet-runtime shape:
 
 ```powershell
+$env:CODESTORY_EMBED_MODEL_SOURCE = (node scripts/prepare-embedded-model.mjs).Trim()
 cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs `
   --packet-runtime `
@@ -119,8 +120,8 @@ includes the human-readable A/B columns; `runs.jsonl` remains the source of
 truth for per-run metrics.
 
 Promotion requires full `language-expansion-holdout` packet-runtime coverage,
-cold and warm modes, `--repeats 3`, `--jobs 4`, prepared sidecars,
-`--publishable`, no `--allow-failures`, full sidecar provenance, no quality
+cold and warm modes, `--repeats 3`, `--jobs 4`, prepared retrievals,
+`--publishable`, no `--allow-failures`, full retrieval provenance, no quality
 misses, no sufficiency gaps, and no SLA misses. `--jobs 4` is valid row
 concurrency for this eval lane. Keep `--prepare-codestory-jobs` lower or capped;
 use `2` for examples unless intentionally running serial prep.
@@ -160,7 +161,7 @@ node scripts/codestory-agent-ab-score.mjs `
 
 `--packet-probe-jobs` controls cheap packet probes, `--jobs` controls
 independent nested A/B repo groups, and `--prepare-codestory-jobs` caps cache
-prep across repos. If a packet probe fails from transient sidecar
+prep across repos. If a packet probe fails from transient retrieval
 unavailability, the score wrapper reruns just those task ids serially in a
 `packet-probes-retry` artifact before deciding which rows enter the A/B phase.
 Baseline reuse is valid only when the task manifest, scorer, harness, model,
@@ -204,7 +205,7 @@ cost.
 ## Holdout retrieval
 
 The `holdout-retrieval` suite measures **generalization** on pinned public OSS
-libraries. It is required for sidecar retrieval promotion (pass at least 2/3 repos)
+libraries. It is required for retrieval retrieval promotion (pass at least 2/3 repos)
 and must **not** be used to tune planner or ranker heuristics.
 
 | Repo key | Upstream | Pin |

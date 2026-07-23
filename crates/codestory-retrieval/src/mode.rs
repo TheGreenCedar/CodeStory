@@ -34,7 +34,7 @@ impl RetrievalDegradedMode {
         matches!(self, Self::Full)
     }
 
-    pub fn runs_qdrant_stage(self) -> bool {
+    pub fn runs_semantic_stage(self) -> bool {
         matches!(self, Self::Full)
     }
 
@@ -45,7 +45,7 @@ impl RetrievalDegradedMode {
 
 pub fn derive_degraded_mode(
     lexical: &ComponentHealth,
-    qdrant: &ComponentHealth,
+    semantic: &ComponentHealth,
     scip: &ComponentHealth,
 ) -> (RetrievalDegradedMode, Option<String>) {
     if lexical.status != ComponentStatus::Healthy || !lexical.capabilities.lexical {
@@ -54,13 +54,13 @@ pub fn derive_degraded_mode(
             mandatory_failure_reason(lexical, "lexical"),
         );
     }
-    if qdrant.status != ComponentStatus::Healthy || !qdrant.capabilities.semantic {
+    if semantic.status != ComponentStatus::Healthy || !semantic.capabilities.semantic {
         let mode = if scip.capabilities.graph {
             RetrievalDegradedMode::NoSemantic
         } else {
             RetrievalDegradedMode::LexicalOnly
         };
-        return (mode, mandatory_failure_reason(qdrant, "qdrant"));
+        return (mode, mandatory_failure_reason(semantic, "semantic"));
     }
     if scip.status != ComponentStatus::Healthy || !scip.capabilities.graph {
         return (RetrievalDegradedMode::NoScip, scip.degraded_reason.clone());
@@ -105,10 +105,10 @@ mod tests {
     fn matrix_rows_match_design_doc() {
         let production = crate::capabilities::SidecarCapabilities::production_stack();
         let lexical_up = component("lexical", ComponentStatus::Healthy, None, production);
-        let qdrant_up = component("qdrant", ComponentStatus::Healthy, None, production);
+        let semantic_up = component("semantic", ComponentStatus::Healthy, None, production);
         let scip_up = component("scip", ComponentStatus::Healthy, None, production);
         assert_eq!(
-            derive_degraded_mode(&lexical_up, &qdrant_up, &scip_up).0,
+            derive_degraded_mode(&lexical_up, &semantic_up, &scip_up).0,
             RetrievalDegradedMode::Full
         );
 
@@ -119,22 +119,22 @@ mod tests {
             SidecarCapabilities::NONE,
         );
         assert_eq!(
-            derive_degraded_mode(&lexical_up, &qdrant_up, &scip_down).0,
+            derive_degraded_mode(&lexical_up, &semantic_up, &scip_down).0,
             RetrievalDegradedMode::NoScip
         );
 
-        let qdrant_down = component(
-            "qdrant",
+        let semantic_down = component(
+            "semantic",
             ComponentStatus::Unavailable,
-            Some("qdrant_unreachable"),
+            Some("embedded_vector_index_unavailable"),
             SidecarCapabilities::NONE,
         );
         assert_eq!(
-            derive_degraded_mode(&lexical_up, &qdrant_down, &scip_up).0,
+            derive_degraded_mode(&lexical_up, &semantic_down, &scip_up).0,
             RetrievalDegradedMode::NoSemantic
         );
         assert_eq!(
-            derive_degraded_mode(&lexical_up, &qdrant_down, &scip_down).0,
+            derive_degraded_mode(&lexical_up, &semantic_down, &scip_down).0,
             RetrievalDegradedMode::LexicalOnly
         );
 
@@ -145,7 +145,7 @@ mod tests {
             SidecarCapabilities::NONE,
         );
         assert_eq!(
-            derive_degraded_mode(&lexical_down, &qdrant_up, &scip_up).0,
+            derive_degraded_mode(&lexical_down, &semantic_up, &scip_up).0,
             RetrievalDegradedMode::Unavailable
         );
     }
@@ -163,10 +163,10 @@ mod tests {
             Some("lexical_stub"),
             lexical_only,
         );
-        let qdrant_stub = component(
-            "qdrant",
+        let semantic_stub = component(
+            "semantic",
             ComponentStatus::Degraded,
-            Some("qdrant_hash_vectors_only"),
+            Some("embedded_vector_index_unavailable"),
             SidecarCapabilities::NONE,
         );
         let scip_stub = component(
@@ -176,7 +176,7 @@ mod tests {
             SidecarCapabilities::NONE,
         );
         assert_ne!(
-            derive_degraded_mode(&lexical_stub, &qdrant_stub, &scip_stub).0,
+            derive_degraded_mode(&lexical_stub, &semantic_stub, &scip_stub).0,
             RetrievalDegradedMode::Full
         );
     }

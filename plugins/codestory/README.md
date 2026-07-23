@@ -1,93 +1,130 @@
-# CodeStory Agent Plugin
+# CodeStory agent plugin
 
-Thin plugin package that wires CodeStory into agent hosts. You install once;
-the agent gets local grounding through MCP, hooks, or project rules depending on
-the host.
+The plugin connects agent hosts to the native CodeStory CLI. It contains no
+indexing or retrieval implementation of its own: hooks teach routing, the MCP
+adapter selects a verified CLI, and every live tool request names its repository
+explicitly.
 
-## Host guides
+## Host surfaces
 
-| Host | Install surface | Guide |
+| Host | Plugin surface | User guide |
 | --- | --- | --- |
-| Codex | `.codex-plugin/plugin.json`, `.mcp.json`, `skills/` | [Codex](../../docs/users/codex.md) |
-| Cursor | `.cursor/rules/codestory.mdc` | [Cursor](../../docs/users/cursor.md) |
-| Claude Code | `.claude-plugin/plugin.json`, `hooks/claude-codex-hooks.json` | [Claude Code](../../docs/users/claude-code.md) |
-| GitHub Copilot CLI | `.github/plugin/plugin.json`, `hooks/copilot-hooks.json` | [Copilot CLI](../../docs/users/copilot.md#copilot-cli) |
-| GitHub Copilot editor | `.github/copilot-instructions.md` (repo root) | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
+| Codex | `.codex-plugin/plugin.json`, `.mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
+| Cursor | `.cursor/rules/codestory.mdc`, `.cursor/mcp.json` | [Cursor](../../docs/users/cursor.md) |
+| Claude Code | `.claude-plugin/plugin.json`, session hooks | [Claude Code](../../docs/users/claude-code.md) |
+| Copilot CLI | `.github/plugin/plugin.json`, session hooks | [Copilot](../../docs/users/copilot.md#copilot-cli) |
+| Copilot editor | Repository instructions | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
 
-Start at the [user guides hub](../../docs/users/README.md) for capability
-comparison and portable prompts.
+The [user guide](../../docs/users/README.md) owns shared first-use, platform,
+privacy, and readiness behavior.
 
-## What runs
+## Package anatomy
 
-- `scripts/codestory-mcp.cjs` -- stdio MCP adapter; provisions a managed CLI when configured
-- `hooks/` -- lifecycle activation for hook-capable hosts
-- `skills/codestory-grounding/` -- canonical grounding skill (Codex and partial other hosts)
+- `scripts/codestory-mcp.cjs` is the stdio adapter and managed CLI launcher.
+- `hooks/` records bounded lifecycle state for hosts that support hooks.
+- `skills/codestory-grounding/` defines the canonical direct-tool and evidence
+  contract.
+- host manifests and rules point those pieces at Codex, Cursor, Claude Code,
+  and Copilot.
 
-The adapter prefers a checksummed plugin-managed CLI and starts one projectless
-MCP runtime. Every tool call carries its repository root, so concurrent Codex
-tasks can use different projects without rebinding or restarting the server. It can provision from
-GitHub release `SHA256SUMS.txt`, honor `CODESTORY_CLI` as a local-dev override,
-and open diagnostic `codestory://status` immediately while a missing exact
-version is provisioned in the background. The next request after verified
-publication is handed to the real stdio runtime; terminal setup failures remain
-available through the same diagnostic MCP.
-Ambient `PATH` binaries are reported as diagnostics only; installed plugin
-runtime does not launch them.
+Hooks do not inject source claims or route a request through an ambient active
+project. They tell the agent to use the live MCP tool with an absolute `project`
+root. If MCP is unavailable, the agent reports the gap and uses ordinary source
+inspection.
 
-After a managed runtime passes archive checksum, executable checksum, manifest,
-`--version`, and MCP stdio `initialize` verification, the adapter retains that
-active version plus one verified pending upgrade or rollback. ZIP and tar.gz
-release assets are extracted with Node platform APIs, without an external
-archive command, under explicit archive-size, entry-count, per-entry, and total
-output ceilings. Same-version launches elect one publisher
-under an atomically owner-published PID/start-identity/token lock; acquisition
-fails closed without a reliable process-start identity, and waiters reuse its
-atomically renamed staging directory. Their wait bound covers both release
-assets' absolute total download retry windows. The staging MCP probe bounds its
-output and waits for child termination with forced-kill escalation. Stale initialization aliases are
-revalidated by inode and owner token after rename before deletion. A corrupt target is quarantined (two
-copies retained) and reprovisioned once. A live owner or unmovable Windows
-executable is never deleted, and publication fails closed when safe quarantine
-or replacement is not possible. Publisher, waiter, reclaimed-lock, quarantine,
-reprovision, and terminal-failure states appear in `plugin_runtime.warnings`;
-retained, removed, and reclaimable byte totals remain under
-`managed_cli_retention`.
+## Runtime handoff
 
-## Codex install (summary)
+The adapter starts one projectless, multi-repository MCP runtime. It prefers the
+exact checksummed CLI version declared by the plugin. If that CLI is missing,
+one installer publishes it while other requests wait or receive a bounded
+preparing response. `CODESTORY_CLI` is an explicit local-development override;
+ambient `PATH` binaries are diagnostic only and are not launched by an installed
+plugin.
 
-1. Open Codex in the repository you want to ground.
-2. Run `/plugins` and install **TheGreenCedar -> codestory**.
-3. Start a fresh thread; follow [Codex guide](../../docs/users/codex.md).
+The managed installer verifies the release checksum manifest, archive,
+executable, plugin version, `--version`, and MCP initialization before
+publication. Archive extraction is bounded, publication is atomic, concurrent
+installers share one owner, unsafe replacement fails closed, and a corrupt
+target is quarantined before one reprovision attempt. Status reports retained
+versions and any terminal provisioning error.
 
-Marketplace catalog: `TheGreenCedar/AgentPluginMarketplace` (display name
-`TheGreenCedar`). Plugin source: this repo at `plugins/codestory`.
+This network activity installs or updates the CodeStory CLI package. It is not
+an embedding-runtime download: the verified CLI already contains its model and
+linked backend. Once installed, repository indexing and retrieval require no
+model download, separate helper executable, TCP endpoint, port, or user
+approval. The same verified CLI automatically runs its hidden per-user server
+over private local IPC.
 
-Refresh or uninstall from `/plugins` in the Codex UI. On Windows, terminal
-commands (`codex.cmd plugin marketplace add|upgrade|remove`) are optional when
-your Codex build exposes them. In Unix shells, use `codex` instead of
-`codex.cmd`.
+CodeStory 0.16 publishes managed packages for Apple Silicon macOS and Windows
+x64. Those packages are qualified from isolated installs with one real
+project-scoped `ground` request and require no separate model, runtime, SDK, or
+helper executable. CPU execution is supported. Linux, Intel macOS, Windows ARM,
+physical accelerator execution, answer accuracy, and performance are not
+release claims for 0.16.
 
-Marketplace refresh is not runtime reload: the marketplace upgrade command only
-refreshes the catalog snapshot. Refresh the installed package from `/plugins` or
-the matching terminal plugin add command, then start a fresh Codex host session
-before trusting the active MCP runtime.
+## Codex install
 
-## Repair and CLI
+1. Open `/plugins` in Codex.
+2. Install **TheGreenCedar -> codestory**.
+3. Start a fresh Codex host session.
 
-Normal users repair through the agent and MCP (`status` and `sidecar_setup`,
-both with an explicit `project`). Power-user CLI transcripts:
-[CLI reference](../../docs/users/cli-reference.md).
+Marketplace catalog: `TheGreenCedar/AgentPluginMarketplace`. Refresh or remove
+the package from the same `/plugins` screen. Some Windows Codex builds also
+expose `codex.cmd plugin marketplace ...` and `codex.cmd plugin add ...`.
+
+Marketplace refresh updates the catalog only. Package refresh replaces the
+installed plugin, and a fresh host session loads that replacement. See the
+[Codex update guide](../../docs/users/codex.md#update).
+
+## CodeStoryDev refresh
+
+Maintainers dogfood an unpublished head through the local `CodeStoryDev`
+marketplace. Build the exact CLI, commit the plugin package, then run:
+
+```sh
+node scripts/install-codestory-dev-plugin.mjs \
+  --cli "$(pwd)/target/release/codestory-cli"
+```
+
+The installer stages the clean committed `plugins/codestory` package, the
+platform-native CLI, and `.codestory-dev-cli.json`, then refreshes only
+`codestory@CodeStoryDev`. The receipt binds the source-package digest, plugin
+ID/version, platform, direct executable name/path, bytes, SHA-256, and reported
+CLI version. It preserves `~/.codex/plugins/data/codestory-CodeStoryDev`.
+
+The installed launcher validates the cached receipt again with an empty
+`PATH`. If the receipt, package, cache copy, or CLI changed—or if
+`CODESTORY_CLI` is also set—it reports the receipt failure and does not try the
+production release installer. Start a fresh Codex host after a successful
+refresh to load the new adapter.
+
+## Diagnostics
+
+Normal calls prepare the repository automatically. Agents call the intended
+tool first and retry it while preparation runs. Project-scoped resources use
+the advertised `{?project}` templates; for example, status binds the caller's
+percent-encoded absolute root in `codestory://status?project=...`.
+`codestory://agent-guide` stays static and project-free. Status and the
+[CLI reference](../../docs/users/cli-reference.md) are diagnostic surfaces for
+failed convergence, not first-use steps.
 
 Blocked session steps: [Troubleshooting](../../docs/users/troubleshooting.md).
 
 ## Maintainer checks
 
-```powershell
-node --test plugins\codestory\tests\plugin-static.test.mjs
+```sh
+node scripts/generate-codestory-skill-syntax.mjs --check
+node --test scripts/tests/install-codestory-dev-plugin.test.mjs
+node --test plugins/codestory/tests/plugin-static.test.mjs
+node .github/scripts/check-doc-links.mjs
 git diff --check
 ```
 
-`plugin-static` validates adapter/skill structure and runtime wiring only — it
-does not assert documentation copy or prose phrases.
+Build `codestory-cli` before checking generated syntax. When Clap syntax
+changes, run the generator with `--rewrite-references` to refresh the compact
+index and remove copied option matrices from the skill references.
 
-Agent portability reference (maintainer): [agent-portability.md](docs/agent-portability.md).
+`plugin-static` checks adapter, manifest, skill, and runtime wiring. It does not
+assert prose.
+
+Host-adapter boundary: [Agent portability](docs/agent-portability.md).

@@ -4,10 +4,12 @@
   "repeats": 3,
   "release_evidence": {
     "commit": "2222222222222222222222222222222222222222",
+    "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
+    "evaluation_contract": "publishable-three-repeat-packet/v1",
     "profile": "ci-contract-v1",
     "evidence_identity": {
       "corpus_id": "ci-contract-corpus-v1",
-      "cache_id": "cold-full-sidecar-v1",
+      "cache_id": "cold-full-retrieval-v1",
       "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
     },
     "publishable": true,
@@ -34,9 +36,10 @@
         },
         "codestory_cache_provenance": {
           "doctor_status": "pass", "storage_path": "fixture/codestory.db",
-          "cache_policy": "prepared-sidecar-cache-read-only", "retrieval_mode": "full",
-          "sidecar_generation": "fixture-generation", "manifest_embedding_backend": "llamacpp:bge-base-en-v1.5",
-          "semantic_backend": "llamacpp", "local_only": true, "locality_kind": "local_model_files",
+          "cache_policy": "prepared-retrieval-cache-read-only", "retrieval_mode": "full",
+          "semantic_generation": "fixture-generation", "manifest_embedding_backend": "per-user-server:coderank-embed:q8_0:sha256-deadbeef",
+          "semantic_backend": "per_user_server", "embedding_engine_instance_id": "engine-fixture", "embedding_policy": "accelerated",
+          "local_only": true, "locality_kind": "same_user_local_ipc",
           "indexed": true, "freshness_status": "fresh", "semantic_ready": true, "indexing_in_timed_run": false
         }
       },
@@ -59,9 +62,10 @@
         },
         "codestory_cache_provenance": {
           "doctor_status": "pass", "storage_path": "fixture/codestory.db",
-          "cache_policy": "prepared-sidecar-cache-read-only", "retrieval_mode": "full",
-          "sidecar_generation": "fixture-generation", "manifest_embedding_backend": "llamacpp:bge-base-en-v1.5",
-          "semantic_backend": "llamacpp", "local_only": true, "locality_kind": "local_model_files",
+          "cache_policy": "prepared-retrieval-cache-read-only", "retrieval_mode": "full",
+          "semantic_generation": "fixture-generation", "manifest_embedding_backend": "per-user-server:coderank-embed:q8_0:sha256-deadbeef",
+          "semantic_backend": "per_user_server", "embedding_engine_instance_id": "engine-fixture", "embedding_policy": "accelerated",
+          "local_only": true, "locality_kind": "same_user_local_ipc",
           "indexed": true, "freshness_status": "fresh", "semantic_ready": true, "indexing_in_timed_run": false
         }
       },
@@ -84,9 +88,10 @@
         },
         "codestory_cache_provenance": {
           "doctor_status": "pass", "storage_path": "fixture/codestory.db",
-          "cache_policy": "prepared-sidecar-cache-read-only", "retrieval_mode": "full",
-          "sidecar_generation": "fixture-generation", "manifest_embedding_backend": "llamacpp:bge-base-en-v1.5",
-          "semantic_backend": "llamacpp", "local_only": true, "locality_kind": "local_model_files",
+          "cache_policy": "prepared-retrieval-cache-read-only", "retrieval_mode": "full",
+          "semantic_generation": "fixture-generation", "manifest_embedding_backend": "per-user-server:coderank-embed:q8_0:sha256-deadbeef",
+          "semantic_backend": "per_user_server", "embedding_engine_instance_id": "engine-fixture", "embedding_policy": "accelerated",
+          "local_only": true, "locality_kind": "same_user_local_ipc",
           "indexed": true, "freshness_status": "fresh", "semantic_ready": true, "indexing_in_timed_run": false
         }
       }

@@ -1,0 +1,85 @@
+# Retrieval Subsystem
+
+`codestory-retrieval` owns project-local retrieval artifacts and the
+fail-closed query boundary. It uses `codestory-llama-sys` for embeddings and
+exposes typed services to runtime and CLI; it does not own packet assembly or
+adapter rendering.
+
+## Inputs and outputs
+
+Inputs are a selected project runtime config, a current core store publication,
+a complete source inventory, graph-native search documents, embedding-free
+dense-anchor inputs, and the immutable embedding policy. Outputs are:
+
+- immutable lexical `lexical-index.sqlite3`, semantic `vectors.sqlite3`, and
+  SCIP generations;
+- a manifest binding those artifacts to source, core, schema, model bytes,
+  vector semantics, engine execution, and producer identity;
+- health/readiness reports;
+- query hits carrying `RetrievalPublicationIdentity`.
+
+## Main paths
+
+- `index.rs` and `generation.rs`: candidate construction, validation, and
+  atomic publication
+- `lexical_index.rs` and `embedded_vector.rs`: lexical and vector persistence
+- `scip_index.rs`: SCIP artifact generation
+- `query.rs`, `executor.rs`, `candidate.rs`, and `ranker.rs`: coherent query
+  execution and result identity
+- `health.rs` and `mode.rs`: artifact classification and live readiness
+- `embedding_contract.rs`: model, prefix, pooling, normalization, dimension,
+  batching, backend, and explicit CPU/accelerator policy
+- `per_user_embedding.rs`: bounded protocol, compatibility, server scheduler,
+  leases, client replay boundary, and diagnostics
+- `retention.rs`: generation leases and owned cleanup
+- `config.rs`: frozen process defaults and per-project runtime config
+
+## Concurrency and publication
+
+Writers stage a whole generation, deep-validate vector bytes, producer evidence,
+exact anchors, and zero-dense evidence, rescan source at the commit fence, and
+publish the manifest only when every identity still matches. Request
+cancellation is checked during embedding and before vector, evidence, and
+SQLite pointer publication.
+Readers use one `PinnedQuerySession` for the core transaction, candidate query,
+numeric-ID resolution, immutable generation leases, manifest/evidence identity,
+engine residency, and final revalidation. Strict reader admission applies the
+same deep generation-evidence contract as writer reuse and promotion; admitted
+query execution then stays pinned to those verified files.
+
+The embedding server is per-user, while manifests and artifacts are
+project-local. Its endpoint namespace is independent of project and cache
+roots. A compatible client joins the existing authority. An incompatible idle
+server drains before replacement; active work or leases return typed retry
+state. Clients never choose another endpoint, kill a remembered PID, or fall
+back to an in-process engine.
+
+Retrieval finalization holds an embedding residency lease across candidate
+build, validation, and publication. Manifest compatibility uses the stable
+producer contract assembled from retrieval-owned model, pooling, normalization,
+dimension, batching, fallback, and vector-schema choices. The native binding
+contributes model compatibility and execution observations; it is not the
+authority for persisted vector semantics. The lease's owner/load generation is
+a live publication fence and is not persisted as vector compatibility.
+
+## Extension rules
+
+- add artifact formats and identity fields here before teaching runtime about
+  them;
+- keep packet sufficiency, evidence assembly, and bounded product retry in
+  `codestory-runtime`;
+- keep model execution mechanics and capability reporting in
+  `codestory-llama-sys`, while keeping product model/vector/backend policy here;
+- preserve stable `sidecar_*` DTO fields only as compatibility vocabulary, not
+  as an external-service abstraction.
+
+## Failure signatures
+
+- a query resolves numeric IDs against a different core publication;
+- `retrieval_mode=full` is treated as live engine proof;
+- deep row validation runs on every query;
+- cleanup recurses from a previously validated pathname;
+- a project silently reconfigures or bypasses the per-user server.
+
+See [retrieval design](../retrieval-design.md) and
+[retrieval verification](../../testing/retrieval-architecture.md).

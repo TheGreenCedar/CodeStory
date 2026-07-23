@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { validatePacketCorpusContract } from "../codestory-release-evidence-gate.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const script = path.join(root, "scripts/codestory-release-evidence-gate.mjs");
@@ -14,7 +15,7 @@ const baseline = path.join(root, "benchmarks/release-evidence/approved-baselines
 const candidateSha = "2222222222222222222222222222222222222222";
 
 function run(command, extra = []) {
-  return spawnSync(process.execPath, [script, command, "--baseline", baseline, "--expected-sha", candidateSha, "--mode", "contract", "--repo", root, ...extra], { encoding: "utf8" });
+  return spawnSync(process.execPath, [script, command, "--baseline", baseline, "--expected-sha", candidateSha, "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root, ...extra], { encoding: "utf8" });
 }
 function workspace() {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-release-evidence-"));
@@ -31,6 +32,163 @@ function reattest(candidate, artifact, filePath) {
   candidate.artifacts[artifact].sha256 = createHash("sha256").update(bytes).digest("hex");
   candidate.artifacts[artifact].bytes = bytes.length;
 }
+
+test("v0.16 release corpus contract rejects an omitted or substituted packet task", () => {
+  const relativePath = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v1.json";
+  const bytes = readFileSync(path.join(root, relativePath));
+  const contract = JSON.parse(bytes);
+  const identity = {
+    corpus_id: contract.corpus_id,
+    cache_id: "cold-inprocess-v1",
+    machine_fingerprint: "fixture/fingerprint",
+  };
+  const provenance = {
+    corpus_contract: {
+      path: relativePath,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      corpus_id: contract.corpus_id,
+      task_ids: contract.task_ids,
+      runtime_modes: contract.runtime_modes,
+      repeats: contract.repeats,
+      task_manifests: contract.task_manifests,
+      task_repositories: { "axios-request-dispatch": "axios" },
+      project_manifests: contract.project_manifests,
+    },
+  };
+  const profile = { corpus_contract: { path: relativePath, sha256: provenance.corpus_contract.sha256 } };
+  const rows = Array.from({ length: contract.repeats }, (_, index) => ({
+    repo: "axios",
+    task_id: "axios-request-dispatch",
+    mode: "cold_cli_packet",
+    repeat: index + 1,
+  }));
+  assert.doesNotThrow(() => validatePacketCorpusContract(provenance, rows, root, identity, profile));
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, [], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, repo: "substitute" })), root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, [...rows, { ...rows[0], repo: "substitute" }], root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+  assert.throws(
+    () => validatePacketCorpusContract(provenance, rows.map((row) => ({ ...row, task_id: "ripgrep-search-pipeline" })), root, identity, profile),
+    /do not exactly match the checked-in release task scope/,
+  );
+});
+
+function axiosV2CorpusFixture(mutate) {
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-axios-v2-corpus-"));
+  const taskRelative = "benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json";
+  const projectRelative = "benchmarks/tasks/release-evidence/axios-js-ts-codestory-project-v2.json";
+  const contractRelative = "benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json";
+  for (const relative of [taskRelative, projectRelative, contractRelative]) {
+    mkdirSync(path.dirname(path.join(dir, relative)), { recursive: true });
+    copyFileSync(path.join(root, relative), path.join(dir, relative));
+  }
+  const paths = {
+    task: path.join(dir, taskRelative),
+    project: path.join(dir, projectRelative),
+    contract: path.join(dir, contractRelative),
+  };
+  mutate?.(paths);
+  return { dir, paths, contractRelative };
+}
+
+function rewriteJson(filePath, mutate) {
+  const document = JSON.parse(readFileSync(filePath));
+  mutate(document);
+  writeFileSync(filePath, `${JSON.stringify(document, null, 2)}\n`);
+}
+
+function rebindTaskHash(paths) {
+  rewriteJson(paths.contract, contract => {
+    contract.task_manifests["axios-request-dispatch-v2"].sha256 = createHash("sha256")
+      .update(readFileSync(paths.task))
+      .digest("hex");
+  });
+}
+
+function validateAxiosV2Fixture(dir, paths, contractRelative) {
+  const contractBytes = readFileSync(paths.contract);
+  const contract = JSON.parse(contractBytes);
+  const identity = {
+    corpus_id: contract.corpus_id,
+    cache_id: "cold-inprocess-v1",
+    machine_fingerprint: "fixture/fingerprint",
+  };
+  const corpusContract = {
+    path: contractRelative,
+    sha256: createHash("sha256").update(contractBytes).digest("hex"),
+    corpus_id: contract.corpus_id,
+    task_ids: contract.task_ids,
+    runtime_modes: contract.runtime_modes,
+    repeats: contract.repeats,
+    task_manifests: contract.task_manifests,
+    task_repositories: { "axios-request-dispatch-v2": "axios" },
+    project_manifests: contract.project_manifests,
+  };
+  const rows = Array.from({ length: contract.repeats }, (_, index) => ({
+    repo: "axios",
+    task_id: "axios-request-dispatch-v2",
+    mode: "cold_cli_packet",
+    repeat: index + 1,
+  }));
+  return () => validatePacketCorpusContract(
+    { corpus_contract: corpusContract },
+    rows,
+    dir,
+    identity,
+    { corpus_contract: { path: contractRelative, sha256: corpusContract.sha256 } },
+  );
+}
+
+test("Axios v2 project manifest binding fails closed", async (t) => {
+  await t.test("accepts the exact checked-in task, project, and corpus bytes", () => {
+    const fixture = axiosV2CorpusFixture();
+    assert.doesNotThrow(validateAxiosV2Fixture(fixture.dir, fixture.paths, fixture.contractRelative));
+  });
+
+  const failures = [
+    ["missing", paths => rmSync(paths.project), /does not name a file/u],
+    ["changed", paths => writeFileSync(paths.project, `${readFileSync(paths.project, "utf8")}\n`), /project manifest hash does not match/u],
+    ["escaped", paths => {
+      rewriteJson(paths.task, task => {
+        task.repo.codestory_project_manifest.path = "../../../../outside-project.json";
+      });
+      rebindTaskHash(paths);
+    }, /project manifest path .* escapes its allowed directory/u],
+    ["substituted", paths => {
+      const substitute = path.join(path.dirname(paths.project), "substitute-project.json");
+      copyFileSync(paths.project, substitute);
+      rewriteJson(paths.contract, contract => {
+        contract.project_manifests["axios-request-dispatch-v2"].path
+          = "benchmarks/tasks/release-evidence/substitute-project.json";
+      });
+    }, /path does not match task declaration/u],
+    ["extra", paths => {
+      rewriteJson(paths.contract, contract => {
+        contract.project_manifests["extra-task"] = contract.project_manifests["axios-request-dispatch-v2"];
+      });
+    }, /keys must exactly match task declarations/u],
+    ["task-inconsistent", paths => {
+      rewriteJson(paths.task, task => {
+        task.repo.codestory_project_manifest.sha256 = "0".repeat(64);
+      });
+      rebindTaskHash(paths);
+    }, /hash does not match task declaration/u],
+  ];
+  for (const [name, mutate, expected] of failures) {
+    await t.test(name, () => {
+      const fixture = axiosV2CorpusFixture(mutate);
+      assert.throws(validateAxiosV2Fixture(fixture.dir, fixture.paths, fixture.contractRelative), expected);
+    });
+  }
+});
 
 test("fingerprint prefers a validated provisioned machine identity", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-provisioning-"));
@@ -165,7 +323,7 @@ test("artifact mutation, identity drift, and short SHA are rejected", () => {
   let result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--out", path.join(dir, "report.json")]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /artifact attestation changed/);
-  result = spawnSync(process.execPath, [script, "evaluate", "--baseline", baseline, "--candidate", path.join(fixture, "candidate.json"), "--out", path.join(dir, "report.json"), "--expected-sha", candidateSha.slice(0, 8), "--mode", "contract", "--repo", root], { encoding: "utf8" });
+  result = spawnSync(process.execPath, [script, "evaluate", "--baseline", baseline, "--candidate", path.join(fixture, "candidate.json"), "--out", path.join(dir, "report.json"), "--expected-sha", candidateSha.slice(0, 8), "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root], { encoding: "utf8" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /full 40-character Git SHA/);
   const stats = JSON.parse(readFileSync(path.join(fixture, "candidate-stats.json")));
@@ -176,14 +334,14 @@ test("artifact mutation, identity drift, and short SHA are rejected", () => {
   assert.match(result.stderr, /cache_id does not match/);
 
   stats.commit = "1111111111111111111111111111111111111111";
-  stats.evidence_identity.cache_id = "cold-full-sidecar-v1";
+  stats.evidence_identity.cache_id = "cold-full-retrieval-v1";
   writeFileSync(path.join(dir, "stats.json"), JSON.stringify(stats));
-  result = spawnSync(process.execPath, [script, "produce", "--baseline", baseline, "--profile", "ci-contract-v1", "--stats", path.join(dir, "stats.json"), "--packet", path.join(fixture, "candidate-packet.json"), "--out", path.join(dir, "candidate-3.json"), "--expected-sha", stats.commit, "--mode", "contract", "--repo", root], { encoding: "utf8" });
+  result = spawnSync(process.execPath, [script, "produce", "--baseline", baseline, "--profile", "ci-contract-v1", "--stats", path.join(dir, "stats.json"), "--packet", path.join(fixture, "candidate-packet.json"), "--out", path.join(dir, "candidate-3.json"), "--expected-sha", stats.commit, "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root], { encoding: "utf8" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /identical/);
 });
 
-test("regression approval is bound to candidate hash, value, threshold, baseline, profile, and expiry", () => {
+test("current full-product regressions are non-waivable and release-bound", () => {
   const dir = workspace();
   const stats = JSON.parse(readFileSync(path.join(dir, "stats.json")));
   stats.retrieval_status_seconds = 2;
@@ -193,9 +351,16 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   let result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--out", reportPath]);
   assert.equal(result.status, 1, result.stderr);
   const report = JSON.parse(readFileSync(reportPath));
+  assert.equal(report.release_claim_evaluation.status, "fail");
+  assert.ok(report.release_claim_evaluation.failures.some(({ class: failureClass, claim }) => failureClass === "failed_evidence" && claim === "performance"));
   const row = report.metrics.find(({ metric }) => metric === "status_seconds");
+  const candidate = JSON.parse(readFileSync(path.join(dir, "candidate.json")));
+  const answerQuality = candidate.release_claims.evidence.find(({ type }) => type === "answer_quality");
+  const approvedAt = new Date().toISOString().slice(0, 10);
+  const expiresAt = new Date(`${approvedAt}T00:00:00.000Z`);
+  expiresAt.setUTCDate(expiresAt.getUTCDate() + 14);
   const approval = {
-    schema_version: 2,
+    schema_version: 3,
     metrics: {
       status_seconds: {
         candidate_sha256: report.candidate_sha256,
@@ -204,36 +369,51 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
         baseline_id: report.baseline_id,
         baseline_sha256: report.baseline_sha256,
         metric: row.metric,
+        regression_class: "model_microbenchmark",
+        baseline_value: row.reference,
         measured_value: row.measured_value,
         threshold: row.threshold,
+        regression_percent: 100,
+        direction: "max",
+        repeats: 3,
+        release_key: candidate.release_key,
         owner: "release owner",
-        approved_at: "2026-07-11",
-        expires_at: "2099-07-11",
-        rationale: "Bound contract exception"
+        approved_at: approvedAt,
+        expires_at: expiresAt.toISOString().slice(0, 10),
+        rationale: "Attempted full-product exception",
+        rollback_evidence: "Revert the candidate and restore the accepted baseline",
+        full_product_benefit: {
+          evidence_id: answerQuality.id,
+          artifact_sha256: candidate.artifacts.packet.sha256,
+          observed_at: answerQuality.observed_at,
+          metric: "packet_quality_score",
+          baseline_value: 0.5,
+          measured_value: 0.6,
+          direction: "increase",
+          improvement_percent: 20
+        }
       }
     }
   };
   const approvalPath = path.join(dir, "approval.json");
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
-  assert.equal(result.status, 0, result.stderr);
-  approval.metrics.status_seconds.expires_at = "2026-07-12";
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /status_seconds is a non-waivable full-product gate/u);
+
+  approval.schema_version = 2;
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /approval is expired/);
-  approval.metrics.status_seconds.expires_at = "2099-07-11";
-  approval.metrics.status_seconds.measured_value = 1.9;
-  writeFileSync(approvalPath, JSON.stringify(approval));
-  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
+  assert.match(result.stderr, /approval schema_version must be 3/u);
+
+  result = run("evaluate", [
+    "--candidate", path.join(dir, "candidate.json"),
+    "--out", reportPath,
+    "--release-key", "next-release",
+  ]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /does not match measured evidence/);
-  approval.metrics.status_seconds.measured_value = row.measured_value;
-  approval.metrics.status_seconds.approved_at = "2026-02-31";
-  writeFileSync(approvalPath, JSON.stringify(approval));
-  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /valid ISO date/);
+  assert.match(result.stderr, /candidate release_key does not match/u);
 });
 
 test("evaluation independently rejects reattested raw commit and packet provenance drift", () => {
@@ -287,7 +467,57 @@ test("failed packet quality and non-full stats cannot produce or evaluate a pass
   writeFileSync(path.join(dir2, "candidate.json"), JSON.stringify(candidate));
   result = run("evaluate", ["--candidate", path.join(dir2, "candidate.json"), "--out", path.join(dir2, "report.json")]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /full-sidecar readiness contract/);
+  assert.match(result.stderr, /full-retrieval readiness contract/);
+});
+
+test("release evidence independently enforces the versioned claim graph", () => {
+  const dir = workspace();
+  produce(dir);
+  const candidatePath = path.join(dir, "candidate.json");
+  const reportPath = path.join(dir, "report.json");
+  let candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.requested_claims = candidate.release_claims.requested_claims
+    .filter(({ id }) => id === "retrieval_readiness");
+  candidate.release_claims.evidence = candidate.release_claims.evidence
+    .filter(({ type }) => type === "retrieval_readiness");
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  let result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must exactly match the trusted release-evidence claim profile/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "answer_quality").tier = "live_behavior";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence[0].graph_sha256 = "0".repeat(64);
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stale_evidence/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "performance")
+    .identity.baseline_id = "fabricated@baseline";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "answer_quality")
+    .identity.evaluation_contract = "fabricated/v9";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
 });
 
 test("forged provenance, duplicate repeats, and omitted repeat budgets fail", () => {

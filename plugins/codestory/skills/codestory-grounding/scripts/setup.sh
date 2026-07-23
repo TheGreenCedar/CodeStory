@@ -64,6 +64,7 @@ fi
 
 command -v git >/dev/null 2>&1 || { echo "Required command 'git' was not found on PATH." >&2; exit 1; }
 command -v cargo >/dev/null 2>&1 || { echo "Required command 'cargo' was not found on PATH." >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "Required command 'node' was not found on PATH." >&2; exit 1; }
 
 mkdir -p "$codestory_home" "$bin_dir"
 
@@ -99,7 +100,13 @@ if [[ "$use_local_checkout" != "1" ]]; then
   fi
 fi
 
-cargo build --release --locked -p codestory-cli --manifest-path "$source_dir/Cargo.toml"
+model_source="$(cd "$source_dir" && node scripts/prepare-embedded-model.mjs)"
+if [[ -z "$model_source" || ! -f "$model_source" ]]; then
+  echo "Embedded model preparation did not return a regular file: $model_source" >&2
+  exit 1
+fi
+CODESTORY_EMBED_MODEL_SOURCE="$model_source" \
+  cargo build --release --locked -p codestory-cli --manifest-path "$source_dir/Cargo.toml"
 
 built="$source_dir/target/release/$binary_name"
 if [[ ! -f "$built" ]]; then

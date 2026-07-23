@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -10,10 +10,6 @@ static ATOMIC_JSON_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn write_synced_new_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     codestory_workspace::atomic_file::write_synced_new_file(path, content)
-}
-
-pub(crate) fn atomic_json_path(path: &Path, stem: &str) -> PathBuf {
-    codestory_workspace::atomic_file::atomic_temp_path(path, stem)
 }
 
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, stem: &str, value: &T) -> Result<()> {

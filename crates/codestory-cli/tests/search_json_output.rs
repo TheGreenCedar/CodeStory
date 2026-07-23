@@ -100,9 +100,7 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.args(args);
     command.arg("--project").arg(workspace);
     command.env("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true");
-    command.env_remove("CODESTORY_EMBED_RUNTIME_MODE");
-    command.env("CODESTORY_EMBED_BACKEND", "llamacpp");
-    command.env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.output().expect("run codestory-cli")
 }
 
@@ -153,7 +151,8 @@ fn assert_route_explore_context(explore: &Value) {
 
 fn assert_affected_route_evidence(affected: &Value) {
     assert_eq!(affected["matched_files"][0]["path"], "src/routes.ts");
-    assert_eq!(affected["unmatched_paths"][0]["path"], "missing/file.ts");
+    assert_eq!(affected["unmatched_paths"][0]["path"], "src/missing.ts");
+    assert_eq!(affected["unmatched_paths"][0]["classification"], "missing");
     assert_eq!(
         affected["impacted_routes"][0]["route"]["framework"],
         "express"
@@ -186,12 +185,21 @@ fn assert_affected_route_evidence(affected: &Value) {
             .is_some_and(|items| !items.is_empty()),
         "affected should expose blind spots for unmatched paths: {affected:#}"
     );
+    assert!(affected.get("next_commands").is_none());
     assert!(
-        affected["next_commands"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "affected should expose next commands: {affected:#}"
+        affected["follow_ups"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["action"] == "locate_input_path"
+                    && item["invocation"]["program"] == "codestory-cli"
+                    && item["invocation"]["args"]
+                        .as_array()
+                        .is_some_and(|args| args.iter().any(|arg| arg == "src/missing.ts"))
+            })
+        }),
+        "affected should expose a focused structured missing-path follow-up: {affected:#}"
     );
+    assert_eq!(affected["completeness"]["complete"], false);
+    assert!(affected["bounds"]["visited_node_count"].is_number());
 }
 
 fn assert_openapi_route_metadata(openapi: &Value) {
@@ -203,6 +211,71 @@ fn assert_openapi_route_metadata(openapi: &Value) {
     assert_eq!(route["confidence"], "schema");
     assert_eq!(route["source_convention"], "openapi");
     assert_eq!(route["provenance"][0], "openapi");
+}
+
+#[test]
+fn affected_json_distinguishes_complete_source_from_valid_uncovered_asset() {
+    let workspace = tempdir().expect("workspace dir");
+    write_retrieval_fixture(workspace.path());
+    let index = run_cli(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        index.status.success(),
+        "index command failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let complete = run_cli(
+        workspace.path(),
+        &[
+            "affected",
+            "src/lib.rs",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        complete.status.success(),
+        "affected source command failed: {}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    let complete: Value =
+        serde_json::from_slice(&complete.stdout).expect("parse complete affected json");
+    assert_eq!(complete["completeness"]["complete"], true);
+    assert!(complete.get("next_commands").is_none());
+
+    fs::write(workspace.path().join("desk.svg"), "<svg/>").expect("write SVG");
+    let uncovered = run_cli(
+        workspace.path(),
+        &[
+            "affected",
+            "desk.svg",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        uncovered.status.success(),
+        "affected SVG command failed: {}",
+        String::from_utf8_lossy(&uncovered.stderr)
+    );
+    let uncovered: Value =
+        serde_json::from_slice(&uncovered.stdout).expect("parse uncovered affected json");
+    assert_eq!(
+        uncovered["unmatched_paths"][0]["classification"],
+        "valid_uncovered"
+    );
+    assert!(uncovered.get("next_commands").is_none());
+    assert_eq!(
+        uncovered["follow_ups"][0]["action"],
+        "inspect_graph_boundary"
+    );
 }
 
 #[test]
@@ -247,20 +320,24 @@ fn search_json_fails_closed_without_full_sidecars() {
     let failure: Value = serde_json::from_slice(&search.stdout).expect("parse failure envelope");
     let failure_text = failure.to_string();
     assert_eq!(failure["schema_version"], 1);
-    assert_eq!(failure["error"]["code"], "command_failed");
-    assert!(
-        failure_text.contains(
-            "retrieval_unavailable: sidecar retrieval primary is unavailable or degraded"
-        ) && failure_text.contains("expected profile=agent mode=full"),
-        "search should report mandatory agent sidecar full-mode boundary: {failure:#}"
+    assert_eq!(failure["error"]["code"], "retrieval_unavailable");
+    assert_eq!(
+        failure["error"]["details"]["failed_layer"],
+        "retrieval_engine"
     );
     assert!(
-        failure_text.contains("Minimum next:")
-            && failure_text.contains("Full repair:")
-            && failure_text.contains("codestory-cli ready --goal agent --repair")
+        failure_text.contains("retrieval is unavailable or degraded")
+            && failure_text.contains("expected profile=agent mode=full"),
+        "search should report the mandatory full-retrieval boundary: {failure:#}"
+    );
+    assert!(
+        failure["error"]["details"]["minimum_next"]
+            .as_array()
+            .is_some_and(|commands| commands.len() == 1)
+            && failure_text.contains("codestory-cli retrieval index")
             && failure_text.contains("codestory-cli retrieval status")
             && failure_text.contains("codestory-cli doctor"),
-        "search should include retrieval repair commands: {failure:#}"
+        "search should retain typed retrieval activation and diagnostic commands: {failure:#}"
     );
 }
 
@@ -335,32 +412,11 @@ fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
 }
 
 #[test]
-#[ignore = "live full-sidecar contract; requires Docker/services plus CODESTORY_EMBED_BACKEND=llamacpp real embeddings"]
+#[ignore = "live full-retrieval contract; requires the managed embedding runtime"]
 fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());
     let run_id = "search-json-sidecar";
-
-    let bootstrap = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "bootstrap",
-            "--profile",
-            "agent",
-            "--run-id",
-            run_id,
-            "--wait-secs",
-            "30",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        bootstrap.status.success(),
-        "retrieval bootstrap failed; live full-sidecar fixture is blocked: {}",
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
 
     let index = run_cli(
         workspace.path(),
@@ -1033,7 +1089,7 @@ fn symbol_json_exposes_typed_route_endpoint_metadata() {
         &[
             "affected",
             "src/routes.ts",
-            "missing/file.ts",
+            "src/missing.ts",
             "--refresh",
             "none",
             "--format",
@@ -1168,27 +1224,6 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
     let run_id = "search-quality-eval";
-
-    let bootstrap = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "bootstrap",
-            "--profile",
-            "agent",
-            "--run-id",
-            run_id,
-            "--wait-secs",
-            "30",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        bootstrap.status.success(),
-        "retrieval bootstrap failed; search quality eval fixture is blocked: {}",
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
 
     let index = run_cli(
         workspace.path(),

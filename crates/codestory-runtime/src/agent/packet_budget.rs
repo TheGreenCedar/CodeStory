@@ -1,9 +1,10 @@
 use crate::agent::packet_capping::cap_packet_citations;
 use crate::agent::packet_command_profiles::packet_command_exact_probe_queries;
 use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
+use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_extra,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_probe_context,
     quote_packet_command_value, quote_packet_project_arg,
 };
 use crate::agent::trace_export::packet_retrieval_trace_summary;
@@ -236,7 +237,8 @@ fn rebuild_packet_budget_dependents(
     extra_probes: &[String],
 ) {
     packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
-    packet.sufficiency = build_packet_sufficiency_with_extra(
+    let exact_probe_paths = exact_packet_probe_paths(&packet.plan.probe_resolutions);
+    packet.sufficiency = build_packet_sufficiency_with_probe_context(
         project_root,
         &packet.question,
         packet
@@ -245,6 +247,7 @@ fn rebuild_packet_budget_dependents(
         &packet.answer,
         &packet.budget,
         extra_probes,
+        &exact_probe_paths,
     );
     let trim_avoid_opening = packet
         .budget
@@ -532,10 +535,101 @@ mod tests {
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
         AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, NodeId, NodeKind,
-        PacketClaimDto, PacketCoverageReportDto, PacketPlanDto, PacketPlanQueryDto,
-        PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
-        SearchHitOrigin,
+        PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
+        PacketEvidenceTierDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto,
+        PacketProbeRejectionCodeDto, PacketProbeRejectionDto, PacketProbeResolutionDto,
+        PacketProbeResolutionStatusDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
+        PacketSufficiencyStatusDto, SearchHitOrigin,
     };
+
+    #[test]
+    fn post_budget_rebuild_demotes_retained_false_safe_architecture_packet() {
+        let question = "Explain the ownership boundary from the packaged CodeStory plugin request through stdio transport, runtime grounding orchestration, retrieval, and evidence publication. Identify uncertainty or gaps.";
+        let project_root = Path::new("/workspace/CodeStory");
+        let launcher_path = "plugins/codestory/scripts/launcher.mjs";
+        let stdio_path = "crates/codestory-cli/src/stdio_transport.rs";
+        let runtime_path = "crates/codestory-runtime/src/agent/orchestrator.rs";
+        let mut packet = test_packet(question, 96 * 1024);
+        packet.packet_id = "ask-1784577982067658000".to_string();
+        packet.answer.answer_id = packet.packet_id.clone();
+        packet.task_class = Some(PacketTaskClassDto::ArchitectureExplanation);
+        packet.plan.task_class = PacketTaskClassDto::ArchitectureExplanation;
+        packet.plan.probe_resolutions = vec![
+            PacketProbeResolutionDto {
+                input_index: 0,
+                probe: PacketProbeDto::ExactPath {
+                    path: launcher_path.to_string(),
+                },
+                status: PacketProbeResolutionStatusDto::Rejected,
+                normalized_query: None,
+                path: Some(launcher_path.to_string()),
+                symbol_id: None,
+                candidates: Vec::new(),
+                rejection: Some(PacketProbeRejectionDto {
+                    code: PacketProbeRejectionCodeDto::MissingTarget,
+                    message: "exact-path target does not exist".to_string(),
+                }),
+            },
+            retained_exact_path_resolution(1, stdio_path),
+            retained_exact_path_resolution(2, runtime_path),
+        ];
+        packet.answer.citations = vec![
+            retained_graph_citation(
+                "stdio_response_retrieval_publication",
+                project_root.join(stdio_path).to_string_lossy().as_ref(),
+            ),
+            retained_graph_citation(
+                "PacketEvidenceRole::TransportAdapter",
+                project_root
+                    .join("crates/codestory-runtime/src/agent/packet_evidence_roles.rs")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+            retained_graph_citation(
+                "transport_adapter_claim",
+                project_root
+                    .join("crates/codestory-runtime/src/agent/packet_claim_profiles.rs")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+            retained_graph_citation(
+                "ResolutionPhaseTelemetry::record_semantic_request_stats",
+                project_root
+                    .join("crates/codestory-indexer/src/resolution/mod.rs")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        ];
+        packet.sufficiency.status = PacketSufficiencyStatusDto::Sufficient;
+        packet.sufficiency.gaps.clear();
+        packet.sufficiency.follow_up_commands.clear();
+
+        enforce_packet_output_budget(project_root, &mut packet);
+
+        assert_eq!(
+            packet.sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "the final post-budget packet must fail closed when the retained answer has no proof-bearing claim from the requested runtime path"
+        );
+        assert!(
+            packet
+                .sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains(runtime_path)),
+            "the final packet should identify the uncovered requested path: {:?}",
+            packet.sufficiency
+        );
+        assert!(
+            packet
+                .sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains(runtime_path)),
+            "the final packet should provide a targeted follow-up for the uncovered path: {:?}",
+            packet.sufficiency
+        );
+    }
 
     #[test]
     fn compact_budget_trims_summary_trace_before_hard_payload_omission() {
@@ -784,6 +878,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "packet-budget-test".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -853,6 +948,7 @@ mod tests {
                     query: question.to_string(),
                     purpose: "fixture".to_string(),
                 }],
+                probe_resolutions: Vec::new(),
                 trace: Vec::new(),
             },
             answer,
@@ -882,6 +978,29 @@ mod tests {
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
         }
+    }
+
+    fn retained_exact_path_resolution(input_index: u32, path: &str) -> PacketProbeResolutionDto {
+        PacketProbeResolutionDto {
+            input_index,
+            probe: PacketProbeDto::ExactPath {
+                path: path.to_string(),
+            },
+            status: PacketProbeResolutionStatusDto::ExactPath,
+            normalized_query: Some(path.to_string()),
+            path: Some(path.to_string()),
+            symbol_id: None,
+            candidates: Vec::new(),
+            rejection: None,
+        }
+    }
+
+    fn retained_graph_citation(display_name: &str, file_path: &str) -> AgentCitationDto {
+        let mut citation = test_citation(display_name, file_path);
+        citation.evidence_tier = Some(PacketEvidenceTierDto::ResolvedGraph);
+        citation.evidence_producer = Some("route_endpoint".to_string());
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::Resolved);
+        citation
     }
 
     fn install_duplicate_summary_trace_payload(packet: &mut AgentPacketDto, repeat: usize) {

@@ -42,7 +42,8 @@ pub struct CandidateHit {
 /// Sidecar lane that produced a retrieval candidate.
 pub enum CandidateSource {
     Lexical,
-    Qdrant,
+    #[serde(rename = "semantic")]
+    Semantic,
     Scip,
     Legacy,
 }

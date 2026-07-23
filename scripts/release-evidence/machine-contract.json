@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "codestory-release-evidence-linux-arm64-v1",
+  "profile_id": "codestory-release-evidence-linux-arm64-v2",
   "repository": "TheGreenCedar/CodeStory",
   "runner": {
     "name": "codestory-release-evidence-m5-colima-arm64",
@@ -13,7 +13,7 @@
       "codestory-release-evidence"
     ],
     "root": "/srv/codestory-release-evidence",
-    "data_root": "/var/lib/docker/codestory-release-evidence"
+    "data_root": "/mnt/lima-colima-codestory-release-evidence/codestory-release-evidence"
   },
   "host": {
     "architecture": "arm64",
@@ -29,17 +29,19 @@
     "profile": "codestory-release-evidence",
     "type": "vz",
     "architecture": "aarch64",
-    "runtime": "docker",
+    "runtime": "containerd",
+    "binfmt": false,
     "activate_host_context": false,
     "mount_type": "virtiofs",
     "host_mounts": [],
     "cpus": 4,
-    "memory_gib": 17,
+    "memory_gib": 8,
     "data_disk_gib": 80,
+    "data_disk_mount": "/mnt/lima-colima-codestory-release-evidence",
     "root_disk_gib": 20,
     "base_image": {
-      "url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
-      "sha512": "32242674b046b5057e60c4aba334b51e3665f05412cda89ed081cc2de153ae5c41f6b105b5c442cbe48d78e2cc21e9ba1950e406b6fb4fc2fd1dd2259240abbd",
+      "url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-containerd.raw.gz",
+      "sha512": "86fd0879941f890b72ad54709cd28d0b9c31638b3ba0201d3abd11eaadc0e87079b908af05de939d9cceb1d338ec3827efc73e81b9c6716148048ab91c7f9286",
       "guest_build_serial": "20260521"
     }
   },
@@ -53,22 +55,22 @@
       "ca-certificates": "20260601~24.04.1",
       "clang": "1:18.0-59~exp2",
       "cmake": "3.28.3-1build7",
-      "containerd.io": "2.2.4-1~ubuntu.24.04~noble",
       "curl": "8.5.0-2ubuntu10.11",
-      "docker-buildx-plugin": "0.34.1-1~ubuntu.24.04~noble",
-      "docker-ce": "5:29.5.2-1~ubuntu.24.04~noble",
-      "docker-ce-cli": "5:29.5.2-1~ubuntu.24.04~noble",
-      "docker-compose-plugin": "5.1.4-1~ubuntu.24.04~noble",
       "git": "1:2.43.0-1ubuntu7.3",
+      "glslc": "2023.8-1build1",
       "jq": "1.7.1-3ubuntu0.24.04.2",
       "libclang-dev": "1:18.0-59~exp2",
+      "libpopt0": "1.19+dfsg-1build1",
       "libsqlite3-dev": "3.45.1-1ubuntu2.6",
       "libssl-dev": "3.0.13-0ubuntu3.11",
+      "libvulkan-dev": "1.3.275.0-1build1",
       "lsof": "4.95.0-1build3",
       "pkg-config": "1.8.1-2build1",
       "procps": "2:4.0.4-4ubuntu3.2",
       "python3": "3.12.3-0ubuntu2.1",
       "python3-venv": "3.12.3-0ubuntu2.1",
+      "rsync": "3.2.7-1ubuntu1.5",
+      "spirv-headers": "1.6.1+1.4.309.0-1~ubuntu0.24.04.2",
       "tar": "1.35+dfsg-3ubuntu0.2",
       "unzip": "6.0-28ubuntu4.1",
       "xz-utils": "5.6.1+really5.4.5-1ubuntu0.3",
@@ -87,16 +89,9 @@
       "rustup_init_sha256": "9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792"
     }
   },
-  "assets": {
-    "model": {
-      "name": "bge-base-en-v1.5.Q8_0.gguf",
-      "sha256": "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c"
-    },
-    "qdrant_image": "qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae",
-    "llama_image": "ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c"
-  },
   "drill": {
     "repository": "https://github.com/serde-rs/json.git",
-    "commit": "827a315bf2198558f0325b07bcc1e2cd973aba2f"
+    "commit": "827a315bf2198558f0325b07bcc1e2cd973aba2f",
+    "project_manifest_sha256": "cccd6fdbd3ee5f288315ed015d9fd3ce0e4a3c9b3398a017038e77b91f4c46e7"
   }
 }

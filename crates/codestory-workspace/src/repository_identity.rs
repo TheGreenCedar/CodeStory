@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -23,6 +24,68 @@ static PROJECT_IDENTITY_OBSERVATION_CACHE: OnceLock<
 static PROJECT_IDENTITY_V3_OBSERVATION_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, (Instant, ProjectIdentityV3)>>,
 > = OnceLock::new();
+
+/// Hashable native identity for one workspace path observation.
+///
+/// Existing paths use filesystem identity. Missing paths use normalized
+/// platform-lexical identity and remain distinct from existing paths. The
+/// representation is intentionally private so callers cannot manufacture an
+/// identity that did not come from a filesystem observation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspacePathIdentity(WorkspacePathIdentityKind);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WorkspacePathIdentityKind {
+    #[cfg(unix)]
+    ExistingUnix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    ExistingWindows {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
+    #[cfg(unix)]
+    MissingUnix(PathBuf),
+    #[cfg(windows)]
+    MissingWindows(Vec<u16>),
+}
+
+/// Operation-scoped platform-lexical path spelling for containment checks.
+///
+/// Unix preserves case. Windows uses the same normalized invariant ordinal
+/// ignore-case spelling as missing [`WorkspacePathIdentity`] values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspacePathLexicalIdentity(WorkspacePathLexicalIdentityKind);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WorkspacePathLexicalIdentityKind {
+    #[cfg(unix)]
+    Unix(PathBuf),
+    #[cfg(windows)]
+    Windows(Vec<u16>),
+}
+
+impl WorkspacePathLexicalIdentity {
+    /// Whether this candidate is the root itself or one of its descendants.
+    pub fn is_within(&self, root: &Self) -> bool {
+        match (&self.0, &root.0) {
+            #[cfg(unix)]
+            (
+                WorkspacePathLexicalIdentityKind::Unix(candidate),
+                WorkspacePathLexicalIdentityKind::Unix(root),
+            ) => candidate == root || candidate.starts_with(root),
+            #[cfg(windows)]
+            (
+                WorkspacePathLexicalIdentityKind::Windows(candidate),
+                WorkspacePathLexicalIdentityKind::Windows(root),
+            ) => {
+                candidate == root
+                    || (candidate.starts_with(root)
+                        && (root.last() == Some(&u16::from(b'\\'))
+                            || candidate.get(root.len()) == Some(&u16::from(b'\\'))))
+            }
+        }
+    }
+}
 
 /// Git-derived identity used to decide whether portable sidecar cache reuse is
 /// safe for a project root.
@@ -606,65 +669,209 @@ fn normalize_repository_path(value: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-/// Compare workspace paths without merging distinct case-sensitive roots.
+/// Observe one path using native filesystem identity when it exists.
 ///
-/// Existing paths use the filesystem's stable file identity. Only two missing
-/// paths use platform lexical rules. Windows missing-path comparison normalizes
-/// separators and dot segments and uses ordinal Unicode case comparison, but
-/// cannot observe a missing path's future per-directory case-sensitivity flag.
+/// Existing Unix paths use device/inode identity and existing Windows paths
+/// use volume/file identity. Missing Unix paths preserve normalized spelling;
+/// missing Windows paths use normalized invariant ordinal ignore-case spelling.
+/// A missing path cannot reveal a future Windows directory's case-sensitivity
+/// flag, so callers must not retain this observation beyond their operation.
+///
+/// Only `NotFound` enters the lexical missing-path contract. Permission,
+/// malformed-path, handle, and platform failures remain errors so callers can
+/// downgrade completeness instead of guessing.
+pub fn workspace_path_identity(path: &Path) -> io::Result<WorkspacePathIdentity> {
+    match fs::metadata(path) {
+        Ok(metadata) => existing_workspace_path_identity(path, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            missing_workspace_path_identity(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Normalize one path for operation-scoped native lexical containment.
+pub fn workspace_path_lexical_identity(path: &Path) -> io::Result<WorkspacePathLexicalIdentity> {
+    #[cfg(unix)]
+    {
+        Ok(WorkspacePathLexicalIdentity(
+            WorkspacePathLexicalIdentityKind::Unix(normalize_missing_unix_path(path)),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let normalized = normalize_windows_lexical_path(path);
+        Ok(WorkspacePathLexicalIdentity(
+            WorkspacePathLexicalIdentityKind::Windows(windows_ordinal_case_fold(&normalized)?),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "lexical workspace path identity is unsupported on this platform",
+        ))
+    }
+}
+
+/// Observe one already-open file using native filesystem identity.
+pub fn workspace_file_identity(file: &fs::File) -> io::Result<WorkspacePathIdentity> {
+    let metadata = file.metadata()?;
+    existing_workspace_file_identity(file, &metadata)
+}
+
+/// Compare workspace paths through [`workspace_path_identity`].
+///
+/// The compatibility boolean fails closed when either identity is unavailable.
 pub fn same_workspace_path(left: &Path, right: &Path) -> bool {
-    match (fs::metadata(left), fs::metadata(right)) {
-        (Ok(left_metadata), Ok(right_metadata)) => {
-            same_existing_path(left, &left_metadata, right, &right_metadata)
-        }
-        (Err(left_error), Err(right_error))
-            if left_error.kind() == std::io::ErrorKind::NotFound
-                && right_error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            same_missing_path(left, right)
-        }
+    match (
+        workspace_path_identity(left),
+        workspace_path_identity(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
 }
 
 #[cfg(unix)]
-fn same_existing_path(
-    _left_path: &Path,
-    left: &fs::Metadata,
-    _right_path: &Path,
-    right: &fs::Metadata,
-) -> bool {
+fn existing_workspace_path_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
     use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
+    Ok(WorkspacePathIdentity(
+        WorkspacePathIdentityKind::ExistingUnix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    ))
+}
+
+#[cfg(unix)]
+fn existing_workspace_file_identity(
+    _file: &fs::File,
+    metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    existing_workspace_path_identity(Path::new(""), metadata)
 }
 
 #[cfg(windows)]
-fn same_existing_path(
-    left_path: &Path,
-    _left: &fs::Metadata,
-    right_path: &Path,
-    _right: &fs::Metadata,
-) -> bool {
-    windows_file_identity(left_path)
-        .zip(windows_file_identity(right_path))
-        .is_some_and(|(left, right)| left == right)
+fn existing_workspace_path_identity(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    let (volume_serial_number, file_id) = windows_file_identity(path)?;
+    Ok(WorkspacePathIdentity(
+        WorkspacePathIdentityKind::ExistingWindows {
+            volume_serial_number,
+            file_id,
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn existing_workspace_file_identity(
+    file: &fs::File,
+    _metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    let (volume_serial_number, file_id) = windows_file_handle_identity(file)?;
+    Ok(WorkspacePathIdentity(
+        WorkspacePathIdentityKind::ExistingWindows {
+            volume_serial_number,
+            file_id,
+        },
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_existing_path(
-    _left_path: &Path,
-    _left: &fs::Metadata,
-    _right_path: &Path,
-    _right: &fs::Metadata,
-) -> bool {
-    false
+fn existing_workspace_path_identity(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native workspace path identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn existing_workspace_file_identity(
+    _file: &fs::File,
+    _metadata: &fs::Metadata,
+) -> io::Result<WorkspacePathIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native workspace file identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn missing_workspace_path_identity(path: &Path) -> io::Result<WorkspacePathIdentity> {
+    Ok(WorkspacePathIdentity(
+        WorkspacePathIdentityKind::MissingUnix(normalize_missing_unix_path(path)),
+    ))
+}
+
+#[cfg(unix)]
+fn normalize_missing_unix_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized
+                    .file_name()
+                    .is_some_and(|name| name != std::ffi::OsStr::new(".."))
+                {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 #[cfg(windows)]
-fn windows_file_identity(path: &Path) -> Option<(u64, [u8; 16])> {
+fn missing_workspace_path_identity(path: &Path) -> io::Result<WorkspacePathIdentity> {
+    let normalized = normalize_windows_lexical_path(path);
+    let folded = windows_ordinal_case_fold(&normalized)?;
+    Ok(WorkspacePathIdentity(
+        WorkspacePathIdentityKind::MissingWindows(folded),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn missing_workspace_path_identity(_path: &Path) -> io::Result<WorkspacePathIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "lexical workspace path identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> io::Result<(u64, [u8; 16])> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    windows_file_handle_identity(&file)
+}
+
+#[cfg(windows)]
+fn windows_file_handle_identity(file: &fs::File) -> io::Result<(u64, [u8; 16])> {
     use std::ffi::c_void;
     use std::mem::MaybeUninit;
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -684,12 +891,6 @@ fn windows_file_identity(path: &Path) -> Option<(u64, [u8; 16])> {
     }
 
     const FILE_ID_INFO_CLASS: i32 = 18;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let file = fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
     let mut information = MaybeUninit::<FileIdInfo>::uninit();
     // SAFETY: `file` owns a valid handle for the duration of the call and the
     // output points to correctly sized, writable storage.
@@ -702,19 +903,11 @@ fn windows_file_identity(path: &Path) -> Option<(u64, [u8; 16])> {
         )
     } == 0
     {
-        return None;
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: a successful `GetFileInformationByHandleEx` initializes all fields.
     let information = unsafe { information.assume_init() };
-    Some((information.volume_serial_number, information.file_id))
-}
-
-#[cfg(windows)]
-fn same_missing_path(left: &Path, right: &Path) -> bool {
-    windows_ordinal_case_eq(
-        &normalize_windows_lexical_path(left),
-        &normalize_windows_lexical_path(right),
-    )
+    Ok((information.volume_serial_number, information.file_id))
 }
 
 #[cfg(windows)]
@@ -739,7 +932,7 @@ fn normalize_windows_lexical_path(path: &Path) -> Vec<u16> {
         let unc = [u16::from(b'U'), u16::from(b'N'), u16::from(b'C'), separator];
         if units
             .get(..unc.len())
-            .is_some_and(|prefix| windows_ordinal_case_eq(prefix, &unc))
+            .is_some_and(|prefix| windows_ascii_case_eq(prefix, &unc))
         {
             units.splice(..unc.len(), [separator, separator]);
         }
@@ -795,40 +988,92 @@ fn normalize_windows_lexical_path(path: &Path) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn windows_ordinal_case_eq(left: &[u16], right: &[u16]) -> bool {
+fn windows_ascii_case_eq(left: &[u16], right: &[u16]) -> bool {
+    fn uppercase(unit: u16) -> u16 {
+        if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) {
+            unit - u16::from(b'a' - b'A')
+        } else {
+            unit
+        }
+    }
+
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| uppercase(*left) == uppercase(*right))
+}
+
+#[cfg(windows)]
+fn windows_ordinal_case_fold(source: &[u16]) -> io::Result<Vec<u16>> {
+    use std::ptr;
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn CompareStringOrdinal(
-            left: *const u16,
-            left_len: i32,
-            right: *const u16,
-            right_len: i32,
-            ignore_case: i32,
+        fn LCMapStringEx(
+            locale_name: *const u16,
+            map_flags: u32,
+            source: *const u16,
+            source_len: i32,
+            destination: *mut u16,
+            destination_len: i32,
+            version_information: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+            sort_handle: isize,
         ) -> i32;
     }
 
-    if left == right {
-        return true;
+    if source.is_empty() {
+        return Ok(Vec::new());
     }
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
-    else {
-        return false;
+    let source_len = i32::try_from(source.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace path exceeds the Windows identity length bound",
+        )
+    })?;
+    const LCMAP_UPPERCASE: u32 = 0x0000_0200;
+    let invariant_locale = [0_u16];
+    // SAFETY: `source` remains valid for `source_len`, and null output asks
+    // Windows for the required invariant-uppercase buffer size. The invariant
+    // uppercase table is the same language-independent table used by ordinal
+    // ignore-case comparison.
+    let required = unsafe {
+        LCMapStringEx(
+            invariant_locale.as_ptr(),
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
     };
-    const CSTR_EQUAL: i32 = 2;
-    // SAFETY: both pointers remain valid for their supplied lengths, and the
-    // API only reads them. Windows ordinal ignore-case is the closest lexical
-    // fallback available when a missing path has no filesystem identity.
-    unsafe {
-        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    if required <= 0 {
+        return Err(io::Error::last_os_error());
     }
-}
-
-#[cfg(not(windows))]
-fn same_missing_path(left: &Path, right: &Path) -> bool {
-    left == right
+    let mut folded = vec![0_u16; required as usize];
+    // SAFETY: `folded` has the exact capacity reported by the query above.
+    let written = unsafe {
+        LCMapStringEx(
+            invariant_locale.as_ptr(),
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            folded.as_mut_ptr(),
+            required,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if written <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    folded.truncate(written as usize);
+    Ok(folded)
 }
 
 fn git_output(project: &Path, args: &[&str]) -> Result<String, ()> {
@@ -1205,8 +1450,45 @@ mod tests {
         fs::write(&file, "identity").expect("identity file");
         fs::hard_link(&file, &alias).expect("hard-link alias");
 
+        assert_eq!(
+            workspace_path_identity(&file).expect("file identity"),
+            workspace_path_identity(&alias).expect("alias identity")
+        );
         assert!(same_workspace_path(&file, &alias));
         assert!(!same_workspace_path(&file, &project.path().join("missing")));
+    }
+
+    #[test]
+    fn open_file_identity_matches_path_observation() {
+        let project = tempdir().expect("project");
+        let path = project.path().join("identity");
+        fs::write(&path, "identity").expect("identity file");
+        let file = fs::File::open(&path).expect("open identity file");
+
+        assert_eq!(
+            workspace_file_identity(&file).expect("open file identity"),
+            workspace_path_identity(&path).expect("path identity")
+        );
+    }
+
+    #[test]
+    fn existing_and_missing_path_identities_are_distinct() {
+        let project = tempdir().expect("project");
+        let existing = project.path().join("entry");
+        fs::write(&existing, "entry").expect("write entry");
+        let missing = project.path().join("missing");
+
+        assert_ne!(
+            workspace_path_identity(&existing).expect("existing identity"),
+            workspace_path_identity(&missing).expect("missing identity")
+        );
+    }
+
+    #[test]
+    fn unavailable_path_identity_is_an_error() {
+        let malformed = Path::new("identity\0unavailable");
+        assert!(workspace_path_identity(malformed).is_err());
+        assert!(!same_workspace_path(malformed, malformed));
     }
 
     #[cfg(unix)]
@@ -1245,14 +1527,32 @@ mod tests {
             Err(error) => panic!("lower-case path: {error}"),
         }
 
+        let missing = project.path().join("Missing").join(".").join("child");
+        let normalized = project.path().join("Missing").join("child");
+        assert_eq!(
+            workspace_path_identity(&missing).expect("missing dotted identity"),
+            workspace_path_identity(&normalized).expect("missing normalized identity")
+        );
+        assert_ne!(
+            workspace_path_identity(&project.path().join("Missing"))
+                .expect("missing upper identity"),
+            workspace_path_identity(&project.path().join("missing"))
+                .expect("missing lower identity")
+        );
+
         let first = project.path().join(OsString::from_vec(vec![b'r', 0x80]));
         let second = project.path().join(OsString::from_vec(vec![b'r', 0x81]));
         match fs::create_dir(&first) {
             Ok(()) => {}
-            // Darwin rejects non-UTF-8 path components with EILSEQ (92), so
-            // only exercise byte-distinct identities on filesystems that can
-            // materialize those names.
-            Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => return,
+            // Darwin filesystems and sandbox policies can reject non-UTF-8
+            // path components with EILSEQ (92) or EPERM (1), so only exercise
+            // byte-distinct identities where those names can be materialized.
+            Err(error)
+                if cfg!(target_os = "macos")
+                    && matches!(error.raw_os_error(), Some(1) | Some(92)) =>
+            {
+                return;
+            }
             Err(error) => panic!("first non-UTF-8 path: {error}"),
         }
         fs::create_dir(&second).expect("second non-UTF-8 path");
@@ -1274,6 +1574,10 @@ mod tests {
         let existing = project.path().join("CodeStory");
         fs::create_dir(&existing).expect("mixed-case path");
         let existing_alias = project.path().join("codestory");
+        assert_eq!(
+            workspace_path_identity(&existing).expect("existing identity"),
+            workspace_path_identity(&existing_alias).expect("existing alias identity")
+        );
         assert!(same_workspace_path(&existing, &existing_alias));
         assert_eq!(
             crate::workspace_relative_path(&existing, &existing_alias.join("src/lib.rs")),
@@ -1282,6 +1586,10 @@ mod tests {
 
         let missing = project.path().join("Missing");
         let missing_alias = project.path().join("missing");
+        assert_eq!(
+            workspace_path_identity(&missing).expect("missing identity"),
+            workspace_path_identity(&missing_alias).expect("missing alias identity")
+        );
         assert!(same_workspace_path(&missing, &missing_alias));
 
         let dotted = project
@@ -1295,14 +1603,19 @@ mod tests {
         assert!(same_workspace_path(&dotted, &normalized));
 
         let extended = PathBuf::from(format!(r"\\?\{}", project.path().display()));
+        assert_eq!(
+            workspace_path_identity(&extended.join("missing")).expect("extended missing identity"),
+            workspace_path_identity(&project.path().join("MISSING"))
+                .expect("ordinary missing identity")
+        );
         assert!(same_workspace_path(
             &extended.join("missing"),
             &project.path().join("MISSING")
         ));
-        assert!(!same_missing_path(
-            Path::new(r"C:missing"),
-            Path::new(r"C:\missing")
-        ));
+        assert_ne!(
+            workspace_path_identity(Path::new(r"C:missing")).expect("drive-relative identity"),
+            workspace_path_identity(Path::new(r"C:\missing")).expect("drive-rooted identity")
+        );
     }
 
     #[test]

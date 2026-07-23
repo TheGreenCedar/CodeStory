@@ -1,0 +1,882 @@
+{
+  "schema": "codestory.release-claims/v1",
+  "graph_version": 4,
+  "graph_id": "codestory-release-claims",
+  "evidence_policy": {
+    "selection": "all_matching_rows_must_pass",
+    "validity": "observed_at_expires_at",
+    "identity_binding": [
+      "repository",
+      "commit",
+      "source_tree"
+    ],
+    "identity_formats": {
+      "repository": "github_repository",
+      "commit": "git_sha",
+      "source_tree": "git_sha",
+      "artifact_sha256": "sha256",
+      "producer_version": "semver",
+      "target": "release_target",
+      "host_os": "identifier",
+      "host_arch": "identifier",
+      "runner": "identifier",
+      "backend": "identifier",
+      "installer": "identifier",
+      "runtime_version": "semver",
+      "profile": "identifier",
+      "corpus_id": "identifier",
+      "cache_id": "identifier",
+      "machine_fingerprint": "non_empty_text",
+      "baseline_id": "baseline_id",
+      "baseline_sha256": "sha256",
+      "candidate_sha256": "sha256",
+      "release_key": "identifier",
+      "evaluation_contract": "versioned_contract",
+      "producer_workflow": "workflow_path",
+      "producer_job": "identifier",
+      "producer_job_name": "non_empty_text",
+      "producer_run_id": "positive_integer",
+      "producer_run_attempt": "positive_integer",
+      "producer_artifact": "non_empty_text",
+      "native_engine": "identifier",
+      "calibration_sha256": "sha256",
+      "pre_publish_artifact_sha256": "sha256"
+    }
+  },
+  "exception_policy": {
+    "schema": "codestory.model-microbenchmark-exception/v1",
+    "eligible_evidence_type": "performance",
+    "regression_class": "model_microbenchmark",
+    "minimum_regression_percent": 5,
+    "minimum_repeats": 3,
+    "maximum_validity_days": 14,
+    "artifact_binding": "candidate_sha256",
+    "release_binding": "release_key",
+    "full_product_benefit_evidence_type": "answer_quality",
+    "non_waivable_metrics": [
+      "status_seconds",
+      "local_grounding_seconds",
+      "convergence_seconds",
+      "packet_seconds",
+      "search_seconds",
+      "indexing_seconds",
+      "storage_growth_ratio"
+    ]
+  },
+  "proof_tiers": [
+    {
+      "id": "source",
+      "rank": 10
+    },
+    {
+      "id": "package",
+      "rank": 20
+    },
+    {
+      "id": "native_platform",
+      "rank": 30
+    },
+    {
+      "id": "protected_hardware",
+      "rank": 40
+    },
+    {
+      "id": "installed_runtime",
+      "rank": 50
+    },
+    {
+      "id": "live_behavior",
+      "rank": 60
+    },
+    {
+      "id": "answer_quality",
+      "rank": 70
+    }
+  ],
+  "evidence_types": [
+    {
+      "id": "source_behavior",
+      "tier": "source",
+      "proof_lanes": [
+        ".github/workflows/source-proof.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 168
+    },
+    {
+      "id": "package_identity",
+      "tier": "package",
+      "proof_lanes": [
+        ".github/workflows/packaged-platform-proof.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "artifact_sha256",
+        "producer_version",
+        "target"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 72
+    },
+    {
+      "id": "platform_support",
+      "tier": "native_platform",
+      "proof_lanes": [
+        ".github/workflows/post-publish-release-smoke.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "artifact_sha256",
+        "target",
+        "host_os",
+        "host_arch"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 72
+    },
+    {
+      "id": "accelerator_execution",
+      "tier": "protected_hardware",
+      "proof_lanes": [
+        ".github/workflows/macos-metal-proof.yml",
+        ".github/workflows/windows-vulkan-proof.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "artifact_sha256",
+        "target",
+        "runner",
+        "backend"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 24
+    },
+    {
+      "id": "installed_runtime_behavior",
+      "tier": "installed_runtime",
+      "proof_lanes": [
+        ".github/workflows/macos-metal-proof.yml",
+        ".github/workflows/windows-vulkan-proof.yml",
+        ".github/workflows/post-publish-release-smoke.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "artifact_sha256",
+        "target",
+        "installer",
+        "runtime_version"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 72
+    },
+    {
+      "id": "retrieval_readiness",
+      "tier": "live_behavior",
+      "proof_lanes": [
+        ".github/workflows/release-candidate-evidence.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "profile",
+        "corpus_id",
+        "cache_id",
+        "machine_fingerprint",
+        "release_key"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 24
+    },
+    {
+      "id": "performance",
+      "tier": "live_behavior",
+      "proof_lanes": [
+        ".github/workflows/release-candidate-evidence.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "profile",
+        "corpus_id",
+        "cache_id",
+        "machine_fingerprint",
+        "baseline_id",
+        "baseline_sha256",
+        "release_key"
+      ],
+      "validity": "expires_at",
+      "maximum_validity_hours": 24
+    },
+    {
+      "id": "answer_quality",
+      "tier": "answer_quality",
+      "proof_lanes": [
+        ".github/workflows/release-candidate-evidence.yml"
+      ],
+      "required_identity": [
+        "repository",
+        "commit",
+        "source_tree",
+        "profile",
+        "corpus_id",
+        "cache_id",
+        "machine_fingerprint",
+        "release_key",
+        "artifact_sha256",
+        "evaluation_contract"
+      ],
+      "identity_constraints": {
+        "evaluation_contract": "publishable-three-repeat-packet/v1"
+      },
+      "validity": "expires_at",
+      "maximum_validity_hours": 24
+    }
+  ],
+  "claims": [
+    {
+      "id": "source_behavior",
+      "minimum_tier": "source",
+      "depends_on_claims": [],
+      "required_evidence": [
+        "source_behavior"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "claim-graph-contract",
+          "command": "node --test scripts/tests/codestory-release-claims.test.mjs"
+        }
+      ],
+      "prerequisites": [
+        "clean exact-SHA checkout",
+        "locked dependency resolution",
+        "source and contract tests pass"
+      ],
+      "non_claims": [
+        "packaged archive identity",
+        "installed or live runtime behavior"
+      ],
+      "accepted_risks": []
+    },
+    {
+      "id": "package_identity",
+      "minimum_tier": "package",
+      "depends_on_claims": [
+        "source_behavior"
+      ],
+      "required_evidence": [
+        "package_identity"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "release-package-contract",
+          "command": "python .github/scripts/package-codestory-release.py --self-test"
+        }
+      ],
+      "prerequisites": [
+        "package producer and embedded model contract are version matched",
+        "archive checksum is bound to the exact source SHA and target"
+      ],
+      "non_claims": [
+        "execution on every supported host",
+        "accelerator execution"
+      ],
+      "accepted_risks": []
+    },
+    {
+      "id": "platform_support",
+      "minimum_tier": "native_platform",
+      "depends_on_claims": [
+        "package_identity"
+      ],
+      "required_evidence": [
+        "platform_support"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "packaged-agent-contract",
+          "command": "python .github/scripts/check-packaged-agent-proof.py --self-test"
+        }
+      ],
+      "prerequisites": [
+        "the attested archive executes on the named native OS and architecture",
+        "platform-specific signing or installer checks pass where applicable"
+      ],
+      "non_claims": [
+        "unsupported operating-system versions",
+        "hardware acceleration on packaging-only cells"
+      ],
+      "accepted_risks": [
+        "native-host-matrix-is-bounded"
+      ]
+    },
+    {
+      "id": "accelerator_execution",
+      "minimum_tier": "protected_hardware",
+      "depends_on_claims": [
+        "package_identity"
+      ],
+      "required_evidence": [
+        "accelerator_execution"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "packaged-agent-contract",
+          "command": "python .github/scripts/check-packaged-agent-proof.py --self-test"
+        }
+      ],
+      "prerequisites": [
+        "protected hardware runner identity is exact",
+        "CPU fallback is disabled",
+        "the packaged binary reports and exercises the named backend"
+      ],
+      "non_claims": [
+        "accelerators absent from the protected runner matrix",
+        "answer quality"
+      ],
+      "accepted_risks": [
+        "protected-hardware-matrix-is-bounded"
+      ]
+    },
+    {
+      "id": "installed_runtime_behavior",
+      "minimum_tier": "installed_runtime",
+      "depends_on_claims": [
+        "package_identity"
+      ],
+      "required_evidence": [
+        "installed_runtime_behavior"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "managed-install-contract",
+          "command": "python .github/scripts/check-packaged-agent-proof.py --self-test"
+        }
+      ],
+      "prerequisites": [
+        "installer or managed-plugin handoff uses the attested archive",
+        "installed runtime version and project-scoped behavior are observed after installation"
+      ],
+      "non_claims": [
+        "fresh host-session visibility unless separately attested",
+        "retrieval readiness"
+      ],
+      "accepted_risks": [
+        "installed-host-matrix-is-bounded"
+      ]
+    },
+    {
+      "id": "retrieval_readiness",
+      "minimum_tier": "live_behavior",
+      "depends_on_claims": [],
+      "required_evidence": [
+        "retrieval_readiness"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "release-evidence-contract",
+          "command": "node --test scripts/tests/codestory-release-evidence-gate.test.mjs"
+        }
+      ],
+      "prerequisites": [
+        "one immutable full sidecar generation is pinned",
+        "project, corpus, cache, runtime profile, and exact source SHA identities agree",
+        "packet and search operate fail closed on the measured repository"
+      ],
+      "non_claims": [
+        "answer sufficiency for an unmeasured task",
+        "performance outside the approved profile"
+      ],
+      "accepted_risks": [
+        "measured-corpus-is-bounded"
+      ]
+    },
+    {
+      "id": "performance",
+      "minimum_tier": "live_behavior",
+      "depends_on_claims": [
+        "retrieval_readiness"
+      ],
+      "required_evidence": [
+        "performance"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "release-evidence-contract",
+          "command": "node --test scripts/tests/codestory-release-evidence-gate.test.mjs"
+        }
+      ],
+      "prerequisites": [
+        "metrics are derived from the approved profile and baseline",
+        "candidate, baseline, artifacts, machine fingerprint, and exact source SHA are attested together"
+      ],
+      "non_claims": [
+        "performance on other hardware or corpora",
+        "future-regression immunity"
+      ],
+      "accepted_risks": [
+        "performance-profile-is-bounded"
+      ]
+    },
+    {
+      "id": "answer_quality",
+      "minimum_tier": "answer_quality",
+      "depends_on_claims": [
+        "retrieval_readiness"
+      ],
+      "required_evidence": [
+        "answer_quality"
+      ],
+      "prerequisite_checks": [
+        {
+          "id": "release-evidence-contract",
+          "command": "node --test scripts/tests/codestory-release-evidence-gate.test.mjs"
+        }
+      ],
+      "prerequisites": [
+        "publishable packet rows pass sufficiency and provenance checks for every declared repeat",
+        "evaluation contract and task set are named and bound to the exact source SHA"
+      ],
+      "non_claims": [
+        "general quality for tasks outside the evaluation contract",
+        "benchmark-driven production steering"
+      ],
+      "accepted_risks": [
+        "evaluation-task-set-is-bounded"
+      ]
+    }
+  ],
+  "failure_controls": [
+    {
+      "id": "stale_or_partial_publication",
+      "claim": "retrieval_readiness",
+      "control": "negative_gate",
+      "command": "cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh"
+    },
+    {
+      "id": "project_identity_drift",
+      "claim": "retrieval_readiness",
+      "control": "negative_gate",
+      "command": "cargo test --locked -p codestory-cli --test stdio_protocol_contracts multi_project_stdio_routes_interleaved_requests_by_explicit_project"
+    },
+    {
+      "id": "sidecar_runtime_mismatch",
+      "claim": "retrieval_readiness",
+      "control": "negative_gate",
+      "command": "cargo test --locked -p codestory-contracts --lib package_runtime_sidecar_evidence_mismatch_requires_a_complete_rebuild"
+    },
+    {
+      "id": "observational_read_mutation",
+      "claim": "source_behavior",
+      "control": "negative_gate",
+      "command": "cargo test --locked -p codestory-cli --test stdio_protocol_contracts status_observes_staleness_and_ground_activates_bounded_local_refresh"
+    },
+    {
+      "id": "benchmark_leakage",
+      "claim": "answer_quality",
+      "control": "negative_gate",
+      "command": "cargo test --locked -p codestory-runtime --test retrieval_generalization_guard"
+    }
+  ],
+  "closeout": {
+    "schema": "codestory.release-closeout/v1",
+    "manifest_schema": "codestory.release-cell-manifest/v1",
+    "ledger_schema": "codestory.release-closeout-ledger/v1",
+    "summary_schema": "codestory.release-closeout-summary/v1",
+    "phases": [
+      "pre_publish",
+      "post_publish"
+    ],
+    "cell_groups": [
+      {
+        "id": "source_behavior",
+        "phase": "pre_publish",
+        "claim": "source_behavior",
+        "evidence_type": "source_behavior",
+        "expansion": "singleton",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/source-proof.yml",
+          "producer_job": "full-source-gate",
+          "producer_job_name": "full-source-gate",
+          "producer_artifact": "release-cell-prepublish-source-attempt-{attempt}"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "package_identity",
+        "phase": "pre_publish",
+        "claim": "package_identity",
+        "evidence_type": "package_identity",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/packaged-platform-proof.yml",
+          "producer_job": "build",
+          "producer_job_name": "Build {target}",
+          "producer_artifact": "release-cell-prepublish-package-{target}-attempt-{attempt}"
+        },
+        "archive_role": "pre_publish"
+      },
+      {
+        "id": "candidate_installed_behavior",
+        "phase": "pre_publish",
+        "claim": "installed_runtime_behavior",
+        "evidence_type": "installed_runtime_behavior",
+        "expansion": "instances",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "installer",
+          "runtime_version",
+          "native_engine",
+          "calibration_sha256",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch",
+          "installer",
+          "native_engine"
+        ],
+        "instances": [
+          {
+            "id": "macos-arm64",
+            "identity_constraints": {
+              "target": "macos-arm64",
+              "host_os": "macOS",
+              "host_arch": "ARM64",
+              "installer": "candidate_managed_plugin",
+              "producer_workflow": ".github/workflows/macos-metal-proof.yml",
+              "producer_job": "packaged-metal",
+              "producer_job_name": "Packaged Apple Silicon Metal engine",
+              "producer_artifact": "release-cell-prepublish-candidate-installed-macos-arm64-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "windows-x64",
+            "identity_constraints": {
+              "target": "windows-x64",
+              "host_os": "Windows",
+              "host_arch": "X64",
+              "installer": "candidate_managed_plugin",
+              "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Windows Vulkan engine",
+              "producer_artifact": "release-cell-prepublish-candidate-installed-windows-x64-attempt-{attempt}"
+            }
+          }
+        ],
+        "archive_role": "none"
+      },
+      {
+        "id": "platform_support",
+        "phase": "post_publish",
+        "claim": "platform_support",
+        "evidence_type": "platform_support",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/post-publish-release-smoke.yml",
+          "producer_job": "smoke",
+          "producer_job_name": "Published {target} smoke",
+          "producer_artifact": "release-cell-postpublish-{target}-attempt-{attempt}"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "installed_runtime_behavior",
+        "phase": "post_publish",
+        "claim": "installed_runtime_behavior",
+        "evidence_type": "installed_runtime_behavior",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "installer",
+          "runtime_version",
+          "native_engine",
+          "calibration_sha256",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch",
+          "installer",
+          "native_engine"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/post-publish-release-smoke.yml",
+          "producer_job": "smoke",
+          "producer_job_name": "Published {target} smoke",
+          "producer_artifact": "release-cell-postpublish-{target}-attempt-{attempt}"
+        },
+        "archive_role": "none"
+      },
+      {
+        "id": "post_publish_bytes",
+        "phase": "post_publish",
+        "claim": "package_identity",
+        "evidence_type": "package_identity",
+        "expansion": "package_matrix",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "pre_publish_artifact_sha256",
+          "producer_version",
+          "target",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "identity_constraints": {
+          "producer_workflow": ".github/workflows/post-publish-release-smoke.yml",
+          "producer_job": "smoke",
+          "producer_job_name": "Published {target} smoke",
+          "producer_artifact": "release-cell-postpublish-{target}-attempt-{attempt}"
+        },
+        "archive_role": "post_publish_compare"
+      }
+    ]
+  },
+  "workflow_policy": {
+    "artifact_retention_days": 30,
+    "package_matrix": [
+      {
+        "os": "windows-latest",
+        "rust_target": "x86_64-pc-windows-msvc",
+        "asset_target": "windows-x64",
+        "exe_suffix": ".exe",
+        "extension": "zip"
+      },
+      {
+        "os": "macos-15",
+        "rust_target": "aarch64-apple-darwin",
+        "asset_target": "macos-arm64",
+        "exe_suffix": "",
+        "extension": "tar.gz"
+      }
+    ],
+    "protected_jobs": [
+      {
+        "workflow": "macos-metal-proof.yml",
+        "job": "packaged-metal",
+        "runner": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "codestory-metal"
+        ],
+        "environment": "macos-metal-release",
+        "permissions": {
+          "actions": "read",
+          "contents": "read"
+        },
+        "secrets": []
+      },
+      {
+        "workflow": "windows-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "runner": [
+          "self-hosted",
+          "Windows",
+          "X64",
+          "codestory-vulkan"
+        ],
+        "environment": "windows-vulkan-proof",
+        "permissions": {
+          "actions": "read",
+          "contents": "read"
+        },
+        "secrets": []
+      }
+    ],
+    "release_chain": {
+      "exact_sha_jobs": [
+        "source-proof",
+        "packaged-proof",
+        "macos-metal-proof",
+        "windows-vulkan-proof"
+      ],
+      "dependencies": {
+        "preflight": [
+          "workflow-policy"
+        ],
+        "source-proof": [
+          "preflight"
+        ],
+        "packaged-proof": [
+          "preflight"
+        ],
+        "macos-metal-proof": [
+          "preflight",
+          "packaged-proof"
+        ],
+        "windows-vulkan-proof": [
+          "preflight",
+          "packaged-proof"
+        ],
+        "pre-publish-closeout": [
+          "preflight",
+          "source-proof",
+          "packaged-proof",
+          "macos-metal-proof",
+          "windows-vulkan-proof"
+        ],
+        "publish": [
+          "preflight",
+          "pre-publish-closeout"
+        ],
+        "post-publish-smoke": [
+          "preflight",
+          "publish"
+        ],
+        "post-publish-closeout": [
+          "preflight",
+          "pre-publish-closeout",
+          "post-publish-smoke"
+        ]
+      }
+    },
+    "artifact_workflows": [
+      "source-proof.yml",
+      "release-candidate-evidence.yml",
+      "packaged-platform-proof.yml",
+      "macos-metal-proof.yml",
+      "windows-vulkan-proof.yml",
+      "post-publish-release-smoke.yml",
+      "release.yml",
+      "repo-scale-stats.yml"
+    ],
+    "promotion": {
+      "source_branch": "dev/codestory-next",
+      "release_branch": "main",
+      "exact_sha_expression": "${{ github.sha }}",
+      "proof_run_sha_expression": "${{ github.sha }}",
+      "manual_pr_ref_hint": "--ref <same-repository PR head branch>",
+      "source_cache_namespace": "source-proof-v2",
+      "macos_source_cache_namespace": "macos-source-v2",
+      "packaged_cache_namespace": "codestory-cli-native-v4",
+      "label_routed_workflows": [
+        "source-proof.yml",
+        "packaged-platform-pr.yml"
+      ],
+      "required_events": [
+        "labeled"
+      ]
+    },
+    "actionlint": {
+      "version": "1.7.12",
+      "config": ".github/actionlint.yaml",
+      "assets": {
+        "linux-x64": {
+          "archive": "actionlint_1.7.12_linux_amd64.tar.gz",
+          "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        },
+        "linux-arm64": {
+          "archive": "actionlint_1.7.12_linux_arm64.tar.gz",
+          "sha256": "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"
+        },
+        "darwin-x64": {
+          "archive": "actionlint_1.7.12_darwin_amd64.tar.gz",
+          "sha256": "5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644"
+        },
+        "darwin-arm64": {
+          "archive": "actionlint_1.7.12_darwin_arm64.tar.gz",
+          "sha256": "aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f"
+        },
+        "win32-x64": {
+          "archive": "actionlint_1.7.12_windows_amd64.zip",
+          "sha256": "6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9"
+        },
+        "win32-arm64": {
+          "archive": "actionlint_1.7.12_windows_arm64.zip",
+          "sha256": "cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41"
+        }
+      }
+    }
+  }
+}

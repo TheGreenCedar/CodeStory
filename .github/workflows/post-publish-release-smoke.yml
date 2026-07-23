@@ -7,14 +7,51 @@ on:
         description: Release version to smoke, with or without a leading v.
         required: true
         type: string
+      calibration_bundle_artifact:
+        description: Frozen calibration bundle artifact name.
+        required: true
+        type: string
+      calibration_bundle_run_id:
+        description: Workflow run that produced the frozen calibration bundle artifact.
+        required: true
+        type: string
+      pre_publish_closeout_artifact:
+        description: Accepted pre-publish closeout artifact from this release run.
+        required: false
+        default: ""
+        type: string
+      emit_release_cells:
+        description: Emit authenticated post-publish cells for production release closeout.
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
         description: Release version to smoke, with or without a leading v.
         required: true
         type: string
+      calibration_bundle_artifact:
+        description: Frozen calibration bundle artifact name.
+        required: true
+        type: string
+      calibration_bundle_run_id:
+        description: Workflow run that produced the frozen calibration bundle artifact.
+        required: true
+        type: string
+      pre_publish_closeout_artifact:
+        description: Accepted pre-publish closeout artifact from this release run.
+        required: false
+        default: ""
+        type: string
+      emit_release_cells:
+        description: Emit authenticated post-publish cells.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -30,21 +67,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            asset_target: linux-x64
-            extension: tar.gz
-          - os: ubuntu-24.04-arm
-            asset_target: linux-arm64
-            extension: tar.gz
           - os: windows-latest
             asset_target: windows-x64
             extension: zip
-          - os: windows-11-arm
-            asset_target: windows-arm64
-            extension: zip
-          - os: macos-15-intel
-            asset_target: macos-x64
-            extension: tar.gz
           - os: macos-15
             asset_target: macos-arm64
             extension: tar.gz
@@ -67,6 +92,44 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Download accepted pre-publish closeout
+        if: inputs.emit_release_cells
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.pre_publish_closeout_artifact }}
+          path: target/pre-publish-closeout
+
+      - name: Authenticate calibration bundle producer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALIBRATION_ARTIFACT: ${{ inputs.calibration_bundle_artifact }}
+          CALIBRATION_RUN_ID: ${{ inputs.calibration_bundle_run_id }}
+        run: |
+          set -euo pipefail
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID")"
+          producer_sha="$(jq -r '.head_sha' <<<"$run")"
+          test "$(jq -r '.head_repository.full_name' <<<"$run")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.path' <<<"$run")" = ".github/workflows/packaged-platform-pr.yml"
+          test "$(jq -r '.event' <<<"$run")" = workflow_dispatch
+          test "$(jq -r '.conclusion' <<<"$run")" = success
+          test "$CALIBRATION_ARTIFACT" = "embedding-calibration-bundle-$producer_sha"
+          artifact_count="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CALIBRATION_RUN_ID/artifacts?per_page=100" \
+              | jq --arg name "$CALIBRATION_ARTIFACT" \
+                '[.artifacts[] | select(.name == $name and .expired == false)] | length'
+          )"
+          test "$artifact_count" = 1
+
+      - name: Download frozen calibration bundle
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ inputs.calibration_bundle_artifact }}
+          path: target/calibration-bundle
+          run-id: ${{ inputs.calibration_bundle_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Download published asset and checksum
         id: asset
@@ -159,54 +222,206 @@ jobs:
           rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
           rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
 
-      - name: Prove managed plugin handoff
-        run: >-
-          python .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --plugin-root plugins/codestory
-          --managed-plugin-handoff
-          --out-dir target/post-publish-managed-proof
+      - name: Resolve the published plugin through the marketplace catalog
+        id: installed
+        shell: bash
+        env:
+          MARKETPLACE_REPOSITORY: TheGreenCedar/AgentPluginMarketplace
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/codestory-installed-proof"
+          marketplace_root="$install_root/marketplace"
+          plugin_root="$install_root/plugin"
+          plugin_data="$install_root/plugin-data"
+          provenance="$install_root/provenance.json"
+          rm -rf "$install_root"
+          mkdir -p "$plugin_root" "$plugin_data"
+          git clone --depth 1 \
+            "https://github.com/${MARKETPLACE_REPOSITORY}.git" \
+            "$marketplace_root"
+          marketplace_commit="$(git -C "$marketplace_root" rev-parse HEAD)"
+          plugin_source_commit="$(
+            git ls-remote https://github.com/TheGreenCedar/CodeStory.git \
+              refs/heads/main | awk '{print $1}'
+          )"
+          release_commit="$(git rev-parse HEAD)"
+          if [ "$plugin_source_commit" != "$release_commit" ]; then
+            echo "::error::Marketplace source main is not the exact published release commit"
+            exit 1
+          fi
+          git archive --format=tar HEAD:plugins/codestory |
+            tar -xf - -C "$plugin_root"
+          python - \
+            "$marketplace_root/.agents/plugins/marketplace.json" \
+            "$plugin_root" \
+            "$provenance" \
+            "$marketplace_commit" \
+            "$plugin_source_commit" \
+            "${{ steps.release.outputs.version }}" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
 
-      - name: Prove published Intel macOS backend policy and explicit CPU/external operation
-        if: matrix.asset_target == 'macos-x64'
-        run: >-
-          python3 .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --intel-runtime-policy
-          --out-dir target/post-publish-intel-policy-proof
+          (
+              catalog_path,
+              plugin_root_raw,
+              provenance_path,
+              marketplace_commit,
+              plugin_source_commit,
+              version,
+          ) = sys.argv[1:]
+          catalog = json.loads(pathlib.Path(catalog_path).read_text(encoding="utf-8"))
+          matches = [
+              plugin
+              for plugin in catalog.get("plugins", [])
+              if plugin.get("name") == "codestory"
+          ]
+          if len(matches) != 1:
+              raise SystemExit("marketplace must contain exactly one codestory plugin")
+          source = matches[0].get("source", {})
+          if source != {
+              "source": "git-subdir",
+              "url": "https://github.com/TheGreenCedar/CodeStory.git",
+              "path": "plugins/codestory",
+          }:
+              raise SystemExit("marketplace codestory source is not the release repository plugin")
+          plugin_root = pathlib.Path(plugin_root_raw)
+          digest = hashlib.sha256()
+          files = sorted(path for path in plugin_root.rglob("*") if path.is_file())
+          if not files:
+              raise SystemExit("installed plugin package is empty")
+          for path in files:
+              if path.is_symlink():
+                  raise SystemExit(f"installed plugin package contains a symlink: {path}")
+              relative = path.relative_to(plugin_root).as_posix().encode("utf-8")
+              payload = path.read_bytes()
+              digest.update(len(relative).to_bytes(8, "little"))
+              digest.update(relative)
+              digest.update(len(payload).to_bytes(8, "little"))
+              digest.update(payload)
+          document = {
+              "schema_version": 1,
+              "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
+              "marketplace_commit": marketplace_commit,
+              "plugin_id": "codestory",
+              "plugin_version": version,
+              "plugin_source_commit": plugin_source_commit,
+              "plugin_package_sha256": digest.hexdigest(),
+          }
+          pathlib.Path(provenance_path).write_text(
+              json.dumps(document, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          {
+            echo "plugin_root=$plugin_root"
+            echo "plugin_data=$plugin_data"
+            echo "provenance=$provenance"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Fetch retrieval embedding model
-        if: matrix.asset_target == 'linux-x64'
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Prove published Linux full-sidecar agent runtime
-        if: matrix.asset_target == 'linux-x64'
+      - name: Qualify the catalog-resolved published runtime
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: >-
-          python .github/scripts/check-packaged-agent-proof.py
-          --archive "${{ steps.asset.outputs.archive }}"
-          --checksum-file "${{ steps.asset.outputs.checksum }}"
-          --expected-version "${{ steps.release.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --plugin-root plugins/codestory
-          --out-dir target/post-publish-agent-proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          matrix_cell="installed_${{ matrix.asset_target }}_cpu"
+          matrix_cell="${matrix_cell//-/_}"
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "${{ steps.asset.outputs.archive }}" \
+            --checksum-file "${{ steps.asset.outputs.checksum }}" \
+            --expected-version "${{ steps.release.outputs.version }}" \
+            --project "${{ github.workspace }}" \
+            --plugin-root "${{ steps.installed.outputs.plugin_root }}" \
+            --plugin-handoff \
+            --engine-policy cpu_explicit \
+            --expected-backend CPU \
+            --proof-tier installed_runtime \
+            --qualification-matrix-cell "$matrix_cell" \
+            --ground-only \
+            --calibration-bundle "$calibration_bundle" \
+            --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
+            --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
+            --installed-plugin-source marketplace \
+            --installed-plugin-provenance "${{ steps.installed.outputs.provenance }}" \
+            --installed-plugin-data "${{ steps.installed.outputs.plugin_data }}" \
+            --expected-source-sha "$source_sha" \
+            --expected-source-tree "$source_tree" \
+            --timeout-secs 3600 \
+            --out-dir target/post-publish-installed-proof
+
+      - name: Emit authenticated post-publish release cells
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          archive="${{ steps.asset.outputs.archive }}"
+          calibration_bundle="$(find target/calibration-bundle -type f -name calibration-bundle.json -print)"
+          ledger="$(find target/pre-publish-closeout -type f -name ledger.json -print)"
+          test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          mkdir -p target/release-cells
+          jq -n \
+            --arg installer marketplace_catalog_resolved_plugin \
+            --arg native_engine coderank_q8_embedded \
+            --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
+            '{installer: $installer, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
+            > target/release-cells/installed-identity.json
+          common=(
+            --repo "$GITHUB_WORKSPACE"
+            --expected-sha "$GITHUB_SHA"
+            --version "$version"
+            --producer-workflow .github/workflows/post-publish-release-smoke.yml
+            --producer-job smoke
+            --producer-run-id "$GITHUB_RUN_ID"
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT"
+            --producer-artifact "release-cell-postpublish-${{ matrix.asset_target }}-attempt-$GITHUB_RUN_ATTEMPT"
+          )
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            "${common[@]}" \
+            --cell-id "platform_support:${{ matrix.asset_target }}" \
+            --archive "$archive" \
+            --out "target/release-cells/platform_support-${{ matrix.asset_target }}.json"
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            "${common[@]}" \
+            --cell-id "installed_runtime_behavior:${{ matrix.asset_target }}" \
+            --identity target/release-cells/installed-identity.json \
+            --archive "$archive" \
+            --out "target/release-cells/installed_runtime_behavior-${{ matrix.asset_target }}.json"
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            "${common[@]}" \
+            --cell-id "post_publish_bytes:${{ matrix.asset_target }}" \
+            --archive "$archive" \
+            --pre-publish-ledger "$ledger" \
+            --out "target/release-cells/post_publish_bytes-${{ matrix.asset_target }}.json"
+
+      - name: Upload authenticated post-publish release cells
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
+          path: |
+            target/release-cells/platform_support-${{ matrix.asset_target }}.json
+            target/release-cells/installed_runtime_behavior-${{ matrix.asset_target }}.json
+            target/release-cells/post_publish_bytes-${{ matrix.asset_target }}.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload post-publish proof artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: post-publish-proof-${{ matrix.asset_target }}-${{ steps.release.outputs.version }}
+          name: post-publish-proof-${{ matrix.asset_target }}-${{ steps.release.outputs.version }}-attempt-${{ github.run_attempt }}
           path: |
             target/post-publish-version-proof/${{ matrix.asset_target }}
-            target/post-publish-managed-proof
-            target/post-publish-agent-proof
-            target/post-publish-intel-policy-proof
+            target/post-publish-installed-proof
             target/post-publish-macos-signing/${{ matrix.asset_target }}
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 30

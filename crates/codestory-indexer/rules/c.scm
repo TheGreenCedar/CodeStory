@@ -224,13 +224,14 @@
   type: (type_identifier) @target_type
   declarator: (type_identifier) @alias_name)
 {
-  node @target_type.node
-  attr (@target_type.node) kind = "CLASS"
-  attr (@target_type.node) name = (source-text @target_type)
-  attr (@target_type.node) start_row = (start-row @target_type)
-  attr (@target_type.node) start_col = (start-column @target_type)
-  attr (@target_type.node) end_row = (end-row @target_type)
-  attr (@target_type.node) end_col = (end-column @target_type)
+  ;; Each direct declarator is a separate match, so its target must stay local.
+  let target_node = (node)
+  attr (target_node) kind = "CLASS"
+  attr (target_node) name = (source-text @target_type)
+  attr (target_node) start_row = (start-row @target_type)
+  attr (target_node) start_col = (start-column @target_type)
+  attr (target_node) end_row = (end-row @target_type)
+  attr (target_node) end_col = (end-column @target_type)
 
   node @alias_name.node
   attr (@alias_name.node) kind = "CLASS"
@@ -240,8 +241,8 @@
   attr (@alias_name.node) end_row = (end-row @alias_name)
   attr (@alias_name.node) end_col = (end-column @alias_name)
 
-  edge @alias_name.node -> @target_type.node
-  attr (@alias_name.node -> @target_type.node) kind = "TYPE_USAGE"
+  edge @alias_name.node -> target_node
+  attr (@alias_name.node -> target_node) kind = "TYPE_USAGE"
 }
 
 (type_definition

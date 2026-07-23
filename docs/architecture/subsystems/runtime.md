@@ -1,69 +1,80 @@
 # Runtime Subsystem
 
-`codestory-runtime` is the only orchestration layer.
+`codestory-runtime` is the only product orchestration layer. It decides which
+owning service to call and assembles cited product results; it does not own
+adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Ownership
 
-- project open and summary flows
-- full and incremental indexing orchestration
-- runtime-owned search engine state and ranking
-- symbol-doc synchronization, dense-anchor reuse, and retrieval readiness reporting
-- grounding, trail, symbol, and snippet assembly
-- agent-oriented retrieval and answer flows
+- project open, summary, and refresh orchestration;
+- full and incremental indexing across workspace, indexer, and store;
+- complete source-inventory classification and publication of verified
+  source-policy exclusions before parser scheduling;
+- graph-native symbol-document and dense-anchor synchronization;
+- explicit semantic-projection republish from one pinned complete stored core,
+  without source discovery, parsing, or source reads;
+- grounding, trails, symbol workflows, target context, search, and packet
+  assembly;
+- one packet-probe normalization and resolution path for exact paths, stable
+  symbol IDs, file-scoped symbols, free queries, and generation-bound
+  continuations;
+- managed retrieval preparation and user-facing gap mapping;
+- generation-coherent candidate resolution and one bounded publication retry.
 
-## Entry Points
+## Main paths
 
-- `crates/codestory-runtime/src/lib.rs`
-- `crates/codestory-runtime/src/services.rs`
-- `crates/codestory-runtime/src/search/`
-- `crates/codestory-runtime/src/grounding.rs`
-- `crates/codestory-runtime/src/support.rs`
+- `src/lib.rs` and `src/services.rs`: project/index services and retained state
+- `src/grounding.rs` and `src/support.rs`: grounding and support assembly
+- `src/search/`: runtime search state and graph-native documents
+- `src/agent/`: packet, retrieval-primary, planning, and evidence workflows
 
-## Call Chain
+## Publication contract
 
-1. CLI builds a runtime context.
-2. Runtime opens the workspace and store.
-3. Runtime calls into indexer and store as needed.
-4. Runtime maps persisted data into contract DTOs.
-5. CLI renders results.
+Runtime publishes the core index through store, then asks retrieval to finalize
+immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
+requires query hits and candidate resolution to share one
+`RetrievalPublicationIdentity`, holds the core read and generation leases, and
+revalidates before returning. Publication drift permits one bounded retry.
 
-## Extension Points
+The per-user engine authority belongs to retrieval/llama-sys and runs in the
+automatically managed embedding server. Runtime may cause lazy server and
+engine activation and hold publication leases, but cannot reconfigure the
+engine per project or infer readiness from `retrieval_mode` alone.
 
-- add new public services in `services.rs`
-- add new retrieval logic under `src/search/`
-- add new grounding or agent flows under runtime modules, not CLI
+Runtime accepts a bounded-source exclusion set only from a complete inventory
+and verified structural collector results, publishes it with the candidate
+core, and requires its bound manifest on freshness and read surfaces. `files`
+exposes those paths as source inventory with observed byte/unit bounds and
+explicit false graph and semantic coverage; packet and search never treat them
+as indexed evidence.
 
-## Search And Semantic Sync
+Semantic document preparation normalizes the file table once and retains
+display/read paths by owning file-node identity. Symbols resolve those paths
+through `file_node_id`; runtime does not duplicate path strings or retain a
+second owned display-name map per symbol. The current all-node load and graph
+lookup remain a separate bounded-streaming concern. Index telemetry exposes
+selected symbols, retained context files and path bytes, and lookup entries so
+that boundary stays visible.
 
-Runtime owns the default semantic-sync path after graph indexing completes. The store owns persisted rows, but runtime decides when to build graph-native symbol docs, when to build component reports, when to classify dense anchors under `graph_first_v1`, when to reuse or embed selected dense anchors, when to reload them into the search engine, and how to report readiness to CLI callers.
+Projection-only republish is a writer, never an activation or observational
+repair path. Runtime accepts only current stored document contracts, rebuilds
+graph-derived context and dense selection, and delegates atomic old-or-new core
+promotion to store. Retrieval generation construction remains retrieval-owned;
+the core replacement therefore makes broad retrieval stale until the existing
+retrieval index command publishes a matching generation.
 
-Important tuning surfaces:
+## Extension rules
 
-- `CODESTORY_SEMANTIC_DOC_SCOPE`: default durable symbol-doc scope; use `all` only for diagnostics that need the older broad symbol set
-- `CODESTORY_SEMANTIC_DOC_ALIAS_MODE`: default `alias_variant`; use `no_alias` for baseline research rows or `current_alias` for the older full alias text
-- `CODESTORY_SEMANTIC_DOC_MAX_TOKENS`: generated symbol-doc and dense-anchor text token budget.
-- `CODESTORY_EMBED_BACKEND`: product sidecar indexing requires `llamacpp`.
-- `CODESTORY_EMBED_LLAMACPP_URL`: local OpenAI-compatible llama.cpp embedding endpoint for `CODESTORY_EMBED_BACKEND=llamacpp`.
-- `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`: local llama.cpp request concurrency, clamped from `1` to `16`.
-- `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`: semantic doc embedding batch size, default `128`.
+- put reusable product workflows here and expose typed contract DTOs;
+- keep command parsing/rendering in CLI and persistence in store;
+- extend packet/search through the existing retrieval-primary path rather than
+  creating a second scoring or readiness system.
+- keep probe resolution metadata diagnostic: a requested probe may add evidence
+  work but cannot promote sufficiency or invent route order.
 
-Product packet/search evidence is served through mandatory sidecars. The live
-query sidecar must use `llamacpp:bge-base-en-v1.5`, and health must report
-`retrieval_mode=full`. Stored legacy ONNX, hash, or other diagnostic producer metadata
-must fail closed when it does not match the current llama.cpp product manifest;
-hash and other in-process embedding paths remain diagnostic. Current benchmark findings live in
-[embedding-backend-benchmarks.md](../../testing/embedding-backend-benchmarks.md).
+## Failure signatures
 
-The CLI owns managed embedding setup. `codestory-cli retrieval bootstrap` starts
-the local llama.cpp sidecar when Docker Compose is available; `retrieval index`
-then writes generation-bound sidecar artifacts and manifest metadata. Missing
-or non-product embedding state fails closed for agent-facing retrieval.
-
-Timing fields for this path are in `IndexingPhaseTimings`: `search_projection_rebuild_ms`, `search_symbol_index_ms`, `runtime_cache_publish_ms`, `semantic_doc_build_ms`, `semantic_embedding_ms`, `semantic_db_upsert_ms`, `semantic_reload_ms`, `semantic_prune_ms`, `symbol_search_docs_written`, `semantic_dense_docs_skipped`, dense reason counters, `semantic_docs_reused`, `semantic_docs_embedded`, `semantic_docs_pending`, and `semantic_docs_stale`.
-
-## Failure Signatures
-
-- runtime regains direct persistence logic
-- search engine internals become public API
-- CLI formatting concerns start driving runtime behavior
-- symbol docs or dense anchors become an implicit background side effect instead of an explicit index phase
+- CLI or MCP adapter composes product semantics;
+- candidate IDs resolve against whatever core database is current;
+- core indexing success is reported as full retrieval readiness;
+- a project operation mutates per-user server or process defaults.

@@ -2,22 +2,10 @@
 
 Produces a budget-aware grounding snapshot of the entire indexed codebase: root symbols, per-file coverage, compressed file summaries, coverage buckets, and recommended follow-up queries.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> ground [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--budget` | enum | `balanced` | Grounding depth: `strict`, `balanced`, `max` |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
-| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Budget Modes
 
@@ -25,7 +13,7 @@ Produces a budget-aware grounding snapshot of the entire indexed codebase: root 
 |------|----------|
 | `strict` | Minimal snapshot — only top-level root symbols and compressed file list |
 | `balanced` | Default — covers most files with representative symbols |
-| `max` | Full-depth coverage of every file and symbol |
+| `max` | Largest bounded snapshot; output may still compress files and symbols to stay within protocol limits |
 
 ## Output
 
@@ -34,6 +22,7 @@ Produces a budget-aware grounding snapshot of the entire indexed codebase: root 
 root: `codestory`
 budget: `balanced`
 coverage: files 187/187 symbols 1200/4231 compressed_files=42
+orientation: confidence=partial entrypoints=1/2 subsystems=4/7 candidates=224/816 uncertainty=bounded_candidate_window,compressed_presentation
 stats: nodes=4231 edges=8452 files=187 errors=3
 recommended_queries: WorkspaceIndexer, AppController, TrailResult
 notes:
@@ -45,6 +34,14 @@ files:
 coverage_buckets:
 - `high_coverage` files=120 symbols=900 samples=src/lib.rs, src/main.rs
 ```
+
+`orientation` reports how well the selected root-symbol prefix represents
+entrypoints and architecture subsystems. Its confidence is specific to compact
+repository orientation; it does not upgrade source coverage or retrieval
+sufficiency. Typed uncertainty names bounded candidate evaluation, missing or
+omitted entrypoint evidence, limited subsystem breadth, and budget-driven
+presentation compression. `ground --why` includes the same limitations in its
+confidence and gap notes.
 
 ## Examples
 

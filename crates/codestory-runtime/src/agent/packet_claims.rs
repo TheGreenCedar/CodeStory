@@ -109,6 +109,7 @@ fn packet_citation_is_diagnostic_only(citation: &AgentCitationDto) -> bool {
     matches!(
         evidence_tier_for_citation(citation),
         PacketEvidenceTierDto::DenseSemantic
+            | PacketEvidenceTierDto::StructuralText
             | PacketEvidenceTierDto::GeneratedSummary
             | PacketEvidenceTierDto::SyntheticSourceScan
     ) || matches!(
@@ -1029,6 +1030,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "packet-claims-test".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,

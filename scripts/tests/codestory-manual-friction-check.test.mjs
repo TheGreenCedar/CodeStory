@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const script = "scripts/codestory-manual-friction-check.mjs";
@@ -12,4 +13,17 @@ test("manual friction harness no longer exposes embedding setup", () => {
   const removed = spawnSync(process.execPath, [script, "--setup-embeddings"], { encoding: "utf8" });
   assert.equal(removed.status, 2);
   assert.match(removed.stderr, /Unknown argument: --setup-embeddings/u);
+});
+
+test("missing release CLI diagnostic prepares the embedded model first", () => {
+  const source = readFileSync(script, "utf8");
+  const diagnostic = source.match(/release codestory-cli is missing;[^"]+/u)?.[0] ?? "";
+  assert.match(diagnostic, /prepare-embedded-model\.mjs/u);
+  assert.match(diagnostic, /CODESTORY_EMBED_MODEL_SOURCE/u);
+  assert.ok(
+    diagnostic.indexOf("prepare-embedded-model.mjs") < diagnostic.indexOf("cargo build --release"),
+  );
+  assert.ok(
+    diagnostic.indexOf("CODESTORY_EMBED_MODEL_SOURCE") < diagnostic.indexOf("cargo build --release"),
+  );
 });

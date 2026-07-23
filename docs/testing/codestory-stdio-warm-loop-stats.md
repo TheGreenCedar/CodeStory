@@ -7,13 +7,14 @@ This log tracks the persistent `serve --stdio` path that agents should prefer on
 Run after building the release CLI:
 
 ```sh
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test stdio_warm_loop_stats -- --ignored --nocapture
 ```
 
 The harness prints metrics from the test process after the stdio server exits. The server stdout remains protocol-only: one JSON-RPC response per line, with no benchmark text mixed into the protocol stream.
 
-| Date | Commit | Scenario | Result | Reps | Startup ms | Tools/list ms | First search ms | Cold one-loop ms | Warm total ms | Warm per-loop ms | Warm/cold per-loop ratio | Search p50/p95/p99 ms | Symbol p50/p95/p99 ms | Trail p50/p95/p99 ms | Snippet p50/p95/p99 ms | Sidecar fingerprint/status p50/p95/p99 ms | Index semantic reload ms | Warm stdio semantic reload ms | Fallback reason | Warm search dir unchanged | Protocol stdout only |
+| Date | Commit | Scenario | Result | Reps | Startup ms | Tools/list ms | First search ms | Cold one-loop ms | Warm total ms | Warm per-loop ms | Warm/cold per-loop ratio | Search p50/p95/p99 ms | Symbol p50/p95/p99 ms | Trail p50/p95/p99 ms | Snippet p50/p95/p99 ms | Retrieval fingerprint/status p50/p95/p99 ms | Index semantic reload ms | Warm stdio semantic reload ms | Fallback reason | Warm search dir unchanged | Protocol stdout only |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- |
 | 2026-05-06 | pending | small fixture, release binary, hash embeddings | pass | 20 | 25.09 | 1.56 | 25.96 | 169.29 | 1070.03 | 53.50 | 0.32 | 20.84/25.96/25.96 | 15.01/17.67/17.67 | 10.25/13.92/13.92 | 6.50/8.36/8.36 | 6.79/13.17/13.17 | 0 | null | null | true | true |
 
@@ -111,6 +112,9 @@ so a changed index bypasses the cached packet.
 
 - The baseline is a small-fixture release-binary smoke, not a repo-scale promotion gate.
 - Response bytes are run-local smoke metrics because temp paths appear in JSON payloads.
-- `warm per-loop ms` covers `search -> symbol -> trail -> snippet`; `resources/read codestory://status` is measured separately as `sidecar_status` because it includes the mandatory sidecar fingerprint/status check, not the cold one-shot comparison.
+- `warm per-loop ms` covers `search -> symbol -> trail -> snippet`; the
+  project-bound `resources/read codestory://status{?project}` call is measured
+  separately as `retrieval_status` because it includes the mandatory retrieval
+  fingerprint/status check, not the cold one-shot comparison.
 - `warm stdio semantic reload ms` is `null` because `serve --stdio` does not currently expose a dedicated semantic reload phase; any warm-server load cost is included in `startup ms`.
 - Add hard latency budgets only after several local runs establish variance.

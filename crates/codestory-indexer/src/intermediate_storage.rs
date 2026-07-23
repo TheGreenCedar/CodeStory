@@ -12,12 +12,23 @@ pub struct IntermediateStorage {
     pub files: Vec<codestory_store::FileInfo>,
     pub file_content_hashes: Vec<codestory_store::FileContentHash>,
     pub nodes: Vec<Node>,
+    pub structural_unit_node_ids: Vec<NodeId>,
+    pub structural_text_units: Vec<codestory_store::StructuralTextUnit>,
+    pub structural_text_projections: Vec<codestory_store::StructuralTextProjection>,
+    pub structural_text_cache_writes: Vec<StructuralTextArtifactCacheWrite>,
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
     pub component_access: Vec<(NodeId, AccessKind)>,
     pub callable_projection_states: Vec<CallableProjectionState>,
     pub impl_anchor_node_ids: Vec<NodeId>,
     pub errors: Vec<ErrorInfo>,
+}
+
+pub struct StructuralTextArtifactCacheWrite {
+    pub path: std::path::PathBuf,
+    pub file_id: i64,
+    pub cache_key: String,
+    pub artifact_blob: Vec<u8>,
 }
 
 impl IntermediateStorage {
@@ -56,6 +67,14 @@ impl IntermediateStorage {
         self.files.extend(other.files);
         self.file_content_hashes.extend(other.file_content_hashes);
         self.nodes.extend(other.nodes);
+        self.structural_unit_node_ids
+            .extend(other.structural_unit_node_ids);
+        self.structural_text_units
+            .extend(other.structural_text_units);
+        self.structural_text_projections
+            .extend(other.structural_text_projections);
+        self.structural_text_cache_writes
+            .extend(other.structural_text_cache_writes);
         self.edges.extend(other.edges);
         self.occurrences.extend(other.occurrences);
         self.component_access.extend(other.component_access);
@@ -70,6 +89,10 @@ impl IntermediateStorage {
         self.files.clear();
         self.file_content_hashes.clear();
         self.nodes.clear();
+        self.structural_unit_node_ids.clear();
+        self.structural_text_units.clear();
+        self.structural_text_projections.clear();
+        self.structural_text_cache_writes.clear();
         self.edges.clear();
         self.occurrences.clear();
         self.component_access.clear();

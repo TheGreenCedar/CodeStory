@@ -15,15 +15,27 @@ pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
+    StagedSnapshotPublishStats,
 };
 pub use storage_impl::{
-    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, DenseReasonCounts, FileContentHash,
-    FileInfo, FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
-    GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState, IndexPublicationMode,
+    BUILD_EDGE_SEED_BATCH_SIZE, BuildNodeLookup, CURRENT_SCHEMA_VERSION,
+    CallerProjectionRemovalSummary, CorePromotionStats, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorInput,
+    DenseAnchorInputReuseMetadata, DenseAnchorPublicationManifest, DenseReasonCounts,
+    FileContentHash, FileInfo, FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount,
+    GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState,
+    IndexArtifactCacheReader, IndexArtifactCacheWrite, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, RetrievalIndexManifest, SearchSymbolProjection,
-    SearchSymbolProjectionDetail, Storage as Store, StorageError, StorageOpenMode, StorageStats,
-    SymbolSearchDoc, SymbolSummaryRecord,
+    ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats, ProjectionPersistenceStats,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord,
+    SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+    STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
+    SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
+    SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord, Storage as Store,
+    StorageError, StorageOpenMode, StorageStats, StructuralTextArtifactCacheWrite,
+    StructuralTextProjection, StructuralTextPublicationCompatibility, StructuralTextUnit,
+    StructuralTextUnitPublicationManifest, SymbolSearchDoc, SymbolSummaryRecord,
+    structural_text_unit_digest,
 };
 
 impl Store {

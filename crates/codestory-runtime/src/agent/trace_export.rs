@@ -272,6 +272,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "r1".to_string(),
+                retrieval_publication: None,
                 resolved_profile: codestory_contracts::api::AgentRetrievalPresetDto::Architecture,
                 policy_mode: codestory_contracts::api::AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 30,

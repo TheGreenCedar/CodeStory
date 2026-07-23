@@ -1,0 +1,82 @@
+{
+  "calibration_required_values": {
+    "capacity_retry_policy": {
+      "retry_after_ms": 40,
+      "retry_class": "after_capacity_change",
+      "retry_condition_source": "named_condition_from_typed_capacity_response"
+    },
+    "connect_timeout_ms": 23,
+    "election_backoff_policy": {
+      "initial_backoff_ms": 8,
+      "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
+      "maximum_backoff_ms": 103
+    },
+    "hard_native_no_progress_ms": 385421,
+    "request_deadlines_ms": {
+      "bulk_replay_success_budget_ms": 144533,
+      "bulk_request_deadline_ms": 549842,
+      "query_request_deadline_ms": 2572
+    },
+    "spawn_convergence_timeout_ms": 617,
+    "watchdog_cadence_ms": 19271
+  },
+  "draft_values": {
+    "bulk_replay_success_budget_ms": 180000,
+    "bulk_request_deadline_ms": 495250,
+    "connect_timeout_ms": 2000,
+    "hard_native_no_progress_ms": 300000,
+    "query_request_deadline_ms": 10000,
+    "retry_after_ms": 100,
+    "spawn_convergence_timeout_ms": 15000,
+    "watchdog_cadence_ms": 250
+  },
+  "fixed_contract_values": {
+    "bootstrap_version": 1,
+    "bulk_queue_capacity": 64,
+    "idle_timeout_ms": 60000,
+    "maximum_document_count": 2048,
+    "maximum_input_bytes": 1048576,
+    "maximum_metadata_bytes": 16777216,
+    "maximum_payload_bytes": 16777216,
+    "protocol_schema_version": 1,
+    "pure_embedding_rpc_replay_limit": 1,
+    "query_queue_capacity": 64
+  },
+  "freeze_record": {
+    "calibration_bundle_sha256": "0aedab7a80a52c5d25e560d5af5191ef6254b8d361441cb0de0ce732ba00d23a",
+    "calibration_freeze_digest": "55bb7522c644d951d76d7903eecae401789c3df11cfe4635aee350d96bec645c",
+    "input_constant_set_sha256": "a7d75f839ca3e8064999e40fb54e0d65b05d232c6c00788626791a9280c0459f",
+    "measurement_protocol_sha256": "9b3a883f11d7e33522a74150d45d8a34f4e9b57759a5e55b980b470aed07ee22",
+    "protocol_sha256": "f4a3fa4afb4d5bcd8e707a5e21b687cdd023dc3398b28ff6891a2318e89c5ec7",
+    "run_artifact_sha256s": [
+      "040cc9659ca23246636beffaecc77be594b5bb4e0315a0f70614fec2774eee9b",
+      "7da6a735aca038c1bf51abc3522227f1d79fc8ec04129cbe82644541d8fee370",
+      "85bbb27353c6b4bdec1636eea9590d6763c3bd4671c55aa672d976715a7a9908",
+      "ec7414161cdba499876f48cd63566c9884150fbb0dafd914ea91cf50c350b1bf",
+      "f321caf47c42a2a2da00a71c86e783920f876f7d33d8c8cb3cc78700d5a08ad0",
+      "f7923ce676945bbd25a199f7331ef9ddaab68eda59da4fb40f77c0c6510cfcf8"
+    ],
+    "selected_at": "github-actions-run:29637777410:1",
+    "selection_rule": "all_preregistered_clean_runs_no_outlier_removal",
+    "selection_source_commit": "46d13cdca987b4e6abfa3402f4007a217ac92f35",
+    "selection_source_tree": "a7c19b6ed1033d7c0b53247a5ecb523b85ee7a62"
+  },
+  "qualification_thresholds": {
+    "backend_observed_accelerator_residency": 1,
+    "bulk_documents_per_second": 2,
+    "bulk_tokens_per_second": 396,
+    "busy_retry_usefulness": 612,
+    "cold_first_vector": 2058,
+    "existing_owner_connect": 19,
+    "first_product_ready": 527,
+    "retrieval_quality": 1.0,
+    "spawn_convergence": 494,
+    "total_codestory_process_memory": 2799068775,
+    "true_idle_exit": 72285,
+    "warm_bulk_ipc": 29214,
+    "warm_query_ipc": 488
+  },
+  "schema_version": 1,
+  "selection_protocol": "codestory-per-user-embedding-server-v1",
+  "status": "frozen"
+}

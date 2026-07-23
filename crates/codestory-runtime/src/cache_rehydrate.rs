@@ -260,7 +260,8 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         invalidated_retrieval_manifests,
         invalidated_index_artifact_rows,
         rebased_path_bound_rows,
-        preserved_scope: "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved".into(),
+        preserved_scope:
+            "sqlite_graph_search_docs_dense_inputs_rebased_v2_index_artifacts_preserved".into(),
         retrieval_status: retrieval_rehydrate_status(request.dry_run),
         retrieval_reason: retrieval_rehydrate_reason(),
         retrieval_next_command: Some(retrieval_next_command(request.target_project)),
@@ -282,8 +283,9 @@ struct SourceCacheFreshness {
 }
 
 fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCacheFreshness> {
-    let workspace = WorkspaceManifest::open(project.to_path_buf())
-        .with_context(|| format!("open source workspace {}", project.display()))?;
+    let workspace =
+        WorkspaceManifest::open_with_storage_owned_exclusions(project.to_path_buf(), source_db)
+            .with_context(|| format!("open source workspace {}", project.display()))?;
     let storage = Store::open(source_db).context("open source cache for freshness")?;
     if storage
         .has_incomplete_incremental_run()
@@ -294,6 +296,7 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
     let refresh = workspace
         .build_execution_outcome(&RefreshInputs {
             stored_files: storage.files().inventory()?,
+            policy_exclusions: Vec::new(),
             inventory: WorkspaceInventory::default(),
         })
         .context("build source cache refresh plan")?;
@@ -527,6 +530,7 @@ fn rehydrate_next_commands(project: &Path) -> Vec<String> {
     let project = quote_path(project);
     vec![
         format!("codestory-cli doctor --project {project}"),
+        format!("codestory-cli index --project {project} --refresh incremental"),
         format!("codestory-cli retrieval index --project {project} --refresh full"),
         format!("codestory-cli doctor --project {project}"),
     ]
@@ -548,7 +552,7 @@ fn retrieval_rehydrate_status(dry_run: bool) -> String {
 }
 
 fn retrieval_rehydrate_reason() -> String {
-    "cache rehydrate copies SQLite graph/search/doc state only; sidecar manifests and Lexical/Qdrant/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
+    "cache rehydrate rebases portable SQLite graph/search/doc and dense-input state, invalidates the path-bound core dense manifest, and does not copy sidecar generations; core dense publication and Lexical/Semantic/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
 }
 
 fn retrieval_rehydrate_policy(dry_run: bool) -> String {
@@ -558,7 +562,7 @@ fn retrieval_rehydrate_policy(dry_run: bool) -> String {
         "invalidated"
     };
     format!(
-        "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests {action} because cache rehydrate copies SQLite cache state only; Lexical/Qdrant/SCIP sidecar directories live outside the copied cache and must be revalidated by retrieval index before reuse"
+        "path-bound SQLite graph/search/doc and dense-input rows rebased; copied core dense publication {action}; portable v2 index artifact rows preserved; retrieval manifests {action} because Lexical/Semantic/SCIP sidecar directories live outside the copied cache; core incremental index must republish dense inputs before retrieval index revalidates sidecar reuse"
     )
 }
 
@@ -618,13 +622,13 @@ mod tests {
         assert!(output.rebased_path_bound_rows > 0);
         assert_eq!(
             output.preserved_scope,
-            "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved"
+            "sqlite_graph_search_docs_dense_inputs_rebased_v2_index_artifacts_preserved"
         );
         assert_eq!(output.retrieval_status, "invalidated_requires_rebuild");
         assert!(
             output
                 .retrieval_reason
-                .contains("SQLite graph/search/doc state only"),
+                .contains("invalidates the path-bound core dense manifest"),
             "rehydrate output should distinguish SQLite reuse from sidecar readiness: {}",
             output.retrieval_reason
         );
@@ -639,16 +643,42 @@ mod tests {
         assert!(
             output
                 .retrieval
-                .contains("retrieval manifests invalidated because cache rehydrate copies SQLite cache state only"),
+                .contains("copied core dense publication invalidated"),
             "rehydrate output should name the fail-closed sidecar rebuild reason: {}",
             output.retrieval
+        );
+        assert!(
+            output.next_commands.iter().any(|command| {
+                command.contains("index --project") && command.contains("--refresh incremental")
+            }),
+            "rehydrate output should republish core dense inputs before retrieval: {output:?}"
         );
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
             storage
-                .list_retrieval_qdrant_collections()
+                .list_retrieval_semantic_generations()
                 .expect("list manifests")
                 .is_empty()
+        );
+        assert!(
+            storage
+                .get_dense_anchor_publication_manifest()
+                .expect("dense publication")
+                .is_none(),
+            "rehydrate must invalidate copied core dense publication identity"
+        );
+        let dense_inputs = storage
+            .get_dense_anchor_inputs_batch_after(None, 10)
+            .expect("dense inputs");
+        assert_eq!(dense_inputs.len(), 1);
+        assert!(
+            dense_inputs[0]
+                .text
+                .contains(target_project.path().to_string_lossy().as_ref())
+                && !dense_inputs[0]
+                    .text
+                    .contains(source_project.path().to_string_lossy().as_ref()),
+            "copied dense inputs must be rebound without source-worktree contamination"
         );
         let source_root = source_project.path().to_string_lossy();
         assert_eq!(
@@ -751,6 +781,29 @@ mod tests {
         assert_eq!(output.status, "skipped");
         assert_eq!(output.reason.as_deref(), Some("git tree mismatch"));
         assert!(!target_cache.path().join("codestory.db").exists());
+    }
+
+    #[test]
+    fn source_cache_freshness_ignores_custom_in_worktree_storage_artifacts() {
+        let project = tempdir().expect("project");
+        let source_db = project.path().join("cache").join("custom-core.db");
+        fs::create_dir_all(source_db.parent().expect("cache parent")).expect("cache parent");
+        let _storage = Store::open(&source_db).expect("source store");
+        let legacy = codestory_workspace::legacy_search_directory_for_storage(&source_db);
+        let generations = codestory_workspace::search_generation_directory_for_storage(&source_db);
+        fs::create_dir_all(&legacy).expect("legacy search directory");
+        fs::create_dir_all(generations.join("generation-1")).expect("search generation directory");
+        fs::write(legacy.join("meta.json"), "{\"generated\":true}\n").expect("legacy metadata");
+        fs::write(
+            generations.join("generation-1").join("meta.json"),
+            "{\"generated\":true}\n",
+        )
+        .expect("generation metadata");
+
+        let freshness =
+            source_cache_freshness(project.path(), &source_db).expect("fresh source cache");
+        assert_eq!(freshness.changed_or_new_files, 0);
+        assert_eq!(freshness.removed_files, 0);
     }
 
     #[test]
@@ -1076,6 +1129,39 @@ mod tests {
             }])
             .expect("llm docs");
         storage
+            .upsert_dense_anchor_inputs_batch(&[codestory_store::DenseAnchorInput {
+                node_id: NodeId(2),
+                file_node_id: Some(NodeId(1)),
+                kind: NodeKind::FUNCTION,
+                display_name: format!("{absolute_source_text}::run"),
+                qualified_name: Some(format!("{absolute_source_text}::run")),
+                file_path: Some(absolute_source_text.clone()),
+                start_line: Some(1),
+                end_line: Some(1),
+                file_role: codestory_store::FileRole::Source,
+                source_provenance: absolute_source_text.clone(),
+                text: format!("dense source file: {absolute_source_text}"),
+                document_hash: "dense-doc-hash".into(),
+                selection_reason: "test".into(),
+                policy_version: "test".into(),
+                source_identity: "core:source-generation:source-run".into(),
+                updated_at_epoch_ms: 1,
+            }])
+            .expect("dense inputs");
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "source-generation".into(),
+            run_id: "source-run".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        storage
+            .publish_dense_anchor_generation(&publication, "test")
+            .expect("dense publication");
+        storage
+            .put_index_publication(&publication)
+            .expect("core publication");
+        storage
             .upsert_index_artifact_cache(
                 Path::new("src.rs"),
                 &test_artifact_cache_key(),
@@ -1093,7 +1179,7 @@ mod tests {
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: codestory_retrieval::project_id_for_root(project),
                 lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
-                qdrant_collection: "codestory_old".into(),
+                semantic_generation: "codestory_old".into(),
                 scip_revision: None,
                 built_at_epoch_ms: 1,
                 disk_bytes: None,

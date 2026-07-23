@@ -4,32 +4,22 @@ Resolves a symbol and returns its source code with surrounding context lines. Us
 
 Markdown output uses ANSI syntax highlighting when stdout is an interactive terminal. Output files, pipes, and JSON output stay uncolored for automation.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> snippet [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--id` | string | — | Node ID of the symbol (conflicts with `--query`) |
-| `--query` | string | — | Symbol name to resolve (conflicts with `--id`) |
-| `--file` | string | — | Limit `--query` resolution to paths containing this fragment |
-| `--context` | integer | `4` | Number of surrounding context lines above and below the symbol. Alias: `--lines` |
-| `--function-body` | flag | `false` | Prefer the selected function/method implementation body when source ranges are available |
-| `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Output format: `markdown` or `json` |
-| `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Output
 
 Markdown output includes `context: scope=<line_context|function_body> requested_lines=<n> max_snippet_bytes=<bytes>`. JSON includes the same `scope`, `requested_context`, `snippet_truncated`, and `max_snippet_bytes` fields, plus `range_source`, `fallback_reason`, and `truncation_guidance` when applicable. If `snippet_truncated` is true, the byte cap stopped the output; follow `truncation_guidance` rather than assuming more `--context` will reveal the omitted code.
 
 When `--function-body` is set, snippet prefers an implementation/body-looking function or method hit over a declaration-looking hit when possible. If indexed source ranges are missing or suspicious, supported brace languages attempt a bounded brace-balanced fallback before degrading. If fallback fails, output keeps `scope=line_context` and reports the fallback reason explicitly.
+
+The MCP `snippet` tool exposes the same behavior with
+`scope=line_context|function_body` and `context=0..200`. `lines` aliases
+`context`, and the CLI-compatible `function_body` boolean aliases `scope`.
+Pass only one member of each alias pair; unknown or conflicting fields fail
+instead of being ignored.
 
 ```
 # Snippet

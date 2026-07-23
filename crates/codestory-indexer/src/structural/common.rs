@@ -138,19 +138,42 @@ pub(crate) fn push_annotation_usage_edge(
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StructuralSourceSpan {
+    pub(crate) start_line: u32,
+    pub(crate) start_col: u32,
+    pub(crate) end_line: u32,
+    pub(crate) end_col: u32,
+}
+
+impl StructuralSourceSpan {
+    pub(crate) fn token(line: u32, zero_based_start: usize, byte_len: usize) -> Self {
+        debug_assert!(line > 0);
+        debug_assert!(byte_len > 0);
+        Self {
+            start_line: line,
+            start_col: zero_based_start
+                .saturating_add(1)
+                .try_into()
+                .unwrap_or(u32::MAX),
+            end_line: line,
+            end_col: zero_based_start
+                .saturating_add(byte_len)
+                .try_into()
+                .unwrap_or(u32::MAX),
+        }
+    }
+}
+
 pub(crate) fn push_structural_node(
     storage: &mut IntermediateStorage,
     file_id: NodeId,
     kind: NodeKind,
     name: &str,
     canonical_id: &str,
-    line: u32,
-    col: u32,
+    span: StructuralSourceSpan,
 ) -> NodeId {
-    let node_id = NodeId(crate::generate_id(canonical_id));
-    let label_len = name.len().max(1);
-    let start_col = col.max(1);
-    let end_col = start_col.saturating_add(label_len as u32).saturating_sub(1);
+    let node_id = structural_node_id(file_id, canonical_id, span.start_line, span.start_col);
     storage.nodes.push(Node {
         id: node_id,
         kind,
@@ -158,24 +181,56 @@ pub(crate) fn push_structural_node(
         qualified_name: Some(name.to_string()),
         canonical_id: Some(canonical_id.to_string()),
         file_node_id: Some(file_id),
-        start_line: Some(line),
-        start_col: Some(start_col),
-        end_line: Some(line),
-        end_col: Some(end_col),
+        start_line: Some(span.start_line),
+        start_col: Some(span.start_col),
+        end_line: Some(span.end_line),
+        end_col: Some(span.end_col),
     });
+    storage.structural_unit_node_ids.push(node_id);
     storage.component_access.push((node_id, AccessKind::Public));
     storage.occurrences.push(Occurrence {
         element_id: node_id.0,
         kind: OccurrenceKind::DEFINITION,
         location: SourceLocation {
             file_node_id: file_id,
-            start_line: line,
-            start_col,
-            end_line: line,
-            end_col,
+            start_line: span.start_line,
+            start_col: span.start_col,
+            end_line: span.end_line,
+            end_col: span.end_col,
         },
     });
     node_id
+}
+
+pub(crate) fn push_synthetic_structural_node(
+    storage: &mut IntermediateStorage,
+    file_id: NodeId,
+    kind: NodeKind,
+    name: &str,
+    canonical_id: &str,
+) -> NodeId {
+    let node_id = structural_node_id(file_id, canonical_id, 0, 0);
+    storage.nodes.push(Node {
+        id: node_id,
+        kind,
+        serialized_name: name.to_string(),
+        qualified_name: Some(name.to_string()),
+        canonical_id: Some(canonical_id.to_string()),
+        file_node_id: Some(file_id),
+        start_line: None,
+        start_col: None,
+        end_line: None,
+        end_col: None,
+    });
+    storage.component_access.push((node_id, AccessKind::Public));
+    node_id
+}
+
+fn structural_node_id(file_id: NodeId, canonical_id: &str, line: u32, col: u32) -> NodeId {
+    NodeId(crate::generate_id(&format!(
+        "structural:{}:{line}:{col}:{canonical_id}",
+        file_id.0,
+    )))
 }
 
 fn structural_edge_id(source: i64, target: i64, kind: EdgeKind) -> i64 {

@@ -92,7 +92,7 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::O
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash");
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.output().expect("run codestory-cli")
 }
 
@@ -108,7 +108,7 @@ fn run_cli_with_stdin(
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -136,18 +136,7 @@ fn run_cli_with_embedding_env(
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
-        .env_remove("CODESTORY_EMBED_BACKEND")
-        .env_remove("CODESTORY_EMBED_PROFILE")
-        .env_remove("CODESTORY_EMBED_MODEL_ID")
-        .env_remove("CODESTORY_EMBED_TRUNCATE_DIM")
-        .env_remove("CODESTORY_EMBED_EXPECTED_DIM")
-        .env_remove("CODESTORY_EMBED_LLAMACPP_URL")
-        .env_remove("CODESTORY_EMBED_ONNX_MODEL")
-        .env_remove("CODESTORY_EMBED_ONNX_TOKENIZER")
-        .env_remove("CODESTORY_EMBED_ONNX_PROVIDER")
-        .env_remove("CODESTORY_EMBED_ONNX_THREADS")
-        .env_remove("CODESTORY_EMBED_ONNX_BATCH_TOKENS");
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1");
     for (name, value) in envs {
         command.env(name, value);
     }
@@ -183,15 +172,6 @@ fn run_cli_json_with_embedding_env(
     serde_json::from_slice(&output.stdout).expect("parse json output")
 }
 
-fn check_with_name<'a>(doctor: &'a Value, name: &str) -> &'a Value {
-    doctor["checks"]
-        .as_array()
-        .expect("doctor checks")
-        .iter()
-        .find(|check| check["name"] == name)
-        .unwrap_or_else(|| panic!("doctor check `{name}` missing: {doctor:#}"))
-}
-
 fn doctor_next_commands(doctor: &Value) -> Vec<&str> {
     doctor["next_commands"]
         .as_array()
@@ -221,7 +201,7 @@ fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -595,65 +575,6 @@ fn new_openapi_with_late_paths_marks_freshness_stale() {
 }
 
 #[test]
-fn doctor_reports_readiness_broker_without_publishing_snapshot() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let doctor = run_cli_json(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-    );
-    let broker = doctor["readiness_broker"]
-        .as_object()
-        .unwrap_or_else(|| panic!("doctor should include a typed readiness broker: {doctor:#}"));
-    assert!(
-        broker.get("schema_version").is_some_and(Value::is_number),
-        "doctor broker should expose its schema version: {broker:#?}"
-    );
-    assert!(
-        broker.get("project_id").is_some_and(Value::is_string),
-        "doctor broker should expose its project identity: {broker:#?}"
-    );
-    assert_eq!(
-        broker.get("persistence_status").and_then(Value::as_str),
-        Some("observed"),
-        "doctor should observe broker state without publishing it: {broker:#?}"
-    );
-    let snapshot_path = broker
-        .get("snapshot_path")
-        .and_then(Value::as_str)
-        .expect("doctor broker snapshot path");
-    assert!(
-        !Path::new(snapshot_path).exists(),
-        "doctor must not create or rewrite the broker snapshot: {snapshot_path}"
-    );
-
-    let markdown = run_cli(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "markdown"],
-    );
-    assert!(
-        markdown.status.success(),
-        "doctor markdown failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&markdown.stdout),
-        String::from_utf8_lossy(&markdown.stderr)
-    );
-    let markdown = String::from_utf8_lossy(&markdown.stdout);
-    assert!(
-        markdown.contains("readiness_broker: project_id=")
-            && markdown.contains("persistence=observed"),
-        "doctor markdown should use the ready broker rendering:\n{markdown}"
-    );
-    assert!(
-        !Path::new(snapshot_path).exists(),
-        "doctor markdown must remain read-only for the broker snapshot: {snapshot_path}"
-    );
-}
-
-#[test]
 fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -686,12 +607,11 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     let next_commands = doctor_next_commands(&doctor);
     let joined = next_commands.join("\n");
     assert!(
-        joined.contains("codestory-cli ready --goal local --repair")
-            && joined.contains("codestory-cli doctor"),
+        joined.contains("codestory-cli index --project") && joined.contains("codestory-cli doctor"),
         "stale doctor should recommend local graph repair then doctor recheck: {doctor:#}"
     );
     assert!(
-        !joined.contains("ready --goal agent --repair")
+        !joined.contains("retrieval index --project")
             && !joined.contains("retrieval status")
             && !joined.contains("retrieval index"),
         "stale doctor next_commands should stop before agent retrieval repair commands: {doctor:#}"
@@ -731,8 +651,8 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     let index_next_commands_joined = index_next_commands.join("\n");
     assert!(
         index_next_commands_joined.contains("codestory-cli retrieval status")
-            && index_next_commands_joined.contains("codestory-cli ready --goal agent --repair"),
-        "index output should recommend sidecar repair when sidecar retrieval is not full: {index:#}"
+            && index_next_commands_joined.contains("codestory-cli retrieval index"),
+        "index output should recommend retrieval publication when retrieval is not full: {index:#}"
     );
     assert_no_agent_proof_commands(&index_next_commands, "index output");
 
@@ -756,7 +676,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
         "doctor should expose local/default retrieval as its own lane: {doctor:#}"
     );
     assert!(
-        doctor["readiness_lanes"]["local_default"]["sidecar_mode"].is_string(),
+        doctor["readiness_lanes"]["local_default"]["retrieval_mode"].is_string(),
         "local/default lane should expose sidecar mode: {doctor:#}"
     );
     assert!(
@@ -781,19 +701,19 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     assert!(
         doctor["readiness_lanes"]["agent_packet_search"]["next_command"]
             .as_str()
-            .is_some_and(|command| command.contains("ready --goal agent --repair")
+            .is_some_and(|command| command.contains("retrieval index")
                 && command.contains("--run-id")
                 && command.contains("shared-agent")),
-        "agent lane should expose the agent-scoped repair command: {doctor:#}"
+        "agent lane should expose the agent-scoped activation command: {doctor:#}"
     );
 
     let next_commands = doctor_next_commands(&doctor);
     let joined = next_commands.join("\n");
     assert!(
         joined.contains("codestory-cli retrieval status")
-            && joined.contains("codestory-cli ready --goal agent --repair")
+            && joined.contains("codestory-cli retrieval index")
             && joined.contains("codestory-cli doctor"),
-        "doctor should recommend retrieval repair before packet/search: {doctor:#}"
+        "doctor should recommend retrieval publication before packet/search: {doctor:#}"
     );
     assert!(
         !joined.contains("codestory-cli index "),
@@ -857,7 +777,7 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         "preflight should expose local/default retrieval lane: {preflight:#}"
     );
     assert!(
-        preflight["local_default"]["sidecar_mode"].is_string(),
+        preflight["local_default"]["retrieval_mode"].is_string(),
         "local/default lane should expose sidecar mode: {preflight:#}"
     );
     assert!(
@@ -881,10 +801,10 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
     assert!(
         preflight["readiness_lanes"]["agent_packet_search"]["next_command"]
             .as_str()
-            .is_some_and(|command| command.contains("ready --goal agent --repair")
+            .is_some_and(|command| command.contains("retrieval index")
                 && command.contains("--run-id")
                 && command.contains("shared-agent")),
-        "agent lane should expose the agent-scoped repair command: {preflight:#}"
+        "agent lane should expose the agent-scoped activation command: {preflight:#}"
     );
     let safe_surfaces = preflight["safe_surfaces"]
         .as_array()
@@ -904,10 +824,10 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         "full retrieval surfaces should be blocked: {preflight:#}"
     );
     assert!(
-        preflight["repair_command"]
+        preflight["next_command"]
             .as_str()
-            .is_some_and(|command| command.contains("ready --goal agent --repair")),
-        "preflight should point at the existing agent repair path: {preflight:#}"
+            .is_some_and(|command| command.contains("retrieval index")),
+        "preflight should point at the retrieval activation path: {preflight:#}"
     );
     assert!(
         preflight["human_summary"]
@@ -943,10 +863,14 @@ pub fn schedule_index(project_path: &str) -> usize {
     )
     .expect("modify indexed file after indexing");
 
-    let preflight = run_cli_json(
+    let preflight = run_cli_json_with_embedding_env(
         workspace.path(),
         cache_dir.path(),
         &["agent", "preflight", "--format", "json"],
+        &[(
+            "CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS",
+            "30000",
+        )],
     );
 
     assert_eq!(preflight["usable"], true, "{preflight:#}");
@@ -1013,7 +937,7 @@ pub fn schedule_index(project_path: &str) -> usize {
         cache_dir.path(),
         &["agent", "preflight", "--format", "json"],
         &[
-            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
+            ("CODESTORY_EMBED_ALLOW_CPU", "1"),
             ("CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS", "0"),
         ],
     );
@@ -1044,226 +968,6 @@ pub fn schedule_index(project_path: &str) -> usize {
     assert_eq!(
         preflight["agent_packet_search"]["status"], "blocked",
         "timeout must not escalate into agent sidecar repair or readiness: {preflight:#}"
-    );
-}
-
-#[test]
-fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let index = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-            ("CODESTORY_EMBED_PROFILE", "bge-small-en-v1.5"),
-        ],
-    );
-    assert!(
-        index["summary"]["retrieval"]["semantic_doc_count"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        "hash-mode index should persist semantic docs for doctor to report"
-    );
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-            ("CODESTORY_EMBED_PROFILE", "bge-small-en-v1.5"),
-        ],
-    );
-    let current = &doctor["retrieval"]["current_embedding"];
-    for field in ["profile", "model_id", "backend", "dimension", "doc_shape"] {
-        assert!(
-            current.get(field).is_some(),
-            "doctor should report current embedding `{field}` metadata: {doctor:#}"
-        );
-    }
-
-    let stored = &doctor["retrieval"]["stored_embedding"];
-    for field in ["doc_count", "cache_key", "dimension", "doc_shape"] {
-        assert!(
-            stored.get(field).is_some(),
-            "doctor should report stored semantic-doc `{field}` metadata: {doctor:#}"
-        );
-    }
-
-    assert_ne!(
-        doctor["retrieval_mode"], "full",
-        "legacy hash semantic readiness must not make mandatory sidecar retrieval look full: {doctor:#}"
-    );
-    assert!(
-        doctor["sidecar_retrieval"]["retrieval_mode"].is_string(),
-        "doctor should expose first-class sidecar retrieval mode: {doctor:#}"
-    );
-    let sidecar_check = check_with_name(&doctor, "sidecar_retrieval");
-    assert_eq!(
-        sidecar_check["status"], "error",
-        "doctor should block when mandatory sidecar retrieval is unavailable despite legacy semantic docs: {doctor:#}"
-    );
-    let next_commands = doctor["next_commands"]
-        .as_array()
-        .expect("doctor next commands");
-    let first_next_commands = next_commands
-        .iter()
-        .take(3)
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        first_next_commands.contains("retrieval status")
-            && first_next_commands.contains("ready --goal agent --repair")
-            && !first_next_commands.contains("packet"),
-        "doctor should recommend canonical sidecar repair before packet/search when mode is not full: {doctor:#}"
-    );
-}
-
-#[test]
-fn doctor_warns_when_stored_semantic_doc_profile_differs_from_current_config() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-            ("CODESTORY_EMBED_PROFILE", "bge-small-en-v1.5"),
-        ],
-    );
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
-            ("CODESTORY_EMBED_PROFILE", "bge-base-en-v1.5"),
-        ],
-    );
-    let semantic_contract = check_with_name(&doctor, "semantic_contract");
-    assert_eq!(
-        semantic_contract["status"], "warn",
-        "doctor should warn when stored semantic-doc metadata mismatches current embedding config: {doctor:#}"
-    );
-    let message = semantic_contract["message"]
-        .as_str()
-        .expect("semantic contract message");
-    assert!(
-        message.contains("bge-small-en-v1.5") && message.contains("bge-base-en-v1.5"),
-        "mismatch warning should name stored and current profiles: {message}"
-    );
-}
-
-#[test]
-fn doctor_keeps_missing_llamacpp_endpoint_explicit() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
-            (
-                "CODESTORY_EMBED_LLAMACPP_URL",
-                "http://127.0.0.1:9/v1/embeddings",
-            ),
-        ],
-    );
-
-    assert_eq!(
-        doctor["retrieval"]["fallback_reason"], "missing_embedding_runtime",
-        "missing llama.cpp endpoint should stay a typed retrieval fallback: {doctor:#}"
-    );
-    let fallback_message = doctor["retrieval"]["fallback_message"]
-        .as_str()
-        .expect("fallback message");
-    assert!(
-        fallback_message.contains("llama.cpp")
-            && fallback_message.contains("127.0.0.1:9/v1/embeddings"),
-        "missing endpoint should name llama.cpp and the configured URL: {fallback_message}"
-    );
-}
-
-#[test]
-fn doctor_reports_removed_onnx_configuration_as_unsupported() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
-            ("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx"),
-        ],
-    );
-
-    assert_eq!(
-        doctor["retrieval"]["fallback_reason"],
-        "missing_embedding_runtime"
-    );
-    let message = doctor["retrieval"]["fallback_message"]
-        .as_str()
-        .expect("fallback message");
-    assert!(message.contains("CODESTORY_EMBED_ONNX_MODEL"), "{message}");
-    assert!(message.contains("no longer supported"), "{message}");
-}
-
-#[test]
-fn doctor_redacts_sensitive_llamacpp_url_output() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
-            (
-                "CODESTORY_EMBED_LLAMACPP_URL",
-                "https://user:secret@example.test/v1/embeddings?token=abc#frag",
-            ),
-        ],
-    );
-
-    let serialized = doctor.to_string();
-    assert!(
-        serialized.contains("https://example.test/v1/embeddings"),
-        "doctor should retain scheme/host/path for configured endpoints: {doctor:#}"
-    );
-    for secret_fragment in ["user:secret", "token=abc", "#frag"] {
-        assert!(
-            !serialized.contains(secret_fragment),
-            "doctor output should redact sensitive URL fragments `{secret_fragment}`: {doctor:#}"
-        );
-    }
-
-    let env_row = doctor["environment"]
-        .as_array()
-        .expect("doctor environment")
-        .iter()
-        .find(|row| row["name"] == "CODESTORY_EMBED_LLAMACPP_URL")
-        .unwrap_or_else(|| panic!("missing URL env row: {doctor:#}"));
-    assert_eq!(
-        env_row["message"], "set to `https://example.test/v1/embeddings`",
-        "doctor URL env row should redact userinfo, query, and fragment: {env_row:#}"
     );
 }
 
@@ -1357,6 +1061,81 @@ fn app_controller_opens_project() {
 }
 
 #[test]
+fn snippet_exact_id_navigates_openapi_diagnostic_evidence_but_query_stays_typed() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_openapi_workspace(workspace.path());
+    let _search_dir_snapshot =
+        index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "openapi::GET /api/users",
+        Some("openapi.json"),
+    );
+
+    let snippet = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            &format!("--id={node_id}"),
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["evidence_tier"],
+        "exact_source"
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["evidence_producer"],
+        "openapi_endpoint_schema"
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["resolution_status"],
+        "source_range_only"
+    );
+    assert_eq!(
+        snippet["resolution"]["resolved"]["eligible_for_sufficiency"],
+        false
+    );
+    assert!(
+        snippet["snippet"]["snippet"]
+            .as_str()
+            .is_some_and(|source| source.contains("/api/users")),
+        "snippet should navigate the exact OpenAPI source range: {snippet:#}"
+    );
+
+    let query = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--query=openapi::GET /api/users",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !query.status.success(),
+        "query snippets must not select source-range-only diagnostic evidence"
+    );
+    let failure: Value = serde_json::from_slice(&query.stdout)
+        .unwrap_or_else(|error| panic!("parse query snippet failure: {error}; output={query:#?}"));
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No symbol matched query")),
+        "query snippet should retain typed graph filtering: {failure:#}"
+    );
+}
+
+#[test]
 fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -1425,8 +1204,8 @@ fn assert_doctor_reports_existing_cache_health(workspace: &Path, cache_dir: &Pat
             .as_array()
             .expect("doctor environment")
             .iter()
-            .any(|row| row["name"] == "CODESTORY_EMBED_MODEL_ID"),
-        "doctor should expose the embedding model-id env var documented by .codestory.toml"
+            .any(|row| row["name"] == "CODESTORY_EMBED_ALLOW_CPU"),
+        "doctor should expose the explicit CPU policy"
     );
 }
 
@@ -1502,22 +1281,60 @@ fn assert_product_search_fails_closed_without_full_sidecars(
     );
     assert!(
         !output.status.success(),
-        "product search should fail closed without full sidecars"
+        "product search should fail closed without full retrieval"
     );
-    assert_sidecar_failure_output(output);
+    assert_retrieval_failure_output(output);
 }
 
-fn assert_sidecar_failure_output(output: std::process::Output) {
+fn assert_product_search_fails_closed_on_stale_core(
+    workspace: &Path,
+    cache_dir: &Path,
+    query: &str,
+) {
+    let output = run_cli(
+        workspace,
+        cache_dir,
+        &[
+            "search",
+            "--query",
+            query,
+            "--repo-text",
+            "off",
+            "--limit",
+            "5",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "product search should fail closed on a stale core publication"
+    );
+    let failure: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse stale-core failure: {error}; output={output:#?}"));
+    assert_eq!(
+        failure["error"]["code"], "project_unavailable",
+        "{failure:#}"
+    );
+    assert_eq!(
+        failure["error"]["message"], "search requires a fresh complete core publication",
+        "{failure:#}"
+    );
+}
+
+fn assert_retrieval_failure_output(output: std::process::Output) {
     let failure = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        failure.contains("sidecar retrieval")
+        failure.contains("retrieval is unavailable or degraded")
             && (failure.contains("expected profile=agent mode=full")
                 || failure.contains("retrieval_manifest_missing")),
-        "command should explain the mandatory sidecar gate, got: {failure}"
+        "command should explain the mandatory retrieval gate, got: {failure}"
     );
 }
 
@@ -1674,7 +1491,7 @@ fn assert_context_bookmark_fails_closed_without_full_sidecars(
         !output.status.success(),
         "context --bookmark should fail closed without full sidecars"
     );
-    assert_sidecar_failure_output(output);
+    assert_retrieval_failure_output(output);
 }
 
 fn assert_explore_outputs_focus_context(workspace: &Path, cache_dir: &Path, node_id: &str) {
@@ -2003,20 +1820,29 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             })),
         "affected JSON should expand changed files to symbols with graph evidence: {affected:#}"
     );
-    if let Some(tests) = affected["impacted_tests"].as_array()
-        && !tests.is_empty()
-    {
-        assert!(
-            tests.iter().all(|item| {
-                item["graph_depth"].is_number()
-                    && item["reason"]
-                        .as_str()
-                        .is_some_and(|reason| reason.contains("focused test hint"))
-                    && item["confidence"].is_string()
-            }),
-            "affected test hints should expose graph evidence and caveat language: {affected:#}"
-        );
-    }
+    let tests = affected["impacted_tests"]
+        .as_array()
+        .expect("affected impacted_tests array");
+    assert!(
+        tests.iter().any(|item| {
+            item["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("tests/app_controller_test.rs"))
+        }),
+        "the controlled AppController change should select its integration test: {affected:#}"
+    );
+    assert!(
+        tests.iter().all(|item| {
+            item["graph_depth"].is_number()
+                && item["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("focused test hint"))
+                && item["confidence"]
+                    .as_str()
+                    .is_some_and(|confidence| !confidence.is_empty())
+        }),
+        "affected test hints should expose graph evidence, confidence, and caveat language: {affected:#}"
+    );
 
     let affected_stdin = run_cli_with_stdin(
         workspace,
@@ -2066,11 +1892,17 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             && affected_markdown.contains("): "),
         "affected markdown should summarize impact:\n{affected_markdown}"
     );
+}
 
-    run_git(workspace, &["init"]);
-    run_git(workspace, &["add", "."]);
+#[test]
+fn affected_git_fallback_distinguishes_stale_observation_from_explicit_refresh() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    run_git(workspace.path(), &["init"]);
+    run_git(workspace.path(), &["add", "."]);
     run_git(
-        workspace,
+        workspace.path(),
         &[
             "-c",
             "user.email=codestory@example.test",
@@ -2083,8 +1915,13 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             "fixture",
         ],
     );
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
     fs::write(
-        workspace.join("src/runtime.rs"),
+        workspace.path().join("src/runtime.rs"),
         r#"pub fn normalize_project(project_name: &str) -> String {
     format!("workspace:{project_name}")
 }
@@ -2099,11 +1936,13 @@ pub fn changed_after_index() -> bool {
 "#,
     )
     .expect("modify runtime fixture for git diff fallback");
+
     let affected_git = run_cli_json(
-        workspace,
-        cache_dir,
+        workspace.path(),
+        cache_dir.path(),
         &["affected", "--refresh", "none", "--format", "json"],
     );
+
     assert!(
         affected_git["changed_paths"]
             .as_array()
@@ -2112,6 +1951,80 @@ pub fn changed_after_index() -> bool {
             .any(|path| path == "src/runtime.rs"),
         "affected should default to git diff --name-only HEAD: {affected_git:#}"
     );
+    assert_eq!(
+        affected_git["completeness"]["complete"], false,
+        "a source change after publication must not produce a complete impact claim: {affected_git:#}"
+    );
+    assert!(
+        affected_git["uncovered_inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs.iter().any(|input| {
+                input["path"] == "src/runtime.rs" && input["classification"] == "stale_index"
+            })),
+        "the exact modified source should carry a stale-index classification: {affected_git:#}"
+    );
+    assert!(affected_git.get("next_commands").is_none());
+    assert!(
+        affected_git["follow_ups"]
+            .as_array()
+            .is_some_and(|follow_ups| follow_ups.iter().any(|follow_up| {
+                follow_up["action"] == "refresh_stale_index"
+                    && follow_up["invocation"]["program"] == "codestory-cli"
+                    && follow_up["invocation"]["args"]
+                        .as_array()
+                        .is_some_and(|args| {
+                            args.windows(2)
+                                .any(|pair| pair[0] == "--refresh" && pair[1] == "incremental")
+                        })
+            })),
+        "positive stale evidence should recommend the focused structured incremental repair: {affected_git:#}"
+    );
+    assert!(
+        !affected_git.to_string().contains("--refresh full")
+            && !affected_git.to_string().contains("doctor --project"),
+        "proven source drift should not emit generic full-refresh or doctor advice: {affected_git:#}"
+    );
+
+    let query = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "query",
+            "trail(symbol: 'AppController')",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !query.status.success(),
+        "ordinary graph queries must not inherit affected's stale-source admission"
+    );
+    let query_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&query.stdout),
+        String::from_utf8_lossy(&query.stderr)
+    );
+    assert!(
+        query_output.contains("graph requires a fresh complete core publication"),
+        "query must remain fail-closed on the stale source after affected observation: {query_output}"
+    );
+
+    let refreshed = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["affected", "--refresh", "incremental", "--format", "json"],
+    );
+    assert!(
+        refreshed["changed_paths"]
+            .as_array()
+            .expect("changed paths")
+            .iter()
+            .any(|path| path == "src/runtime.rs"),
+        "explicit incremental refresh should preserve git-diff input: {refreshed:#}"
+    );
+    assert_eq!(refreshed["matched_file_count"], 1, "{refreshed:#}");
 }
 
 fn run_git(workspace: &Path, args: &[&str]) {
@@ -2147,7 +2060,7 @@ fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cach
         !output.status.success(),
         "query search DSL should fail closed without full sidecars"
     );
-    assert_sidecar_failure_output(output);
+    assert_retrieval_failure_output(output);
 }
 
 fn assert_context_id_fails_closed_without_full_sidecars(
@@ -2171,7 +2084,7 @@ fn assert_context_id_fails_closed_without_full_sidecars(
         !output.status.success(),
         "context --id should fail closed without full sidecars"
     );
-    assert_sidecar_failure_output(output);
+    assert_retrieval_failure_output(output);
 }
 
 fn remove_and_assert_bookmark_gone(workspace: &Path, cache_dir: &Path, bookmark_id: &str) {
@@ -2214,10 +2127,9 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let combined = format!("{stderr}\n{stdout}");
         assert!(
-            combined.contains("sidecar retrieval")
-                || combined.contains("retrieval sidecar")
-                || combined.contains("mandatory"),
-            "packet without full sidecars should fail closed with a sidecar diagnostic, got stdout:\n{stdout}\nstderr:\n{stderr}"
+            combined.contains("retrieval is unavailable or degraded")
+                || combined.contains("retrieval_manifest_missing"),
+            "packet without full retrieval should fail closed with a retrieval diagnostic, got stdout:\n{stdout}\nstderr:\n{stderr}"
         );
         return;
     }
@@ -2271,19 +2183,24 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
     let stdio = run_stdio_request(workspace, cache_dir, &request);
     assert_eq!(
         stdio["result"]["isError"], true,
-        "stdio context --id should return a tool error without full sidecars: {stdio:#}"
+        "stdio context --id should return a tool error without full retrieval: {stdio:#}"
     );
     let structured = &stdio["result"]["structuredContent"];
-    assert_eq!(
-        structured["code"].as_str(),
-        Some("codestory_tool_blocked"),
-        "stdio context --id should fail closed with a typed tool block: {stdio:#}"
-    );
-    let status = structured["status"].as_str();
+    let code = structured["code"].as_str();
     assert!(
-        status.is_some_and(|status| matches!(status, "repair_setup" | "blocked")),
-        "stdio context --id should fail closed before serving context: {stdio:#}"
+        matches!(
+            code,
+            Some("codestory_tool_blocked" | "codestory_preparing" | "codestory_unavailable")
+        ),
+        "stdio context --id should fail closed with a typed retrieval error: {stdio:#}"
     );
+    if code == Some("codestory_tool_blocked") {
+        let status = structured["status"].as_str();
+        assert!(
+            status.is_some_and(|status| matches!(status, "repair_setup" | "blocked")),
+            "stdio context --id should fail closed before serving context: {stdio:#}"
+        );
+    }
 }
 
 impl SearchDirSnapshot {
@@ -2453,7 +2370,7 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
     fs::remove_file(workspace.path().join("src").join("removed_after_index.rs"))
         .expect("remove indexed file after indexing");
 
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_product_search_fails_closed_on_stale_core(
         workspace.path(),
         cache_dir.path(),
         "AppController",
@@ -2531,6 +2448,6 @@ fn context_json_reports_deep_trace_by_default() {
         !context.status.success(),
         "context --id should fail closed without full sidecars"
     );
-    assert_sidecar_failure_output(context);
+    assert_retrieval_failure_output(context);
 }
 mod test_support;

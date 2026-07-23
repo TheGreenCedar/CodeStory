@@ -1,138 +1,94 @@
 # CLI Subsystem
 
-`codestory-cli` is the thin adapter for indexing, grounding reads, DB-first target context packets, graph-query helpers, local exploration, health checks, and lightweight serving.
+`codestory-cli` is the adapter for command-line, loopback HTTP, and multi-project
+stdio/MCP surfaces. It captures process defaults, validates requests, selects a
+project, calls runtime or retrieval services, and renders stable DTOs.
 
 ## Ownership
 
-- parse command-line arguments
-- resolve project and cache paths
-- call runtime services
-- render text or JSON
+- argument, tool, resource, and prompt schemas;
+- tagged packet-probe parsing plus legacy-string compatibility at the adapter
+  boundary;
+- process-start configuration capture and trusted config precedence;
+- explicit per-request project selection and retained `RuntimeContext` values;
+- bounded local activation/readiness integration;
+- text, JSON, HTTP, and stdio rendering;
+- public status redaction and maintainer diagnostics.
 
-## Entry Points
+Project files cannot silently choose cache roots, credentials, or network
+egress. Ambient defaults are captured once; switching A/B/A in stdio reuses each
+project's immutable config and never rereads or mutates process environment.
 
-- `crates/codestory-cli/src/main.rs`
-- `crates/codestory-cli/src/args.rs`
-- `crates/codestory-cli/src/runtime.rs`
-- `crates/codestory-cli/src/output.rs`
+## Entry points
 
-## Extension Points
+- `src/args.rs` and `src/main.rs`: CLI schema and dispatch
+- `src/config.rs` and `src/runtime.rs`: startup config and project contexts
+- `src/stdio_catalog.rs`: MCP schema and safety metadata
+- `src/stdio_transport.rs`: project routing, activation, resources, and tools
 
-- add commands in `args.rs` and `main.rs`
-- add renderers in `output.rs`
-- keep business logic in runtime, not here
+Multi-project stdio retains at most four hot contexts. A context key combines
+native workspace identity with a non-secret fingerprint of the immutable cache,
+retrieval, embedding, and summary configuration captured at process start.
+Equivalent path spellings converge on one context; configuration changes do
+not silently reuse another context. Project selection requires an absolute,
+existing repository root. Every repository-reading resource advertises a
+`{?project}` URI template and binds the canonical percent-encoded native root
+before dispatch. Missing, relative, unavailable, duplicate, malformed, or
+conflicting selectors fail closed. `codestory://agent-guide` is the static,
+project-free exception. A legacy `params.project` resource selector remains an
+unadvertised compatibility input, but it cannot be combined with a bound URI.
 
-## Command Reference Ownership
+Status and resources use the runtime's observational summary path. They may
+read existing complete publications and operation snapshots, but they do not
+create storage or start activation. Product tool calls join the runtime-owned
+activation service and the runtime owns the single bounded retrieval-publication
+retry for a complete public response. The same whole-response service wraps
+ordinary CLI packet, search, context, drill, and graph-assisted reads, so stdio
+is not a stronger consistency boundary than the CLI.
+- `src/output.rs`: rendering
 
-This page documents CLI ownership and subsystem boundaries, not detailed option
-semantics. The canonical option contract is the generated CLI help from
-`crates/codestory-cli/src/args.rs`; the agent-facing operational reference is
-`plugins/codestory/skills/codestory-grounding/references/*.md`. User guides in
-`docs/users/` should stay workflow-oriented and link to those sources instead of
-copying complete option matrices.
+Generated `--help` owns option syntax. User guides own workflows. This page owns
+the adapter boundary.
 
-Refresh behavior belongs to runtime, not the CLI adapter. The CLI parses the
-requested refresh mode, resolves project/cache paths, delegates to runtime, and
-renders the returned summary. Semantic indexing is part of the runtime-owned
-index path when embedding assets are available.
+The canonical packet probe is a tagged JSON object. CLI `--probe` and stdio
+`probes[]` accept the same five kinds; `--extra-probe` and stdio
+`extra_probes[]` remain compatibility inputs and are passed to the same runtime
+resolver without adapter-side inference. Both adapters enforce one combined
+16-probe limit and the shared 240-character field limit. The generated MCP
+schema is a strict tagged union, so fields from another probe kind are rejected.
+Search and definition links bind continuations to the selected project, stable
+node ID, contract version, and evidence generation.
 
-## Configuration Files
+MCP `snippet` accepts `scope=line_context|function_body`, bounded `context`,
+the `lines` compatibility alias, and the CLI-compatible `function_body`
+selector. The adapter normalizes aliases and rejects conflicts before runtime
+selection. Function-body target preference is owned by
+`codestory-runtime::target_resolution`, so CLI and stdio cannot diverge.
 
-The CLI captures process environment defaults once, including the user config
-home, project-network opt-in, and multi-project stdio cache root, then loads
-optional `.codestory.toml` defaults from the captured user home directory and
-the selected project root. It merges those values into an immutable
-`SidecarRuntimeConfig` retained by that project runtime; it never publishes
-project choices back through the process environment. This is required for
-multi-project stdio: switching A/B/A
-must keep each project's endpoint, model, prefix, retrieval policy, and summary
-settings isolated. Cache roots, network endpoints, model selectors for
-source-egress calls, credentials, and source-text egress settings must come from
-trusted user config, explicit environment variables, or CLI options; project
-files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding
-endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set
-deliberately for that process. Explicit environment values have highest
-precedence without being mutated or re-read when a stdio request switches
-projects.
+## Serving contract
 
-Plugin launchers start one projectless multi-project stdio process. Every tool
-or status request supplies its absolute project root; hook-written active-state
-files are diagnostics only and never select a runtime. The optional bootstrap
-diagnostic asks `cache identity` for the lossless schema-3 project and workspace
-ids, then accepts broker readiness only when those ids match. Existing
-executables and roots compare by filesystem identity; only missing paths use
-platform lexical rules (case-sensitive on Unix and case-insensitive on
-Windows).
+Status and diagnostics are observational. Activating product calls may perform
+their bounded local refresh and managed retrieval preparation. Request
+validation happens first, and every stdio request supplies an absolute project.
+Hook state never routes the runtime.
 
-Embedding config keys map to the runtime env names:
+HTTP remains read-only and loopback-bound by default. `packet` remains the broad
+evidence workflow; exact graph primitives and `context` do not create a second
+packet/search implementation.
 
-| `.codestory.toml` key | Runtime env var | Notes |
-| --- | --- | --- |
-| `embedding_profile` | `CODESTORY_EMBED_PROFILE` | Selects a built-in profile such as `bge-base-en-v1.5`, `bge-small-en-v1.5`, or `custom`. |
-| `embedding_model_id` | `CODESTORY_EMBED_MODEL_ID` | Overrides the resolved model id for the selected profile. |
-| `embedding_model` | `CODESTORY_EMBED_MODEL_ID` | Deprecated alias for `embedding_model_id`; prefer the explicit key in new config. |
-| `embedding_endpoint` | `CODESTORY_EMBED_LLAMACPP_URL` | Trusted-only endpoint for the product llama.cpp embedding sidecar. |
-| `embedding_query_prefix` | `CODESTORY_EMBED_QUERY_PREFIX` | Per-project query prefix retained with the embedding contract. |
-| `embedding_document_prefix` | `CODESTORY_EMBED_DOCUMENT_PREFIX` | Per-project document prefix retained with the embedding contract. |
+## Extension rules
 
-Runtime status reports distinguish a managed sidecar endpoint from an explicit
-process, trusted-user, or trusted-project endpoint. The CLI must not set runtime
-environment variables after startup.
+- add command/tool schema and rendering here;
+- add reusable behavior to runtime first;
+- do not open store/indexer internals or set environment variables after
+  process startup.
 
-Index output should expose:
+## Failure signatures
 
-- project and storage paths
-- resolved refresh mode
-- graph stats and retrieval state
-- graph phase timings
-- semantic timings and doc counts when semantic sync was considered
-- resolution diagnostics when the indexer reports them
-
-## Read And Query Output
-
-Generated help and [../../users/cli-reference.md](../../users/cli-reference.md)
-own command syntax, workflow examples, and option semantics. This subsystem
-page owns the adapter boundary:
-
-- parse CLI arguments without embedding runtime policy;
-- keep rendering in `output.rs`;
-- delegate refresh, retrieval, packet sufficiency, query planning, and health
-  checks to `codestory-runtime`;
-- report stale, partial, ambiguous, or degraded evidence instead of silently
-  hiding it;
-- keep mutating setup paths explicit so read commands do not download assets or
-  change sidecar state.
-
-`packet` owns broad-question retrieval. `drill` executes that packet path once
-with its explicit anchors as extra probes, then adapts packet citations,
-sufficiency, gaps, and follow-up commands into durable drill reports. It must
-not assemble a second search, bridge, readiness, or claim-scoring system.
-Sidecar-backed `search` remains candidate discovery, while `context`, `symbol`,
-`trail`, `snippet`, and local graph exploration remain exact-target surfaces.
-Generated help is the source of truth for the current flags on each command.
-
-`task brief` is an owner-directed implementation workflow view over `packet`.
-It must keep the stable JSON and Markdown brief contracts in the CLI adapter,
-reuse packet sufficiency/citations/follow-up commands, and avoid adding storage
-or separate `scout`, `where`, or `onboard` implementations in this slice.
-
-## Search And Context Research Boundary
-
-`codestory-cli search` and `codestory-cli context` keep production behavior on
-runtime defaults; public hybrid tuning flags have been removed. Internal
-packet and retrieval planning may still use hybrid weights, but the CLI does
-not expose ranking knobs for product search/context calls.
-
-## Serving And Integration Surface
-
-HTTP serving keeps the current small GET/query-string shape. It is local-only by default: non-loopback binds and non-loopback `Host`/`Origin` headers are rejected unless the operator passes `--allow-non-loopback` behind an intentional network boundary. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
-
-`serve --stdio` is MCP-style JSON lines. It exposes tools for ground, files, affected, packet, search, context, symbol, callers, callees, trace, trail, definition, references, symbols, snippet, and warm graph primitives (`get_node`, `neighbors`, `shortest_path`, and `query_subgraph`); resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
-
-The warm graph primitives are intentionally narrower than `packet`. They resolve exact node ids or bounded local graph neighborhoods before an agent asks for a broad evidence packet. Their responses include stable node ids, project-relative file refs when available, certainty metadata, count/truncation fields, and explicit result limits. `packet` remains the broad task tool with sufficiency, citations, retrieval traces, and budget accounting.
-
-## Failure Signatures
-
-- CLI depends directly on `codestory-store` or `codestory-indexer`
-- output helpers start opening files or stores on their own
-- command-specific orchestration is copied instead of delegated
+- an invalid resource activates or mutates a project;
+- a repository resource is advertised or returned without its canonical
+  project-bound URI;
+- stdio silently ignores an unknown or conflicting snippet option;
+- adapter code assembles graph/retrieval product semantics;
+- project switching changes frozen defaults or the shared engine policy;
+- CLI output hides stale, partial, or unavailable evidence.

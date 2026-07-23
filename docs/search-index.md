@@ -1,139 +1,60 @@
-﻿# Documentation Search Index
+# Documentation Search Index
 
-Keyword index for CodeStory documentation. For routing by job, start at
-[docs/README.md](README.md). Canonical owners are listed there.
+Use this page for keyword routing. [Docs home](README.md) owns reader journeys;
+the linked page owns the concept.
 
-## Documentation Sections
+## Architecture
 
-### Main Documentation
+| Keyword | Canonical page |
+| --- | --- |
+| topology, crates, dependency direction, identity scopes | [Architecture overview](architecture/overview.md) |
+| plugin launcher, fail-open, provisioning, handoff, project routing | [Host integration](architecture/host-integration.md) |
+| activation, tool classes, request lifecycle, bounded retry | [Runtime execution](architecture/runtime-execution-path.md) |
+| core index, refresh plan, parser, resolution, snapshots | [Indexing pipeline](architecture/indexing-pipeline.md) |
+| vectors.sqlite3, retrieval manifest, publication, readiness | [Retrieval design](architecture/retrieval-design.md) |
+| Metal, Vulkan, embedded model, llama.cpp, engine queues | [Llama sys subsystem](architecture/subsystems/llama-sys.md) |
+| lexical, semantic, SCIP, generation leases, retention | [Retrieval subsystem](architecture/subsystems/retrieval.md) |
+| language tiers, parser-backed, structural source proof | [Language support](architecture/language-support.md) |
+| contracts, workspace, store, indexer, runtime, CLI | [Subsystem pages](architecture/subsystems/) |
 
-#### README.md
-- **Quick start**: Plugin installation and initial setup
-- **Example prompts**: CodeStory-repo examples with link to portable templates
-- **What your agent gets**: Capabilities and readiness lanes
-- **CLI escape hatch**: Command-line interface usage
-- **With vs without CodeStory**: Focused and holdout benchmark comparison
-- **Documentation**: Navigation to other documentation
+## Users and operators
 
-#### docs/README.md
-- **First stop**: Reader job to canonical doc mapping
-- **Common paths**: Question-to-doc routing
-- **Evidence surfaces**: Trust boundary documentation
-- **Canonical owners**: Which doc owns operator flow, terms, verification
-- **Documentation maintenance**: Search index, checklist, templates
+| Keyword | Canonical page |
+| --- | --- |
+| host selection, installation | [User guides](users/README.md) |
+| Codex, Cursor, Claude Code, Copilot | [Host guides](users/README.md#pick-your-host) |
+| proof, hints, readiness, allowed surfaces | [Trust and readiness](users/trust-and-readiness.md) |
+| preparing, stale, unavailable, recovery | [Troubleshooting](users/troubleshooting.md) |
+| commands, status fields, configuration | [CLI reference](users/cli-reference.md) |
+| prompt shapes | [Prompt patterns](users/prompt-patterns.md) |
+| terminology | [Glossary](glossary.md) |
 
-#### docs/users/
-- **README.md**: Host selection, capability matrix, portable prompt shapes, day-1 checklist
-- **trust-and-readiness.md**: Repo map vs broad search lanes
-- **what-to-expect.md**, **prompt-patterns.md**: Coverage limits and prompt shapes
-- **cli-reference.md**: CLI commands, readiness, repair, configuration
-- **cursor.md**, **codex.md**, **claude-code.md**, **copilot.md**: Host-specific setup
-- **troubleshooting.md**: Blocked sessions and recovery
+## Contributors and evidence
 
-#### plugins/codestory/skills/
-- **codestory-grounding/SKILL.md**: Canonical grounding skill
-- **references/status-contract.md**: Runtime status field glossary for agents
+| Keyword | Canonical page |
+| --- | --- |
+| local setup, worktrees | [Contributor setup](contributors/getting-started.md) |
+| test lane, proof tier, release gate | [Testing matrix](contributors/testing-matrix.md) |
+| engine package, hardware, restart proof | [Retrieval verification](testing/retrieval-architecture.md) |
+| embedding measurements | [Embedding benchmarks](testing/embedding-backend-benchmarks.md) |
+| indexing and packet telemetry | [E2E stats log](testing/codestory-e2e-stats-log.md) |
+| language benchmark evidence | [Language holdout stats](testing/language-expansion-holdout-stats.md) |
+| retrieval diagnostics | [Retrieval operations](ops/retrieval-engine.md) |
+| research comparisons | [Research handbook](research.md) |
+| docs checks and ownership | [Documentation checklist](contributors/documentation-maintenance-checklist.md) |
 
-#### docs/architecture/
-- **overview.md**: Architecture overview and system layers
-- **runtime-execution-path.md**: Runtime execution path documentation
-- **indexing-pipeline.md**: Indexing pipeline documentation
-- **retrieval-design.md**: Retrieval design and architecture
-- **language-support.md**: Language support claims and coverage
-- **subsystems/**: Subsystem-specific documentation
+## Common routing
 
-#### docs/glossary.md
-- **glossary.md**: Canonical terminology across operator, architecture, and verification docs
+- “How does one installed plugin serve several repositories?” Start with
+  [host integration](architecture/host-integration.md), then
+  [runtime execution](architecture/runtime-execution-path.md).
+- “Why is graph navigation ready while packet is preparing?” Start with
+  [indexing pipeline](architecture/indexing-pipeline.md), then
+  [retrieval design](architecture/retrieval-design.md).
+- “What proves Metal or Vulkan?” Start with
+  [retrieval verification](testing/retrieval-architecture.md).
+- “Where should this code change live?” Start with the
+  [architecture overview](architecture/overview.md), then the owning subsystem.
 
-#### docs/contributors/
-- **getting-started.md**: Contributor setup and verification
-- **testing-matrix.md**: Testing matrix and verification lanes
-- **debugging.md**: Debugging guide
-- **documentation-maintenance-checklist.md**: Documentation quality gates
-
-#### docs/templates/
-- **documentation-template.md**: General documentation structure
-- **readme-template.md**: README structure
-- **operator-journey-template.md**: Operator journey structure
-- **contributor-setup-template.md**: Contributor setup structure
-
-#### docs/testing/
-- **agent-benchmark-harness-verification.md**: Benchmark harness verification
-- **language-expansion-holdout-stats.md**: Language expansion holdout statistics
-- **codestory-e2e-stats-log.md**: E2E stats log documentation
-- **performance-review-playbook.md**: Performance review playbook
-- **embedding-backend-benchmarks.md**: Embedding backend benchmarks
-- **retrieval-architecture.md**: Sidecar promotion gates and proof tiers
-- **codestory-stdio-warm-loop-stats.md**: Stdin/stdout warm loop statistics
-
-#### docs/ops/
-- **retrieval-sidecars.md**: Retrieval sidecars operations
-
-#### Other
-- **glossary.md**: Terminology across operator, architecture, and verification docs
-- **research.md**: Research handbook for retrieval and embedding decisions
-
-## Key Concepts Index
-
-See [glossary.md](glossary.md) for canonical definitions. Summary:
-
-### Readiness Concepts
-- **Local navigation**: SQLite cache, graph, and DB-backed browse commands
-- **Agent packet/search**: Sidecars healthy and `retrieval_mode=full`
-- **Retrieval mode**: Sidecar status contract; only `full` serves agent packet/search
-- **Semantic ready**: Dense-anchor embedding state matches policy
-
-### System Concepts
-- **Runtime**: Orchestrates indexing, grounding, trails, packet/search flows
-- **Workspace**: Manifest and discovery layer for project files
-- **Contracts**: Shared graph types, DTOs, and events across crates
-- **Target context**: DB-first bundle for one concrete target
-- **Cache root**: Directory for one project cache
-
-## Example Prompt Templates
-
-Portable shapes (any repository):
-
-```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
-```
-
-```text
-@CodeStory Where is [TARGET_FEATURE] defined and who calls it?
-```
-
-```text
-@CodeStory I am editing [PATH_TO_FILE]. What symbols are affected and what tests should I run first?
-```
-
-CodeStory-repo dogfood examples: [users/README.md - Portable prompt shapes](users/README.md#portable-prompt-shapes).
-
-## Navigation Paths
-
-### For First-Time Users
-1. Start with [User guides - Pick your host](users/README.md#pick-your-host)
-2. Open your host guide from the table on that page
-3. Use [portable prompt shapes](users/README.md#portable-prompt-shapes) to understand the workflow
-
-### For Contributors
-1. Start with [Contributor setup](contributors/getting-started.md)
-2. Use the [verification lane picker](contributors/getting-started.md#choose-the-verification-lane-first)
-3. Follow the recommended reading order for building mental models
-
-### For Reviewers
-1. Start with [Testing matrix](contributors/testing-matrix.md)
-2. Use the verification lane picker to determine the appropriate testing approach
-3. Review [documentation maintenance checklist](contributors/documentation-maintenance-checklist.md) for docs-only changes
-
-### For Researchers
-1. Start with [Research handbook](research.md)
-2. Use the comparison matrix for embedding and retrieval experiments
-3. Review timing and benchmark records
-
-## Maintenance
-
-Update this index when adding major doc pages. Canonical command and verification
-details live in [users/cli-reference.md](users/cli-reference.md) and
-[contributors/testing-matrix.md](contributors/testing-matrix.md).
-
-Link-check scope: `README.md`, `docs/**` (including templates), `plugins/codestory/README.md`, `plugins/codestory/docs/**`, and `plugins/codestory/skills/**`. Run `node .github/scripts/check-doc-links.mjs` before merge.
+Update this index only for a new canonical topic or page. Do not duplicate
+command matrices, test instructions, or time-specific measurements here.

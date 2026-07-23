@@ -21,6 +21,7 @@ struct RepoE2eStats {
     embed_batch_size: u32,
     search_dir_unchanged: bool,
     index_seconds: f64,
+    phase_timings: Value,
     graph_phase_seconds: f64,
     semantic_phase_seconds: f64,
     semantic_embedding_ms: u64,
@@ -37,6 +38,7 @@ struct RepoE2eStats {
     semantic_docs_pending: u64,
     semantic_docs_stale: u64,
     repeat_full_refresh_seconds: f64,
+    repeat_phase_timings: Value,
     repeat_graph_phase_seconds: f64,
     repeat_semantic_phase_seconds: f64,
     repeat_semantic_doc_build_ms: u64,
@@ -54,7 +56,7 @@ struct RepoE2eStats {
     repeat_semantic_docs_stale: u64,
     retrieval_index_seconds: f64,
     retrieval_status_seconds: f64,
-    sidecar_manifest: SidecarManifestStats,
+    retrieval_manifest: RetrievalManifestStats,
     ground_seconds: f64,
     search_seconds: f64,
     symbol_seconds: f64,
@@ -78,7 +80,7 @@ struct EvidenceIdentity {
 }
 
 #[derive(Debug, Serialize)]
-struct SidecarManifestStats {
+struct RetrievalManifestStats {
     symbol_doc_count: u64,
     dense_projection_count: u64,
     projection_count: u64,
@@ -109,14 +111,14 @@ struct IndexStats {
     edge_count: u64,
     file_count: u64,
     error_count: u64,
-    sidecar_status_after_retrieval_index: String,
+    retrieval_status_after_index: String,
     legacy_index_retrieval_mode: String,
     semantic_doc_count: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct GroundStats {
-    sidecar_status_after_retrieval_index: String,
+    retrieval_status_after_index: String,
     legacy_ground_retrieval_mode: String,
     root_symbols: usize,
     file_digests: usize,
@@ -126,7 +128,7 @@ struct GroundStats {
 #[derive(Debug, Serialize)]
 struct SearchStats {
     query: String,
-    sidecar_shadow_retrieval_mode: String,
+    retrieval_shadow_mode: String,
     legacy_search_retrieval_mode: String,
     semantic_doc_count: u64,
     indexed_symbol_hits: usize,
@@ -167,15 +169,15 @@ struct ReportStats {
 }
 
 const PROOF_TIER_STATS_ONLY: &str = "stats_only";
-const PROOF_TIER_FULL_SIDECAR: &str = "full_sidecar";
+const PROOF_TIER_FULL_RETRIEVAL: &str = "full_retrieval";
 const RELEASE_WARNING_REGRESSION_FACTOR: f64 = 1.25;
 
 fn release_readiness_proof_tier(
-    sidecar_status_after_retrieval_index: &str,
-    search_shadow_sidecar_mode: &str,
+    retrieval_status_after_index: &str,
+    search_retrieval_shadow_mode: &str,
 ) -> &'static str {
-    if sidecar_status_after_retrieval_index == "full" && search_shadow_sidecar_mode == "full" {
-        PROOF_TIER_FULL_SIDECAR
+    if retrieval_status_after_index == "full" && search_retrieval_shadow_mode == "full" {
+        PROOF_TIER_FULL_RETRIEVAL
     } else {
         PROOF_TIER_STATS_ONLY
     }
@@ -252,90 +254,203 @@ fn latest_phase_stats_baseline(repo_root: &Path) -> StatsLogBaseline {
             source_path.display()
         )
     });
-    let mut baseline = latest_phase_stats_baseline_from_str(&log)
-        .expect("docs/testing/codestory-e2e-stats-log.md must contain a Phase Metrics row");
+    let mut baseline = latest_phase_stats_baseline_from_str(&log).expect(
+        "docs/testing/codestory-e2e-stats-log.md must contain one valid latest Phase Metrics row and one unique matching headline row",
+    );
     baseline.source_path = source_path.display().to_string();
     baseline
 }
 
+#[derive(Clone, Copy)]
+enum StatsLogTable {
+    Headline,
+    Phase,
+}
+
+struct HeadlineStatsRow {
+    date: String,
+    commit: String,
+    runtime: Option<(f64, f64, f64)>,
+}
+
+struct PhaseStatsRow {
+    date: String,
+    commit: String,
+    scenario: String,
+    index_seconds: f64,
+    graph_phase_seconds: f64,
+    semantic_phase_seconds: f64,
+    repeat_full_refresh_seconds: f64,
+}
+
+const HEADLINE_STATS_HEADER: [&str; 6] = [
+    "Date",
+    "Commit",
+    "Result",
+    "Index seconds",
+    "Ground seconds",
+    "Search seconds",
+];
+const PHASE_STATS_HEADER: [&str; 6] = [
+    "Date",
+    "Commit",
+    "Scenario",
+    "Index seconds",
+    "Graph phase seconds",
+    "Semantic phase seconds",
+];
+
 fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
-    let mut in_phase_table = false;
-    let mut latest = None;
-    let mut latest_runtime = None;
+    let mut table = None;
+    let mut headline_rows = Vec::new();
+    let mut phase_row_identities = Vec::new();
+    let mut phase_rows = Vec::new();
     for line in log.lines() {
-        if line.trim() == "## Phase Metrics" {
-            in_phase_table = true;
+        let Some(fields) = stats_log_table_fields(line) else {
+            table = None;
+            continue;
+        };
+        if fields.starts_with(&HEADLINE_STATS_HEADER) {
+            table = Some(StatsLogTable::Headline);
             continue;
         }
-        if !line.starts_with('|') {
+        if fields.starts_with(&PHASE_STATS_HEADER) {
+            table = Some(StatsLogTable::Phase);
             continue;
         }
-        let fields = line.split('|').skip(1).map(str::trim).collect::<Vec<_>>();
-        if fields.len() >= 15 && fields[0] != "Date" && !fields[0].starts_with("---") {
-            let Some(search_seconds) = parse_stats_seconds(fields[5]) else {
+        if fields.first() == Some(&"Date") {
+            table = None;
+            continue;
+        }
+        if fields.first().is_none_or(|field| field.starts_with("---")) {
+            continue;
+        }
+        match table {
+            Some(StatsLogTable::Headline) => {
+                let Some((date, commit)) = stats_log_row_identity(&fields) else {
+                    continue;
+                };
+                let runtime = (|| {
+                    let search_seconds = parse_stats_seconds(fields.get(5)?)?;
+                    let result = *fields.get(2)?;
+                    let retrieval_index_seconds =
+                        parse_named_result_seconds(result, "retrieval_index_seconds")?;
+                    let retrieval_status_seconds =
+                        parse_named_result_seconds(result, "retrieval_status_seconds")?;
+                    Some((
+                        retrieval_index_seconds,
+                        retrieval_status_seconds,
+                        search_seconds,
+                    ))
+                })();
+                headline_rows.push(HeadlineStatsRow {
+                    date: date.to_string(),
+                    commit: commit.to_string(),
+                    runtime,
+                });
+            }
+            Some(StatsLogTable::Phase) => {
+                let Some((date, commit)) = stats_log_row_identity(&fields) else {
+                    continue;
+                };
+                phase_row_identities.push((date.to_string(), commit.to_string()));
+                let Some(scenario) = fields.get(2) else {
+                    continue;
+                };
+                let Some(index_seconds) =
+                    fields.get(3).and_then(|value| parse_stats_seconds(value))
+                else {
+                    continue;
+                };
+                let Some(graph_phase_seconds) =
+                    fields.get(4).and_then(|value| parse_stats_seconds(value))
+                else {
+                    continue;
+                };
+                let Some(semantic_phase_seconds) =
+                    fields.get(5).and_then(|value| parse_stats_seconds(value))
+                else {
+                    continue;
+                };
+                let Some(repeat_full_refresh_seconds) = parse_repeat_full_refresh_seconds(scenario)
+                else {
+                    continue;
+                };
+                phase_rows.push(PhaseStatsRow {
+                    date: date.to_string(),
+                    commit: commit.to_string(),
+                    scenario: scenario.to_string(),
+                    index_seconds,
+                    graph_phase_seconds,
+                    semantic_phase_seconds,
+                    repeat_full_refresh_seconds,
+                });
+            }
+            None => {
                 continue;
-            };
-            let Some(retrieval_index_seconds) =
-                parse_named_result_seconds(fields[2], "retrieval_index_seconds")
-            else {
-                continue;
-            };
-            let Some(retrieval_status_seconds) =
-                parse_named_result_seconds(fields[2], "retrieval_status_seconds")
-            else {
-                continue;
-            };
-            latest_runtime = Some((
-                retrieval_index_seconds,
-                retrieval_status_seconds,
-                search_seconds,
-            ));
-            continue;
+            }
         }
-        if !in_phase_table {
-            continue;
-        }
-        if fields.len() < 9 || fields[0] == "Date" || fields[0].starts_with("---") {
-            continue;
-        }
-        let Some(index_seconds) = parse_stats_seconds(fields[3]) else {
-            continue;
-        };
-        let Some(graph_phase_seconds) = parse_stats_seconds(fields[4]) else {
-            continue;
-        };
-        let Some(semantic_phase_seconds) = parse_stats_seconds(fields[5]) else {
-            continue;
-        };
-        let Some(repeat_full_refresh_seconds) = parse_repeat_full_refresh_seconds(fields[2]) else {
-            continue;
-        };
-        let (retrieval_index_seconds, retrieval_status_seconds, search_seconds) = latest_runtime?;
-        latest = Some(StatsLogBaseline {
-            source_path: String::new(),
-            date: fields[0].to_string(),
-            commit: fields[1].to_string(),
-            scenario: fields[2].to_string(),
-            index_seconds,
-            graph_phase_seconds,
-            semantic_phase_seconds,
-            repeat_full_refresh_seconds,
-            retrieval_index_seconds,
-            retrieval_status_seconds,
-            search_seconds,
-        });
     }
-    latest
+    let (latest_phase_date, latest_phase_commit) = phase_row_identities.last()?;
+    let latest_phase = phase_rows.pop()?;
+    if latest_phase.date != *latest_phase_date || latest_phase.commit != *latest_phase_commit {
+        return None;
+    }
+    if phase_row_identities
+        .iter()
+        .filter(|(date, commit)| date == latest_phase_date && commit == latest_phase_commit)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let mut matching_headlines = headline_rows
+        .iter()
+        .filter(|row| row.date == latest_phase.date && row.commit == latest_phase.commit);
+    let matching_headline = matching_headlines.next()?;
+    if matching_headlines.next().is_some() {
+        return None;
+    }
+    let (retrieval_index_seconds, retrieval_status_seconds, search_seconds) =
+        matching_headline.runtime?;
+    Some(StatsLogBaseline {
+        source_path: String::new(),
+        date: latest_phase.date,
+        commit: latest_phase.commit,
+        scenario: latest_phase.scenario,
+        index_seconds: latest_phase.index_seconds,
+        graph_phase_seconds: latest_phase.graph_phase_seconds,
+        semantic_phase_seconds: latest_phase.semantic_phase_seconds,
+        repeat_full_refresh_seconds: latest_phase.repeat_full_refresh_seconds,
+        retrieval_index_seconds,
+        retrieval_status_seconds,
+        search_seconds,
+    })
+}
+
+fn stats_log_table_fields(line: &str) -> Option<Vec<&str>> {
+    let row = line.trim().strip_prefix('|')?.strip_suffix('|')?;
+    Some(row.split('|').map(str::trim).collect())
+}
+
+fn stats_log_row_identity<'a>(fields: &'a [&str]) -> Option<(&'a str, &'a str)> {
+    let date = *fields.first()?;
+    let commit = *fields.get(1)?;
+    if date.is_empty() || commit.is_empty() {
+        return None;
+    }
+    Some((date, commit))
 }
 
 fn parse_named_result_seconds(value: &str, marker: &str) -> Option<f64> {
-    let start = value.find(marker)? + marker.len();
-    let seconds = value[start..]
-        .split(';')
-        .next()?
-        .trim()
-        .trim_end_matches('s');
-    parse_stats_seconds(seconds)
+    value.match_indices(marker).find_map(|(start, _)| {
+        let seconds = value[start + marker.len()..]
+            .split(';')
+            .next()?
+            .trim()
+            .trim_end_matches('s');
+        parse_stats_seconds(seconds)
+    })
 }
 
 fn parse_repeat_full_refresh_seconds(value: &str) -> Option<f64> {
@@ -348,6 +463,42 @@ fn parse_repeat_full_refresh_seconds(value: &str) -> Option<f64> {
 fn parse_stats_seconds(value: &str) -> Option<f64> {
     let value = value.replace(',', "");
     value.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn retained_phase_timings(index_json: &Value) -> Value {
+    index_json
+        .get("phase_timings")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn retained_phase_timings_preserve_additive_diagnostics() {
+    let index_json = serde_json::json!({
+        "phase_timings": {
+            "parse_index_ms": 12,
+            "staged_snapshot_copy": {
+                "copy_ms": 13,
+                "source_bytes": 1024,
+                "target_bytes": 1024
+            },
+            "core_promotion": {
+                "total_ms": 21,
+                "staged_to_live_restore_ms": 8,
+                "candidate_bytes": 2048,
+                "unattributed_ms": 1
+            },
+            "future_additive_diagnostic": {"rows": 34}
+        }
+    });
+
+    let retained = retained_phase_timings(&index_json);
+
+    assert_eq!(retained["parse_index_ms"], 12);
+    assert_eq!(retained["staged_snapshot_copy"]["source_bytes"], 1_024);
+    assert_eq!(retained["core_promotion"]["total_ms"], 21);
+    assert_eq!(retained["future_additive_diagnostic"]["rows"], 34);
 }
 
 #[derive(Debug)]
@@ -372,10 +523,10 @@ struct DrillRepoCaseConfig {
 }
 
 #[test]
-fn release_readiness_proof_tier_requires_full_sidecar_evidence() {
+fn release_readiness_proof_tier_requires_full_retrieval_evidence() {
     assert_eq!(
         release_readiness_proof_tier("full", "full"),
-        PROOF_TIER_FULL_SIDECAR
+        PROOF_TIER_FULL_RETRIEVAL
     );
     assert_eq!(
         release_readiness_proof_tier("full", "degraded"),
@@ -391,7 +542,7 @@ fn release_readiness_proof_tier_requires_full_sidecar_evidence() {
 fn release_readiness_proof_tier_does_not_claim_drill_or_promotion() {
     let proof_tier = release_readiness_proof_tier("full", "full");
 
-    assert_eq!(proof_tier, PROOF_TIER_FULL_SIDECAR);
+    assert_eq!(proof_tier, PROOF_TIER_FULL_RETRIEVAL);
     assert_ne!(proof_tier, "real_repo_drill");
     assert_ne!(proof_tier, "promotion_grade");
 }
@@ -460,6 +611,158 @@ fn latest_phase_stats_baseline_parses_last_valid_phase_row() {
     assert_eq!(baseline.search_seconds, 3.40);
 }
 
+#[test]
+fn latest_phase_stats_baseline_does_not_borrow_runtime_from_an_older_wide_phase_row() {
+    let baseline = latest_phase_stats_baseline_from_str(
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-14 | b09b8c44 | older headline; retrieval_index_seconds 46.67; retrieval_status_seconds 0.51 | 14.50 | 0.06 | 1.52 | 0.22 | 0.05 | 0.05 | 151,319 | 125,723 | 313 | 0 | 1,010 | true |
+| 2026-07-20 | 29d36459+1311wt | warnings retrieval_index_seconds, retrieval_status_seconds, and search_seconds exceeded an older baseline; latest headline; retrieval_index_seconds 77.32; retrieval_status_seconds 0.91 | 9.05 | 0.56 | 5.74 | 1.54 | 1.48 | 1.48 | 162,955 | 136,565 | 495 | 0 | 2,542 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-14 | b09b8c44 | older wide phase; retrieval_index_seconds 46.67; retrieval_status_seconds 0.51; repeat full refresh 14.43s with 0 embedded | 14.50 | 0.06 | 1.52 | 0.22 | 0.05 | 0.05 | 151,319 | 125,723 | 313 | 0 | 1,010 | true |
+| 2026-07-20 | 29d36459+1311wt | latest phase; repeat full refresh 9.92s with 2,539 reused and 0 embedded | 9.05 | 4.63 | 0.46 | 0 | 0 | 0 |
+"#,
+    )
+    .expect("phase baseline");
+
+    assert_eq!(baseline.date, "2026-07-20");
+    assert_eq!(baseline.commit, "29d36459+1311wt");
+    assert_eq!(baseline.retrieval_index_seconds, 77.32);
+    assert_eq!(baseline.retrieval_status_seconds, 0.91);
+    assert_eq!(baseline.search_seconds, 5.74);
+    assert_eq!(
+        release_readiness_warnings(11.8384, 0.45, 84.7086, 0.9807, 6.0637, &baseline),
+        vec![
+            "index_seconds exceeded latest stats-log baseline by >25%: current 11.84s > threshold 11.31s from 2026-07-20 29d36459+1311wt (9.05s)"
+                .to_string(),
+        ]
+    );
+}
+
+#[test]
+fn latest_phase_stats_baseline_fails_closed_without_one_valid_matching_headline() {
+    for log in [
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-19 | old+wt | old headline; retrieval_index_seconds 80.00; retrieval_status_seconds 0.80 | 90.00 | 0.20 | 8.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | new+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | new+wt | malformed headline; retrieval_index_seconds 10.00 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | new+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | duplicate+wt | first headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+| 2026-07-20 | duplicate+wt | second headline; retrieval_index_seconds 20.00; retrieval_status_seconds 0.20 | 86.00 | 0.20 | 4.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | duplicate+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | duplicate+wt | matching headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | duplicate+wt | first phase; repeat full refresh 31.00s with 1 reused and 0 embedded | 84.00 | 16.00 | 54.00 | 1 | 0 | 0 |
+| 2026-07-20 | duplicate+wt | duplicate phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | duplicate+wt | matching headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | duplicate+wt | valid phase; repeat full refresh 31.00s with 1 reused and 0 embedded | 84.00 | 16.00 | 54.00 | 1 | 0 | 0 |
+| 2026-07-20 | duplicate+wt | malformed duplicate phase | invalid | 17.00 | 55.00 | 1 | 0 | 0 |
+"#,
+    ] {
+        assert_eq!(latest_phase_stats_baseline_from_str(log), None);
+    }
+}
+
+#[test]
+fn latest_phase_stats_baseline_binds_the_latest_run_across_reordered_tables() {
+    let baseline = latest_phase_stats_baseline_from_str(
+        r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-19 | old+wt | old headline; retrieval_index_seconds 80.00; retrieval_status_seconds 0.80 | 90.00 | 0.20 | 8.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-19 | old+wt | old phase; repeat full refresh 30.00s with 0 embedded | 90.00 | 15.00 | 60.00 | 0 | 1 | 0 |
+
+## Later run with tables emitted in the opposite order
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-20 | new+wt | latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded | 85.00 | 17.00 | 55.00 | 1 | 0 | 0 |
+
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-07-20 | new+wt | latest headline; retrieval_index_seconds 10.00; retrieval_status_seconds 0.10 | 85.00 | 0.20 | 3.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+"#,
+    )
+    .expect("latest matching baseline");
+
+    assert_eq!(baseline.date, "2026-07-20");
+    assert_eq!(baseline.commit, "new+wt");
+    assert_eq!(
+        baseline.scenario,
+        "latest phase; repeat full refresh 32.00s with 1 reused and 0 embedded"
+    );
+    assert_eq!(baseline.index_seconds, 85.00);
+    assert_eq!(baseline.graph_phase_seconds, 17.00);
+    assert_eq!(baseline.semantic_phase_seconds, 55.00);
+    assert_eq!(baseline.repeat_full_refresh_seconds, 32.00);
+    assert_eq!(baseline.retrieval_index_seconds, 10.00);
+    assert_eq!(baseline.retrieval_status_seconds, 0.10);
+    assert_eq!(baseline.search_seconds, 3.00);
+}
+
+#[test]
+fn latest_phase_stats_baseline_accepts_the_checked_in_ledger() {
+    let baseline = latest_phase_stats_baseline(&repo_root());
+
+    assert!(!baseline.date.is_empty());
+    assert!(!baseline.commit.is_empty());
+    assert!(baseline.index_seconds > 0.0);
+    assert!(baseline.repeat_full_refresh_seconds > 0.0);
+    assert!(baseline.retrieval_index_seconds > 0.0);
+    assert!(baseline.retrieval_status_seconds > 0.0);
+    assert!(baseline.search_seconds > 0.0);
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -483,95 +786,6 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .expect("storage file stem");
     parent.join(format!("{stem}.search-generations"))
-}
-
-struct ReleaseE2eSidecarCleanup {
-    binary: PathBuf,
-    project_root: PathBuf,
-    cache_dir: PathBuf,
-    sidecar_cache_root: PathBuf,
-    run_id: String,
-    armed: bool,
-}
-
-impl ReleaseE2eSidecarCleanup {
-    fn down(&self) -> std::io::Result<std::process::Output> {
-        test_support::command(&self.binary)
-            .current_dir(&self.project_root)
-            .args(["retrieval", "down", "--profile", "agent", "--run-id"])
-            .arg(&self.run_id)
-            .arg("--project")
-            .arg(&self.project_root)
-            .arg("--cache-dir")
-            .arg(&self.cache_dir)
-            .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
-            .env_remove("CODESTORY_STDIO_CACHE_ROOT")
-            .env("CODESTORY_CACHE_ROOT", &self.sidecar_cache_root)
-            .env("CODESTORY_EMBED_BACKEND", "llamacpp")
-            .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
-            .output()
-    }
-
-    fn teardown(&mut self) {
-        let (_, status_json) = run_cli_json_with_sidecar_cache_root(
-            &self.binary,
-            &self.project_root,
-            &self.cache_dir,
-            &self.sidecar_cache_root,
-            &[
-                "retrieval".to_string(),
-                "status".to_string(),
-                "--profile".to_string(),
-                "agent".to_string(),
-                "--run-id".to_string(),
-                self.run_id.clone(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        );
-        let namespace = string_field(&status_json, &["ownership", "namespace"]).to_string();
-
-        let down = self.down().expect("tear down release evidence sidecar");
-        assert!(
-            down.status.success(),
-            "release evidence sidecar teardown failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&down.stdout),
-            String::from_utf8_lossy(&down.stderr)
-        );
-
-        let (_, inventory_json) = run_cli_json_with_sidecar_cache_root(
-            &self.binary,
-            &self.project_root,
-            &self.cache_dir,
-            &self.sidecar_cache_root,
-            &[
-                "retrieval".to_string(),
-                "inventory".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        );
-        let namespaces = json_path(&inventory_json, &["namespaces"])
-            .as_array()
-            .expect("release evidence sidecar inventory namespaces");
-        if let Some(entry) = namespaces
-            .iter()
-            .find(|entry| entry["namespace"].as_str() == Some(namespace.as_str()))
-        {
-            assert_eq!(entry["state_exists"].as_bool(), Some(false));
-            assert_eq!(entry["containers"].as_array().map(Vec::len), Some(0));
-            assert_eq!(entry["networks"].as_array().map(Vec::len), Some(0));
-        }
-        self.armed = false;
-    }
-}
-
-impl Drop for ReleaseE2eSidecarCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.down();
-        }
-    }
 }
 
 fn path_bytes(path: &Path) -> u64 {
@@ -642,11 +856,9 @@ fn run_cli_output_with_sidecar_cache_root(
         .arg(project_root)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
         .env_remove("CODESTORY_STDIO_CACHE_ROOT")
         .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
-        .env("CODESTORY_EMBED_BACKEND", "llamacpp")
-        .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run codestory-cli");
     let seconds = started.elapsed().as_secs_f64();
@@ -796,26 +1008,18 @@ fn drill_repo_cases_from_manifest(manifest_path: &Path) -> Vec<DrillRepoCase> {
 }
 
 #[test]
-#[ignore = "repo-scale release e2e; run with cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture after cargo build --release -p codestory-cli"]
+#[ignore = "repo-scale release e2e; set CODESTORY_EMBED_MODEL_SOURCE to the output of node scripts/prepare-embedded-model.mjs, build with cargo build --release -p codestory-cli, then run cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture"]
 fn codestory_repo_release_e2e_emits_stats() {
     let project_root = repo_root();
     let binary = release_cli_binary();
     let sidecar_run_id = "release-e2e-stats";
     assert!(
         binary.is_file(),
-        "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
+        "missing release binary at {}. Set CODESTORY_EMBED_MODEL_SOURCE to the output of `node scripts/prepare-embedded-model.mjs`, then run `cargo build --release -p codestory-cli`.",
         binary.display()
     );
 
     let cache_dir = tempdir().expect("cache dir");
-    let mut sidecar_cleanup = ReleaseE2eSidecarCleanup {
-        binary: binary.clone(),
-        project_root: project_root.clone(),
-        cache_dir: cache_dir.path().to_path_buf(),
-        sidecar_cache_root: cache_dir.path().to_path_buf(),
-        run_id: sidecar_run_id.to_string(),
-        armed: true,
-    };
 
     let (index_seconds, index_json) = run_cli_json(
         &binary,
@@ -846,31 +1050,17 @@ fn codestory_repo_release_e2e_emits_stats() {
         ],
     );
 
-    let (_retrieval_bootstrap_seconds, _retrieval_bootstrap_json) = run_cli_json(
-        &binary,
-        project_root.as_path(),
-        cache_dir.path(),
-        &[
-            "retrieval".to_string(),
-            "bootstrap".to_string(),
-            "--profile".to_string(),
-            "agent".to_string(),
-            "--run-id".to_string(),
-            sidecar_run_id.to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ],
-    );
-
     let (_ready_repair_seconds, _ready_repair_json) = run_cli_json(
         &binary,
         project_root.as_path(),
         cache_dir.path(),
         &[
-            "ready".to_string(),
-            "--goal".to_string(),
+            "retrieval".to_string(),
+            "index".to_string(),
+            "--profile".to_string(),
             "agent".to_string(),
-            "--repair".to_string(),
+            "--refresh".to_string(),
+            "auto".to_string(),
             "--run-id".to_string(),
             sidecar_run_id.to_string(),
             "--format".to_string(),
@@ -1092,14 +1282,14 @@ fn codestory_repo_release_e2e_emits_stats() {
         + repeat_semantic_reload_ms
         + repeat_semantic_prune_ms;
     let semantic_phase_seconds = semantic_phase_ms as f64 / 1000.0;
-    let search_sidecar_shadow_retrieval_mode =
+    let search_retrieval_shadow_mode =
         string_field(&search_json, &["retrieval_shadow", "retrieval_mode"]).to_string();
     let dense_reason_counts_json = string_field(
         &retrieval_status_json,
         &["manifest", "dense_reason_counts_json"],
     )
     .to_string();
-    let sidecar_manifest = SidecarManifestStats {
+    let retrieval_manifest = RetrievalManifestStats {
         symbol_doc_count: u64_field(&retrieval_status_json, &["manifest", "symbol_doc_count"]),
         dense_projection_count: u64_field(
             &retrieval_status_json,
@@ -1122,7 +1312,7 @@ fn codestory_repo_release_e2e_emits_stats() {
     };
     let proof_tier = release_readiness_proof_tier(
         sidecar_retrieval_mode.as_str(),
-        search_sidecar_shadow_retrieval_mode.as_str(),
+        search_retrieval_shadow_mode.as_str(),
     )
     .to_string();
     let stats_baseline = latest_phase_stats_baseline(project_root.as_path());
@@ -1157,6 +1347,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         embed_batch_size: 128,
         search_dir_unchanged,
         index_seconds,
+        phase_timings: retained_phase_timings(&index_json),
         graph_phase_seconds: graph_phase_ms as f64 / 1000.0,
         semantic_phase_seconds,
         semantic_embedding_ms: optional_u64_field(
@@ -1212,6 +1403,7 @@ fn codestory_repo_release_e2e_emits_stats() {
             &["phase_timings", "semantic_docs_stale"],
         ),
         repeat_full_refresh_seconds,
+        repeat_phase_timings: retained_phase_timings(&repeat_index_json),
         repeat_graph_phase_seconds: repeat_graph_phase_ms as f64 / 1000.0,
         repeat_semantic_phase_seconds: repeat_semantic_phase_ms as f64 / 1000.0,
         repeat_semantic_doc_build_ms,
@@ -1253,7 +1445,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         ),
         retrieval_index_seconds,
         retrieval_status_seconds,
-        sidecar_manifest,
+        retrieval_manifest,
         ground_seconds,
         search_seconds,
         symbol_seconds,
@@ -1265,13 +1457,13 @@ fn codestory_repo_release_e2e_emits_stats() {
             edge_count: u64_field(&index_json, &["summary", "stats", "edge_count"]),
             file_count: u64_field(&index_json, &["summary", "stats", "file_count"]),
             error_count: u64_field(&index_json, &["summary", "stats", "error_count"]),
-            sidecar_status_after_retrieval_index: sidecar_retrieval_mode.clone(),
+            retrieval_status_after_index: sidecar_retrieval_mode.clone(),
             legacy_index_retrieval_mode: string_field(&index_json, &["retrieval", "mode"])
                 .to_string(),
             semantic_doc_count: u64_field(&index_json, &["retrieval", "semantic_doc_count"]),
         },
         ground: GroundStats {
-            sidecar_status_after_retrieval_index: sidecar_retrieval_mode.clone(),
+            retrieval_status_after_index: sidecar_retrieval_mode.clone(),
             legacy_ground_retrieval_mode: string_field(&ground_json, &["retrieval", "mode"])
                 .to_string(),
             root_symbols: array_len(&ground_json, &["root_symbols"]),
@@ -1280,7 +1472,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         },
         search: SearchStats {
             query: string_field(&search_json, &["query"]).to_string(),
-            sidecar_shadow_retrieval_mode: search_sidecar_shadow_retrieval_mode,
+            retrieval_shadow_mode: search_retrieval_shadow_mode,
             legacy_search_retrieval_mode: string_field(&search_json, &["retrieval", "mode"])
                 .to_string(),
             semantic_doc_count: u64_field(&search_json, &["retrieval", "semantic_doc_count"]),
@@ -1334,44 +1526,44 @@ fn codestory_repo_release_e2e_emits_stats() {
         "full repo index should finish without errors"
     );
     assert_eq!(
-        stats.index.sidecar_status_after_retrieval_index, "full",
+        stats.index.retrieval_status_after_index, "full",
         "retrieval status after retrieval index should be full before trusting index/ground/search evidence"
     );
     assert_eq!(
-        stats.proof_tier, PROOF_TIER_FULL_SIDECAR,
-        "repo e2e stats harness proves full sidecar evidence but does not run real-repo drill cases"
+        stats.proof_tier, PROOF_TIER_FULL_RETRIEVAL,
+        "repo e2e stats harness proves full retrieval evidence but does not run real-repo drill cases"
     );
     assert_eq!(
-        stats.ground.sidecar_status_after_retrieval_index, "full",
-        "strict grounding should reuse the prepared full sidecar retrieval state"
+        stats.ground.retrieval_status_after_index, "full",
+        "strict grounding should reuse the prepared full retrieval state"
     );
     assert_eq!(
-        stats.search.sidecar_shadow_retrieval_mode, "full",
-        "search should expose full sidecar retrieval shadow"
+        stats.search.retrieval_shadow_mode, "full",
+        "search should expose full retrieval shadow"
     );
     assert!(
-        stats.sidecar_manifest.symbol_doc_count > 0,
-        "full sidecar manifest should record graph-native symbol docs"
+        stats.retrieval_manifest.symbol_doc_count > 0,
+        "full retrieval manifest should record graph-native symbol docs"
     );
     assert!(
-        stats.sidecar_manifest.dense_projection_count > 0,
+        stats.retrieval_manifest.dense_projection_count > 0,
         "CodeStory product run should select dense anchors"
     );
     assert_eq!(
-        stats.sidecar_manifest.dense_projection_count, stats.sidecar_manifest.projection_count,
-        "legacy projection_count should mirror dense_projection_count under graph_first_v1"
+        stats.retrieval_manifest.dense_projection_count, stats.retrieval_manifest.projection_count,
+        "legacy projection_count should mirror dense_projection_count under graph_first_v2"
     );
     assert_eq!(
-        stats.sidecar_manifest.semantic_policy_version, "graph_first_v1",
-        "full sidecar manifest should record the active dense policy"
+        stats.retrieval_manifest.semantic_policy_version, "graph_first_v2",
+        "full retrieval manifest should record the active dense policy"
     );
     assert!(
-        stats.sidecar_manifest.graph_artifact_hash_present,
-        "full sidecar manifest should record a graph artifact hash"
+        stats.retrieval_manifest.graph_artifact_hash_present,
+        "full retrieval manifest should record a graph artifact hash"
     );
     assert_eq!(
-        stats.sidecar_manifest.dense_reason_count_total,
-        stats.sidecar_manifest.dense_projection_count,
+        stats.retrieval_manifest.dense_reason_count_total,
+        stats.retrieval_manifest.dense_projection_count,
         "dense reason counts should account for every dense anchor"
     );
     assert!(
@@ -1411,16 +1603,15 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.search_dir_unchanged,
         "plain read commands should not recreate the persisted search dir"
     );
-    sidecar_cleanup.teardown();
 }
 
 #[test]
-#[ignore = "real-repo drill release gate; set CODESTORY_REAL_REPO_DRILL_CASES or CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1 and run after cargo build --release -p codestory-cli"]
+#[ignore = "real-repo drill release gate; set CODESTORY_REAL_REPO_DRILL_CASES or CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1, set CODESTORY_EMBED_MODEL_SOURCE to the output of node scripts/prepare-embedded-model.mjs, build with cargo build --release -p codestory-cli, then run the ignored test"]
 fn real_repo_agent_grounding_drill_emits_verification_packets() {
     let binary = release_cli_binary();
     assert!(
         binary.is_file(),
-        "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
+        "missing release binary at {}. Set CODESTORY_EMBED_MODEL_SOURCE to the output of `node scripts/prepare-embedded-model.mjs`, then run `cargo build --release -p codestory-cli`.",
         binary.display()
     );
 
@@ -1466,37 +1657,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             missing.join(", ")
         );
     }
-    let mut sidecar_cleanup = cases
-        .iter()
-        .map(|case| ReleaseE2eSidecarCleanup {
-            binary: binary.clone(),
-            project_root: case.project_root.clone(),
-            cache_dir: cache_dir.path().join(&case.name),
-            sidecar_cache_root: cache_dir.path().to_path_buf(),
-            run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
-            armed: true,
-        })
-        .collect::<Vec<_>>();
-
-    for cleanup in &sidecar_cleanup {
-        run_cli_json_with_sidecar_cache_root(
-            &binary,
-            &cleanup.project_root,
-            &cleanup.cache_dir,
-            &cleanup.sidecar_cache_root,
-            &[
-                "retrieval".to_string(),
-                "bootstrap".to_string(),
-                "--profile".to_string(),
-                "agent".to_string(),
-                "--run-id".to_string(),
-                cleanup.run_id.clone(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        );
-    }
-
     let (_seconds, suite_json) = run_cli_json_with_sidecar_cache_root(
         &binary,
         repo_root().as_path(),
@@ -1683,9 +1843,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         }
 
         assert_manifest_anchor_expectations(case, repo_json);
-    }
-    for cleanup in &mut sidecar_cleanup {
-        cleanup.teardown();
     }
 }
 

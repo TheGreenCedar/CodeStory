@@ -10,22 +10,22 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
-    ReadinessStatusDto, ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
-    RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
+    NodeId, NodeKind, PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+    PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
+    ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
+    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
     SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
-    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
+    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode, validate_packet_probe,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
-const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
-cache already has indexed files.";
+const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty, pre-current, or structurally incompatible cache and `incremental` for a compatible existing publication. An explicit `incremental` request never escalates to `full`; incompatible state returns `full_refresh_required` before workspace reads or writes.";
 const READ_REFRESH_HELP: &str = "Read commands default to `none` so they only query the existing cache. Use `incremental` to \
 refresh an existing cache in place, or `full` after a cache reset, schema change, or indexing \
-failure.";
+failure. Explicit `incremental` fails with `full_refresh_required` instead of escalating.";
 const DRILL_REFRESH_HELP: &str = "Drill defaults to `full` so each report is mechanically fresh. Use `none` only after a \
-fresh index, or `incremental` to refresh an existing cache in place.";
+fresh index, or `incremental` to refresh a compatible existing cache without allowing full-refresh escalation.";
 const CLI_LONG_ABOUT: &str = "\
 CodeStory turns a local repository into auditable grounding evidence.
 
@@ -34,7 +34,7 @@ Common lanes:
   Broad question: codestory-cli packet --project <repo> --question \"How does this system work?\"
   Exact target:  codestory-cli context --project <repo> --query <symbol-or-file>
 
-For agent packet/search readiness, first run retrieval bootstrap + retrieval index and require retrieval status to report retrieval_mode=full.";
+Packet and search initialize the embedded retrieval engine automatically and require retrieval_mode=full.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
@@ -72,11 +72,9 @@ pub(crate) enum Command {
     Doctor(DoctorCommand),
     #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
     Ready(ReadyCommand),
-    #[command(about = "Run the single supported readiness repair entrypoint.")]
-    Fix(FixCommand),
     #[command(about = "Run a machine-readable smoke profile for CI and agent images.")]
     Smoke(SmokeCommand),
-    #[command(about = "Agent-facing readiness and repair helpers.")]
+    #[command(about = "Agent-facing retrieval helpers.")]
     Agent(AgentCommand),
     #[command(about = "Prepare or inspect local cache artifacts.")]
     Cache(CacheCommand),
@@ -116,12 +114,16 @@ pub(crate) enum Command {
     Serve(ServeCommand),
     #[command(about = "Generate shell completions.")]
     GenerateCompletions(GenerateCompletionsCommand),
-    #[command(about = "Manage retrieval sidecar data.")]
+    #[command(about = "Manage retrieval artifacts.")]
     Retrieval(RetrievalCommand),
-    #[command(about = "Show retrieval sidecar status.")]
-    Sidecar(SidecarCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-embedding-server", hide = true)]
+    InternalEmbeddingServer,
+    #[command(name = "internal-embedding-qualification", hide = true)]
+    InternalEmbeddingQualification(InternalEmbeddingQualificationCommand),
+    #[command(name = "internal-embedding-qualification-worker", hide = true)]
+    InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
 }
 
 #[derive(Args, Debug)]
@@ -130,6 +132,14 @@ pub(crate) struct InternalOwnedDeleteCommand {
     pub(crate) root: PathBuf,
     #[arg(long, value_name = "RELATIVE_PATH")]
     pub(crate) relative: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalEmbeddingQualificationCommand {
+    #[arg(long, value_name = "PRIVATE_JSON")]
+    pub(crate) request: PathBuf,
+    #[arg(long, value_name = "PRIVATE_JSON")]
+    pub(crate) output: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -172,6 +182,29 @@ fn parse_read_output_format(value: &str) -> Result<OutputFormat, String> {
             "invalid output format `{other}`; expected `markdown` or `json`"
         )),
     }
+}
+
+fn parse_packet_probe(value: &str) -> Result<PacketProbeDto, String> {
+    let probe: PacketProbeDto = serde_json::from_str(value).map_err(|error| {
+        format!(
+            "invalid tagged packet probe JSON: {error}; expected an object with kind exact_path, symbol_id, file_symbol, free_query, or continuation"
+        )
+    })?;
+    validate_packet_probe(&probe)
+        .map_err(|error| format!("invalid tagged packet probe: {error}"))?;
+    Ok(probe)
+}
+
+fn parse_legacy_packet_probe(value: &str) -> Result<String, String> {
+    codestory_contracts::api::validate_packet_probe_request(&[], &[value.to_string()])
+        .map(|()| value.to_string())
+}
+
+pub(crate) fn validate_packet_probe_arguments(
+    probes: &[PacketProbeDto],
+    legacy_probes: &[String],
+) -> Result<(), String> {
+    codestory_contracts::api::validate_packet_probe_request(probes, legacy_probes)
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -459,9 +492,17 @@ pub(crate) struct PacketCommand {
     #[arg(long, value_enum)]
     pub(crate) task_class: Option<CliPacketTaskClass>,
     #[arg(
+        long = "probe",
+        value_name = "TAGGED_JSON",
+        value_parser = parse_packet_probe,
+        help = "Add a typed packet probe as tagged JSON. Kinds: exact_path, symbol_id, file_symbol, free_query, continuation. Repeatable."
+    )]
+    pub(crate) probes: Vec<PacketProbeDto>,
+    #[arg(
         long = "extra-probe",
         value_name = "QUERY",
-        help = "Add an explicit file, symbol, or file-scoped symbol probe to the packet plan. Repeatable; intended for audited benchmark or operator-supplied anchors."
+        value_parser = parse_legacy_packet_probe,
+        help = "Add a legacy string probe. It is normalized through the same typed resolver as --probe."
     )]
     pub(crate) extra_probes: Vec<String>,
     #[arg(
@@ -531,9 +572,17 @@ pub(crate) struct TaskBriefCommand {
     #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
     pub(crate) budget: CliPacketBudget,
     #[arg(
+        long = "probe",
+        value_name = "TAGGED_JSON",
+        value_parser = parse_packet_probe,
+        help = "Add a typed packet probe as tagged JSON. Repeatable."
+    )]
+    pub(crate) probes: Vec<PacketProbeDto>,
+    #[arg(
         long = "extra-probe",
         value_name = "QUERY",
-        help = "Add an explicit file, symbol, or file-scoped symbol probe to the underlying packet plan."
+        value_parser = parse_legacy_packet_probe,
+        help = "Add a legacy string probe normalized through the typed packet resolver."
     )]
     pub(crate) extra_probes: Vec<String>,
     #[arg(
@@ -586,41 +635,16 @@ pub(crate) struct ReadyCommand {
     pub(crate) goal: Option<ReadyGoal>,
     #[arg(
         long,
-        help = "Repair readiness before reporting it. Local repairs refresh the index; agent repairs also bootstrap and rebuild retrieval sidecars."
-    )]
-    pub(crate) repair: bool,
-    #[arg(
-        long,
         help = "For local graph freshness, no-op when fresh and run at most one incremental refresh when stale or unchecked."
     )]
     pub(crate) wait_fresh: bool,
     #[arg(
         long,
         value_name = "ID",
-        help = "Use a specific agent sidecar run id when checking or repairing agent readiness."
+        help = "Inspect a specific agent retrieval run."
     )]
     pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
-    pub(crate) format: OutputFormat,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Write command output to this file instead of stdout. The parent directory must already exist."
-    )]
-    pub(crate) output_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct FixCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Use a specific agent sidecar run id when repairing agent readiness."
-    )]
-    pub(crate) run_id: Option<String>,
-    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -738,19 +762,15 @@ pub(crate) struct RetrievalCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RetrievalAction {
-    /// Start Docker Compose sidecars (when available), prepare cache dirs, and wait for health.
-    Bootstrap(RetrievalBootstrapCommand),
-    /// Prepare local sidecar data directories and write sidecar state (does not start Docker).
-    Up(RetrievalSidecarStateCommand),
-    /// Remove local sidecar state file (does not stop external processes).
-    Down(RetrievalSidecarStateCommand),
-    /// Validate the lexical shard plus Qdrant and SCIP availability for the project.
+    /// Validate lexical, semantic, and graph retrieval for the project.
     Status(RetrievalStatusCommand),
-    /// List owned sidecar namespaces and dry-run cleanup eligibility.
+    /// List owned retrieval generations and dry-run cleanup eligibility.
     Inventory(RetrievalInventoryCommand),
-    /// Run workspace index then persist retrieval_index_manifest sidecar metadata.
+    /// Run workspace index then publish a retrieval manifest.
     Index(RetrievalIndexCommand),
-    /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
+    /// Republish semantic projections from the complete stored core without reading source files.
+    RepublishProjections(RetrievalRepublishProjectionsCommand),
+    /// Execute a standalone query against published retrieval artifacts.
     Query(RetrievalQueryCommand),
 }
 
@@ -770,20 +790,6 @@ impl From<CliSidecarProfile> for codestory_retrieval::SidecarProfile {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct RetrievalSidecarStateCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
-    pub(crate) profile: CliSidecarProfile,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Agent profile run id to reuse for status or cleanup. If omitted, agent profile creates a fresh run namespace."
-    )]
-    pub(crate) run_id: Option<String>,
-}
-
-#[derive(Args, Debug)]
 pub(crate) struct RetrievalQueryCommand {
     /// Natural-language, symbol, or path query string.
     pub(crate) query: String,
@@ -795,42 +801,6 @@ pub(crate) struct RetrievalQueryCommand {
         help = "Hard deadline for the staged retrieval plan."
     )]
     pub(crate) budget_ms: Option<u64>,
-    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
-    pub(crate) format: OutputFormat,
-    #[arg(long, value_name = "PATH")]
-    pub(crate) output_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct RetrievalBootstrapCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
-    pub(crate) profile: CliSidecarProfile,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Agent profile run id to reuse for status or cleanup. If omitted, agent profile creates a fresh run namespace."
-    )]
-    pub(crate) run_id: Option<String>,
-    #[arg(
-        long,
-        help = "Skip docker compose even when Docker is installed (dirs + state file only)."
-    )]
-    pub(crate) skip_compose: bool,
-    #[arg(
-        long,
-        value_name = "SECS",
-        default_value_t = 90,
-        help = "Seconds to wait for Qdrant and embedding HTTP probes (0 = no wait)."
-    )]
-    pub(crate) wait_secs: u64,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Override docker/retrieval-compose.yml path."
-    )]
-    pub(crate) compose_file: Option<PathBuf>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -871,22 +841,6 @@ pub(crate) struct RetrievalInventoryCommand {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct SidecarCommand {
-    #[command(subcommand)]
-    pub(crate) action: SidecarAction,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum SidecarAction {
-    /// Alias for `retrieval status`.
-    Status(RetrievalStatusCommand),
-    /// Alias for `retrieval inventory`.
-    Inventory(RetrievalInventoryCommand),
-    #[command(external_subcommand)]
-    Unknown(Vec<String>),
-}
-
-#[derive(Args, Debug)]
 pub(crate) struct RetrievalIndexCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -895,11 +849,21 @@ pub(crate) struct RetrievalIndexCommand {
     #[arg(
         long,
         value_name = "ID",
-        help = "Agent profile run id to reuse while finalizing sidecar artifacts."
+        help = "Agent retrieval run id to reuse while publishing artifacts."
     )]
     pub(crate) run_id: Option<String>,
     #[arg(long, value_enum, default_value_t = RefreshMode::Auto, help = INDEX_REFRESH_HELP)]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalRepublishProjectionsCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -1531,6 +1495,8 @@ pub(crate) struct IndexOutput<'a> {
     pub(crate) project: &'a str,
     pub(crate) storage_path: &'a str,
     pub(crate) refresh: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh_reason: Option<&'a str>,
     pub(crate) summary: &'a ProjectSummary,
     pub(crate) retrieval: &'a RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1550,17 +1516,6 @@ pub(crate) struct ReadyOutput {
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) readiness_broker: Option<crate::readiness_broker::ReadinessBrokerSnapshot>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct FixOutput {
-    pub(crate) status: &'static str,
-    pub(crate) ready: bool,
-    pub(crate) goal: ReadinessGoalDto,
-    pub(crate) action: &'static str,
-    pub(crate) result: ReadyOutput,
 }
 
 #[derive(Debug, Serialize)]
@@ -1598,12 +1553,10 @@ pub(crate) struct ReadinessLaneOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) compose_project: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repair_updated_at_epoch_ms: Option<i64>,
-    pub(crate) sidecar_mode: String,
+    pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1620,15 +1573,18 @@ pub(crate) struct AgentPreflightOutput {
     pub(crate) local_default: ReadinessLaneOutput,
     pub(crate) agent_packet_search: ReadinessLaneOutput,
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
-    pub(crate) sidecar_setup: serde_json::Value,
     pub(crate) safe_surfaces: Vec<String>,
     pub(crate) blocked_surfaces: Vec<String>,
-    pub(crate) repair_command: Option<String>,
+    pub(crate) next_command: Option<String>,
     pub(crate) human_summary: String,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexDryRunOutput<'a> {
+    pub(crate) requested_refresh: &'a str,
+    pub(crate) effective_refresh: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compatibility_reason: Option<&'a str>,
     pub(crate) dry_run: &'a IndexDryRunDto,
 }
 
@@ -1660,6 +1616,14 @@ pub(crate) struct SearchHitOutput {
     pub(crate) origin: SearchHitOrigin,
     pub(crate) match_quality: SearchMatchQualityDto,
     pub(crate) resolvable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolution_status: Option<PacketEvidenceResolutionDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) eligible_for_sufficiency: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) score_breakdown: Option<RetrievalScoreBreakdownDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1694,7 +1658,7 @@ pub(crate) struct VerificationTargetOutput {
 /// JSON contract for `search`.
 ///
 /// Retrieval readiness and repo-text mode are explicit so consumers can
-/// distinguish full sidecar evidence from degraded or fallback search paths.
+/// distinguish full retrieval evidence from degraded or fallback search paths.
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
@@ -1773,10 +1737,16 @@ pub(crate) struct DrillRuntimeTimingsOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillMechanicalOutput {
-    pub(crate) before_files: u32,
-    pub(crate) before_nodes: u32,
-    pub(crate) before_edges: u32,
-    pub(crate) before_errors: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_nodes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_edges: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_errors: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after_files: u32,
     pub(crate) after_nodes: u32,
     pub(crate) after_edges: u32,
@@ -1930,10 +1900,14 @@ pub(crate) struct DrillSummaryStatsOutput {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryMechanicalOutput {
     pub(crate) refresh: String,
-    pub(crate) before: DrillSummaryStatsOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before: Option<DrillSummaryStatsOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after: DrillSummaryStatsOutput,
     pub(crate) index_ready: bool,
-    pub(crate) error_delta: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_delta: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2310,7 +2284,7 @@ pub(crate) struct DoctorCheckOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DoctorSidecarStatusOutput {
+pub(crate) struct RetrievalStatusOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2358,7 +2332,7 @@ pub(crate) struct DoctorOutput {
     pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
-    pub(crate) sidecar_retrieval: DoctorSidecarStatusOutput,
+    pub(crate) sidecar_retrieval: RetrievalStatusOutput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2367,14 +2341,12 @@ pub(crate) struct DoctorOutput {
     pub(crate) readiness: Vec<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) readiness_broker: Option<crate::readiness_broker::ReadinessBrokerSnapshot>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TargetSelection {
     Id(NodeId),
     Query {
@@ -2533,26 +2505,115 @@ mod tests {
     }
 
     #[test]
-    fn fix_command_parses_as_single_repair_entrypoint() {
-        let cli = Cli::try_parse_from([
+    fn packet_cli_parses_tagged_and_legacy_probes() {
+        let parsed = Cli::try_parse_from([
             "codestory-cli",
-            "fix",
-            "--project",
-            "C:/repo",
-            "--format",
-            "json",
-            "--run-id",
-            "shared-agent",
+            "packet",
+            "--question",
+            "Explain the target",
+            "--probe",
+            r#"{"kind":"exact_path","path":"assets/desk.svg"}"#,
+            "--extra-probe",
+            "WorkspaceIndexer",
         ])
-        .expect("fix command should parse");
-        match cli.command {
-            Command::Fix(cmd) => {
-                assert_eq!(cmd.project.project, PathBuf::from("C:/repo"));
-                assert_eq!(cmd.run_id.as_deref(), Some("shared-agent"));
-                assert_eq!(cmd.format, OutputFormat::Json);
-            }
-            _ => panic!("expected fix command"),
-        }
+        .expect("packet probes should parse");
+        let Command::Packet(packet) = parsed.command else {
+            panic!("expected packet command");
+        };
+        assert_eq!(
+            packet.probes,
+            [PacketProbeDto::ExactPath {
+                path: "assets/desk.svg".into()
+            }]
+        );
+        assert_eq!(packet.extra_probes, ["WorkspaceIndexer"]);
+    }
+
+    #[test]
+    fn packet_cli_rejects_malformed_tagged_probe_before_runtime() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--question",
+            "Explain the target",
+            "--probe",
+            r#"{"kind":"file_symbol","path":"src/lib.rs"}"#,
+        ])
+        .expect_err("incomplete tagged probe must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid tagged packet probe JSON")
+        );
+    }
+
+    #[test]
+    fn packet_cli_uses_shared_probe_count_and_text_limits() {
+        assert!(
+            Cli::try_parse_from([
+                "codestory-cli",
+                "packet",
+                "--question",
+                "Explain the target",
+                "--extra-probe",
+                &"x".repeat(codestory_contracts::api::PACKET_PROBE_MAX_TEXT_LENGTH + 1),
+            ])
+            .is_err()
+        );
+        let typed = vec![
+            PacketProbeDto::FreeQuery { query: "x".into() };
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT
+        ];
+        assert!(validate_packet_probe_arguments(&typed, &["overflow".into()]).is_err());
+    }
+
+    #[test]
+    fn embedding_server_entrypoint_is_parsable_but_hidden() {
+        let parsed = Cli::try_parse_from(["codestory-cli", "internal-embedding-server"])
+            .expect("hidden embedding server entrypoint should parse");
+        assert!(matches!(parsed.command, Command::InternalEmbeddingServer));
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help.contains("internal-embedding-server"),
+            "internal server entrypoint leaked into public help: {help}"
+        );
+
+        let qualification = Cli::try_parse_from([
+            "codestory-cli",
+            "internal-embedding-qualification",
+            "--request",
+            "/private/request.json",
+            "--output",
+            "/private/output.json",
+        ])
+        .expect("hidden embedding qualification entrypoint should parse");
+        assert!(matches!(
+            qualification.command,
+            Command::InternalEmbeddingQualification(_)
+        ));
+        assert!(
+            !help.contains("internal-embedding-qualification"),
+            "internal qualification entrypoint leaked into public help: {help}"
+        );
+
+        let worker = Cli::try_parse_from([
+            "codestory-cli",
+            "internal-embedding-qualification-worker",
+            "--request",
+            "/private/worker-request.json",
+            "--output",
+            "/private/worker-output.json",
+        ])
+        .expect("hidden embedding qualification worker should parse");
+        assert!(matches!(
+            worker.command,
+            Command::InternalEmbeddingQualificationWorker(_)
+        ));
+        assert!(
+            !help.contains("internal-embedding-qualification-worker"),
+            "internal qualification worker leaked into public help: {help}"
+        );
     }
 
     #[test]
@@ -2827,14 +2888,39 @@ mod tests {
             _ => panic!("expected retrieval inventory command"),
         }
 
-        let apply = Cli::try_parse_from(["codestory-cli", "sidecar", "inventory", "--apply"])
-            .expect("sidecar inventory --apply should parse");
+        let apply = Cli::try_parse_from(["codestory-cli", "retrieval", "inventory", "--apply"])
+            .expect("retrieval inventory --apply should parse");
         match apply.command {
-            Command::Sidecar(SidecarCommand {
-                action: SidecarAction::Inventory(cmd),
+            Command::Retrieval(RetrievalCommand {
+                action: RetrievalAction::Inventory(cmd),
             }) => assert!(cmd.apply),
-            _ => panic!("expected sidecar inventory command"),
+            _ => panic!("expected retrieval inventory command"),
         }
+    }
+
+    #[test]
+    fn semantic_projection_republish_is_an_explicit_retrieval_writer() {
+        let parsed = Cli::try_parse_from([
+            "codestory-cli",
+            "retrieval",
+            "republish-projections",
+            "--project",
+            "/tmp/project",
+        ])
+        .expect("semantic projection writer should parse");
+        match parsed.command {
+            Command::Retrieval(RetrievalCommand {
+                action: RetrievalAction::RepublishProjections(cmd),
+            }) => {
+                assert_eq!(cmd.project.project, PathBuf::from("/tmp/project"));
+                assert_eq!(cmd.format, OutputFormat::Json);
+            }
+            _ => panic!("expected explicit semantic projection writer"),
+        }
+
+        let help = render_subcommand_help("retrieval");
+        assert!(help.contains("republish-projections"));
+        assert!(help.contains("without reading source files"));
     }
 
     #[test]

@@ -16,14 +16,18 @@ on:
         required: false
         type: string
         default: ""
-      embedding_model_dir:
-        required: false
-        type: string
-        default: ""
       source_run_id:
         required: false
         type: string
         default: ""
+      version:
+        required: false
+        type: string
+        default: ""
+      emit_release_cells:
+        required: false
+        type: boolean
+        default: false
     secrets:
       CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
         required: false
@@ -54,11 +58,9 @@ jobs:
         env:
           PROFILE: ${{ inputs.profile }}
           DRILL_MANIFEST: ${{ inputs.drill_manifest }}
-          EMBEDDING_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
           test "$DRILL_MANIFEST" = /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-          test "$EMBEDDING_MODEL_DIR" = /srv/codestory-release-evidence/models
           bash scripts/release-evidence/guest-verify.sh \
             scripts/release-evidence/machine-contract.json
           mkdir -p target/release-evidence
@@ -70,6 +72,10 @@ jobs:
             echo "::error::Requested profile $PROFILE does not match provisioned profile $provisioned_profile."
             exit 1
           }
+
+      - name: Prepare checksum-pinned embedded model
+        if: inputs.source_run_id == ''
+        run: node scripts/prepare-embedded-model.mjs
 
       - name: Build release CLI
         if: inputs.source_run_id == ''
@@ -83,19 +89,18 @@ jobs:
           CODESTORY_RELEASE_EVIDENCE_PROVISIONING: ${{ github.workspace }}/target/release-evidence/provisioning.json
         run: echo "fingerprint=$(node scripts/codestory-release-evidence-gate.mjs fingerprint)" >> "$GITHUB_OUTPUT"
 
-      - name: Produce full-sidecar repo evidence
+      - name: Produce full-retrieval repo evidence
         if: inputs.source_run_id == ''
         shell: bash
         env:
           CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR: ${{ github.workspace }}/target/release-evidence/drill
           CODESTORY_RELEASE_EVIDENCE_STATS_PATH: ${{ github.workspace }}/target/release-evidence/stats.json
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
-          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
-          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
+          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v0.16-axios-js-ts-v2
+          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-inprocess-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_REAL_REPO_DRILL_CASES: ${{ inputs.drill_manifest }}
           CODESTORY_EMBED_ALLOW_CPU: "1"
-          CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
           cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture --test-threads=1 \
@@ -107,17 +112,19 @@ jobs:
         env:
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
           CODESTORY_RELEASE_EVIDENCE_PROFILE: ${{ inputs.profile }}
-          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
-          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
+          CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v0.16-axios-js-ts-v2
+          CODESTORY_RELEASE_EVIDENCE_CORPUS_CONTRACT: benchmarks/release-evidence/corpus-contracts/v0.16-axios-js-ts-v2.json
+          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-inprocess-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_EMBED_ALLOW_CPU: "1"
-          CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
+          CODESTORY_RELEASE_EVIDENCE_TREE="$(git rev-parse 'HEAD^{tree}')"
+          export CODESTORY_RELEASE_EVIDENCE_TREE
           node scripts/codestory-agent-ab-benchmark.mjs \
             --packet-runtime \
             --packet-runtime-mode cold-cli \
-            --task-suite holdout-retrieval \
+            --task-manifest benchmarks/tasks/release-evidence/axios-request-dispatch-v2.task.json \
             --materialize-repos \
             --repeats 3 \
             --publishable \
@@ -156,6 +163,7 @@ jobs:
           PROFILE: ${{ inputs.profile }}
           APPROVAL_JSON: ${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}
           EVIDENCE_SHA: ${{ inputs.ref }}
+          PROOF_KEY: ${{ inputs.proof_key }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           set -euo pipefail
@@ -171,6 +179,7 @@ jobs:
               --packet target/release-evidence/packet/packet-runtime-summary.json \
               --out target/release-evidence/candidate.json \
               --expected-sha "$EVIDENCE_SHA" \
+              --release-key "$PROOF_KEY" \
               --mode release \
               --repo "$GITHUB_WORKSPACE"
           fi
@@ -184,9 +193,36 @@ jobs:
             --candidate target/release-evidence/candidate.json \
             --out target/release-evidence/report.json \
             --expected-sha "$EVIDENCE_SHA" \
+            --release-key "$PROOF_KEY" \
             --mode release \
             --repo "$GITHUB_WORKSPACE" \
             "${approval_args[@]}"
+
+      - name: Emit authenticated release-evidence cells
+        if: inputs.emit_release_cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/codestory-release-cell-manifest.mjs release-evidence \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "${{ inputs.version }}" \
+            --report target/release-evidence/report.json \
+            --producer-workflow .github/workflows/release-candidate-evidence.yml \
+            --producer-job measure \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-prepublish-release-evidence-attempt-$GITHUB_RUN_ATTEMPT" \
+            --out-dir target/release-cells
+
+      - name: Upload authenticated release-evidence cells
+        if: success() && inputs.emit_release_cells
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-prepublish-release-evidence-attempt-${{ github.run_attempt }}
+          path: target/release-cells/*.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload release evidence
         if: always()
@@ -195,3 +231,5 @@ jobs:
           name: release-evidence-${{ inputs.ref }}
           path: target/release-evidence
           if-no-files-found: warn
+          retention-days: 30
+          overwrite: true

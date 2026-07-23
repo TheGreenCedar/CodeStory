@@ -1,118 +1,149 @@
 # Runtime Execution Path
 
-This page describes the current command path for the core CLI workflows:
-`index`, `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `explore`,
-`serve`, and `doctor`.
+CodeStory routes CLI, HTTP, and MCP calls through the same product boundaries.
+The adapter validates and renders; `codestory-runtime` orchestrates; the owning
+workspace, store, indexer, and retrieval crates enforce their state contracts.
 
-## Index Command
+## Request state machine
 
-See [indexing pipeline](indexing-pipeline.md) for the full indexing lifecycle,
-refresh modes, and staged snapshot publish path.
+```mermaid
+flowchart TD
+    Input["CLI, HTTP, tool, or resource request"] --> Validate["validate name, URI, and arguments"]
+    Validate --> Project["select explicit project and immutable config"]
+    Project --> Class{"surface class"}
+    Class -->|"observational"| Observe["read status or diagnostics"]
+    Class -->|"local graph"| Refresh["bounded local freshness check/refresh"]
+    Class -->|"broad retrieval"| Prepare["bounded local refresh + managed retrieval preparation"]
+    Class -->|"exact target"| Target["resolve target, then apply its graph/retrieval requirement"]
+    Refresh --> Execute["runtime operation"]
+    Prepare --> Ready{"publication and engine ready?"}
+    Ready -->|"still working"| Retry["preparing + retry same call"]
+    Ready -->|"unavailable"| Gap["fail closed with actionable gap"]
+    Ready -->|"ready"| Pin["pin coherent retrieval identity"]
+    Pin --> Execute
+    Target --> Execute
+    Execute --> Revalidate{"publication changed?"}
+    Revalidate -->|"yes"| Bounded["one bounded retry"]
+    Revalidate -->|"no"| Render["redact diagnostics and render DTO"]
+    Bounded --> Execute
+```
 
-At runtime, `codestory-cli` delegates to `codestory-runtime`, which opens the
-workspace refresh plan, runs `codestory-indexer::WorkspaceIndexer`, flushes graph
-and search projections through `codestory-store`, and synchronizes symbol docs,
-component reports, and selected dense anchors before returning the index summary.
+Validation precedes activation. An unknown resource or malformed request cannot
+refresh a project, initialize the engine, or mutate status state.
 
-Default index runs do not defer symbol docs. When embedding assets are available, the returned retrieval state reports the selected dense-anchor corpus for `graph_first_v1`; that corpus may be zero for graph-only projects. If embedding assets are missing, runtime still completes graph, lexical, symbol-doc, and component-report state and reports the degraded-state reason instead of pretending dense retrieval is ready.
+## Surface classes
 
-## Search Command
+| Class | Examples | May activate work | Required state |
+| --- | --- | --- | --- |
+| Observational | `status`, `doctor`, retrieval-engine diagnostics | No | readable current state |
+| Local graph | `ground`, `files`, `symbol`, `callers`, `trail`, `snippet` | bounded local refresh | current core publication for the requested surface |
+| Broad retrieval | `packet`, `search`, broad query-based `context` | local refresh, engine init, retrieval finalization | coherent retrieval publication and live policy-compliant engine |
+| Exact target | definition/reference/node and focused context calls | only what the selected operation needs | resolved target plus its declared readiness |
+
+`ground` is the normal first call. It can return a useful local repository map
+after the bounded graph refresh while managed broad-retrieval preparation
+continues. A later `packet` or `search` call either completes that preparation,
+returns `preparing` for a bounded retry, or reports an environment gap. There is
+no user-facing sidecar setup or repair decision.
+
+## Core indexing
+
+An explicit `index` request delegates to runtime, which asks
+`codestory-workspace` for a complete or incremental refresh plan,
+`codestory-indexer` to parse and resolve projections, and `codestory-store` to
+publish or refresh the core database. Runtime then synchronizes graph-native
+symbol documents and reusable dense-anchor rows.
+
+This publishes core state, not the immutable retrieval generation. Normal
+agent activation or an explicit retrieval index operation may next finalize
+lexical, vector, and SCIP artifacts against that core publication. See the
+[indexing pipeline](indexing-pipeline.md).
+
+Managed activation enters through the summary-only core reader. It does not
+require the derived search generation that activation may need to repair. Once
+core freshness and the dense-anchor publication are coherent, runtime takes the
+project writer and search-generation locks, validates the generation against
+the exact core publication, rebuilds missing or corrupt search state, and
+publishes its completion marker last. The normal project reader remains
+fail-closed and never performs this repair.
+
+## Broad retrieval read
 
 ```mermaid
 sequenceDiagram
-    participant CLI as codestory-cli
+    participant Adapter as CLI or stdio adapter
     participant Runtime as codestory-runtime
-    participant Store as codestory-store
     participant Retrieval as codestory-retrieval
+    participant Store as codestory-store
 
-    CLI->>Runtime: resolve command and query options
-    Runtime->>Retrieval: strict_sidecar_status(project, storage)
-    Retrieval->>Store: load retrieval manifest and validate live indexable inventory
-    Retrieval-->>Runtime: retrieval_mode + degraded reason
-    Runtime->>Retrieval: execute sidecar query only when retrieval_mode=full
-    Runtime->>Store: resolve sidecar candidates to indexed symbols
-    Runtime->>Runtime: map sidecar trace and resolved hits into DTOs
-    Runtime-->>CLI: result DTOs
-    CLI->>CLI: render markdown or JSON
+    Adapter->>Runtime: packet/search request
+    Runtime->>Retrieval: ensure current publication and live engine
+    Retrieval->>Store: derive core publication identity
+    Retrieval-->>Runtime: query hits + RetrievalPublicationIdentity
+    Runtime->>Store: open matching read transaction
+    Runtime->>Retrieval: retain lexical/semantic generation leases
+    Runtime->>Runtime: resolve candidates and assemble evidence
+    Runtime->>Retrieval: revalidate publication and engine identity
+    alt publication changed
+        Runtime->>Runtime: retry once
+    else coherent
+        Runtime-->>Adapter: cited result DTO
+    end
 ```
 
-1. CLI resolves the project and query options.
-2. Runtime asks `codestory-retrieval` for sidecar status before serving results.
-3. Retrieval status loads the stored retrieval manifest, applies stale-manifest checks, and reports the exact degraded reason before any healthy sidecar probe can bless an invalid manifest.
-4. `retrieval_mode = full` is the only product-serving search path. Missing, stale, partial, or non-product sidecar state fails closed with the degraded reason.
-5. Runtime executes the mandatory sidecar query in AST-first order: exact symbol/AST lookup, lexical source and virtual-doc search, graph expansion, then dense-anchor augmentation. It resolves returned candidates back into indexed symbols and rejects unresolved or non-full candidate sets before returning product hits.
-6. Hybrid semantic state, repo-text matches, and local lexical search are diagnostic/navigation surfaces only; they are not a product fallback for `search`.
-7. For broad architecture-style queries, runtime may assemble a Search Plan with extracted/dropped terms, bounded subqueries, candidate windows, anchor groups, bridge evidence, next commands, and source-truth checks.
-8. Runtime maps retrieval state plus resolved sidecar matches into contract DTOs and CLI renders them.
+Query execution and candidate resolution use one retrieval-owned pinned session
+holding the matching core read transaction, immutable generation leases,
+manifest/evidence identity, and engine residency. Numeric node IDs are accepted
+only through that session. A concurrent publish returns typed
+`publication_changed` to the whole-operation bounded retry instead of resolving
+an old candidate against a new graph.
 
-When `search --why` is requested, the CLI renders compact explanations from the
-same DTO surface: sidecar origin, degraded/fail-closed state, candidate
-provenance (`exact`, `lexical_source`, `symbol_doc`, `graph_neighbor`,
-`component_report`, `dense_anchor`),
-resolution details, and the Search Plan when the broad-query planner emitted
-one. Legacy hybrid score details may appear only as diagnostic data from
-non-serving paths.
+`retrieval_mode=full` records the artifact classification. Serving additionally
+requires a current manifest, matching producer identity, live embedded engine,
+and allowed surface. The mode string alone cannot bless dead or mismatched
+infrastructure.
 
-## Context Command
+## Local and exact-target reads
 
-```mermaid
-sequenceDiagram
-    participant CLI as codestory-cli
-    participant Runtime as codestory-runtime
-    participant Retrieval as mandatory sidecar retrieval
-    participant Graph as runtime graph builders
+Runtime reads graph rows, occurrences, trails, search documents, or grounding
+snapshots from `codestory-store` and assembles contract DTOs. `explore` and
+`serve` reuse those services; adapters do not open SQLite or invent product
+fallbacks. When broad retrieval is unavailable, local graph tools can remain
+usable, but their output must not be presented as a full packet/search result.
 
-    CLI->>Runtime: concrete target request
-    Runtime->>Retrieval: Investigate sidecar-primary retrieval
-    Runtime->>Graph: neighborhood, trail, snippets, citations
-    Runtime-->>CLI: context packet with trace and evidence
-    CLI->>CLI: render markdown/json and optional bundle
-```
+Packet callers may supply tagged probes for an exact project-relative path,
+stable symbol ID, file-scoped symbol, free query, or continuation. CLI and
+stdio normalize those forms and legacy string probes into the same runtime
+resolver. Workspace owns native path containment; runtime resolves exact paths
+and IDs before fuzzy discovery and returns ordered ambiguity candidates rather
+than choosing one. A valid source file outside graph coverage remains a
+`valid_uncovered_path`, and source-range-only text remains distinct from an
+indexed symbol.
 
-`context` is target-first. The CLI resolves `--id`, `--query`, or `--bookmark`
-to one concrete target. Query target selection may use read-only indexed-symbol
-resolution to choose that target; it is not broad packet/search discovery.
-The context packet still delegates to `runtime.browser.ask` with the
-`Investigate` retrieval profile and the selected `focus_node_id`. Runtime then
-builds the deep evidence packet from sidecar-primary retrieval, graph
-neighborhoods, trails, snippets, and citations. If sidecar primary is
-unavailable, rejected, disabled, or non-`full`, the Investigate path can fail
-closed rather than serving a DB-only answer packet. It is not a
-question-answering command and does not interpret broad natural-language
-prompts. Use `symbol`, `trail`, `snippet`, or `explore` for cache-only local
-navigation when sidecars are degraded; use `packet` or `search` for broad
-sidecar-backed discovery.
+Resolved path and symbol probes enter packet evidence as exact citations keyed
+by normalized project path or stable node ID. They do not become display-name
+searches. Exact citations remain explicit inputs and cannot satisfy packet
+sufficiency by themselves.
 
-## Ground, Symbol, Trail, and Snippet Commands
+Continuation probes carry the probe contract version, project identity, core
+generation, and optional retrieval generation. Runtime rejects a continuation
+when any bound identity differs from the selected public operation. Resolved
+free-query probes may add broad packet evidence work, but exact resolutions do
+not. Neither form changes task-class route order or packet sufficiency
+requirements.
 
-```mermaid
-flowchart LR
-    Store["codestory-store"] --> Runtime["codestory-runtime"]
-    Runtime --> Assembly["ranking + deduplication + grounding assembly"]
-    Assembly --> CLI["codestory-cli rendering"]
-```
+## Failure boundaries
 
-1. CLI resolves the project root plus any query or location inputs.
-2. Runtime reads graph rows, occurrences, trail data, search docs, or snapshot digests from the store.
-3. Runtime adds ranking, deduplication, and grounding-specific assembly on top of store-owned state.
-4. CLI formats the resulting DTOs without reimplementing orchestration.
+- adapters never choose a global active project;
+- status and diagnostics never activate managed work;
+- project switching never rereads ambient process defaults;
+- core success never implies retrieval publication success;
+- internally repairable writer contention or publication drift returns a
+  stable `preparing` operation with a same-tool retry instead of terminal
+  unavailability;
+- stale, partial, ambiguous, non-`full`, or engine-mismatched broad evidence
+  fails closed;
+- CLI rendering does not reimplement runtime orchestration.
 
-`explore` composes the same symbol, trail, and snippet DTOs into one bundled
-view and now adds definition plus incoming/outgoing reference metadata. `serve`
-reuses the same runtime calls for `/definition`, `/references`, `/symbols`, and
-stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
-reports cache/index/retrieval health without mutating state.
-
-`explore` and `serve --stdio` remain the browser-capable read surfaces until the
-[browser surface gate](../testing/codestory-stdio-warm-loop-stats.md#browser-surface-gate)
-is satisfied. Do not add a separate `browse` command, web UI route, or
-browser-specific UI without current manifest, warm-loop, stress-lane, explore,
-and screenshot-review evidence.
-
-## Ownership Notes
-
-- The runtime layer owns orchestration and search assembly.
-- The indexer layer owns parse/extract/resolve behavior.
-- The store layer owns persistence and snapshot lifecycle.
-- The CLI layer owns rendering only.
-- The contracts layer defines the DTOs and graph types that move between these layers.
+Read [host integration](host-integration.md) for plugin lifecycle and
+[retrieval design](retrieval-design.md) for publication mechanics.

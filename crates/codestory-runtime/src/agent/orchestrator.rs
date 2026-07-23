@@ -34,11 +34,14 @@ use crate::agent::packet_evidence_roles::{
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
-    build_packet_plan, build_packet_plan_with_extra, packet_concept_queries,
-    packet_symbol_probe_queries,
+    build_packet_plan, packet_concept_queries, packet_symbol_probe_queries,
 };
 use crate::agent::packet_plan::{
-    packet_plan_annotation, packet_rank_terms, packet_request_extra_probes,
+    build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
+};
+use crate::agent::packet_probe::{
+    exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
+    resolve_packet_probes, resolved_packet_probe_queries,
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
@@ -53,16 +56,16 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
 };
 use crate::agent::packet_source_patterns::packet_sql_identifier_after;
-use crate::agent::packet_sufficiency::build_packet_sufficiency_with_extra;
+use crate::agent::packet_sufficiency::build_packet_sufficiency_with_probe_context;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value,
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    build_packet_sufficiency, packet_budget_exceeded_hard_output_cap,
-    packet_claim_can_satisfy_sufficiency, packet_claim_family, packet_supported_claim_family_count,
-    packet_targeted_follow_up_queries,
+    build_packet_sufficiency, build_packet_sufficiency_with_extra,
+    packet_budget_exceeded_hard_output_cap, packet_claim_can_satisfy_sufficiency,
+    packet_claim_family, packet_supported_claim_family_count, packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
@@ -367,11 +370,19 @@ pub(crate) fn agent_packet(
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
     }
+    codestory_contracts::api::validate_packet_probe_request(&req.probes, &req.extra_probes)
+        .map_err(ApiError::invalid_argument)?;
     let project_root = controller.require_project_root()?;
     controller.begin_packet_retrieval();
 
-    let plan = super::plan_packet(&req)?;
-    let extra_probes = packet_request_extra_probes(req.extra_probes);
+    let probes = normalize_packet_probe_request(&req.probes, &req.extra_probes);
+    let probe_resolutions = resolve_packet_probes(controller, probes);
+    let exact_probe_citations =
+        exact_packet_probe_citations(controller, &probe_resolutions, req.include_evidence);
+    let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
+    let mut plan =
+        build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
+    plan.probe_resolutions = probe_resolutions;
     let limits = packet_budget_limits(req.budget);
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
@@ -395,6 +406,13 @@ pub(crate) fn agent_packet(
             hybrid_weights: initial_hybrid_weights.clone(),
         },
     )?;
+    if !exact_probe_citations.is_empty() {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_exact_probe_citations appended={}",
+            exact_probe_citations.len()
+        ));
+        answer.citations.extend(exact_probe_citations);
+    }
     if packet_initial_retrieval_is_lexical_only(initial_hybrid_weights.as_ref()) {
         answer.retrieval_trace.annotations.push(format!(
             "packet_initial_retrieval semantic_skipped=true reason=compact_exact_anchor_probes probe_count={}",
@@ -442,6 +460,7 @@ pub(crate) fn agent_packet(
         &question,
         plan.task_class,
         &file_scoped_source_probes,
+        &extra_probes,
         &mut answer,
     );
     append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
@@ -472,6 +491,7 @@ pub(crate) fn agent_packet(
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
+    let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
     let phase_started = Instant::now();
     let budget = apply_packet_budget_with_extra(
         &project_root,
@@ -487,13 +507,14 @@ pub(crate) fn agent_packet(
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
     let phase_started = Instant::now();
-    let sufficiency = build_packet_sufficiency_with_extra(
+    let sufficiency = build_packet_sufficiency_with_probe_context(
         &project_root,
         &question,
         plan.task_class,
         &answer,
         &budget,
         &sufficiency_extra_probes,
+        &exact_probe_paths,
     );
     append_packet_non_trace_phase(&mut answer, "sufficiency", phase_started);
     let phase_started = Instant::now();
@@ -548,15 +569,13 @@ fn packet_non_trace_phase_annotation(label: &str, duration_ms: u32) -> String {
 
 fn packet_plan_sufficiency_extra_probes(
     plan: &PacketPlanDto,
-    explicit_extra_probes: &[String],
+    _explicit_extra_probes: &[String],
 ) -> Vec<String> {
     let mut probes = Vec::new();
-    for probe in explicit_extra_probes {
-        push_packet_sufficiency_extra_probe(&mut probes, probe);
-    }
     for query in &plan.queries {
-        if packet_plan_query_can_gate_sufficiency(&query.query)
-            || packet_file_scoped_symbol_probe_parts(&query.query).is_some()
+        if !query.purpose.contains("explicit")
+            && (packet_plan_query_can_gate_sufficiency(&query.query)
+                || packet_file_scoped_symbol_probe_parts(&query.query).is_some())
         {
             push_packet_sufficiency_extra_probe(&mut probes, &query.query);
         }
@@ -2903,6 +2922,7 @@ fn maybe_append_required_file_scoped_source_citations(
     question: &str,
     task_class: PacketTaskClassDto,
     extra_probes: &[String],
+    explicit_probes: &[String],
     answer: &mut AgentAnswerDto,
 ) {
     let required_queries =
@@ -2957,6 +2977,9 @@ fn maybe_append_required_file_scoped_source_citations(
             already_cited = already_cited.saturating_add(1);
             continue;
         }
+        let explicit = explicit_probes
+            .iter()
+            .any(|probe| probe.eq_ignore_ascii_case(&query));
         answer.citations.push(AgentCitationDto {
             node_id: NodeId(format!(
                 "packet::required_source_probe::{}::{}::{}",
@@ -2988,8 +3011,12 @@ fn maybe_append_required_file_scoped_source_citations(
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
             ),
             loss_reason: None,
-            coverage_role: Some("required source probe".to_string()),
-            eligible_for_sufficiency: Some(true),
+            coverage_role: Some(if explicit {
+                "explicit source probe".to_string()
+            } else {
+                "required source probe".to_string()
+            }),
+            eligible_for_sufficiency: Some(!explicit),
         });
         appended += 1;
     }
@@ -3506,100 +3533,96 @@ fn execute_retrieval(
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, resolved_profile.max_search_results) as usize;
 
-    let (mut scored_hits, hits) = match try_sidecar_primary_search(
-        controller,
-        prompt,
-        max_results,
-        req.latency_budget_ms,
-    ) {
-        Some(SidecarPrimarySearchOutcome::Served {
-            hits,
-            scored_hits,
-            shadow,
-        }) => {
-            trace.set_retrieval_shadow(shadow.clone());
-            trace.annotate(format!(
-                "retrieval_sidecar_primary mode={} candidates={} resolved_hits={}",
-                shadow.retrieval_mode,
-                shadow.candidate_count,
-                hits.len()
-            ));
-            let search_step = trace.start_step(
-                AgentRetrievalStepKindDto::Search,
-                vec![
-                    field("query_chars", prompt.len().to_string()),
-                    field("retrieval_path", "sidecar"),
-                ],
-            );
-            trace.finish_ok_with_duration_ms(
-                search_step,
-                vec![
-                    field("hits", hits.len().to_string()),
-                    field("sidecar_candidates", shadow.candidate_count.to_string()),
-                    field(
-                        "sidecar_resolved_hits",
-                        shadow.resolved_hit_count.to_string(),
-                    ),
-                    field("accepted_hits", hits.len().to_string()),
-                    field("max_results", max_results.to_string()),
-                    field("repo_text", "off_initial"),
-                    field("mode", "packet_initial_sidecar_query"),
-                    field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
-                ],
-                shadow.retrieval_total_ms,
-            );
-            let semantic_query_step = trace.start_step(
-                AgentRetrievalStepKindDto::SemanticQueryEmbedding,
-                vec![field("required", semantic_required.to_string())],
-            );
-            let semantic_candidates_step = trace.start_step(
-                AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
-                vec![field("required", semantic_required.to_string())],
-            );
-            let hybrid_rerank_step = trace.start_step(
-                AgentRetrievalStepKindDto::HybridRerank,
-                vec![field("required", semantic_required.to_string())],
-            );
-            trace.finish_skipped(
-                semantic_query_step,
-                "Semantic embedding skipped on sidecar retrieval path.",
-                Vec::new(),
-            );
-            trace.finish_skipped(
-                semantic_candidates_step,
-                "Semantic candidate scan skipped on sidecar retrieval path.",
-                Vec::new(),
-            );
-            trace.finish_ok(
-                hybrid_rerank_step,
-                vec![field("ranked", hits.len().to_string())],
-            );
-            (scored_hits, hits)
-        }
-        Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
-            trace.set_retrieval_shadow(shadow);
-            trace.annotate(format!(
-                "retrieval_sidecar_primary rejected=true fail_closed=true reason={reason}"
-            ));
-            return Err(sidecar_retrieval_unavailable_error(
-                controller,
-                format!("sidecar retrieval primary rejected query: {reason}"),
-            ));
-        }
-        Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
-            trace.annotate(format!(
-                "retrieval_sidecar_primary unavailable=true fail_closed=true reason={reason}"
-            ));
-            return Err(sidecar_retrieval_unavailable_error(controller, reason));
-        }
-        Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
-        None => {
-            return Err(sidecar_retrieval_unavailable_error(
-                controller,
-                "sidecar retrieval primary is mandatory; non-sidecar initial search is disabled",
-            ));
-        }
-    };
+    let (mut scored_hits, hits) =
+        match try_sidecar_primary_search(controller, prompt, max_results, req.latency_budget_ms) {
+            Some(SidecarPrimarySearchOutcome::Served {
+                hits,
+                scored_hits,
+                shadow,
+            }) => {
+                trace.set_retrieval_shadow(shadow.clone());
+                trace.annotate(format!(
+                    "retrieval_primary mode={} candidates={} resolved_hits={}",
+                    shadow.retrieval_mode,
+                    shadow.candidate_count,
+                    hits.len()
+                ));
+                let search_step = trace.start_step(
+                    AgentRetrievalStepKindDto::Search,
+                    vec![
+                        field("query_chars", prompt.len().to_string()),
+                        field("retrieval_path", "sidecar"),
+                    ],
+                );
+                trace.finish_ok_with_duration_ms(
+                    search_step,
+                    vec![
+                        field("hits", hits.len().to_string()),
+                        field("sidecar_candidates", shadow.candidate_count.to_string()),
+                        field(
+                            "sidecar_resolved_hits",
+                            shadow.resolved_hit_count.to_string(),
+                        ),
+                        field("accepted_hits", hits.len().to_string()),
+                        field("max_results", max_results.to_string()),
+                        field("repo_text", "off_initial"),
+                        field("mode", "packet_initial_sidecar_query"),
+                        field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
+                    ],
+                    shadow.retrieval_total_ms,
+                );
+                let semantic_query_step = trace.start_step(
+                    AgentRetrievalStepKindDto::SemanticQueryEmbedding,
+                    vec![field("required", semantic_required.to_string())],
+                );
+                let semantic_candidates_step = trace.start_step(
+                    AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
+                    vec![field("required", semantic_required.to_string())],
+                );
+                let hybrid_rerank_step = trace.start_step(
+                    AgentRetrievalStepKindDto::HybridRerank,
+                    vec![field("required", semantic_required.to_string())],
+                );
+                trace.finish_skipped(
+                    semantic_query_step,
+                    "Semantic embedding skipped on sidecar retrieval path.",
+                    Vec::new(),
+                );
+                trace.finish_skipped(
+                    semantic_candidates_step,
+                    "Semantic candidate scan skipped on sidecar retrieval path.",
+                    Vec::new(),
+                );
+                trace.finish_ok(
+                    hybrid_rerank_step,
+                    vec![field("ranked", hits.len().to_string())],
+                );
+                (scored_hits, hits)
+            }
+            Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
+                trace.set_retrieval_shadow(shadow);
+                trace.annotate(format!(
+                    "retrieval_primary rejected=true fail_closed=true reason={reason}"
+                ));
+                return Err(sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("retrieval rejected query: {reason}"),
+                ));
+            }
+            Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
+                trace.annotate(format!(
+                    "retrieval_primary unavailable=true fail_closed=true reason={reason}"
+                ));
+                return Err(sidecar_retrieval_unavailable_error(controller, reason));
+            }
+            Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
+            None => {
+                return Err(sidecar_retrieval_unavailable_error(
+                    controller,
+                    "full retrieval is mandatory; legacy initial search is disabled",
+                ));
+            }
+        };
 
     let initial_hit_count = hits.len();
     let mut hits = hits;
@@ -3611,7 +3634,7 @@ fn execute_retrieval(
         sidecar_retrieval_blocks_nucleo_supplement(controller, hits.len());
     if block_nucleo_supplement && weak_initial_hits(prompt, &hits) {
         trace.annotate(
-            "retrieval_sidecar_primary skipped local nucleo investigation supplement on weak hits",
+            "retrieval_primary skipped local nucleo investigation supplement on weak hits",
         );
     }
     if should_investigate(resolved_profile)
@@ -5084,6 +5107,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "packet-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -7514,7 +7538,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_plan_uses_explicit_request_probes_with_required_sufficiency() {
+    fn packet_plan_uses_explicit_request_probes_without_promoting_sufficiency() {
         let question = "Explain how request dispatch reaches validation and callbacks.";
         let extra_probes = vec![
             "Source/Core/RequestSession.swift Session.request".to_string(),
@@ -7549,17 +7573,13 @@ mod tests {
             plan.trace
         );
 
-        let required = packet_sufficiency_required_probe_queries_with_extra(
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &extra_probes,
-        );
+        let required = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
         for expected in &extra_probes {
             assert!(
-                required
+                !required
                     .iter()
                     .any(|query| query.eq_ignore_ascii_case(expected)),
-                "expected explicit probe {expected} in sufficiency requirements: {required:?}"
+                "explicit probe {expected} must not become a sufficiency requirement: {required:?}"
             );
         }
     }
@@ -8071,6 +8091,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "generic-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8280,6 +8301,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "exec-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8363,6 +8385,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "source-definition-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8437,6 +8460,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "indexing-storage-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8640,6 +8664,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "indexing-storage-production-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8713,6 +8738,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "vscode-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8780,6 +8806,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "payload-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8830,6 +8857,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "payload-rank-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8877,6 +8905,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8926,6 +8955,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-test-symbols".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8977,6 +9007,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-roles".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -9013,6 +9044,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-docs".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -9078,17 +9110,6 @@ mod tests {
                 ],
                 "`AffectedReferenceIndex` extracts nodes, edges, occurrences",
                 "crates/indexer/src/references.rs",
-            ),
-            (
-                PacketTaskClassDto::RouteTracing,
-                "Trace how a request reaches the selected handler.",
-                vec![
-                    test_packet_citation("RouteDispatcher", "src/router/dispatch.rs", 0.9),
-                    test_packet_citation("RouteHandler", "src/router/handler.rs", 0.8),
-                    test_packet_citation("RouteRegression", "tests/route_regression.rs", 0.7),
-                ],
-                "`RouteHandler` handles route dispatch or handler ownership",
-                "src/router/handler.rs",
             ),
             (
                 PacketTaskClassDto::SymbolOwnership,
@@ -10176,6 +10197,7 @@ mod tests {
                     query: question.to_string(),
                     purpose: "fixture".to_string(),
                 }],
+                probe_resolutions: Vec::new(),
                 trace: Vec::new(),
             },
             answer,
@@ -10399,6 +10421,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "packet-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -12397,6 +12420,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::DataFlow,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -12533,6 +12557,37 @@ mod tests {
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
             annotation.starts_with("packet_generic_source_shape_citations appended=")
         }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_file_scoped_probe_citation_cannot_promote_sufficiency() {
+        let root = packet_temp_root("explicit-source-probe-sufficiency");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/session.rs",
+            "impl Session {\n    fn request(&self) {}\n}\n",
+        );
+
+        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let probes = ["src/session.rs Session::request".to_string()];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::RouteTracing,
+            &probes,
+            &probes,
+            &mut answer,
+        );
+
+        let explicit = answer
+            .citations
+            .iter()
+            .find(|citation| citation.coverage_role.as_deref() == Some("explicit source probe"))
+            .expect("explicit source probe citation");
+        assert_eq!(explicit.eligible_for_sufficiency, Some(false));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -13419,6 +13474,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::ArchitectureExplanation,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -13479,6 +13535,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::ArchitectureExplanation,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -13556,6 +13613,7 @@ mod tests {
             "fixture packet",
             PacketTaskClassDto::RouteTracing,
             &probes,
+            &[],
             &mut answer,
         );
 
@@ -14109,6 +14167,9 @@ mod tests {
                 member_count: None,
                 summary: None,
                 edge_digest: Vec::new(),
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
             });
 
         assert_eq!(hit.display_name, "AppController");
@@ -14253,6 +14314,140 @@ mod tests {
         assert_eq!(into.len(), 2);
         assert_eq!(into[0].node_id.0, "1");
         assert_eq!(into[0].score, 42.0);
+    }
+
+    #[test]
+    fn indexed_primary_file_survives_lexical_batch_and_compact_packet_capping() {
+        let root = packet_temp_root("indexed-primary-file-capping");
+        let _ = std::fs::remove_dir_all(&root);
+        let adapter_path = write_packet_fixture_file(
+            &root,
+            "src/runtime/adapters.js",
+            r#"
+            const transportDrivers = { native: nativeDriver, socket: socketDriver };
+            export function chooseTransport(name) {
+              const transport = transportDrivers[name];
+              return typeof transport === 'function' ? transport : null;
+            }
+            "#,
+        );
+        let path = adapter_path.to_string_lossy().to_string();
+
+        let mut helper = test_search_hit("helper", 100.0);
+        helper.display_name = "resolveHandle".to_string();
+        helper.kind = NodeKind::FUNCTION;
+        helper.file_path = Some(path.clone());
+        helper.line = Some(3);
+        helper.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.9,
+            semantic: 0.0,
+            graph: 0.0,
+            total: 0.9,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: Vec::new(),
+        });
+
+        let mut indexed_file = test_search_hit("file", 1.0);
+        indexed_file.display_name = "adapters.js".to_string();
+        indexed_file.kind = NodeKind::FILE;
+        indexed_file.file_path = Some(path.clone());
+        indexed_file.line = Some(1);
+        indexed_file.match_quality = Some(SearchMatchQualityDto::Exact);
+        indexed_file.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.8,
+            semantic: 0.0,
+            graph: 0.0,
+            total: 0.8,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: Vec::new(),
+        });
+
+        let mut lower_ranked = test_search_hit("fallback", 0.1);
+        lower_ranked.display_name = "adaptersFallback".to_string();
+        lower_ranked.file_path = Some(path.clone());
+        lower_ranked.line = Some(4);
+        lower_ranked.match_quality = Some(SearchMatchQualityDto::Prefix);
+        lower_ranked.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.25,
+            semantic: 0.0,
+            graph: 0.0,
+            total: 0.25,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: Vec::new(),
+        });
+
+        assert!(packet_anchor_hit_is_relevant("adapters", &helper));
+        assert!(packet_anchor_hit_is_relevant("adapters", &indexed_file));
+        assert!(packet_anchor_hit_is_relevant("adapters", &lower_ranked));
+
+        let query = PacketPlanQueryDto {
+            query: "adapters".to_string(),
+            purpose: "transport adapter ownership".to_string(),
+        };
+        let pending = vec![(0usize, &query)];
+        let results = vec![(
+            query.query.clone(),
+            vec![lower_ranked, indexed_file, helper],
+        )];
+        let prompt = "Explain how the client chooses adapters for request transport.";
+        let mut answer = packet_answer_fixture(prompt, Vec::new());
+        crate::agent::packet_trace::merge_packet_lexical_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            1,
+            &[],
+            true,
+            &packet_rank_terms(prompt),
+            2,
+        );
+        assert_eq!(answer.citations.len(), 2);
+        assert_eq!(answer.citations[0].display_name, "resolveHandle");
+        assert_eq!(answer.citations[1].display_name, "adapters.js");
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.contains("packet_lexical_subquery")
+                && annotation.contains("hits=3")
+                && annotation.contains("citations_added=2")
+        }));
+
+        rank_packet_evidence(prompt, &mut answer);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 8 * 1024,
+        };
+        let _budget = apply_packet_budget_with_extra(
+            &root,
+            prompt,
+            PacketTaskClassDto::ArchitectureExplanation,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+            &["adapters".to_string()],
+        );
+
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].kind, NodeKind::FILE);
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some(path.as_str())
+        );
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_probe_citations promoted=1")
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

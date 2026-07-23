@@ -1,87 +1,57 @@
 # Trust and readiness
 
-CodeStory gives your agent a repo map and, when sidecars are healthy, broad
-search. Two readiness lanes decide what you can treat as proof and what is only
-a hint to inspect further.
+CodeStory has two evidence lanes. They can be ready at different times, so a
+useful local answer does not automatically prove that broad repository search
+is current.
 
-Terms used below: [Glossary](../glossary.md).
+## Evidence lanes
 
-## Two lanes
-
-| Lane | Plain name | What it covers | When you can trust it |
-| --- | --- | --- | --- |
-| Local navigation | **Repo map ready** | Graph browse, symbols, trails, snippets, impact hints from the SQLite index | The agent finds symbols, cites files, and traces callers without guessing paths |
-| Agent packet/search | **Broad search ready** | Task-sized packets and semantic search over dense anchors | Sidecars are healthy and retrieval mode is `full`; output ties back to concrete files |
-
-Local map ready does **not** mean broad search ready. You can navigate the
-checkout confidently while packet and search are still blocked or degraded.
-
-## Proof vs hint
-
-| Output type | Treat as proof when | Treat as hint only when |
+| Lane | Covers | Trust it when |
 | --- | --- | --- |
-| Symbol lookup, trail, snippet, callers/callees | Local navigation lane is good | Lane is degraded or the agent skipped CodeStory and guessed |
-| Impact hints from `affected` | Local navigation lane is good | Always a planning aid, not a test run |
-| Packet, search, broad context | Broad search lane is good (`full` retrieval) | Retrieval is degraded, blocked, or the agent did not check readiness first |
+| **Repository map** | Files, symbols, definitions, callers, trails, snippets, and changed-file impact hints | Returned paths exist, symbols resolve, and the tool served a complete local publication |
+| **Broad search** | Packet, semantic search, and broad context across lexical, vector, and graph artifacts | The requested tool succeeds against `retrieval_mode=full` and its citations resolve |
 
-**Degraded packet output is not proof.** If broad search is not fully ready, a
-packet may still return text. Use it to decide where to look next, not as cited
-evidence for a design or review answer.
+The repository map remains useful while broad search initializes. CodeStory
+never treats a half-published generation as current: readers see one complete
+old or new publication.
 
-## When to stop trusting output
+## Proof, planning evidence, and hints
 
-Stop treating CodeStory-backed answers as proof when any of these apply:
-
-1. **Wrong lane.** You asked a broad "how does X work across the repo?" question
-   but only local navigation is ready. Expect navigation-quality answers, not
-   full task packets.
-2. **Stale map.** Symbols, file lists, or trails do not match what you see on
-   disk. The index may need refresh or repair.
-3. **No CodeStory at all.** MCP is missing, the session predates install, or
-   the agent never grounded the checkout. Answers may be generic exploration.
-4. **Degraded broad search.** Packet or search ran while retrieval was not
-   `full`. Treat output as a lead, verify in source.
-5. **Proven runtime incompatibility.** Status reports an actual runtime,
-   protocol, or schema failure for the surface. A newer release being available
-   under `runtime_update` is advice only and does not invalidate otherwise-ready
-   surfaces.
-
-When in doubt, ask a narrow local question first ("Where is `Foo` defined?") and
-confirm the answer cites real paths before trusting broader claims.
-
-## Good session vs blocked session
-
-**Good local session.** You ask where a feature lives. The agent returns a
-symbol, file path, and a short trail of callers -- all matching files you can
-open in the editor.
-
-**Blocked local session.** The agent says symbols are missing, lists files that
-no longer exist, or falls back to searching the tree with generic tools. Repair
-the local lane before trusting navigation.
-
-**Good broad-search session.** You ask how a subsystem fits together. The agent
-reports broad search is ready, returns a compact packet with cited files, and
-those files exist at the paths given.
-
-**Degraded broad-search session.** The agent returns a long narrative without
-clear citations, or mentions that packet/search is blocked or degraded. Treat
-the answer as orientation only; open cited files yourself or repair sidecars.
-
-## What you do vs what the agent checks
-
-| You | Agent |
+| Result | How to use it |
 | --- | --- |
-| Install once and open a fresh session in the repo | Reads runtime status and obeys allowed surfaces |
-| Ask concrete questions with symbol and path names | Uses local graph tools when the map is ready |
-| Ask broad questions only when you need task-scale context | Uses packet/search only when broad search is ready |
-| Repair or start a new session when output looks stale | Reports blocked surfaces and suggested repair steps |
+| Resolved symbol, caller, trail, or snippet from a ready map | Source-navigation evidence |
+| `affected` output | A bounded change-planning aid, never proof that a test ran or that every impact was found |
+| Packet with `sufficient` status and resolvable citations | Evidence for the covered claims |
+| Packet with `partial` status | A useful lead; run its requested follow-up before claiming completeness |
+| Repo-text or semantic suggestion without a resolved symbol | Navigation hint to verify in source |
+| `working_locally` | Use local graph tools; broad search is still preparing |
+| `unavailable` | Fall back to focused source inspection and state the gap |
 
-You do not need to memorize status field names. Ask whether the **repo map** and
-**broad search** are ready; the agent translates that into runtime checks.
+`retrieval_mode=full` proves that the retrieval infrastructure is coherent. It
+does not guarantee that a particular answer found enough evidence. The result's
+sufficiency and citations still matter.
 
-## Repair and deeper reading
+## When to stop trusting a CodeStory claim
 
-- [Troubleshooting](troubleshooting.md) -- decision tree and host-specific fixes
-- [CLI reference](cli-reference.md) -- power-user repair commands
-- [Glossary](../glossary.md) -- canonical definitions for readiness lanes
-- [Status contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md) -- runtime JSON fields for agents
+- Paths or symbols do not match the checkout.
+- The answer came from an old host session that does not expose CodeStory MCP.
+- A broad tool is still preparing, unavailable, or returned partial evidence.
+- Citations cannot be resolved to the files they name.
+- The agent substituted a generic tree search without reporting the CodeStory
+  gap.
+- Status reports an actual runtime, protocol, publication, or schema failure for
+  that surface.
+
+A compatible update being available is advisory. It does not invalidate an
+otherwise ready installed runtime.
+
+## Normal retry behavior
+
+Do not ask for status before every question. Call the tool that matches the task.
+If it returns `preparing` or `updating`, wait for `retry_after_ms` and retry that
+same tool with the same repository and arguments. Read status only when that
+loop does not converge or the task is explicitly diagnostic.
+
+See [Troubleshooting](troubleshooting.md) for recovery and the
+[agent status contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md)
+for wire fields.
