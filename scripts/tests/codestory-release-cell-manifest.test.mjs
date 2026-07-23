@@ -81,9 +81,9 @@ function actionsMetadata(phase, overrides = []) {
 
 test("package manifest binds workflow artifact identity separately from archive bytes", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-release-cell-"));
-  const archive = path.join(directory, "codestory-cli-v0.16.0-linux-x64.tar.gz");
+  const archive = path.join(directory, "codestory-cli-v0.16.0-windows-x64.zip");
   writeFileSync(archive, "release archive bytes");
-  const selected = cell("package_identity:linux-x64");
+  const selected = cell("package_identity:windows-x64");
   const manifest = produceReleaseCellManifest({
     graph,
     gitIdentity,
@@ -96,22 +96,22 @@ test("package manifest binds workflow artifact identity separately from archive 
   });
   assert.equal(
     manifest.evidence.identity.producer_artifact,
-    "release-cell-prepublish-package-linux-x64-attempt-2",
+    "release-cell-prepublish-package-windows-x64-attempt-2",
   );
-  assert.equal(manifest.archive.name, "codestory-cli-v0.16.0-linux-x64.tar.gz");
+  assert.equal(manifest.archive.name, "codestory-cli-v0.16.0-windows-x64.zip");
   assert.equal(manifest.archive.sha256, manifest.evidence.identity.artifact_sha256);
 });
 
 test("post-publish byte producer refuses an archive that differs from the accepted ledger", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-release-cell-"));
-  const archive = path.join(directory, "codestory-cli-v0.16.0-linux-x64.tar.gz");
+  const archive = path.join(directory, "codestory-cli-v0.16.0-windows-x64.zip");
   writeFileSync(archive, "published replacement bytes");
-  const selected = cell("post_publish_bytes:linux-x64");
+  const selected = cell("post_publish_bytes:windows-x64");
   const prePublishLedger = {
     phase: "pre_publish",
     decision: "accept",
     cells: [{
-      id: "package_identity:linux-x64",
+      id: "package_identity:windows-x64",
       manifest: { sha256: "b".repeat(64) },
       archive: {
         name: path.basename(archive),
@@ -136,40 +136,6 @@ test("post-publish byte producer refuses an archive that differs from the accept
   );
 });
 
-test("release-evidence wrappers retain upstream evidence ids and statuses", () => {
-  const selected = cell("performance");
-  const upstream = {
-    id: "performance-measurement-1",
-    type: "performance",
-    tier: "live_behavior",
-    status: "pass_with_exception",
-    graph_sha256: "0".repeat(64),
-    observed_at: observedAt,
-    expires_at: "2026-07-20T12:00:00.000Z",
-    identity: {
-      profile: "codestory-release-evidence-linux-arm64-v2",
-      corpus_id: "v0.16-corpus",
-      cache_id: "cold-full-retrieval-v1",
-      machine_fingerprint: "fixture/linux-arm64",
-      baseline_id: "release-baseline@1111111",
-      baseline_sha256: "b".repeat(64),
-      release_key: "release-0.16.0",
-    },
-  };
-  const manifest = produceReleaseCellManifest({
-    graph,
-    gitIdentity,
-    version,
-    cell: selected,
-    identity: {},
-    producer: producer(selected),
-    evidence: upstream,
-  });
-  assert.equal(manifest.evidence.id, upstream.id);
-  assert.equal(manifest.evidence.status, upstream.status);
-  assert.equal(manifest.evidence.graph_sha256, manifest.graph_sha256);
-});
-
 test("all graph-derived cells fix workflow, job name, and attempt-qualified artifact identity", () => {
   for (const selected of deriveReleaseCells(graph, "post_publish")) {
     for (const key of ["producer_workflow", "producer_job", "producer_job_name", "producer_artifact"]) {
@@ -182,7 +148,7 @@ test("all graph-derived cells fix workflow, job name, and attempt-qualified arti
 
 test("Actions provenance recovers a split rerun by selecting each job's latest execution", () => {
   const metadata = actionsMetadata("post_publish", [{
-    cell_id: "platform_support:linux-x64",
+    cell_id: "platform_support:windows-x64",
     attempt: 2,
     conclusion: "success",
   }]);
@@ -194,12 +160,12 @@ test("Actions provenance recovers a split rerun by selecting each job's latest e
     currentRunAttempt: "2",
     ...metadata,
   });
-  assert.equal(map.producers.length, 30);
-  assert.equal(map.artifacts.length, 16);
+  assert.equal(map.producers.length, 11);
+  assert.equal(map.artifacts.length, 7);
   for (const id of [
-    "platform_support:linux-x64",
-    "installed_runtime_behavior:linux-x64",
-    "post_publish_bytes:linux-x64",
+    "platform_support:windows-x64",
+    "installed_runtime_behavior:windows-x64",
+    "post_publish_bytes:windows-x64",
   ]) {
     assert.equal(map.producers.find(({ cell_id: cellId }) => cellId === id).producer_run_attempt, "2");
   }
@@ -211,7 +177,7 @@ test("Actions provenance recovers a split rerun by selecting each job's latest e
 
 test("Actions provenance rejects a failed latest rerun instead of reusing older proof", () => {
   const metadata = actionsMetadata("post_publish", [{
-    cell_id: "platform_support:linux-x64",
+    cell_id: "platform_support:windows-x64",
     attempt: 2,
     conclusion: "failure",
   }]);
@@ -222,7 +188,7 @@ test("Actions provenance rejects a failed latest rerun instead of reusing older 
     runId: "12345",
     currentRunAttempt: "2",
     ...metadata,
-  }), /latest execution of Published linux-x64 smoke.*did not succeed/u);
+  }), /latest execution of Published windows-x64 smoke.*did not succeed/u);
 });
 
 test("Actions provenance rejects duplicate or out-of-window artifact containers", () => {

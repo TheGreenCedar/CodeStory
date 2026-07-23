@@ -15,7 +15,7 @@
       "id": "duplicate-cell",
       "operation": {
         "kind": "duplicate_cell",
-        "cell": "answer_quality"
+        "cell": "candidate_installed_behavior:macos-arm64"
       },
       "expected_input_error": "duplicate manifest"
     },
@@ -35,60 +35,60 @@
       "id": "cross-tree",
       "operation": {
         "kind": "set_identity",
-        "cell": "package_identity:linux-x64",
+        "cell": "package_identity:windows-x64",
         "key": "source_tree",
         "value": "4444444444444444444444444444444444444444"
       },
       "expected_failed_cells": [
-        "package_identity:linux-x64"
+        "package_identity:windows-x64"
       ]
     },
     {
       "id": "expired",
       "operation": {
         "kind": "set_evidence",
-        "cell": "retrieval_readiness",
+        "cell": "candidate_installed_behavior:windows-x64",
         "key": "expires_at",
         "value": "2026-07-18T12:00:00.000Z"
       },
       "expected_failed_cells": [
-        "retrieval_readiness"
+        "candidate_installed_behavior:windows-x64"
       ]
     },
     {
       "id": "failed-evidence",
       "operation": {
         "kind": "set_evidence",
-        "cell": "answer_quality",
+        "cell": "candidate_installed_behavior:macos-arm64",
         "key": "status",
         "value": "fail"
       },
       "expected_failed_cells": [
-        "answer_quality"
+        "candidate_installed_behavior:macos-arm64"
       ]
     },
     {
       "id": "aggregate-host",
       "operation": {
         "kind": "set_identity",
-        "cell": "accelerator_execution:macos-arm64-metal",
+        "cell": "candidate_installed_behavior:macos-arm64",
         "key": "host_os",
         "value": "matrix"
       },
       "expected_failed_cells": [
-        "accelerator_execution:macos-arm64-metal"
+        "candidate_installed_behavior:macos-arm64"
       ]
     },
     {
       "id": "reused-evidence",
       "operation": {
         "kind": "reuse_evidence",
-        "cell": "performance",
-        "source_cell": "retrieval_readiness"
+        "cell": "candidate_installed_behavior:windows-x64",
+        "source_cell": "candidate_installed_behavior:macos-arm64"
       },
       "expected_failed_cells": [
-        "performance",
-        "retrieval_readiness"
+        "candidate_installed_behavior:windows-x64",
+        "candidate_installed_behavior:macos-arm64"
       ]
     }
   ]

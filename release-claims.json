@@ -1,6 +1,6 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 3,
+  "graph_version": 4,
   "graph_id": "codestory-release-claims",
   "evidence_policy": {
     "selection": "all_matching_rows_must_pass",
@@ -166,6 +166,8 @@
       "id": "installed_runtime_behavior",
       "tier": "installed_runtime",
       "proof_lanes": [
+        ".github/workflows/macos-metal-proof.yml",
+        ".github/workflows/windows-vulkan-proof.yml",
         ".github/workflows/post-publish-release-smoke.yml"
       ],
       "required_identity": [
@@ -354,7 +356,7 @@
       "id": "installed_runtime_behavior",
       "minimum_tier": "installed_runtime",
       "depends_on_claims": [
-        "platform_support"
+        "package_identity"
       ],
       "required_evidence": [
         "installed_runtime_behavior"
@@ -554,10 +556,10 @@
         "archive_role": "pre_publish"
       },
       {
-        "id": "accelerator_execution",
+        "id": "candidate_installed_behavior",
         "phase": "pre_publish",
-        "claim": "accelerator_execution",
-        "evidence_type": "accelerator_execution",
+        "claim": "installed_runtime_behavior",
+        "evidence_type": "installed_runtime_behavior",
         "expansion": "instances",
         "required_identity": [
           "repository",
@@ -568,8 +570,8 @@
           "target",
           "host_os",
           "host_arch",
-          "runner",
-          "backend",
+          "installer",
+          "runtime_version",
           "native_engine",
           "calibration_sha256",
           "producer_workflow",
@@ -582,134 +584,37 @@
         "singleton_identity": [
           "host_os",
           "host_arch",
-          "runner",
-          "backend",
+          "installer",
           "native_engine"
         ],
         "instances": [
           {
-            "id": "macos-arm64-metal",
+            "id": "macos-arm64",
             "identity_constraints": {
               "target": "macos-arm64",
               "host_os": "macOS",
               "host_arch": "ARM64",
-              "runner": "codestory-metal",
-              "backend": "Metal",
+              "installer": "candidate_managed_plugin",
               "producer_workflow": ".github/workflows/macos-metal-proof.yml",
               "producer_job": "packaged-metal",
               "producer_job_name": "Packaged Apple Silicon Metal engine",
-              "producer_artifact": "release-cell-prepublish-macos-arm64-metal-attempt-{attempt}"
+              "producer_artifact": "release-cell-prepublish-candidate-installed-macos-arm64-attempt-{attempt}"
             }
           },
           {
-            "id": "windows-x64-vulkan",
+            "id": "windows-x64",
             "identity_constraints": {
               "target": "windows-x64",
               "host_os": "Windows",
               "host_arch": "X64",
-              "runner": "codestory-vulkan",
-              "backend": "Vulkan",
+              "installer": "candidate_managed_plugin",
               "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
               "producer_job": "packaged-vulkan",
               "producer_job_name": "Packaged Windows Vulkan engine",
-              "producer_artifact": "release-cell-prepublish-windows-x64-vulkan-attempt-{attempt}"
+              "producer_artifact": "release-cell-prepublish-candidate-installed-windows-x64-attempt-{attempt}"
             }
           }
         ],
-        "archive_role": "none"
-      },
-      {
-        "id": "retrieval_readiness",
-        "phase": "pre_publish",
-        "claim": "retrieval_readiness",
-        "evidence_type": "retrieval_readiness",
-        "expansion": "singleton",
-        "required_identity": [
-          "repository",
-          "commit",
-          "source_tree",
-          "profile",
-          "corpus_id",
-          "cache_id",
-          "machine_fingerprint",
-          "release_key",
-          "producer_workflow",
-          "producer_job",
-          "producer_job_name",
-          "producer_run_id",
-          "producer_run_attempt",
-          "producer_artifact"
-        ],
-        "identity_constraints": {
-          "producer_workflow": ".github/workflows/release-candidate-evidence.yml",
-          "producer_job": "measure",
-          "producer_job_name": "Measure release candidate",
-          "producer_artifact": "release-cell-prepublish-release-evidence-attempt-{attempt}"
-        },
-        "archive_role": "none"
-      },
-      {
-        "id": "performance",
-        "phase": "pre_publish",
-        "claim": "performance",
-        "evidence_type": "performance",
-        "expansion": "singleton",
-        "required_identity": [
-          "repository",
-          "commit",
-          "source_tree",
-          "profile",
-          "corpus_id",
-          "cache_id",
-          "machine_fingerprint",
-          "baseline_id",
-          "baseline_sha256",
-          "release_key",
-          "producer_workflow",
-          "producer_job",
-          "producer_job_name",
-          "producer_run_id",
-          "producer_run_attempt",
-          "producer_artifact"
-        ],
-        "identity_constraints": {
-          "producer_workflow": ".github/workflows/release-candidate-evidence.yml",
-          "producer_job": "measure",
-          "producer_job_name": "Measure release candidate",
-          "producer_artifact": "release-cell-prepublish-release-evidence-attempt-{attempt}"
-        },
-        "archive_role": "none"
-      },
-      {
-        "id": "answer_quality",
-        "phase": "pre_publish",
-        "claim": "answer_quality",
-        "evidence_type": "answer_quality",
-        "expansion": "singleton",
-        "required_identity": [
-          "repository",
-          "commit",
-          "source_tree",
-          "profile",
-          "corpus_id",
-          "cache_id",
-          "machine_fingerprint",
-          "release_key",
-          "artifact_sha256",
-          "evaluation_contract",
-          "producer_workflow",
-          "producer_job",
-          "producer_job_name",
-          "producer_run_id",
-          "producer_run_attempt",
-          "producer_artifact"
-        ],
-        "identity_constraints": {
-          "producer_workflow": ".github/workflows/release-candidate-evidence.yml",
-          "producer_job": "measure",
-          "producer_job_name": "Measure release candidate",
-          "producer_artifact": "release-cell-prepublish-release-evidence-attempt-{attempt}"
-        },
         "archive_role": "none"
       },
       {
@@ -821,39 +726,11 @@
     "artifact_retention_days": 30,
     "package_matrix": [
       {
-        "os": "ubuntu-latest",
-        "rust_target": "x86_64-unknown-linux-gnu",
-        "asset_target": "linux-x64",
-        "exe_suffix": "",
-        "extension": "tar.gz"
-      },
-      {
-        "os": "ubuntu-24.04-arm",
-        "rust_target": "aarch64-unknown-linux-gnu",
-        "asset_target": "linux-arm64",
-        "exe_suffix": "",
-        "extension": "tar.gz"
-      },
-      {
         "os": "windows-latest",
         "rust_target": "x86_64-pc-windows-msvc",
         "asset_target": "windows-x64",
         "exe_suffix": ".exe",
         "extension": "zip"
-      },
-      {
-        "os": "windows-11-arm",
-        "rust_target": "aarch64-pc-windows-msvc",
-        "asset_target": "windows-arm64",
-        "exe_suffix": ".exe",
-        "extension": "zip"
-      },
-      {
-        "os": "macos-15-intel",
-        "rust_target": "x86_64-apple-darwin",
-        "asset_target": "macos-x64",
-        "exe_suffix": "",
-        "extension": "tar.gz"
       },
       {
         "os": "macos-15",
@@ -864,24 +741,6 @@
       }
     ],
     "protected_jobs": [
-      {
-        "workflow": "release-candidate-evidence.yml",
-        "job": "measure",
-        "runner": [
-          "self-hosted",
-          "Linux",
-          "ARM64",
-          "codestory-release-evidence"
-        ],
-        "environment": "release-evidence",
-        "permissions": {
-          "actions": "read",
-          "contents": "read"
-        },
-        "secrets": [
-          "CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON"
-        ]
-      },
       {
         "workflow": "macos-metal-proof.yml",
         "job": "packaged-metal",
@@ -916,12 +775,8 @@
       }
     ],
     "release_chain": {
-      "evidence_workflow": "./.github/workflows/release-candidate-evidence.yml",
-      "evidence_profile": "codestory-release-evidence-linux-arm64-v2",
-      "drill_manifest": "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
       "exact_sha_jobs": [
         "source-proof",
-        "release-evidence",
         "packaged-proof",
         "macos-metal-proof",
         "windows-vulkan-proof"
@@ -930,15 +785,11 @@
         "preflight": [
           "workflow-policy"
         ],
-        "release-evidence": [
-          "preflight"
-        ],
         "source-proof": [
           "preflight"
         ],
         "packaged-proof": [
-          "preflight",
-          "release-evidence"
+          "preflight"
         ],
         "macos-metal-proof": [
           "preflight",
@@ -951,7 +802,6 @@
         "pre-publish-closeout": [
           "preflight",
           "source-proof",
-          "release-evidence",
           "packaged-proof",
           "macos-metal-proof",
           "windows-vulkan-proof"

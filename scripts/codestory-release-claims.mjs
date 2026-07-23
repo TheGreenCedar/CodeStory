@@ -164,8 +164,8 @@ export function releaseClaimGraphDigest(graph) {
 
 export function validateReleaseClaimGraph(graph) {
   object(graph, "release claim graph");
-  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 3) {
-    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 3`);
+  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 4) {
+    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 4`);
   }
   nonEmptyText(graph.graph_id, "release claim graph.graph_id");
   const evidencePolicy = object(graph.evidence_policy, "release claim graph.evidence_policy");
@@ -334,14 +334,11 @@ export function validateReleaseClaimGraph(graph) {
   }
   const cellGroups = uniqueById(closeout.cell_groups, "release claim graph.closeout.cell_groups");
   const requiredCellGroups = [
-    "accelerator_execution",
-    "answer_quality",
+    "candidate_installed_behavior",
     "installed_runtime_behavior",
     "package_identity",
-    "performance",
     "platform_support",
     "post_publish_bytes",
-    "retrieval_readiness",
     "source_behavior",
   ];
   if (JSON.stringify([...cellGroups.keys()].sort()) !== JSON.stringify(requiredCellGroups)) {
@@ -414,8 +411,8 @@ export function validateReleaseClaimGraph(graph) {
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
   }
-  if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 6) {
-    fail("workflow_policy.package_matrix must define six native package rows");
+  if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 2) {
+    fail("workflow_policy.package_matrix must define two desktop package rows");
   }
   const targets = new Set();
   for (const [index, rowValue] of policy.package_matrix.entries()) {
@@ -426,6 +423,9 @@ export function validateReleaseClaimGraph(graph) {
     if (typeof row.exe_suffix !== "string") fail(`workflow_policy.package_matrix[${index}].exe_suffix must be a string`);
     if (targets.has(row.asset_target)) fail(`workflow_policy.package_matrix duplicates ${row.asset_target}`);
     targets.add(row.asset_target);
+  }
+  if (JSON.stringify([...targets].sort()) !== JSON.stringify(["macos-arm64", "windows-x64"])) {
+    fail("workflow_policy.package_matrix must define exactly macos-arm64 and windows-x64");
   }
   if (!Array.isArray(policy.protected_jobs) || policy.protected_jobs.length === 0) {
     fail("workflow_policy.protected_jobs must be a non-empty array");
@@ -442,9 +442,6 @@ export function validateReleaseClaimGraph(graph) {
     stringArray(row.secrets, `workflow_policy.protected_jobs[${index}].secrets`);
   }
   const releaseChain = object(policy.release_chain, "workflow_policy.release_chain");
-  nonEmptyText(releaseChain.evidence_workflow, "workflow_policy.release_chain.evidence_workflow");
-  nonEmptyText(releaseChain.evidence_profile, "workflow_policy.release_chain.evidence_profile");
-  nonEmptyText(releaseChain.drill_manifest, "workflow_policy.release_chain.drill_manifest");
   stringArray(releaseChain.exact_sha_jobs, "workflow_policy.release_chain.exact_sha_jobs", { nonEmpty: true });
   const dependencies = object(releaseChain.dependencies, "workflow_policy.release_chain.dependencies");
   for (const [job, needsValue] of Object.entries(dependencies)) {

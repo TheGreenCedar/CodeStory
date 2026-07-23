@@ -7,11 +7,6 @@ on:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true
         type: string
-      source_run_id:
-        description: "Optional rejected release-evidence run to re-evaluate without measuring again"
-        required: false
-        type: string
-        default: ""
       calibration_bundle_artifact:
         description: "Frozen calibration bundle artifact name"
         required: true
@@ -40,11 +35,6 @@ on:
         description: "Exact dev/codestory-next head to authenticate without publishing"
         required: true
         type: string
-      source_run_id:
-        description: "Optional rejected release-evidence run to re-evaluate without measuring again"
-        required: false
-        type: string
-        default: ""
       calibration_bundle_artifact:
         description: "Frozen calibration bundle artifact name"
         required: true
@@ -176,20 +166,6 @@ jobs:
             exit 1
           fi
 
-  release-evidence:
-    needs: preflight
-    uses: ./.github/workflows/release-candidate-evidence.yml
-    with:
-      ref: ${{ github.sha }}
-      proof_key: release-${{ needs.preflight.outputs.version }}
-      profile: codestory-release-evidence-linux-arm64-v2
-      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-      source_run_id: ${{ inputs.source_run_id }}
-      version: ${{ needs.preflight.outputs.version }}
-      emit_release_cells: true
-    secrets:
-      CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: ${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}
-
   source-proof:
     needs: preflight
     uses: ./.github/workflows/source-proof.yml
@@ -200,18 +176,15 @@ jobs:
       emit_release_cells: true
 
   packaged-proof:
-    needs:
-      - preflight
-      - release-evidence
+    needs: preflight
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ github.sha }}
-      scope: full
+      scope: desktop
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
       emit_release_cells: true
-      quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
     # Provision these names as environment secrets on macos-release-signing.
@@ -235,9 +208,12 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
-      quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      candidate_installed_proof: true
+      candidate_installed_only: true
+      candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
+      server_behavior_only: true
       emit_release_cells: true
 
   windows-vulkan-proof:
@@ -250,9 +226,12 @@ jobs:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
-      quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      candidate_installed_proof: true
+      candidate_installed_only: true
+      candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
+      server_behavior_only: true
       emit_release_cells: true
 
   pre-publish-closeout:
@@ -260,7 +239,6 @@ jobs:
     needs:
       - preflight
       - source-proof
-      - release-evidence
       - packaged-proof
       - macos-metal-proof
       - windows-vulkan-proof
@@ -322,8 +300,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          trusted_exceptions="$(find target/release-cell-manifests -type f -name trusted-exceptions.json -print)"
-          test "$(printf '%s\n' "$trusted_exceptions" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           evaluated_at="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
           node scripts/codestory-release-closeout.mjs evaluate \
             --repo "$GITHUB_WORKSPACE" \
@@ -332,7 +308,6 @@ jobs:
             --phase pre_publish \
             --evaluated-at "$evaluated_at" \
             --trusted-producers target/release-closeout/trusted-pre-publish-producers.json \
-            --trusted-exceptions "$trusted_exceptions" \
             --manifest-dir target/release-cell-manifests \
             --out-dir target/release-closeout/pre_publish
 
@@ -402,14 +377,15 @@ jobs:
 
           ## Platform proof boundaries
 
-          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
+          This release ships self-contained managed CLI assets for Windows x64
+          and Apple Silicon macOS.
 
-          - Windows x64 managed install and local ground are acceptance-smoked; accelerated retrieval requires the protected Vulkan hardware proof.
-          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged per-user-server Metal qualification with frozen evidence.
-          - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
-          - Windows arm64 ships a CLI asset but has no protected accelerated embedding cell.
-          - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
-          - Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.
+          Each archive is checksum-verified and gated on an isolated candidate
+          install that initializes MCP, starts the bundled local runtime, and
+          completes one real ground request without extra dependencies. CPU
+          execution is acceptable. This release does not claim Linux, Intel
+          macOS, Windows ARM, physical Metal/Vulkan execution, answer accuracy,
+          or performance thresholds.
           EOF
 
       - name: Refuse existing tag or release
@@ -442,8 +418,8 @@ jobs:
             target/release-assets/codestory-cli-v${VERSION}-*.zip
             target/release-assets/SHA256SUMS.txt
           )
-          if [ "${#assets[@]}" -ne 7 ]; then
-            echo "::error::Expected six binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
+          if [ "${#assets[@]}" -ne 3 ]; then
+            echo "::error::Expected two desktop archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
@@ -467,7 +443,6 @@ jobs:
     uses: ./.github/workflows/post-publish-release-smoke.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
-      quality_evidence_artifact: release-evidence-${{ github.sha }}
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
       pre_publish_closeout_artifact: release-closeout-pre-publish-${{ needs.preflight.outputs.version }}-${{ github.sha }}
@@ -549,8 +524,6 @@ jobs:
           set -euo pipefail
           ledger="$(find target/accepted-pre-publish-closeout -type f -name ledger.json -print)"
           test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
-          trusted_exceptions="$(find target/release-cell-manifests -type f -name trusted-exceptions.json -print)"
-          test "$(printf '%s\n' "$trusted_exceptions" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           evaluated_at="$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
           node scripts/codestory-release-closeout.mjs evaluate \
             --repo "$GITHUB_WORKSPACE" \
@@ -559,7 +532,6 @@ jobs:
             --phase post_publish \
             --evaluated-at "$evaluated_at" \
             --trusted-producers target/release-closeout/trusted-post-publish-producers.json \
-            --trusted-exceptions "$trusted_exceptions" \
             --manifest-dir target/release-cell-manifests \
             --pre-publish-ledger "$ledger" \
             --out-dir target/release-closeout/post_publish

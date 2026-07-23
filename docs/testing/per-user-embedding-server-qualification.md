@@ -139,25 +139,22 @@ python .github/scripts/check-packaged-agent-proof.py \
   --qualification-evidence <calibration.json>
 ```
 
-After constants are frozen, replace `calibration` with the exact requested
-tier and pass `--retrieval-quality-evidence` the exact-head
-`packet-runtime-summary.json` emitted by the release-evidence workflow. The
-release workflow downloads and supplies that artifact to package, protected
-hardware, and post-publish installed-runtime proof automatically. A calibration
-run may omit it and remains an answer-quality nonclaim. Hosted and protected
-package tiers may bind the unpacked archive through the source plugin launcher.
+Accuracy or performance qualification may replace `calibration` with its exact
+requested tier and pass `--retrieval-quality-evidence` the exact-head
+`packet-runtime-summary.json` emitted by the release-evidence workflow. v0.16
+release closeout does not consume that artifact. Hosted and protected package
+tiers may bind the unpacked archive through the source plugin launcher.
 `installed_runtime` instead requires the managed installed plugin and managed
 executable it claims; it rejects
 `CODESTORY_CLI`, a repository-source plugin root, and a direct unpacked binary
 override.
 
-Accepted-PR proof has a separate candidate-installed lane for Linux x64 and
-Apple Silicon. It copies the exact source plugin into an isolated private
+v0.16 release proof has candidate-installed lanes for Windows x64 and Apple
+Silicon. Each copies the exact source plugin into an isolated private
 installation root beneath the canonical runner temp directory and outside the
 source checkout, stages the exact packaged archive as the managed runtime, and
-binds both to the trusted coordinator run. That lane is opt-in and cannot stand
-in for the post-publish marketplace proof. Release closeout still runs all six
-published packages through the marketplace-managed installation path.
+binds both to the trusted coordinator run. These lanes cannot stand in for the
+two post-publish marketplace proofs.
 
 The coordinator's `server` scope is narrower than qualification. It runs the
 Linux package, protected Apple Silicon package, and both candidate-installed
@@ -166,9 +163,7 @@ consume retrieval-quality evidence. The verifier records
 `claim_scope=server_behavior_only` and rejects qualification inputs in that
 mode. It may support server lifecycle, package identity, accelerator execution,
 and candidate-managed runtime provenance claims; it cannot support retrieval
-quality, answer quality, release readiness, or any retained qualification-tier
-claim. Every other frozen package, hardware, installed-runtime, and release
-scope still requires authenticated exact-head packet-quality evidence.
+quality, answer quality, performance, or physical accelerator claims.
 
 The explicit `linux` coordinator scope runs the existing Linux x64 package and
 candidate-installed proof without scheduling Mac or Windows protected jobs. It

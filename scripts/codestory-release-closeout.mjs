@@ -467,6 +467,9 @@ function producerAuthenticationProblems(manifest, trustedProducer) {
 
 function trustedExceptionInput({ document, graph, graphSha256, gitIdentity, version, trustedProducer }) {
   const errors = [];
+  if (!trustedProducer && document === null) {
+    return { exceptions: {}, identity: {}, errors };
+  }
   if (document === null || typeof document !== "object" || Array.isArray(document)) {
     return {
       exceptions: {},
@@ -1111,8 +1114,12 @@ export function readReleaseCellArtifacts(directory, trustedProducers) {
       });
     }
   }
-  if (trustedExceptionCount !== 1) {
-    fail("selected release-cell containers must contain exactly one trusted-exceptions.json");
+  const expectsTrustedExceptions = producerRows.some(({ cell_id: cellId }) =>
+    cellId === "performance");
+  if (trustedExceptionCount !== (expectsTrustedExceptions ? 1 : 0)) {
+    fail(expectsTrustedExceptions
+      ? "selected release-cell containers must contain exactly one trusted-exceptions.json"
+      : "selected release-cell containers must not contain trusted-exceptions.json");
   }
   return { manifests, artifactBindings };
 }
@@ -1148,19 +1155,24 @@ function main() {
     text(values["trusted-producers"], "--trusted-producers"),
     "utf8",
   ));
-  const trustedExceptionPath = path.resolve(text(
-    values["trusted-exceptions"],
-    "--trusted-exceptions",
-  ));
-  const trustedExceptionDocument = JSON.parse(readFileSync(trustedExceptionPath, "utf8"));
   const performanceProducer = trustedProducers.producers?.find(({ cell_id: cellId }) =>
     cellId === graph.exception_policy.eligible_evidence_type);
-  const expectedExceptionParent = path.join(
-    path.resolve(text(values["manifest-dir"], "--manifest-dir")),
-    String(performanceProducer?.producer_artifact ?? ""),
-  );
-  if (path.dirname(trustedExceptionPath) !== expectedExceptionParent) {
-    fail("trusted exception input must come from the selected release-evidence artifact");
+  let trustedExceptionDocument = null;
+  if (performanceProducer) {
+    const trustedExceptionPath = path.resolve(text(
+      values["trusted-exceptions"],
+      "--trusted-exceptions",
+    ));
+    trustedExceptionDocument = JSON.parse(readFileSync(trustedExceptionPath, "utf8"));
+    const expectedExceptionParent = path.join(
+      path.resolve(text(values["manifest-dir"], "--manifest-dir")),
+      String(performanceProducer.producer_artifact),
+    );
+    if (path.dirname(trustedExceptionPath) !== expectedExceptionParent) {
+      fail("trusted exception input must come from the selected release-evidence artifact");
+    }
+  } else if (values["trusted-exceptions"] !== undefined) {
+    fail("--trusted-exceptions is not valid when the release closeout has no performance cell");
   }
   const downloaded = readReleaseCellArtifacts(
     text(values["manifest-dir"], "--manifest-dir"),

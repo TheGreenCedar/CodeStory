@@ -248,6 +248,6 @@ evaluator. Flattened or loose manifest JSON is never a closeout input.
 
 The production pre-publish inventory is 12 cells and intentionally excludes a
 candidate-installed runtime. Publication is the prerequisite for the
-marketplace-managed tier. The six installed-runtime cells appear only in the
+marketplace-catalog-resolved tier. The six installed-runtime cells appear only in the
 30-cell post-publish ledger, while #1221 continues to own the real
 two-session/one-server installed-runtime qualification.

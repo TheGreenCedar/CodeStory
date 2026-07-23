@@ -98,9 +98,13 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 3);
+  assert.equal(graph.graph_version, 4);
   assert.deepEqual(graph.closeout.phases, ["pre_publish", "post_publish"]);
-  assert.equal(graph.closeout.cell_groups.length, 9);
+  assert.equal(graph.closeout.cell_groups.length, 6);
+  assert.deepEqual(
+    graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
+    ["macos-arm64", "windows-x64"],
+  );
   assert.deepEqual(
     graph.failure_controls.map(({ id }) => id).sort(),
     [
