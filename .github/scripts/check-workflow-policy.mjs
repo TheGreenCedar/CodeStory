@@ -1354,6 +1354,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     `${releaseFile} publication authority must have only the trusted auto-release.yml caller`,
   );
   add(violations, object(release.permissions).actions === "read", `${releaseFile} must read prior-run evidence`);
+  add(
+    violations,
+    object(release.permissions)["pull-requests"] === "read",
+    `${releaseFile} must grant the exact source resolver pull-request metadata access`,
+  );
   const callExpectedHead = object(at(release, "on", "workflow_call", "inputs", "expected_head_sha"));
   add(
     violations,
@@ -2443,6 +2448,11 @@ function validateRemainingWorkflows(workflows, violations) {
     add(violations, sameMembers(needs(release), ["detect-version"]), `${autoFile} release must need version detection`);
     add(violations, object(release.permissions).contents === "write", `${autoFile} release caller must grant contents write`);
     add(violations, object(release.permissions).actions === "read", `${autoFile} release caller must grant actions read`);
+    add(
+      violations,
+      object(release.permissions)["pull-requests"] === "read",
+      `${autoFile} release caller must pass pull-request metadata access to exact source proof`,
+    );
     add(violations, object(release.with).publish_release === true, `${autoFile} trusted main caller must explicitly authorize publication`);
   }
 
