@@ -4,135 +4,73 @@
 
 ## 0.16.0
 
-CodeStory 0.16 is the release where setup disappears.
+CodeStory 0.16 is the release where the machinery disappears.
 
-Install it on an Apple Silicon Mac or Windows x64 machine, point Codex at a
-repository, and ask a question. CodeStory carries its own model and native
-search engine, prepares the repository automatically, and returns
-project-scoped grounding without Docker, Python, a separate service, or a model
-download.
+Install the plugin, open a project, and ask. CodeStory now brings everything it
+needs to understand a codebase, runs privately on your machine, and takes care
+of preparation in the background.
 
-### What you will notice
+No Docker. No Python setup. No model download. No separate service to babysit.
 
-#### A real install, not a science project
+### Install it and get to work
 
-The CodeStory plugin and CLI now arrive as one self-contained package. The
-model, tokenizer, CPU engine, and native Metal or Vulkan capability travel with
-the app. Checksums protect the download, and the managed plugin starts the
-matching runtime for you.
+CodeStory 0.16 launches on Apple Silicon Mac and Windows x64 as one
+self-contained download. The plugin starts CodeStory when you need it and gets
+out of the way when you do not.
 
-The v0.16 release bar is deliberately simple: install the archive on Apple
-Silicon macOS and Windows x64, start the bundled runtime, and complete one real
-`ground` request against a project. Both platforms passed.
+One private local model can stay warm across compatible CodeStory sessions,
+while every repository keeps its own index and state. Moving between projects
+does not mean loading another copy of the model or letting context bleed from
+one codebase into another.
 
-#### Ask first. Let CodeStory prepare the rest.
+### Better context, fewer detours
 
-You no longer need to run a setup ritual before asking about a repository.
-`ground`, `packet`, and search bring the local index current as needed. While
-deeper search is preparing, CodeStory can still return the last complete local
-map instead of leaving the agent empty-handed.
+CodeStory now gives more weight to the files that actually explain a system:
+application entry points, architecture boundaries, request paths, and the
+source files that own behavior.
 
-Every request names its project explicitly, so switching among repositories
-does not leak routing, cache, or readiness state from one project into another.
+More of the repository can take part in that story, too. Markdown, JSON, YAML,
+TOML, SQL, HTML, CSS, shell, PowerShell, Cargo manifests, GitHub Actions, and
+Compose files can all support an answer instead of disappearing from view.
 
-#### One model per user, not one model per agent
+When the evidence is incomplete, CodeStory says what is missing and points the
+agent toward the next useful source instead of pretending it knows.
 
-Compatible CodeStory processes share a private local embedding server while
-their repository indexes stay isolated. The server starts on demand, reuses the
-warm model across compatible work, exits after true idle, and comes back on the
-next request. There is no Docker daemon, TCP service, or runtime model download
-to manage.
+### Ask first. Preparation happens automatically.
 
-#### Better evidence from real-world repositories
+You no longer need to prepare a repository before asking about it. CodeStory
+builds or updates its local understanding as needed and keeps the last good
+index available while a replacement is being prepared.
 
-CodeStory now favors the source files and architecture entry points that
-actually own an answer, rather than letting helpers and repeated leaf names
-dominate the first screen. Exact paths, stable symbol IDs, file-scoped symbols,
-and follow-up probes resolve through one typed evidence path.
+If a refresh is interrupted, the working index stays intact. If a file cannot
+be understood safely, CodeStory identifies the gap without sacrificing the rest
+of the project.
 
-Repository understanding also reaches beyond parser-backed languages. Markdown,
-MDX, JSON, YAML, TOML, SQL, HTML, CSS, shell, PowerShell, Cargo manifests,
-workflows, and Compose files can contribute bounded, source-linked structural
-evidence without pretending to be full semantic graph coverage.
+Large repositories also require less duplicated work and memory to index, so
+CodeStory spends more time helping and less time rebuilding the same context.
 
-Route-tracing answers now need the requested endpoints in order and a matching
-directed call path before CodeStory calls them sufficient. When evidence is
-partial, the response says what is missing and offers a focused follow-up.
+### A calmer everyday experience
 
-#### Large repositories waste less work
+Switching projects is isolated and predictable. Windows paths and process
+handoffs are more reliable. Everyday messages tell the agent whether CodeStory
+is ready, preparing, or unavailable without flooding the conversation with
+backend diagnostics.
 
-The indexing pipeline now streams and batches more of its SQLite, semantic, and
-search work instead of materializing repository-wide intermediates or
-committing tiny fragments one at a time. Parsing and staged writes can overlap,
-search writers stay open across bounded batches, and expensive summary indexes
-are built at the useful point in publication.
+Rust 2024 and current Dart call extraction are supported. Change-impact
+analysis also handles moved files, copies, stale evidence, and platform-specific
+paths more accurately.
 
-The practical result is less duplicated work, lower peak memory pressure, and
-better progress visibility on large refreshes—without turning benchmark
-thresholds into a release promise.
+### Availability
 
-#### Safer refreshes and clearer failures
+CodeStory 0.16 is available for Apple Silicon macOS and Windows x64.
 
-A refresh is still all-or-nothing. CodeStory stages and validates a complete
-generation before publishing it; cancellation, unreadable files, concurrent
-source changes, or an incompatible index leave the last complete generation
-available.
-
-Oversized or structurally noisy files now become explicit, identity-bound
-coverage exclusions instead of poisoning the whole repository refresh.
-Diagnostics distinguish incomplete discovery, parser limits, source drift,
-collector failures, and missing broad-search readiness, so agents can make an
-honest claim or stop.
-
-Windows path aliases, named pipes, native teardown, and packaged runtime
-ownership received a substantial reliability pass. Unix path matching remains
-case-sensitive, while existing Windows paths are compared by native file
-identity.
-
-### Also in 0.16
-
-- Rust 2024 syntax and current Dart direct-call extraction are supported.
-- `affected` handles renames, copies, native path identity, stale evidence, and
-  bounded results more accurately.
-- MCP resources use strict project-bound URIs, and `snippet` exposes bounded
-  line and function context through the same runtime-owned selection path.
-- CLI JSON errors preserve their runtime codes and details across activation,
-  indexing, search, and packet flows.
-- Existing semantic indexes rebuild once after upgrade while the last complete
-  index remains usable.
-- `serde_with` 3.21.0 removes the affected `KeyValueMap` panic advisory
-  without changing CodeStory's DTO encoding.
-- Everyday plugin messages focus on what matters: ready, preparing, or
-  unavailable. Backend and timing details stay in diagnostics.
-
-### Supported release packages
-
-- Apple Silicon macOS (`macos-arm64`)
-- Windows x64 (`windows-x64`)
-
-Both packages include CodeStory's model and native runtime payload. They still
-rely on the standard libraries, frameworks, and device drivers supplied by the
-operating system.
-
-### Deliberate boundaries
-
-v0.16 proves the thing users need first: CodeStory can be installed on the two
-supported desktop platforms and can ground a real repository without extra
-CodeStory dependencies.
-
-This release does not make claims about answer accuracy, performance
-thresholds, physical accelerator execution, cross-session server sharing,
-Linux, Intel macOS, Windows ARM, or benchmark baselines. Those may be measured
-and improved independently; they are not conditions for using v0.16.
-
-The language changes in this release are the Rust 2024 and Dart fixes above.
-Broader language-fidelity work continues separately.
+Linux, Intel Mac, and Windows ARM are not part of this release.
 
 ### Upgrade
 
-Install the updated plugin and start a fresh host session. The first broad
-repository question may take longer while CodeStory rebuilds its semantic index
-once. No manual cleanup or migration command is required.
+Update the CodeStory plugin and start a fresh Codex session. The first broad
+question may take a little longer while CodeStory updates the repository's
+local index. No manual migration or cleanup is required.
 
 ## 0.15.0
 
