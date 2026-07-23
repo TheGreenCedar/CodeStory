@@ -344,7 +344,7 @@ jobs:
             --expected-backend CPU \
             --proof-tier installed_runtime \
             --qualification-matrix-cell "$matrix_cell" \
-            --server-behavior-only \
+            --ground-only \
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \

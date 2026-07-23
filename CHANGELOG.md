@@ -14,6 +14,11 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   isolated install without extra dependencies. CPU execution is acceptable;
   Linux, Intel macOS, Windows ARM, physical Metal/Vulkan execution, answer
   accuracy, and performance are explicit non-claims for this release.
+  Package, candidate-installed, and post-publish receipts now stop at that
+  exact installed-ground boundary. The broader two-host search, snippet,
+  shared-server, lifecycle, accelerator, accuracy, and performance verifier
+  remains available as separate qualification evidence and cannot be inferred
+  from the v0.16 receipt.
 - Exact indexed primary-source files outrank helper symbols when their file stem
   directly matches a required packet probe, without granting the helpers
   behavior ownership.

@@ -989,6 +989,7 @@ export function managedPluginViolations(job, archiveFragment) {
     "--engine-policy cpu_explicit",
     "--expected-backend CPU",
     "--offline",
+    "--ground-only",
   ]) {
     add(violations, run.includes(fragment), `managed plugin proof step must run ${fragment}`);
   }
@@ -2064,7 +2065,7 @@ function validatePostPublish(workflows, violations, graph) {
     "--engine-policy cpu_explicit",
     "--expected-backend CPU",
     "--proof-tier installed_runtime",
-    "--server-behavior-only",
+    "--ground-only",
     "--installed-plugin-provenance",
     "--installed-plugin-data",
     "--expected-source-sha",
@@ -2637,7 +2638,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "$CANDIDATE_PRODUCER_WORKFLOW_PATH",
-      "--server-behavior-only",
+      "--ground-only",
       "$CODESTORY_CANDIDATE_MACOS_ROOT/plugin",
       "$CODESTORY_CANDIDATE_MACOS_ROOT/data",
       'test -f "$quality_path"',
@@ -2823,7 +2824,7 @@ function validateRemainingWorkflows(workflows, violations) {
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
       "--retrieval-quality-evidence",
-      "--server-behavior-only",
+      "--ground-only",
       "Test-Path $qualityPath",
       "--expected-source-sha",
       "--expected-source-tree",

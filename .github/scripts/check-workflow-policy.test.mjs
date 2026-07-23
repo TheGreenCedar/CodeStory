@@ -154,6 +154,7 @@ function managedJob() {
           "--engine-policy cpu_explicit",
           "--expected-backend CPU",
           "--offline",
+          "--ground-only",
           "--timeout-secs 1800",
         ].join(" "),
       },
@@ -1381,9 +1382,9 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
       candidateProof(workflow).if = candidateProof(workflow).if
         .replace("inputs.server_behavior_only || ", "");
     }, /candidate-installed proof must require coordinator opt-in and remain runnable in Windows server scope/u],
-    ["candidate server-only claim removed", protectedFile, workflow => {
+    ["candidate installed-ground claim removed", protectedFile, workflow => {
       candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("--server-behavior-only", "--version-only");
+        .replace("--ground-only", "--version-only");
     }, /Prove two-host candidate-installed Windows runtime/u],
     ["candidate cell relabeled", protectedFile, workflow => {
       candidateProof(workflow).run = candidateProof(workflow).run

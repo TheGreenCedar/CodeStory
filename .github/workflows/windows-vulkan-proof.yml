@@ -349,7 +349,7 @@ jobs:
           $qualityPath = "target/release-quality-evidence/packet/packet-runtime-summary.json"
           $claimArgs = @()
           if ("${{ inputs.server_behavior_only }}" -eq "true") {
-            $claimArgs = @("--server-behavior-only")
+            $claimArgs = @("--ground-only")
           } else {
             if (-not (Test-Path $qualityPath)) {
               throw "candidate-installed Windows proof requires exact-head quality evidence"

@@ -388,7 +388,7 @@ jobs:
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
           if [ "${{ inputs.server_behavior_only }}" = true ]; then
-            claim_args=(--server-behavior-only)
+            claim_args=(--ground-only)
           else
             test -f "$quality_path"
             claim_args=(
