@@ -1205,10 +1205,6 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     workflow.jobs["packaged-vulkan"],
     "Capture host evidence",
   );
-  const protectedSevenZip = workflow => draftStep(
-    workflow.jobs["packaged-vulkan"],
-    "Install checksum-pinned 7-Zip bootstrap",
-  );
   const protectedPython = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Install pinned Python",
@@ -1332,25 +1328,24 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     ["protected Python version drifts", protectedFile, workflow => {
       protectedPython(workflow).with["python-version"] = "3.14";
     }, /must pin Python 3\.13/u],
+    ["protected Python process policy is removed", protectedFile, workflow => {
+      delete protectedPython(workflow).env;
+    }, /must pin Python 3\.13 with process-scoped script policy/u],
+    ["protected Python process policy drifts", protectedFile, workflow => {
+      protectedPython(workflow).env.PSExecutionPolicyPreference = "RemoteSigned";
+    }, /must pin Python 3\.13 with process-scoped script policy/u],
     ["protected Python becomes conditional", protectedFile, workflow => {
       protectedPython(workflow).if = "false";
-    }, /must pin Python 3\.13 unconditionally/u],
+    }, /must pin Python 3\.13 with process-scoped script policy/u],
     ["protected Python becomes optional", protectedFile, workflow => {
       protectedPython(workflow)["continue-on-error"] = true;
-    }, /must pin Python 3\.13 unconditionally/u],
-    ["protected 7-Zip checksum drifts", protectedFile, workflow => {
-      protectedSevenZip(workflow).run = protectedSevenZip(workflow).run
-        .replace("56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72", "wrong");
-    }, /Install checksum-pinned 7-Zip bootstrap/u],
-    ["protected 7-Zip bootstrap becomes optional", protectedFile, workflow => {
-      protectedSevenZip(workflow)["continue-on-error"] = true;
-    }, /must remain unconditional and fail closed/u],
+    }, /must pin Python 3\.13 with process-scoped script policy/u],
     ["protected Python moves after host scripts", protectedFile, workflow => {
       const steps = workflow.jobs["packaged-vulkan"].steps;
       const pythonIndex = steps.findIndex(step => step.name === "Install pinned Python");
       const [python] = steps.splice(pythonIndex, 1);
       steps.push(python);
-    }, /proof tooling must run immediately after checkout/u],
+    }, /pinned Python must run immediately after checkout/u],
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {
