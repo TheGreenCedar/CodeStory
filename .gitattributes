@@ -1,5 +1,10 @@
 *.scm text eol=lf
 
+# Release contract digests must be identical on every package builder.
+docs/testing/per-user-embedding-server-constant-set.json text eol=lf
+docs/testing/per-user-embedding-server-measurement-protocol.json text eol=lf
+docs/testing/per-user-embedding-server-protocol.json text eol=lf
+
 # Codex Autoresearch ledger files
 autoresearch.jsonl text eol=lf
 autoresearch.md text eol=lf
