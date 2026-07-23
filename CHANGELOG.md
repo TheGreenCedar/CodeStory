@@ -65,7 +65,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   Protected Windows qualification uses the operating system's built-in
   Windows PowerShell host with a process-scoped execution-policy bypass, and
   no longer requires a separate PowerShell 7 installation or a machine-policy
-  change on the self-hosted proof machine.
+  change on the self-hosted proof machine. The protected job also bootstraps
+  checksum-pinned 7-Zip and Python tooling inside the job instead of inheriting
+  a user-scoped host PATH that is unavailable to the runner service account.
   The dedicated Linux release-evidence service now provisions and verifies a
   private per-user runtime authority before measuring the shared embedding
   server, instead of failing closed when `XDG_RUNTIME_DIR` is absent.

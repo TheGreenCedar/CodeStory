@@ -2735,9 +2735,49 @@ function validateRemainingWorkflows(workflows, violations) {
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
+    const sevenZipBootstrap = namedStep(job, "Install checksum-pinned 7-Zip bootstrap");
+    add(
+      violations,
+      hasExactKeys(object(sevenZipBootstrap), ["name", "shell", "run"]),
+      `${vulkanFile} 7-Zip bootstrap must remain unconditional and fail closed`,
+    );
+    requireStepRun(
+      violations,
+      vulkanFile,
+      job,
+      "Install checksum-pinned 7-Zip bootstrap",
+      [
+        "https://www.7-zip.org/a/7zr.exe",
+        "Get-FileHash -Algorithm SHA256",
+        "56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72",
+        "$env:GITHUB_PATH",
+      ],
+    );
+    const pythonSetup = namedStep(job, "Install pinned Python");
+    requireStepUses(
+      violations,
+      vulkanFile,
+      job,
+      "Install pinned Python",
+      "actions/setup-python@v7.0.0",
+    );
+    add(
+      violations,
+      hasExactKeys(object(pythonSetup), ["name", "uses", "with"])
+        && hasExactKeys(object(pythonSetup?.with), ["python-version"])
+        && object(pythonSetup?.with)["python-version"] === "3.13",
+      `${vulkanFile} must pin Python 3.13 unconditionally for the self-hosted proof runner`,
+    );
+    add(
+      violations,
+      list(job.steps).at(1) === sevenZipBootstrap
+        && list(job.steps).at(2) === pythonSetup,
+      `${vulkanFile} proof tooling must run immediately after checkout`,
+    );
     const windowsPowerShellShell = `powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"`;
     for (const stepName of [
       "Capture host evidence",
+      "Install checksum-pinned 7-Zip bootstrap",
       "Validate candidate-installed-only mode",
       "Capture source build tool evidence",
       "Install pinned Rust",
