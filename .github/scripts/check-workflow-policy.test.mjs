@@ -1201,6 +1201,10 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     workflow.jobs["packaged-vulkan"],
     "Capture source build tool evidence",
   );
+  const protectedHost = workflow => draftStep(
+    workflow.jobs["packaged-vulkan"],
+    "Capture host evidence",
+  );
   const protectedBuild = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Build and package native CLI",
@@ -1311,6 +1315,9 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     ["protected source evidence made optional", protectedFile, workflow => {
       protectedSourceTools(workflow)["continue-on-error"] = true;
     }, /source build tool evidence must remain source-only/u],
+    ["protected host requires PowerShell 7", protectedFile, workflow => {
+      protectedHost(workflow).shell = "pwsh";
+    }, /must use built-in Windows PowerShell/u],
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {
