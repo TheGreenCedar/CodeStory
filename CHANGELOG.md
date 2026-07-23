@@ -51,7 +51,10 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   lanes instead of silently falling back to 900 seconds.
   Windows package proof now accepts a canonical project URI returned for a
   native-identical existing project path, while resource bases, URI encoding,
-  missing paths, and Unix project URI matching remain strict.
+  missing paths, and Unix project URI matching remain strict. Managed-handoff
+  search-link verification now applies that same native-identity rule to
+  project-bound snippet links instead of rejecting a valid 8.3/long-path
+  alias before reading the resource.
   The dedicated Linux release-evidence service now provisions and verifies a
   private per-user runtime authority before measuring the shared embedding
   server, instead of failing closed when `XDG_RUNTIME_DIR` is absent.

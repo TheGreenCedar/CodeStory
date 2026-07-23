@@ -4507,7 +4507,8 @@ def prove_runtime(
             None,
         )
         require(
-            linked_snippet_uri == expected_snippet_uri,
+            isinstance(linked_snippet_uri, str)
+            and resource_uri_matches(expected_snippet_uri, linked_snippet_uri),
             "packaged search returned a missing or noncanonical project-bound snippet link",
         )
         snippet_resource = host_b.resource(
@@ -9804,6 +9805,30 @@ def self_test() -> None:
         and identity_probes == [expected_identity_probe]
         and expected_identity_probe[0] != expected_identity_probe[1],
         "native-identical Windows project resource URI was rejected",
+    )
+    short_windows_snippet = short_windows_resource.replace(
+        "codestory://diagnostics/retrieval-engine",
+        "codestory://snippet/node%2Fid",
+    )
+    long_windows_snippet = long_windows_resource.replace(
+        "codestory://diagnostics/retrieval-engine",
+        "codestory://snippet/node%2Fid",
+    )
+    snippet_identity_probes: list[tuple[Path, Path]] = []
+
+    def same_windows_snippet(left: Path, right: Path) -> bool:
+        snippet_identity_probes.append((left, right))
+        return True
+
+    require(
+        resource_uri_matches(
+            short_windows_snippet,
+            long_windows_snippet,
+            platform_name="nt",
+            samefile=same_windows_snippet,
+        )
+        and snippet_identity_probes == [expected_identity_probe],
+        "native-identical Windows snippet link URI was rejected",
     )
     require(
         not resource_uri_matches(
