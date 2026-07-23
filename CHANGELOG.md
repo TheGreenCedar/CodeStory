@@ -4,406 +4,135 @@
 
 ## 0.16.0
 
-CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.
+CodeStory 0.16 is the release where setup disappears.
 
-### Release
+Install it on an Apple Silicon Mac or Windows x64 machine, point Codex at a
+repository, and ask a question. CodeStory carries its own model and native
+search engine, prepares the repository automatically, and returns
+project-scoped grounding without Docker, Python, a separate service, or a model
+download.
 
-- v0.16 ships self-contained managed packages for Apple Silicon macOS and
-  Windows x64. Each checksum-verified candidate must initialize MCP, start the
-  bundled local runtime, and complete one real `ground` request from an
-  isolated install without extra dependencies. CPU execution is acceptable;
-  Linux, Intel macOS, Windows ARM, physical Metal/Vulkan execution, answer
-  accuracy, and performance are explicit non-claims for this release.
-  Package, candidate-installed, and post-publish receipts now stop at that
-  exact installed-ground boundary. The broader two-host search, snippet,
-  shared-server, lifecycle, accelerator, accuracy, and performance verifier
-  remains available as separate qualification evidence and cannot be inferred
-  from the v0.16 receipt. Windows ground-only package cleanup uses the same
-  manifest-bound idle and native teardown window as broader qualification
-  before removing an executable that the native process may still hold open.
-- Exact indexed primary-source files outrank helper symbols when their file stem
-  directly matches a required packet probe, without granting the helpers
-  behavior ownership.
-- The v0.16 Axios release-evidence task is now versioned separately from the
-  general holdout suite and bound to a checksum-pinned JavaScript/TypeScript
-  project manifest. Its standalone evaluator independently verifies the task,
-  project, and corpus bindings while the retained v1 evidence and approved
-  baseline stay unchanged pending any later protected measurement and baseline
-  approval.
-- Windows-only pre-publish qualification now skips unavailable ARM64 release
-  evidence and retains protected Vulkan and candidate-installed provenance under
-  an explicit server-behavior-only non-claim. Hosted Windows packages
-  build through a Cargo target junction at the runner volume root so nested
-  Vulkan CMake, object, and PDB paths remain inside the native toolchain limit.
-  Private Windows qualification directories accept ordinary and canonical path
-  spellings only when both resolve to the same native volume and file identity.
-  Native dependency manifests now use a deterministic case-sensitive tie-break
-  after case-insensitive ordering, preserving exact import spellings while
-  keeping package and archive-smoke inspection identical across processes.
-  Windows package proof now pins the final exact native server process for both
-  unpacked and candidate-installed qualification, preserves its authenticated
-  executable digest, and allows a separate 60-second native teardown grace
-  after the 60-second product idle timeout under one shared cleanup deadline
-  before removing package files.
-  Windows named-pipe disconnects now retain their exact Win32 error and
-  authenticated peer-process state while entering the existing exactly-once
-  pure-RPC recovery path. Successful Windows handlers now keep the one-shot
-  pipe connected for a server-capped final-response drain, preventing teardown
-  from discarding unread vector bytes while the shared server remains healthy,
-  and chunks nonblocking writes to the pipe buffer while keeping zero-progress
-  polling inside the frozen server-owned query budget even when a peer supplies
-  a longer wire deadline.
-  Cross-platform managed plugin handoff proof now uses the same explicit,
-  bounded 1,800-second checker deadline as the other two-host qualification
-  lanes instead of silently falling back to 900 seconds.
-  Windows package proof now accepts a canonical project URI returned for a
-  native-identical existing project path, while resource bases, URI encoding,
-  missing paths, and Unix project URI matching remain strict. Managed-handoff
-  search-link verification now applies that same native-identity rule to
-  project-bound snippet links instead of rejecting a valid 8.3/long-path
-  alias before reading the resource.
-  Protected Windows qualification uses the operating system's built-in
-  Windows PowerShell host with a process-scoped execution-policy bypass, and
-  no longer requires a separate PowerShell 7 installation or a machine-policy
-  change on the self-hosted proof machine. The protected job provisions pinned
-  Python with the same process-scoped script-policy bypass instead of inheriting
-  a user-scoped host PATH or changing machine policy. Byte-hashed release
-  contracts use LF checkouts on every platform so Windows packages, protected
-  qualification, and the frozen calibration receipt share one identity.
-  The dedicated Linux release-evidence service now provisions and verifies a
-  private per-user runtime authority before measuring the shared embedding
-  server, instead of failing closed when `XDG_RUNTIME_DIR` is absent.
-- Warm `ground` and `retrieval status` calls reuse a private, native-file-
-  identity-bound executable digest attestation while retaining live embedding
-  readiness observation and the exact executable compatibility handshake.
-  Cache misses still hash the executable, and cached evidence cannot authorize
-  an embedding-server spawn.
+### What you will notice
 
-- Generic YAML structural collection now distinguishes quoted scalars from
-  apostrophes and quotation marks inside plain text, and it permits tabs inside
-  literal or folded block content while retaining fail-closed indentation and
-  delimiter checks. Generic JSON collection accepts complete value streams and
-  still rejects empty, malformed, or truncated input.
-- Explicit incremental refresh now fails closed with typed
-  `full_refresh_required` compatibility evidence when the live core lacks its
-  required structural publication or needs a supported schema upgrade. The
-  decision occurs before workspace reads, writer acquisition, or publication
-  changes; `auto` retains deliberate full recovery, and dry-run reports the
-  same requested mode, effective mode, and reason. Full-mode source failures
-  now name the effective mode instead of implying that every caller requested a
-  full refresh. Drill reports omit unavailable pre-refresh metrics and carry
-  the compatibility reason instead of copying post-refresh counts into the
-  before fields.
-- Retrieval indexing now binds the selected project runtime after compatibility
-  preflight and before executing an automatic incremental refresh, preventing
-  exact-head repo-scale evidence runs from failing with an unopened project.
-- Disposable full-refresh storage now opens the staged SQLite database with a
-  writable handle before its durability flush, so Windows can seal and promote
-  the candidate instead of failing `sync_all` with access denied.
-- The proof coordinator now supports explicit hosted-only integration and
-  Linux-only package scopes, so exact-head source, repo-scale, and Linux
-  candidate evidence do not schedule unrelated protected-platform runners.
-- Candidate-installed package qualification now has a bounded 120-minute job
-  budget, preventing exact Linux and Windows proof from being cancelled by the
-  generic 60-minute package timeout after their expensive build and lifecycle
-  checks have already passed.
-- The release workflow can now authenticate the complete pre-publish ledger on
-  an exact manually selected `dev/codestory-next` head without granting publish
-  authority. Only the trusted automatic `main` caller can opt into publication.
-- A new explicit `retrieval republish-projections` writer can adopt the current
-  semantic and dense-selection policy from one complete stored core without
-  source discovery, parsing, or source-file reads. It validates the pinned
-  graph and projection contracts, selected-root cache identity, and the one
-  retained schema-29 compatibility case: no structural manifest and no
-  structural units, projections, or cache rows. It acquires the writer lock
-  before opening or migrating that stored core, rebuilds bounded semantic
-  pages, and publishes an explicit empty structural manifest when adopting the
-  legacy case. Fail/cancel coverage spans every live semantic and search-build
-  checkpoint before promotion. Missing or incompatible stored documents,
-  cancellation, concurrent writers, and publication drift preserve the
-  previous complete core, retrieval identity, and search rollback; retrieval
-  stays unavailable until its existing builder publishes a generation bound
-  to the replacement core. The same writer can rebind the exact retained
-  schema-1 `oversized-source-v1` publication to
-  `bounded-source-exclusion-v2` only for the schema-29 empty-structural case
-  with its v1 digest valid and byte and structural-unit caps unchanged; every
-  other policy or cap transition remains fail closed. A
-  runtime-cache failure or late cancellation after
-  durable commit completes the prepared search publication, clears controller
-  indexing state, and still leaves retrieval bound to the prior core.
-- Dense-anchor centrality now uses complete bounded graph relationship counts
-  instead of the six-item member and related-symbol presentation lists. This
-  admits genuinely high-degree callables without repository-specific steering,
-  keeps low-degree locals sparse, and advances the policy identity so existing
-  vector generations rebuild rather than reusing selections from the old rule.
-- The protected Windows proof workflow now keeps physical Vulkan qualification
-  separate while also staging the exact x64 archive through an isolated
-  candidate-managed plugin root. The installed-runtime lane launches two fresh
-  plugin hosts, requires explicit CPU execution and authenticated candidate
-  provenance, and retains attempt-scoped ownership, admission, lifecycle,
-  identity, memory, and quality evidence for release review.
-- Compact grounding now ranks roots with architecture evidence and reports a
-  typed orientation confidence with bounded-candidate, entrypoint, subsystem,
-  and presentation uncertainty. The stdio schema and `ground --why` render the
-  same contract, so weak orientation cannot be reported as high-confidence
-  coverage. Root ranking derives its path, name, subsystem, and graph evidence
-  once per candidate instead of recomputing it inside every sort comparison.
-- The native sqlite-vec/USearch evidence harness now uses 75,000 as its largest
-  nested real-anchor workload while retaining 100 incremental anchors, two
-  clean roots, six paired counterbalanced blocks, and the existing identity,
-  failure, and replay proof. The frozen input now binds the declared workload
-  criteria byte-for-byte, and changed fixtures use a new selection seed and
-  schema.
-- Incremental freshness now carries forward unchanged verified structural-unit
-  exclusions even though they intentionally have no parser-backed file row.
-  This stops managed activation from republishing the same excluded inputs as
-  new files on every retry. If a replacement core does publish before later
-  freshness validation fails, retained local navigation now rebinds to that
-  exact live generation so `ground` can continue without widening broad search.
-- Project activation retries now retain one operation ID with monotonic
-  revision, stage, attempt, and progress fields. Request cancellation no longer
-  replaces shared preparation, and failed replacements bind any still-complete
-  core publication as `retained` local evidence while broad search remains
-  unavailable without a matching retrieval/runtime proof. Native MCP failures
-  return the same-tool retry when applicable plus project-bound status and
-  retained `affected` follow-ups.
-- Structural JSON, YAML, TOML, Markdown, and other tooling sources that exceed
-  the 2,048-unit collector bound without exceeding the source-byte cap now
-  publish as verified source-policy exclusions instead of blocking the entire
-  replacement core. Each exclusion binds its path, content hash, observed byte
-  size and unit count, byte/unit policy caps, project/workspace identity, and
-  core generation/run. Excluded bytes retain no graph, structural-semantic,
-  typed-target, or packet-sufficiency claim, and source or policy changes force
-  reevaluation before atomic publication.
-- The local `CodeStoryDev` installer now binds one clean committed plugin
-  package to one explicit staged CLI through a versioned receipt. The cached
-  launcher verifies package, marketplace, platform, filename, byte count,
-  checksum, executable, and CLI version before using that development
-  override. Missing or changed receipt inputs and simultaneous raw overrides
-  fail closed without falling through to the production release installer.
-  The launcher now owns the MCP initialize handshake and relays the verified
-  native runtime through explicit pipes instead of grandchild stdio inheritance.
-- Repo-scale warning baselines now bind headline runtime values and phase
-  timings to one unique date/commit row. The evidence parser recognizes each
-  Markdown table by its header, ignores older over-wide phase rows as runtime
-  sources, and fails closed on missing or malformed headline data and duplicate
-  row identities instead of combining measurements from different runs.
-- MCP repository resources now advertise canonical project-bound URI templates
-  while the static agent guide remains project-free. Strict URI parsing
-  preserves native path identity across spaces, percent characters, Unicode,
-  Unix roots, and Windows drive paths, and rejects missing, duplicate,
-  relative, malformed, or conflicting selectors before project selection.
-  MCP `snippet` now exposes the CLI's bounded line-context and function-body
-  controls through one runtime-owned target-selection path. The generated
-  catalog, fail-open launcher, packaged proof, and multi-project tests enforce
-  the same contract.
-- Packet probes now use one tagged exact-target grammar across contracts,
-  runtime, CLI, and stdio: exact project-relative path, stable symbol ID,
-  file-scoped symbol, free query, or generation-bound continuation. Legacy
-  string probes enter the same resolver. Exact paths retain native filesystem
-  identity and remain distinct when valid but outside graph coverage;
-  ambiguity, text-only evidence, stale identity, malformed input, missing
-  targets, and out-of-project targets fail or report separately. Probe inputs
-  resolve to exact path/node citations rather than display-name searches and
-  cannot promote packet sufficiency. CLI and stdio share a combined 16-probe
-  limit and 240-character field limit.
-- Architecture packets now keep explicit exact paths as relevance constraints
-  through initial sufficiency and output-budget rebuilds. Each requested path
-  needs a separate proof-bearing claim before the packet can report
-  `sufficient`; missing paths produce explicit gaps and targeted follow-ups,
-  while diagnostic exact-path citations no longer discourage source reads.
-- Markdown/MDX, generic YAML, TOML, JSON, non-parser shell, and PowerShell now
-  emit bounded exact-source structural units through the same verified
-  publication and cache contract as the existing collectors. Dedicated
-  workflow, Compose, Cargo, OpenAPI, and parser-backed Bash routing keeps
-  precedence. Generated, vendor, secret-bearing, lockfile, minified, and other
-  declared high-noise paths are rejected from workspace-relative inventory
-  before structural reads. Incremental refresh removes previously published
-  rows that become excluded, and structural cache identity v2 prevents
-  pre-limit artifacts from bypassing current bounds. Malformed text,
-  binary/non-UTF-8 input, and unreadable sources now remain distinct fail-closed
-  coverage outcomes.
-- Structural workflow, Compose, Cargo manifest, HTML, CSS, and SQL collectors
-  now persist versioned exact-source units with separate content and placement
-  identity. Verified source hashes, per-file projections, and a dedicated
-  structural cache advance atomically; a complete manifest binds them to the
-  core generation and is checked across full, incremental, promotion, and
-  rollback boundaries. Grounding, search, details, and packets consume the
-  persisted provenance instead of inferring it from paths.
-- The production release chain now emits graph-owned, success-only proof-cell
-  manifests for exact source, the Apple Silicon macOS and Windows x64
-  packages, candidate-installed behavior on both hosts, and the matching
-  post-publish hosts. Publication depends on an accepted authenticated 5-cell
-  pre-publish ledger; the retained 11-cell post-publish ledger also proves
-  downloaded archive bytes match the accepted package digests. Producer
-  workflow, job, run, attempt and
-  artifact identity comes from current-run Actions artifact and per-attempt job
-  metadata instead of the manifest directory. Immutable attempt-qualified
-  containers support failed-job reruns without accepting a failed newer
-  execution or flattening unrelated JSON. Accuracy and performance evaluators
-  remain available as independent evidence lanes but do not authorize v0.16.
+#### A real install, not a science project
 
-### Performance
+The CodeStory plugin and CLI now arrive as one self-contained package. The
+model, tokenizer, CPU engine, and native Metal or Vulkan capability travel with
+the app. Checksums protect the download, and the managed plugin starts the
+matching runtime for you.
 
-- Grounding summary materialization now carries only node IDs and file ranks
-  through its window sort, rejoins full source rows afterward, and loads MEMBER
-  targets once through the existing covering edge index instead of issuing one
-  correlated lookup per snapshot node. The staged snapshot keeps the same rows,
-  file ranks, root direction, timing attribution, and bulk destination-index
-  order.
-- Full staged semantic publication now keyset-pages accepted symbol kinds
-  directly from SQLite, resolves graph endpoints through cache-isolated bounded
-  reads, and drops each page-local context after document emission instead of
-  retaining the complete node table and a second all-node lookup. Component
-  reports keep bounded first-file and central-node accumulators across pages.
-  Telemetry reports stream batches, endpoint rows/query batches and wall, and
-  the peak page-local lookup size; incremental dependency scopes retain their
-  existing loader.
-- Core publication telemetry now separates incremental live-to-staged SQLite
-  backup-call wall and logical bytes from successful promotion validation,
-  rollback-backup copy, journal sync, staged-to-live restore, validation, and
-  cleanup wall. The incremental clone happens before indexing and outside
-  `publish_ms`; promotion subphases remain nested inside it. Candidate,
-  prior-live, and rollback-backup SQLite logical bytes (`page_count *
-  page_size`) plus a saturating promotion residual make the existing copy and
-  validation amplification measurable without changing publication, recovery,
-  journal, checkpoint, or durability behavior.
-- Semantic document preparation now keeps normalized display/read paths once
-  per owning file instead of cloning them for every symbol, derives display
-  names inside the existing bounded document window, and avoids an
-  all-semantic intermediate selection. Telemetry reports selected symbols,
-  retained context files/path bytes, and the still-retained all-node lookup so
-  later streaming work remains measurable.
-- Projection batches now replace errors owned by their refreshed file rows and
-  mark grounding and resolution snapshots dirty inside the owning SQLite
-  transaction instead of following each flush with a second error transaction
-  and snapshot autocommits. Error-only cache-maintenance failures retain their
-  existing file-outcome fallback. Index telemetry reports transaction
-  setup/commit wall plus attempted rows, estimated bound-input bytes, statement
-  executions, and wall time by persisted family.
-- Fresh disposable full-refresh stages now declare the parser artifact cache
-  `known_empty` instead of issuing guaranteed-miss queries. Structural
-  read-through is enabled only when verified rows were copied from the prior
-  publication, so an entirely fresh stage opens no second SQLite reader.
-  Parser and structural telemetry now report policy, logical lookups, physical
-  queries, hits, misses, reader opens, and lookup wall time independently.
-- Staged builds now create the four edge endpoint indexes immediately before
-  semantic context reads instead of issuing thousands of bounded endpoint
-  queries against an unindexed edge table. The normal deferred schema still
-  owns the indexes, and telemetry reports their wall time separately while
-  retaining it in the deferred-index total.
-- The sqlite-vec versus USearch evidence harness now freezes and independently
-  revalidates its reviewed catalog, source publication, query embeddings, and
-  exact corpus identity before measurement. Candidate publication validates
-  staged generations first and proves corrupt, incomplete, and mid-build
-  cancellation failures preserve the previous pointer.
-- Staged full refresh now bulk-builds grounding summary indexes around
-  materialization instead of maintaining them row by row. The node file-rank
-  index is created between node and file materialization for the file join;
-  deferred-index telemetry includes the pre-, mid-, and post-summary builds.
-- Full-refresh telemetry now reconciles exclusive outer wall stages and exposes
-  previously hidden source preparation, complete projection transactions,
-  semantic node/context loading, and final Tantivy commit/reload time. The
-  repo-scale evidence artifact retains the complete first and repeat timing
-  payloads instead of dropping unrecognized diagnostics.
-- Full refresh now persists each ordered parser-artifact chunk in one SQLite
-  transaction instead of one autocommit per parsed file. Index telemetry
-  reports artifact-cache rows, transactions, and write time separately.
-- Staged symbol search generations now retain one bounded Tantivy writer across
-  document checkpoints and commit/reload once, instead of reopening and
-  committing the writer for every 8,192 symbols. Index telemetry reports
-  symbol documents, writers, commits, and reloads.
-- Runtime and retrieval now stream canonical search symbols directly from the
-  node table in 4,096-row keyset pages. Fresh full and incremental builds no
-  longer rewrite the legacy SQLite search projection or materialize every
-  complete graph node before search construction; telemetry reports stream
-  time, rows, and batches alongside the single Tantivy commit.
-- File-backed full refreshes now overlap preparation and Rayon parsing with a
-  dedicated staged SQLite writer through a capacity-one queue. Cancellation
-  drains only accepted chunks, incremental indexing keeps its serial path, and
-  telemetry reports queue pressure plus producer/writer wait time.
-- Full refresh now replaces the fixed small-file parse window with an adaptive
-  8 MiB source and 120,000 projected-node target plus a 512-file safety
-  ceiling. Completed output adjusts the next chunk's node-density estimate,
-  and telemetry reports planning time, observed maxima, and target overruns.
-- Fresh full-refresh stages now use a store-owned disposable SQLite profile:
-  WAL remains available to the bounded cache reader, automatic checkpoint work
-  uses a 64 MiB window instead of SQLite's small default, and durability is
-  deferred to a verified NORMAL/TRUNCATE checkpoint plus filesystem sync before
-  promotion. Live, generic build, and incremental-clone profiles remain
-  WAL/NORMAL. Full-refresh telemetry reports the configured checkpoint window,
-  final checkpoint time, and explicit sync time.
+The v0.16 release bar is deliberately simple: install the archive on Apple
+Silicon macOS and Windows x64, start the bundled runtime, and complete one real
+`ground` request against a project. Both platforms passed.
 
-### Highlights
+#### Ask first. Let CodeStory prepare the rest.
 
-- **Better search ranking.** CodeRankEmbed replaces BGE. In a fixed same-machine comparison, ranking quality improved by 36% and the first-result hit rate by 55%.
-- **One warm model per user.** Compatible CodeStory processes now share one local embedding server without sharing repository indexes or readiness state. The server exits after 60 seconds of true idle and starts again on the next search.
-- **Private and offline after installation.** The model and engine are carried inside the executable. There is no Docker service, TCP port, runtime model download, or retrieval component to repair.
-- **Automatic preparation.** The first broad repository question prepares the local map and search index. Local navigation remains available while broader search is still preparing.
-- **Verified accelerator use.** Apple Silicon uses Metal, and Windows x64 uses Vulkan on supported physical GPUs. Linux packages are Vulkan-capable, but v0.16 makes no Linux GPU claim. Production never silently falls back to CPU.
+You no longer need to run a setup ritual before asking about a repository.
+`ground`, `packet`, and search bring the local index current as needed. While
+deeper search is preparing, CodeStory can still return the last complete local
+map instead of leaving the agent empty-handed.
 
-### Reliability and compatibility
+Every request names its project explicitly, so switching among repositories
+does not leak routing, cache, or readiness state from one project into another.
 
-- Source files larger than the parser byte cap are now hashed and classified
-  before parser scheduling. Complete builds revalidate those bytes at the
-  identity fence and publish their project, workspace, and core-bound exclusion
-  manifest atomically, while `files` diagnostics show the retained source
-  inventory without claiming graph or semantic coverage. Partial discovery and
-  unreadable or changing files still fail closed.
-- Release closeout now derives its exact source, package, protected hardware,
-  installed runtime, retrieval, performance, quality, platform and
-  post-publish byte-comparison cells from the release claim graph. The generic
-  coordinator retains one manifest and evaluator result per cell plus a
-  deterministic ledger and summary, and rejects stale, duplicate,
-  identity-incomplete, aggregate-host, cross-version, target-host-mismatched,
-  retained-package-mismatched or cross-release evidence.
-- Collector-backed workflow, Compose, Cargo manifest, HTML, CSS, and SQL
-  anchors now publish the explicit `structural_text` evidence tier, collector
-  provenance, and `source_range_only` resolution through grounding, search, and
-  packet results. They remain non-sufficient diagnostic evidence rather than
-  parser-backed or semantic claims.
-- Exact-head source and platform proof now require one coherent workflow ref,
-  reviewed SHA, Actions SHA, concurrency identity, checkout, and cache
-  namespace. PR coordinators are label-only; manual runs must select the live
-  same-repository PR branch (or current `dev/codestory-next` for integration),
-  and failed, cancelled, wrong-ref, or stale-head work cannot publish proof
-  caches.
-- Windows source builds now use stable file-handle identity and replace preexisting hard-linked DLLs before runtime staging, allowing Rust 1.97.1 builds to complete.
-- Managed activation now repairs migrated cores that are missing a completed
-  search generation instead of entering through the fail-closed reader and
-  returning terminal unavailability. Repair remains writer-owned and bounded;
-  longer work returns a stable same-tool retry operation.
-- Stable parser-partial files with verified bytes and no file-level error now
-  publish as explicit coverage limitations. Typed file diagnostics distinguish
-  parser partial, source drift, unreadable and oversized source, incomplete
-  discovery, and collector failure without weakening source-integrity gates.
-- C headers with one named type and multiple direct `typedef` aliases now emit
-  one type-usage edge per alias instead of failing graph collection and
-  blocking the staged core publication.
-- Safe refreshes preserve the last verified index. Incomplete reads, cancellation, or concurrent source changes cannot publish a partial generation or mix results from different generations.
-- Large full and incremental refreshes now batch file-identity lookups against SQLite's runtime bind-variable limit without changing duplicate or missing-ID semantics.
-- Large semantic-document builds now batch component-access metadata lookups
-  against SQLite's runtime bind-variable limit instead of constructing one
-  repository-wide statement.
-- Resolution now skips its optional support cache when the serialized snapshot exceeds SQLite's runtime value limit, while keeping the in-memory result and staged publication intact.
-- Existing semantic indexes rebuild once after upgrading. The last complete index remains available while the replacement is prepared.
-- Project switching now preserves isolated per-project state across A/B/A MCP routing. Requests require an explicit project, and status remains observational instead of activating or repairing a repository.
-- `affected` now handles native path identity, renames, copies, stale evidence, and bounded results more accurately across Unix and Windows.
-- CLI JSON failures retain their runtime error codes and details across search, packet, activation, and retrieval indexing.
-- Compact grounding now prefers stored production file roles and diversifies repeated terminal names before spending its root-symbol budget, while retaining fixture coverage when no production roots are available.
-- Route-tracing packets now require cited executable endpoints in explicit question order plus one matching directed call graph before reporting sufficient. Self-edges, unrelated graph neighborhoods, generic helpers, fixture prose, and wrong-kind symbols fail closed with bounded follow-up gaps.
-- Rust 2024 sources, including `unsafe extern` blocks and let-chains, are now accepted. Dart direct-call extraction has been updated for the current grammar shape.
-- Linux ARM64 packages retain the portable runtime-loaded CPU backend alongside Vulkan. Windows packages use architecture-matched Vulkan components rather than mutable runner-image contents.
-- Updated `serde_with` to 3.21.0, removing the affected `KeyValueMap` panic advisory while preserving CodeStory's existing DTO encoding.
-- Everyday plugin messages now focus on whether broader search is ready, preparing, or unavailable; backend and timing detail stays in diagnostics.
+#### One model per user, not one model per agent
 
-### Scope
+Compatible CodeStory processes share a private local embedding server while
+their repository indexes stay isolated. The server starts on demand, reuses the
+warm model across compatible work, exits after true idle, and comes back on the
+next request. There is no Docker daemon, TCP service, or runtime model download
+to manage.
 
-The v0.16 language changes are the Rust 2024 and Dart fixes listed above. This release makes no general cross-language parser-completeness claim; broader language-fidelity work continues in v0.16.1.
+#### Better evidence from real-world repositories
 
-### Upgrade note
+CodeStory now favors the source files and architecture entry points that
+actually own an answer, rather than letting helpers and repeated leaf names
+dominate the first screen. Exact paths, stable symbol IDs, file-scoped symbols,
+and follow-up probes resolve through one typed evidence path.
 
-Install the updated plugin package and start a fresh host session. The first broad-search call may take longer while CodeStory rebuilds the semantic index once. No manual cleanup or migration command is required.
+Repository understanding also reaches beyond parser-backed languages. Markdown,
+MDX, JSON, YAML, TOML, SQL, HTML, CSS, shell, PowerShell, Cargo manifests,
+workflows, and Compose files can contribute bounded, source-linked structural
+evidence without pretending to be full semantic graph coverage.
+
+Route-tracing answers now need the requested endpoints in order and a matching
+directed call path before CodeStory calls them sufficient. When evidence is
+partial, the response says what is missing and offers a focused follow-up.
+
+#### Large repositories waste less work
+
+The indexing pipeline now streams and batches more of its SQLite, semantic, and
+search work instead of materializing repository-wide intermediates or
+committing tiny fragments one at a time. Parsing and staged writes can overlap,
+search writers stay open across bounded batches, and expensive summary indexes
+are built at the useful point in publication.
+
+The practical result is less duplicated work, lower peak memory pressure, and
+better progress visibility on large refreshes—without turning benchmark
+thresholds into a release promise.
+
+#### Safer refreshes and clearer failures
+
+A refresh is still all-or-nothing. CodeStory stages and validates a complete
+generation before publishing it; cancellation, unreadable files, concurrent
+source changes, or an incompatible index leave the last complete generation
+available.
+
+Oversized or structurally noisy files now become explicit, identity-bound
+coverage exclusions instead of poisoning the whole repository refresh.
+Diagnostics distinguish incomplete discovery, parser limits, source drift,
+collector failures, and missing broad-search readiness, so agents can make an
+honest claim or stop.
+
+Windows path aliases, named pipes, native teardown, and packaged runtime
+ownership received a substantial reliability pass. Unix path matching remains
+case-sensitive, while existing Windows paths are compared by native file
+identity.
+
+### Also in 0.16
+
+- Rust 2024 syntax and current Dart direct-call extraction are supported.
+- `affected` handles renames, copies, native path identity, stale evidence, and
+  bounded results more accurately.
+- MCP resources use strict project-bound URIs, and `snippet` exposes bounded
+  line and function context through the same runtime-owned selection path.
+- CLI JSON errors preserve their runtime codes and details across activation,
+  indexing, search, and packet flows.
+- Existing semantic indexes rebuild once after upgrade while the last complete
+  index remains usable.
+- `serde_with` 3.21.0 removes the affected `KeyValueMap` panic advisory
+  without changing CodeStory's DTO encoding.
+- Everyday plugin messages focus on what matters: ready, preparing, or
+  unavailable. Backend and timing details stay in diagnostics.
+
+### Supported release packages
+
+- Apple Silicon macOS (`macos-arm64`)
+- Windows x64 (`windows-x64`)
+
+Both packages include CodeStory's model and native runtime payload. They still
+rely on the standard libraries, frameworks, and device drivers supplied by the
+operating system.
+
+### Deliberate boundaries
+
+v0.16 proves the thing users need first: CodeStory can be installed on the two
+supported desktop platforms and can ground a real repository without extra
+CodeStory dependencies.
+
+This release does not make claims about answer accuracy, performance
+thresholds, physical accelerator execution, cross-session server sharing,
+Linux, Intel macOS, Windows ARM, or benchmark baselines. Those may be measured
+and improved independently; they are not conditions for using v0.16.
+
+The language changes in this release are the Rust 2024 and Dart fixes above.
+Broader language-fidelity work continues separately.
+
+### Upgrade
+
+Install the updated plugin and start a fresh host session. The first broad
+repository question may take longer while CodeStory rebuilds its semantic index
+once. No manual cleanup or migration command is required.
 
 ## 0.15.0
 
