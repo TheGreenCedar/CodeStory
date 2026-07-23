@@ -4,6 +4,9 @@
 
 ### Release
 
+- Exact indexed primary-source files outrank helper symbols when their file stem
+  directly matches a required packet probe, without granting the helpers
+  behavior ownership.
 - Windows-only pre-publish qualification now skips unavailable ARM64 release
   evidence and retains protected Vulkan and candidate-installed provenance under
   an explicit server-behavior-only non-claim. Full release qualification remains

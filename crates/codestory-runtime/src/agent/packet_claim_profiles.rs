@@ -2681,6 +2681,28 @@ mod tests {
             "a request-suffixed method must not inherit the request declaration: {retry_claims:?}"
         );
 
+        let mut private_request_method =
+            test_packet_citation("Client.prototype._request", "src/client.js");
+        private_request_method.kind = NodeKind::METHOD;
+        let private_request_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &private_request_method,
+            r#"
+            class Client {
+              _request(config) { return config }
+              request(config) {
+                config = merge(defaults, config)
+                this.interceptors.request.forEach(run)
+                return dispatchTransport(config)
+              }
+            }
+            "#,
+        );
+        assert!(
+            private_request_claims.is_empty(),
+            "_request must not inherit a co-located request pipeline: {private_request_claims:?}"
+        );
+
         let mut request_method = test_packet_citation("Client.prototype.request", "src/client.js");
         request_method.kind = NodeKind::METHOD;
         let request_claims =
@@ -2726,6 +2748,18 @@ mod tests {
                 .iter()
                 .any(|claim| claim.contains("transport based on environment capabilities")),
             "the adapter selector should retain its selection claim: {adapter_owner_claims:?}"
+        );
+
+        let mut adapter_file =
+            test_packet_citation("src/adapters/adapters.js", "src/adapters/adapters.js");
+        adapter_file.kind = NodeKind::FILE;
+        let adapter_file_claims =
+            packet_source_derived_claims_for_citation(prompt, &adapter_file, adapter_source);
+        assert!(
+            adapter_file_claims
+                .iter()
+                .any(|claim| claim.contains("transport based on environment capabilities")),
+            "an exact adapter file should retain its file-level selection claim: {adapter_file_claims:?}"
         );
     }
 

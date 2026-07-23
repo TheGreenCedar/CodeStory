@@ -14317,6 +14317,140 @@ mod tests {
     }
 
     #[test]
+    fn indexed_primary_file_survives_lexical_batch_and_compact_packet_capping() {
+        let root = packet_temp_root("indexed-primary-file-capping");
+        let _ = std::fs::remove_dir_all(&root);
+        let adapter_path = write_packet_fixture_file(
+            &root,
+            "src/runtime/adapters.js",
+            r#"
+            const transportDrivers = { native: nativeDriver, socket: socketDriver };
+            export function chooseTransport(name) {
+              const transport = transportDrivers[name];
+              return typeof transport === 'function' ? transport : null;
+            }
+            "#,
+        );
+        let path = adapter_path.to_string_lossy().to_string();
+
+        let mut helper = test_search_hit("helper", 100.0);
+        helper.display_name = "resolveHandle".to_string();
+        helper.kind = NodeKind::FUNCTION;
+        helper.file_path = Some(path.clone());
+        helper.line = Some(3);
+        helper.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.9,
+            semantic: 0.0,
+            graph: 0.0,
+            total: 0.9,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: Vec::new(),
+        });
+
+        let mut indexed_file = test_search_hit("file", 1.0);
+        indexed_file.display_name = "adapters.js".to_string();
+        indexed_file.kind = NodeKind::FILE;
+        indexed_file.file_path = Some(path.clone());
+        indexed_file.line = Some(1);
+        indexed_file.match_quality = Some(SearchMatchQualityDto::Exact);
+        indexed_file.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.8,
+            semantic: 0.0,
+            graph: 0.0,
+            total: 0.8,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: Vec::new(),
+        });
+
+        let mut lower_ranked = test_search_hit("fallback", 0.1);
+        lower_ranked.display_name = "adaptersFallback".to_string();
+        lower_ranked.file_path = Some(path.clone());
+        lower_ranked.line = Some(4);
+        lower_ranked.match_quality = Some(SearchMatchQualityDto::Prefix);
+        lower_ranked.score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.25,
+            semantic: 0.0,
+            graph: 0.0,
+            total: 0.25,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: Vec::new(),
+        });
+
+        assert!(packet_anchor_hit_is_relevant("adapters", &helper));
+        assert!(packet_anchor_hit_is_relevant("adapters", &indexed_file));
+        assert!(packet_anchor_hit_is_relevant("adapters", &lower_ranked));
+
+        let query = PacketPlanQueryDto {
+            query: "adapters".to_string(),
+            purpose: "transport adapter ownership".to_string(),
+        };
+        let pending = vec![(0usize, &query)];
+        let results = vec![(
+            query.query.clone(),
+            vec![lower_ranked, indexed_file, helper],
+        )];
+        let prompt = "Explain how the client chooses adapters for request transport.";
+        let mut answer = packet_answer_fixture(prompt, Vec::new());
+        crate::agent::packet_trace::merge_packet_lexical_subquery_batch(
+            &mut answer,
+            &pending,
+            &results,
+            1,
+            &[],
+            true,
+            &packet_rank_terms(prompt),
+            2,
+        );
+        assert_eq!(answer.citations.len(), 2);
+        assert_eq!(answer.citations[0].display_name, "resolveHandle");
+        assert_eq!(answer.citations[1].display_name, "adapters.js");
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.contains("packet_lexical_subquery")
+                && annotation.contains("hits=3")
+                && annotation.contains("citations_added=2")
+        }));
+
+        rank_packet_evidence(prompt, &mut answer);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
+            max_output_bytes: 8 * 1024,
+        };
+        let _budget = apply_packet_budget_with_extra(
+            &root,
+            prompt,
+            PacketTaskClassDto::ArchitectureExplanation,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+            &["adapters".to_string()],
+        );
+
+        assert_eq!(answer.citations.len(), 1);
+        assert_eq!(answer.citations[0].kind, NodeKind::FILE);
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some(path.as_str())
+        );
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_probe_citations promoted=1")
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn evidence_edge_ids_are_sorted_and_filtered() {
         let graph = GraphResponse {
             center_id: codestory_contracts::api::NodeId("1".to_string()),

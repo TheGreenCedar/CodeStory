@@ -34,7 +34,7 @@ use crate::agent::packet_terms::{
 };
 use crate::exact_symbol_query_terms;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, NodeKind, PacketClaimDto, PacketTaskClassDto,
+    AgentAnswerDto, AgentCitationDto, NodeKind, PacketClaimDto, PacketTaskClassDto, SearchHitOrigin,
 };
 
 pub(crate) fn packet_missing_sufficiency_probe_queries_with_extra(
@@ -1029,6 +1029,9 @@ pub(crate) fn packet_citation_probe_match_rank(
     if packet_citation_matches_behavior_owning_required_probe(query, citation) {
         return Some(6);
     }
+    if packet_citation_is_exact_primary_file_probe_match(query, citation) {
+        return Some(6);
+    }
     let normalized_display = normalize_identifier(&citation.display_name);
     let normalized_path = citation
         .file_path
@@ -1075,6 +1078,19 @@ pub(crate) fn packet_citation_probe_match_rank(
     } else {
         None
     }
+}
+
+fn packet_citation_is_exact_primary_file_probe_match(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    citation.kind == NodeKind::FILE
+        && citation.origin == SearchHitOrigin::IndexedSymbol
+        && citation.resolvable
+        && citation.file_path.as_deref().is_some_and(|path| {
+            crate::retrieval_file_role_from_path(path) == crate::RetrievalFileRole::Source
+        })
+        && packet_file_stem_matches_query(query, citation.file_path.as_deref())
 }
 
 fn packet_citation_matches_behavior_owning_required_probe(
@@ -2363,6 +2379,57 @@ mod tests {
         };
         assert_lexical_fallback("transport adapter", "src/client/adapters/imports.ts");
         assert_lexical_fallback("search entrypoint", "src/search/imports.rs");
+    }
+
+    #[test]
+    fn exact_primary_file_probe_rank_requires_indexed_resolvable_file_identity() {
+        let mut indexed_file =
+            test_packet_citation("transport registry", "src/runtime/adapters.js", 0.1);
+        indexed_file.kind = NodeKind::FILE;
+        assert_eq!(
+            packet_citation_probe_match_rank("adapters", &indexed_file),
+            Some(6)
+        );
+
+        for (label, citation) in [
+            {
+                let mut citation = indexed_file.clone();
+                citation.file_path = Some("generated/adapters.js".to_string());
+                ("generated file", citation)
+            },
+            {
+                let mut citation = indexed_file.clone();
+                citation.file_path = Some("tests/adapters.js".to_string());
+                ("test file", citation)
+            },
+            {
+                let mut citation = indexed_file.clone();
+                citation.file_path = Some("src/runtime/adapter_factory.js".to_string());
+                ("non-exact stem", citation)
+            },
+            {
+                let mut citation = indexed_file.clone();
+                citation.kind = NodeKind::FUNCTION;
+                citation.display_name = "resolveHandle".to_string();
+                ("helper in exact file", citation)
+            },
+            {
+                let mut citation = indexed_file.clone();
+                citation.origin = SearchHitOrigin::TextMatch;
+                ("synthetic file", citation)
+            },
+            {
+                let mut citation = indexed_file.clone();
+                citation.resolvable = false;
+                ("unresolved file", citation)
+            },
+        ] {
+            assert_ne!(
+                packet_citation_probe_match_rank("adapters", &citation),
+                Some(6),
+                "{label} must not receive exact primary FILE preference"
+            );
+        }
     }
 
     #[test]
