@@ -18,7 +18,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   exact installed-ground boundary. The broader two-host search, snippet,
   shared-server, lifecycle, accelerator, accuracy, and performance verifier
   remains available as separate qualification evidence and cannot be inferred
-  from the v0.16 receipt.
+  from the v0.16 receipt. Windows ground-only package cleanup uses the same
+  manifest-bound idle and native teardown window as broader qualification
+  before removing an executable that the native process may still hold open.
 - Exact indexed primary-source files outrank helper symbols when their file stem
   directly matches a required packet probe, without granting the helpers
   behavior ownership.

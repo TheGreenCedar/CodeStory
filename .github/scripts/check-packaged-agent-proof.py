@@ -3425,9 +3425,33 @@ def add_exception_note(error: BaseException, note: str) -> None:
 
 
 class FailurePreservingTemporaryDirectory(tempfile.TemporaryDirectory):
+    def __init__(
+        self,
+        *args,
+        cleanup_retry_budget_secs: float = 0,
+        cleanup_retry_interval_secs: float = 0.5,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.cleanup_retry_budget_secs = cleanup_retry_budget_secs
+        self.cleanup_retry_interval_secs = cleanup_retry_interval_secs
+
     def __exit__(self, exc_type, exc, traceback) -> bool | None:
+        deadline = time.monotonic() + self.cleanup_retry_budget_secs
         try:
-            return super().__exit__(exc_type, exc, traceback)
+            while True:
+                try:
+                    self.cleanup()
+                    return None
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(
+                        min(
+                            self.cleanup_retry_interval_secs,
+                            max(0, deadline - time.monotonic()),
+                        )
+                    )
         except OSError as cleanup_error:
             if exc is None:
                 raise
@@ -10465,6 +10489,35 @@ def self_test() -> None:
         "temporary cleanup preservation self-test leaked its directory",
     )
 
+    retrying_directory = FailurePreservingTemporaryDirectory(
+        prefix="codestory-cleanup-retry-self-test-",
+        cleanup_retry_budget_secs=1,
+        cleanup_retry_interval_secs=0,
+    )
+    retrying_path = Path(retrying_directory.name)
+    original_retrying_cleanup = retrying_directory.cleanup
+    retrying_attempts = 0
+
+    def transient_temporary_cleanup() -> None:
+        nonlocal retrying_attempts
+        retrying_attempts += 1
+        if retrying_attempts < 3:
+            raise PermissionError("synthetic transient executable lock")
+        original_retrying_cleanup()
+
+    retrying_directory.cleanup = transient_temporary_cleanup
+    try:
+        with retrying_directory:
+            pass
+    finally:
+        retrying_directory.cleanup = original_retrying_cleanup
+        if retrying_path.exists():
+            original_retrying_cleanup()
+    require(
+        retrying_attempts == 3 and not retrying_path.exists(),
+        "temporary cleanup retry did not clear a transient executable lock",
+    )
+
     class ScriptedMcpProcess(McpProcess):
         def __init__(self, responses: list[dict]):
             self.timeout = 1
@@ -12288,9 +12341,10 @@ def main() -> int:
     validate_runtime_claim_scope(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     require(sha256(args.archive) == expected_archive_digest(args.checksum_file, args.archive), "archive checksum mismatch")
-    with FailurePreservingTemporaryDirectory(
+    temporary_package_directory = FailurePreservingTemporaryDirectory(
         prefix="codestory-packaged-proof-"
-    ) as raw:
+    )
+    with temporary_package_directory as raw:
         root = Path(raw)
         unpack_archive(args.archive, root / "unpacked")
         cli = find_cli(root / "unpacked")
@@ -12315,6 +12369,11 @@ def main() -> int:
             args.measurement_protocol,
             require_frozen=require_frozen,
         )
+        if args.ground_only and os.name == "nt":
+            cleanup_wait_budget = native_server_exit_wait_budget(manifest)
+            temporary_package_directory.cleanup_retry_budget_secs = (
+                cleanup_wait_budget["timeout_ms"] / 1000
+            )
         calibration_bundle = None
         if require_frozen:
             require(
