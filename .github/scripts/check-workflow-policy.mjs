@@ -2735,12 +2735,29 @@ function validateRemainingWorkflows(workflows, violations) {
     const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
     add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
+    for (const stepName of [
+      "Capture host evidence",
+      "Validate candidate-installed-only mode",
+      "Capture source build tool evidence",
+      "Install pinned Rust",
+      "Build and package native CLI",
+      "Authenticate calibration bundle producer",
+      "Prove offline Vulkan and multi-repository reuse",
+      "Stage isolated candidate-managed Windows install",
+      "Prove two-host candidate-installed Windows runtime",
+    ]) {
+      add(
+        violations,
+        namedStep(job, stepName)?.shell === "powershell",
+        `${vulkanFile} ${stepName} must use built-in Windows PowerShell`,
+      );
+    }
     const sourceBuildTools = namedStep(job, "Capture source build tool evidence");
     add(
       violations,
       hasExactKeys(object(sourceBuildTools), ["name", "if", "shell", "run"])
         && sourceBuildTools?.if === "${{ !inputs.use_packaged_cli_artifact }}"
-        && sourceBuildTools?.shell === "pwsh",
+        && sourceBuildTools?.shell === "powershell",
       `${vulkanFile} source build tool evidence must remain source-only and fail closed`,
     );
     requireStepRun(violations, vulkanFile, job, "Capture source build tool evidence", [
