@@ -233,16 +233,45 @@ fn cli_stays_thin() {
 }
 
 #[test]
+fn cli_binary_uses_the_library_module_graph() {
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        !cli_main.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("mod ") || line.starts_with("pub mod ")
+        }),
+        "the CLI binary must not compile a second module graph"
+    );
+    assert!(
+        cli_main.contains("codestory_cli::run()"),
+        "the CLI binary should delegate to the library entrypoint"
+    );
+    for module in ["embedding_server_transport", "sidecar_runtime"] {
+        let declaration = format!("mod {module};");
+        assert_eq!(
+            cli_lib.matches(&declaration).count(),
+            1,
+            "{module} should have one library-owned module declaration"
+        );
+        assert!(
+            !cli_main.contains(&declaration),
+            "{module} must not be compiled again by the binary"
+        );
+    }
+}
+
+#[test]
 fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");
     let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
-    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let cli_app = read("crates/codestory-cli/src/app.rs");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
     let explore = read("crates/codestory-cli/src/explore.rs");
     let cli_browser_surfaces = [
-        cli_main.as_str(),
+        cli_app.as_str(),
         http_transport.as_str(),
         stdio_transport.as_str(),
         explore.as_str(),
@@ -305,8 +334,8 @@ fn runtime_exposes_read_only_browser_service_boundary() {
             && cli_browser_surfaces.contains(".trail_context(")
             && cli_browser_surfaces.contains(".snippet_context(")
             && cli_browser_surfaces.contains(".query(&ast)")
-            && cli_main.contains("runtime.browser.ask(request)")
-            && !cli_main.contains("runtime.agent.ask(request)"),
+            && cli_app.contains("runtime.browser.ask(request)")
+            && !cli_app.contains("runtime.agent.ask(request)"),
         "CLI read-only browser operations should route through RuntimeContext.browser"
     );
 }

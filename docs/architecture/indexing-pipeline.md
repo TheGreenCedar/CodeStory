@@ -159,7 +159,7 @@ flowchart TD
 
 ### 1. CLI dispatches the `index` workflow
 
-`crates/codestory-cli/src/main.rs` routes `Command::Index` into `run_index`. The CLI does not index files directly. It builds a runtime context, asks runtime to open the project with the requested refresh mode, and then renders the returned summary.
+`crates/codestory-cli/src/app.rs` routes `Command::Index` into `run_index`. The CLI does not index files directly. It builds a runtime context, asks runtime to open the project with the requested refresh mode, and then renders the returned summary.
 
 ### 2. Runtime chooses full or incremental indexing
 
