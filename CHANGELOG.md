@@ -67,7 +67,9 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   no longer requires a separate PowerShell 7 installation or a machine-policy
   change on the self-hosted proof machine. The protected job provisions pinned
   Python with the same process-scoped script-policy bypass instead of inheriting
-  a user-scoped host PATH or changing machine policy.
+  a user-scoped host PATH or changing machine policy. Byte-hashed release
+  contracts use LF checkouts on every platform so Windows packages, protected
+  qualification, and the frozen calibration receipt share one identity.
   The dedicated Linux release-evidence service now provisions and verifies a
   private per-user runtime authority before measuring the shared embedding
   server, instead of failing closed when `XDG_RUNTIME_DIR` is absent.
