@@ -57,6 +57,14 @@ REQUIRED_HOLDOUT_TASK_FILES = {
     "redis-server-event-loop.task.json",
     "ripgrep-search-pipeline.task.json",
 }
+CANDIDATE_PRODUCER_WORKFLOW_PATHS = {
+    ".github/workflows/auto-release.yml",
+    ".github/workflows/macos-metal-proof.yml",
+    ".github/workflows/packaged-platform-pr.yml",
+    ".github/workflows/packaged-platform-proof.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/windows-vulkan-proof.yml",
+}
 
 
 def project_resource_uri(base_uri: str, project: Path) -> str:
@@ -2079,7 +2087,7 @@ def verify_retained_qualification(
                 isinstance(producer, dict)
                 and producer.get("repository") == "TheGreenCedar/CodeStory"
                 and producer.get("workflow_path")
-                == ".github/workflows/packaged-platform-pr.yml"
+                in CANDIDATE_PRODUCER_WORKFLOW_PATHS
                 and isinstance(producer.get("run_id"), str)
                 and re.fullmatch(r"[1-9][0-9]*", producer["run_id"]) is not None
                 and isinstance(producer.get("run_attempt"), str)
@@ -3908,14 +3916,13 @@ def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
     }
     require(
         producer["repository"] == "TheGreenCedar/CodeStory"
-        and producer["workflow_path"]
-        == ".github/workflows/packaged-platform-pr.yml"
+        and producer["workflow_path"] in CANDIDATE_PRODUCER_WORKFLOW_PATHS
         and isinstance(producer["run_id"], str)
         and re.fullmatch(r"[1-9][0-9]*", producer["run_id"]) is not None
         and isinstance(producer["run_attempt"], str)
         and re.fullmatch(r"[1-9][0-9]*", producer["run_attempt"]) is not None
         and producer["artifact_name"] == archive.name,
-        "candidate install producer identity is missing or is not the trusted coordinator artifact",
+        "candidate install producer identity is missing or is not an authenticated release workflow artifact",
     )
     require(
         sha256(archive) == expected_archive_digest(checksum, archive),
@@ -4397,6 +4404,19 @@ def prove_runtime(
     )
     try:
         run_parallel({"initialize-a": host_a.initialize, "initialize-b": host_b.initialize})
+        ground_response, ground_attempts = host_a.tool_until_ready(
+            "ground",
+            {
+                "project": str(project_a),
+                "budget": "strict",
+            },
+            "installed-ground-a",
+        )
+        ground = ground_response["result"]["structuredContent"]
+        require(
+            isinstance(ground, dict) and ground,
+            f"installed runtime ground returned no structured result: {ground!r}",
+        )
         cold_started = time.perf_counter()
         cold_results = run_parallel(
             {
@@ -4721,6 +4741,8 @@ def prove_runtime(
                 "host_b": cold_results["search-b"][1],
             },
             "mcp_public_contract": {
+                "ground_attempts": ground_attempts,
+                "ground_project_bound": True,
                 "snippet_scope": snippet["scope"],
                 "requested_context": snippet["requested_context"],
                 "snippet_attempts": snippet_attempts,

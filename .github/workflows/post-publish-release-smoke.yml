@@ -7,11 +7,6 @@ on:
         description: Release version to smoke, with or without a leading v.
         required: true
         type: string
-      quality_evidence_artifact:
-        description: Exact-head release-evidence artifact containing packet/packet-runtime-summary.json.
-        required: false
-        default: ""
-        type: string
       calibration_bundle_artifact:
         description: Frozen calibration bundle artifact name.
         required: true
@@ -35,10 +30,6 @@ on:
       version:
         description: Release version to smoke, with or without a leading v.
         required: true
-        type: string
-      quality_evidence_artifact:
-        description: Existing exact-head release-evidence artifact name.
-        required: false
         type: string
       calibration_bundle_artifact:
         description: Frozen calibration bundle artifact name.
@@ -76,21 +67,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            asset_target: linux-x64
-            extension: tar.gz
-          - os: ubuntu-24.04-arm
-            asset_target: linux-arm64
-            extension: tar.gz
           - os: windows-latest
             asset_target: windows-x64
             extension: zip
-          - os: windows-11-arm
-            asset_target: windows-arm64
-            extension: zip
-          - os: macos-15-intel
-            asset_target: macos-x64
-            extension: tar.gz
           - os: macos-15
             asset_target: macos-arm64
             extension: tar.gz
@@ -121,13 +100,6 @@ jobs:
         with:
           name: ${{ inputs.pre_publish_closeout_artifact }}
           path: target/pre-publish-closeout
-
-      - name: Download exact-head publishable packet quality evidence
-        if: inputs.quality_evidence_artifact != ''
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: ${{ inputs.quality_evidence_artifact }}
-          path: target/release-quality-evidence
 
       - name: Authenticate calibration bundle producer
         shell: bash
@@ -250,7 +222,7 @@ jobs:
           rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
           rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
 
-      - name: Resolve the marketplace-installed plugin
+      - name: Resolve the published plugin through the marketplace catalog
         id: installed
         shell: bash
         env:
@@ -349,7 +321,7 @@ jobs:
             echo "provenance=$provenance"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Qualify the marketplace-managed installed runtime
+      - name: Qualify the catalog-resolved published runtime
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
         shell: bash
@@ -361,11 +333,6 @@ jobs:
           test "$(printf '%s\n' "$calibration_bundle" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           matrix_cell="installed_${{ matrix.asset_target }}_cpu"
           matrix_cell="${matrix_cell//-/_}"
-          quality_args=()
-          quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
-          if [ -f "$quality_path" ]; then
-            quality_args=(--retrieval-quality-evidence "$quality_path")
-          fi
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "${{ steps.asset.outputs.archive }}" \
             --checksum-file "${{ steps.asset.outputs.checksum }}" \
@@ -377,8 +344,7 @@ jobs:
             --expected-backend CPU \
             --proof-tier installed_runtime \
             --qualification-matrix-cell "$matrix_cell" \
-            --produce-qualification-evidence \
-            --qualification-evidence target/post-publish-installed-proof/qualification.json \
+            --server-behavior-only \
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
@@ -387,7 +353,6 @@ jobs:
             --installed-plugin-data "${{ steps.installed.outputs.plugin_data }}" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
-            "${quality_args[@]}" \
             --timeout-secs 3600 \
             --out-dir target/post-publish-installed-proof
 
@@ -404,7 +369,7 @@ jobs:
           test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           mkdir -p target/release-cells
           jq -n \
-            --arg installer marketplace_managed_plugin \
+            --arg installer marketplace_catalog_resolved_plugin \
             --arg native_engine coderank_q8_embedded \
             --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
             '{installer: $installer, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \

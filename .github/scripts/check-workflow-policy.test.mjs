@@ -1353,12 +1353,12 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
       workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact
         = "${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}";
     }, /Windows quality evidence must come only from the successful protected producer/u],
-    ["release enables pre-merge proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = true;
-    }, /leave pre-merge Windows candidate-installed proof/u],
-    ["release enables server-only proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
-    }, /leave pre-merge Windows candidate-installed proof/u],
+    ["release disables candidate-installed proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = false;
+    }, /candidate-installed server behavior gate/u],
+    ["release enables physical Vulkan proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = false;
+    }, /candidate-installed server behavior gate/u],
     ["explicit opt-in removed", protectedFile, workflow => {
       delete workflow.on.workflow_call.inputs.candidate_installed_proof;
     }, /candidate-installed proof must be an explicit opt-in/u],
@@ -1781,11 +1781,6 @@ test("release policy rejects manifest producer, trusted-map, and publication byp
       const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
         .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
       step.run = step.run.replace("--trusted-producers", "--self-attested-producers");
-    }],
-    ["trusted exception input", workflows => {
-      const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps
-        .find(({ name }) => name === "Evaluate authenticated pre-publish closeout");
-      step.run = step.run.replace("--trusted-exceptions", "--manifest-exceptions");
     }],
     ["flattened current-run JSON", workflows => {
       const step = workflows.get("release.yml").jobs["pre-publish-closeout"].steps

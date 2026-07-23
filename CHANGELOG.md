@@ -2,20 +2,30 @@
 
 ## Unreleased
 
+## 0.16.0
+
+CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.
+
 ### Release
 
+- v0.16 ships self-contained managed packages for Apple Silicon macOS and
+  Windows x64. Each checksum-verified candidate must initialize MCP, start the
+  bundled local runtime, and complete one real `ground` request from an
+  isolated install without extra dependencies. CPU execution is acceptable;
+  Linux, Intel macOS, Windows ARM, physical Metal/Vulkan execution, answer
+  accuracy, and performance are explicit non-claims for this release.
 - Exact indexed primary-source files outrank helper symbols when their file stem
   directly matches a required packet probe, without granting the helpers
   behavior ownership.
 - The v0.16 Axios release-evidence task is now versioned separately from the
   general holdout suite and bound to a checksum-pinned JavaScript/TypeScript
-  project manifest. The release gate independently verifies the task, project,
-  and corpus bindings while the retained v1 evidence and approved baseline stay
-  unchanged pending a new protected measurement and baseline approval.
+  project manifest. Its standalone evaluator independently verifies the task,
+  project, and corpus bindings while the retained v1 evidence and approved
+  baseline stay unchanged pending any later protected measurement and baseline
+  approval.
 - Windows-only pre-publish qualification now skips unavailable ARM64 release
   evidence and retains protected Vulkan and candidate-installed provenance under
-  an explicit server-behavior-only non-claim. Full release qualification remains
-  strict and still requires exact-head quality evidence. Hosted Windows packages
+  an explicit server-behavior-only non-claim. Hosted Windows packages
   build through a Cargo target junction at the runner volume root so nested
   Vulkan CMake, object, and PDB paths remain inside the native toolchain limit.
   Private Windows qualification directories accept ordinary and canonical path
@@ -50,12 +60,6 @@
   readiness observation and the exact executable compatibility handshake.
   Cache misses still hash the executable, and cached evidence cannot authorize
   an embedding-server spawn.
-
-## 0.16.0
-
-CodeStory 0.16 makes repository search more accurate and reduces duplicate model memory across agents and projects. The model and embedding engine ship inside CodeStory, compatible processes share one private local server, and startup, readiness, and idle shutdown happen automatically.
-
-### Release
 
 - Generic YAML structural collection now distinguishes quoted scalars from
   apostrophes and quotation marks inside plain text, and it permits tabs inside
@@ -209,19 +213,17 @@ CodeStory 0.16 makes repository search more accurate and reduces duplicate model
   rollback boundaries. Grounding, search, details, and packets consume the
   persisted provenance instead of inferring it from paths.
 - The production release chain now emits graph-owned, success-only proof-cell
-  manifests for exact source, release evidence, all six packages, protected
-  Metal and Vulkan execution, and all six post-publish hosts. Publication
-  depends only on an accepted authenticated 12-cell pre-publish ledger; the
-  retained 30-cell post-publish ledger also proves downloaded archive bytes
-  match the accepted package digests. Producer workflow, job, run, attempt and
+  manifests for exact source, the Apple Silicon macOS and Windows x64
+  packages, candidate-installed behavior on both hosts, and the matching
+  post-publish hosts. Publication depends on an accepted authenticated 5-cell
+  pre-publish ledger; the retained 11-cell post-publish ledger also proves
+  downloaded archive bytes match the accepted package digests. Producer
+  workflow, job, run, attempt and
   artifact identity comes from current-run Actions artifact and per-attempt job
   metadata instead of the manifest directory. Immutable attempt-qualified
   containers support failed-job reruns without accepting a failed newer
-  execution or flattening unrelated JSON. Approved performance exceptions are
-  separately authenticated and evaluated with same-run answer-quality proof.
-- Candidate-installed proof remains outside pre-publish authorization. The
-  real installed-runtime tier, including its separate two-session/one-server
-  qualification, remains post-publish work owned by #1221.
+  execution or flattening unrelated JSON. Accuracy and performance evaluators
+  remain available as independent evidence lanes but do not authorize v0.16.
 
 ### Performance
 

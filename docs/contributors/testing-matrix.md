@@ -415,15 +415,14 @@ release evidence gate evaluates that graph; workflow policy consumes its
 runner, target, promotion, retention, and proof-chain facts. Update the graph
 instead of copying those facts into contributor prose.
 
-The same graph declares the exact release-closeout cells. The closeout
-coordinator expands native cells from `workflow_policy.package_matrix`, keeps
-protected hardware cells explicit, invokes the claim evaluator for each cell
-and its graph dependencies, then retains canonical copies under `manifests/`
-and `evaluations/` beside `ledger.json` and `summary.json`. A pre-publish run
-accepts 12 cells: exact source, six package targets, two protected-hardware
-targets, and the three release-evidence claims. A post-publish run accepts 30
-cells after adding platform, installed-runtime and downloaded-byte proof for
-all six targets. Package rows record each archive name, byte count, and SHA-256.
+The same graph declares the exact release-closeout cells. For v0.16,
+`workflow_policy.package_matrix` contains only `macos-arm64` and `windows-x64`.
+The coordinator retains canonical copies under `manifests/` and `evaluations/`
+beside `ledger.json` and `summary.json`. A pre-publish run accepts five cells:
+exact source, two package identities, and two candidate-installed behavior
+receipts. A post-publish run accepts eleven cells after adding platform,
+marketplace-catalog-resolved behavior, and downloaded-byte proof for both targets.
+Package rows record each archive name, byte count, and SHA-256.
 A post-publish run requires
 that accepted pre-publish ledger, requires its current package manifests to
 match the retained rows, and rejects any downloaded archive whose bytes do not
@@ -455,13 +454,10 @@ downloads by name use explicit replacement from a policy-owned allowlist, so a
 retried producer cannot fail on an immutable same-name artifact before it emits
 its authenticated cell. Terminal evidence is never overwriteable.
 
-An accepted model-microbenchmark exception is a separate authenticated input,
-not a manifest assertion. The release-evidence container retains
-`codestory.release-closeout-exceptions/v1`; closeout verifies its producer,
-includes same-run `answer_quality` in the performance-cell evaluation, and
-passes the trusted exception map to the claim evaluator. Both closeout jobs
-retain the provenance map and exception input with canonical manifests,
-individual evaluations, ledger and summary.
+Accuracy, latency, throughput, and physical accelerator evidence remain
+independent evaluator lanes. Their thresholds and exception rules are
+unchanged, but v0.16 closeout does not consume them and makes no claim from
+them.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -474,7 +470,6 @@ node scripts/codestory-release-closeout.mjs evaluate \
   --phase pre_publish \
   --evaluated-at <canonical-ISO-timestamp> \
   --trusted-producers <actions-provenance-map.json> \
-  --trusted-exceptions <selected-release-evidence-container/trusted-exceptions.json> \
   --manifest-dir <unflattened-selected-artifact-directories> \
   --out-dir <new-closeout-directory>
 ```
@@ -485,11 +480,11 @@ tested and merged without final evidence; an accepted ledger still requires
 the frozen exact-head producer manifests and does not upgrade source or package
 proof into installed, protected-hardware, or live-behavior proof.
 
-Pre-publish authorization deliberately has no candidate-installed cell. A
-marketplace install cannot exist until publication, and candidate-managed proof
-does not replace it. The six installed-runtime cells remain post-publish and
-the real two-session/one-server installed-runtime qualification remains the
-separate #1221 evidence tier.
+Pre-publish authorization deliberately uses candidate-managed installations
+because a marketplace-catalog-resolved package cannot exist before publication. These receipts
+must come from isolated installs of the exact candidate archive, initialize
+MCP, start the bundled local runtime, and complete one real `ground` request.
+They do not replace the two marketplace-catalog-resolved post-publish receipts.
 
 The command-line evaluator derives repository, commit, and source-tree identity
 from `--repo` and the full `--expected-sha`; evidence documents cannot supply
@@ -530,7 +525,7 @@ release workflow. No version bump, tag, signing, notarization, or release is
 part of ordinary remediation or embedding-engine PRs.
 
 Maintainers may manually dispatch `release.yml` from an exact
-`dev/codestory-next` SHA to authenticate the 12-cell pre-publish ledger without
+`dev/codestory-next` SHA to authenticate the 5-cell pre-publish ledger without
 publishing. The required `expected_head_sha` must equal both the workflow SHA
 and the live dev branch head. Manual dispatch exposes no publication input;
 only the automatic reusable-workflow caller on the live `main` head passes the

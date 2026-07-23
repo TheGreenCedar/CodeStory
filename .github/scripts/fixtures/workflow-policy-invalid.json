@@ -27,7 +27,7 @@
     {
       "id": "permissions-secrets",
       "class_prefix": "[permissions_secrets]",
-      "workflow": "release-candidate-evidence.yml",
+      "workflow": "macos-metal-proof.yml",
       "field": [
         "permissions",
         "contents"
@@ -37,35 +37,14 @@
     {
       "id": "job-permissions-override",
       "class_prefix": "[permissions_secrets]",
-      "workflow": "release-candidate-evidence.yml",
-      "job": "measure",
+      "workflow": "macos-metal-proof.yml",
+      "job": "packaged-metal",
       "field": [
         "permissions"
       ],
       "value": {
         "contents": "write"
       }
-    },
-    {
-      "id": "protected-caller-secrets-inherit",
-      "class_prefix": "[permissions_secrets]",
-      "workflow": "packaged-platform-pr.yml",
-      "job": "release-evidence",
-      "field": [
-        "secrets"
-      ],
-      "value": "inherit"
-    },
-    {
-      "id": "protected-caller-undeclared-secret",
-      "class_prefix": "[permissions_secrets]",
-      "workflow": "release.yml",
-      "job": "release-evidence",
-      "field": [
-        "secrets",
-        "EXTRA_SECRET"
-      ],
-      "value": "${{ secrets.EXTRA_SECRET }}"
     },
     {
       "id": "artifact-retention",
@@ -83,7 +62,7 @@
       "id": "exact-sha",
       "class_prefix": "[exact_sha]",
       "workflow": "release.yml",
-      "job": "release-evidence",
+      "job": "source-proof",
       "field": [
         "with",
         "ref"
@@ -102,17 +81,6 @@
         "preflight",
         "packaged-proof"
       ]
-    },
-    {
-      "id": "proof-contract",
-      "class_prefix": "[proof_contract]",
-      "workflow": "release.yml",
-      "job": "release-evidence",
-      "field": [
-        "with",
-        "profile"
-      ],
-      "value": "unattested-profile"
     },
     {
       "id": "target-matrix",

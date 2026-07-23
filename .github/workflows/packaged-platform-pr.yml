@@ -529,6 +529,7 @@ jobs:
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
       candidate_installed_proof: true
+      candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
       server_behavior_only: ${{ needs.route.outputs.scope == 'server' }}
 
   windows-vulkan-proof:
@@ -551,6 +552,7 @@ jobs:
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
       candidate_installed_proof: true
+      candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
       server_behavior_only: ${{ needs.route.outputs.scope == 'windows' }}
 
   closeout:

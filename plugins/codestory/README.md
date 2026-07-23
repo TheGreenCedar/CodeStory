@@ -55,6 +55,13 @@ model download, separate helper executable, TCP endpoint, port, or user
 approval. The same verified CLI automatically runs its hidden per-user server
 over private local IPC.
 
+CodeStory 0.16 publishes managed packages for Apple Silicon macOS and Windows
+x64. Those packages are qualified from isolated installs with one real
+project-scoped `ground` request and require no separate model, runtime, SDK, or
+helper executable. CPU execution is supported. Linux, Intel macOS, Windows ARM,
+physical accelerator execution, answer accuracy, and performance are not
+release claims for 0.16.
+
 ## Codex install
 
 1. Open `/plugins` in Codex.
