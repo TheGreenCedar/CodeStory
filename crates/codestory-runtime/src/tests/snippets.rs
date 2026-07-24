@@ -1,3 +1,8 @@
+use super::{
+    DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX, bounded_direct_markdown_snippet,
+    bounded_markdown_snippet_from_path, tempdir,
+};
+
 #[test]
 fn direct_markdown_snippet_is_byte_capped() {
     let text = (0..10_000)

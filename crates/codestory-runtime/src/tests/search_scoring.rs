@@ -1,3 +1,28 @@
+use super::{
+    AgentHybridWeightsDto, AppController, CancellationToken, CoreNodeId, EnvGuard, FileExt,
+    GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, HybridSearchConfig,
+    IndexFreshnessStatusDto, IndexMode, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
+    OpenProjectRequest, Path, PathBuf, PublicationTestAction, PublicationTestBoundary,
+    RetrievalModeDto, SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_MAX_TOKENS_ENV, SearchEngine,
+    SearchGenerationCatalogGuard, SearchGenerationCompletion, SearchHit, SearchRepoTextMode,
+    SearchRequest, SearchSymbolProjection, SemanticProjectionStats, SnapshotStore, SourceLocation,
+    Storage, apply_hybrid_limits, arm_publication_test_fault,
+    assert_mandatory_retrieval_unavailable, assert_no_staged_publication_artifacts,
+    build_persisted_search_state_from_canonical_symbols, build_search_state, compare_search_hits,
+    copy_tictactoe_workspace, current_epoch_ms, dedupe_inexact_search_hits_by_display_key,
+    default_source_policy_identity, finalize_staged_semantic_docs,
+    flush_pending_dense_anchor_inputs, fs, hybrid_search_config_for_request, hybrid_test_env,
+    insert_semantic_fixture_nodes, llm_symbol_doc_hash, load_persisted_search_state,
+    merge_search_hits_by_node_id, normalized_hybrid_weights, pending_semantic_doc_for_test,
+    persisted_search_generation_names, primary_source_retention_threshold, process_env_test_lock,
+    project_identity_v3, prune_search_generations, rebuild_search_state_from_storage,
+    search_generation_completion_path, search_index_generation_root,
+    search_index_path_for_publication, search_index_storage_path, semantic_doc_text_for_test,
+    semantic_projection_republish_for_runtime, tempdir, test_index_publication,
+    test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
+    write_search_generation_completion, write_semantic_fixture,
+};
+
 #[test]
 fn semantic_doc_text_alias_modes_are_switchable_for_research() {
     let _lock = process_env_test_lock();

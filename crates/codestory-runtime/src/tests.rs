@@ -37,11 +37,16 @@ use tempfile::tempdir;
 #[path = "tests/activation_coverage_tests.rs"]
 mod activation_coverage_tests;
 
-include!("tests/search_intent.rs");
-include!("tests/search_plan.rs");
-include!("tests/search_scoring.rs");
-include!("tests/repo_text.rs");
-include!("tests/snippets.rs");
+#[path = "tests/repo_text.rs"]
+mod repo_text_tests;
+#[path = "tests/search_intent.rs"]
+mod search_intent_tests;
+#[path = "tests/search_plan.rs"]
+mod search_plan_tests;
+#[path = "tests/search_scoring.rs"]
+mod search_scoring_tests;
+#[path = "tests/snippets.rs"]
+mod snippet_tests;
 
 #[test]
 fn runtime_facade_remains_inside_the_default_source_index_cap() {

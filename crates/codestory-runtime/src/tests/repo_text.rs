@@ -1,3 +1,13 @@
+use super::{
+    AppController, CoreNodeId, FileInfo, HashMap, HashSet, Instant, Node, NodeKind, Path,
+    REPO_TEXT_MAX_FILE_BYTES, REPO_TEXT_SCAN_BYTE_CAP, REPO_TEXT_SCAN_FILE_CAP,
+    REPO_TEXT_SCAN_TIME_CAP_MS, RepoTextScanStatsDto, SearchHitOrigin, SearchPlanAnchorGroupDto,
+    SearchPlanPromotionStatusDto, SearchRepoTextMode, SearchRequest, Storage,
+    assert_mandatory_retrieval_unavailable, fs, search_plan_anchor_groups,
+    search_plan_next_actions, search_plan_rejected_hits, search_plan_terms, search_plan_test_hit,
+    tempdir, truncate_repo_text_hits_for_query,
+};
+
 #[test]
 fn architecture_repo_text_window_preserves_coverage_surfaces() {
     let query = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";

@@ -1,3 +1,11 @@
+use super::{
+    HashMap, Path, SearchHitOrigin, SearchPlanActivePathEvidence, SearchPlanChannelDto,
+    apply_architecture_cross_source_coverage, architecture_coverage_for_hit,
+    architecture_query_intents, fs, search_plan_anchor_groups, search_plan_eligible,
+    search_plan_path_is_test_or_bench, search_plan_runtime_call_is_speculative,
+    search_plan_subqueries, search_plan_terms, search_plan_test_hit, tempdir,
+};
+
 #[test]
 fn broad_architecture_search_plan_terms_and_subqueries_are_bounded() {
     let query = "Explain how CodeStory's full-index path flows through CLI/runtime/workspace/indexer/store and how that supports later search, trail, and snippet commands.";

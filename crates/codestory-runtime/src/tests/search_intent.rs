@@ -1,3 +1,9 @@
+use super::{
+    Path, SearchHit, SearchIntentFilter, apply_search_intent_filters, extract_symbol_search_terms,
+    indexed_file_matches_language_filter, language_filter_matches_path,
+    mixed_natural_language_query, parse_search_intent_query, should_expand_symbol_query,
+};
+
 #[test]
 fn parse_search_intent_query_extracts_supported_filters() {
     let parsed = parse_search_intent_query(
