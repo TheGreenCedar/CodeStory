@@ -17,6 +17,8 @@ use crate::publication::{PublicationTestBoundary, publication_test_checkpoint};
 #[cfg(test)]
 use crate::search;
 use crate::search_state::reload_llm_docs_from_storage;
+#[cfg(feature = "test-support")]
+use codestory_store::Store;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fmt::Write as _;
