@@ -25,13 +25,16 @@ function rustFiles(root) {
 
 function guardedTestModule(owner) {
   if (!fs.existsSync(owner)) return null;
+  const source = fs.readFileSync(owner, "utf8");
   const declarations = [
-    ...fs
-      .readFileSync(owner, "utf8")
-      .matchAll(/^\s*(#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*)?mod\s+tests\s*;/gmu),
+    ...source.matchAll(
+      /^(?<attributes>(?:\s*#\s*\[[^\r\n]*\]\s*)*)\s*(?:pub(?:\s*\([^)\r\n]+\))?\s+)?mod\s+tests\s*;/gmu,
+    ),
   ];
   if (!declarations.length) return null;
-  return declarations.every((declaration) => declaration[1] !== undefined);
+  return declarations.every((declaration) =>
+    /#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/u.test(declaration.groups.attributes),
+  );
 }
 
 function isOutOfLineTestSource(file) {

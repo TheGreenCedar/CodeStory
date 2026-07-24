@@ -44,3 +44,25 @@ test("root test sources require every declaring crate root to be cfg(test)", () 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("attributed visible test modules must carry their own cfg(test) guard", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-runtime-config-"));
+  try {
+    const sourceRoot = path.join(root, "crate", "src");
+    const testSource = path.join(sourceRoot, "tests", "affected.rs");
+    fs.mkdirSync(path.dirname(testSource), { recursive: true });
+    fs.writeFileSync(testSource, "std::env::set_var(\"KEY\", \"value\");\n");
+    const owner = path.join(sourceRoot, "affected.rs");
+    fs.writeFileSync(
+      owner,
+      '#[cfg(test)]\n#[path = "tests/affected.rs"]\npub(crate) mod tests;\n',
+    );
+
+    assert.equal(isOutOfLineTestSource(testSource), true);
+
+    fs.writeFileSync(owner, '#[path = "tests/affected.rs"]\npub(crate) mod tests;\n');
+    assert.equal(isOutOfLineTestSource(testSource), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
