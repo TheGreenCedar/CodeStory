@@ -2476,6 +2476,11 @@ function validateRemainingWorkflows(workflows, violations) {
       `${autoFile} release caller must pass pull-request metadata access to exact source proof`,
     );
     add(violations, object(release.with).publish_release === true, `${autoFile} trusted main caller must explicitly authorize publication`);
+    add(
+      violations,
+      release.secrets === "inherit",
+      `${autoFile} release caller must inherit repository release secrets`,
+    );
   }
 
   const evidenceFile = "release-candidate-evidence.yml";
