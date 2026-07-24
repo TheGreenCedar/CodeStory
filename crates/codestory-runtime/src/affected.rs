@@ -3,9 +3,9 @@ use super::{
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
     AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
-    AffectedUncoveredInputDto, AffectedUnmatchedPathDto, ApiError, AppController, GraphNodeId,
-    IndexFreshnessDto, IndexFreshnessStatusDto, IndexedFileRoleDto, NodeId, NodeKind,
-    OperationPathIdentityResolver, PathIdentityUnavailable, WorkspacePathIdentity,
+    AffectedUncoveredInputDto, AffectedUnmatchedPathDto, ApiError, AppController, FileInfo,
+    GraphNode, GraphNodeId, IndexFreshnessDto, IndexFreshnessStatusDto, IndexedFileRoleDto, NodeId,
+    NodeKind, OperationPathIdentityResolver, PathIdentityUnavailable, Store, WorkspacePathIdentity,
     clamp_usize_to_u32, edge_certainty_label,
     index_freshness_observation_from_storage_with_identities, indexable_source_path_in_workspace,
     indexable_source_path_with_root, indexed_file_role, normalize_path_key, path_role_from_key,
@@ -1440,7 +1440,313 @@ fn affected_route_confidence(
         .to_string()
 }
 
+struct AffectedGraphIndex {
+    labels: HashMap<GraphNodeId, String>,
+    file_path_by_id: HashMap<GraphNodeId, String>,
+    nodes_by_id: HashMap<GraphNodeId, GraphNode>,
+    node_ids_by_file: HashMap<GraphNodeId, Vec<GraphNodeId>>,
+}
+
+fn affected_graph_index(
+    controller: &AppController,
+    root: &Path,
+    files: &[FileInfo],
+    nodes: &[GraphNode],
+) -> AffectedGraphIndex {
+    let mut labels = controller.cached_labels(nodes.iter().map(|node| node.id));
+    for node in nodes {
+        labels.entry(node.id).or_insert_with(|| {
+            node.qualified_name
+                .clone()
+                .unwrap_or_else(|| node.serialized_name.clone())
+        });
+    }
+    let file_path_by_id = files
+        .iter()
+        .map(|file| {
+            (
+                codestory_contracts::graph::NodeId(file.id),
+                runtime_relative_path(root, &file.path),
+            )
+        })
+        .collect();
+    let nodes_by_id = nodes.iter().map(|node| (node.id, node.clone())).collect();
+    let mut node_ids_by_file = HashMap::<GraphNodeId, Vec<GraphNodeId>>::new();
+    for node in nodes {
+        if let Some(file_id) = node.file_node_id {
+            node_ids_by_file.entry(file_id).or_default().push(node.id);
+        }
+    }
+    for node_ids in node_ids_by_file.values_mut() {
+        node_ids.sort_unstable();
+    }
+    AffectedGraphIndex {
+        labels,
+        file_path_by_id,
+        nodes_by_id,
+        node_ids_by_file,
+    }
+}
+
+fn affected_graph_seeds(
+    graph_seed_file_ids: &BTreeSet<GraphNodeId>,
+    previous_identity_seed_evidence: &BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    node_ids_by_file: &HashMap<GraphNodeId, Vec<GraphNodeId>>,
+) -> BTreeMap<GraphNodeId, AffectedGraphEvidence> {
+    let mut seeds = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
+    for file_id in graph_seed_file_ids {
+        let file_evidence = previous_identity_seed_evidence.get(file_id).cloned();
+        let file_candidate = file_evidence.clone().unwrap_or_else(|| {
+            AffectedGraphEvidence::seed(
+                *file_id,
+                "changed file matched current input path",
+                AffectedConfidenceFloor::from_label("direct"),
+                false,
+            )
+        });
+        seeds
+            .entry(*file_id)
+            .and_modify(|current| {
+                if affected_evidence_is_better(&file_candidate, current) {
+                    current.clone_from(&file_candidate);
+                }
+            })
+            .or_insert(file_candidate);
+        for node_id in node_ids_by_file.get(file_id).into_iter().flatten() {
+            let node_candidate = file_evidence
+                .as_ref()
+                .map(|evidence| {
+                    AffectedGraphEvidence::seed(
+                        *node_id,
+                        evidence.reason.clone(),
+                        evidence.confidence_floor.clone(),
+                        evidence.previous_identity_proxy,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    AffectedGraphEvidence::seed(
+                        *node_id,
+                        "symbol declared in file matched by current input path",
+                        AffectedConfidenceFloor::from_label("direct"),
+                        false,
+                    )
+                });
+            seeds
+                .entry(*node_id)
+                .and_modify(|current| {
+                    if affected_evidence_is_better(&node_candidate, current) {
+                        current.clone_from(&node_candidate);
+                    }
+                })
+                .or_insert(node_candidate);
+        }
+    }
+    seeds
+}
+
+struct AffectedSymbolImpacts {
+    symbols: Vec<AffectedSymbolDto>,
+    total: usize,
+    truncated: bool,
+    direct_count: usize,
+    propagated_count: usize,
+}
+
+fn affected_symbol_impacts(
+    distances: &BTreeMap<GraphNodeId, u32>,
+    evidence: &BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    graph: &AffectedGraphIndex,
+    filter: Option<&str>,
+) -> AffectedSymbolImpacts {
+    let mut symbols = distances
+        .iter()
+        .filter_map(|(node_id, distance)| {
+            let node = graph.nodes_by_id.get(node_id)?;
+            if node.kind == codestory_contracts::graph::NodeKind::FILE {
+                return None;
+            }
+            let file_path = node
+                .file_node_id
+                .and_then(|file_id| graph.file_path_by_id.get(&file_id).cloned());
+            if filter.is_some_and(|needle| {
+                !graph
+                    .labels
+                    .get(node_id)
+                    .is_some_and(|label| normalize_path_key(label).contains(needle))
+                    && !file_path
+                        .as_deref()
+                        .is_some_and(|path| normalize_path_key(path).contains(needle))
+            }) {
+                return None;
+            }
+            let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
+                let mut fallback = AffectedGraphEvidence::seed(
+                    *node_id,
+                    "reached by dependent graph walk",
+                    AffectedConfidenceFloor::from_label("graph"),
+                    false,
+                );
+                fallback.distance = *distance;
+                fallback
+            });
+            Some(AffectedSymbolDto {
+                node_id: NodeId::from(*node_id),
+                display_name: graph
+                    .labels
+                    .get(node_id)
+                    .cloned()
+                    .unwrap_or_else(|| node.serialized_name.clone()),
+                kind: NodeKind::from(node.kind),
+                file_path,
+                line: node.start_line,
+                distance: *distance,
+                graph_depth: graph_evidence.distance,
+                reason: graph_evidence.reason,
+                confidence: graph_evidence.confidence_floor.label().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let direct_count = symbols.iter().filter(|symbol| symbol.distance == 0).count();
+    let propagated_count = symbols.iter().filter(|symbol| symbol.distance > 0).count();
+    symbols.sort_by(|left, right| {
+        left.distance
+            .cmp(&right.distance)
+            .then(left.file_path.cmp(&right.file_path))
+            .then(left.display_name.cmp(&right.display_name))
+            .then(left.node_id.0.cmp(&right.node_id.0))
+    });
+    let total = symbols.len();
+    let truncated = total > 200;
+    symbols.truncate(200);
+    AffectedSymbolImpacts {
+        symbols,
+        total,
+        truncated,
+        direct_count,
+        propagated_count,
+    }
+}
+
+fn affected_test_impacts(symbols: &[AffectedSymbolDto]) -> Vec<AffectedTestFileDto> {
+    let mut by_file = BTreeMap::<String, (u32, u32, String)>::new();
+    for symbol in symbols {
+        if let Some(path) = symbol.file_path.as_deref()
+            && path_role_from_key(&normalize_path_key(path)) == IndexedFileRoleDto::Test
+        {
+            let entry = by_file.entry(path.to_string()).or_insert((
+                0,
+                symbol.graph_depth,
+                symbol.confidence.clone(),
+            ));
+            entry.0 += 1;
+            if symbol.graph_depth < entry.1 {
+                entry.1 = symbol.graph_depth;
+                entry.2.clone_from(&symbol.confidence);
+            }
+        }
+    }
+    by_file
+        .into_iter()
+        .map(
+            |(path, (impacted_symbol_count, distance, confidence))| AffectedTestFileDto {
+                path,
+                reason: "focused test hint: test-like path reached by affected graph walk"
+                    .to_string(),
+                confidence,
+                distance,
+                graph_depth: distance,
+                impacted_symbol_count,
+            },
+        )
+        .collect()
+}
+
+struct AffectedRouteImpacts {
+    routes: Vec<AffectedRouteDto>,
+    total: usize,
+    truncated: bool,
+}
+
 impl AppController {
+    fn affected_route_impacts(
+        &self,
+        storage: &Store,
+        distances: &BTreeMap<GraphNodeId, u32>,
+        evidence: &BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+        graph: &AffectedGraphIndex,
+        filter: Option<&str>,
+    ) -> AffectedRouteImpacts {
+        let mut routes = distances
+            .iter()
+            .filter_map(|(node_id, distance)| {
+                let node = graph.nodes_by_id.get(node_id)?;
+                let file_path = node
+                    .file_node_id
+                    .and_then(|file_id| graph.file_path_by_id.get(&file_id).cloned());
+                if filter.is_some_and(|needle| {
+                    !graph
+                        .labels
+                        .get(node_id)
+                        .is_some_and(|label| normalize_path_key(label).contains(needle))
+                        && !file_path
+                            .as_deref()
+                            .is_some_and(|path| normalize_path_key(path).contains(needle))
+                }) {
+                    return None;
+                }
+                let display_name = graph
+                    .labels
+                    .get(node_id)
+                    .cloned()
+                    .unwrap_or_else(|| node.serialized_name.clone());
+                let route = self.route_endpoint_metadata(
+                    storage,
+                    node,
+                    file_path.as_deref(),
+                    &display_name,
+                )?;
+                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
+                    let mut fallback = AffectedGraphEvidence::seed(
+                        *node_id,
+                        "route endpoint reached by dependent graph walk",
+                        AffectedConfidenceFloor::from_label("graph"),
+                        false,
+                    );
+                    fallback.distance = *distance;
+                    fallback
+                });
+                let confidence =
+                    affected_route_confidence(&graph_evidence, route.confidence.as_deref());
+                Some(AffectedRouteDto {
+                    node_id: NodeId::from(*node_id),
+                    display_name,
+                    file_path,
+                    line: node.start_line,
+                    distance: *distance,
+                    graph_depth: graph_evidence.distance,
+                    reason: graph_evidence.reason,
+                    confidence,
+                    route,
+                })
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| {
+            left.distance
+                .cmp(&right.distance)
+                .then(left.file_path.cmp(&right.file_path))
+                .then(left.display_name.cmp(&right.display_name))
+                .then(left.node_id.0.cmp(&right.node_id.0))
+        });
+        let total = routes.len();
+        let truncated = total > 100;
+        routes.truncate(100);
+        AffectedRouteImpacts {
+            routes,
+            total,
+            truncated,
+        }
+    }
+
     pub fn affected_analysis(
         &self,
         req: AffectedAnalysisRequest,
@@ -1666,254 +1972,33 @@ impl AppController {
             .map(|(_, file)| file)
             .collect::<Vec<_>>();
 
-        let mut labels = self.cached_labels(nodes.iter().map(|node| node.id));
-        for node in &nodes {
-            labels.entry(node.id).or_insert_with(|| {
-                node.qualified_name
-                    .clone()
-                    .unwrap_or_else(|| node.serialized_name.clone())
-            });
-        }
-        let file_path_by_id = files
-            .iter()
-            .map(|file| {
-                (
-                    codestory_contracts::graph::NodeId(file.id),
-                    runtime_relative_path(&root, &file.path),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let nodes_by_id = nodes
-            .iter()
-            .map(|node| (node.id, node.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut node_ids_by_file = HashMap::<GraphNodeId, Vec<GraphNodeId>>::new();
-        for node in &nodes {
-            if let Some(file_id) = node.file_node_id {
-                node_ids_by_file.entry(file_id).or_default().push(node.id);
-            }
-        }
-        for node_ids in node_ids_by_file.values_mut() {
-            node_ids.sort_unstable();
-        }
+        let graph = affected_graph_index(self, &root, &files, &nodes);
 
-        let mut seed_evidence = BTreeMap::<GraphNodeId, AffectedGraphEvidence>::new();
-        for file_id in &graph_seed_file_ids {
-            let file_evidence = previous_identity_seed_evidence.get(file_id).cloned();
-            let file_candidate = file_evidence.clone().unwrap_or_else(|| {
-                AffectedGraphEvidence::seed(
-                    *file_id,
-                    "changed file matched current input path",
-                    AffectedConfidenceFloor::from_label("direct"),
-                    false,
-                )
-            });
-            seed_evidence
-                .entry(*file_id)
-                .and_modify(|current| {
-                    if affected_evidence_is_better(&file_candidate, current) {
-                        current.clone_from(&file_candidate);
-                    }
-                })
-                .or_insert(file_candidate);
-            if let Some(file_nodes) = node_ids_by_file.get(file_id) {
-                for node_id in file_nodes {
-                    let node_candidate = file_evidence
-                        .as_ref()
-                        .map(|evidence| {
-                            AffectedGraphEvidence::seed(
-                                *node_id,
-                                evidence.reason.clone(),
-                                evidence.confidence_floor.clone(),
-                                evidence.previous_identity_proxy,
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            AffectedGraphEvidence::seed(
-                                *node_id,
-                                "symbol declared in file matched by current input path",
-                                AffectedConfidenceFloor::from_label("direct"),
-                                false,
-                            )
-                        });
-                    seed_evidence
-                        .entry(*node_id)
-                        .and_modify(|current| {
-                            if affected_evidence_is_better(&node_candidate, current) {
-                                current.clone_from(&node_candidate);
-                            }
-                        })
-                        .or_insert(node_candidate);
-                }
-            }
-        }
-
+        let seed_evidence = affected_graph_seeds(
+            &graph_seed_file_ids,
+            &previous_identity_seed_evidence,
+            &graph.node_ids_by_file,
+        );
         let AffectedReverseWalk {
             distances,
             evidence,
             visited_edge_count,
-        } = affected_reverse_walk(depth, &edges, seed_evidence, &labels);
+        } = affected_reverse_walk(depth, &edges, seed_evidence, &graph.labels);
 
-        let mut impacted_symbols = distances
-            .iter()
-            .filter_map(|(node_id, distance)| {
-                let node = nodes_by_id.get(node_id)?;
-                if node.kind == codestory_contracts::graph::NodeKind::FILE {
-                    return None;
-                }
-                let file_path = node
-                    .file_node_id
-                    .and_then(|file_id| file_path_by_id.get(&file_id).cloned());
-                if filter.as_deref().is_some_and(|needle| {
-                    !labels
-                        .get(node_id)
-                        .is_some_and(|label| normalize_path_key(label).contains(needle))
-                        && !file_path
-                            .as_deref()
-                            .is_some_and(|path| normalize_path_key(path).contains(needle))
-                }) {
-                    return None;
-                }
-                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
-                    let mut fallback = AffectedGraphEvidence::seed(
-                        *node_id,
-                        "reached by dependent graph walk",
-                        AffectedConfidenceFloor::from_label("graph"),
-                        false,
-                    );
-                    fallback.distance = *distance;
-                    fallback
-                });
-                let confidence = graph_evidence.confidence_floor.label().to_string();
-                Some(AffectedSymbolDto {
-                    node_id: NodeId::from(*node_id),
-                    display_name: labels
-                        .get(node_id)
-                        .cloned()
-                        .unwrap_or_else(|| node.serialized_name.clone()),
-                    kind: NodeKind::from(node.kind),
-                    file_path,
-                    line: node.start_line,
-                    distance: *distance,
-                    graph_depth: graph_evidence.distance,
-                    reason: graph_evidence.reason,
-                    confidence,
-                })
-            })
-            .collect::<Vec<_>>();
-        let direct_impact_count = impacted_symbols
-            .iter()
-            .filter(|symbol| symbol.distance == 0)
-            .count();
-        let propagated_impact_count = impacted_symbols
-            .iter()
-            .filter(|symbol| symbol.distance > 0)
-            .count();
-        impacted_symbols.sort_by(|left, right| {
-            left.distance
-                .cmp(&right.distance)
-                .then(left.file_path.cmp(&right.file_path))
-                .then(left.display_name.cmp(&right.display_name))
-                .then(left.node_id.0.cmp(&right.node_id.0))
-        });
-        let impacted_symbol_total = impacted_symbols.len();
-        let impacted_symbols_truncated = impacted_symbol_total > 200;
-        impacted_symbols.truncate(200);
+        let symbol_impacts =
+            affected_symbol_impacts(&distances, &evidence, &graph, filter.as_deref());
+        let impacted_symbols = symbol_impacts.symbols;
+        let direct_impact_count = symbol_impacts.direct_count;
+        let propagated_impact_count = symbol_impacts.propagated_count;
+        let impacted_symbol_total = symbol_impacts.total;
+        let impacted_symbols_truncated = symbol_impacts.truncated;
 
-        let mut impacted_routes = distances
-            .iter()
-            .filter_map(|(node_id, distance)| {
-                let node = nodes_by_id.get(node_id)?;
-                let file_path = node
-                    .file_node_id
-                    .and_then(|file_id| file_path_by_id.get(&file_id).cloned());
-                if filter.as_deref().is_some_and(|needle| {
-                    !labels
-                        .get(node_id)
-                        .is_some_and(|label| normalize_path_key(label).contains(needle))
-                        && !file_path
-                            .as_deref()
-                            .is_some_and(|path| normalize_path_key(path).contains(needle))
-                }) {
-                    return None;
-                }
-                let display_name = labels
-                    .get(node_id)
-                    .cloned()
-                    .unwrap_or_else(|| node.serialized_name.clone());
-                let route = self.route_endpoint_metadata(
-                    &storage,
-                    node,
-                    file_path.as_deref(),
-                    &display_name,
-                )?;
-                let graph_evidence = evidence.get(node_id).cloned().unwrap_or_else(|| {
-                    let mut fallback = AffectedGraphEvidence::seed(
-                        *node_id,
-                        "route endpoint reached by dependent graph walk",
-                        AffectedConfidenceFloor::from_label("graph"),
-                        false,
-                    );
-                    fallback.distance = *distance;
-                    fallback
-                });
-                let confidence =
-                    affected_route_confidence(&graph_evidence, route.confidence.as_deref());
-                Some(AffectedRouteDto {
-                    node_id: NodeId::from(*node_id),
-                    display_name,
-                    file_path,
-                    line: node.start_line,
-                    distance: *distance,
-                    graph_depth: graph_evidence.distance,
-                    reason: graph_evidence.reason,
-                    confidence,
-                    route,
-                })
-            })
-            .collect::<Vec<_>>();
-        impacted_routes.sort_by(|left, right| {
-            left.distance
-                .cmp(&right.distance)
-                .then(left.file_path.cmp(&right.file_path))
-                .then(left.display_name.cmp(&right.display_name))
-                .then(left.node_id.0.cmp(&right.node_id.0))
-        });
-        let impacted_route_total = impacted_routes.len();
-        let impacted_routes_truncated = impacted_route_total > 100;
-        impacted_routes.truncate(100);
-
-        let mut impacted_by_test_file = BTreeMap::<String, (u32, u32, String)>::new();
-        for symbol in &impacted_symbols {
-            if let Some(path) = symbol.file_path.as_deref()
-                && path_role_from_key(&normalize_path_key(path)) == IndexedFileRoleDto::Test
-            {
-                let entry = impacted_by_test_file.entry(path.to_string()).or_insert((
-                    0,
-                    symbol.graph_depth,
-                    symbol.confidence.clone(),
-                ));
-                entry.0 += 1;
-                if symbol.graph_depth < entry.1 {
-                    entry.1 = symbol.graph_depth;
-                    entry.2.clone_from(&symbol.confidence);
-                }
-            }
-        }
-        let impacted_tests = impacted_by_test_file
-            .into_iter()
-            .map(
-                |(path, (impacted_symbol_count, distance, confidence))| AffectedTestFileDto {
-                    path,
-                    reason: "focused test hint: test-like path reached by affected graph walk"
-                        .to_string(),
-                    confidence,
-                    distance,
-                    graph_depth: distance,
-                    impacted_symbol_count,
-                },
-            )
-            .collect::<Vec<_>>();
+        let route_impacts =
+            self.affected_route_impacts(&storage, &distances, &evidence, &graph, filter.as_deref());
+        let impacted_routes = route_impacts.routes;
+        let impacted_route_total = route_impacts.total;
+        let impacted_routes_truncated = route_impacts.truncated;
+        let impacted_tests = affected_test_impacts(&impacted_symbols);
 
         let mut notes = Vec::new();
         let mut blind_spots = Vec::new();
