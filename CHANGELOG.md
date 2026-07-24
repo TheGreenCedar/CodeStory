@@ -12,6 +12,8 @@
 - Require exact packaged retrieval readiness on protected Mac and Windows
   release hosts without making optional performance or answer-quality evaluation
   a shipping gate.
+- Give cold Linux retrieval contract runs enough bounded time to complete
+  instead of canceling passing protocol tests mid-suite.
 
 ## 0.16.0
 

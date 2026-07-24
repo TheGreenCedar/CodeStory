@@ -859,6 +859,9 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
   }
 
   for (const [name, mutate] of [
+    ["shortened producer timeout", job => {
+      job["timeout-minutes"] = 30;
+    }],
     ["incompatible retrieval path", job => {
       draftStep(job, "Restore Cargo registry, git sources, and build output").with.path = "~/.cargo/registry\ntarget/retrieval\n";
     }],

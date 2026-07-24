@@ -652,6 +652,11 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
 
   add(
     violations,
+    retrievalJob["timeout-minutes"] === 45,
+    "retrieval cache producer timeout must remain 45 minutes",
+  );
+  add(
+    violations,
     hasExactKeys(job, ["name", "runs-on", "timeout-minutes", "steps"]),
     "draft source job must keep its exact required serial shape",
   );
