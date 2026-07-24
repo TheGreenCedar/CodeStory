@@ -244,19 +244,26 @@ fn cli_stays_thin() {
 }
 
 #[test]
-fn cli_binary_uses_the_library_module_graph() {
+fn cli_binaries_preserve_the_library_module_graph() {
     let cli_main = read("crates/codestory-cli/src/main.rs");
+    let runtime_main = read("crates/codestory-cli/src/runtime_main.rs");
     let cli_lib = read("crates/codestory-cli/src/lib.rs");
-    assert!(
-        !cli_main.lines().any(|line| {
+    let launcher_modules = cli_main
+        .lines()
+        .filter_map(|line| {
             let line = line.trim_start();
-            line.starts_with("mod ") || line.starts_with("pub mod ")
-        }),
-        "the CLI binary must not compile a second module graph"
+            line.strip_prefix("mod ")
+                .and_then(|module| module.strip_suffix(';'))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        launcher_modules,
+        ["native_launcher", "native_runtime_layout"],
+        "the public CLI binary may own only its static native launcher"
     );
     assert!(
-        cli_main.contains("codestory_cli::run()"),
-        "the CLI binary should delegate to the library entrypoint"
+        runtime_main.contains("codestory_cli::run()"),
+        "the internal runtime binary should delegate to the library entrypoint"
     );
     for module in ["embedding_server_transport", "sidecar_runtime"] {
         let declaration = format!("mod {module};");
@@ -266,8 +273,8 @@ fn cli_binary_uses_the_library_module_graph() {
             "{module} should have one library-owned module declaration"
         );
         assert!(
-            !cli_main.contains(&declaration),
-            "{module} must not be compiled again by the binary"
+            !cli_main.contains(&declaration) && !runtime_main.contains(&declaration),
+            "{module} must not be compiled again by either binary"
         );
     }
 }
