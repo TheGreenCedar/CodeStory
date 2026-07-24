@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from .archive import load_native_manifest
-from .contracts import write_json
+from .contract_primitives import write_json
 from .foundation import NATIVE_MANIFEST_FILE, ProofFailure
+from .native_manifest import load_native_manifest
 from .self_test_full_stack_types import FullStackFixture
 
 

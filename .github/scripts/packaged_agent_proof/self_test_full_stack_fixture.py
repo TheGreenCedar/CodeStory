@@ -9,15 +9,12 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .archive import (
-    embedding_contract_digest,
+from .archive_io import (
     expected_archive_digest,
     find_cli,
-    load_native_manifest,
-    parse_server_proof_identity,
     unpack_archive,
 )
-from .contracts import (
+from .contract_primitives import (
     assert_retained_json_privacy,
     sha256,
     write_json,
@@ -30,6 +27,11 @@ from .foundation import (
     ProofFailure,
     require,
 )
+from .native_contract_identity import (
+    embedding_contract_digest,
+    parse_server_proof_identity,
+)
+from .native_manifest import load_native_manifest
 from .self_test_full_stack_types import FullStackFixture
 
 

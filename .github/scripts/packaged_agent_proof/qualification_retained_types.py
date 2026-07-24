@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contracts import selected_qualification_matrix_cell
 from .foundation import QUALIFICATION_SCHEMA_VERSION, require
+from .measurement_samples import selected_qualification_matrix_cell
 
 
 @dataclass(frozen=True)

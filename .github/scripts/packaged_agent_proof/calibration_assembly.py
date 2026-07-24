@@ -7,16 +7,12 @@ import json
 from pathlib import Path
 
 from .calibration_verification import verify_calibration_bundle
-from .contracts import (
-    load_server_measurement_contract,
-    require_nonempty_string,
-    sha256,
-    write_json,
-)
+from .contract_primitives import require_nonempty_string, sha256, write_json
 from .foundation import (
     ProofFailure,
     require,
 )
+from .measurement_protocol import load_server_measurement_contract
 
 
 def _calibration_run_documents(

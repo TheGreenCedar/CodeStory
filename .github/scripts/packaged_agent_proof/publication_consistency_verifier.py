@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .contracts import require_exact_keys, require_sha256
+from .contract_primitives import require_exact_keys, require_sha256
 from .foundation import (
     FAULT_RECOVERY_CONSISTENCY_CASES,
     FAULT_RECOVERY_CONSISTENCY_CONTRACT,

@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 from packaged_agent_proof.cli import main
-from packaged_agent_proof.contracts import ProofFailure
+from packaged_agent_proof.foundation import ProofFailure
 
 if __name__ == "__main__":
     try:

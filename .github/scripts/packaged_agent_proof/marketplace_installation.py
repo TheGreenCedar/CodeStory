@@ -9,7 +9,7 @@ from pathlib import Path
 
 import tomllib
 
-from .contracts import require_exact_keys
+from .contract_primitives import require_exact_keys
 from .foundation import PINNED_CODEX_CLI_VERSION, REPOSITORY_ROOT, require
 from .installation_support import directory_contract_sha256, same_existing_path
 

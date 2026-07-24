@@ -6,11 +6,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .contracts import (
-    load_holdout_task_contracts,
-    require_nonempty_string,
-    require_positive_int,
-)
+from .contract_primitives import require_nonempty_string, require_positive_int
 from .foundation import (
     HOLDOUT_TASK_ROOT,
     MIN_RETRIEVAL_QUALITY_REPEATS,
@@ -19,6 +15,7 @@ from .foundation import (
     RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
     require,
 )
+from .measurement_protocol import load_holdout_task_contracts
 from .runtime_evidence_support import load_external_raw_evidence
 
 

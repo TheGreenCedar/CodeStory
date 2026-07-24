@@ -13,7 +13,7 @@ from .calibration_records import (
     _calibration_sample,
     _record_calibration_durations,
 )
-from .contracts import require_exact_keys, require_nonnegative_int
+from .contract_primitives import require_exact_keys, require_nonnegative_int
 from .foundation import require
 
 

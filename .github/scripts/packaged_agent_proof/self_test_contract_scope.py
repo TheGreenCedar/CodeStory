@@ -6,11 +6,11 @@ import argparse
 import json
 from pathlib import Path
 
-from .contracts import require_sha256, validate_runtime_claim_scope
+from .contract_primitives import require_sha256, validate_runtime_claim_scope
 from .foundation import ProofFailure, require
-from .process import parse_byte_quantity
+from .process_memory_sampling import parse_byte_quantity
+from .publication_protocol import publication_identity_from_status
 from .qualification_recording import record_qualification_contract
-from .runtime import publication_identity_from_status
 
 
 def _claim_scope_tests() -> None:

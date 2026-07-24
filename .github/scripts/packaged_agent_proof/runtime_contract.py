@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .archive import verify_runtime_against_manifest
-from .calibration import produce_qualification_evidence
-from .contracts import require_nonempty_string, sha256
+from .contract_primitives import require_nonempty_string, sha256
 from .foundation import require
-from .installation import prove_ground_only_runtime
-from .process import add_exception_note, wait_for_final_temporary_package_server
-from .runtime import prove_runtime
+from .ground_proof import prove_ground_only_runtime
+from .native_contract_identity import verify_runtime_against_manifest
+from .qualification_workflow import produce_qualification_evidence
+from .runtime_bootstrap import prove_runtime
+from .server_cleanup import wait_for_final_temporary_package_server
+from .subprocess_control import add_exception_note
 
 
 def run_runtime_proof(

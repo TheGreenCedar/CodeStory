@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .contracts import (
+from .contract_primitives import (
     assert_retained_json_privacy,
     canonical_sha256,
     require_positive_int,

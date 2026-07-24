@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .contracts import require_nonempty_string, sha256
+from .contract_primitives import require_nonempty_string, sha256
 from .foundation import require
 from .installation_support import same_existing_path
 

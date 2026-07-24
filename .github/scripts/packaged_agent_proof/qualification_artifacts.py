@@ -18,7 +18,7 @@ from .qualification_artifact_transitions import (
 )
 from .qualification_artifact_types import QualificationArtifactEvidence
 from .qualification_orchestration import _qualification_orchestration
-from .qualification_scenarios import derive_scenario_assertions
+from .qualification_scenario_assertions import derive_scenario_assertions
 
 
 def _verify_qualification_summary(

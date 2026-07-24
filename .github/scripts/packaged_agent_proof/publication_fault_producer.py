@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .contracts import write_private_json
+from .contract_primitives import write_private_json
 from .publication_fault_evidence import (
     _consistency_payload,
     _post_fault_observations,

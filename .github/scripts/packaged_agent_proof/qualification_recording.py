@@ -6,12 +6,9 @@ import argparse
 import json
 from pathlib import Path
 
-from .contracts import (
-    require_nonempty_string,
-    selected_qualification_matrix_cell,
-    sha256,
-)
+from .contract_primitives import require_nonempty_string, sha256
 from .foundation import ProofFailure, require
+from .measurement_samples import selected_qualification_matrix_cell
 from .qualification_retained import verify_retained_qualification
 from .runtime_contract import installed_runtime_provenance_is_proven
 

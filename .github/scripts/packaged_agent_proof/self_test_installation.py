@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from .foundation import REPOSITORY_ROOT, ProofFailure, require
-from .process import McpProcess
+from .subprocess_control import McpProcess
 
 
 class ScriptedMcpProcess(McpProcess):

@@ -12,7 +12,7 @@ from native_binary_contract import (
     runtime_artifact_role,
 )
 
-from .contracts import sha256
+from .contract_primitives import sha256
 from .foundation import (
     NATIVE_ENGINE_MARKER_PREFIX,
     NATIVE_MANIFEST_FILE,

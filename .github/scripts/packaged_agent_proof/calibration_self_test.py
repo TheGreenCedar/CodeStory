@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .contracts import canonical_sha256, sha256, write_json
+from .contract_primitives import canonical_sha256, sha256, write_json
 from .foundation import TARGET_CONTRACTS
 
 _MEMORY_ROLES = (

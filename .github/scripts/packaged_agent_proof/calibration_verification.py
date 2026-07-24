@@ -11,7 +11,7 @@ from .calibration_metrics import (
     _verified_calibration_runs,
 )
 from .calibration_records import _calibration_bundle
-from .contracts import sha256
+from .contract_primitives import sha256
 
 
 def verify_calibration_bundle(

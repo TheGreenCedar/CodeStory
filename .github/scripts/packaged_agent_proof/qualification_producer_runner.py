@@ -6,18 +6,18 @@ import hashlib
 import json
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
-    selected_qualification_matrix_cell,
     write_private_json,
 )
 from .foundation import REQUIRED_SERVER_SCENARIOS, ProofFailure, require
-from .process import run
+from .measurement_samples import selected_qualification_matrix_cell
 from .qualification_production_types import (
     QualificationProducerContext,
     QualificationRunnerEvidence,
 )
+from .subprocess_control import run
 
 
 def _qualification_request(

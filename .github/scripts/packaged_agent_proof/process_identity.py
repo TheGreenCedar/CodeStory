@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from .contracts import require_nonempty_string, require_sha256
+from .contract_primitives import require_nonempty_string, require_sha256
 from .foundation import ProofFailure, require
 
 

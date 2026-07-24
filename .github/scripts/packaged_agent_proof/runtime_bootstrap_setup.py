@@ -7,15 +7,13 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from .contracts import sha256, write_private_json
+from .contract_primitives import sha256, write_private_json
 from .foundation import TARGET_CONTRACTS, require
-from .installation import (
-    create_second_repository,
-    installed_plugin_identity,
-    qualification_environment,
-)
-from .process import McpProcess, process_start_identity
+from .installation_support import create_second_repository, qualification_environment
+from .installed_identity import installed_plugin_identity
+from .process_identity import process_start_identity
 from .runtime_bootstrap_types import HostPair, RuntimeSetup
+from .subprocess_control import McpProcess
 
 
 def _proof_projects(args: argparse.Namespace, root: Path) -> tuple[Path, Path, str]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contracts import (
+from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
     require_nonnegative_int,

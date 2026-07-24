@@ -6,19 +6,21 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .contracts import (
-    qualification_measurement_sample_value,
+from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
     require_nonnegative_int,
     require_opaque_identifier,
     require_positive_int,
-    selected_qualification_matrix_cell,
 )
 from .foundation import (
     EXTERNAL_QUALIFICATION_METRICS,
     TARGET_CONTRACTS,
     require,
+)
+from .measurement_samples import (
+    qualification_measurement_sample_value,
+    selected_qualification_matrix_cell,
 )
 from .qualification_documents import (
     PrivateJsonArtifact,

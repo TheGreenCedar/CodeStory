@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     require_exact_keys,
     require_nonnegative_int,
     require_opaque_identifier,

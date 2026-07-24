@@ -6,17 +6,15 @@ import argparse
 import json
 from pathlib import Path
 
-from .archive import expected_archive_digest
+from .archive_io import expected_archive_digest
 from .archive_proof import run_archive_proof
-from .calibration import assemble_calibration_bundle
-from .contracts import (
+from .calibration_assembly import assemble_calibration_bundle
+from .candidate_installation import prepare_candidate_installed_proof
+from .contract_primitives import (
     sha256,
     validate_runtime_claim_scope,
 )
 from .foundation import DEFAULT_QUERY, DEFAULT_QUESTION, MEASUREMENT_PROTOCOL, require
-from .installation import (
-    prepare_candidate_installed_proof,
-)
 from .qualification_artifacts import (
     require_candidate_matrix_installation_source,
 )

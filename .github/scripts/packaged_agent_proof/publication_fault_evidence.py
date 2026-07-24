@@ -10,7 +10,6 @@ from .foundation import (
     PUBLICATION_FAULT_EVIDENCE_CONTRACT,
     require,
 )
-from .process import json_command
 from .publication_fault_types import (
     PublicationCommands,
     PublicationFaultRun,
@@ -21,6 +20,7 @@ from .publication_protocol import (
     run_quality_search,
     server_observation_from_control_event,
 )
+from .subprocess_control import json_command
 
 
 def _post_fault_observations(

@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 
 from .foundation import FAULT_RECOVERY_CONSISTENCY_CASES
-from .process import json_command
 from .publication_fault_types import PublicationCommands, PublicationFixture
 from .publication_protocol import publication_identity_from_status, run_quality_search
+from .subprocess_control import json_command
 
 
 def _publication_fixture(private_root: Path) -> PublicationFixture:

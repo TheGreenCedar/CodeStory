@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 from .foundation import ProofFailure, require
-from .qualification_scenarios import validate_replay_attempts, validate_retry_state
+from .qualification_scenario_evidence import validate_replay_attempts, validate_retry_state
 
 
 def _replay_attempt(

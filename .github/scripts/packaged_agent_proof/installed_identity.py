@@ -7,7 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from .contracts import require_exact_keys, sha256
+from .contract_primitives import require_exact_keys, sha256
 from .foundation import REPOSITORY_ROOT, ProofFailure, require
 from .installation_support import directory_contract_sha256, same_existing_path
 from .marketplace_installation import marketplace_installed_plugin_identity

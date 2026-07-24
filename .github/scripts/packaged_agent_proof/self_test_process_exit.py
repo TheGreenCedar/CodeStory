@@ -10,11 +10,10 @@ import tempfile
 from pathlib import Path
 
 from .foundation import ProofFailure, require
-from .process import (
-    ExactProcessExitWaiter,
+from .process_identity import ExactProcessExitWaiter, process_start_identity
+from .server_cleanup import (
     native_server_exit_wait_budget,
     native_server_exit_wait_required,
-    process_start_identity,
     remaining_native_server_exit_wait_ms,
     retained_final_native_server_exit_evidence,
 )

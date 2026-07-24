@@ -6,7 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .contracts import require_nonempty_string
+from .contract_primitives import require_nonempty_string
 from .foundation import require
 
 

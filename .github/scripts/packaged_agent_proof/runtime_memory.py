@@ -5,16 +5,18 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .contracts import (
-    qualification_measurement_sample_value,
+from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
     require_opaque_identifier,
     require_positive_int,
-    selected_qualification_matrix_cell,
     write_private_json,
 )
 from .foundation import MEMORY_EVIDENCE_CONTRACT, TARGET_CONTRACTS, require
+from .measurement_samples import (
+    qualification_measurement_sample_value,
+    selected_qualification_matrix_cell,
+)
 
 
 def _write_memory_payload(

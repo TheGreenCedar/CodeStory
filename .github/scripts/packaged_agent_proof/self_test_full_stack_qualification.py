@@ -9,13 +9,13 @@ from .foundation import (
     PINNED_CODEX_CLI_VERSION,
     ProofFailure,
 )
-from .process import engine_identity
 from .qualification_retained import verify_retained_qualification
 from .self_test_full_stack_types import (
     ExternalEvidenceFixture,
     FullStackFixture,
     ServerIdentityFixture,
 )
+from .server_engine_identity import engine_identity
 
 
 def _package_and_host_evidence(fixture: FullStackFixture) -> tuple[dict, dict]:

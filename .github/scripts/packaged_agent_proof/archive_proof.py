@@ -6,18 +6,17 @@ import argparse
 import os
 from pathlib import Path
 
-from .archive import find_cli, load_native_manifest, unpack_archive
-from .calibration import verify_calibration_bundle
-from .contracts import verify_package_server_contracts, write_json
+from .archive_io import find_cli, unpack_archive
+from .calibration_verification import verify_calibration_bundle
+from .contract_primitives import write_json
 from .foundation import LEGACY_HELP_TOKENS, REPOSITORY_ROOT, require
-from .installation import isolated_environment
-from .process import (
-    FailurePreservingTemporaryDirectory,
-    native_server_exit_wait_budget,
-    run,
-)
+from .installation_support import isolated_environment
+from .native_manifest import load_native_manifest
+from .package_contracts import verify_package_server_contracts
 from .qualification_recording import record_qualification_contract
 from .runtime_contract import record_runtime_contract, run_runtime_proof
+from .server_cleanup import native_server_exit_wait_budget
+from .subprocess_control import FailurePreservingTemporaryDirectory, run
 
 
 def verify_package_source(

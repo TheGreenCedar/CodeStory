@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     normalized_backend,
     require_sha256,
 )

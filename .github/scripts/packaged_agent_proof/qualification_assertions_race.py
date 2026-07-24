@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contracts import require_positive_int
+from .contract_primitives import require_positive_int
 from .foundation import HEX_SHA256, require
 from .qualification_scenario_evidence import ScenarioAssertionEvidence
 

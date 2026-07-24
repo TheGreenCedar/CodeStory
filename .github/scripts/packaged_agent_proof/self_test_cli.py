@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .archive_proof import claim_scope
 from .cli import _installed_proof_source, _resolve_optional_paths
-from .contracts import write_json
+from .contract_primitives import write_json
 from .foundation import ProofFailure, require
 from .qualification_recording import record_calibration_qualification
 

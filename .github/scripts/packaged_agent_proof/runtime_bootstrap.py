@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .contracts import retained_mcp_transcript, write_json
+from .contract_primitives import retained_mcp_transcript, write_json
 from .runtime_bootstrap_cold import _cold_shared_proof, _snippet_contract
 from .runtime_bootstrap_continuity import (
     _continuity_proof,

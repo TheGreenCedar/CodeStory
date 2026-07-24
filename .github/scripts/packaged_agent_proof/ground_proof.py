@@ -7,7 +7,7 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     assert_retained_json_privacy,
     require_nonempty_string,
     retained_mcp_transcript,
@@ -20,7 +20,7 @@ from .foundation import LOWER_TIER_NONCLAIMS, require
 from .installation_support import assert_no_legacy_state, qualification_environment
 from .installed_identity import installed_plugin_identity
 from .managed_runtime import verify_managed_runtime_status
-from .process import McpProcess
+from .subprocess_control import McpProcess
 
 
 def _qualification_environment(

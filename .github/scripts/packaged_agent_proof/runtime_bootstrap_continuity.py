@@ -5,22 +5,21 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     require_nonempty_string,
     retained_mcp_transcript,
     sha256,
     write_json,
 )
 from .foundation import require
-from .installation import run_parallel, verify_managed_runtime_status
-from .process import (
-    McpProcess,
-    capture_five_process_memory,
-    engine_identity,
-    process_start_identity,
-    server_snapshot,
-)
+from .installation_support import run_parallel
+from .managed_runtime import verify_managed_runtime_status
+from .memory_observation import capture_five_process_memory
+from .process_identity import process_start_identity
 from .runtime_bootstrap_types import ColdProof, ContinuityProof, HostPair, RuntimeSetup
+from .server_engine_identity import engine_identity
+from .server_identity import server_snapshot
+from .subprocess_control import McpProcess
 
 
 def _managed_runtime(

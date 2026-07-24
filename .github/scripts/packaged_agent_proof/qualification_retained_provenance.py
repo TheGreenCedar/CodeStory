@@ -5,8 +5,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .archive import normalized_backend
-from .contracts import require_nonempty_string, require_positive_int, require_sha256
+from .contract_primitives import (
+    normalized_backend,
+    require_nonempty_string,
+    require_positive_int,
+    require_sha256,
+)
 from .foundation import (
     CANDIDATE_PRODUCER_WORKFLOW_PATHS,
     PINNED_CODEX_CLI_VERSION,

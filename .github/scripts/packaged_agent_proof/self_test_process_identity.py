@@ -6,7 +6,7 @@ import os
 import sys
 
 from .foundation import ProofFailure
-from .process import (
+from .process_identity import (
     live_process_executable_sha256,
     process_start_identity,
     verified_live_executable,

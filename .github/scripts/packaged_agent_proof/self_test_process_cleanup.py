@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .foundation import ProofFailure, require
-from .process import FailurePreservingTemporaryDirectory
+from .subprocess_control import FailurePreservingTemporaryDirectory
 
 
 def _primary_failure_preservation_test() -> None:

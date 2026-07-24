@@ -7,16 +7,16 @@ import os
 import time
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     canonical_sha256,
-    load_measurement_protocol,
     require_exact_keys,
     require_nonempty_string,
     require_positive_int,
-    selected_qualification_matrix_cell,
     sha256,
 )
 from .foundation import MEMORY_EVIDENCE_CONTRACT, TARGET_CONTRACTS, require
+from .measurement_protocol import load_measurement_protocol
+from .measurement_samples import selected_qualification_matrix_cell
 from .process_identity import process_start_identity, verified_live_executable
 from .process_memory_sampling import process_resident_memory, suspend_clock_pair
 from .subprocess_control import McpProcess

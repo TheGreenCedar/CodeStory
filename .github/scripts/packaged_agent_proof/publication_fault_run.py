@@ -7,7 +7,7 @@ import secrets
 import subprocess
 from pathlib import Path
 
-from .contracts import write_private_json
+from .contract_primitives import write_private_json
 from .foundation import require
 from .publication_fault_setup import _restore_fixture
 from .publication_fault_types import (

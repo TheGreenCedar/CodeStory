@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .calibration_lineage import verify_calibration_source_lineage
 from .calibration_records import CalibrationAccumulator, CalibrationBundle
-from .contracts import canonical_sha256, sha256
+from .contract_primitives import canonical_sha256, sha256
 from .foundation import require
 
 

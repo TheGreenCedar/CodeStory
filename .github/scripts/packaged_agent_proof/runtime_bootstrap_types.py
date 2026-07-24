@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .process import McpProcess
+from .subprocess_control import McpProcess
 
 
 @dataclass(frozen=True)

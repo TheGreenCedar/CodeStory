@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     canonical_sha256,
     require_nonempty_string,
     require_opaque_identifier,
@@ -18,7 +18,7 @@ from .contracts import (
     write_private_json,
 )
 from .foundation import ProofFailure, require
-from .process import json_command, run
+from .subprocess_control import json_command, run
 
 
 def read_jsonl(path: Path) -> list[dict]:

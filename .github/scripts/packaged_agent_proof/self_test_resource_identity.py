@@ -11,8 +11,9 @@ from .foundation import (
     require,
     resource_uri_matches,
 )
-from .installation import run_parallel
-from .process import extract_resource, require_native_process_start_identity
+from .installation_support import run_parallel
+from .process_identity import require_native_process_start_identity
+from .subprocess_control import extract_resource
 
 SHORT_WINDOWS_RESOURCE = (
     "codestory://diagnostics/retrieval-engine"

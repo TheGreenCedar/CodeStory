@@ -7,7 +7,7 @@ import math
 import time
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     require_nonempty_string,
     require_positive_int,
     require_sha256,

@@ -5,15 +5,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .contracts import (
+from .contract_primitives import (
     assert_retained_json_privacy,
     retained_runtime_evidence,
     sha256,
     write_json,
 )
 from .foundation import LOWER_TIER_NONCLAIMS
-from .installation import assert_no_legacy_state
-from .process import current_account_identity, opaque_repository_id
+from .installation_support import assert_no_legacy_state
+from .process_identity import current_account_identity, opaque_repository_id
 from .runtime_bootstrap_types import (
     HostPair,
     RuntimePhaseEvidence,

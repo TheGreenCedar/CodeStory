@@ -7,10 +7,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .archive import normalized_backend
-from .contracts import (
+from .contract_primitives import (
     canonical_sha256,
-    qualification_measurement_sample_value,
+    normalized_backend,
     require_exact_keys,
     require_nonempty_string,
     require_nonnegative_int,
@@ -19,6 +18,7 @@ from .contracts import (
     require_sha256,
 )
 from .foundation import TARGET_CONTRACTS, ProofFailure, require
+from .measurement_samples import qualification_measurement_sample_value
 
 
 @dataclass(frozen=True)

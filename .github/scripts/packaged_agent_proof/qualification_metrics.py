@@ -6,9 +6,9 @@ import os
 import sys
 from dataclasses import dataclass
 
-from .archive import normalized_backend
-from .contracts import (
+from .contract_primitives import (
     canonical_sha256,
+    normalized_backend,
     require_nonempty_string,
 )
 from .foundation import require
@@ -18,7 +18,8 @@ from .qualification_production_types import (
     QualificationProducerContext,
     QualificationRunnerEvidence,
 )
-from .runtime import metric_passes, retain_five_process_memory_evidence
+from .runtime_evidence_support import metric_passes
+from .runtime_memory import retain_five_process_memory_evidence
 
 
 @dataclass(frozen=True)

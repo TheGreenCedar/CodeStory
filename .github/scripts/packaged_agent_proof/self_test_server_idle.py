@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from .foundation import ProofFailure, require
-from .qualification_scenarios import derive_scenario_assertions
+from .qualification_scenario_assertions import derive_scenario_assertions
 from .self_test_full_stack_types import ServerIdentityFixture, TrueIdleFixture
 
 
