@@ -10,7 +10,17 @@ pub fn cli_command() -> Command {
     command(cli_binary_path())
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn cli_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli-runtime"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn cli_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli"))
+}
+
+pub fn launcher_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli"))
 }
 
