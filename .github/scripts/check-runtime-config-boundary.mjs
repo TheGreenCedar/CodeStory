@@ -22,8 +22,17 @@ function rustFiles(root) {
   });
 }
 
+function isOutOfLineTestSource(file) {
+  const components = file.split(path.sep);
+  const sourceIndex = components.lastIndexOf("src");
+  if (sourceIndex < 0) return false;
+  const sourceChild = components[sourceIndex + 1];
+  return sourceChild === "tests" || sourceChild === "tests.rs";
+}
+
 const violations = [];
 for (const file of roots.flatMap(rustFiles)) {
+  if (isOutOfLineTestSource(file)) continue;
   const source = fs.readFileSync(file, "utf8");
   const production = source.split(/\r?\n#\[cfg\(test\)\]\r?\nmod tests\s*\{/u, 1)[0];
   for (const token of forbidden) {
