@@ -11,6 +11,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
 const script = resolve(repositoryRoot, "scripts/prepare-embedded-model.mjs");
 const buildScript = resolve(repositoryRoot, "crates/codestory-llama-sys/build.rs");
 const modelStaging = resolve(repositoryRoot, "crates/codestory-llama-sys/model_staging.rs");
+const nativeStaging = resolve(repositoryRoot, "crates/codestory-llama-sys/native_staging.rs");
 const canonicalContract = resolve(
   repositoryRoot,
   "crates/codestory-llama-sys/model-contract.json",
@@ -185,10 +186,11 @@ test("Cargo's build boundary is process-free and release input is explicit", asy
 });
 
 test("acquisition, build, and Rust evidence consume the checked-in contract", async () => {
-  const [acquisition, build, contract, llama, embeddings, embeddingContract, vectors] =
+  const [acquisition, build, native, contract, llama, embeddings, embeddingContract, vectors] =
     await Promise.all([
       readFile(script, "utf8"),
       readFile(buildScript, "utf8"),
+      readFile(nativeStaging, "utf8"),
       readFile(canonicalContract, "utf8"),
       readFile(llamaSource, "utf8"),
       readFile(retrievalEmbeddings, "utf8"),
@@ -208,7 +210,7 @@ test("acquisition, build, and Rust evidence consume the checked-in contract", as
   assert.doesNotMatch(acquisition, new RegExp(parsed.model.sha256, "u"));
   assert.doesNotMatch(build, new RegExp(parsed.model.sha256, "u"));
   assert.match(build, /DEP_LLAMA_BACKENDS_DIR/u);
-  assert.match(build, /codestory-native-runtime-files-v1\.txt/u);
+  assert.match(native, /codestory-native-runtime-files-v1\.txt/u);
   assert.match(llama, /CompiledModelCompatibility/u);
   assert.match(embeddings, /crate::embedding_contract::CODERANK_QUERY_PREFIX/u);
   assert.match(embeddingContract, /pub\(crate\) const EMBEDDING_NORMALIZATION/u);

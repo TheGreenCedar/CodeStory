@@ -204,7 +204,7 @@ test("default setup rehydrates, indexes, and reports a local result without full
 });
 
 test("Cargo fallback is locked and still feeds the shared setup path", () => {
-  const project = createProject();
+  const project = realpathSync(createProject());
   const home = temporaryRoot();
   const stale = writeExecutable(join(home, "stale-codestory-cli"));
   const binaryName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";

@@ -23,6 +23,17 @@ function rustFiles(root) {
   });
 }
 
+function guardedTestModule(owner) {
+  if (!fs.existsSync(owner)) return null;
+  const declarations = [
+    ...fs
+      .readFileSync(owner, "utf8")
+      .matchAll(/^\s*(#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*)?mod\s+tests\s*;/gmu),
+  ];
+  if (!declarations.length) return null;
+  return declarations.every((declaration) => declaration[1] !== undefined);
+}
+
 function isOutOfLineTestSource(file) {
   const components = file.split(path.sep);
   const sourceIndex = components.lastIndexOf("src");
@@ -44,10 +55,8 @@ function isOutOfLineTestSource(file) {
         .readdirSync(sourceRoot, { withFileTypes: true })
         .filter((entry) => entry.isFile() && entry.name.endsWith(".rs") && entry.name !== "tests.rs")
         .map((entry) => path.join(sourceRoot, entry.name));
-  const guardedTestModule = /#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*;/u;
-  return owners.some(
-    (owner) => fs.existsSync(owner) && guardedTestModule.test(fs.readFileSync(owner, "utf8")),
-  );
+  const guards = owners.map(guardedTestModule).filter((guard) => guard !== null);
+  return guards.length > 0 && guards.every(Boolean);
 }
 
 function main() {
