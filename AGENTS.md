@@ -176,9 +176,12 @@ adapter to compensate for incorrect upstream state.
 - Keep generated comparisons, ledgers, CSVs, SVGs, and pre-release evidence in
   PR bodies, issue comments, Project updates, CI artifacts, or external
   storage unless they are intended as durable product documentation.
-- Update `CHANGELOG.md` in the same change when shipped behavior, operator or
-  contributor guidance, release automation, packaging, or version metadata
-  changes. Keep current work under `Unreleased` until release preparation.
+- Update `CHANGELOG.md` only for user- or operator-visible changes. Write for
+  release-note readers: lead with what changed for them and omit implementation,
+  refactor, CI, proof, issue, and PR mechanics. Contributor-only changes and
+  internal release automation belong in their owning PR or issue unless they
+  materially change what users or operators do or can rely on. Keep current
+  release-note work under `Unreleased` until release preparation.
 - Commit messages are short, lowercase, and imperative.
 
 ## Release Rules
