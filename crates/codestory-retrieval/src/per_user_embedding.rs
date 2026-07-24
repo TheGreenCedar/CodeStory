@@ -3220,33 +3220,62 @@ fn spawn_server_watchdog(
     thread::Builder::new()
         .name("codestory-embedding-watchdog".into())
         .spawn(move || {
-            let mut last_progress = 0_u64;
-            let mut last_progress_at = state.clock.now_ns();
+            let started_ns = state.clock.now_ns();
+            let mut query_progress = WatchdogClassProgress::new(started_ns);
+            let mut bulk_progress = WatchdogClassProgress::new(started_ns);
+            let mut draining_progress = WatchdogClassProgress::new(started_ns);
             while !state.stopped.load(Ordering::Acquire) {
                 state.clock.sleep(budgets.watchdog_poll);
                 if state.stopped.load(Ordering::Acquire) {
                     return;
                 }
-                let active = state.draining.load(Ordering::Acquire)
-                    || state.active.lock().is_ok_and(|active| !active.is_empty());
-                if !active {
-                    last_progress = state
-                        .try_initialized_engine()
-                        .map_or(0, |engine| engine.admission_snapshot().progress_sequence);
-                    last_progress_at = state.clock.now_ns();
-                    continue;
-                }
+                let draining = state.draining.load(Ordering::Acquire);
+                let active_classes = state.active.lock().map_or_else(
+                    |_| ActiveRequestClasses::default(),
+                    |active| ActiveRequestClasses {
+                        query: active
+                            .values()
+                            .any(|request| request.request_class == EmbeddingRequestClass::Query),
+                        bulk: active
+                            .values()
+                            .any(|request| request.request_class == EmbeddingRequestClass::Bulk),
+                    },
+                );
                 let progress = state
                     .try_initialized_engine()
-                    .map_or(0, |engine| engine.admission_snapshot().progress_sequence);
-                if progress != last_progress {
-                    last_progress = progress;
-                    last_progress_at = state.clock.now_ns();
-                    continue;
-                }
-                if elapsed_since(state.clock.as_ref(), last_progress_at)
-                    >= budgets.native_no_progress
-                {
+                    .map(|engine| {
+                        let admission = engine.admission_snapshot();
+                        WatchdogProgressSnapshot {
+                            overall: admission.progress_sequence,
+                            query: admission.query_progress_sequence,
+                            bulk: admission.bulk_progress_sequence,
+                        }
+                    })
+                    .unwrap_or_default();
+                let stalled = query_progress
+                    .observe(
+                        active_classes.query,
+                        progress.query,
+                        state.clock.as_ref(),
+                        budgets.native_no_progress,
+                    )
+                    .or_else(|| {
+                        bulk_progress.observe(
+                            active_classes.bulk,
+                            progress.bulk,
+                            state.clock.as_ref(),
+                            budgets.native_no_progress,
+                        )
+                    })
+                    .or_else(|| {
+                        draining_progress.observe(
+                            draining && !active_classes.query && !active_classes.bulk,
+                            progress.overall,
+                            state.clock.as_ref(),
+                            budgets.native_no_progress,
+                        )
+                    });
+                if let Some(stalled) = stalled {
                     state.record_failure(EmbeddingServerFailureSnapshot {
                         code: "embedding_engine_stalled".into(),
                         retry_class: "same_rpc_once".into(),
@@ -3258,8 +3287,8 @@ fn spawn_server_watchdog(
                             control,
                             &state,
                             budgets,
-                            last_progress,
-                            last_progress_at,
+                            stalled.sequence,
+                            stalled.last_progress_ns,
                         )
                     {
                         tracing::error!(
@@ -3275,6 +3304,67 @@ fn spawn_server_watchdog(
             }
         })
         .context("spawn embedding server watchdog")
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ActiveRequestClasses {
+    query: bool,
+    bulk: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WatchdogProgressSnapshot {
+    overall: u64,
+    query: u64,
+    bulk: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchdogStall {
+    sequence: u64,
+    last_progress_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchdogClassProgress {
+    sequence: u64,
+    last_progress_ns: u64,
+    was_active: bool,
+}
+
+impl WatchdogClassProgress {
+    fn new(now_ns: u64) -> Self {
+        Self {
+            sequence: 0,
+            last_progress_ns: now_ns,
+            was_active: false,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        active: bool,
+        sequence: u64,
+        clock: &dyn AwakeMonotonicClock,
+        timeout: Duration,
+    ) -> Option<WatchdogStall> {
+        if !active {
+            self.was_active = false;
+            self.sequence = sequence;
+            self.last_progress_ns = clock.now_ns();
+            return None;
+        }
+        if !self.was_active || sequence != self.sequence {
+            self.was_active = true;
+            self.sequence = sequence;
+            self.last_progress_ns = clock.now_ns();
+            return None;
+        }
+        (elapsed_since(clock, self.last_progress_ns) >= timeout).then_some(WatchdogStall {
+            sequence,
+            last_progress_ns: self.last_progress_ns,
+        })
+    }
 }
 
 fn publish_watchdog_fail_stop_marker(
@@ -7367,6 +7457,63 @@ mod tests {
         .expect("reopen qualification control")
         .expect("qualification control remains enabled");
         assert_eq!(restarted.last_sequence.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn watchdog_progress_isolated_by_request_class() {
+        let clock = TestClock::new();
+        let timeout = Duration::from_millis(5);
+        let mut query = WatchdogClassProgress::new(clock.now_ns());
+        let mut bulk = WatchdogClassProgress::new(clock.now_ns());
+
+        clock.sleep(Duration::from_millis(3));
+        assert!(query.observe(true, 1, clock.as_ref(), timeout).is_none());
+        assert!(bulk.observe(true, 0, clock.as_ref(), timeout).is_none());
+        clock.sleep(Duration::from_millis(6));
+        assert!(query.observe(true, 2, clock.as_ref(), timeout).is_none());
+        let stalled = bulk
+            .observe(true, 0, clock.as_ref(), timeout)
+            .expect("query progress must not mask a stalled bulk class");
+
+        assert_eq!(stalled.sequence, 0);
+        assert_eq!(stalled.last_progress_ns, 3_000_001);
+    }
+
+    #[test]
+    fn watchdog_class_activation_starts_a_fresh_deadline() {
+        let clock = TestClock::new();
+        let timeout = Duration::from_millis(5);
+        let mut progress = WatchdogClassProgress::new(clock.now_ns());
+
+        clock.sleep(Duration::from_millis(20));
+        assert!(
+            progress
+                .observe(false, 0, clock.as_ref(), timeout)
+                .is_none()
+        );
+        clock.sleep(Duration::from_millis(20));
+        assert!(
+            progress.observe(true, 0, clock.as_ref(), timeout).is_none(),
+            "inactive time must not be charged to a newly active class"
+        );
+        clock.sleep(timeout);
+        assert!(progress.observe(true, 0, clock.as_ref(), timeout).is_some());
+    }
+
+    #[test]
+    fn inactive_watchdog_class_never_trips() {
+        let clock = TestClock::new();
+        let timeout = Duration::from_millis(1);
+        let mut progress = WatchdogClassProgress::new(clock.now_ns());
+
+        for sequence in 0..4 {
+            clock.sleep(Duration::from_millis(10));
+            assert!(
+                progress
+                    .observe(false, sequence, clock.as_ref(), timeout)
+                    .is_none()
+            );
+        }
     }
 
     #[cfg(unix)]
