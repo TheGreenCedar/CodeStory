@@ -68,17 +68,15 @@ is disabled unless the process opts into it.
 
 ## Platform summary
 
-| Platform | Local map | Broad search |
+<!-- codestory-public-support:start -->
+| Released package | Local map | Broad retrieval |
 | --- | --- | --- |
 | macOS 15+ on Apple Silicon | Yes | Metal |
-| macOS 15+ on Intel | Yes | Explicit CPU is maintainer/CI only; no Metal claim |
-| Windows x64 | Yes | Vulkan on supported physical hardware |
-| Windows arm64 | Yes | Vulkan only where the packaged hardware path is proved |
-| Linux x64 / arm64 | Yes | Vulkan requires real hardware proof; hosted jobs use explicit CPU and make no GPU claim |
+| Windows x64 | Yes | Vulkan |
 
-The release contains native packages for the listed architectures. Accelerator
-claims are narrower: they apply only to backends exercised by the protected
-hardware workflows.
+CodeStory 0.16 publishes only these managed package targets.
+Unshipped targets: linux-arm64, linux-x64, macos-x64, windows-arm64. Answer quality and performance are separate release non-claims.
+<!-- codestory-public-support:end -->
 
 ## Everyday use
 

@@ -10,7 +10,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const {
-  assetTarget,
   directoryContractSha256,
   expectedBinaryName,
   receiptName,
@@ -18,6 +17,7 @@ const {
   receiptPluginName,
   receiptPurpose,
   receiptSchemaVersion,
+  sourceBuildTarget,
   validateDevCliReceipt,
 } = require("../plugins/codestory/scripts/codestory-dev-cli-contract.cjs");
 
@@ -322,7 +322,7 @@ function stageCandidate({
       plugin_version: version,
       source_commit: sourceIdentity.commit,
       source_package_sha256: sourceIdentity.sha256,
-      target: assetTarget(platform, arch),
+      target: sourceBuildTarget(platform, arch),
       cli: {
         path: `bin/${cli.name}`,
         name: cli.name,
@@ -376,7 +376,7 @@ export function installDevPlugin(rawOptions = {}) {
   const sourceIdentity = verifyCommittedPluginSource(repoRoot, pluginSource);
   const manifest = pluginManifest(pluginSource);
   const cli = verifyCli(path.resolve(cliPath), manifest.version, rawOptions);
-  const target = assetTarget(rawOptions.platform, rawOptions.arch);
+  const target = sourceBuildTarget(rawOptions.platform, rawOptions.arch);
   if (!target) fail(`unsupported_target:${rawOptions.platform || process.platform}-${rawOptions.arch || process.arch}`);
   marketplaceTargetsStaging(marketplacePlugin, stagingRoot);
 

@@ -9,8 +9,17 @@ readme = "../../README.md"
 keywords = ["code-search", "grounding", "cli", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 
+[[bin]]
+name = "codestory-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "codestory-cli-runtime"
+path = "src/runtime_main.rs"
+
 [dependencies]
 codestory-contracts = { workspace = true }
+codestory-llama-sys = { workspace = true }
 codestory-retrieval = { workspace = true }
 codestory-runtime = { workspace = true }
 codestory-workspace = { workspace = true }

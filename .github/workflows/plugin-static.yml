@@ -11,6 +11,8 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/install-codestory-marketplace-proof.mjs
+      - .github/scripts/install-codestory-marketplace-proof.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
       - .github/scripts/fixtures/actionlint-invalid.yml
       - .github/scripts/run-actionlint.mjs
@@ -71,6 +73,8 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/install-codestory-marketplace-proof.mjs
+      - .github/scripts/install-codestory-marketplace-proof.test.mjs
       - .github/scripts/fixtures/workflow-policy-invalid.json
       - .github/scripts/fixtures/actionlint-invalid.yml
       - .github/scripts/run-actionlint.mjs
@@ -161,6 +165,9 @@ jobs:
         run: |
           node .github/scripts/check-workflow-policy.mjs
           node --test .github/scripts/check-workflow-policy.test.mjs
+
+      - name: Check real Codex marketplace installation
+        run: node --test .github/scripts/install-codestory-marketplace-proof.test.mjs
 
       - name: Check CI proof routing fixtures
         run: node .github/scripts/route-ci-proof.mjs --self-test

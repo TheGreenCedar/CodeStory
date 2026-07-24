@@ -73,6 +73,15 @@ def is_vulkan_loader(name: str, target_os: str) -> bool:
     return False
 
 
+def managed_native_runtime_dependencies(names: list[str]) -> list[str]:
+    """Return public-launcher imports that belong behind the native runtime."""
+    return [
+        name
+        for name in names
+        if any(component in Path(name).name.lower() for component in ("llama", "ggml", "vulkan"))
+    ]
+
+
 def inspect_runtime_layout(
     executable: Path,
     artifacts: list[Path],

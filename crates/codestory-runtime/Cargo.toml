@@ -21,6 +21,7 @@ parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }
 ureq = { workspace = true }
@@ -29,5 +30,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
-sha2 = { workspace = true }
 tempfile = { workspace = true }

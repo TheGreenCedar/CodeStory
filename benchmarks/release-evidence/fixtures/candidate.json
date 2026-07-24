@@ -62,16 +62,10 @@
   },
   "release_claims": {
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "96965d48a2232ee3ff01a538502364bb1598c9ff4375eaf385fc7477ffb5e88f",
+    "graph_sha256": "e01afbbe4c28a2e4838c79bab3f5c5e7f5c6b6339cd6eaec93452257fc1787a8",
     "observed_at": "2026-07-21T02:13:20.738Z",
     "expires_at": "2026-07-22T02:13:20.738Z",
     "requested_claims": [
-      {
-        "id": "retrieval_readiness",
-        "accepted_risks": [
-          "measured-corpus-is-bounded"
-        ]
-      },
       {
         "id": "performance",
         "accepted_risks": [
@@ -87,30 +81,11 @@
     ],
     "evidence": [
       {
-        "id": "retrieval_readiness-222222222222",
-        "type": "retrieval_readiness",
-        "tier": "live_behavior",
-        "status": "pass",
-        "graph_sha256": "96965d48a2232ee3ff01a538502364bb1598c9ff4375eaf385fc7477ffb5e88f",
-        "observed_at": "2026-07-21T02:13:20.738Z",
-        "expires_at": "2026-07-22T02:13:20.738Z",
-        "identity": {
-          "repository": "TheGreenCedar/CodeStory",
-          "commit": "2222222222222222222222222222222222222222",
-          "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
-          "profile": "ci-contract-v1",
-          "corpus_id": "ci-contract-corpus-v1",
-          "cache_id": "cold-full-retrieval-v1",
-          "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
-          "release_key": "ci-contract-v1"
-        }
-      },
-      {
         "id": "performance-222222222222",
         "type": "performance",
         "tier": "live_behavior",
         "status": "measured",
-        "graph_sha256": "96965d48a2232ee3ff01a538502364bb1598c9ff4375eaf385fc7477ffb5e88f",
+        "graph_sha256": "e01afbbe4c28a2e4838c79bab3f5c5e7f5c6b6339cd6eaec93452257fc1787a8",
         "observed_at": "2026-07-21T02:13:20.738Z",
         "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {
@@ -131,7 +106,7 @@
         "type": "answer_quality",
         "tier": "answer_quality",
         "status": "pass",
-        "graph_sha256": "96965d48a2232ee3ff01a538502364bb1598c9ff4375eaf385fc7477ffb5e88f",
+        "graph_sha256": "e01afbbe4c28a2e4838c79bab3f5c5e7f5c6b6339cd6eaec93452257fc1787a8",
         "observed_at": "2026-07-21T02:13:20.738Z",
         "expires_at": "2026-07-22T02:13:20.738Z",
         "identity": {

@@ -4255,6 +4255,8 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         }
     }
@@ -4529,6 +4531,8 @@ mod tests {
                 origin: SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                source_excerpt: None,
+                verification_targets: Vec::new(),
                 score_breakdown: None,
                 ..test_search_hit_defaults()
             },

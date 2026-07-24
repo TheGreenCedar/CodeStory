@@ -705,6 +705,15 @@ pub struct SearchHit {
     pub coverage_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_for_sufficiency: Option<bool>,
+    /// Source text captured by the read operation that produced this hit.
+    ///
+    /// Adapters must render this value instead of reopening the workspace after
+    /// the operation's publication has been released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_excerpt: Option<String>,
+    /// Verification locations derived while the owning publication is pinned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_targets: Vec<SearchVerificationTargetDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score_breakdown: Option<RetrievalScoreBreakdownDto>,
 }
@@ -713,6 +722,19 @@ impl SearchHit {
     pub const fn is_text_match(&self) -> bool {
         matches!(self.origin, SearchHitOrigin::TextMatch)
     }
+}
+
+/// A source location related to a search hit by operation-bound source evidence.
+///
+/// `role` names the evidence relationship. It must not imply parser-backed
+/// declaration or definition semantics when the producer only verified bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SearchVerificationTargetDto {
+    pub role: String,
+    pub file_path: String,
+    pub line: u32,
+    pub display_name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

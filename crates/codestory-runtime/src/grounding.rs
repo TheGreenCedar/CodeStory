@@ -1056,6 +1056,8 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.45,
             semantic: 0.0,

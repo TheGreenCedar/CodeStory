@@ -1118,6 +1118,8 @@ impl AppController {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(structural_unit.is_none() && !openapi_endpoint),
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         };
         decorate_search_hit_evidence(&mut hit);

@@ -124,6 +124,8 @@ python .github/scripts/check-packaged-agent-proof.py --self-test
 A draft exact-package run is explicitly calibration:
 
 ```sh
+cargo build --release --locked -p codestory-bench \
+  --bin codestory_embedding_qualification
 python .github/scripts/check-packaged-agent-proof.py \
   --archive <archive> \
   --checksum-file <checksums> \
@@ -136,8 +138,14 @@ python .github/scripts/check-packaged-agent-proof.py \
   --proof-tier calibration \
   --qualification-matrix-cell hosted_linux_x64_cpu \
   --produce-qualification-evidence \
+  --qualification-driver target/release/codestory_embedding_qualification \
   --qualification-evidence <calibration.json>
 ```
+
+The proof harness invokes this separate driver with `--cli` pointing at the
+exact unpacked packaged executable. Only the nonce-gated worker remains in the
+shipped CLI; scenario orchestration and evidence writing stay in the proof
+tool.
 
 Accuracy or performance qualification may replace `calibration` with its exact
 requested tier and pass `--retrieval-quality-evidence` the exact-head

@@ -108,9 +108,10 @@ Do not hand-author candidate metrics. The provisioned
 `release-candidate-evidence.yml` workflow runs the full repo-scale and
 publishable packet producers on the same clean SHA, records the corpus, cache,
 and machine fingerprint, hashes both non-empty raw artifacts, and derives the
-candidate. It refuses contract-only profiles during release runs. The release
-workflow calls this gate after preflight and does not start packaged proof until
-the evidence decision passes.
+candidate. It refuses contract-only profiles during evaluation runs. This is an
+optional performance and answer-quality lane: failure rejects that evaluation,
+not the standard desktop release. `release.yml` does not call it or wait for
+its protected Linux ARM64 runner.
 
 Provision, verify, recover, and unregister the dedicated Linux host using the
 [release-evidence runner runbook](../contributors/release-evidence-runner.md).

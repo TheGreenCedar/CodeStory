@@ -11,7 +11,7 @@ const receiptPluginName = 'codestory';
 const sha256Pattern = /^[0-9a-f]{64}$/u;
 const commitPattern = /^[0-9a-f]{40}$/u;
 
-function assetTarget(platform = process.platform, arch = process.arch) {
+function sourceBuildTarget(platform = process.platform, arch = process.arch) {
   if (platform === 'win32' && arch === 'x64') return 'windows-x64';
   if (platform === 'win32' && arch === 'arm64') return 'windows-arm64';
   if (platform === 'linux' && arch === 'x64') return 'linux-x64';
@@ -178,7 +178,7 @@ function validateDevCliReceipt(root, options = {}) {
     if (!sha256Pattern.test(String(receipt.source_package_sha256 || ''))) {
       throw new Error('codestory_dev_receipt_source_digest');
     }
-    const target = assetTarget(options.platform, options.arch);
+    const target = sourceBuildTarget(options.platform, options.arch);
     if (!target || receipt.target !== target) {
       throw new Error('codestory_dev_receipt_target');
     }
@@ -283,7 +283,6 @@ function validateDevCliReceipt(root, options = {}) {
 }
 
 module.exports = {
-  assetTarget,
   directoryContractSha256,
   expectedBinaryName,
   pluginCacheIdentity,
@@ -292,5 +291,6 @@ module.exports = {
   receiptPluginName,
   receiptPurpose,
   receiptSchemaVersion,
+  sourceBuildTarget,
   validateDevCliReceipt,
 };

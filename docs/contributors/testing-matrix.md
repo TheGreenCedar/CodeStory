@@ -205,14 +205,18 @@ Runtime proof uses the ordinary plugin launcher with two independently started
 host processes and different repositories. `--proof-tier calibration` may
 collect draft measurements, but cannot satisfy a package, hardware, installed,
 or release claim. A higher tier requires a frozen constant set and a retained
-qualification record. `--produce-qualification-evidence` runs the private,
-nonce-gated scenario orchestrator and writes the path passed to
+qualification record. `--produce-qualification-evidence` requires the separate
+`codestory-embedding-qualification` driver through `--qualification-driver`.
+The harness passes the exact packaged executable to that driver through
+`--cli`; the driver orchestrates private nonce-gated worker calls without
+shipping the suite inside `codestory-cli`. It writes the path passed to
 `--qualification-evidence`; without the producer flag, the harness verifies an
 existing record. Missing, stale, partial, self-selected, or wrong-tier evidence
 fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
-ship runtime-loaded native modules beside the executable. Hosted Linux proof
+ship the runtime executable and native modules in one immutable generation
+selected by the public launcher through a single atomic pointer. Hosted Linux proof
 does not install a Vulkan loader before help, stdio initialization, or explicit
 CPU execution, and it makes no Linux acceleration claim.
 
@@ -409,19 +413,23 @@ hardware behavior. Those claims remain with the package and protected Windows
 Vulkan proof lanes.
 
 `release-claims.json` is the release claim and proof-tier source of truth. It
-binds each claim to its evidence identity, expiry, dependency, executable
-prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The
-release evidence gate evaluates that graph; workflow policy consumes its
-runner, target, promotion, retention, and proof-chain facts. Update the graph
-instead of copying those facts into contributor prose.
+separates the six standard release claims from optional performance and
+answer-quality evaluations. The standard release requires
+exact source, package, native platform, protected accelerator, and installed
+runtime evidence plus bounded packet/search readiness for both desktop targets.
+Optional evaluation may reject its
+own run, but it is not a dependency of packaging, hardware proof, closeout, or
+publication. Workflow policy enforces that separation.
 
 The same graph declares the exact release-closeout cells. For v0.16,
 `workflow_policy.package_matrix` contains only `macos-arm64` and `windows-x64`.
 The coordinator retains canonical copies under `manifests/` and `evaluations/`
-beside `ledger.json` and `summary.json`. A pre-publish run accepts five cells:
-exact source, two package identities, and two candidate-installed behavior
-receipts. A post-publish run accepts eleven cells after adding platform,
-marketplace-catalog-resolved behavior, and downloaded-byte proof for both targets.
+beside `ledger.json` and `summary.json`. A pre-publish run accepts seven cells:
+exact source, two package identities, two accelerator-execution receipts, and
+two candidate-installed behavior receipts. A post-publish run accepts fifteen
+cells after adding platform,
+marketplace-catalog-resolved behavior, downloaded-byte proof, and the two
+protected-package retrieval-readiness receipts.
 Package rows record each archive name, byte count, and SHA-256.
 A post-publish run requires
 that accepted pre-publish ledger, requires its current package manifests to
@@ -454,10 +462,9 @@ downloads by name use explicit replacement from a policy-owned allowlist, so a
 retried producer cannot fail on an immutable same-name artifact before it emits
 its authenticated cell. Terminal evidence is never overwriteable.
 
-Accuracy, latency, throughput, and physical accelerator evidence remain
-independent evaluator lanes. Their thresholds and exception rules are
-unchanged, but v0.16 closeout does not consume them and makes no claim from
-them.
+The v0.16 closeout consumes physical Metal and Vulkan execution evidence and
+makes those accelerator claims for the released targets. Accuracy, latency,
+and throughput remain independent evaluator lanes and release non-claims.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -531,7 +538,7 @@ release workflow. No version bump, tag, signing, notarization, or release is
 part of ordinary remediation or embedding-engine PRs.
 
 Maintainers may manually dispatch `release.yml` from an exact
-`dev/codestory-next` SHA to authenticate the 5-cell pre-publish ledger without
+`dev/codestory-next` SHA to authenticate the 7-cell pre-publish ledger without
 publishing. The required `expected_head_sha` must equal both the workflow SHA
 and the live dev branch head. Manual dispatch exposes no publication input;
 only the automatic reusable-workflow caller on the live `main` head passes the

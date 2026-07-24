@@ -67,6 +67,17 @@ fn source_tree_contains(dir: &str, needle: &str) -> bool {
     })
 }
 
+fn read_source_tree(dir: &str) -> String {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join(dir), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| fs::read_to_string(path).expect("read source"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = source.find(start).expect("start marker exists");
     let tail = &source[start_index..];
@@ -233,16 +244,52 @@ fn cli_stays_thin() {
 }
 
 #[test]
+fn cli_binaries_preserve_the_library_module_graph() {
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let runtime_main = read("crates/codestory-cli/src/runtime_main.rs");
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    let launcher_modules = cli_main
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("mod ")
+                .and_then(|module| module.strip_suffix(';'))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        launcher_modules,
+        ["native_launcher", "native_runtime_layout"],
+        "the public CLI binary may own only its static native launcher"
+    );
+    assert!(
+        runtime_main.contains("codestory_cli::run()"),
+        "the internal runtime binary should delegate to the library entrypoint"
+    );
+    for module in ["embedding_server_transport", "sidecar_runtime"] {
+        let declaration = format!("mod {module};");
+        assert_eq!(
+            cli_lib.matches(&declaration).count(),
+            1,
+            "{module} should have one library-owned module declaration"
+        );
+        assert!(
+            !cli_main.contains(&declaration) && !runtime_main.contains(&declaration),
+            "{module} must not be compiled again by either binary"
+        );
+    }
+}
+
+#[test]
 fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");
     let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
-    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let cli_app = read_source_tree("crates/codestory-cli/src/app");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
     let explore = read("crates/codestory-cli/src/explore.rs");
     let cli_browser_surfaces = [
-        cli_main.as_str(),
+        cli_app.as_str(),
         http_transport.as_str(),
         stdio_transport.as_str(),
         explore.as_str(),
@@ -305,8 +352,8 @@ fn runtime_exposes_read_only_browser_service_boundary() {
             && cli_browser_surfaces.contains(".trail_context(")
             && cli_browser_surfaces.contains(".snippet_context(")
             && cli_browser_surfaces.contains(".query(&ast)")
-            && cli_main.contains("runtime.browser.ask(request)")
-            && !cli_main.contains("runtime.agent.ask(request)"),
+            && cli_app.contains("runtime.browser.ask(request)")
+            && !cli_app.contains("runtime.agent.ask(request)"),
         "CLI read-only browser operations should route through RuntimeContext.browser"
     );
 }

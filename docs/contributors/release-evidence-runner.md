@@ -167,11 +167,11 @@ To unregister and delete all proof-owned VM state:
 scripts/codestory-release-evidence-runner.sh destroy
 ```
 
-## Release workflow handoff
+## Evaluation workflow handoff
 
-`release.yml` calls `release-candidate-evidence.yml` on the exact release head
-after preflight and before packaged proof. The automatic path measures fresh
-evidence with:
+`release-candidate-evidence.yml` is an optional performance and answer-quality
+evaluation lane. `packaged-platform-pr.yml` may call it for a selected exact
+head with:
 
 | Input | Value |
 | --- | --- |
@@ -179,12 +179,9 @@ evidence with:
 | `drill_manifest` | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
 | `source_run_id` | empty for measurement; a rejected run ID only for exact-artifact re-evaluation |
 
-If a measured candidate is rejected and receives an exact, expiring approval,
-manually dispatch `release.yml` on the same SHA and version with
-`source_run_id=<rejected-run-id>`. The reusable workflow downloads that run's
-artifact and evaluates it again without producing new measurements. Before the
-download, it requires a failed trusted evidence workflow from this repository
-whose head is the exact evidence SHA.
+An evaluation failure does not block the standard desktop release. The release
+coordinator does not call this workflow, wait for this runner, or consume its
+artifact.
 
 The approval document uses schema v3, but none of the current full-product gate
 metrics is waivable. A model exception is admissible only through separately
@@ -195,25 +192,21 @@ rollback, and an expiry no more than 14 days after approval. The next release
 key invalidates it sooner. An accepted model exception remains
 `pass_with_exception`; approval never turns a regression into a plain pass.
 
-GitHub does not expose environment-only secrets across a reusable-workflow
-call. Store the short-lived approval as the repository Actions secret
-`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON`; `release.yml` passes only that named
-secret into the called job, which remains behind the protected
-`release-evidence` environment gate. PR packaging passes no secrets. Delete the
-repository secret after publication. A re-evaluation with no nonempty approval
-fails before the evaluator runs.
+The reusable workflow remains behind the protected `release-evidence`
+environment gate. PR packaging passes no approval secret. Any separately
+authorized re-evaluation must authenticate the exact retained artifact; it
+does not alter standard release closeout.
 
 The workflow uploads `release-evidence-<full SHA>` from
 `target/release-evidence`, including provisioning, raw stats, packet summary,
 candidate, approval when supplied, and report files that exist. Runner
 provisioning alone does not establish a baseline, execute the real-repo drill,
-or prove a candidate acceptable. The release remains blocked until the selected
-profile exists as an approved, release-eligible baseline.
+or prove a candidate acceptable.
 
 ## Closeout handoff
 
-Release-evidence output is one input to the exact-head closeout ledger; it is
-not the ledger itself. Each producer supplies one
+Release-evidence output is not an input to the standard release closeout. Each
+standard producer supplies one
 `codestory.release-cell-manifest/v1` document for its graph-owned cell. The
 manifest carries the claim evidence row plus its workflow, run, attempt and
 artifact identity. Production cells are emitted only on producer success, and
@@ -240,14 +233,9 @@ manifests and evaluations with both ledgers. A missing, duplicate, expired, fail
 cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
 an operator override.
 
-Approved model-microbenchmark exceptions use a separately authenticated
-`codestory.release-closeout-exceptions/v1` input from the selected
-release-evidence artifact. Performance closeout includes the same-run
-`answer_quality` cell and passes that trusted exception map to the claim
-evaluator. Flattened or loose manifest JSON is never a closeout input.
-
-The production pre-publish inventory is 12 cells and intentionally excludes a
-candidate-installed runtime. Publication is the prerequisite for the
-marketplace-catalog-resolved tier. The six installed-runtime cells appear only in the
-30-cell post-publish ledger, while #1221 continues to own the real
-two-session/one-server installed-runtime qualification.
+The production pre-publish inventory is seven cells: source, two package
+identities, two accelerator receipts, and two candidate-installed receipts.
+The post-publish inventory is fifteen after adding platform, installed runtime,
+downloaded-byte proof, and protected-package retrieval readiness for both
+targets. Performance,
+answer-quality, and their exception documents are outside this closeout.

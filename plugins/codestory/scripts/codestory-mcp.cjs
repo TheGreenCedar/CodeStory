@@ -12,13 +12,13 @@ const { Transform, pipeline } = require('stream');
 const { TextDecoder } = require('util');
 const zlib = require('zlib');
 const {
+  sourceBuildTarget,
   validateDevCliReceipt,
 } = require('./codestory-dev-cli-contract.cjs');
 
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = process.cwd();
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
-const fallbackBinaryNames = [binaryName];
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
@@ -74,19 +74,6 @@ const canonicalMcpCatalog = readJson(path.join(pluginRoot, 'generated-mcp-catalo
 
 function fileSha256(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-}
-
-function findFile(root, names) {
-  const entries = fs.readdirSync(root, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = path.join(root, entry.name);
-    if (entry.isFile() && names.includes(entry.name)) return fullPath;
-    if (entry.isDirectory()) {
-      const found = findFile(fullPath, names);
-      if (found) return found;
-    }
-  }
-  return null;
 }
 
 function pluginVersion() {
@@ -199,14 +186,8 @@ function resolveManifest(manifestPath) {
   };
 }
 
-function assetTarget() {
-  const platform = process.platform;
-  const arch = process.arch;
+function assetTarget(platform = process.platform, arch = process.arch) {
   if (platform === 'win32' && arch === 'x64') return 'windows-x64';
-  if (platform === 'win32' && arch === 'arm64') return 'windows-arm64';
-  if (platform === 'linux' && arch === 'x64') return 'linux-x64';
-  if (platform === 'linux' && arch === 'arm64') return 'linux-arm64';
-  if (platform === 'darwin' && arch === 'x64') return 'macos-x64';
   if (platform === 'darwin' && arch === 'arm64') return 'macos-arm64';
   return null;
 }
@@ -215,6 +196,40 @@ function archiveName(version, target = assetTarget()) {
   if (!target) return null;
   const extension = target.startsWith('windows-') ? 'zip' : 'tar.gz';
   return `codestory-cli-v${version}-${target}.${extension}`;
+}
+
+function releaseAssetIdentity(version, platform = process.platform, arch = process.arch) {
+  const target = assetTarget(platform, arch);
+  if (!target) throw new Error(`unsupported_release_target:${platform}-${arch}`);
+  return { target, asset: archiveName(version, target) };
+}
+
+function managedAssetIdentity(version, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const explicitSource = options.explicitSource ?? explicitPackageSourceConfigured();
+  if (explicitSource) {
+    const target = sourceBuildTarget(platform, arch);
+    if (!target) {
+      throw new Error(`unsupported_package_target:${platform}-${arch}`);
+    }
+    return {
+      target,
+      asset: archiveName(version, target),
+      buildSource: 'explicit_package',
+    };
+  }
+  return {
+    ...releaseAssetIdentity(version, platform, arch),
+    buildSource: 'github_release',
+  };
+}
+
+function explicitPackageSourceConfigured() {
+  return Boolean(
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR ||
+    process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL
+  );
 }
 
 function expectedArchiveHash(sumsText, name) {
@@ -672,6 +687,50 @@ function extractArchive(archivePath, destination) {
   else throw new Error(`archive_format_unsupported:${path.basename(archivePath)}`);
 }
 
+function copyDirectTree(source, destination) {
+  const metadata = fs.lstatSync(source);
+  if (metadata.isSymbolicLink()) throw new Error(`managed_cli_package_link:${source}`);
+  if (metadata.isDirectory()) {
+    fs.mkdirSync(destination, { recursive: true });
+    for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+      copyDirectTree(path.join(source, entry.name), path.join(destination, entry.name));
+    }
+    return;
+  }
+  if (!metadata.isFile()) throw new Error(`managed_cli_package_non_file:${source}`);
+  fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+  if (process.platform !== 'win32') fs.chmodSync(destination, metadata.mode & 0o777);
+}
+
+function stageExtractedManagedCli(extractDir, asset, stagingDir) {
+  const archiveBase = asset.replace(/\.(?:zip|tar\.gz)$/u, '');
+  if (!archiveBase || archiveBase === asset) {
+    throw new Error(`managed_cli_archive_name_invalid:${asset}`);
+  }
+  const entries = fs.readdirSync(extractDir);
+  if (entries.length !== 1 || entries[0] !== archiveBase) {
+    throw new Error('managed_cli_archive_root_invalid');
+  }
+  const packageRoot = path.join(extractDir, archiveBase);
+  const rootMetadata = fs.lstatSync(packageRoot);
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+    throw new Error('managed_cli_archive_root_invalid');
+  }
+  for (const reserved of ['manifest.json', '.provisioning']) {
+    if (fs.existsSync(path.join(packageRoot, reserved))) {
+      throw new Error(`managed_cli_archive_reserved_path:${reserved}`);
+    }
+  }
+  const launcher = path.join(packageRoot, binaryName);
+  if (!fs.existsSync(launcher)) throw new Error(`archive_missing_cli:${asset}`);
+  const launcherMetadata = fs.lstatSync(launcher);
+  if (launcherMetadata.isSymbolicLink() || !launcherMetadata.isFile()) {
+    throw new Error(`archive_missing_cli:${asset}`);
+  }
+  copyDirectTree(packageRoot, stagingDir);
+  return path.join(stagingDir, binaryName);
+}
+
 function processIsAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   if (pid === process.pid) return true;
@@ -1034,9 +1093,10 @@ function managedCliFailureCode(error) {
 function verifyPublishedManagedCli(
   versionDir,
   version,
-  expectedTarget = assetTarget(),
+  expectedTarget,
   probeVersion = probeResolvedCli,
 ) {
+  const target = expectedTarget || releaseAssetIdentity(version).target;
   let bytes = 0;
   try {
     bytes = managedPathSize(versionDir);
@@ -1052,12 +1112,18 @@ function verifyPublishedManagedCli(
   }, probeVersion);
   if (!verified.verified) return verified;
   const manifest = readJson(path.join(versionDir, 'manifest.json'));
-  const expectedAsset = archiveName(version, expectedTarget);
+  const expectedAsset = archiveName(version, target);
   const candidateArchiveSha256 = candidateQualificationArchiveSha256() || '';
-  const releaseMetadataValid =
+  const publicReleaseMetadataValid =
+    !explicitPackageSourceConfigured() &&
     manifest.build_source === 'github_release' &&
     manifest.repo_ref === `v${version}` &&
     manifest.archive_url === redactedReleaseFileUrl(version, expectedAsset);
+  const explicitPackageMetadataValid =
+    explicitPackageSourceConfigured() &&
+    manifest.build_source === 'explicit_package' &&
+    manifest.repo_ref === null &&
+    manifest.archive_url === `explicit-package:${manifest.archive_sha256}`;
   const candidateMetadataValid =
     /^[0-9a-f]{64}$/iu.test(candidateArchiveSha256) &&
     manifest.build_source === 'candidate_archive' &&
@@ -1065,7 +1131,7 @@ function verifyPublishedManagedCli(
     manifest.archive_sha256 === candidateArchiveSha256 &&
     manifest.archive_url === `candidate-archive:${candidateArchiveSha256}`;
   if (
-    (!releaseMetadataValid && !candidateMetadataValid) ||
+    (!publicReleaseMetadataValid && !explicitPackageMetadataValid && !candidateMetadataValid) ||
     manifest.archive !== expectedAsset ||
     manifest.target !== expectedTarget ||
     manifest.stdio_initialize_verified !== true ||
@@ -1259,9 +1325,7 @@ function releaseManagedCliLock(lock) {
 
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
-  const target = assetTarget();
-  const asset = archiveName(version, target);
-  if (!target || !asset) throw new Error(`unsupported_release_target:${process.platform}-${process.arch}`);
+  const { target, asset, buildSource } = managedAssetIdentity(version);
 
   const root = managedCliRoot(dataDir, true);
   const versionDir = path.join(root, version);
@@ -1293,25 +1357,21 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       throw new Error(`archive_checksum_mismatch:${asset}`);
     }
     extractArchive(archivePath, extractDir);
-    const extracted = findFile(extractDir, fallbackBinaryNames);
-    if (!extracted) throw new Error(`archive_missing_cli:${asset}`);
 
     stagingDir = fs.mkdtempSync(path.join(root, `.provisioning-${version}-${process.pid}-`));
-    const binDir = path.join(stagingDir, 'bin');
     const manifestPath = path.join(stagingDir, 'manifest.json');
-    fs.mkdirSync(binDir, { recursive: true });
-    const destination = path.join(binDir, path.basename(extracted));
-    fs.copyFileSync(extracted, destination);
-    if (process.platform !== 'win32') fs.chmodSync(destination, 0o755);
+    const destination = stageExtractedManagedCli(extractDir, asset, stagingDir);
     const binarySha256 = fileSha256(destination);
     const manifest = {
       path: path.relative(stagingDir, destination).replace(/\\/gu, '/'),
       sha256: binarySha256,
       version,
-      build_source: 'github_release',
-      repo_ref: `v${version}`,
+      build_source: buildSource,
+      repo_ref: buildSource === 'github_release' ? `v${version}` : null,
       archive: asset,
-      archive_url: archiveUrl,
+      archive_url: buildSource === 'github_release'
+        ? archiveUrl
+        : `explicit-package:${actual}`,
       archive_sha256: actual,
       target,
       provisioned_at: new Date().toISOString(),
@@ -1345,6 +1405,13 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
 
 async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   if (!dataDir || !version) return null;
+  let target;
+  try {
+    target = managedAssetIdentity(version).target;
+  } catch (error) {
+    warnings.push(`managed_cli_unsupported_target:${managedCliFailureCode(error)}`);
+    return null;
+  }
   try {
     managedCliRoot(dataDir);
   } catch (error) {
@@ -1353,7 +1420,7 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   }
   const versionDir = path.join(dataDir, 'codestory-cli', version);
   if (fs.existsSync(versionDir)) {
-    const existing = verifyPublishedManagedCli(versionDir, version);
+    const existing = verifyPublishedManagedCli(versionDir, version, target);
     if (existing.verified) return existing.resolved;
   }
   if (options.provision === false) return null;
@@ -2831,6 +2898,8 @@ if (require.main === module) {
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,
+      managedAssetIdentity,
+      releaseAssetIdentity,
       isWindowsBatchCli,
       requireDirectCli,
       reclaimStaleManagedCliPendingOwners,
@@ -2844,6 +2913,7 @@ if (require.main === module) {
       runFailOpenMcp,
       sameFilesystemPath,
       shutdownHandoffChild,
+      stageExtractedManagedCli,
       managedCliRetentionReport,
       managedCliVersionEntries,
       removeManagedCliVersion,

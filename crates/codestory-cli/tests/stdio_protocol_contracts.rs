@@ -352,6 +352,23 @@ fn send_json(server: &mut StdioServer, request: Value) -> Value {
     send_line(server, &request.to_string())
 }
 
+fn initialize_stdio_server(server: &mut StdioServer, id: &str) {
+    let response = send_json(
+        server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    assert_success_envelope(&response, json!(id));
+}
+
 fn send_line(server: &mut StdioServer, line: &str) -> Value {
     writeln!(server.stdin, "{line}").expect("write request line");
     server.stdin.flush().expect("flush request line");
@@ -4379,6 +4396,8 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
 fn ground_tool_serves_complete_publication_when_refresh_budget_expires() {
     let mut fixture = indexed_fixture();
     fixture.local_refresh_timeout_ms = Some(0);
+    let mut server = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut server, "init-ground-refresh-budget-expired");
 
     thread::sleep(Duration::from_millis(25));
     fs::write(
@@ -4390,7 +4409,6 @@ fn ground_tool_serves_complete_publication_when_refresh_budget_expires() {
     )
     .expect("modify indexed file after indexing");
 
-    let mut server = spawn_stdio_server(&fixture);
     let started = Instant::now();
     let response = send_json(
         &mut server,
@@ -4469,9 +4487,12 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
     )
     .expect("make the published index stale");
 
+    let mut status_client = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut status_client, "init-concurrent-status");
+    let mut ground_client = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut ground_client, "init-concurrent-ground");
     let pid = write_live_local_refresh(&fixture);
 
-    let mut status_client = spawn_stdio_server(&fixture);
     let status_response = send_json(
         &mut status_client,
         json!({
@@ -4497,7 +4518,6 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
         .as_u64()
         .expect("status serving generation");
 
-    let mut ground_client = spawn_stdio_server(&fixture);
     let ground_response = send_json(
         &mut ground_client,
         json!({
@@ -4570,9 +4590,9 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
 fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     let mut fixture = indexed_fixture();
     fixture.local_refresh_timeout_ms = Some(0);
-    let mut warmup_client = spawn_stdio_server(&fixture);
+    let mut reader_client = spawn_stdio_server(&fixture);
     let warmup_status = send_json(
-        &mut warmup_client,
+        &mut reader_client,
         json!({
             "jsonrpc": "2.0",
             "id": "warmup-generation",
@@ -4586,7 +4606,8 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     )["index_publication"]["generation"]
         .as_u64()
         .expect("old complete generation");
-    drop(warmup_client);
+    let mut writer_client = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut writer_client, "writer-initialize");
     thread::sleep(Duration::from_millis(25));
     for index in 0..96 {
         fs::write(
@@ -4600,8 +4621,6 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         .expect("add source file for real refresh");
     }
 
-    let mut reader_client = spawn_stdio_server(&fixture);
-    let mut writer_client = spawn_stdio_server(&fixture);
     let writer = thread::spawn(move || {
         let response = send_json(
             &mut writer_client,

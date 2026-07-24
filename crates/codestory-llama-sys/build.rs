@@ -2,7 +2,10 @@ mod model_staging;
 mod native_staging;
 
 use model_staging::{ExpectedModel, stage_model, verify_model};
-use native_staging::{stage_linux_shared_libraries, stage_windows_runtime_file};
+use native_staging::{
+    NATIVE_RUNTIME_FILE_LIST, stage_linux_shared_libraries, stage_native_generation,
+    stage_windows_runtime_files,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -10,7 +13,6 @@ use std::fs;
 use std::path::PathBuf;
 
 const MODEL_CONTRACT_FILE: &str = "model-contract.json";
-const NATIVE_RUNTIME_FILE_LIST: &str = "codestory-native-runtime-files-v1.txt";
 const EMBEDDING_SERVER_PROTOCOL_FILE: &str =
     "../../docs/testing/per-user-embedding-server-protocol.json";
 const EMBEDDING_SERVER_CONSTANT_SET_FILE: &str =
@@ -104,7 +106,10 @@ fn main() {
     );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    stage_dynamic_runtime(&target_os, &out_dir);
+    let native_generation = stage_dynamic_runtime(&target_os, &out_dir);
+    let native_generation_id = native_generation.as_deref().unwrap_or("");
+    let native_generation_marker =
+        format!("codestory-native-runtime-seed-v1|id={native_generation_id}|end");
     fs::write(
         out_dir.join("model_contract.rs"),
         format!(
@@ -127,6 +132,8 @@ fn main() {
              pub const NATIVE_ENGINE_LINKAGE: &str = {engine_linkage:?};\n\
              pub const NATIVE_ENGINE_BACKEND_LOADING: &str = {backend_loading:?};\n\
              pub const NATIVE_ENGINE_COMPILED_BACKENDS: &[&str] = &{compiled_backends:?};\n\
+             pub const NATIVE_ENGINE_GENERATION_ID: &str = {native_generation_id:?};\n\
+             pub static NATIVE_ENGINE_GENERATION_MARKER: &[u8] = {native_generation_marker:?}.as_bytes();\n\
              pub const NATIVE_ENGINE_EMBEDDING_CONTRACT_SHA256: &str = {embedding_contract_sha256:?};\n\
              pub const GGML_BUILD_IDENTITY: &str = {ggml_build_identity:?};\n\
              pub const PRODUCT_EMBEDDING_RUNTIME_ID: &str = {product_embedding_runtime_id:?};\n",
@@ -379,9 +386,9 @@ fn file_sha256(path: &str) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
+fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) -> Option<String> {
     if !matches!(target_os, "windows" | "linux") {
-        return;
+        return None;
     }
 
     let backend_dir = PathBuf::from(
@@ -436,20 +443,38 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
         );
     }
     runtime_files.sort_by_key(|entry| entry.0.to_lowercase());
+    let runtime_sources = runtime_files
+        .iter()
+        .map(|(_, source, _)| source.as_path())
+        .collect::<Vec<_>>();
+    let generation =
+        stage_native_generation(&runtime_sources, profile_dir).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage immutable native runtime generation from {}: {error}",
+                native_out.display()
+            )
+        });
+
+    // Cargo test and example executables are launched directly from these
+    // directories rather than through the product launcher. Keep their
+    // upstream compatibility copies healthy, but never package or activate
+    // this mutable layout.
     if target_os == "windows" {
-        for (name, source, _) in &runtime_files {
-            stage_windows_runtime_file(source, &profile_dir.join(name)).unwrap_or_else(|error| {
-                panic!(
-                    "failed to stage native runtime artifact {}: {error}",
-                    source.display()
-                )
-            });
-        }
-    } else {
-        let runtime_sources = runtime_files
+        let destinations = runtime_files
             .iter()
-            .map(|(_, source, _)| source.as_path())
+            .map(|(name, source, _)| (source.as_path(), profile_dir.join(name)))
             .collect::<Vec<_>>();
+        let entries = destinations
+            .iter()
+            .map(|(source, destination)| (*source, destination.as_path()))
+            .collect::<Vec<_>>();
+        stage_windows_runtime_files(&entries).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage native runtime artifacts from {}: {error}",
+                native_out.display()
+            )
+        });
+    } else {
         let build_support_source = core_dir.join("libllama-common.so");
         stage_linux_shared_libraries(
             &runtime_sources,
@@ -471,6 +496,19 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
     file_list.push('\n');
     fs::write(profile_dir.join(NATIVE_RUNTIME_FILE_LIST), file_list)
         .expect("write deterministic native runtime file list");
+    assert_eq!(
+        generation.runtime_file_names,
+        runtime_files
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect::<Vec<_>>(),
+        "immutable generation manifest differs from runtime role inventory"
+    );
+    assert!(
+        generation.directory.is_dir(),
+        "immutable native generation directory is missing"
+    );
+    Some(generation.id)
 }
 
 fn native_runtime_role(name: &str, target_os: &str) -> Option<&'static str> {

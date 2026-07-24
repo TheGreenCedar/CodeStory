@@ -21,7 +21,6 @@ const METRICS = [
   "packet_seconds", "search_seconds", "indexing_seconds", "storage_growth_ratio",
 ];
 const RELEASE_EVIDENCE_CLAIM_IDS = [
-  "retrieval_readiness",
   "performance",
   "answer_quality",
 ];
@@ -238,7 +237,7 @@ function requireExactReleaseClaimDocument({
     === JSON.stringify(canonical(expectedEvidenceProfile));
   if (!requestedClaimsMatch || !evidenceProfileMatches) {
     fail(
-      "candidate.release_claims must exactly match the trusted release-evidence claim profile, including retrieval_readiness, performance, and answer_quality with one evidence row each",
+      "candidate.release_claims must exactly match the optional performance and answer_quality profile with one evidence row each",
     );
   }
   return document;

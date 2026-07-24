@@ -208,6 +208,11 @@ jobs:
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
+          cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli-runtime" \
+            "target/${{ matrix.rust_target }}/release/codestory-cli-runtime"
+          rm -rf "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
+          cp -R "target/glibc-2.31/${{ matrix.rust_target }}/release/.codestory-native-seeds" \
+            "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
           find "target/${{ matrix.rust_target }}/release" -maxdepth 1 -type f \
             \( -name 'libllama.so*' -o -name 'libggml*.so*' \) -delete
           find "target/glibc-2.31/${{ matrix.rust_target }}/release" -maxdepth 1 \
@@ -216,6 +221,10 @@ jobs:
             -exec cp -L {} "target/${{ matrix.rust_target }}/release/" \;
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt" \
             "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
+
+      - name: Build qualification driver
+        if: matrix.asset_target == 'linux-x64'
+        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
       - name: Prove clean-cache Node-absent network-denied offline release build
         if: matrix.asset_target == 'linux-x64'
@@ -574,6 +583,7 @@ jobs:
                 "${common_args[@]}" \
                 --proof-tier calibration \
                 --produce-qualification-evidence \
+                --qualification-driver target/release/codestory_embedding_qualification \
                 --calibration-run-index "$run_index" \
                 --calibration-run-output "target/calibration-runs/linux/run-${run_index}.json" \
                 --qualification-evidence "target/calibration-runs/linux/qualification-${run_index}.json" \
@@ -603,13 +613,14 @@ jobs:
           claim_scope_args=()
           quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
           if [ "$proof_tier" = hosted_package ]; then
-            if [ "$PROOF_SCOPE" = server ] || [ "$PROOF_SCOPE" = linux ]; then
+            if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
               claim_scope_args=(--server-behavior-only)
             else
               test -f "$quality_path"
               quality_args=(--retrieval-quality-evidence "$quality_path")
               qualification_args=(
                 --produce-qualification-evidence
+                --qualification-driver target/release/codestory_embedding_qualification
                 --qualification-evidence target/packaged-agent-proof/qualification.json
               )
             fi
@@ -647,7 +658,6 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
           !inputs.calibration_mode &&
-          (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '') &&
           inputs.calibration_bundle_artifact != '' &&
           inputs.calibration_bundle_run_id != ''
         shell: bash
@@ -673,7 +683,7 @@ jobs:
             --plugin-root plugins/codestory \
             --candidate-plugin-root-output "$candidate_root/plugin" \
             --candidate-plugin-data-output "$candidate_root/data" \
-            --installed-plugin-provenance-output target/candidate-installed-linux/provenance.json \
+            --installed-plugin-attestation-output target/candidate-installed-linux/install-attestation-v2.json \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
             --candidate-producer-run-id "$GITHUB_RUN_ID" \
@@ -685,7 +695,6 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
           !inputs.calibration_mode &&
-          (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '') &&
           inputs.calibration_bundle_artifact != '' &&
           inputs.calibration_bundle_run_id != ''
         env:
@@ -699,12 +708,13 @@ jobs:
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
-          if [ "${{ inputs.scope }}" = server ] || [ "${{ inputs.scope }}" = linux ]; then
+          if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
             claim_args=(--server-behavior-only)
           else
             test -f "$quality_path"
             claim_args=(
               --produce-qualification-evidence
+              --qualification-driver target/release/codestory_embedding_qualification
               --qualification-evidence target/candidate-installed-linux/qualification.json
               --retrieval-quality-evidence "$quality_path"
             )
@@ -725,8 +735,7 @@ jobs:
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
-            --installed-plugin-source candidate \
-            --installed-plugin-provenance target/candidate-installed-linux/provenance.json \
+            --installed-plugin-attestation target/candidate-installed-linux/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_LINUX_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
@@ -739,7 +748,7 @@ jobs:
             --out-dir target/candidate-installed-linux/proof
 
       - name: Upload candidate-installed Linux proof
-        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '')
+        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-linux-${{ inputs.version }}-attempt-${{ github.run_attempt }}

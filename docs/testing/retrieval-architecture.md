@@ -68,10 +68,11 @@ for its environment:
 
 The package manifest proves compiled capability only. Accelerator execution is
 a separate protected-hardware result, and neither package nor execution proof
-is an answer-quality claim. Windows and Linux packages runtime-load their
-recorded backend modules; their base executables must not require a Vulkan
-loader, so help, status, local navigation, and explicit CPU execution can start
-without one. Linux packages remain an explicit GPU non-claim.
+is an answer-quality claim. The Windows release package and Linux non-release
+build artifacts runtime-load their recorded backend modules; their base
+executables must not require a Vulkan loader, so help, status, local navigation,
+and explicit CPU execution can start without one. Linux proof remains a package
+and GPU non-claim.
 
 ## Workflow ownership
 
@@ -82,8 +83,7 @@ without one. Linux packages remain an explicit GPU non-claim.
 | `macos-metal-proof.yml` | protected Apple Silicon | packaged Metal, physical adapter, smoke, offload |
 | `windows-vulkan-proof.yml` | protected Windows GPU | packaged Vulkan, physical adapter, smoke, offload |
 
-Linux acceleration remains unclaimed until equivalent protected Vulkan hardware
-evidence exists.
+Linux is not a v0.16 release target.
 
 ## Performance and quality acceptance
 

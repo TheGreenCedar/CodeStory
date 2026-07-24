@@ -73,16 +73,15 @@ flowchart LR
 
 ## Platform support
 
-| Platform | Normal local map | Broad retrieval |
+<!-- codestory-public-support:start -->
+| Released package | Local map | Broad retrieval |
 | --- | --- | --- |
 | macOS 15+ on Apple Silicon | Yes | Metal |
-| macOS 15+ on Intel | Yes | No production CPU fallback and no Metal claim |
-| Windows x64 | Yes | Vulkan on supported physical hardware |
-| Windows arm64 and Linux | Yes | Vulkan only where the packaged hardware path is proved |
+| Windows x64 | Yes | Vulkan |
 
-Hosted CI may enable the explicit CPU policy for source and package checks; a
-CPU run never claims Metal or Vulkan. See the [user guide platform
-table](docs/users/README.md#platform-summary) for the full support boundary.
+CodeStory 0.16 publishes only these managed package targets.
+Unshipped targets: linux-arm64, linux-x64, macos-x64, windows-arm64. Answer quality and performance are separate release non-claims.
+<!-- codestory-public-support:end -->
 
 ## Example prompts
 

@@ -658,6 +658,8 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
     };
     let method = SearchHit {
@@ -676,6 +678,8 @@ fn compare_search_hits_prefers_function_over_method_for_equal_symbol_matches() {
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: None,
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: None,
     };
 
@@ -1596,6 +1600,8 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
         SearchHit {
@@ -1614,6 +1620,8 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
     ];
@@ -1636,6 +1644,8 @@ fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         }],
     );
@@ -1673,6 +1683,8 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
         SearchHit {
@@ -1691,6 +1703,8 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
         SearchHit {
@@ -1709,6 +1723,8 @@ fn inexact_search_results_deduplicate_repeated_display_keys() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
     ];
@@ -1749,6 +1765,8 @@ fn exact_search_results_keep_repeated_display_keys() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
         SearchHit {
@@ -1767,6 +1785,8 @@ fn exact_search_results_keep_repeated_display_keys() {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         },
     ];

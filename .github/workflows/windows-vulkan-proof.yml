@@ -45,7 +45,7 @@ on:
         default: ".github/workflows/packaged-platform-pr.yml"
         type: string
       server_behavior_only:
-        description: Prove bounded server behavior without making packet-quality or release-readiness claims.
+        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
         required: false
         default: false
         type: boolean
@@ -89,7 +89,7 @@ on:
         default: ".github/workflows/windows-vulkan-proof.yml"
         type: string
       server_behavior_only:
-        description: Prove bounded server behavior without making packet-quality or release-readiness claims.
+        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
         required: false
         default: false
         type: boolean
@@ -150,7 +150,6 @@ jobs:
           ninja --version | Out-File -Append target/windows-vulkan-proof/host.txt
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -181,6 +180,10 @@ jobs:
         with:
           name: codestory-cli-windows-x64
           path: target/release-dist
+
+      - name: Build qualification driver
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
       - name: Download exact-head publishable packet quality evidence
         if: inputs.quality_evidence_artifact != ''
@@ -255,6 +258,7 @@ jobs:
             }
             $claimArgs = @(
               "--produce-qualification-evidence",
+              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
               "--qualification-evidence", "target/windows-vulkan-proof/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
             )
@@ -327,7 +331,7 @@ jobs:
             --plugin-root plugins/codestory `
             --candidate-plugin-root-output (Join-Path $candidateRoot "plugin") `
             --candidate-plugin-data-output (Join-Path $candidateRoot "data") `
-            --installed-plugin-provenance-output target/candidate-installed-windows/provenance.json `
+            --installed-plugin-attestation-output target/candidate-installed-windows/install-attestation-v2.json `
             --candidate-producer-repository $env:GITHUB_REPOSITORY `
             --candidate-producer-workflow-path $env:CANDIDATE_PRODUCER_WORKFLOW_PATH `
             --candidate-producer-run-id $env:GITHUB_RUN_ID `
@@ -363,6 +367,7 @@ jobs:
             }
             $claimArgs = @(
               "--produce-qualification-evidence",
+              "--qualification-driver", "target/release/codestory_embedding_qualification.exe",
               "--qualification-evidence", "target/candidate-installed-windows/qualification.json",
               "--retrieval-quality-evidence", $qualityPath
             )
@@ -385,8 +390,7 @@ jobs:
             --calibration-bundle $calibrationBundles[0].FullName `
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" `
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" `
-            --installed-plugin-source candidate `
-            --installed-plugin-provenance target/candidate-installed-windows/provenance.json `
+            --installed-plugin-attestation target/candidate-installed-windows/install-attestation-v2.json `
             --installed-plugin-data $pluginData `
             --candidate-producer-repository $env:GITHUB_REPOSITORY `
             --candidate-producer-workflow-path $env:CANDIDATE_PRODUCER_WORKFLOW_PATH `
@@ -408,7 +412,7 @@ jobs:
           retention-days: 30
 
       - name: Emit authenticated Vulkan release cell
-        if: inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only
+        if: inputs.emit_release_cells && !inputs.candidate_installed_only
         shell: bash
         run: |
           set -euo pipefail
@@ -436,11 +440,40 @@ jobs:
             --out target/release-cells/accelerator_execution-windows-x64-vulkan.json
 
       - name: Upload authenticated Vulkan release cell
-        if: success() && inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only
+        if: success() && inputs.emit_release_cells && !inputs.candidate_installed_only
         uses: actions/upload-artifact@v7.0.1
         with:
           name: release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}
           path: target/release-cells/accelerator_execution-windows-x64-vulkan.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Emit authenticated Windows retrieval-readiness release cell
+        if: inputs.emit_release_cells && inputs.server_behavior_only && !inputs.candidate_installed_only
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "$version" \
+            --cell-id retrieval_readiness:windows-x64 \
+            --producer-workflow .github/workflows/windows-vulkan-proof.yml \
+            --producer-job packaged-vulkan \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT" \
+            --archive "target/release-dist/codestory-cli-v${version}-windows-x64.zip" \
+            --out target/release-cells/retrieval_readiness-windows-x64.json
+
+      - name: Upload authenticated Windows retrieval-readiness release cell
+        if: success() && inputs.emit_release_cells && inputs.server_behavior_only && !inputs.candidate_installed_only
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-postpublish-retrieval-windows-x64-attempt-${{ github.run_attempt }}
+          path: target/release-cells/retrieval_readiness-windows-x64.json
           if-no-files-found: error
           retention-days: 30
 

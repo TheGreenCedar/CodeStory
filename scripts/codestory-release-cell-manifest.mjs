@@ -17,7 +17,6 @@ import {
 } from "./codestory-release-closeout.mjs";
 
 const PRODUCER_MAP_SCHEMA = "codestory.release-actions-provenance/v1";
-const TRUSTED_EXCEPTIONS_SCHEMA = "codestory.release-closeout-exceptions/v1";
 const ACTIONS_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
 function fail(message) {
@@ -233,51 +232,6 @@ function produceOne(values) {
   writeJson(text(values.out, "--out"), manifest);
 }
 
-function produceReleaseEvidence(values) {
-  const { graph, gitIdentity } = common(values);
-  const version = text(values.version, "--version").replace(/^v/u, "");
-  const producer = authenticatedProducer(values, gitIdentity);
-  const report = JSON.parse(readFileSync(text(values.report, "--report"), "utf8"));
-  if (!new Set(["pass", "pass_with_exception"]).has(report.status)) {
-    fail("release evidence report must be accepted before manifests are emitted");
-  }
-  const rows = Array.isArray(report.release_cell_evidence) ? report.release_cell_evidence : [];
-  const outDir = path.resolve(text(values["out-dir"], "--out-dir"));
-  for (const cellId of ["retrieval_readiness", "performance", "answer_quality"]) {
-    const matches = rows.filter(({ type }) => type === cellId);
-    if (matches.length !== 1) fail(`release evidence report must contain one ${cellId} row`);
-    const cell = selectedCell(graph, cellId);
-    const manifest = produceReleaseCellManifest({
-      graph,
-      gitIdentity,
-      version,
-      cell,
-      identity: {},
-      producer,
-      evidence: matches[0],
-    });
-    writeJson(path.join(outDir, `${cellId}.json`), manifest);
-  }
-  const performanceCell = selectedCell(graph, "performance");
-  const constraints = resolveReleaseCellConstraints(performanceCell, producer.producer_run_attempt);
-  const answerQuality = rows.find(({ type }) => type === "answer_quality");
-  writeJson(path.join(outDir, "trusted-exceptions.json"), {
-    schema: TRUSTED_EXCEPTIONS_SCHEMA,
-    graph_sha256: releaseClaimGraphDigest(graph),
-    version,
-    identity: gitIdentity,
-    producer: {
-      ...producer,
-      producer_job_name: constraints.producer_job_name,
-    },
-    trusted_identity: {
-      candidate_sha256: report.candidate_sha256,
-      artifact_sha256: answerQuality?.identity?.artifact_sha256,
-    },
-    exceptions: report.release_cell_exceptions ?? {},
-  });
-}
-
 function positiveInteger(value, label) {
   const selected = text(String(value ?? ""), label);
   if (!/^[1-9]\d*$/u.test(selected)) fail(`${label} must be a positive integer`);
@@ -477,9 +431,8 @@ async function produceMap(values) {
 async function main() {
   const { command, values } = parseArgs(process.argv.slice(2));
   if (command === "produce") produceOne(values);
-  else if (command === "release-evidence") produceReleaseEvidence(values);
   else if (command === "producer-map") await produceMap(values);
-  else fail("command must be produce, release-evidence, or producer-map");
+  else fail("command must be produce or producer-map");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

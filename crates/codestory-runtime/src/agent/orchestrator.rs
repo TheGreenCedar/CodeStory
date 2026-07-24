@@ -4288,6 +4288,8 @@ fn search_hit_from_grounding_symbol(
         loss_reason: None,
         coverage_role: None,
         eligible_for_sufficiency: Some(true),
+        source_excerpt: None,
+        verification_targets: Vec::new(),
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.35,
             semantic: 0.0,
@@ -5034,6 +5036,8 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         }
     }
@@ -14257,6 +14261,8 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         }];
 
@@ -14283,6 +14289,8 @@ mod tests {
                     loss_reason: None,
                     coverage_role: None,
                     eligible_for_sufficiency: Some(true),
+                    source_excerpt: None,
+                    verification_targets: Vec::new(),
                     score_breakdown: None,
                 },
                 SearchHit {
@@ -14305,6 +14313,8 @@ mod tests {
                     loss_reason: None,
                     coverage_role: None,
                     eligible_for_sufficiency: Some(true),
+                    source_excerpt: None,
+                    verification_targets: Vec::new(),
                     score_breakdown: None,
                 },
             ],

@@ -44,9 +44,9 @@ batching contract.
 
 | Environment | Backend policy |
 | --- | --- |
-| Apple Silicon macOS | verified Metal acceleration |
-| Windows | verified Vulkan acceleration |
-| Linux | verified Vulkan only where protected hardware evidence exists |
+| Apple Silicon macOS | v0.16 package with verified Metal acceleration |
+| Windows x64 | v0.16 package with verified Vulkan acceleration |
+| Other targets | no v0.16 package or runtime claim |
 | Hosted CI or maintainer diagnostic | CPU only with `CODESTORY_EMBED_ALLOW_CPU=1` |
 
 There is no silent GPU-to-CPU fallback. Software adapters such as llvmpipe,

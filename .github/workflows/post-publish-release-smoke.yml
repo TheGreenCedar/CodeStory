@@ -57,6 +57,7 @@ permissions:
 env:
   RELEASE_RUST_TOOLCHAIN: "1.95.0"
   APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
+  CODEX_CLI_VERSION: "0.144.5"
 
 jobs:
   smoke:
@@ -225,101 +226,36 @@ jobs:
       - name: Resolve the published plugin through the marketplace catalog
         id: installed
         shell: bash
-        env:
-          MARKETPLACE_REPOSITORY: TheGreenCedar/AgentPluginMarketplace
         run: |
           set -euo pipefail
           install_root="$RUNNER_TEMP/codestory-installed-proof"
-          marketplace_root="$install_root/marketplace"
-          plugin_root="$install_root/plugin"
-          plugin_data="$install_root/plugin-data"
-          provenance="$install_root/provenance.json"
-          rm -rf "$install_root"
-          mkdir -p "$plugin_root" "$plugin_data"
-          git clone --depth 1 \
-            "https://github.com/${MARKETPLACE_REPOSITORY}.git" \
-            "$marketplace_root"
-          marketplace_commit="$(git -C "$marketplace_root" rev-parse HEAD)"
-          plugin_source_commit="$(
-            git ls-remote https://github.com/TheGreenCedar/CodeStory.git \
+          codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
+          marketplace_revision="$(
+            git ls-remote \
+              https://github.com/TheGreenCedar/AgentPluginMarketplace.git \
               refs/heads/main | awk '{print $1}'
           )"
-          release_commit="$(git rev-parse HEAD)"
-          if [ "$plugin_source_commit" != "$release_commit" ]; then
-            echo "::error::Marketplace source main is not the exact published release commit"
-            exit 1
-          fi
-          git archive --format=tar HEAD:plugins/codestory |
-            tar -xf - -C "$plugin_root"
-          python - \
-            "$marketplace_root/.agents/plugins/marketplace.json" \
-            "$plugin_root" \
-            "$provenance" \
-            "$marketplace_commit" \
-            "$plugin_source_commit" \
-            "${{ steps.release.outputs.version }}" <<'PY'
-          import hashlib
-          import json
-          import os
-          import pathlib
-          import sys
-
-          (
-              catalog_path,
-              plugin_root_raw,
-              provenance_path,
-              marketplace_commit,
-              plugin_source_commit,
-              version,
-          ) = sys.argv[1:]
-          catalog = json.loads(pathlib.Path(catalog_path).read_text(encoding="utf-8"))
-          matches = [
-              plugin
-              for plugin in catalog.get("plugins", [])
-              if plugin.get("name") == "codestory"
-          ]
-          if len(matches) != 1:
-              raise SystemExit("marketplace must contain exactly one codestory plugin")
-          source = matches[0].get("source", {})
-          if source != {
-              "source": "git-subdir",
-              "url": "https://github.com/TheGreenCedar/CodeStory.git",
-              "path": "plugins/codestory",
-          }:
-              raise SystemExit("marketplace codestory source is not the release repository plugin")
-          plugin_root = pathlib.Path(plugin_root_raw)
-          digest = hashlib.sha256()
-          files = sorted(path for path in plugin_root.rglob("*") if path.is_file())
-          if not files:
-              raise SystemExit("installed plugin package is empty")
-          for path in files:
-              if path.is_symlink():
-                  raise SystemExit(f"installed plugin package contains a symlink: {path}")
-              relative = path.relative_to(plugin_root).as_posix().encode("utf-8")
-              payload = path.read_bytes()
-              digest.update(len(relative).to_bytes(8, "little"))
-              digest.update(relative)
-              digest.update(len(payload).to_bytes(8, "little"))
-              digest.update(payload)
-          document = {
-              "schema_version": 1,
-              "marketplace_repository": "TheGreenCedar/AgentPluginMarketplace",
-              "marketplace_commit": marketplace_commit,
-              "plugin_id": "codestory",
-              "plugin_version": version,
-              "plugin_source_commit": plugin_source_commit,
-              "plugin_package_sha256": digest.hexdigest(),
-          }
-          pathlib.Path(provenance_path).write_text(
-              json.dumps(document, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          PY
-          {
-            echo "plugin_root=$plugin_root"
-            echo "plugin_data=$plugin_data"
-            echo "provenance=$provenance"
-          } >> "$GITHUB_OUTPUT"
+          test "$(printf '%s' "$marketplace_revision" | wc -c | tr -d ' ')" = 40
+          source_sha="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          rm -rf "$install_root"
+          npm install \
+            --prefix "$codex_package_root" \
+            --no-audit \
+            --no-fund \
+            "@openai/codex@$CODEX_CLI_VERSION"
+          node .github/scripts/install-codestory-marketplace-proof.mjs \
+            --codex-package-root "$codex_package_root" \
+            --codex-home "$install_root/codex-home" \
+            --plugin-data "$install_root/codex-home/plugin-data" \
+            --marketplace-source TheGreenCedar/AgentPluginMarketplace \
+            --marketplace-name TheGreenCedar \
+            --marketplace-revision "$marketplace_revision" \
+            --expected-version "${{ steps.release.outputs.version }}" \
+            --source-commit "$source_sha" \
+            --source-tree "$source_tree" \
+            --attestation "$install_root/install-attestation-v2.json" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Qualify the catalog-resolved published runtime
         env:
@@ -348,8 +284,7 @@ jobs:
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
-            --installed-plugin-source marketplace \
-            --installed-plugin-provenance "${{ steps.installed.outputs.provenance }}" \
+            --installed-plugin-attestation "${{ steps.installed.outputs.attestation }}" \
             --installed-plugin-data "${{ steps.installed.outputs.plugin_data }}" \
             --expected-source-sha "$source_sha" \
             --expected-source-tree "$source_tree" \
@@ -369,7 +304,7 @@ jobs:
           test "$(printf '%s\n' "$ledger" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           mkdir -p target/release-cells
           jq -n \
-            --arg installer marketplace_catalog_resolved_plugin \
+            --arg installer codex_marketplace_install \
             --arg native_engine coderank_q8_embedded \
             --arg calibration_sha256 "$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$calibration_bundle")" \
             '{installer: $installer, native_engine: $native_engine, calibration_sha256: $calibration_sha256}' \
