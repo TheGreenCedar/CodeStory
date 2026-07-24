@@ -10,6 +10,7 @@ from native_binary_contract import (
     NativeBinaryError,
     inspect_binary,
     inspect_runtime_layout,
+    managed_native_runtime_dependencies,
     runtime_artifact_role,
 )
 
@@ -263,6 +264,15 @@ def _verify_binary_descriptor(
         identity["arch"] == target_contract["target_arch"],
         "packaged executable architecture does not match asset target",
     )
+    if parts.runtime_executable.get("generation_id") is not None:
+        forbidden_launcher_dependencies = managed_native_runtime_dependencies(
+            identity["needed"]
+        )
+        require(
+            not forbidden_launcher_dependencies,
+            "packaged launcher imports managed native runtime dependencies: "
+            + ", ".join(forbidden_launcher_dependencies),
+        )
     runtime_identity = inventory.binary_identity
     require(
         parts.runtime_executable

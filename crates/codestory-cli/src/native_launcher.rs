@@ -46,24 +46,24 @@ fn prepare_runtime_at(root: &Path) -> io::Result<PathBuf> {
     FileExt::lock_exclusive(&lock)?;
 
     let candidate = root.join(NATIVE_RUNTIME_EXECUTABLE);
-    let seed_id = runtime_seed_id(&candidate).ok();
-    if seed_id.is_none() {
-        return pinned_current_runtime(root)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "neither a build-tree runtime candidate nor an installed generation is available",
-            )
-        });
-    }
-    let seed_id = seed_id.expect("checked above");
+    let seed_id = match runtime_seed_id(&candidate) {
+        Ok(seed_id) => seed_id,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return pinned_current_runtime(root)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "neither a build-tree runtime candidate nor an installed generation is available",
+                )
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let seed_dir = root.join(NATIVE_RUNTIME_SEEDS_DIR).join(&seed_id);
     if !seed_dir.is_dir() {
-        return pinned_current_runtime(root)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("native runtime seed directory is missing for candidate {seed_id}"),
-            )
-        });
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("native runtime seed directory is missing for candidate {seed_id}"),
+        ));
     }
     let runtime_sha256 = file_sha256(&candidate)?;
     let generation_id = final_generation_id(&seed_id, &runtime_sha256);
@@ -158,7 +158,7 @@ fn publish_complete_generation(
             seed_dir.join(NATIVE_RUNTIME_FILE_LIST),
             temporary.join(NATIVE_RUNTIME_FILE_LIST),
         )?;
-        File::open(&temporary)?.sync_all()?;
+        sync_directory(&temporary)?;
         fs::rename(&temporary, generation_dir)?;
         sync_parent(generation_dir)?;
         verify_complete_generation(generation_dir, runtime_sha256)
@@ -404,6 +404,16 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn sync_parent(path: &Path) -> io::Result<()> {
     path.parent()
         .map_or(Ok(()), |parent| File::open(parent)?.sync_all())
@@ -506,6 +516,33 @@ mod tests {
         assert!(
             first.is_file(),
             "previous immutable generation remains pinned"
+        );
+
+        fs::remove_file(&candidate).expect("remove build-tree candidate");
+        assert_eq!(
+            prepare_runtime_at(root).expect("installed activation"),
+            second
+        );
+
+        fs::write(&candidate, b"malformed runtime candidate").expect("malformed candidate");
+        assert_eq!(
+            prepare_runtime_at(root)
+                .expect_err("malformed candidate must not fall back")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let missing_seed = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        fs::write(
+            &candidate,
+            format!("codestory-native-runtime-seed-v1|id={missing_seed}|end"),
+        )
+        .expect("candidate with missing seed");
+        assert_eq!(
+            prepare_runtime_at(root)
+                .expect_err("missing seed must not fall back")
+                .kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 }

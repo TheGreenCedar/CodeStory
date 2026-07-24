@@ -20,6 +20,7 @@ from native_binary_contract import (
     NativeBinaryError,
     inspect_binary,
     inspect_runtime_layout,
+    managed_native_runtime_dependencies,
     runtime_artifact_role,
 )
 
@@ -522,6 +523,15 @@ def native_release_manifest(
         launcher_identity["arch"] == target_contract["target_arch"],
         f"launcher architecture {launcher_identity['arch']} does not match target {target}",
     )
+    if generation_id is not None:
+        forbidden_launcher_dependencies = managed_native_runtime_dependencies(
+            launcher_identity["needed"]
+        )
+        require(
+            not forbidden_launcher_dependencies,
+            "public launcher imports managed native runtime dependencies: "
+            + ", ".join(forbidden_launcher_dependencies),
+        )
 
     markers = native_engine_markers(runtime_binary)
     require(len(markers) == 1, f"binary must contain one native engine identity; found {len(markers)}")
@@ -1261,11 +1271,14 @@ def run_self_test() -> None:
                 manifests = list(unpacked.rglob(NATIVE_MANIFEST_FILE))
                 require(len(manifests) == 1, "package omitted the native engine manifest")
                 manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+                from packaged_agent_proof.foundation import ProofFailure
                 from packaged_agent_proof.native_manifest import load_native_manifest
 
+                package_root = manifests[0].parent
+                packaged_cli = package_root / TARGET_CONTRACTS[target]["binary_name"]
                 load_native_manifest(
-                    manifests[0].parent,
-                    manifests[0].parent / TARGET_CONTRACTS[target]["binary_name"],
+                    package_root,
+                    packaged_cli,
                     "0.0.0",
                 )
                 require(
@@ -1285,6 +1298,37 @@ def run_self_test() -> None:
                     manifest["accelerator"]["runtime_execution"] == "not_proven_by_package",
                     "package incorrectly claimed runtime accelerator execution",
                 )
+                if manifest["runtime_executable"]["generation_id"] is not None:
+                    dependency = (
+                        "llama.dll"
+                        if TARGET_CONTRACTS[target]["target_os"] == "windows"
+                        else "libllama.so"
+                    )
+                    packaged_cli.write_bytes(
+                        synthetic_binary(
+                            TARGET_CONTRACTS[target]["binary_format"],
+                            TARGET_CONTRACTS[target]["target_arch"],
+                            "",
+                            (dependency,),
+                        )
+                    )
+                    manifest["binary"] = {
+                        "name": packaged_cli.name,
+                        "sha256": sha256_file(packaged_cli),
+                        **inspect_binary(packaged_cli),
+                    }
+                    manifests[0].write_text(
+                        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    try:
+                        load_native_manifest(package_root, packaged_cli, "0.0.0")
+                    except ProofFailure:
+                        pass
+                    else:
+                        raise AssertionError(
+                            "packaged proof accepted managed native imports on the launcher"
+                        )
 
         stale_contract = json.loads(json.dumps(model_contract))
         stale_contract["embedding"]["query_prefix"] = "changed query: "
@@ -1323,27 +1367,12 @@ def run_self_test() -> None:
             ),
             "linux",
         )
-        hostile_runtime = hostile.parent / "codestory-cli-runtime"
-        seed_id = next((hostile.parent / NATIVE_RUNTIME_SEEDS_DIR).iterdir()).name
-        seed_marker = (
-            NATIVE_RUNTIME_SEED_MARKER_PREFIX
-            + seed_id.encode()
-            + NATIVE_RUNTIME_SEED_MARKER_SUFFIX
-        ).decode()
-        hostile_runtime.write_bytes(
+        hostile.write_bytes(
             synthetic_binary(
                 "elf",
                 "x86_64",
-                native_marker(
-                    target="x86_64-unknown-linux-gnu",
-                    os_name="linux",
-                    arch="x86_64",
-                    backends="cpu,vulkan",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                    linkage="dynamic",
-                )
-                + seed_marker,
-                ("libvulkan.so.1",),
+                "",
+                ("libllama.so",),
             )
         )
         try:
@@ -1358,7 +1387,7 @@ def run_self_test() -> None:
         except PackageContractError:
             pass
         else:
-            raise AssertionError("base executable with mandatory Vulkan loader was accepted")
+            raise AssertionError("public launcher with managed native imports was accepted")
 
         missing_cpu = temp_root / "missing-cpu-runtime/codestory-cli"
         write_synthetic_runtime(

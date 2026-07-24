@@ -89,7 +89,7 @@ pub(crate) fn stage_native_generation(
                 &temporary.join(NATIVE_RUNTIME_FILE_LIST),
                 entries.iter().map(|(name, _)| name.as_str()),
             )?;
-            File::open(&temporary)?.sync_all()?;
+            sync_directory(&temporary)?;
             match fs::rename(&temporary, &generation_dir) {
                 Ok(()) => sync_parent_directory(&generation_dir)?,
                 Err(error)
@@ -813,6 +813,16 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     }
 
     unreachable!("replacement attempts always return")
+}
+
+#[cfg(not(windows))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(windows))]
