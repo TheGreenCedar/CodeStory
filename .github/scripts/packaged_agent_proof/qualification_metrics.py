@@ -13,7 +13,7 @@ from .contracts import (
 )
 from .foundation import require
 from .qualification import qualification_measurement_artifact
-from .qualification_production import (
+from .qualification_production_types import (
     QualificationExternalEvidence,
     QualificationProducerContext,
     QualificationRunnerEvidence,

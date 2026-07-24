@@ -12,7 +12,7 @@ from .contracts import (
 )
 from .foundation import LOWER_TIER_NONCLAIMS, require
 from .qualification_metrics import QualificationMeasurementEvidence
-from .qualification_production import (
+from .qualification_production_types import (
     QualificationProducerContext,
     QualificationRunnerEvidence,
     QualificationScenarioEvidence,

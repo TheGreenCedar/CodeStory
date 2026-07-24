@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .contracts import require_nonempty_string
 from .foundation import CANDIDATE_QUALIFICATION_MATRIX_ALIASES, require
 from .qualification_artifact_document import _qualification_artifact_document
 from .qualification_artifact_snapshots import _qualification_controls, _qualification_process_observations
