@@ -642,30 +642,91 @@ def validate_replay_attempts(
     return attempts
 
 
-def derive_scenario_assertions(
-    scenario_id: str,
-    *,
-    observations_by_kind: dict[str, list[dict]],
-    process_observations: list[dict],
-    invocations: list[dict],
-    control_actions: list[str],
-    same_account: dict,
-    materialization: dict,
-) -> dict[str, bool]:
-    def transition(kind: str, expected_keys: set[str] | None = None) -> dict:
-        matches = observations_by_kind.get(kind, [])
+@dataclass(frozen=True)
+class ScenarioAssertionEvidence:
+    scenario_id: str
+    observations_by_kind: dict[str, list[dict]]
+    process_observations: list[dict]
+    invocations: list[dict]
+    same_account: dict
+    materialization: dict
+    snapshots: tuple[dict, ...]
+    snapshot_instances: frozenset[str]
+    snapshot_authorities: frozenset[tuple[str, str]]
+    snapshot_engines: frozenset[tuple[str, str, int, int]]
+
+    @classmethod
+    def from_raw(
+        cls,
+        scenario_id: str,
+        *,
+        observations_by_kind: dict[str, list[dict]],
+        process_observations: list[dict],
+        invocations: list[dict],
+        same_account: dict,
+        materialization: dict,
+    ) -> ScenarioAssertionEvidence:
+        snapshots = tuple(
+            observation["snapshot"]
+            for observation in process_observations
+            if observation.get("snapshot") is not None
+        )
+        return cls(
+            scenario_id=scenario_id,
+            observations_by_kind=observations_by_kind,
+            process_observations=process_observations,
+            invocations=invocations,
+            same_account=same_account,
+            materialization=materialization,
+            snapshots=snapshots,
+            snapshot_instances=frozenset(
+                snapshot["process"]["server_instance_id"]
+                for snapshot in snapshots
+            ),
+            snapshot_authorities=frozenset(
+                (
+                    snapshot["authority"]["lifetime_authority_id"],
+                    snapshot["authority"]["listener_id"],
+                )
+                for snapshot in snapshots
+            ),
+            snapshot_engines=frozenset(
+                (
+                    snapshot["engine"]["engine_owner_id"],
+                    snapshot["engine"]["native_worker_id"],
+                    snapshot["engine"]["load_generation"],
+                    snapshot["engine"]["model_load_count"],
+                )
+                for snapshot in snapshots
+                if snapshot.get("engine") is not None
+            ),
+        )
+
+    def transition(
+        self,
+        kind: str,
+        expected_keys: set[str] | None = None,
+    ) -> dict:
+        matches = self.observations_by_kind.get(kind, [])
         require(
             len(matches) == 1,
-            f"qualification scenario {scenario_id} omitted or duplicated transition {kind}",
+            f"qualification scenario {self.scenario_id} omitted or duplicated transition {kind}",
         )
         values = matches[0]["values"]
-        require(isinstance(values, dict), f"qualification transition {kind} values are malformed")
+        require(
+            isinstance(values, dict),
+            f"qualification transition {kind} values are malformed",
+        )
         if expected_keys is not None:
-            require_exact_keys(values, expected_keys, f"qualification transition {kind} values")
+            require_exact_keys(
+                values,
+                expected_keys,
+                f"qualification transition {kind} values",
+            )
         return values
 
-    def scheduler(kind: str) -> dict:
-        values = transition(
+    def scheduler(self, kind: str) -> dict:
+        values = self.transition(
             kind,
             {
                 "query_capacity",
@@ -685,64 +746,253 @@ def derive_scenario_assertions(
             "active_request_count",
             "lease_count",
         ):
-            require_nonnegative_int(values[field], f"qualification transition {kind}.{field}")
+            require_nonnegative_int(
+                values[field],
+                f"qualification transition {kind}.{field}",
+            )
         require(
             values["active_request_class"] in {None, "query", "bulk"},
             f"qualification transition {kind} has an invalid active request class",
         )
         return values
 
-    snapshots = [
-        observation["snapshot"]
-        for observation in process_observations
-        if observation.get("snapshot") is not None
-    ]
-    snapshot_instances = {
-        snapshot["process"]["server_instance_id"] for snapshot in snapshots
+
+def _client_death_assertions(
+    evidence: ScenarioAssertionEvidence,
+) -> dict[str, bool]:
+    active = evidence.scheduler("dead_client_work_observed")
+    continued = evidence.transition(
+        "other_client_continued",
+        {"project_identity_sha256"},
+    )
+    terminated = evidence.transition("client_terminated", {"termination"})
+    reclaimed = evidence.scheduler("dead_client_work_reclaimed")
+    post = evidence.transition(
+        "post_reclaim_other_client_query",
+        {"server_instance_id"},
+    )
+    return {
+        "dead_client_queue_and_leases_reclaimed": (
+            active["query_depth"] > 0
+            and active["bulk_depth"] > 0
+            and active["active_request_count"] > 0
+            and active["lease_count"] > 0
+            and reclaimed["query_depth"] == 0
+            and reclaimed["bulk_depth"] == 0
+            and reclaimed["active_request_count"] == 0
+            and reclaimed["lease_count"] == 0
+            and terminated["termination"] == "terminated"
+        ),
+        "other_client_continues": (
+            HEX_SHA256.fullmatch(str(continued["project_identity_sha256"]))
+            is not None
+            and post["server_instance_id"] in evidence.snapshot_instances
+        ),
+        "no_server_replacement": len(evidence.snapshot_instances) == 1,
     }
-    snapshot_authorities = {
-        (
-            snapshot["authority"]["lifetime_authority_id"],
-            snapshot["authority"]["listener_id"],
+
+
+def _frozen_owner_assertions(
+    evidence: ScenarioAssertionEvidence,
+) -> dict[str, bool]:
+    bounded = evidence.transition(
+        "bounded_owner_unresponsive",
+        {
+            "started_ns",
+            "finished_ns",
+            "error_code",
+            "timeout_ms",
+            "clock_domain",
+            "clock_boot_id",
+            "retry",
+        },
+    )
+    stable = evidence.transition(
+        "owner_identity_stable",
+        {
+            "server_instance_id",
+            "lifetime_authority_id",
+            "listener_id",
+            "pid",
+            "process_start_id",
+            "post_release_query_succeeded",
+        },
+    )
+    started = require_nonnegative_int(
+        bounded["started_ns"],
+        "frozen owner started_ns",
+    )
+    finished = require_nonnegative_int(
+        bounded["finished_ns"],
+        "frozen owner finished_ns",
+    )
+    timeout_ms = require_positive_int(
+        bounded["timeout_ms"],
+        "frozen owner timeout_ms",
+    )
+    stable_pid = require_positive_int(stable["pid"], "frozen owner stable pid")
+    retry = validate_retry_state(bounded["retry"], "frozen owner retry")
+    stable_identity = (
+        len(evidence.snapshot_instances) == 1
+        and stable["server_instance_id"] == next(iter(evidence.snapshot_instances))
+        and len(evidence.snapshot_authorities) == 1
+        and (
+            stable["lifetime_authority_id"],
+            stable["listener_id"],
         )
-        for snapshot in snapshots
-    }
-    snapshot_engines = {
-        (
-            snapshot["engine"]["engine_owner_id"],
-            snapshot["engine"]["native_worker_id"],
-            snapshot["engine"]["load_generation"],
-            snapshot["engine"]["model_load_count"],
+        == next(iter(evidence.snapshot_authorities))
+        and all(
+            snapshot["process"]["pid"] == stable_pid
+            and snapshot["process"]["process_start_id"]
+            == stable["process_start_id"]
+            for snapshot in evidence.snapshots
         )
-        for snapshot in snapshots
-        if snapshot.get("engine") is not None
+        and stable["post_release_query_succeeded"] is True
+    )
+    return {
+        "owner_unresponsive_is_bounded": (
+            finished >= started
+            and finished - started <= timeout_ms * 1_000_000
+            and bounded["clock_domain"] == "awake_monotonic"
+            and bool(bounded["clock_boot_id"])
+            and bounded["error_code"] == "embedding_server_owner_unresponsive"
+            and retry.code == bounded["error_code"]
+            and retry.retry_class == "after_server_change"
+            and bool(retry.retry_condition)
+        ),
+        "authority_retained": stable_identity,
+        "no_unlink": stable_identity,
+        "no_pid_kill": stable_identity,
+        "no_takeover": stable_identity,
+        "no_second_engine": len(evidence.snapshot_engines) == 1,
     }
+
+
+def _incompatible_owner_assertions(
+    evidence: ScenarioAssertionEvidence,
+) -> dict[str, bool]:
+    active = evidence.transition(
+        "active_owner_rejected",
+        {"compatibility_evidence", "error_code", "retry"},
+    )
+    idle = evidence.transition(
+        "idle_owner_draining",
+        {"compatibility_evidence", "error_code", "retry"},
+    )
+    replacement = evidence.transition(
+        "compatible_replacement",
+        {"old_server_instance_id", "new_server_instance_id"},
+    )
+    replaced = (
+        replacement["old_server_instance_id"]
+        != replacement["new_server_instance_id"]
+        and {
+            replacement["old_server_instance_id"],
+            replacement["new_server_instance_id"],
+        }
+        <= evidence.snapshot_instances
+    )
+    active_retry = validate_retry_state(
+        active["retry"],
+        "incompatible active retry",
+    )
+    idle_retry = validate_retry_state(
+        idle["retry"],
+        "incompatible idle retry",
+    )
+    expected_condition = "the incompatible server exits while fully idle"
+    return {
+        "idle_owner_drains": (
+            idle["compatibility_evidence"] == "injected_contract_mismatch"
+            and idle["error_code"] == "embedding_server_draining"
+            and idle_retry.code == idle["error_code"]
+            and idle_retry.retry_class == "after_owner_idle"
+            and idle_retry.retry_after_ms == 0
+            and idle_retry.retry_condition == expected_condition
+            and replaced
+        ),
+        "active_owner_returns_typed_retry": (
+            active["compatibility_evidence"] == "injected_contract_mismatch"
+            and active["error_code"]
+            == "embedding_server_incompatible_active_owner"
+            and active_retry.code == active["error_code"]
+            and active_retry.retry_class == "after_owner_idle"
+            and active_retry.retry_after_ms == 0
+            and active_retry.retry_condition == expected_condition
+        ),
+        "one_authority": len(evidence.snapshot_authorities) <= 2 and replaced,
+        "one_engine_maximum": len(evidence.snapshot_instances) == 2 and replaced,
+    }
+
+
+def _server_crash_assertions(
+    evidence: ScenarioAssertionEvidence,
+) -> dict[str, bool]:
+    active = evidence.scheduler("inflight_request_observed")
+    replacement = evidence.transition(
+        "server_replaced",
+        {"old_server_instance_id", "new_server_instance_id"},
+    )
+    replay = evidence.transition(
+        "query_replayed",
+        {
+            "logical_operation_count",
+            "wire_attempt_count",
+            "wire_attempts",
+        },
+    )
+    attempts = validate_replay_attempts(
+        replay,
+        old_server_instance_id=replacement["old_server_instance_id"],
+        new_server_instance_id=replacement["new_server_instance_id"],
+    )
+    return {
+        "one_replacement_server": (
+            active["active_request_class"] == "query"
+            and replacement["old_server_instance_id"]
+            != replacement["new_server_instance_id"]
+            and [attempt.server_instance_id for attempt in attempts]
+            == [
+                replacement["old_server_instance_id"],
+                replacement["new_server_instance_id"],
+            ]
+        ),
+        "pure_embedding_rpc_replayed_at_most_once": (
+            replay["logical_operation_count"] == 1
+            and replay["wire_attempt_count"] <= 2
+            and sum(attempt.outcome == "completed" for attempt in attempts) == 1
+        ),
+    }
+
+
+def derive_scenario_assertions(
+    scenario_id: str,
+    *,
+    observations_by_kind: dict[str, list[dict]],
+    process_observations: list[dict],
+    invocations: list[dict],
+    control_actions: list[str],
+    same_account: dict,
+    materialization: dict,
+) -> dict[str, bool]:
+    evidence = ScenarioAssertionEvidence.from_raw(
+        scenario_id,
+        observations_by_kind=observations_by_kind,
+        process_observations=process_observations,
+        invocations=invocations,
+        same_account=same_account,
+        materialization=materialization,
+    )
+    transition = evidence.transition
+    scheduler = evidence.scheduler
+    snapshots = evidence.snapshots
+    snapshot_instances = evidence.snapshot_instances
+    snapshot_authorities = evidence.snapshot_authorities
+    snapshot_engines = evidence.snapshot_engines
 
     assertions: dict[str, bool]
     if scenario_id == "client_death":
-        active = scheduler("dead_client_work_observed")
-        continued = transition("other_client_continued", {"project_identity_sha256"})
-        terminated = transition("client_terminated", {"termination"})
-        reclaimed = scheduler("dead_client_work_reclaimed")
-        post = transition("post_reclaim_other_client_query", {"server_instance_id"})
-        assertions = {
-            "dead_client_queue_and_leases_reclaimed": (
-                active["query_depth"] > 0
-                and active["bulk_depth"] > 0
-                and active["active_request_count"] > 0
-                and active["lease_count"] > 0
-                and reclaimed["query_depth"] == 0
-                and reclaimed["bulk_depth"] == 0
-                and reclaimed["active_request_count"] == 0
-                and reclaimed["lease_count"] == 0
-                and terminated["termination"] == "terminated"
-            ),
-            "other_client_continues": (
-                HEX_SHA256.fullmatch(str(continued["project_identity_sha256"])) is not None
-                and post["server_instance_id"] in snapshot_instances
-            ),
-            "no_server_replacement": len(snapshot_instances) == 1,
-        }
+        assertions = _client_death_assertions(evidence)
     elif scenario_id == "cold_race":
         election_witnesses = {
             phase: [
@@ -844,120 +1094,9 @@ def derive_scenario_assertions(
             ),
         }
     elif scenario_id == "frozen_owner":
-        bounded = transition(
-            "bounded_owner_unresponsive",
-            {
-                "started_ns",
-                "finished_ns",
-                "error_code",
-                "timeout_ms",
-                "clock_domain",
-                "clock_boot_id",
-                "retry",
-            },
-        )
-        stable = transition(
-            "owner_identity_stable",
-            {
-                "server_instance_id",
-                "lifetime_authority_id",
-                "listener_id",
-                "pid",
-                "process_start_id",
-                "post_release_query_succeeded",
-            },
-        )
-        started = require_nonnegative_int(bounded["started_ns"], "frozen owner started_ns")
-        finished = require_nonnegative_int(bounded["finished_ns"], "frozen owner finished_ns")
-        timeout_ms = require_positive_int(bounded["timeout_ms"], "frozen owner timeout_ms")
-        stable_pid = require_positive_int(stable["pid"], "frozen owner stable pid")
-        retry = validate_retry_state(bounded["retry"], "frozen owner retry")
-        stable_identity = (
-            len(snapshot_instances) == 1
-            and stable["server_instance_id"] == next(iter(snapshot_instances))
-            and len(snapshot_authorities) == 1
-            and (
-                stable["lifetime_authority_id"],
-                stable["listener_id"],
-            )
-            == next(iter(snapshot_authorities))
-            and all(
-                snapshot["process"]["pid"] == stable_pid
-                and snapshot["process"]["process_start_id"]
-                == stable["process_start_id"]
-                for snapshot in snapshots
-            )
-            and stable["post_release_query_succeeded"] is True
-        )
-        assertions = {
-            "owner_unresponsive_is_bounded": (
-                finished >= started
-                and finished - started <= timeout_ms * 1_000_000
-                and bounded["clock_domain"] == "awake_monotonic"
-                and bool(bounded["clock_boot_id"])
-                and bounded["error_code"] == "embedding_server_owner_unresponsive"
-                and retry.code == bounded["error_code"]
-                and retry.retry_class == "after_server_change"
-                and bool(retry.retry_condition)
-            ),
-            "authority_retained": stable_identity,
-            "no_unlink": stable_identity,
-            "no_pid_kill": stable_identity,
-            "no_takeover": stable_identity,
-            "no_second_engine": len(snapshot_engines) == 1,
-        }
+        assertions = _frozen_owner_assertions(evidence)
     elif scenario_id == "incompatible_owner":
-        active = transition(
-            "active_owner_rejected",
-            {"compatibility_evidence", "error_code", "retry"},
-        )
-        idle = transition(
-            "idle_owner_draining",
-            {"compatibility_evidence", "error_code", "retry"},
-        )
-        replacement = transition(
-            "compatible_replacement",
-            {"old_server_instance_id", "new_server_instance_id"},
-        )
-        replaced = (
-            replacement["old_server_instance_id"] != replacement["new_server_instance_id"]
-            and {
-                replacement["old_server_instance_id"],
-                replacement["new_server_instance_id"],
-            }
-            <= snapshot_instances
-        )
-        active_retry = validate_retry_state(
-            active["retry"],
-            "incompatible active retry",
-        )
-        idle_retry = validate_retry_state(
-            idle["retry"],
-            "incompatible idle retry",
-        )
-        assertions = {
-            "idle_owner_drains": (
-                idle["compatibility_evidence"] == "injected_contract_mismatch"
-                and idle["error_code"] == "embedding_server_draining"
-                and idle_retry.code == idle["error_code"]
-                and idle_retry.retry_class == "after_owner_idle"
-                and idle_retry.retry_after_ms == 0
-                and idle_retry.retry_condition
-                == "the incompatible server exits while fully idle"
-                and replaced
-            ),
-            "active_owner_returns_typed_retry": (
-                active["compatibility_evidence"] == "injected_contract_mismatch"
-                and active["error_code"] == "embedding_server_incompatible_active_owner"
-                and active_retry.code == active["error_code"]
-                and active_retry.retry_class == "after_owner_idle"
-                and active_retry.retry_after_ms == 0
-                and active_retry.retry_condition
-                == "the incompatible server exits while fully idle"
-            ),
-            "one_authority": len(snapshot_authorities) <= 2 and replaced,
-            "one_engine_maximum": len(snapshot_instances) == 2 and replaced,
-        }
+        assertions = _incompatible_owner_assertions(evidence)
     elif scenario_id == "mixed_queue":
         saturated = scheduler("queues_saturated")
         selected = scheduler("query_selected_before_bulk_backlog")
@@ -1069,41 +1208,7 @@ def derive_scenario_assertions(
             ),
         }
     elif scenario_id == "server_crash":
-        active = scheduler("inflight_request_observed")
-        replacement = transition(
-            "server_replaced",
-            {"old_server_instance_id", "new_server_instance_id"},
-        )
-        replay = transition(
-            "query_replayed",
-            {
-                "logical_operation_count",
-                "wire_attempt_count",
-                "wire_attempts",
-            },
-        )
-        attempts = validate_replay_attempts(
-            replay,
-            old_server_instance_id=replacement["old_server_instance_id"],
-            new_server_instance_id=replacement["new_server_instance_id"],
-        )
-        assertions = {
-            "one_replacement_server": (
-                active["active_request_class"] == "query"
-                and replacement["old_server_instance_id"]
-                != replacement["new_server_instance_id"]
-                and [attempt.server_instance_id for attempt in attempts]
-                == [
-                    replacement["old_server_instance_id"],
-                    replacement["new_server_instance_id"],
-                ]
-            ),
-            "pure_embedding_rpc_replayed_at_most_once": (
-                replay["logical_operation_count"] == 1
-                and replay["wire_attempt_count"] <= 2
-                and sum(attempt.outcome == "completed" for attempt in attempts) == 1
-            ),
-        }
+        assertions = _server_crash_assertions(evidence)
     elif scenario_id == "true_idle_respawn":
         active = scheduler("anti_idle_work_observed")
         preserved = transition(
