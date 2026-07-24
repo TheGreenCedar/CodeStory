@@ -86,7 +86,6 @@ pub(crate) fn collect_yaml_entities(
     file_id: NodeId,
     storage: &mut IntermediateStorage,
 ) -> Result<(), StructuralCollectionError> {
-    validate_yaml_source(source)?;
     let mut ordinal = 0usize;
     let mut block_scalar_parent_indent = None;
     for (line_index, line_text) in source.lines().enumerate() {
@@ -468,94 +467,6 @@ fn markdown_fence_marker(line: &str) -> Option<(u8, usize)> {
 fn markdown_fence_closes(line: &str, marker: u8, opening_len: usize) -> bool {
     let marker_len = line.bytes().take_while(|byte| *byte == marker).count();
     marker_len >= opening_len && line[marker_len..].trim().is_empty()
-}
-
-fn validate_yaml_source(source: &str) -> Result<(), StructuralCollectionError> {
-    let mut flow = Vec::new();
-    let mut quote = None;
-    let mut escaped = false;
-    let mut block_scalar_parent_indent = None;
-    for (line_index, line) in source.lines().enumerate() {
-        let leading_spaces = line
-            .as_bytes()
-            .iter()
-            .take_while(|byte| **byte == b' ')
-            .count();
-        let trimmed = line[leading_spaces..].trim_end();
-        if let Some(parent_indent) = block_scalar_parent_indent {
-            if trimmed.is_empty() || leading_spaces > parent_indent {
-                continue;
-            }
-            block_scalar_parent_indent = None;
-        }
-        let indentation = line
-            .as_bytes()
-            .iter()
-            .take_while(|byte| byte.is_ascii_whitespace())
-            .count();
-        if line.as_bytes()[..indentation].contains(&b'\t') {
-            return Err(StructuralCollectionError::Malformed(format!(
-                "YAML indentation contains a tab on line {}",
-                line_index + 1
-            )));
-        }
-        let code = strip_yaml_comment(line);
-        let mut chars = code.char_indices().peekable();
-        while let Some((index, ch)) = chars.next() {
-            if let Some(active) = quote {
-                if escaped {
-                    escaped = false;
-                    continue;
-                }
-                if active == '"' && ch == '\\' {
-                    escaped = true;
-                    continue;
-                }
-                if ch == active {
-                    if active == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
-                        chars.next();
-                        continue;
-                    }
-                    quote = None;
-                }
-                continue;
-            }
-            if ch == '#' && yaml_comment_starts_at(code, index) {
-                break;
-            }
-            match ch {
-                '\'' | '"' if yaml_quote_can_open_at(code, index) => quote = Some(ch),
-                '[' | '{' => flow.push(ch),
-                ']' if flow.pop() != Some('[') => {
-                    return Err(StructuralCollectionError::Malformed(format!(
-                        "unmatched YAML flow delimiter on line {}",
-                        line_index + 1
-                    )));
-                }
-                '}' if flow.pop() != Some('{') => {
-                    return Err(StructuralCollectionError::Malformed(format!(
-                        "unmatched YAML flow delimiter on line {}",
-                        line_index + 1
-                    )));
-                }
-                _ => {}
-            }
-        }
-        if flow.is_empty() && yaml_block_scalar_header(code.trim_start()) {
-            block_scalar_parent_indent = Some(indentation);
-        }
-    }
-    if !flow.is_empty() {
-        return Err(StructuralCollectionError::Malformed(
-            "unterminated YAML flow collection".to_string(),
-        ));
-    }
-    if quote.is_some() {
-        return Err(StructuralCollectionError::Malformed(
-            "unterminated YAML quoted scalar".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
