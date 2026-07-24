@@ -238,7 +238,7 @@ pub(super) fn render_symbol_workflow_markdown(
     markdown
 }
 
-pub(super) fn append_symbol_workflow_nodes(
+pub(in crate::app) fn append_symbol_workflow_nodes(
     markdown: &mut String,
     label: &str,
     nodes: &[codestory_runtime::SymbolWorkflowNode],

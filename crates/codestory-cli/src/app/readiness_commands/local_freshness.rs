@@ -142,7 +142,7 @@ pub(crate) fn attach_complete_publication(
     }
 }
 
-pub(crate) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
+pub(in crate::app) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
     summary.freshness.as_ref().is_some_and(|freshness| {
         matches!(
             freshness.status,
@@ -166,7 +166,9 @@ pub(crate) fn local_refresh_output_from_summary(
     readiness::local_refresh_output(&verdict)
 }
 
-fn classify_local_refresh_failure_state(error: &anyhow::Error) -> readiness::LocalRefreshState {
+pub(in crate::app) fn classify_local_refresh_failure_state(
+    error: &anyhow::Error,
+) -> readiness::LocalRefreshState {
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("cache_busy")
         || message.contains("database is locked")

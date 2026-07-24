@@ -94,9 +94,27 @@ mod server;
 mod source_commands;
 
 pub(crate) use agent_context::packet_sufficiency_label;
+#[cfg(test)]
+use agent_context::{
+    build_task_brief_output, packet_budget_mode_label, packet_task_class_label,
+    render_packet_markdown, render_task_brief_markdown,
+};
+#[cfg(test)]
+use index_command::validate_index_watch_output_file;
+#[cfg(test)]
+use lifecycle::{
+    embedding_client_transport_mode, map_embedding_preflight_error, open_agent_surface,
+};
 pub(crate) use readiness_commands::{
     attach_complete_publication, local_refresh_output_from_summary,
 };
+#[cfg(test)]
+use readiness_commands::{
+    build_agent_preflight_output, classify_local_refresh_failure_state,
+    local_freshness_needs_refresh,
+};
+#[cfg(test)]
+use runtime::map_api_error;
 
 #[tokio::main]
 pub async fn run() -> ExitCode {
@@ -204,10 +222,6 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::InternalOwnedDelete(cmd) => lifecycle::run_internal_owned_delete(cmd),
         Command::InternalEmbeddingServer => {
             embedding_server_transport::run_internal_embedding_server()
-        }
-        Command::InternalEmbeddingQualification(cmd) => {
-            embedding_qualification::run_internal_embedding_qualification(cmd)
-                .map_err(|error| anyhow::anyhow!("{error:#}"))
         }
         Command::InternalEmbeddingQualificationWorker(cmd) => {
             embedding_qualification::run_internal_embedding_qualification_worker(cmd)

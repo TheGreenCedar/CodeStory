@@ -316,7 +316,7 @@ fn drill_summary_open_gaps(
     }
 }
 
-pub(super) fn drill_packet_claim_readiness(
+pub(in crate::app) fn drill_packet_claim_readiness(
     status: PacketSufficiencyStatusDto,
 ) -> ClaimReadinessDto {
     match status {

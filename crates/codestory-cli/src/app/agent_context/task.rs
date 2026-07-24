@@ -50,38 +50,38 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct TaskBriefOutput {
-    task_brief_version: u32,
-    prompt: String,
-    status: String,
-    source_packet_id: String,
-    source_packet_sufficiency: String,
-    first_files: Vec<TaskBriefFileOutput>,
-    relevant_symbols: Vec<TaskBriefSymbolOutput>,
-    likely_tests: Vec<TaskBriefFileOutput>,
-    impacted_surfaces: Vec<String>,
-    risks_unknowns: Vec<String>,
-    follow_up_codestory_commands: Vec<String>,
-    future_sections: Vec<String>,
+pub(in crate::app) struct TaskBriefOutput {
+    pub(in crate::app) task_brief_version: u32,
+    pub(in crate::app) prompt: String,
+    pub(in crate::app) status: String,
+    pub(in crate::app) source_packet_id: String,
+    pub(in crate::app) source_packet_sufficiency: String,
+    pub(in crate::app) first_files: Vec<TaskBriefFileOutput>,
+    pub(in crate::app) relevant_symbols: Vec<TaskBriefSymbolOutput>,
+    pub(in crate::app) likely_tests: Vec<TaskBriefFileOutput>,
+    pub(in crate::app) impacted_surfaces: Vec<String>,
+    pub(in crate::app) risks_unknowns: Vec<String>,
+    pub(in crate::app) follow_up_codestory_commands: Vec<String>,
+    pub(in crate::app) future_sections: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct TaskBriefFileOutput {
-    path: String,
-    line: Option<u32>,
-    reason: String,
+pub(in crate::app) struct TaskBriefFileOutput {
+    pub(in crate::app) path: String,
+    pub(in crate::app) line: Option<u32>,
+    pub(in crate::app) reason: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct TaskBriefSymbolOutput {
-    name: String,
-    kind: String,
-    path: Option<String>,
-    line: Option<u32>,
-    reason: String,
+pub(in crate::app) struct TaskBriefSymbolOutput {
+    pub(in crate::app) name: String,
+    pub(in crate::app) kind: String,
+    pub(in crate::app) path: Option<String>,
+    pub(in crate::app) line: Option<u32>,
+    pub(in crate::app) reason: String,
 }
 
-fn build_task_brief_output(
+pub(in crate::app) fn build_task_brief_output(
     project_root: &std::path::Path,
     packet: &AgentPacketDto,
 ) -> TaskBriefOutput {
@@ -286,7 +286,7 @@ fn task_brief_follow_up_commands(
     commands
 }
 
-fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
+pub(in crate::app) fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Task Brief");
     let _ = writeln!(

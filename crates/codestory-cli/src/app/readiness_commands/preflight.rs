@@ -113,7 +113,7 @@ const LOCAL_GRAPH_AGENT_SURFACES: &[&str] = &[
 ];
 const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "context_full"];
 
-fn build_agent_preflight_output(
+pub(in crate::app) fn build_agent_preflight_output(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     local_refresh: Option<readiness::LocalRefreshOutput>,

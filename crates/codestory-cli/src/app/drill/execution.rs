@@ -199,14 +199,14 @@ fn drill_execution_boundaries() -> Vec<DrillExecutionBoundaryOutput> {
     }]
 }
 
-pub(super) fn execute_drill_packet(
+pub(in crate::app) fn execute_drill_packet(
     request: AgentPacketRequestDto,
     execute: impl FnOnce(AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError>,
 ) -> Result<AgentPacketDto> {
     execute(request).map_err(map_api_error)
 }
 
-pub(super) fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitationDto> {
+pub(in crate::app) fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitationDto> {
     let mut citations = packet.answer.citations.clone();
     for claim in &packet.sufficiency.covered_claims {
         citations.extend(claim.citations.iter().cloned());
@@ -222,7 +222,7 @@ pub(super) fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitati
     citations
 }
 
-pub(super) fn drill_packet_anchors(
+pub(in crate::app) fn drill_packet_anchors(
     project_root: &std::path::Path,
     anchors: &[String],
     citations: &[AgentCitationDto],
@@ -261,7 +261,7 @@ pub(super) fn drill_packet_anchors(
         .collect()
 }
 
-pub(super) fn drill_search_hit_from_packet_citation(
+pub(in crate::app) fn drill_search_hit_from_packet_citation(
     project_root: &std::path::Path,
     query: &str,
     citation: &AgentCitationDto,
@@ -336,7 +336,9 @@ pub(super) fn drill_packet_verification_target(
     })
 }
 
-pub(super) fn drill_packet_citation_is_typed_resolvable(citation: &AgentCitationDto) -> bool {
+pub(in crate::app) fn drill_packet_citation_is_typed_resolvable(
+    citation: &AgentCitationDto,
+) -> bool {
     citation.resolvable
         && citation.kind != NodeKind::UNKNOWN
         && citation.evidence_tier
@@ -345,7 +347,7 @@ pub(super) fn drill_packet_citation_is_typed_resolvable(citation: &AgentCitation
             != Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
 }
 
-pub(super) fn drill_packet_verification_targets(
+pub(in crate::app) fn drill_packet_verification_targets(
     project_root: &std::path::Path,
     citations: &[AgentCitationDto],
 ) -> Vec<VerificationTargetOutput> {
@@ -355,7 +357,7 @@ pub(super) fn drill_packet_verification_targets(
         .collect()
 }
 
-pub(super) fn drill_packet_bridges(
+pub(in crate::app) fn drill_packet_bridges(
     project_root: &std::path::Path,
     packet: &AgentPacketDto,
 ) -> Vec<DrillBridgeOutput> {
@@ -435,7 +437,7 @@ pub(super) fn drill_packet_citations_share_graph_evidence(
         .any(|edge| to.evidence_edge_ids.contains(edge))
 }
 
-pub(super) fn write_drill_outputs(
+pub(in crate::app) fn write_drill_outputs(
     format: args::OutputFormat,
     output_dir: &std::path::Path,
     operation: &codestory_runtime::PublicOperation<DrillOutput>,

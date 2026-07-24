@@ -29,7 +29,7 @@ pub(super) fn run_index(cmd: IndexCommand) -> Result<()> {
     Ok(())
 }
 
-fn validate_index_watch_output_file(cmd: &IndexCommand) -> Result<()> {
+pub(in crate::app) fn validate_index_watch_output_file(cmd: &IndexCommand) -> Result<()> {
     if !cmd.watch {
         return Ok(());
     }

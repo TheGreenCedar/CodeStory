@@ -120,7 +120,7 @@ pub(super) fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::p
 }
 
 #[derive(Debug)]
-pub(super) struct UnsupportedNonUtf8Path {
+pub(in crate::app) struct UnsupportedNonUtf8Path {
     source: &'static str,
 }
 
@@ -151,7 +151,7 @@ pub(super) fn affected_discovery_error(
     .into()
 }
 
-pub(super) fn unsupported_non_utf8_path_envelope(
+pub(in crate::app) fn unsupported_non_utf8_path_envelope(
     error: &UnsupportedNonUtf8Path,
 ) -> CommandFailureEnvelope {
     command_failure_envelope(
@@ -199,7 +199,7 @@ pub(super) fn parse_git_nul_path_records(
         .collect()
 }
 
-pub(super) fn parse_git_name_status_records_z(
+pub(in crate::app) fn parse_git_name_status_records_z(
     input: &[u8],
 ) -> Result<Vec<AffectedChangeRecordDto>> {
     let fields = nul_delimited_git_fields(input)?;

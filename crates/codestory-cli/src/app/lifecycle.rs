@@ -72,7 +72,7 @@ pub(super) fn open_agent_surface(
     })
 }
 
-fn map_embedding_preflight_error(error: anyhow::Error) -> anyhow::Error {
+pub(in crate::app) fn map_embedding_preflight_error(error: anyhow::Error) -> anyhow::Error {
     codestory_runtime::embedding_api_error(&error).map_or(error, map_api_error)
 }
 

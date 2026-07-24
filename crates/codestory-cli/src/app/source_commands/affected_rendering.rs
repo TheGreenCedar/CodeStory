@@ -2,7 +2,9 @@ use super::super::resolution::quote_command_argument_value;
 use codestory_contracts::api::{AffectedFollowUpInvocationDto, FrameworkRouteCoverageDto};
 use std::fmt::Write as _;
 
-pub(super) fn render_files_markdown(output: &codestory_contracts::api::IndexedFilesDto) -> String {
+pub(in crate::app) fn render_files_markdown(
+    output: &codestory_contracts::api::IndexedFilesDto,
+) -> String {
     let mut markdown = String::new();
     markdown.push_str("# indexed files\n\n");
     render_files_summary(&mut markdown, output);
@@ -376,7 +378,9 @@ pub(super) fn render_affected_symbols(
     }
 }
 
-pub(super) fn render_affected_invocation(invocation: &AffectedFollowUpInvocationDto) -> String {
+pub(in crate::app) fn render_affected_invocation(
+    invocation: &AffectedFollowUpInvocationDto,
+) -> String {
     std::iter::once(invocation.program.clone())
         .chain(
             invocation

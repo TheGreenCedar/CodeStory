@@ -8,3 +8,12 @@ pub(super) use affected::{affected_path_record, run_affected};
 pub(super) use source_read::{run_files, run_query, run_snippet};
 pub(super) use symbol::{run_symbol, run_symbol_workflow};
 pub(super) use trail::{run_callees, run_callers, run_trace, run_trail};
+
+#[cfg(test)]
+pub(super) use affected::{
+    UnsupportedNonUtf8Path, parse_git_name_status_records_z, unsupported_non_utf8_path_envelope,
+};
+#[cfg(test)]
+pub(super) use affected_rendering::{render_affected_invocation, render_files_markdown};
+#[cfg(test)]
+pub(super) use symbol::append_symbol_workflow_nodes;

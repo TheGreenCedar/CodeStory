@@ -60,7 +60,10 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
-fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDto) -> String {
+pub(in crate::app) fn render_packet_markdown(
+    project_root: &std::path::Path,
+    packet: &AgentPacketDto,
+) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Packet");
     append_packet_operator_header(&mut markdown, packet);
@@ -191,7 +194,7 @@ fn packet_operator_next_action(packet: &AgentPacketDto) -> &str {
         .unwrap_or("Inspect cited source before relying on claims not covered by packet citations.")
 }
 
-pub(super) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {
+pub(in crate::app) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {
     match mode {
         PacketBudgetModeDto::Tiny => "tiny",
         PacketBudgetModeDto::Compact => "compact",
@@ -200,7 +203,7 @@ pub(super) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static st
     }
 }
 
-fn packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
+pub(in crate::app) fn packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
     match task_class {
         PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
         PacketTaskClassDto::BugLocalization => "bug_localization",
