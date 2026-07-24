@@ -1475,7 +1475,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   const releaseEvidence = requireJob(violations, releaseFile, release, "release-evidence");
   add(
     violations,
-    releaseEvidence.uses === "./.github/workflows/release-candidate-evidence.yml",
+    releaseEvidence.uses === releaseEvidenceWorkflowRef,
     `${releaseFile} must produce exact-head release evidence before hardware qualification`,
   );
   add(
