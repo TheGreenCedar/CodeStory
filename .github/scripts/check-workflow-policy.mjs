@@ -652,8 +652,8 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
 
   add(
     violations,
-    retrievalJob["timeout-minutes"] === 45,
-    "retrieval cache producer timeout must remain 45 minutes",
+    retrievalJob["timeout-minutes"] === 60,
+    "retrieval cache producer timeout must remain 60 minutes",
   );
   add(
     violations,

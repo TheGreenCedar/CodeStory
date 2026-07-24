@@ -20,7 +20,14 @@ const args = process.argv.slice(2);
 const check = args.includes("--check");
 const rewriteReferences = args.includes("--rewrite-references");
 const cliIndex = args.indexOf("--cli");
-const defaultCli = join(repoRoot, "target", "debug", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+const executableSuffix = process.platform === "win32" ? ".exe" : "";
+const splitNativeRuntime = process.platform === "linux" || process.platform === "win32";
+const defaultCli = join(
+  repoRoot,
+  "target",
+  "debug",
+  `${splitNativeRuntime ? "codestory-cli-runtime" : "codestory-cli"}${executableSuffix}`,
+);
 const cli = resolve(cliIndex >= 0 ? args[cliIndex + 1] : process.env.CODESTORY_CLI_BIN || defaultCli);
 
 if (!existsSync(cli)) {
@@ -44,7 +51,9 @@ function usage(text) {
     if (!line.startsWith("  ")) break;
     collected.push(line.trim());
   }
-  return collected.join(" ").replace(/^codestory-cli(?:\.exe)?\b/u, "codestory-cli");
+  return collected
+    .join(" ")
+    .replace(/^codestory-cli(?:-runtime)?(?:\.exe)?\b/u, "codestory-cli");
 }
 
 function mcpCatalog() {
