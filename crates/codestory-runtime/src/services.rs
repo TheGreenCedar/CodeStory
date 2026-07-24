@@ -17,6 +17,7 @@ use codestory_indexer::CancellationToken;
 use codestory_store::{IndexPublicationRecord, Store};
 use serde::Serialize;
 use std::cell::RefCell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -545,18 +546,20 @@ impl ActivationService {
             if let Err(error) = std::thread::Builder::new()
                 .name(format!("codestory-{operation_id}"))
                 .spawn(move || {
-                    let attempt = worker_operation.attempt();
-                    let result = worker_service
-                        .activate_once(&worker_operation, worker_project_root, worker_storage_path)
-                        .map_err(|error| classify_activation_api_error_for_attempt(error, attempt));
-                    worker_operation.finish(result.as_ref().err());
+                    run_activation_worker(&worker_operation, || {
+                        worker_service.activate_once(
+                            &worker_operation,
+                            worker_project_root,
+                            worker_storage_path,
+                        )
+                    });
                 })
             {
                 let error = ApiError::new(
                     "project_unavailable",
                     format!("failed to start project activation worker: {error}"),
                 );
-                operation.finish(Some(&error));
+                let _ = operation.finish(Some(&error));
                 return Err(error);
             }
             operation_id
@@ -1219,6 +1222,23 @@ impl PublicOperationService {
     }
 }
 
+fn run_activation_worker(
+    operation: &ActivationOperation,
+    activate: impl FnOnce() -> Result<(), ApiError>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let attempt = operation.attempt();
+        activate().map_err(|error| classify_activation_api_error_for_attempt(error, attempt))
+    }))
+    .unwrap_or_else(|_| {
+        Err(ApiError::new(
+            "project_unavailable",
+            "project activation worker stopped unexpectedly",
+        ))
+    });
+    let _ = operation.finish(result.as_ref().err());
+}
+
 impl ActivationOperation {
     fn attempt(&self) -> u32 {
         self.service
@@ -1322,18 +1342,21 @@ impl ActivationOperation {
         self.service.coordinator.changed.notify_all();
     }
 
-    fn finish(&self, error: Option<&ApiError>) -> ActivationSnapshot {
+    fn finish(&self, error: Option<&ApiError>) -> Option<ActivationSnapshot> {
         let mut state = self
             .service
             .coordinator
             .state
             .lock()
-            .expect("activation coordinator poisoned");
-        let snapshot = state
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(snapshot) = state
             .current
             .as_mut()
             .filter(|snapshot| snapshot.operation_id == self.operation_id)
-            .expect("activation operation owns current snapshot");
+        else {
+            self.service.coordinator.changed.notify_all();
+            return None;
+        };
         if let Some(error) = error {
             let capability = match error.code.as_str() {
                 "cancelled" => ActivationCapabilityState::Cancelled,
@@ -1398,7 +1421,7 @@ impl ActivationOperation {
         state.running = false;
         state.current_cancel = None;
         self.service.coordinator.changed.notify_all();
-        snapshot
+        Some(snapshot)
     }
 }
 
@@ -2024,6 +2047,79 @@ mod activation_tests {
         assert_eq!(after.operation_id, before.operation_id);
         assert_ne!(after.state, ActivationState::Cancelled);
         service.cancel_and_wait();
+    }
+
+    #[test]
+    fn panicking_activation_worker_finishes_waiters_and_allows_retry() {
+        let project = tempfile::tempdir().expect("project");
+        let missing = project.path().join("missing");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let service = Runtime::new().activation_service();
+        let target = ActivationTarget::new(&missing, &storage_path);
+        let operation_id = "activation-panic-fixture".to_string();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = service
+                .coordinator
+                .state
+                .lock()
+                .expect("activation coordinator");
+            state.target = Some(target.clone());
+            state.current = Some(ActivationSnapshot {
+                operation_id: operation_id.clone(),
+                revision: 1,
+                state: ActivationState::Preparing,
+                stage: ActivationStage::Discovery,
+                progress: activation_stage_progress(ActivationStage::Discovery),
+                attempt: 1,
+                retry_after_ms: Some(250),
+                embedding_capacity: None,
+                embedding_retry: None,
+                failure_code: None,
+                failure: None,
+                failure_details: None,
+                retained_core_publication: None,
+                capabilities: ActivationCapabilities {
+                    local_navigation: ActivationCapabilityState::Unavailable,
+                    broad_search: ActivationCapabilityState::Unavailable,
+                },
+            });
+            state.running = true;
+            state.current_cancel = Some(Arc::clone(&cancelled));
+        }
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id: operation_id.clone(),
+            cancelled,
+        };
+
+        run_activation_worker(&operation, || panic!("activation panic fixture"));
+
+        let terminal_error = service
+            .wait_for_activation(
+                &target,
+                &operation_id,
+                false,
+                &AtomicBool::new(false),
+                Duration::from_secs(1),
+            )
+            .expect_err("worker panic must become a terminal activation error");
+        assert_eq!(terminal_error.code, "project_unavailable");
+        let terminal = service.snapshot().expect("terminal snapshot");
+        assert_eq!(terminal.state, ActivationState::Unavailable);
+        assert_eq!(
+            terminal.failure.as_deref(),
+            Some("project activation worker stopped unexpectedly")
+        );
+
+        service.cancel_and_wait();
+        let retry = service
+            .activate_project(&missing, &storage_path, Arc::new(AtomicBool::new(false)))
+            .expect_err("the missing project still fails, without a wedged coordinator");
+        assert_eq!(retry.code, "project_unavailable");
+        let retried = service.snapshot().expect("retried terminal snapshot");
+        assert_eq!(retried.operation_id, operation_id);
+        assert_eq!(retried.attempt, 2);
     }
 
     #[test]
