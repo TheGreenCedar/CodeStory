@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  cpSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -33,6 +34,25 @@ function run(executable, args, options = {}) {
   return result.stdout.trim();
 }
 
+function commitFixture(root) {
+  run("git", ["init", "-q"], { cwd: root });
+  run("git", ["add", "."], { cwd: root });
+  run(
+    "git",
+    [
+      "-c",
+      "user.name=fixture",
+      "-c",
+      "user.email=fixture@example.invalid",
+      "commit",
+      "-qm",
+      "fixture",
+    ],
+    { cwd: root },
+  );
+  return run("git", ["rev-parse", "HEAD"], { cwd: root });
+}
+
 test("pinned Codex installs a local marketplace fixture into the attested cache", () => {
   const root = mkdtempSync(path.join(tmpdir(), "codestory-marketplace-proof-"));
   try {
@@ -48,6 +68,13 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
     ]);
 
     const marketplaceRoot = path.join(root, "marketplace");
+    const pluginSourceRoot = path.join(root, "plugin-source");
+    cpSync(
+      path.join(repositoryRoot, "plugins", "codestory"),
+      path.join(pluginSourceRoot, "plugins", "codestory"),
+      { recursive: true },
+    );
+    commitFixture(pluginSourceRoot);
     mkdirSync(path.join(marketplaceRoot, ".agents", "plugins"), { recursive: true });
     writeFileSync(
       path.join(marketplaceRoot, ".agents", "plugins", "marketplace.json"),
@@ -58,7 +85,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
           name: "codestory",
           source: {
             source: "git-subdir",
-            url: pathToFileURL(repositoryRoot).href,
+            url: pathToFileURL(pluginSourceRoot).href,
             path: "plugins/codestory",
           },
           policy: {
@@ -69,24 +96,7 @@ test("pinned Codex installs a local marketplace fixture into the attested cache"
         }],
       }, null, 2)}\n`,
     );
-    run("git", ["init", "-q"], { cwd: marketplaceRoot });
-    run("git", ["add", "."], { cwd: marketplaceRoot });
-    run(
-      "git",
-      [
-        "-c",
-        "user.name=fixture",
-        "-c",
-        "user.email=fixture@example.invalid",
-        "commit",
-        "-qm",
-        "fixture",
-      ],
-      { cwd: marketplaceRoot },
-    );
-    const marketplaceRevision = run("git", ["rev-parse", "HEAD"], {
-      cwd: marketplaceRoot,
-    });
+    const marketplaceRevision = commitFixture(marketplaceRoot);
     const sourceCommit = run("git", ["rev-parse", "HEAD"], {
       cwd: repositoryRoot,
     });
