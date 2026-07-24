@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       scope:
-        description: Native package matrix scope (linux, windows, macos, desktop, server, or full).
+        description: Native package matrix scope (linux, windows, macos, server, or full).
         required: false
         default: full
         type: string
@@ -103,7 +103,7 @@ jobs:
       # GitHub applies matrix exclusions before includes, so an include-only
       # matrix must select the complete row set rather than trying to exclude
       # rows after the fact.
-      matrix: ${{ fromJSON(inputs.calibration_mode && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'server' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'linux' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'desktop' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-24.04-arm","rust_target":"aarch64-unknown-linux-gnu","asset_target":"linux-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","asset_target":"windows-arm64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}') }}
+      matrix: ${{ fromJSON(inputs.calibration_mode && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'server' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'linux' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -777,31 +777,6 @@ jobs:
             --expected-version "${{ inputs.version }}" `
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Prove Intel macOS explicit CPU policy
-        if: matrix.asset_target == 'macos-x64'
-        env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: >-
-          python3 .github/scripts/check-packaged-agent-proof.py
-          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-macos-x64.tar.gz"
-          --checksum-file target/release-dist/SHA256SUMS.txt
-          --expected-version "${{ inputs.version }}"
-          --project "${{ github.workspace }}"
-          --engine-policy cpu_explicit
-          --expected-backend CPU
-          --offline
-          --proof-tier calibration
-          --out-dir target/packaged-intel-policy-proof
-
-      - name: Upload Intel macOS policy proof
-        if: always() && matrix.asset_target == 'macos-x64'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: packaged-intel-policy-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
-          path: target/packaged-intel-policy-proof
-          if-no-files-found: warn
-          retention-days: 30
 
       - name: Upload packaged version proof
         if: always()

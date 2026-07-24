@@ -233,9 +233,9 @@ manifests and evaluations with both ledgers. A missing, duplicate, expired, fail
 cross-commit, cross-tree, identity-incomplete or reused row is a rejection, not
 an operator override.
 
-The production pre-publish inventory is seven cells: source, two package
-identities, two accelerator receipts, and two candidate-installed receipts.
-The post-publish inventory is fifteen after adding platform, installed runtime,
-downloaded-byte proof, and protected-package retrieval readiness for both
-targets. Performance,
+The production pre-publish inventory is ten cells: source, three package
+identities, three accelerator receipts, and three candidate-installed receipts.
+The post-publish inventory is twenty-two after adding platform, installed
+runtime, downloaded-byte proof, and protected-package retrieval readiness for
+all three targets. Performance,
 answer-quality, and their exception documents are outside this closeout.

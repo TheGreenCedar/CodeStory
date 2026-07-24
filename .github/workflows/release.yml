@@ -182,7 +182,7 @@ jobs:
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ github.sha }}
-      scope: desktop
+      scope: full
       proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
       emit_release_cells: true
@@ -233,6 +233,22 @@ jobs:
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
       emit_release_cells: true
 
+  linux-vulkan-proof:
+    needs:
+      - preflight
+      - packaged-proof
+    uses: ./.github/workflows/linux-vulkan-proof.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
+      calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      server_behavior_only: true
+      candidate_installed_proof: true
+      candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
+      emit_release_cells: true
+
   pre-publish-closeout:
     name: Authenticate pre-publish release cells
     needs:
@@ -241,6 +257,7 @@ jobs:
       - packaged-proof
       - macos-metal-proof
       - windows-vulkan-proof
+      - linux-vulkan-proof
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

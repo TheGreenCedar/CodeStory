@@ -1450,6 +1450,58 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
   }
 });
 
+test("Linux x64 Vulkan proof remains protected and fail-closed", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const file = "linux-vulkan-proof.yml";
+  const protectedJob = workflow => workflow.jobs["packaged-vulkan"];
+  const protectedProof = workflow => draftStep(
+    protectedJob(workflow),
+    "Prove offline Linux Vulkan retrieval",
+  );
+  const candidateProof = workflow => draftStep(
+    protectedJob(workflow),
+    "Prove candidate-installed Linux Vulkan runtime",
+  );
+
+  const mutations = [
+    ["runner label drifts", workflow => {
+      protectedJob(workflow)["runs-on"][3] = "generic-vulkan";
+    }, /must use \["self-hosted","Linux","X64","codestory-linux-vulkan"\]/u],
+    ["protected CPU fallback enabled", workflow => {
+      protectedProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }, /protected proof must reject CPU fallback/u],
+    ["protected qualification cell drifts", workflow => {
+      protectedProof(workflow).run = protectedProof(workflow).run
+        .replace("protected_linux_x64_vulkan", "hosted_linux_x64_cpu");
+    }, /Prove offline Linux Vulkan retrieval/u],
+    ["candidate CPU fallback enabled", workflow => {
+      candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }, /candidate-installed proof must reject CPU fallback/u],
+    ["candidate qualification cell drifts", workflow => {
+      candidateProof(workflow).run = candidateProof(workflow).run
+        .replace("candidate_installed_linux_x64_vulkan", "candidate_installed_linux_x64_cpu");
+    }, /Prove candidate-installed Linux Vulkan runtime/u],
+    ["release cell omitted", workflow => {
+      const step = draftStep(
+        protectedJob(workflow),
+        "Emit authenticated Linux Vulkan release cells",
+      );
+      step.run = step.run.replace("retrieval_readiness:linux-x64", "retrieval_readiness:windows-x64");
+    }, /Emit authenticated Linux Vulkan release cells/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+    });
+  }
+});
+
 test("post-publish proof uses an immutable real Codex marketplace install", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
 

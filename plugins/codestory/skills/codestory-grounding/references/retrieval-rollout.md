@@ -37,8 +37,9 @@ lifecycle. Maintainer JSON owns backend details.
 
 Hosted CI sets `CODESTORY_EMBED_ALLOW_CPU=1` and must report `cpu_explicit`.
 Protected Apple Silicon proof must report Metal and verified accelerator
-execution. Windows hardware proof must report Vulkan. Linux makes no GPU claim
-without real Vulkan hardware evidence.
+execution. Windows and Linux hardware proof must report Vulkan. The Linux claim
+requires `.github/workflows/linux-vulkan-proof.yml`; hosted CPU proof is
+insufficient.
 
 ## Quality and performance gate
 

@@ -56,13 +56,14 @@ approval. The same verified CLI automatically runs its hidden per-user server
 over private local IPC.
 
 <!-- codestory-public-support:start -->
-| Released package | Local map | Broad retrieval |
-| --- | --- | --- |
-| macOS 15+ on Apple Silicon | Yes | Metal |
-| Windows x64 | Yes | Vulkan |
-
-CodeStory 0.16 publishes only these managed package targets.
-Unshipped targets: linux-arm64, linux-x64, macos-x64, windows-arm64. Answer quality and performance are separate release non-claims.
+| Platform | Release support |
+| --- | --- |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
 <!-- codestory-public-support:end -->
 
 ## Codex install

@@ -188,6 +188,7 @@ function resolveManifest(manifestPath) {
 
 function assetTarget(platform = process.platform, arch = process.arch) {
   if (platform === 'win32' && arch === 'x64') return 'windows-x64';
+  if (platform === 'linux' && arch === 'x64') return 'linux-x64';
   if (platform === 'darwin' && arch === 'arm64') return 'macos-arm64';
   return null;
 }

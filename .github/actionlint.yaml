@@ -1,6 +1,7 @@
 self-hosted-runner:
   labels:
     - codestory-metal
+    - codestory-linux-vulkan
     - codestory-release-evidence
     - codestory-vulkan
 

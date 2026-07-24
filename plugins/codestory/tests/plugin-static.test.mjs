@@ -44,10 +44,16 @@ test("managed release provisioning rejects unshipped targets before URL construc
       asset: "codestory-cli-v0.16.0-windows-x64.zip",
     },
   );
+  assert.deepEqual(
+    launcherTest.releaseAssetIdentity("0.16.0", "linux", "x64"),
+    {
+      target: "linux-x64",
+      asset: "codestory-cli-v0.16.0-linux-x64.tar.gz",
+    },
+  );
   for (const [platform, architecture] of [
     ["darwin", "x64"],
     ["win32", "arm64"],
-    ["linux", "x64"],
     ["linux", "arm64"],
   ]) {
     assert.throws(
@@ -251,17 +257,11 @@ async function readPluginVersion() {
 function releaseAssetForPlatform(version) {
   const target = process.platform === "win32" && process.arch === "x64"
     ? "windows-x64"
-    : process.platform === "win32" && process.arch === "arm64"
-      ? "windows-arm64"
-      : process.platform === "linux" && process.arch === "x64"
+    : process.platform === "linux" && process.arch === "x64"
         ? "linux-x64"
-      : process.platform === "linux" && process.arch === "arm64"
-          ? "linux-arm64"
-          : process.platform === "darwin" && process.arch === "x64"
-            ? "macos-x64"
-            : process.platform === "darwin" && process.arch === "arm64"
-              ? "macos-arm64"
-              : null;
+      : process.platform === "darwin" && process.arch === "arm64"
+        ? "macos-arm64"
+        : null;
   assert.ok(target, `unsupported test platform: ${process.platform}-${process.arch}`);
   const archiveBase = `codestory-cli-v${version}-${target}`;
   const archiveName = `${archiveBase}.${target.startsWith("windows-") ? "zip" : "tar.gz"}`;
@@ -3330,7 +3330,7 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
   const archivePath = join(releaseDir, archiveName);
 
   try {
-    const priorVersion = "0.0.0";
+    const priorVersion = "0.15.0";
     const priorRelease = releaseAssetForPlatform(priorVersion);
     const priorDir = join(dataDir, "codestory-cli", priorVersion);
     const priorCli = join(priorDir, "bin", cliName);
