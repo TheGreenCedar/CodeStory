@@ -4494,6 +4494,8 @@ struct PreparedFullRefreshSnapshots {
     semantic_stats: SemanticProjectionStats,
     finalize_stats: StagedSnapshotFinalizeStats,
     detail_snapshot_ms: u32,
+    semantic_duration: Duration,
+    snapshot_duration: Duration,
 }
 
 fn prepare_full_refresh_snapshots(
@@ -4502,6 +4504,7 @@ fn prepare_full_refresh_snapshots(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<PreparedFullRefreshSnapshots, ApiError> {
+    let semantic_started = Instant::now();
     let semantic_stats = finalize_staged_semantic_docs_for_runtime(
         staged.store_mut(),
         None,
@@ -4512,6 +4515,8 @@ fn prepare_full_refresh_snapshots(
         SemanticProjectionDocumentSource::SourceFiles,
     )?;
     ensure_indexing_active(cancel_token)?;
+    let semantic_duration = semantic_started.elapsed();
+    let snapshot_started = Instant::now();
     let finalize_stats = staged.snapshots().finalize_staged().map_err(|error| {
         ApiError::internal(format!(
             "Failed to finalize staged snapshot lifecycle: {error}"
@@ -4528,6 +4533,8 @@ fn prepare_full_refresh_snapshots(
         semantic_stats,
         finalize_stats,
         detail_snapshot_ms: clamp_u128_to_u32(detail_started.elapsed().as_millis()),
+        semantic_duration,
+        snapshot_duration: snapshot_started.elapsed(),
     })
 }
 
@@ -4870,45 +4877,70 @@ fn core_indexing_phase_timings(
     timings
 }
 
-fn index_full_for_runtime(
+struct StagedPreparation {
+    staged: Option<StagedSnapshot>,
+}
+
+impl StagedPreparation {
+    fn new(staged: StagedSnapshot) -> Self {
+        Self {
+            staged: Some(staged),
+        }
+    }
+
+    fn staged_mut(&mut self) -> &mut StagedSnapshot {
+        self.staged
+            .as_mut()
+            .expect("staged preparation must own staged storage")
+    }
+
+    fn release(mut self) -> StagedSnapshot {
+        self.staged
+            .take()
+            .expect("staged preparation must own staged storage")
+    }
+}
+
+impl Drop for StagedPreparation {
+    fn drop(&mut self) {
+        if let Some(staged) = self.staged.take() {
+            let _ = staged.discard();
+        }
+    }
+}
+
+struct FullRefreshIndexingOutput {
+    staged: StagedSnapshot,
+    stats: IncrementalIndexingStats,
+    policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+}
+
+fn run_full_refresh_indexer(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
-    runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
-) -> Result<IndexingRunSummary, ApiError> {
-    let core_refresh_started = Instant::now();
-    let mut wall_durations = FullRefreshWallDurations::default();
-    let mut wall_stage_started = Instant::now();
-    let live_state = inspect_full_index_live_state(root, storage_path, source_index_policy)?;
-    let publication = &live_state.publication;
-    let recovering_incomplete_run = live_state.recovering_incomplete_run;
-    let has_verified_live_publication = live_state.has_verified_publication;
-    wall_durations.live_inspection = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
-    let workspace = runtime_workspace_manifest(root, storage_path)
-        .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-    let (execution_plan, mut policy_exclusions) =
-        full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
-
-    wall_durations.source_discovery = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
+    execution_plan: &RefreshExecutionPlan,
+    mut policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+    live_state: &FullIndexLiveState,
+    wall_durations: &mut FullRefreshWallDurations,
+) -> Result<FullRefreshIndexingOutput, ApiError> {
+    let stage_started = Instant::now();
     let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
     let _ = events_tx.send(AppEventPayload::IndexingStarted {
         file_count: total_files,
     });
-
     #[cfg(test)]
     run_source_policy_after_plan_hook();
-
-    let mut staged = SnapshotStore::open_disposable_full_refresh(storage_path)
-        .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
+    let staged = SnapshotStore::open_disposable_full_refresh(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to open staged storage: {error}")))?;
+    let mut preparation = StagedPreparation::new(staged);
     #[cfg(test)]
-    run_full_refresh_staged_store_hook(staged.store_mut());
-    let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
-    let copied_structural_artifacts = if has_verified_live_publication {
-        match staged
+    run_full_refresh_staged_store_hook(preparation.staged_mut().store_mut());
+    let copied_structural_artifacts = if live_state.has_verified_publication {
+        match preparation
+            .staged_mut()
             .store_mut()
             .copy_structural_text_artifact_cache_from(storage_path)
         {
@@ -4929,7 +4961,6 @@ fn index_full_for_runtime(
     } else {
         0
     };
-
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
@@ -4942,61 +4973,135 @@ fn index_full_for_runtime(
                 ArtifactCachePolicy::KnownEmpty
             },
         });
-    wall_durations.stage_open = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
-    let result =
-        indexer.run_with_policy_exclusions(staged.store_mut(), &execution_plan, &bus, cancel_token);
-
+    wall_durations.stage_open = stage_started.elapsed();
+    let execution_started = Instant::now();
+    let result = indexer.run_with_policy_exclusions(
+        preparation.staged_mut().store_mut(),
+        execution_plan,
+        &bus,
+        cancel_token,
+    );
     drop(bus);
     let _ = forwarder.join();
-
-    let index_stats = match result {
+    let outcome = match result {
         Ok(_) if is_indexing_cancelled(cancel_token) => {
-            let _ = staged.discard();
             return Err(indexing_cancelled_error());
         }
-        Ok(outcome) => {
-            policy_exclusions.extend(outcome.policy_exclusions);
-            outcome.stats
-        }
+        Ok(outcome) => outcome,
         Err(_) if is_indexing_cancelled(cancel_token) => {
-            let _ = staged.discard();
             return Err(indexing_cancelled_error());
         }
-        Err(err) => {
-            let _ = staged.discard();
-            return Err(ApiError::internal(format!("Indexing failed: {err}")));
-        }
+        Err(error) => return Err(ApiError::internal(format!("Indexing failed: {error}"))),
     };
-    wall_durations.indexer_execution = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
-    if let Err(error) = validate_full_refresh_coverage(root, &mut staged, &live_state) {
-        let _ = staged.discard();
-        return Err(error);
+    wall_durations.indexer_execution = execution_started.elapsed();
+    policy_exclusions.extend(outcome.policy_exclusions);
+    Ok(FullRefreshIndexingOutput {
+        staged: preparation.release(),
+        stats: outcome.stats,
+        policy_exclusions,
+    })
+}
+
+struct PreparedFullRefresh {
+    staged: StagedSnapshot,
+    live_state: FullIndexLiveState,
+    workspace: WorkspaceManifest,
+    stats: IncrementalIndexingStats,
+    policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+    snapshots: PreparedFullRefreshSnapshots,
+    wall_durations: FullRefreshWallDurations,
+    core_refresh_started: Instant,
+}
+
+fn prepare_full_refresh(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<PreparedFullRefresh, ApiError> {
+    let core_refresh_started = Instant::now();
+    let live_started = Instant::now();
+    let live_state = inspect_full_index_live_state(root, storage_path, source_index_policy)?;
+    let mut wall_durations = FullRefreshWallDurations {
+        live_inspection: live_started.elapsed(),
+        ..Default::default()
+    };
+    let discovery_started = Instant::now();
+    let workspace = runtime_workspace_manifest(root, storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+    let (execution_plan, policy_exclusions) =
+        full_refresh_execution_plan_with_coverage(root, &workspace, source_index_policy)?;
+    wall_durations.source_discovery = discovery_started.elapsed();
+    let output = run_full_refresh_indexer(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        source_index_policy,
+        &execution_plan,
+        policy_exclusions,
+        &live_state,
+        &mut wall_durations,
+    )?;
+    let mut preparation = StagedPreparation::new(output.staged);
+    let coverage_started = Instant::now();
+    validate_full_refresh_coverage(root, preparation.staged_mut(), &live_state)?;
+    wall_durations.coverage_validation = coverage_started.elapsed();
+    let copy_started = Instant::now();
+    if !live_state.recovering_incomplete_run && storage_path.exists() {
+        copy_forward_full_refresh_artifacts(preparation.staged_mut(), storage_path);
     }
-    wall_durations.coverage_validation = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
-    if can_copy_forward {
-        copy_forward_full_refresh_artifacts(&mut staged, storage_path);
-    }
-    wall_durations.copy_forward = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
-    let prepared_snapshots = match prepare_full_refresh_snapshots(
-        &mut staged,
+    wall_durations.copy_forward = copy_started.elapsed();
+    let snapshots = prepare_full_refresh_snapshots(
+        preparation.staged_mut(),
         &live_state.dense_anchor_source_identity,
         cancel_token,
         runtime,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
-    wall_durations.semantic_stage = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
-    wall_durations.snapshot_stage = wall_stage_started.elapsed();
-    wall_stage_started = Instant::now();
+    )?;
+    wall_durations.semantic_stage = snapshots.semantic_duration;
+    wall_durations.snapshot_stage = snapshots.snapshot_duration;
+    Ok(PreparedFullRefresh {
+        staged: preparation.release(),
+        live_state,
+        workspace,
+        stats: output.stats,
+        policy_exclusions: output.policy_exclusions,
+        snapshots,
+        wall_durations,
+        core_refresh_started,
+    })
+}
+
+fn index_full_for_runtime(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<IndexingRunSummary, ApiError> {
+    let PreparedFullRefresh {
+        mut staged,
+        live_state,
+        workspace,
+        stats: index_stats,
+        policy_exclusions,
+        snapshots: prepared_snapshots,
+        mut wall_durations,
+        core_refresh_started,
+    } = prepare_full_refresh(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        runtime,
+        source_index_policy,
+    )?;
+    let publication = &live_state.publication;
+    let recovering_incomplete_run = live_state.recovering_incomplete_run;
+    let mut wall_stage_started = Instant::now();
     if recovering_incomplete_run && let Err(err) = staged.store_mut().begin_incremental_run() {
         let _ = staged.discard();
         return Err(ApiError::internal(format!(
