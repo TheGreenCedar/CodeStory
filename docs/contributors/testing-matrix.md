@@ -412,20 +412,23 @@ hardware behavior. Those claims remain with the package and protected Windows
 Vulkan proof lanes.
 
 `release-claims.json` is the release claim and proof-tier source of truth. It
-binds each claim to its evidence identity, expiry, dependency, executable
-prerequisite, non-claims, accepted risks, and higher-tier proof lanes. The
-release evidence gate evaluates that graph; workflow policy consumes its
-runner, target, promotion, retention, and proof-chain facts. Update the graph
-instead of copying those facts into contributor prose.
+separates the six standard release claims from optional performance and
+answer-quality evaluations. The standard release requires
+exact source, package, native platform, protected accelerator, and installed
+runtime evidence plus bounded packet/search readiness for both desktop targets.
+Optional evaluation may reject its
+own run, but it is not a dependency of packaging, hardware proof, closeout, or
+publication. Workflow policy enforces that separation.
 
 The same graph declares the exact release-closeout cells. For v0.16,
 `workflow_policy.package_matrix` contains only `macos-arm64` and `windows-x64`.
 The coordinator retains canonical copies under `manifests/` and `evaluations/`
 beside `ledger.json` and `summary.json`. A pre-publish run accepts seven cells:
 exact source, two package identities, two accelerator-execution receipts, and
-two candidate-installed behavior receipts. A post-publish run accepts thirteen
+two candidate-installed behavior receipts. A post-publish run accepts fifteen
 cells after adding platform,
-marketplace-catalog-resolved behavior, and downloaded-byte proof for both targets.
+marketplace-catalog-resolved behavior, downloaded-byte proof, and the two
+protected-package retrieval-readiness receipts.
 Package rows record each archive name, byte count, and SHA-256.
 A post-publish run requires
 that accepted pre-publish ledger, requires its current package manifests to

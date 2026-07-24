@@ -10,7 +10,7 @@ from .foundation import (
     ProofFailure,
 )
 from .process import engine_identity
-from .qualification import verify_retained_qualification
+from .qualification_retained import verify_retained_qualification
 from .self_test_full_stack_types import (
     ExternalEvidenceFixture,
     FullStackFixture,

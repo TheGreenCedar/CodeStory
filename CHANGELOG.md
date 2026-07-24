@@ -8,6 +8,9 @@
 - Move release qualification orchestration out of the shipped CLI into a
   separate proof driver that exercises the exact packaged CLI through private
   worker calls.
+- Require exact packaged retrieval readiness on protected Mac and Windows
+  release hosts without making optional performance or answer-quality evaluation
+  a shipping gate.
 
 ## 0.16.0
 

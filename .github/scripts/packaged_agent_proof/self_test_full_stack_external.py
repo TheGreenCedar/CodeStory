@@ -20,7 +20,7 @@ from .foundation import (
     ProofFailure,
     require,
 )
-from .qualification import derive_scenario_assertions
+from .qualification_scenarios import derive_scenario_assertions
 from .runtime import (
     verify_fault_recovery_consistency_raw_evidence,
     verify_publication_fault_raw_evidence,

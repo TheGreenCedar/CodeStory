@@ -57,7 +57,7 @@ on:
         default: ".github/workflows/packaged-platform-pr.yml"
         type: string
       server_behavior_only:
-        description: Prove server/package behavior without retrieval-quality or release-readiness claims.
+        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
         required: false
         default: false
         type: boolean
@@ -113,7 +113,7 @@ on:
         default: ".github/workflows/macos-metal-proof.yml"
         type: string
       server_behavior_only:
-        description: Prove server/package behavior without retrieval-quality or release-readiness claims.
+        description: Prove bounded package retrieval readiness without answer-quality or performance claims.
         required: false
         default: false
         type: boolean
@@ -485,6 +485,36 @@ jobs:
         with:
           name: release-cell-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}
           path: target/release-cells/accelerator_execution-macos-arm64-metal.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Emit authenticated macOS retrieval-readiness release cell
+        if: inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode && !inputs.candidate_installed_only
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          node scripts/codestory-release-cell-manifest.mjs produce \
+            --repo "$GITHUB_WORKSPACE" \
+            --expected-sha "${{ inputs.ref }}" \
+            --version "$version" \
+            --cell-id retrieval_readiness:macos-arm64 \
+            --producer-workflow .github/workflows/macos-metal-proof.yml \
+            --producer-job packaged-metal \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --producer-artifact "release-cell-postpublish-retrieval-macos-arm64-attempt-$GITHUB_RUN_ATTEMPT" \
+            --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
+            --out target/release-cells/retrieval_readiness-macos-arm64.json
+
+      - name: Upload authenticated macOS retrieval-readiness release cell
+        if: success() && inputs.emit_release_cells && inputs.server_behavior_only && !inputs.calibration_mode && !inputs.candidate_installed_only
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-cell-postpublish-retrieval-macos-arm64-attempt-${{ github.run_attempt }}
+          path: target/release-cells/retrieval_readiness-macos-arm64.json
           if-no-files-found: error
           retention-days: 30
 

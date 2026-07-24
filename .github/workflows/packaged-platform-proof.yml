@@ -608,7 +608,7 @@ jobs:
           claim_scope_args=()
           quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
           if [ "$proof_tier" = hosted_package ]; then
-            if [ "$PROOF_SCOPE" = server ] || [ "$PROOF_SCOPE" = linux ]; then
+            if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
               claim_scope_args=(--server-behavior-only)
             else
               test -f "$quality_path"
@@ -653,7 +653,6 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
           !inputs.calibration_mode &&
-          (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '') &&
           inputs.calibration_bundle_artifact != '' &&
           inputs.calibration_bundle_run_id != ''
         shell: bash
@@ -691,7 +690,6 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
           !inputs.calibration_mode &&
-          (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '') &&
           inputs.calibration_bundle_artifact != '' &&
           inputs.calibration_bundle_run_id != ''
         env:
@@ -705,7 +703,7 @@ jobs:
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
-          if [ "${{ inputs.scope }}" = server ] || [ "${{ inputs.scope }}" = linux ]; then
+          if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
             claim_args=(--server-behavior-only)
           else
             test -f "$quality_path"
@@ -745,7 +743,7 @@ jobs:
             --out-dir target/candidate-installed-linux/proof
 
       - name: Upload candidate-installed Linux proof
-        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '')
+        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-linux-${{ inputs.version }}-attempt-${{ github.run_attempt }}

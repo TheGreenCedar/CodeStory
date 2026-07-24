@@ -33,6 +33,18 @@ const REQUIRED_CLAIMS = [
   "retrieval_readiness",
   "source_behavior",
 ];
+const STANDARD_RELEASE_CLAIMS = [
+  "accelerator_execution",
+  "installed_runtime_behavior",
+  "package_identity",
+  "platform_support",
+  "retrieval_readiness",
+  "source_behavior",
+];
+const OPTIONAL_EVALUATIONS = [
+  "answer_quality",
+  "performance",
+];
 const REQUIRED_FAILURE_CONTROLS = [
   "benchmark_leakage",
   "observational_read_mutation",
@@ -250,10 +262,29 @@ export function releaseClaimGraphDigest(graph) {
 
 export function validateReleaseClaimGraph(graph) {
   object(graph, "release claim graph");
-  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 5) {
-    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 5`);
+  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 6) {
+    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 6`);
   }
   nonEmptyText(graph.graph_id, "release claim graph.graph_id");
+  const standardReleaseClaims = stringArray(
+    graph.standard_release_claims,
+    "release claim graph.standard_release_claims",
+    { nonEmpty: true },
+  ).sort();
+  if (JSON.stringify(standardReleaseClaims) !== JSON.stringify(STANDARD_RELEASE_CLAIMS)) {
+    fail(`release claim graph standard release must require exactly ${STANDARD_RELEASE_CLAIMS.join(", ")}`);
+  }
+  const optionalEvaluations = stringArray(
+    graph.optional_evaluations,
+    "release claim graph.optional_evaluations",
+    { nonEmpty: true },
+  ).sort();
+  if (JSON.stringify(optionalEvaluations) !== JSON.stringify(OPTIONAL_EVALUATIONS)) {
+    fail(`release claim graph optional evaluations must be exactly ${OPTIONAL_EVALUATIONS.join(", ")}`);
+  }
+  if (standardReleaseClaims.some((claim) => optionalEvaluations.includes(claim))) {
+    fail("release claim graph standard release claims and optional evaluations must be disjoint");
+  }
   const evidencePolicy = object(graph.evidence_policy, "release claim graph.evidence_policy");
   if (evidencePolicy.selection !== "all_matching_rows_must_pass") {
     fail("release claim graph evidence selection must be all_matching_rows_must_pass");
@@ -350,6 +381,9 @@ export function validateReleaseClaimGraph(graph) {
   if (JSON.stringify([...claims.keys()].sort()) !== JSON.stringify(REQUIRED_CLAIMS)) {
     fail(`release claim graph must define exactly ${REQUIRED_CLAIMS.join(", ")}`);
   }
+  for (const id of [...standardReleaseClaims, ...optionalEvaluations]) {
+    if (!claims.has(id)) fail(`release claim graph classifies unknown claim ${id}`);
+  }
   for (const [id, claim] of claims) {
     if (!tiers.has(claim.minimum_tier)) fail(`claim ${id} references unknown minimum tier ${claim.minimum_tier}`);
     const dependencies = stringArray(claim.depends_on_claims, `claim ${id}.depends_on_claims`);
@@ -426,6 +460,7 @@ export function validateReleaseClaimGraph(graph) {
     "package_identity",
     "platform_support",
     "post_publish_bytes",
+    "retrieval_readiness",
     "source_behavior",
   ];
   if (JSON.stringify([...cellGroups.keys()].sort()) !== JSON.stringify(requiredCellGroups)) {
@@ -530,11 +565,25 @@ export function validateReleaseClaimGraph(graph) {
     stringArray(row.secrets, `workflow_policy.protected_jobs[${index}].secrets`);
   }
   const releaseChain = object(policy.release_chain, "workflow_policy.release_chain");
-  stringArray(releaseChain.exact_sha_jobs, "workflow_policy.release_chain.exact_sha_jobs", { nonEmpty: true });
+  const exactShaJobs = stringArray(
+    releaseChain.exact_sha_jobs,
+    "workflow_policy.release_chain.exact_sha_jobs",
+    { nonEmpty: true },
+  );
+  if (exactShaJobs.includes("release-evidence")) {
+    fail("optional release evidence must not be an exact-SHA job in the standard release chain");
+  }
   const dependencies = object(releaseChain.dependencies, "workflow_policy.release_chain.dependencies");
   for (const [job, needsValue] of Object.entries(dependencies)) {
     nonEmptyText(job, "workflow_policy.release_chain.dependencies job");
-    stringArray(needsValue, `workflow_policy.release_chain.dependencies.${job}`, { nonEmpty: true });
+    const needs = stringArray(
+      needsValue,
+      `workflow_policy.release_chain.dependencies.${job}`,
+      { nonEmpty: true },
+    );
+    if (job === "release-evidence" || needs.includes("release-evidence")) {
+      fail("optional release evidence must not block a standard release job");
+    }
   }
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");

@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "841b5eda04be3d64d3989babd7dadbfd6472cd90304cd225997b5b13f483fbca",
+  "candidate_sha256": "1f784d74a2a10292fa9551bd4340778f1465b15fbb3d89c4910deecb0d2649b9",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
@@ -22,30 +22,11 @@
   ],
   "release_cell_evidence": [
     {
-      "id": "retrieval_readiness-222222222222",
-      "type": "retrieval_readiness",
-      "tier": "live_behavior",
-      "status": "pass",
-      "graph_sha256": "32b6d0a8c28239db1bf36ee76afd47666745af91b94978b1e41c228f64554b5b",
-      "observed_at": "2026-07-21T02:13:20.738Z",
-      "expires_at": "2026-07-22T02:13:20.738Z",
-      "identity": {
-        "repository": "TheGreenCedar/CodeStory",
-        "commit": "2222222222222222222222222222222222222222",
-        "source_tree": "d40d3a0d24b170c098461cf6c29d71451d66bff3",
-        "profile": "ci-contract-v1",
-        "corpus_id": "ci-contract-corpus-v1",
-        "cache_id": "cold-full-retrieval-v1",
-        "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB",
-        "release_key": "ci-contract-v1"
-      }
-    },
-    {
       "id": "performance-222222222222",
       "type": "performance",
       "tier": "live_behavior",
       "status": "pass",
-      "graph_sha256": "32b6d0a8c28239db1bf36ee76afd47666745af91b94978b1e41c228f64554b5b",
+      "graph_sha256": "e01afbbe4c28a2e4838c79bab3f5c5e7f5c6b6339cd6eaec93452257fc1787a8",
       "observed_at": "2026-07-21T02:13:20.738Z",
       "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
@@ -66,7 +47,7 @@
       "type": "answer_quality",
       "tier": "answer_quality",
       "status": "pass",
-      "graph_sha256": "32b6d0a8c28239db1bf36ee76afd47666745af91b94978b1e41c228f64554b5b",
+      "graph_sha256": "e01afbbe4c28a2e4838c79bab3f5c5e7f5c6b6339cd6eaec93452257fc1787a8",
       "observed_at": "2026-07-21T02:13:20.738Z",
       "expires_at": "2026-07-22T02:13:20.738Z",
       "identity": {
@@ -88,7 +69,7 @@
     "schema": "codestory.release-claim-evaluation/v1",
     "status": "pass",
     "graph_schema": "codestory.release-claims/v1",
-    "graph_sha256": "32b6d0a8c28239db1bf36ee76afd47666745af91b94978b1e41c228f64554b5b",
+    "graph_sha256": "e01afbbe4c28a2e4838c79bab3f5c5e7f5c6b6339cd6eaec93452257fc1787a8",
     "evidence_selection": "all_matching_rows_must_pass",
     "expected_commit": "2222222222222222222222222222222222222222",
     "evaluated_at": "2026-07-21T02:13:20.738Z",
@@ -127,24 +108,6 @@
         "non_claims": [
           "performance on other hardware or corpora",
           "future-regression immunity"
-        ]
-      },
-      {
-        "id": "retrieval_readiness",
-        "minimum_tier": "live_behavior",
-        "status": "pass",
-        "evidence": [
-          {
-            "type": "retrieval_readiness",
-            "status": "pass"
-          }
-        ],
-        "accepted_risks": [
-          "measured-corpus-is-bounded"
-        ],
-        "non_claims": [
-          "answer sufficiency for an unmeasured task",
-          "performance outside the approved profile"
         ]
       }
     ],

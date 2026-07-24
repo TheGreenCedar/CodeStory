@@ -12,7 +12,7 @@ from .contracts import (
     require_nonempty_string,
 )
 from .foundation import require
-from .qualification import qualification_measurement_artifact
+from .qualification_measurements import qualification_measurement_artifact
 from .qualification_production_types import (
     QualificationExternalEvidence,
     QualificationProducerContext,

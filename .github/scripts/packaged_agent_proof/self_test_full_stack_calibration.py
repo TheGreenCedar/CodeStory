@@ -17,7 +17,7 @@ from .contracts import (
     write_json,
 )
 from .foundation import ProofFailure, require
-from .qualification import require_candidate_matrix_installation_source
+from .qualification_artifacts import require_candidate_matrix_installation_source
 from .self_test_full_stack_types import CalibrationFixture, FullStackFixture
 
 

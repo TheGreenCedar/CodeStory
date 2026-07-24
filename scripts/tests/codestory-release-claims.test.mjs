@@ -102,9 +102,27 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 5);
+  assert.equal(graph.graph_version, 6);
+  assert.deepEqual(
+    [...graph.standard_release_claims].sort(),
+    [
+      "accelerator_execution",
+      "installed_runtime_behavior",
+      "package_identity",
+      "platform_support",
+      "retrieval_readiness",
+      "source_behavior",
+    ],
+  );
+  assert.deepEqual(
+    [...graph.optional_evaluations].sort(),
+    ["answer_quality", "performance"],
+  );
+  assert.ok(!graph.workflow_policy.release_chain.exact_sha_jobs.includes("release-evidence"));
+  assert.ok(Object.values(graph.workflow_policy.release_chain.dependencies)
+    .every((needs) => !needs.includes("release-evidence")));
   assert.deepEqual(graph.closeout.phases, ["pre_publish", "post_publish"]);
-  assert.equal(graph.closeout.cell_groups.length, 7);
+  assert.equal(graph.closeout.cell_groups.length, 8);
   assert.deepEqual(
     graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
     ["macos-arm64", "windows-x64"],
@@ -263,18 +281,12 @@ test("performance and quality identities are bound to trusted candidate and grap
     failureClass === "incompatible_tier_identity" && id.startsWith("answer_quality-")));
 });
 
-test("risk-bearing dependencies require their own explicit request and risk acceptance", () => {
+test("optional evaluations do not inherit standard release dependencies", () => {
   const fixture = releaseEvidenceFixture();
-  fixture.requested_claims = fixture.requested_claims.filter(({ id }) => id !== "retrieval_readiness");
-  const result = evaluate(fixture);
-  assert.ok(result.failures.some(({ class: failureClass, message }) =>
-    failureClass === "accepted_risk" && /risk-bearing dependency retrieval_readiness must be explicitly requested/u.test(message)));
-
-  fixture.requested_claims.unshift({
-    id: "retrieval_readiness",
-    accepted_risks: ["measured-corpus-is-bounded"],
-  });
   assert.equal(evaluate(fixture).status, "pass");
+  for (const id of graph.optional_evaluations) {
+    assert.deepEqual(graph.claims.find((claim) => claim.id === id).depends_on_claims, []);
+  }
 });
 
 test("only bounded, release-bound model microbenchmark exceptions remain visible", () => {

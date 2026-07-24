@@ -12,7 +12,7 @@ from .contracts import (
     sha256,
 )
 from .foundation import ProofFailure, require
-from .qualification import verify_retained_qualification
+from .qualification_retained import verify_retained_qualification
 from .runtime_contract import installed_runtime_provenance_is_proven
 
 
@@ -104,11 +104,12 @@ def record_qualification_contract(
             "runtime_tier_exercised": args.proof_tier,
             "answer_quality_claim": False,
             "retrieval_quality_claim": False,
-            "release_readiness_claim": False,
+            "release_readiness_claim": True,
             "installed_runtime_provenance_proven": (
                 installed_runtime_provenance_is_proven(args, runtime)
             ),
         }
+        summary["package_contract"]["release_readiness_claim"] = True
         summary["package_contract"]["highest_proof_tier"] = "server_behavior"
     elif args.proof_tier == "calibration":
         record_calibration_qualification(args, summary)

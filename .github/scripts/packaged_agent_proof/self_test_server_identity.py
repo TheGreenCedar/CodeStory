@@ -7,7 +7,7 @@ import json
 from .archive import verify_runtime_against_manifest
 from .foundation import ProofFailure, require
 from .process import engine_identity, server_snapshot, shared_server_identity
-from .qualification import derive_scenario_assertions
+from .qualification_scenarios import derive_scenario_assertions
 from .self_test_full_stack_types import FullStackFixture, ServerIdentityFixture
 
 

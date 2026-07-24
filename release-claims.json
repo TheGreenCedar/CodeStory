@@ -1,7 +1,19 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 5,
+  "graph_version": 6,
   "graph_id": "codestory-release-claims",
+  "standard_release_claims": [
+    "source_behavior",
+    "package_identity",
+    "platform_support",
+    "accelerator_execution",
+    "installed_runtime_behavior",
+    "retrieval_readiness"
+  ],
+  "optional_evaluations": [
+    "performance",
+    "answer_quality"
+  ],
   "public_support": {
     "release_line": "0.16",
     "packages": [
@@ -215,17 +227,14 @@
       "id": "retrieval_readiness",
       "tier": "live_behavior",
       "proof_lanes": [
+        ".github/workflows/macos-metal-proof.yml",
+        ".github/workflows/windows-vulkan-proof.yml",
         ".github/workflows/release-candidate-evidence.yml"
       ],
       "required_identity": [
         "repository",
         "commit",
-        "source_tree",
-        "profile",
-        "corpus_id",
-        "cache_id",
-        "machine_fingerprint",
-        "release_key"
+        "source_tree"
       ],
       "validity": "expires_at",
       "maximum_validity_hours": 24
@@ -411,20 +420,24 @@
     {
       "id": "retrieval_readiness",
       "minimum_tier": "live_behavior",
-      "depends_on_claims": [],
+      "depends_on_claims": [
+        "package_identity",
+        "platform_support",
+        "accelerator_execution"
+      ],
       "required_evidence": [
         "retrieval_readiness"
       ],
       "prerequisite_checks": [
         {
-          "id": "release-evidence-contract",
-          "command": "node --test scripts/tests/codestory-release-evidence-gate.test.mjs"
+          "id": "packaged-agent-contract",
+          "command": "python .github/scripts/check-packaged-agent-proof.py --self-test"
         }
       ],
       "prerequisites": [
-        "one immutable full sidecar generation is pinned",
-        "project, corpus, cache, runtime profile, and exact source SHA identities agree",
-        "packet and search operate fail closed on the measured repository"
+        "the exact packaged archive runs on protected release hardware",
+        "packet and search complete on two project-bound plugin hosts",
+        "live encoding and shared-server continuity remain observable"
       ],
       "non_claims": [
         "answer sufficiency for an unmeasured task",
@@ -437,9 +450,7 @@
     {
       "id": "performance",
       "minimum_tier": "live_behavior",
-      "depends_on_claims": [
-        "retrieval_readiness"
-      ],
+      "depends_on_claims": [],
       "required_evidence": [
         "performance"
       ],
@@ -464,9 +475,7 @@
     {
       "id": "answer_quality",
       "minimum_tier": "answer_quality",
-      "depends_on_claims": [
-        "retrieval_readiness"
-      ],
+      "depends_on_claims": [],
       "required_evidence": [
         "answer_quality"
       ],
@@ -644,6 +653,59 @@
               "producer_job": "packaged-vulkan",
               "producer_job_name": "Packaged Windows Vulkan engine",
               "producer_artifact": "release-cell-prepublish-windows-x64-vulkan-attempt-{attempt}"
+            }
+          }
+        ],
+        "archive_role": "none"
+      },
+      {
+        "id": "retrieval_readiness",
+        "phase": "post_publish",
+        "claim": "retrieval_readiness",
+        "evidence_type": "retrieval_readiness",
+        "expansion": "instances",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "target",
+          "runner",
+          "backend",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "runner",
+          "backend"
+        ],
+        "instances": [
+          {
+            "id": "macos-arm64",
+            "identity_constraints": {
+              "target": "macos-arm64",
+              "runner": "codestory-metal",
+              "backend": "Metal",
+              "producer_workflow": ".github/workflows/macos-metal-proof.yml",
+              "producer_job": "packaged-metal",
+              "producer_job_name": "Packaged Apple Silicon Metal engine",
+              "producer_artifact": "release-cell-postpublish-retrieval-macos-arm64-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "windows-x64",
+            "identity_constraints": {
+              "target": "windows-x64",
+              "runner": "codestory-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Windows Vulkan engine",
+              "producer_artifact": "release-cell-postpublish-retrieval-windows-x64-attempt-{attempt}"
             }
           }
         ],
@@ -872,7 +934,6 @@
       "exact_sha_jobs": [
         "source-proof",
         "packaged-proof",
-        "release-evidence",
         "macos-metal-proof",
         "windows-vulkan-proof"
       ],
@@ -886,24 +947,18 @@
         "packaged-proof": [
           "preflight"
         ],
-        "release-evidence": [
-          "preflight"
-        ],
         "macos-metal-proof": [
           "preflight",
-          "packaged-proof",
-          "release-evidence"
+          "packaged-proof"
         ],
         "windows-vulkan-proof": [
           "preflight",
-          "packaged-proof",
-          "release-evidence"
+          "packaged-proof"
         ],
         "pre-publish-closeout": [
           "preflight",
           "source-proof",
           "packaged-proof",
-          "release-evidence",
           "macos-metal-proof",
           "windows-vulkan-proof"
         ],

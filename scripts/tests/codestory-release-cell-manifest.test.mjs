@@ -164,8 +164,24 @@ test("Actions provenance recovers a split rerun by selecting each job's latest e
     currentRunAttempt: "2",
     ...metadata,
   });
-  assert.equal(map.producers.length, 13);
-  assert.equal(map.artifacts.length, 9);
+  assert.equal(map.producers.length, 15);
+  assert.equal(map.artifacts.length, 11);
+  for (const [cellId, artifact] of [
+    [
+      "retrieval_readiness:macos-arm64",
+      "release-cell-postpublish-retrieval-macos-arm64-attempt-1",
+    ],
+    [
+      "retrieval_readiness:windows-x64",
+      "release-cell-postpublish-retrieval-windows-x64-attempt-1",
+    ],
+  ]) {
+    assert.equal(
+      map.producers.find(({ cell_id: candidate }) => candidate === cellId)
+        .producer_artifact,
+      artifact,
+    );
+  }
   for (const id of [
     "platform_support:windows-x64",
     "installed_runtime_behavior:windows-x64",

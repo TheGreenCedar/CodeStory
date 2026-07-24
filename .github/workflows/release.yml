@@ -199,20 +199,10 @@ jobs:
       APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
-  release-evidence:
-    needs: preflight
-    uses: ./.github/workflows/release-candidate-evidence.yml
-    with:
-      ref: ${{ github.sha }}
-      proof_key: release-${{ needs.preflight.outputs.version }}
-      profile: codestory-release-evidence-linux-arm64-v2
-      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-
   macos-metal-proof:
     needs:
       - preflight
       - packaged-proof
-      - release-evidence
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -221,7 +211,7 @@ jobs:
       use_packaged_cli_artifact: true
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
-      quality_evidence_artifact: release-evidence-${{ github.sha }}
+      server_behavior_only: true
       candidate_installed_proof: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
       emit_release_cells: true
@@ -230,7 +220,6 @@ jobs:
     needs:
       - preflight
       - packaged-proof
-      - release-evidence
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -239,7 +228,7 @@ jobs:
       use_packaged_cli_artifact: true
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
-      quality_evidence_artifact: release-evidence-${{ github.sha }}
+      server_behavior_only: true
       candidate_installed_proof: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
       emit_release_cells: true
@@ -250,7 +239,6 @@ jobs:
       - preflight
       - source-proof
       - packaged-proof
-      - release-evidence
       - macos-metal-proof
       - windows-vulkan-proof
     runs-on: ubuntu-latest

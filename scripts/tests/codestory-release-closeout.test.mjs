@@ -248,7 +248,7 @@ test("cell inventory is derived only from the release claim graph", () => {
   const prePublish = deriveReleaseCells(graph, "pre_publish");
   const postPublish = deriveReleaseCells(graph, "post_publish");
   assert.equal(prePublish.length, 7);
-  assert.equal(postPublish.length, 13);
+  assert.equal(postPublish.length, 15);
   assert.deepEqual(
     prePublish.filter(({ group_id }) => group_id === "package_identity").map(({ identity_constraints }) => identity_constraints.target),
     graph.workflow_policy.package_matrix.map(({ asset_target: assetTarget }) => assetTarget).sort(),
@@ -370,7 +370,7 @@ test("post-publish closeout compares every downloaded archive with the retained 
   const manifests = manifestsFor("post_publish", prePublish.ledger);
   const postPublish = evaluate("post_publish", manifests, prePublish.ledger);
   assert.equal(postPublish.decision, "accept");
-  assert.equal(postPublish.summary.counts.required, 13);
+  assert.equal(postPublish.summary.counts.required, 15);
   assert.equal(
     postPublish.ledger.cells.filter(({ id }) => id.startsWith("post_publish_bytes:")).length,
     graph.workflow_policy.package_matrix.length,

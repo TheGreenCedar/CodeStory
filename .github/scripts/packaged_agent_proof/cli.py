@@ -17,7 +17,7 @@ from .foundation import DEFAULT_QUERY, DEFAULT_QUESTION, MEASUREMENT_PROTOCOL, r
 from .installation import (
     prepare_candidate_installed_proof,
 )
-from .qualification import (
+from .qualification_artifacts import (
     require_candidate_matrix_installation_source,
 )
 

@@ -593,34 +593,23 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       const step = draftStep(workflow.jobs.route, "Select change-aware proof scope");
       step.run = step.run.replace(' || [ "$REQUESTED_SCOPE" = linux ]', "");
     }, /integration must preserve explicit hosted and Linux scopes/u],
-    ["hosted-only release evidence guard removed", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if
-        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'none' &&", "");
-    }, /hosted-only integration must skip release evidence/u],
-    ["Linux release evidence guard removed", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if
-        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'linux' &&", "");
-    }, /Linux server-behavior proof must not require protected release evidence/u],
-    ["Windows release evidence guard removed", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if
-        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'windows' &&", "");
-    }, /Windows server-behavior proof must not require protected release evidence/u],
-    ["Windows package remains blocked on release evidence", packagedCoordinatorFile, workflow => {
-      workflow.jobs["packaged-proof"].if
-        = workflow.jobs["packaged-proof"].if.replace("needs.route.outputs.scope == 'windows'", "needs.route.outputs.scope == 'full'");
-    }, /Windows server-behavior package proof must accept skipped protected release evidence/u],
-    ["Windows closeout still requires release evidence", packagedCoordinatorFile, workflow => {
-      const step = draftStep(workflow.jobs.closeout, "Require one coherent accepted proof");
-      step.run = step.run.replace(' && [ "$SCOPE" != windows ]', "");
-    }, /Require one coherent accepted proof/u],
+    ["release evidence runs implicitly", packagedCoordinatorFile, workflow => {
+      workflow.jobs["release-evidence"].if = "needs.route.outputs.mode != 'calibration'";
+    }, /optional release evidence must run only in explicit release-evidence mode/u],
+    ["package waits for release evidence", packagedCoordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].needs.push("release-evidence");
+    }, /package proof must not depend on optional release evidence/u],
+    ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
+      workflow.jobs.closeout.needs.push("release-evidence");
+    }, /normal closeout must not depend on optional release evidence/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
     }, /matrix must select structural JSON by scope/u],
     ["Linux candidate install guard removed", packagedProofFile, workflow => {
       const step = draftStep(workflow.jobs.build, "Stage isolated candidate-managed Linux install");
-      step.if = step.if.replace("inputs.scope == 'linux' || ", "");
-    }, /remain runnable in server and Linux scopes/u],
+      step.if += " && inputs.quality_evidence_artifact != ''";
+    }, /without optional quality evidence/u],
     ["source unversioned cache", sourceFile, workflow => {
       const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
       restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");
@@ -1384,20 +1373,20 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     }, /accepted PR Windows package into candidate-installed proof/u],
     ["coordinator server-only scope removed", coordinatorFile, workflow => {
       delete workflow.jobs["windows-vulkan-proof"].with.server_behavior_only;
-    }, /non-quality Windows claim only for Windows scope/u],
+    }, /Windows proof must use bounded retrieval readiness/u],
     ["coordinator quality artifact bypasses producer result", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact
         = "${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}";
-    }, /Windows quality evidence must come only from the successful protected producer/u],
+    }, /Windows proof must not consume optional quality evidence/u],
     ["release disables candidate-installed proof", releaseFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /close both Vulkan and candidate-installed claims/u],
+    }, /close Vulkan and candidate-installed claims without optional quality evidence/u],
     ["release suppresses physical Vulkan proof", releaseFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = true;
-    }, /close both Vulkan and candidate-installed claims/u],
-    ["release downgrades to server-only proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
-    }, /close both Vulkan and candidate-installed claims/u],
+    }, /close Vulkan and candidate-installed claims without optional quality evidence/u],
+    ["release reintroduces quality evaluation", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = false;
+    }, /without optional quality evidence/u],
     ["explicit opt-in removed", protectedFile, workflow => {
       delete workflow.on.workflow_call.inputs.candidate_installed_proof;
     }, /candidate-installed proof must be an explicit opt-in/u],
@@ -1441,10 +1430,10 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     ["candidate artifact loses attempt identity", protectedFile, workflow => {
       candidateUpload(workflow).with.name = "candidate-installed-windows-${{ inputs.version }}";
     }, /attempt-scoped artifact/u],
-    ["server-only proof emits release cell", protectedFile, workflow => {
+    ["server-only proof suppresses release cell", protectedFile, workflow => {
       draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
-        = "inputs.emit_release_cells";
-    }, /server-behavior-only proof must never emit a release cell/u],
+        = "inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only";
+    }, /bounded server proof must retain the authenticated Vulkan release cell/u],
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {

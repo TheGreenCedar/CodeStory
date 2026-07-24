@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .contracts import require_exact_keys, require_nonempty_string, require_positive_int
 from .foundation import REQUIRED_SERVER_SCENARIOS, require
-from .qualification import qualification_artifact
+from .qualification_artifacts import qualification_artifact
 from .qualification_production_types import (
     QualificationExternalEvidence,
     QualificationProducerContext,

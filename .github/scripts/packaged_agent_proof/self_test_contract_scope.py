@@ -9,6 +9,7 @@ from pathlib import Path
 from .contracts import require_sha256, validate_runtime_claim_scope
 from .foundation import ProofFailure, require
 from .process import parse_byte_quantity
+from .qualification_recording import record_qualification_contract
 from .runtime import publication_identity_from_status
 
 
@@ -49,6 +50,28 @@ def _claim_scope_tests() -> None:
             raise ProofFailure(
                 f"ground-only scope accepted incompatible {field}={value!r}"
             )
+    summary = {
+        "package_contract": {
+            "release_readiness_claim": False,
+            "highest_proof_tier": "package",
+        }
+    }
+    record_qualification_contract(
+        argparse.Namespace(
+            ground_only=False,
+            server_behavior_only=True,
+            proof_tier="protected_hardware",
+        ),
+        summary,
+        {},
+        {},
+        {},
+    )
+    require(
+        summary["server_behavior"]["release_readiness_claim"] is True
+        and summary["package_contract"]["release_readiness_claim"] is True,
+        "bounded server proof recorded contradictory release-readiness claims",
+    )
 
 
 def _publication_identity_tests() -> None:

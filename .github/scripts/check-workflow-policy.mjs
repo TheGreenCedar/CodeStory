@@ -1472,25 +1472,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ];
   add(violations, sameMembers(Object.keys(object(packaged.secrets)), expectedSecrets), `${releaseFile} packaged-proof must pass exactly the Apple signing secrets`);
 
-  const releaseEvidence = requireJob(violations, releaseFile, release, "release-evidence");
   add(
     violations,
-    releaseEvidence.uses === releaseEvidenceWorkflowRef,
-    `${releaseFile} must produce exact-head release evidence before hardware qualification`,
-  );
-  add(
-    violations,
-    sameMembers(needs(releaseEvidence), releaseChain.dependencies["release-evidence"]),
-    `${releaseFile} release-evidence dependencies must match the release claim graph`,
-  );
-  add(
-    violations,
-    object(releaseEvidence.with).ref === "${{ github.sha }}"
-      && object(releaseEvidence.with).proof_key === "release-${{ needs.preflight.outputs.version }}"
-      && object(releaseEvidence.with).profile === "codestory-release-evidence-linux-arm64-v2"
-      && object(releaseEvidence.with).drill_manifest
-      === "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
-    `${releaseFile} release evidence must measure the exact release head on the approved profile`,
+    at(release, "jobs", "release-evidence") === undefined,
+    `${releaseFile} must not make optional performance or answer-quality evaluation release-blocking`,
   );
 
   const metal = requireJob(violations, releaseFile, release, "macos-metal-proof");
@@ -1502,11 +1487,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     violations,
     object(metal.with).candidate_installed_proof === true
       && object(metal.with).candidate_installed_only === undefined
-      && object(metal.with).server_behavior_only === undefined
-      && object(metal.with).quality_evidence_artifact
-      === "release-evidence-${{ github.sha }}",
-    `${releaseFile} Mac proof must close both Metal and candidate-installed claims`,
+      && object(metal.with).server_behavior_only === true
+      && object(metal.with).quality_evidence_artifact === undefined,
+    `${releaseFile} Mac proof must close Metal and candidate-installed claims without optional quality evidence`,
   );
+  requireStepRun(violations, "macos-metal-proof.yml", at(workflows.get("macos-metal-proof.yml"), "jobs", "packaged-metal"), "Emit authenticated macOS retrieval-readiness release cell", [
+    "--cell-id retrieval_readiness:macos-arm64",
+    "release-cell-postpublish-retrieval-macos-arm64-attempt-$GITHUB_RUN_ATTEMPT",
+  ]);
 
   const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
   add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
@@ -1517,11 +1505,14 @@ function validateReleaseCoordinator(workflows, violations, graph) {
     violations,
     object(vulkan.with).candidate_installed_proof === true
       && object(vulkan.with).candidate_installed_only === undefined
-      && object(vulkan.with).server_behavior_only === undefined
-      && object(vulkan.with).quality_evidence_artifact
-      === "release-evidence-${{ github.sha }}",
-    `${releaseFile} Windows proof must close both Vulkan and candidate-installed claims`,
+      && object(vulkan.with).server_behavior_only === true
+      && object(vulkan.with).quality_evidence_artifact === undefined,
+    `${releaseFile} Windows proof must close Vulkan and candidate-installed claims without optional quality evidence`,
   );
+  requireStepRun(violations, "windows-vulkan-proof.yml", at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Windows retrieval-readiness release cell", [
+    "--cell-id retrieval_readiness:windows-x64",
+    "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
+  ]);
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
   add(violations, sameMembers(needs(preCloseout), releaseChain.dependencies["pre-publish-closeout"]), `${releaseFile} pre-publish closeout dependencies must match the release claim graph`);
@@ -1972,7 +1963,7 @@ function validatePackagedProof(workflows, violations, graph) {
       '--calibration-bundle "$calibration_bundle"',
       "--calibration-producer-run-id",
       "--calibration-producer-artifact",
-      'if [ "$PROOF_SCOPE" = server ] || [ "$PROOF_SCOPE" = linux ]',
+      'if [ -z "${{ inputs.quality_evidence_artifact }}" ]',
       "--server-behavior-only",
       'test -f "$quality_path"',
       "--timeout-secs 1800",
@@ -1982,9 +1973,8 @@ function validatePackagedProof(workflows, violations, graph) {
   add(
     violations,
     String(candidateStage?.if ?? "").includes("inputs.candidate_installed_proof")
-      && String(candidateStage?.if ?? "").includes("inputs.scope == 'server'")
-      && String(candidateStage?.if ?? "").includes("inputs.scope == 'linux'"),
-    `${file} candidate-managed Linux staging must require coordinator opt-in and remain runnable in server and Linux scopes`,
+      && !String(candidateStage?.if ?? "").includes("quality_evidence_artifact"),
+    `${file} candidate-managed Linux staging must require coordinator opt-in without optional quality evidence`,
   );
   requireStepRun(violations, file, job, "Stage isolated candidate-managed Linux install", [
     "--prepare-candidate-installed-proof",
@@ -2001,9 +1991,8 @@ function validatePackagedProof(workflows, violations, graph) {
   add(
     violations,
     String(candidateProof?.if ?? "").includes("inputs.candidate_installed_proof")
-      && String(candidateProof?.if ?? "").includes("inputs.scope == 'server'")
-      && String(candidateProof?.if ?? "").includes("inputs.scope == 'linux'"),
-    `${file} candidate-installed Linux proof must require coordinator opt-in and remain runnable in server and Linux scopes`,
+      && !String(candidateProof?.if ?? "").includes("quality_evidence_artifact"),
+    `${file} candidate-installed Linux proof must require coordinator opt-in without optional quality evidence`,
   );
   requireStepRun(violations, file, job, "Prove two-host candidate-installed Linux runtime", [
     "--proof-tier installed_runtime",
@@ -2390,15 +2379,17 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    String(packaged.if ?? "").includes("needs.route.outputs.scope == 'windows'"),
-    `${file} Windows server-behavior package proof must accept skipped protected release evidence`,
+    !String(packaged.if ?? "").includes("release-evidence")
+      && !needs(packaged).includes("release-evidence")
+      && object(packaged.with).quality_evidence_artifact === "",
+    `${file} package proof must not depend on optional release evidence`,
   );
   violations.push(...packagedPrSigningViolations(workflow));
   const metal = requireJob(violations, file, workflow, "macos-metal-proof");
   add(
     violations,
-    sameMembers(needs(metal), ["route", "release-evidence", "packaged-proof"]),
-    `${file} Metal proof must wait for package and exact-head release evidence`,
+    sameMembers(needs(metal), ["route", "packaged-proof"]),
+    `${file} Metal proof must wait only for routing and package proof`,
   );
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${file} Metal proof must use the packaged CLI`);
   add(
@@ -2408,15 +2399,15 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(metal.with).server_behavior_only
-      === "${{ needs.route.outputs.scope == 'server' }}",
-    `${file} must select the non-quality server claim only for server scope`,
+    object(metal.with).server_behavior_only === true
+      && object(metal.with).quality_evidence_artifact === "",
+    `${file} Metal proof must use bounded readiness without optional quality evidence`,
   );
   const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
   add(
     violations,
-    sameMembers(needs(vulkan), ["route", "release-evidence", "packaged-proof"]),
-    `${file} Vulkan proof must wait for package and exact-head release evidence`,
+    sameMembers(needs(vulkan), ["route", "packaged-proof"]),
+    `${file} Vulkan proof must wait only for routing and package proof`,
   );
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   add(
@@ -2426,37 +2417,30 @@ function validatePackagedCoordinator(workflows, violations, graph) {
   );
   add(
     violations,
-    object(vulkan.with).quality_evidence_artifact
-      === "${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}",
-    `${file} Windows quality evidence must come only from the successful protected producer`,
+    object(vulkan.with).quality_evidence_artifact === "",
+    `${file} Windows proof must not consume optional quality evidence`,
   );
   add(
     violations,
-    object(vulkan.with).server_behavior_only
-      === "${{ needs.route.outputs.scope == 'windows' }}",
-    `${file} must select the non-quality Windows claim only for Windows scope`,
+    object(vulkan.with).server_behavior_only === true,
+    `${file} Windows proof must use bounded retrieval readiness`,
   );
   const closeout = requireJob(violations, file, workflow, "closeout");
   const evidence = requireJob(violations, file, workflow, "release-evidence");
   add(
     violations,
-    String(evidence.if ?? "").includes("needs.route.outputs.scope != 'none'"),
-    `${file} hosted-only integration must skip release evidence`,
+    evidence.if === "needs.route.outputs.mode == 'release-evidence'",
+    `${file} optional release evidence must run only in explicit release-evidence mode`,
   );
   add(
     violations,
-    String(evidence.if ?? "").includes("needs.route.outputs.scope != 'linux'"),
-    `${file} Linux server-behavior proof must not require protected release evidence`,
-  );
-  add(
-    violations,
-    String(evidence.if ?? "").includes("needs.route.outputs.scope != 'windows'"),
-    `${file} Windows server-behavior proof must not require protected release evidence`,
+    !needs(closeout).includes("release-evidence")
+      && !scalarStrings(closeout).some(value => value.includes("EVIDENCE_RESULT")),
+    `${file} normal closeout must not depend on optional release evidence`,
   );
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", [
-    '[ "$SCOPE" != none ]',
+    'if [ "$SCOPE" = none ]',
     '[ "$SCOPE" = linux ]',
-    '[ "$SCOPE" != windows ]',
     "dev/codestory-next moved from proved head",
   ]);
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
@@ -2547,18 +2531,6 @@ function validateRemainingWorkflows(workflows, violations) {
       `${evidenceFile} packet evidence must select only the corpus-bound release task manifest`,
     );
     requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
-    requireStepRun(violations, evidenceFile, job, "Emit authenticated release-evidence cells", [
-      "codestory-release-cell-manifest.mjs release-evidence",
-      "--producer-job measure",
-    ]);
-    const evidenceCellUpload = namedStep(job, "Upload authenticated release-evidence cells");
-    add(
-      violations,
-      evidenceCellUpload?.uses === "actions/upload-artifact@v7.0.1"
-        && String(evidenceCellUpload?.if ?? "").includes("success()")
-        && String(evidenceCellUpload?.if ?? "").includes("inputs.emit_release_cells"),
-      `${evidenceFile} release-evidence cells must be success-only retained artifacts`,
-    );
   }
 
   const metalFile = "macos-metal-proof.yml";
@@ -2941,8 +2913,8 @@ function validateRemainingWorkflows(workflows, violations) {
     const releaseCell = namedStep(job, "Emit authenticated Vulkan release cell");
     add(
       violations,
-      releaseCell?.if === "inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only",
-      `${vulkanFile} server-behavior-only proof must never emit a release cell`,
+      releaseCell?.if === "inputs.emit_release_cells && !inputs.candidate_installed_only",
+      `${vulkanFile} bounded server proof must retain the authenticated Vulkan release cell`,
     );
     const vulkanCellUpload = namedStep(job, "Upload authenticated Vulkan release cell");
     add(
@@ -2950,7 +2922,7 @@ function validateRemainingWorkflows(workflows, violations) {
       vulkanCellUpload?.uses === "actions/upload-artifact@v7.0.1"
         && String(vulkanCellUpload?.if ?? "").includes("success()")
         && String(vulkanCellUpload?.if ?? "").includes("inputs.emit_release_cells")
-        && String(vulkanCellUpload?.if ?? "").includes("!inputs.server_behavior_only"),
+        && !String(vulkanCellUpload?.if ?? "").includes("!inputs.server_behavior_only"),
       `${vulkanFile} Vulkan release cell must be a success-only retained artifact`,
     );
     requireStepRun(violations, vulkanFile, job, "Emit authenticated candidate-installed Windows release cell", [
@@ -3166,12 +3138,12 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
   }
   const expected = [
     "source-proof.yml/full-source-gate/release-cell-prepublish-source-attempt-${{ github.run_attempt }}",
-    evidenceFile
-      + "/measure/release-cell-prepublish-release-evidence-attempt-${{ github.run_attempt }}",
     "packaged-platform-proof.yml/build/release-cell-prepublish-package-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
     "macos-metal-proof.yml/packaged-metal/release-cell-prepublish-macos-arm64-metal-attempt-${{ github.run_attempt }}",
+    "macos-metal-proof.yml/packaged-metal/release-cell-postpublish-retrieval-macos-arm64-attempt-${{ github.run_attempt }}",
     "macos-metal-proof.yml/packaged-metal/release-cell-prepublish-candidate-installed-macos-arm64-attempt-${{ github.run_attempt }}",
     "windows-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "windows-vulkan-proof.yml/packaged-vulkan/release-cell-postpublish-retrieval-windows-x64-attempt-${{ github.run_attempt }}",
     "windows-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-candidate-installed-windows-x64-attempt-${{ github.run_attempt }}",
     "post-publish-release-smoke.yml/smoke/release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
   ];
