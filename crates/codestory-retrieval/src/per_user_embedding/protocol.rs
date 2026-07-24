@@ -438,6 +438,23 @@ pub fn embedding_capacity_pressure(error: &anyhow::Error) -> Option<EmbeddingCap
     embedding_retry_state(error).and_then(|retry| retry.capacity)
 }
 
+pub(super) fn validate_raw_inputs(inputs: &[String]) -> Result<()> {
+    if inputs.is_empty()
+        || inputs.len() > PER_USER_EMBEDDING_MAX_DOCUMENT_COUNT
+        || inputs.iter().any(|input| input.trim().is_empty())
+    {
+        bail!("embedding_server_input_shape_invalid");
+    }
+    let bytes = inputs
+        .iter()
+        .try_fold(0_usize, |total, input| total.checked_add(input.len()))
+        .ok_or_else(|| anyhow::anyhow!("embedding_server_input_length_overflow"))?;
+    if bytes > PER_USER_EMBEDDING_MAX_INPUT_BYTES {
+        bail!("embedding_server_input_too_large");
+    }
+    Ok(())
+}
+
 pub(super) fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }

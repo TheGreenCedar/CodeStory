@@ -1,5 +1,6 @@
 //! Per-process embedding client, replay boundary, and residency lease.
 
+use super::protocol::validate_raw_inputs;
 use super::qualification_control::{
     EmbeddingQualificationAttemptExchange, EmbeddingQualificationAttemptResult,
 };
@@ -11,7 +12,7 @@ use super::{
     configure_exchange_timeout, decode_vectors, duration_ms, elapsed_since, embedding_scope_id,
     exchange, hello, is_server_loss, positive_duration_ms, request, response_result,
     validate_engine_identity, validate_engine_server_identity, validate_lease_server_identity,
-    validate_raw_inputs, validate_same_server, validate_server_snapshot, vectors_result,
+    validate_same_server, validate_server_snapshot, vectors_result,
 };
 use crate::config::SidecarRuntimeConfig;
 use crate::embedding_contract::normalize_and_validate_vectors;
