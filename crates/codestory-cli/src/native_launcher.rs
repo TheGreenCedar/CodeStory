@@ -46,8 +46,8 @@ fn prepare_runtime_at(root: &Path) -> io::Result<PathBuf> {
     FileExt::lock_exclusive(&lock)?;
 
     let candidate = root.join(NATIVE_RUNTIME_EXECUTABLE);
-    let seed_id = match runtime_seed_id(&candidate) {
-        Ok(seed_id) => seed_id,
+    let seed_id = match fs::symlink_metadata(&candidate) {
+        Ok(_) => runtime_seed_id(&candidate)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return pinned_current_runtime(root)?.ok_or_else(|| {
                 io::Error::new(
@@ -154,9 +154,9 @@ fn publish_complete_generation(
             hard_link_or_copy(&seed_dir.join(name), &temporary.join(name))?;
         }
         copy_verified(candidate, &temporary.join(NATIVE_RUNTIME_EXECUTABLE))?;
-        fs::copy(
-            seed_dir.join(NATIVE_RUNTIME_FILE_LIST),
-            temporary.join(NATIVE_RUNTIME_FILE_LIST),
+        copy_verified(
+            &seed_dir.join(NATIVE_RUNTIME_FILE_LIST),
+            &temporary.join(NATIVE_RUNTIME_FILE_LIST),
         )?;
         sync_directory(&temporary)?;
         fs::rename(&temporary, generation_dir)?;
@@ -544,6 +544,18 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::remove_file(&candidate).expect("remove missing-seed candidate");
+            symlink(root.join("missing-runtime"), &candidate).expect("dangling runtime candidate");
+            assert!(
+                prepare_runtime_at(root).is_err(),
+                "dangling candidate must not fall back"
+            );
+        }
     }
 }
 
