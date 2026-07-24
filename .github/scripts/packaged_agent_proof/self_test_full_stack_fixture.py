@@ -177,6 +177,14 @@ def _native_manifest(contract: NativeContractFixture) -> dict:
             "arch": "aarch64",
             "needed": [],
         },
+        "runtime_executable": {
+            "name": "codestory-cli",
+            "sha256": hashlib.sha256(contract.binary_payload).hexdigest(),
+            "format": "mach-o",
+            "arch": "aarch64",
+            "needed": [],
+            "generation_id": None,
+        },
         "runtime_artifacts": [],
         "engine": {
             "build_contract_schema_version": 2,
