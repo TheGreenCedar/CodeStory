@@ -1,10 +1,37 @@
-use super::*;
+use super::{
+    AffectedCompletenessInput, AffectedConfidenceFloor, AffectedEvidenceGapCategory,
+    AffectedGraphEvidence, AffectedOperationIdentityIndex, AffectedPathMetadataObservation,
+    AffectedPathTieStep, AffectedRelevantEvidenceGapInput, AffectedRelevantEvidenceGaps,
+    AffectedResolvedInput, AffectedUnmatchedPathObservation, IndexFreshnessObservation,
+    affected_follow_ups, affected_relevant_evidence_gaps, affected_reverse_walk,
+    affected_route_confidence, classify_matched_affected_input, classify_unmatched_affected_input,
+    classify_unmatched_affected_input_with_metadata, compose_affected_completeness,
+    compose_affected_evidence_gaps, match_affected_file_identities, normalized_affected_input,
+};
 use crate::tests::assert_no_staged_publication_artifacts;
+use crate::{
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedInputClassificationDto, AffectedMatchedFileDto, AffectedUncoveredInputDto, ApiError,
+    AppController, EventBus, FileCoverageReason, FileInfo, HashMap, IndexFreshnessChangeKindDto,
+    IndexFreshnessDto, IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode,
+    IndexedFileRoleDto, OpenProjectRequest, PublicationTestAction, PublicationTestBoundary,
+    RefreshExecutionPlan, RefreshMode, RouteHandlerCandidate, SourceIndexPolicy, Storage, Uuid,
+    V2WorkspaceIndexer, WorkspaceManifest, arm_after_index_freshness_fence_test_hook,
+    arm_publication_test_fault, compare_optional_confidence_desc, compare_route_handler_candidates,
+    index_freshness_from_storage, indexable_source_path, indexable_source_path_in_workspace,
+    not_checked_index_freshness, process_env_test_lock, resolve_project_file_path_from_root,
+    stored_file_coverage_diagnostics,
+};
 use codestory_contracts::graph::{
     Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, SourceLocation,
 };
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, UNIX_EPOCH};
 use tempfile::tempdir;
 
 fn all_permutations<T: Clone>(values: &[T]) -> Vec<Vec<T>> {

@@ -1,5 +1,21 @@
-use super::*;
+use super::{
+    AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
+    AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
+    AffectedUncoveredInputDto, AffectedUnmatchedPathDto, ApiError, AppController, GraphNodeId,
+    IndexFreshnessDto, IndexFreshnessStatusDto, IndexedFileRoleDto, NodeId, NodeKind,
+    OperationPathIdentityResolver, PathIdentityUnavailable, WorkspacePathIdentity,
+    clamp_usize_to_u32, edge_certainty_label,
+    index_freshness_observation_from_storage_with_identities, indexable_source_path_in_workspace,
+    indexable_source_path_with_root, indexed_file_role, normalize_path_key, path_role_from_key,
+    runtime_relative_path,
+};
 use crate::workspace_state::runtime_workspace_manifest;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 #[path = "tests/affected.rs"]

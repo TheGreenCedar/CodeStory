@@ -1,9 +1,66 @@
-use super::*;
+use super::{
+    AccessKind, AgentHybridWeightsDto, ApiError, AppController, AppEventPayload,
+    AppGraphFeatureFlags, ArtifactCachePolicyDto, BUILD_EDGE_SEED_BATCH_SIZE,
+    CURRENT_SCHEMA_VERSION, CancellationToken, CorePromotionTimings, DEFAULT_SOURCE_FILE_BYTE_CAP,
+    DENSE_CENTRAL_RELATIONSHIP_THRESHOLD, DENSE_CENTRAL_SCORE_THRESHOLD, DIRECT_SNIPPET_MAX_BYTES,
+    DIRECT_SNIPPET_TRUNCATION_SUFFIX, DenseAnchorCentrality, DenseAnchorInput, DenseAnchorReason,
+    Event, EventBus, FULL_REFRESH_REQUIRED_ERROR_CODE, FileCoverageReason, FileExt, FileInfo,
+    FullRefreshWallDurations, GraphRequest, GroundingBudgetDto, HYBRID_RETRIEVAL_ENABLED_ENV,
+    HybridSearchConfig, IndexFreshnessStatusDto, IndexMode, IndexPublicationMode,
+    IndexPublicationRecord, IndexWriterGuard, IndexedFileRoleDto, IndexedFilesRequest,
+    IndexingPhaseTimings, IndexingRunSummary, LEGACY_OVERSIZED_SOURCE_POLICY_VERSION,
+    LEGACY_SEMANTIC_PROJECTION_SCHEMA_VERSION, LLM_DOC_EMBED_BATCH_SIZE_ENV,
+    LLM_SYMBOL_DOC_SCHEMA_VERSION, ListRootSymbolsRequest, NodeId, OVERSIZED_SOURCE_POLICY_VERSION,
+    OpenProjectRequest, OversizedSourceExclusionCandidate, PUBLICATION_TEST_FAULT,
+    PendingLlmSymbolDoc, PublicationTestAction, PublicationTestBoundary, RefreshExecutionPlan,
+    RefreshMode, RepoTextScanStatsDto, RetrievalIndexManifest, RetrievalModeDto, RetrievalStateDto,
+    SEMANTIC_DOC_ALIAS_MODE_ENV, SEMANTIC_DOC_DEFAULT_MAX_TOKENS, SEMANTIC_DOC_MAX_TOKENS_ENV,
+    SEMANTIC_DOC_SCOPE_ENV, SEMANTIC_EDGE_STREAM_BATCH_SIZE, SEMANTIC_POLICY_VERSION,
+    SEMANTIC_STREAM_PENDING_DOCS_ENV, SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV,
+    SYMBOL_SEARCH_DOC_PROVENANCE, SearchEngine, SearchGenerationCatalogGuard,
+    SearchGenerationCompletion, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
+    SearchPlanAnchorGroupDto, SearchPlanChannelDto, SearchPlanPromotionStatusDto,
+    SearchRepoTextMode, SearchRequest, SearchSymbolProjection, SemanticDocAliasMode,
+    SemanticDocGraphContext, SemanticDocScope, SemanticModeDto,
+    SemanticProjectionSourcePolicyCompatibility, SemanticProjectionStats, SnapshotStore,
+    SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, SourcePolicyExclusionRecord,
+    StartIndexingRequest, Storage, Store, SymbolSearchDoc, TrailConfigDto,
+    UpdateBookmarkCategoryRequest, V2WorkspaceIndexer, WorkspaceManifest, WriteFileTextRequest,
+    apply_hybrid_limits, architecture_query_intents, arm_full_refresh_staged_store_hook,
+    arm_incremental_staged_store_hook, arm_publication_test_fault,
+    arm_semantic_projection_before_revalidate_hook, arm_source_policy_after_plan_hook,
+    arm_source_policy_before_revalidate_hook, bounded_markdown_snippet_from_path,
+    build_component_report_docs, build_llm_symbol_doc_text,
+    build_persisted_search_state_from_canonical_symbols, build_search_state,
+    build_semantic_file_text_cache_with_limits, clamp_usize_to_u32, compare_search_hits,
+    current_epoch_ms, dense_anchor_is_central, dense_anchor_reason_for_node,
+    extract_symbol_search_terms, file_text_match_line, finalize_staged_semantic_docs,
+    flush_pending_dense_anchor_inputs, framework_route_coverage_matrix,
+    full_refresh_required_error, graph_edge_dto, index_freshness_from_storage, index_incremental,
+    indexed_file_matches_language_filter, llm_doc_embed_batch_size, llm_indexable_kind,
+    llm_indexable_kind_for_scope, llm_indexable_kinds_for_scope, llm_symbol_doc_hash,
+    load_persisted_search_state, mixed_natural_language_query, node_display_name,
+    normalized_hybrid_weights, process_env_test_lock, project_identity_v3,
+    prune_search_generations, publish_search_engine, query_has_symbol_or_literal_signal,
+    read_search_generation_completion, rebuild_search_state_from_storage,
+    search_generation_completion_path, search_index_generation_root,
+    search_index_path_for_publication, search_index_storage_path, semantic_component_key_for_path,
+    semantic_doc_alias_mode_from_env, semantic_doc_alias_mode_from_value,
+    semantic_doc_max_tokens_from_env, semantic_doc_scope_from_env, semantic_doc_scope_from_value,
+    semantic_doc_shape_contract, semantic_doc_text_budget_cost,
+    semantic_graph_dependent_file_ids_by_seed, semantic_projection_republish_for_runtime,
+    semantic_projection_source_policy_compatibility, semantic_stream_sort_window_batches_from_env,
+    should_expand_symbol_query, sort_pending_dense_anchor_inputs, spawn_progress_forwarder,
+    stream_pending_llm_symbol_docs_from_env, terminal_symbol_segment,
+    test_sidecar_runtime_from_env, truncate_semantic_doc_text_to_token_budget,
+    write_search_generation_completion,
+};
 use crate::affected::tests::{EnvGuard, assert_mandatory_retrieval_unavailable};
 use crate::repo_text::{
     REPO_TEXT_MAX_FILE_BYTES, REPO_TEXT_SCAN_BYTE_CAP, REPO_TEXT_SCAN_FILE_CAP,
     REPO_TEXT_SCAN_TIME_CAP_MS,
 };
+use crate::search;
 use crate::search::lexical::exact_symbol_merged_lexical_queries;
 use crate::search_intent::{
     SearchIntentFilter, annotate_search_hit_match_quality, apply_search_intent_filters,
@@ -30,9 +87,11 @@ use codestory_contracts::graph::{
 };
 use crossbeam_channel::unbounded;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::MutexGuard as StdMutexGuard;
+use std::sync::{Arc, MutexGuard as StdMutexGuard};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 #[path = "tests/activation_coverage_tests.rs"]
