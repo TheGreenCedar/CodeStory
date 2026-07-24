@@ -70,7 +70,7 @@ use codestory_workspace::{DEFAULT_SOURCE_FILE_BYTE_CAP, OVERSIZED_SOURCE_POLICY_
 use codestory_workspace::{
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInputs, RefreshMode,
     SourceIndexPolicy, WorkspaceInventoryOutcome, WorkspaceManifest, WorkspacePathIdentity,
-    process_source_index_policy, project_identity_v3,
+    project_identity_v3,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
@@ -113,6 +113,8 @@ mod path_identity;
 mod path_resolution;
 #[doc(hidden)]
 pub use path_resolution::resolve_project_file_path_from_root;
+mod process_config;
+pub use process_config::RuntimeProcessConfig;
 mod query_language;
 mod repository_identity;
 mod search;
@@ -4193,20 +4195,18 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
-        let controller = AppController::new();
-        let activation = ActivationService::new(controller.clone());
-        Self {
-            activation: activation.clone(),
-            public_operation: PublicOperationService::new_with_activation(
-                controller.clone(),
-                activation,
-            ),
-            controller,
-        }
+        Self::new_with_process_config(RuntimeProcessConfig::local())
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
-        let controller = AppController::new_with_config(config);
+        Self::new_with_process_config(RuntimeProcessConfig::new(
+            config,
+            SourceIndexPolicy::default(),
+        ))
+    }
+
+    pub fn new_with_process_config(config: RuntimeProcessConfig) -> Self {
+        let controller = AppController::new_with_process_config(config);
         let activation = ActivationService::new(controller.clone());
         Self {
             activation: activation.clone(),
@@ -5915,7 +5915,7 @@ fn index_freshness_from_storage(
         root,
         workspace,
         storage,
-        process_source_index_policy(),
+        &SourceIndexPolicy::default(),
     )
 }
 
@@ -11211,11 +11211,18 @@ impl Default for AppController {
 
 impl AppController {
     pub fn new() -> Self {
-        Self::new_with_config(codestory_retrieval::SidecarRuntimeConfig::local())
+        Self::new_with_process_config(RuntimeProcessConfig::local())
     }
 
     pub fn new_with_config(config: codestory_retrieval::SidecarRuntimeConfig) -> Self {
-        Self::new_with_source_index_policy(config, process_source_index_policy().clone())
+        Self::new_with_process_config(RuntimeProcessConfig::new(
+            config,
+            SourceIndexPolicy::default(),
+        ))
+    }
+
+    fn new_with_process_config(config: RuntimeProcessConfig) -> Self {
+        Self::new_with_source_index_policy(config.sidecar, config.source_index_policy)
     }
 
     fn new_with_source_index_policy(
@@ -16823,7 +16830,7 @@ fn index_incremental(
         events_tx,
         cancel_token,
         &test_sidecar_runtime_from_env(),
-        process_source_index_policy(),
+        &SourceIndexPolicy::default(),
     )
 }
 

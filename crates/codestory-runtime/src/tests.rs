@@ -14,6 +14,20 @@ use tempfile::tempdir;
 #[path = "tests/activation_coverage_tests.rs"]
 mod activation_coverage_tests;
 
+#[test]
+fn runtime_facade_remains_inside_the_default_source_index_cap() {
+    let facade = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let bytes = fs::metadata(&facade)
+        .expect("read runtime facade metadata")
+        .len();
+
+    assert!(
+        bytes <= DEFAULT_SOURCE_FILE_BYTE_CAP,
+        "{} is {bytes} bytes, above the {DEFAULT_SOURCE_FILE_BYTE_CAP}-byte source-index cap",
+        facade.display()
+    );
+}
+
 fn default_source_policy_identity() -> SourcePolicyExclusionPolicyIdentity<'static> {
     SourcePolicyExclusionPolicyIdentity::new(
         OVERSIZED_SOURCE_POLICY_VERSION,
@@ -900,6 +914,19 @@ impl Drop for EnvGuard {
             }
         }
     }
+}
+
+#[test]
+fn default_runtime_source_policy_does_not_read_process_environment() {
+    let _lock = process_env_test_lock();
+    let _cap = EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "17");
+
+    let controller = AppController::new();
+
+    assert_eq!(
+        controller.source_index_policy.as_ref(),
+        &SourceIndexPolicy::default()
+    );
 }
 
 fn assert_mandatory_retrieval_unavailable(error: &ApiError) {

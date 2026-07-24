@@ -16,9 +16,7 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
-use codestory_contracts::workspace::{
-    OversizedSourceExclusionCandidate, SourceIndexPolicy, process_source_index_policy,
-};
+use codestory_contracts::workspace::{OversizedSourceExclusionCandidate, SourceIndexPolicy};
 use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
@@ -1493,7 +1491,7 @@ impl WorkspaceIndexer {
             compilation_db_warning,
             batch_config: IncrementalIndexingConfig::default(),
             full_refresh_chunk_budget: FullRefreshChunkBudget::default(),
-            source_file_byte_cap: process_source_index_policy().byte_cap,
+            source_file_byte_cap: SourceIndexPolicy::default().byte_cap,
             source_index_policy: None,
             artifact_cache_policies: ArtifactCachePolicies::default(),
             #[cfg(test)]
@@ -23380,7 +23378,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
         }
         source.push('}');
         std::fs::write(&path, &source)?;
-        assert!(source.len() as u64 <= process_source_index_policy().byte_cap);
+        assert!(source.len() as u64 <= SourceIndexPolicy::default().byte_cap);
 
         let plan = codestory_workspace::RefreshExecutionPlan {
             mode: codestory_workspace::BuildMode::FullRefresh,
@@ -23388,7 +23386,7 @@ fn checked_foreign(value: Option<i32>) -> Option<i32> {
             files_to_remove: Vec::new(),
             existing_file_ids: HashMap::new(),
         };
-        let policy = process_source_index_policy().clone();
+        let policy = SourceIndexPolicy::default();
         let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
             .with_source_index_policy(policy.clone());
         let mut storage = Storage::new_in_memory()?;
