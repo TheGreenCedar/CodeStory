@@ -965,6 +965,288 @@ def _server_crash_assertions(
     }
 
 
+@dataclass(frozen=True)
+class ColdRaceElection:
+    instances: frozenset[str]
+    authorities: frozenset[tuple[str, str]]
+    engines: frozenset[tuple[str, str, int, int]]
+
+
+def _cold_race_election(
+    evidence: ScenarioAssertionEvidence,
+) -> ColdRaceElection:
+    witnesses = {
+        phase: [
+            observation
+            for observation in evidence.process_observations
+            if observation.get("phase") == phase
+        ]
+        for phase in ("cold_race_first", "cold_race_second")
+    }
+    require(
+        all(len(phase_witnesses) == 1 for phase_witnesses in witnesses.values()),
+        "cold race must retain exactly one post-reset snapshot from each process",
+    )
+    snapshots = tuple(
+        witnesses[phase][0]["snapshot"]
+        for phase in ("cold_race_first", "cold_race_second")
+    )
+    require(
+        all(
+            isinstance(snapshot, dict) and snapshot.get("engine") is not None
+            for snapshot in snapshots
+        ),
+        "cold race post-reset snapshots must retain engine identity",
+    )
+    return ColdRaceElection(
+        instances=frozenset(
+            snapshot["process"]["server_instance_id"] for snapshot in snapshots
+        ),
+        authorities=frozenset(
+            (
+                snapshot["authority"]["lifetime_authority_id"],
+                snapshot["authority"]["listener_id"],
+            )
+            for snapshot in snapshots
+        ),
+        engines=frozenset(
+            (
+                snapshot["engine"]["engine_owner_id"],
+                snapshot["engine"]["native_worker_id"],
+                snapshot["engine"]["load_generation"],
+                snapshot["engine"]["model_load_count"],
+            )
+            for snapshot in snapshots
+        ),
+    )
+
+
+def _cold_race_assertions(
+    evidence: ScenarioAssertionEvidence,
+) -> dict[str, bool]:
+    election = _cold_race_election(evidence)
+    independent = evidence.transition(
+        "two_independent_processes",
+        {
+            "first_pid",
+            "second_pid",
+            "first_project_identity_sha256",
+            "second_project_identity_sha256",
+            "first_transport_peer_verified",
+            "second_transport_peer_verified",
+        },
+    )
+    converged = evidence.transition(
+        "single_server_convergence",
+        {"server_instance_id", "lifetime_authority_id"},
+    )
+    hosts = (
+        evidence.same_account.get("plugin_hosts")
+        if isinstance(evidence.same_account, dict)
+        else None
+    )
+    return {
+        "two_independent_plugin_hosts": (
+            require_positive_int(independent["first_pid"], "cold race first pid")
+            != require_positive_int(independent["second_pid"], "cold race second pid")
+            and independent["first_transport_peer_verified"] is True
+            and independent["second_transport_peer_verified"] is True
+        ),
+        "same_os_account": (
+            evidence.same_account.get("relation") == "same_os_account"
+            and isinstance(hosts, list)
+            and len(hosts) == 2
+        ),
+        "different_repositories": (
+            independent["first_project_identity_sha256"]
+            != independent["second_project_identity_sha256"]
+            and all(
+                HEX_SHA256.fullmatch(str(independent[field])) is not None
+                for field in (
+                    "first_project_identity_sha256",
+                    "second_project_identity_sha256",
+                )
+            )
+        ),
+        "one_lifetime_authority": (
+            len(election.authorities) == 1
+            and converged["lifetime_authority_id"]
+            == next(iter(election.authorities))[0]
+        ),
+        "one_listener": (
+            len({identity[1] for identity in election.authorities}) == 1
+        ),
+        "one_server": (
+            len(election.instances) == 1
+            and converged["server_instance_id"] == next(iter(election.instances))
+        ),
+        "one_engine_owner": (
+            len({identity[0] for identity in election.engines}) == 1
+        ),
+        "one_native_worker": (
+            len({identity[1] for identity in election.engines}) == 1
+        ),
+        "one_load_generation": (
+            len({identity[2] for identity in election.engines}) == 1
+        ),
+        "one_model_load": (
+            len(election.engines) == 1 and next(iter(election.engines))[3] == 1
+        ),
+    }
+
+
+def _mixed_queue_capacity_is_typed(capacity: dict) -> bool:
+    for queue_class in ("query", "bulk"):
+        record = capacity[f"{queue_class}_65th"]
+        pressure = (
+            record.get("error", {}).get("capacity")
+            if isinstance(record, dict)
+            else None
+        )
+        if not (
+            isinstance(pressure, dict)
+            and pressure.get("queue_class") == queue_class
+            and pressure.get("capacity") == 64
+            and pressure.get("depth") == 64
+            and bool(pressure.get("retry_condition"))
+        ):
+            return False
+    return True
+
+
+def _mixed_queue_is_fifo(class_orders: dict) -> bool:
+    return all(
+        class_orders[f"{queue_class}_expected_queue_insertion_request_ids"]
+        == class_orders[f"{queue_class}_native_completed_request_ids"]
+        and isinstance(
+            class_orders[
+                f"{queue_class}_expected_queue_insertion_request_ids"
+            ],
+            list,
+        )
+        and bool(
+            class_orders[
+                f"{queue_class}_expected_queue_insertion_request_ids"
+            ]
+        )
+        and isinstance(
+            class_orders[f"{queue_class}_native_completion_sequences"],
+            list,
+        )
+        and bool(class_orders[f"{queue_class}_native_completion_sequences"])
+        and all(
+            isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence > 0
+            for sequence in class_orders[
+                f"{queue_class}_native_completion_sequences"
+            ]
+        )
+        and class_orders[f"{queue_class}_native_completion_sequences"]
+        == sorted(class_orders[f"{queue_class}_native_completion_sequences"])
+        and len(
+            set(class_orders[f"{queue_class}_native_completion_sequences"])
+        )
+        == len(class_orders[f"{queue_class}_native_completion_sequences"])
+        for queue_class in ("query", "bulk")
+    )
+
+
+def _mixed_queue_preserves_project_order(project_orders: dict) -> bool:
+    return all(
+        project_orders[
+            f"{queue_class}_expected_queue_insertion_project_identities"
+        ]
+        == project_orders[f"{queue_class}_native_completed_project_identities"]
+        and len(
+            set(
+                project_orders[
+                    f"{queue_class}_expected_queue_insertion_project_identities"
+                ]
+            )
+        )
+        == 2
+        for queue_class in ("query", "bulk")
+    )
+
+
+def _mixed_queue_assertions(
+    evidence: ScenarioAssertionEvidence,
+) -> dict[str, bool]:
+    saturated = evidence.scheduler("queues_saturated")
+    selected = evidence.scheduler("query_selected_before_bulk_backlog")
+    capacity = evidence.transition(
+        "typed_capacity_retry_observed",
+        {"query_65th", "bulk_65th"},
+    )
+    class_orders = evidence.transition(
+        "per_class_fifo_observed",
+        {
+            "query_expected_queue_insertion_request_ids",
+            "query_native_completed_request_ids",
+            "query_native_completion_sequences",
+            "bulk_expected_queue_insertion_request_ids",
+            "bulk_native_completed_request_ids",
+            "bulk_native_completion_sequences",
+        },
+    )
+    project_orders = evidence.transition(
+        "global_fifo_across_projects",
+        {
+            "query_expected_queue_insertion_project_identities",
+            "query_native_completed_project_identities",
+            "bulk_expected_queue_insertion_project_identities",
+            "bulk_native_completed_project_identities",
+        },
+    )
+    preference = evidence.transition(
+        "query_preference_observed",
+        {
+            "first_query_request_id",
+            "first_query_native_completion_sequence",
+            "first_bulk_request_id",
+            "first_bulk_native_completion_sequence",
+        },
+    )
+    resumed = evidence.transition(
+        "bulk_resumed",
+        {
+            "last_query_request_id",
+            "last_query_native_completion_sequence",
+            "last_bulk_request_id",
+            "last_bulk_native_completion_sequence",
+        },
+    )
+    return {
+        "query_and_bulk_capacities_are_64": (
+            saturated["query_capacity"] == saturated["query_depth"] == 64
+            and saturated["bulk_capacity"] == saturated["bulk_depth"] == 64
+        ),
+        "fifo_within_each_class": _mixed_queue_is_fifo(class_orders),
+        "query_preferred_between_bulk_batches": (
+            selected["active_request_class"] == "query"
+            and selected["bulk_depth"] > 0
+            and preference["first_query_native_completion_sequence"]
+            < preference["first_bulk_native_completion_sequence"]
+        ),
+        "bulk_resumes_when_query_queue_permits": (
+            resumed["last_bulk_native_completion_sequence"]
+            > resumed["last_query_native_completion_sequence"]
+        ),
+        "no_project_or_scope_round_robin": (
+            _mixed_queue_preserves_project_order(project_orders)
+        ),
+        "typed_retry_names_useful_condition": (
+            _mixed_queue_capacity_is_typed(capacity)
+        ),
+        "no_project_or_request_text_leakage": all(
+            all(HEX_SHA256.fullmatch(str(value)) is not None for value in values)
+            for key, values in project_orders.items()
+            if key.endswith("_project_identities")
+        ),
+    }
+
+
 def derive_scenario_assertions(
     scenario_id: str,
     *,
@@ -994,219 +1276,13 @@ def derive_scenario_assertions(
     if scenario_id == "client_death":
         assertions = _client_death_assertions(evidence)
     elif scenario_id == "cold_race":
-        election_witnesses = {
-            phase: [
-                observation
-                for observation in process_observations
-                if observation.get("phase") == phase
-            ]
-            for phase in ("cold_race_first", "cold_race_second")
-        }
-        require(
-            all(len(witnesses) == 1 for witnesses in election_witnesses.values()),
-            "cold race must retain exactly one post-reset snapshot from each process",
-        )
-        election_snapshots = [
-            election_witnesses[phase][0]["snapshot"]
-            for phase in ("cold_race_first", "cold_race_second")
-        ]
-        require(
-            all(
-                isinstance(snapshot, dict) and snapshot.get("engine") is not None
-                for snapshot in election_snapshots
-            ),
-            "cold race post-reset snapshots must retain engine identity",
-        )
-        election_instances = {
-            snapshot["process"]["server_instance_id"]
-            for snapshot in election_snapshots
-        }
-        election_authorities = {
-            (
-                snapshot["authority"]["lifetime_authority_id"],
-                snapshot["authority"]["listener_id"],
-            )
-            for snapshot in election_snapshots
-        }
-        election_engines = {
-            (
-                snapshot["engine"]["engine_owner_id"],
-                snapshot["engine"]["native_worker_id"],
-                snapshot["engine"]["load_generation"],
-                snapshot["engine"]["model_load_count"],
-            )
-            for snapshot in election_snapshots
-        }
-        independent = transition(
-            "two_independent_processes",
-            {
-                "first_pid",
-                "second_pid",
-                "first_project_identity_sha256",
-                "second_project_identity_sha256",
-                "first_transport_peer_verified",
-                "second_transport_peer_verified",
-            },
-        )
-        converged = transition(
-            "single_server_convergence",
-            {"server_instance_id", "lifetime_authority_id"},
-        )
-        hosts = same_account.get("plugin_hosts") if isinstance(same_account, dict) else None
-        assertions = {
-            "two_independent_plugin_hosts": (
-                require_positive_int(independent["first_pid"], "cold race first pid")
-                != require_positive_int(independent["second_pid"], "cold race second pid")
-                and independent["first_transport_peer_verified"] is True
-                and independent["second_transport_peer_verified"] is True
-            ),
-            "same_os_account": (
-                same_account.get("relation") == "same_os_account"
-                and isinstance(hosts, list)
-                and len(hosts) == 2
-            ),
-            "different_repositories": (
-                independent["first_project_identity_sha256"]
-                != independent["second_project_identity_sha256"]
-                and all(
-                    HEX_SHA256.fullmatch(str(independent[field])) is not None
-                    for field in (
-                        "first_project_identity_sha256",
-                        "second_project_identity_sha256",
-                    )
-                )
-            ),
-            "one_lifetime_authority": (
-                len(election_authorities) == 1
-                and converged["lifetime_authority_id"]
-                == next(iter(election_authorities))[0]
-            ),
-            "one_listener": len({identity[1] for identity in election_authorities}) == 1,
-            "one_server": (
-                len(election_instances) == 1
-                and converged["server_instance_id"] == next(iter(election_instances))
-            ),
-            "one_engine_owner": len({identity[0] for identity in election_engines}) == 1,
-            "one_native_worker": len({identity[1] for identity in election_engines}) == 1,
-            "one_load_generation": len({identity[2] for identity in election_engines}) == 1,
-            "one_model_load": (
-                len(election_engines) == 1 and next(iter(election_engines))[3] == 1
-            ),
-        }
+        assertions = _cold_race_assertions(evidence)
     elif scenario_id == "frozen_owner":
         assertions = _frozen_owner_assertions(evidence)
     elif scenario_id == "incompatible_owner":
         assertions = _incompatible_owner_assertions(evidence)
     elif scenario_id == "mixed_queue":
-        saturated = scheduler("queues_saturated")
-        selected = scheduler("query_selected_before_bulk_backlog")
-        capacity = transition("typed_capacity_retry_observed", {"query_65th", "bulk_65th"})
-        class_orders = transition(
-            "per_class_fifo_observed",
-            {
-                "query_expected_queue_insertion_request_ids",
-                "query_native_completed_request_ids",
-                "query_native_completion_sequences",
-                "bulk_expected_queue_insertion_request_ids",
-                "bulk_native_completed_request_ids",
-                "bulk_native_completion_sequences",
-            },
-        )
-        project_orders = transition(
-            "global_fifo_across_projects",
-            {
-                "query_expected_queue_insertion_project_identities",
-                "query_native_completed_project_identities",
-                "bulk_expected_queue_insertion_project_identities",
-                "bulk_native_completed_project_identities",
-            },
-        )
-        preference = transition(
-            "query_preference_observed",
-            {
-                "first_query_request_id",
-                "first_query_native_completion_sequence",
-                "first_bulk_request_id",
-                "first_bulk_native_completion_sequence",
-            },
-        )
-        resumed = transition(
-            "bulk_resumed",
-            {
-                "last_query_request_id",
-                "last_query_native_completion_sequence",
-                "last_bulk_request_id",
-                "last_bulk_native_completion_sequence",
-            },
-        )
-        typed_capacity = True
-        for queue_class in ("query", "bulk"):
-            record = capacity[f"{queue_class}_65th"]
-            pressure = record.get("error", {}).get("capacity") if isinstance(record, dict) else None
-            typed_capacity = typed_capacity and (
-                isinstance(pressure, dict)
-                and pressure.get("queue_class") == queue_class
-                and pressure.get("capacity") == 64
-                and pressure.get("depth") == 64
-                and bool(pressure.get("retry_condition"))
-            )
-        fifo = all(
-            class_orders[f"{queue_class}_expected_queue_insertion_request_ids"]
-            == class_orders[f"{queue_class}_native_completed_request_ids"]
-            and isinstance(
-                class_orders[f"{queue_class}_expected_queue_insertion_request_ids"], list
-            )
-            and bool(class_orders[f"{queue_class}_expected_queue_insertion_request_ids"])
-            and isinstance(class_orders[f"{queue_class}_native_completion_sequences"], list)
-            and bool(class_orders[f"{queue_class}_native_completion_sequences"])
-            and all(
-                isinstance(sequence, int)
-                and not isinstance(sequence, bool)
-                and sequence > 0
-                for sequence in class_orders[f"{queue_class}_native_completion_sequences"]
-            )
-            and class_orders[f"{queue_class}_native_completion_sequences"]
-            == sorted(class_orders[f"{queue_class}_native_completion_sequences"])
-            and len(set(class_orders[f"{queue_class}_native_completion_sequences"]))
-            == len(class_orders[f"{queue_class}_native_completion_sequences"])
-            for queue_class in ("query", "bulk")
-        )
-        global_fifo = all(
-            project_orders[f"{queue_class}_expected_queue_insertion_project_identities"]
-            == project_orders[f"{queue_class}_native_completed_project_identities"]
-            and len(
-                set(project_orders[f"{queue_class}_expected_queue_insertion_project_identities"])
-            )
-            == 2
-            for queue_class in ("query", "bulk")
-        )
-        assertions = {
-            "query_and_bulk_capacities_are_64": (
-                saturated["query_capacity"] == saturated["query_depth"] == 64
-                and saturated["bulk_capacity"] == saturated["bulk_depth"] == 64
-            ),
-            "fifo_within_each_class": fifo,
-            "query_preferred_between_bulk_batches": (
-                selected["active_request_class"] == "query"
-                and selected["bulk_depth"] > 0
-                and preference["first_query_native_completion_sequence"]
-                < preference["first_bulk_native_completion_sequence"]
-            ),
-            "bulk_resumes_when_query_queue_permits": (
-                resumed["last_bulk_native_completion_sequence"]
-                > resumed["last_query_native_completion_sequence"]
-            ),
-            "no_project_or_scope_round_robin": global_fifo,
-            "typed_retry_names_useful_condition": typed_capacity,
-            "no_project_or_request_text_leakage": all(
-                all(
-                    HEX_SHA256.fullmatch(str(value)) is not None
-                    for value in values
-                )
-                for key, values in project_orders.items()
-                if key.endswith("_project_identities")
-            ),
-        }
+        assertions = _mixed_queue_assertions(evidence)
     elif scenario_id == "server_crash":
         assertions = _server_crash_assertions(evidence)
     elif scenario_id == "true_idle_respawn":
