@@ -2,7 +2,6 @@ use crate::app::resolution::command_failure_message;
 use crate::app::server::ensure_http_serve_bind_allowed;
 use crate::app::{classify_local_refresh_failure_state, map_api_error};
 use crate::readiness;
-use anyhow::Context;
 use codestory_contracts::api::ApiError;
 
 #[test]

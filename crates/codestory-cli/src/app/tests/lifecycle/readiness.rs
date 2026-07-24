@@ -5,7 +5,6 @@ use crate::app::diagnostics::{
 };
 use crate::app::{build_agent_preflight_output, local_freshness_needs_refresh};
 use crate::args::RetrievalStatusOutput;
-use crate::runtime;
 use codestory_contracts::api::{
     IndexFreshnessDto, IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessStatusDto,
     StorageStatsDto,

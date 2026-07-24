@@ -273,7 +273,7 @@ pub(super) fn validate_drill_output_dir(output_dir: &std::path::Path) -> Result<
     })
 }
 
-pub(super) struct DrillReportContents {
+pub(in crate::app) struct DrillReportContents {
     pub(super) selected: String,
     pub(super) markdown: String,
     pub(super) json: String,
