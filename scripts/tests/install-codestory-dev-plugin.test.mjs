@@ -171,7 +171,7 @@ async function cachedReceiptFixture() {
     plugin_version: version,
     source_commit: "a".repeat(40),
     source_package_sha256: sourcePackageSha256,
-    target: contract.assetTarget(),
+    target: contract.sourceBuildTarget(),
     cli: {
       path: `bin/${cliName}`,
       name: cliName,
@@ -204,7 +204,7 @@ test("CodeStoryDev installer stages and refreshes an exact receipt while preserv
     const first = install(value);
     assert.equal(first.plugin_id, "codestory@CodeStoryDev");
     assert.equal(first.plugin_version, version);
-    assert.equal(first.target, contract.assetTarget());
+    assert.equal(first.target, contract.sourceBuildTarget());
     assert.equal(first.cli.sha256, digest(await readFile(value.cli)));
     assert.equal(await readFile(path.join(value.pluginData, "sentinel"), "utf8"), "keep");
     assert.equal(first.plugin_data_preserved, true);

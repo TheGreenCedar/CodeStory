@@ -7,6 +7,32 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GRAPH_SCHEMA = "codestory.release-claims/v1";
+const GRAPH_VERSION = 7;
+const KNOWN_PACKAGE_TARGETS = new Set([
+  "linux-arm64",
+  "linux-x64",
+  "macos-arm64",
+  "macos-x64",
+  "windows-arm64",
+  "windows-x64",
+]);
+const UNSUPPORTED_RELEASE_CONFIGURATIONS = [
+  {
+    label: "CPU-only Windows and Linux",
+    targets: ["windows-x64", "linux-x64"],
+    condition: "cpu_only",
+  },
+  {
+    label: "Intel Mac",
+    targets: ["macos-x64"],
+    condition: "all",
+  },
+  {
+    label: "Windows ARM",
+    targets: ["windows-arm64"],
+    condition: "all",
+  },
+];
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/u;
@@ -32,6 +58,18 @@ const REQUIRED_CLAIMS = [
   "platform_support",
   "retrieval_readiness",
   "source_behavior",
+];
+const STANDARD_RELEASE_CLAIMS = [
+  "accelerator_execution",
+  "installed_runtime_behavior",
+  "package_identity",
+  "platform_support",
+  "retrieval_readiness",
+  "source_behavior",
+];
+const OPTIONAL_EVALUATIONS = [
+  "answer_quality",
+  "performance",
 ];
 const REQUIRED_FAILURE_CONTROLS = [
   "benchmark_leakage",
@@ -146,6 +184,130 @@ function uniqueById(values, label) {
   return found;
 }
 
+function validatePublicSupport(graph, packageTargets, cellGroups) {
+  const publicSupport = object(
+    graph.public_support,
+    "release claim graph.public_support",
+  );
+  if (!/^\d+\.\d+$/u.test(publicSupport.release_line)) {
+    fail("public_support.release_line must be a major.minor release line");
+  }
+  if (!Array.isArray(publicSupport.packages) || publicSupport.packages.length === 0) {
+    fail("public_support.packages must be a non-empty array");
+  }
+
+  const supportRows = new Map();
+  for (const [index, value] of publicSupport.packages.entries()) {
+    const row = object(value, `public_support.packages[${index}]`);
+    const target = nonEmptyText(row.target, `public_support.packages[${index}].target`);
+    if (supportRows.has(target)) fail(`public_support.packages duplicates ${target}`);
+    nonEmptyText(row.label, `public_support.packages[${index}].label`);
+    if (row.local_map !== "supported") {
+      fail(`public_support package ${target} must support the local map`);
+    }
+    if (!new Set(["accelerated", "cpu_explicit"]).has(row.broad_retrieval)) {
+      fail(`public_support package ${target} has an invalid broad retrieval path`);
+    }
+    if (!new Set(["none", "metal", "vulkan"]).has(row.accelerator_claim)) {
+      fail(`public_support package ${target} has an invalid accelerator claim`);
+    }
+    supportRows.set(target, row);
+  }
+  if (
+    JSON.stringify([...supportRows.keys()].sort())
+    !== JSON.stringify([...packageTargets].sort())
+  ) {
+    fail("public_support package targets must exactly match workflow_policy.package_matrix");
+  }
+
+  const acceleratorCloseoutTargets = new Set(
+    [...cellGroups.values()]
+      .filter(({ claim }) => claim === "accelerator_execution")
+      .flatMap(({ instances = [] }) => instances)
+      .map(({ identity_constraints: constraints }) => constraints?.target)
+      .filter(Boolean),
+  );
+  for (const [target, row] of supportRows) {
+    if (
+      row.accelerator_claim !== "none"
+      && !acceleratorCloseoutTargets.has(target)
+    ) {
+      fail(`public accelerator claim ${target}/${row.accelerator_claim} has no required closeout cell`);
+    }
+    if (
+      (row.accelerator_claim === "none")
+      !== (row.broad_retrieval === "cpu_explicit")
+    ) {
+      fail(`public_support package ${target} has inconsistent execution and accelerator claims`);
+    }
+  }
+
+  const unshippedTargets = stringArray(
+    publicSupport.unshipped_targets,
+    "public_support.unshipped_targets",
+    { nonEmpty: true },
+  );
+  const expectedUnshippedTargets = [...KNOWN_PACKAGE_TARGETS]
+    .filter((target) => !packageTargets.has(target))
+    .sort();
+  if (JSON.stringify([...unshippedTargets].sort()) !== JSON.stringify(expectedUnshippedTargets)) {
+    fail("public_support.unshipped_targets must name every non-release package target");
+  }
+  if (unshippedTargets.some((target) => supportRows.has(target))) {
+    fail("public_support cannot mark a shipped package target as unshipped");
+  }
+
+  if (!Array.isArray(publicSupport.unsupported) || publicSupport.unsupported.length === 0) {
+    fail("public_support.unsupported must be a non-empty array");
+  }
+  const unsupportedLabels = new Set();
+  for (const [index, value] of publicSupport.unsupported.entries()) {
+    const row = object(value, `public_support.unsupported[${index}]`);
+    const label = nonEmptyText(row.label, `public_support.unsupported[${index}].label`);
+    if (unsupportedLabels.has(label)) fail(`public_support.unsupported duplicates ${label}`);
+    unsupportedLabels.add(label);
+    const targets = stringArray(
+      row.targets,
+      `public_support.unsupported[${index}].targets`,
+      { nonEmpty: true },
+    );
+    if (targets.some((target) => !KNOWN_PACKAGE_TARGETS.has(target))) {
+      fail(`public_support.unsupported ${label} names an unknown package target`);
+    }
+    if (!new Set(["all", "cpu_only"]).has(row.condition)) {
+      fail(`public_support.unsupported ${label} has an invalid condition`);
+    }
+    if (row.condition === "all" && targets.some((target) => supportRows.has(target))) {
+      fail(`public_support.unsupported ${label} conflicts with a shipped package target`);
+    }
+    if (
+      row.condition === "cpu_only"
+      && targets.some((target) =>
+        !supportRows.has(target) || supportRows.get(target).accelerator_claim === "none")
+    ) {
+      fail(`public_support.unsupported ${label} conflicts with a CPU-supported package target`);
+    }
+  }
+  if (
+    JSON.stringify(publicSupport.unsupported)
+    !== JSON.stringify(UNSUPPORTED_RELEASE_CONFIGURATIONS)
+  ) {
+    fail("public_support.unsupported must match the canonical unsupported release matrix");
+  }
+
+  const unclaimedCapabilities = stringArray(
+    publicSupport.unclaimed_capabilities,
+    "public_support.unclaimed_capabilities",
+    { nonEmpty: true },
+  );
+  if (
+    JSON.stringify([...unclaimedCapabilities].sort())
+    !== JSON.stringify(["answer_quality", "performance"])
+  ) {
+    fail("public_support.unclaimed_capabilities must name the release non-claims");
+  }
+}
+
 export function canonicalReleaseClaimValue(value) {
   if (Array.isArray(value)) return value.map(canonicalReleaseClaimValue);
   if (value !== null && typeof value === "object") {
@@ -164,10 +326,29 @@ export function releaseClaimGraphDigest(graph) {
 
 export function validateReleaseClaimGraph(graph) {
   object(graph, "release claim graph");
-  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== 4) {
-    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version 4`);
+  if (graph.schema !== GRAPH_SCHEMA || graph.graph_version !== GRAPH_VERSION) {
+    fail(`release claim graph must use ${GRAPH_SCHEMA} graph_version ${GRAPH_VERSION}`);
   }
   nonEmptyText(graph.graph_id, "release claim graph.graph_id");
+  const standardReleaseClaims = stringArray(
+    graph.standard_release_claims,
+    "release claim graph.standard_release_claims",
+    { nonEmpty: true },
+  ).sort();
+  if (JSON.stringify(standardReleaseClaims) !== JSON.stringify(STANDARD_RELEASE_CLAIMS)) {
+    fail(`release claim graph standard release must require exactly ${STANDARD_RELEASE_CLAIMS.join(", ")}`);
+  }
+  const optionalEvaluations = stringArray(
+    graph.optional_evaluations,
+    "release claim graph.optional_evaluations",
+    { nonEmpty: true },
+  ).sort();
+  if (JSON.stringify(optionalEvaluations) !== JSON.stringify(OPTIONAL_EVALUATIONS)) {
+    fail(`release claim graph optional evaluations must be exactly ${OPTIONAL_EVALUATIONS.join(", ")}`);
+  }
+  if (standardReleaseClaims.some((claim) => optionalEvaluations.includes(claim))) {
+    fail("release claim graph standard release claims and optional evaluations must be disjoint");
+  }
   const evidencePolicy = object(graph.evidence_policy, "release claim graph.evidence_policy");
   if (evidencePolicy.selection !== "all_matching_rows_must_pass") {
     fail("release claim graph evidence selection must be all_matching_rows_must_pass");
@@ -264,6 +445,9 @@ export function validateReleaseClaimGraph(graph) {
   if (JSON.stringify([...claims.keys()].sort()) !== JSON.stringify(REQUIRED_CLAIMS)) {
     fail(`release claim graph must define exactly ${REQUIRED_CLAIMS.join(", ")}`);
   }
+  for (const id of [...standardReleaseClaims, ...optionalEvaluations]) {
+    if (!claims.has(id)) fail(`release claim graph classifies unknown claim ${id}`);
+  }
   for (const [id, claim] of claims) {
     if (!tiers.has(claim.minimum_tier)) fail(`claim ${id} references unknown minimum tier ${claim.minimum_tier}`);
     const dependencies = stringArray(claim.depends_on_claims, `claim ${id}.depends_on_claims`);
@@ -334,11 +518,13 @@ export function validateReleaseClaimGraph(graph) {
   }
   const cellGroups = uniqueById(closeout.cell_groups, "release claim graph.closeout.cell_groups");
   const requiredCellGroups = [
+    "accelerator_execution",
     "candidate_installed_behavior",
     "installed_runtime_behavior",
     "package_identity",
     "platform_support",
     "post_publish_bytes",
+    "retrieval_readiness",
     "source_behavior",
   ];
   if (JSON.stringify([...cellGroups.keys()].sort()) !== JSON.stringify(requiredCellGroups)) {
@@ -411,8 +597,8 @@ export function validateReleaseClaimGraph(graph) {
   if (!Number.isInteger(policy.artifact_retention_days) || policy.artifact_retention_days <= 0) {
     fail("workflow_policy.artifact_retention_days must be a positive integer");
   }
-  if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 2) {
-    fail("workflow_policy.package_matrix must define two desktop package rows");
+  if (!Array.isArray(policy.package_matrix) || policy.package_matrix.length !== 3) {
+    fail("workflow_policy.package_matrix must define three release package rows");
   }
   const targets = new Set();
   for (const [index, rowValue] of policy.package_matrix.entries()) {
@@ -422,11 +608,12 @@ export function validateReleaseClaimGraph(graph) {
     }
     if (typeof row.exe_suffix !== "string") fail(`workflow_policy.package_matrix[${index}].exe_suffix must be a string`);
     if (targets.has(row.asset_target)) fail(`workflow_policy.package_matrix duplicates ${row.asset_target}`);
+    if (!KNOWN_PACKAGE_TARGETS.has(row.asset_target)) {
+      fail(`workflow_policy.package_matrix names unknown target ${row.asset_target}`);
+    }
     targets.add(row.asset_target);
   }
-  if (JSON.stringify([...targets].sort()) !== JSON.stringify(["macos-arm64", "windows-x64"])) {
-    fail("workflow_policy.package_matrix must define exactly macos-arm64 and windows-x64");
-  }
+  validatePublicSupport(graph, targets, cellGroups);
   if (!Array.isArray(policy.protected_jobs) || policy.protected_jobs.length === 0) {
     fail("workflow_policy.protected_jobs must be a non-empty array");
   }
@@ -442,11 +629,25 @@ export function validateReleaseClaimGraph(graph) {
     stringArray(row.secrets, `workflow_policy.protected_jobs[${index}].secrets`);
   }
   const releaseChain = object(policy.release_chain, "workflow_policy.release_chain");
-  stringArray(releaseChain.exact_sha_jobs, "workflow_policy.release_chain.exact_sha_jobs", { nonEmpty: true });
+  const exactShaJobs = stringArray(
+    releaseChain.exact_sha_jobs,
+    "workflow_policy.release_chain.exact_sha_jobs",
+    { nonEmpty: true },
+  );
+  if (exactShaJobs.includes("release-evidence")) {
+    fail("optional release evidence must not be an exact-SHA job in the standard release chain");
+  }
   const dependencies = object(releaseChain.dependencies, "workflow_policy.release_chain.dependencies");
   for (const [job, needsValue] of Object.entries(dependencies)) {
     nonEmptyText(job, "workflow_policy.release_chain.dependencies job");
-    stringArray(needsValue, `workflow_policy.release_chain.dependencies.${job}`, { nonEmpty: true });
+    const needs = stringArray(
+      needsValue,
+      `workflow_policy.release_chain.dependencies.${job}`,
+      { nonEmpty: true },
+    );
+    if (job === "release-evidence" || needs.includes("release-evidence")) {
+      fail("optional release evidence must not block a standard release job");
+    }
   }
   stringArray(policy.artifact_workflows, "workflow_policy.artifact_workflows", { nonEmpty: true });
   const promotion = object(policy.promotion, "workflow_policy.promotion");
@@ -486,6 +687,90 @@ export function loadReleaseClaimGraph(repoRoot = path.resolve(path.dirname(fileU
     fail(`failed to read release claim graph ${graphPath}: ${error.message}`);
   }
   return validateReleaseClaimGraph(graph);
+}
+
+const PUBLIC_SUPPORT_START = "<!-- codestory-public-support:start -->";
+const PUBLIC_SUPPORT_END = "<!-- codestory-public-support:end -->";
+const PUBLIC_SUPPORT_DOCUMENTS = [
+  "README.md",
+  "CHANGELOG.md",
+  "docs/users/README.md",
+  "plugins/codestory/README.md",
+];
+
+export function renderPublicSupport(graph) {
+  validateReleaseClaimGraph(graph);
+  const rows = graph.public_support.packages.map((row) => {
+    const accelerator = {
+      metal: "Metal",
+      vulkan: "Vulkan",
+      none: "CPU",
+    }[row.accelerator_claim];
+    return `| ${row.label} | Supported with ${accelerator} |`;
+  });
+  const unsupported = graph.public_support.unsupported.map(
+    ({ label }) => `| ${label} | Unsupported |`,
+  );
+  return [
+    PUBLIC_SUPPORT_START,
+    "| Platform | Release support |",
+    "| --- | --- |",
+    ...rows,
+    ...unsupported,
+    PUBLIC_SUPPORT_END,
+  ].join("\n");
+}
+
+export function validatePublicSupportDocuments(graph, repoRoot) {
+  const expected = renderPublicSupport(graph);
+  for (const relative of PUBLIC_SUPPORT_DOCUMENTS) {
+    const document = readFileSync(path.join(repoRoot, relative), "utf8");
+    const start = document.indexOf(PUBLIC_SUPPORT_START);
+    const end = document.indexOf(PUBLIC_SUPPORT_END);
+    if (
+      start < 0
+      || end < start
+      || document.indexOf(PUBLIC_SUPPORT_START, start + 1) >= 0
+      || document.indexOf(PUBLIC_SUPPORT_END, end + 1) >= 0
+    ) {
+      fail(`${relative} must contain exactly one generated public support block`);
+    }
+    const actual = document.slice(start, end + PUBLIC_SUPPORT_END.length);
+    if (actual !== expected) {
+      fail(`${relative} public support block is stale`);
+    }
+  }
+}
+
+export function releaseAssetNames(graph, version) {
+  validateReleaseClaimGraph(graph);
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
+    fail("release asset version must be semver");
+  }
+  return [
+    ...graph.workflow_policy.package_matrix.map(
+      ({ asset_target: target, extension }) =>
+        `codestory-cli-v${version}-${target}.${extension}`,
+    ),
+    "SHA256SUMS.txt",
+  ];
+}
+
+export function renderReleasePlatformNotes(graph) {
+  validateReleaseClaimGraph(graph);
+  const packages = graph.public_support.packages.map(
+    ({ label, accelerator_claim: claim }) =>
+      `- ${label}: supported with ${claim === "metal" ? "Metal" : "Vulkan"}`,
+  );
+  const unsupported = graph.public_support.unsupported.map(
+    ({ label }) => `- ${label}: unsupported`,
+  );
+  return [
+    "## Platform support",
+    "",
+    ...packages,
+    ...unsupported,
+  ].join("\n");
 }
 
 function sortedFailures(failures) {
@@ -961,7 +1246,16 @@ function main() {
   const repoRoot = path.resolve(values.repo ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
   const graph = loadReleaseClaimGraph(repoRoot);
   if (command === "validate") {
+    validatePublicSupportDocuments(graph, repoRoot);
     console.log(`Release claim graph passed: ${releaseClaimGraphDigest(graph)}`);
+    return;
+  }
+  if (command === "release-assets") {
+    console.log(releaseAssetNames(graph, nonEmptyText(values.version, "--version")).join("\n"));
+    return;
+  }
+  if (command === "release-platform-notes") {
+    console.log(renderReleasePlatformNotes(graph));
     return;
   }
   if (command === "evaluate") {
@@ -993,7 +1287,7 @@ function main() {
     if (evaluation.status === "fail") process.exitCode = 1;
     return;
   }
-  fail("command must be validate or evaluate");
+  fail("command must be validate, release-assets, release-platform-notes, or evaluate");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

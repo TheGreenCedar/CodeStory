@@ -593,34 +593,23 @@ test("exact proof policy rejects trigger, identity, and cache downgrades", async
       const step = draftStep(workflow.jobs.route, "Select change-aware proof scope");
       step.run = step.run.replace(' || [ "$REQUESTED_SCOPE" = linux ]', "");
     }, /integration must preserve explicit hosted and Linux scopes/u],
-    ["hosted-only release evidence guard removed", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if
-        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'none' &&", "");
-    }, /hosted-only integration must skip release evidence/u],
-    ["Linux release evidence guard removed", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if
-        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'linux' &&", "");
-    }, /Linux server-behavior proof must not require protected release evidence/u],
-    ["Windows release evidence guard removed", packagedCoordinatorFile, workflow => {
-      workflow.jobs["release-evidence"].if
-        = workflow.jobs["release-evidence"].if.replace("needs.route.outputs.scope != 'windows' &&", "");
-    }, /Windows server-behavior proof must not require protected release evidence/u],
-    ["Windows package remains blocked on release evidence", packagedCoordinatorFile, workflow => {
-      workflow.jobs["packaged-proof"].if
-        = workflow.jobs["packaged-proof"].if.replace("needs.route.outputs.scope == 'windows'", "needs.route.outputs.scope == 'full'");
-    }, /Windows server-behavior package proof must accept skipped protected release evidence/u],
-    ["Windows closeout still requires release evidence", packagedCoordinatorFile, workflow => {
-      const step = draftStep(workflow.jobs.closeout, "Require one coherent accepted proof");
-      step.run = step.run.replace(' && [ "$SCOPE" != windows ]', "");
-    }, /Require one coherent accepted proof/u],
+    ["release evidence runs implicitly", packagedCoordinatorFile, workflow => {
+      workflow.jobs["release-evidence"].if = "needs.route.outputs.mode != 'calibration'";
+    }, /optional release evidence must run only in explicit release-evidence mode/u],
+    ["package waits for release evidence", packagedCoordinatorFile, workflow => {
+      workflow.jobs["packaged-proof"].needs.push("release-evidence");
+    }, /package proof must not depend on optional release evidence/u],
+    ["closeout waits for release evidence", packagedCoordinatorFile, workflow => {
+      workflow.jobs.closeout.needs.push("release-evidence");
+    }, /normal closeout must not depend on optional release evidence/u],
     ["Linux package matrix scope removed", packagedProofFile, workflow => {
       workflow.jobs.build.strategy.matrix
         = workflow.jobs.build.strategy.matrix.replace("inputs.scope == 'linux'", "inputs.scope == 'windows'");
     }, /matrix must select structural JSON by scope/u],
     ["Linux candidate install guard removed", packagedProofFile, workflow => {
       const step = draftStep(workflow.jobs.build, "Stage isolated candidate-managed Linux install");
-      step.if = step.if.replace("inputs.scope == 'linux' || ", "");
-    }, /remain runnable in server and Linux scopes/u],
+      step.if += " && inputs.quality_evidence_artifact != ''";
+    }, /without optional quality evidence/u],
     ["source unversioned cache", sourceFile, workflow => {
       const restore = draftStep(workflow.jobs["full-source-gate"], "Restore Cargo inputs and output");
       restore.with.key = restore.with.key.replace("source-proof-v2", "source-proof");
@@ -870,6 +859,9 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
   }
 
   for (const [name, mutate] of [
+    ["shortened producer timeout", job => {
+      job["timeout-minutes"] = 30;
+    }],
     ["incompatible retrieval path", job => {
       draftStep(job, "Restore Cargo registry, git sources, and build output").with.path = "~/.cargo/registry\ntarget/retrieval\n";
     }],
@@ -1384,17 +1376,20 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     }, /accepted PR Windows package into candidate-installed proof/u],
     ["coordinator server-only scope removed", coordinatorFile, workflow => {
       delete workflow.jobs["windows-vulkan-proof"].with.server_behavior_only;
-    }, /non-quality Windows claim only for Windows scope/u],
+    }, /Windows proof must use bounded retrieval readiness/u],
     ["coordinator quality artifact bypasses producer result", coordinatorFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.quality_evidence_artifact
         = "${{ needs.route.outputs.constants_frozen == 'true' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}";
-    }, /Windows quality evidence must come only from the successful protected producer/u],
+    }, /Windows proof must not consume optional quality evidence/u],
     ["release disables candidate-installed proof", releaseFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /candidate-installed server behavior gate/u],
-    ["release enables physical Vulkan proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = false;
-    }, /candidate-installed server behavior gate/u],
+    }, /close Vulkan and candidate-installed claims without optional quality evidence/u],
+    ["release suppresses physical Vulkan proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = true;
+    }, /close Vulkan and candidate-installed claims without optional quality evidence/u],
+    ["release reintroduces quality evaluation", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = false;
+    }, /without optional quality evidence/u],
     ["explicit opt-in removed", protectedFile, workflow => {
       delete workflow.on.workflow_call.inputs.candidate_installed_proof;
     }, /candidate-installed proof must be an explicit opt-in/u],
@@ -1431,20 +1426,117 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     ["candidate CPU opt-in removed", protectedFile, workflow => {
       candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "0";
     }, /explicit CPU execution/u],
-    ["candidate provenance removed", protectedFile, workflow => {
+    ["candidate attestation removed", protectedFile, workflow => {
       candidateProof(workflow).run = candidateProof(workflow).run
-        .replace("--installed-plugin-provenance", "--untrusted-plugin-provenance");
+        .replace("--installed-plugin-attestation", "--untrusted-plugin-attestation");
     }, /Prove two-host candidate-installed Windows runtime/u],
     ["candidate artifact loses attempt identity", protectedFile, workflow => {
       candidateUpload(workflow).with.name = "candidate-installed-windows-${{ inputs.version }}";
     }, /attempt-scoped artifact/u],
-    ["server-only proof emits release cell", protectedFile, workflow => {
+    ["server-only proof suppresses release cell", protectedFile, workflow => {
       draftStep(workflow.jobs["packaged-vulkan"], "Emit authenticated Vulkan release cell").if
-        = "inputs.emit_release_cells";
-    }, /server-behavior-only proof must never emit a release cell/u],
+        = "inputs.emit_release_cells && !inputs.server_behavior_only && !inputs.candidate_installed_only";
+    }, /bounded server proof must retain the authenticated Vulkan release cell/u],
   ];
 
   for (const [name, file, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+    });
+  }
+});
+
+test("Linux x64 Vulkan proof remains protected and fail-closed", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const file = "linux-vulkan-proof.yml";
+  const protectedJob = workflow => workflow.jobs["packaged-vulkan"];
+  const protectedProof = workflow => draftStep(
+    protectedJob(workflow),
+    "Prove offline Linux Vulkan retrieval",
+  );
+  const candidateProof = workflow => draftStep(
+    protectedJob(workflow),
+    "Prove candidate-installed Linux Vulkan runtime",
+  );
+
+  const mutations = [
+    ["runner label drifts", workflow => {
+      protectedJob(workflow)["runs-on"][3] = "generic-vulkan";
+    }, /must use \["self-hosted","Linux","X64","codestory-linux-vulkan"\]/u],
+    ["protected CPU fallback enabled", workflow => {
+      protectedProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }, /protected proof must reject CPU fallback/u],
+    ["protected qualification cell drifts", workflow => {
+      protectedProof(workflow).run = protectedProof(workflow).run
+        .replace("protected_linux_x64_vulkan", "hosted_linux_x64_cpu");
+    }, /Prove offline Linux Vulkan retrieval/u],
+    ["candidate CPU fallback enabled", workflow => {
+      candidateProof(workflow).env.CODESTORY_EMBED_ALLOW_CPU = "1";
+    }, /candidate-installed proof must reject CPU fallback/u],
+    ["candidate qualification cell drifts", workflow => {
+      candidateProof(workflow).run = candidateProof(workflow).run
+        .replace("candidate_installed_linux_x64_vulkan", "candidate_installed_linux_x64_cpu");
+    }, /Prove candidate-installed Linux Vulkan runtime/u],
+    ["release cell omitted", workflow => {
+      const step = draftStep(
+        protectedJob(workflow),
+        "Emit authenticated Linux Vulkan release cells",
+      );
+      step.run = step.run.replace("retrieval_readiness:linux-x64", "retrieval_readiness:windows-x64");
+    }, /Emit authenticated Linux Vulkan release cells/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
+    await t.test(name, () => {
+      const workflows = loadWorkflows();
+      mutate(workflows.get(file));
+      const violations = validateWorkflows(workflows);
+      assert.notDeepEqual(violations, []);
+      assert.match(violations.join("\n"), expectedReason);
+    });
+  }
+});
+
+test("post-publish proof uses an immutable real Codex marketplace install", async (t) => {
+  assert.deepEqual(validateWorkflows(loadWorkflows()), []);
+
+  const file = "post-publish-release-smoke.yml";
+  const installStep = workflow => workflow.jobs.smoke.steps.find(
+    ({ name }) => name === "Resolve the published plugin through the marketplace catalog",
+  );
+  const proofStep = workflow => workflow.jobs.smoke.steps.find(
+    ({ name }) => name === "Qualify the catalog-resolved published runtime",
+  );
+  const mutations = [
+    ["Codex CLI pin drifts", workflow => {
+      workflow.env.CODEX_CLI_VERSION = "latest";
+    }, /pin the Codex CLI/u],
+    ["marketplace revision becomes mutable", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace('--marketplace-revision "$marketplace_revision"', "--marketplace-revision main");
+    }, /Resolve the published plugin through the marketplace catalog/u],
+    ["real installer helper is bypassed", workflow => {
+      installStep(workflow).run = installStep(workflow).run
+        .replace(
+          "install-codestory-marketplace-proof.mjs",
+          "copy-codestory-marketplace-proof.mjs",
+        );
+    }, /Resolve the published plugin through the marketplace catalog/u],
+    ["source archive is substituted for installation", workflow => {
+      installStep(workflow).run += "\ngit archive HEAD:plugins/codestory";
+    }, /must not fabricate installation with git archive/u],
+    ["single v2 attestation is removed", workflow => {
+      proofStep(workflow).run = proofStep(workflow).run
+        .replace("--installed-plugin-attestation", "--installed-plugin-provenance");
+    }, /installed runtime proof must run --installed-plugin-attestation/u],
+  ];
+
+  for (const [name, mutate, expectedReason] of mutations) {
     await t.test(name, () => {
       const workflows = loadWorkflows();
       mutate(workflows.get(file));

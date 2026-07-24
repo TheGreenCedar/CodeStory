@@ -11,7 +11,8 @@ use codestory_contracts::api::{
 };
 use codestory_runtime::{
     ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
-    PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, TargetResolution,
+    PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, RuntimeProcessConfig,
+    TargetResolution,
 };
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
@@ -62,6 +63,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
     pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    pub(crate) source_index_policy: codestory_contracts::workspace::SourceIndexPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,9 +180,15 @@ impl RuntimeContext {
             context
                 .sidecar
                 .with_profile_and_run_id(Some(&context.project_root), selected, run_id);
-        context.context_key.configuration_id =
-            runtime_configuration_id(&context.cache_root, &context.sidecar);
-        let runtime = Runtime::new_with_config(context.sidecar.clone());
+        context.context_key.configuration_id = runtime_configuration_id(
+            &context.cache_root,
+            &context.sidecar,
+            &context.source_index_policy,
+        );
+        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
+            context.sidecar.clone(),
+            context.source_index_policy.clone(),
+        ));
         context.project = runtime.project_service();
         context.index = runtime.index_service();
         context.grounding = runtime.grounding_service();
@@ -231,12 +239,16 @@ impl RuntimeContext {
             &sidecar_defaults,
             &config.runtime_overrides(),
         );
+        let source_index_policy = startup.source_index_policy.clone();
         let context_key = ProjectContextKey {
             project_id: project_identity.project_id.clone(),
             workspace_id: project_identity.workspace_id.clone(),
-            configuration_id: runtime_configuration_id(&cache_root, &sidecar),
+            configuration_id: runtime_configuration_id(&cache_root, &sidecar, &source_index_policy),
         };
-        let runtime = Runtime::new_with_config(sidecar.clone());
+        let runtime = Runtime::new_with_process_config(RuntimeProcessConfig::new(
+            sidecar.clone(),
+            source_index_policy.clone(),
+        ));
         let events = runtime.events();
         Ok(Self {
             activation: runtime.activation_service(),
@@ -252,6 +264,7 @@ impl RuntimeContext {
             cache_root,
             storage_path,
             sidecar,
+            source_index_policy,
         })
     }
 
@@ -490,6 +503,7 @@ pub(crate) fn map_public_operation<T, U>(
 fn runtime_configuration_id(
     cache_root: &Path,
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &codestory_contracts::workspace::SourceIndexPolicy,
 ) -> String {
     // Do not hash credentials. Their presence participates in the immutable
     // configuration boundary, while secret material remains outside logs and
@@ -511,7 +525,7 @@ fn runtime_configuration_id(
         sidecar.summary.api_key.is_some(),
     );
     identity.push_str(&format!(
-        "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}",
+        "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         sidecar.summary.model,
         sidecar.summary.max_tokens,
         sidecar.summary.timeout,
@@ -520,6 +534,9 @@ fn runtime_configuration_id(
         configuration_path_identity(&sidecar.layout.semantic_data_dir),
         configuration_path_identity(&sidecar.layout.scip_artifacts_root),
         configuration_path_identity(&sidecar.layout.state_file),
+        source_index_policy.policy_version,
+        source_index_policy.byte_cap,
+        source_index_policy.structural_unit_cap,
     ));
     fnv1a_hex(identity.as_bytes())
 }
@@ -1286,6 +1303,7 @@ mod tests {
                 cache_root.to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
         let first_startup = startup(&first_cache);
         let second_startup = startup(&second_cache);
@@ -1356,6 +1374,47 @@ mod tests {
     }
 
     #[test]
+    fn source_index_policy_is_retained_and_participates_in_context_identity() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        let defaults = codestory_retrieval::SidecarProcessDefaults::new(
+            cache.clone(),
+            codestory_retrieval::SidecarRuntimeDefaults::default(),
+        );
+        let startup = |byte_cap| crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.clone()),
+            sidecar_defaults: defaults.clone(),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::oversized(
+                byte_cap,
+            ),
+        };
+        let open = |startup: &crate::config::CliStartupConfig| {
+            RuntimeContext::new_agent_sidecar_with_startup(
+                &ProjectArgs {
+                    project: project.clone(),
+                    cache_dir: None,
+                },
+                startup,
+            )
+            .expect("runtime context")
+        };
+
+        let first = open(&startup(64));
+        let second = open(&startup(65));
+
+        assert_eq!(first.source_index_policy.byte_cap, 64);
+        assert_eq!(second.source_index_policy.byte_cap, 65);
+        assert_ne!(
+            first.context_key.configuration_id,
+            second.context_key.configuration_id
+        );
+    }
+
+    #[test]
     fn existing_cache_aliases_share_one_configuration_identity() {
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("project");
@@ -1370,6 +1429,7 @@ mod tests {
                 temp.path().join("process-cache"),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
         let open = |cache_dir: PathBuf| {
             RuntimeContext::new_agent_sidecar_with_startup(
@@ -1790,6 +1850,7 @@ mod tests {
                 cache,
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
 
         let open = |root: PathBuf| {

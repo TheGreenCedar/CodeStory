@@ -73,16 +73,16 @@ flowchart LR
 
 ## Platform support
 
-| Platform | Normal local map | Broad retrieval |
-| --- | --- | --- |
-| macOS 15+ on Apple Silicon | Yes | Metal |
-| macOS 15+ on Intel | Yes | No production CPU fallback and no Metal claim |
-| Windows x64 | Yes | Vulkan on supported physical hardware |
-| Windows arm64 and Linux | Yes | Vulkan only where the packaged hardware path is proved |
-
-Hosted CI may enable the explicit CPU policy for source and package checks; a
-CPU run never claims Metal or Vulkan. See the [user guide platform
-table](docs/users/README.md#platform-summary) for the full support boundary.
+<!-- codestory-public-support:start -->
+| Platform | Release support |
+| --- | --- |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
+<!-- codestory-public-support:end -->
 
 ## Example prompts
 

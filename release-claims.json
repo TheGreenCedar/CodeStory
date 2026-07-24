@@ -1,7 +1,78 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 4,
+  "graph_version": 7,
   "graph_id": "codestory-release-claims",
+  "standard_release_claims": [
+    "source_behavior",
+    "package_identity",
+    "platform_support",
+    "accelerator_execution",
+    "installed_runtime_behavior",
+    "retrieval_readiness"
+  ],
+  "optional_evaluations": [
+    "performance",
+    "answer_quality"
+  ],
+  "public_support": {
+    "release_line": "0.16",
+    "packages": [
+      {
+        "target": "macos-arm64",
+        "label": "macOS 15+ on Apple Silicon",
+        "local_map": "supported",
+        "broad_retrieval": "accelerated",
+        "accelerator_claim": "metal"
+      },
+      {
+        "target": "windows-x64",
+        "label": "Windows x64",
+        "local_map": "supported",
+        "broad_retrieval": "accelerated",
+        "accelerator_claim": "vulkan"
+      },
+      {
+        "target": "linux-x64",
+        "label": "Linux x64",
+        "local_map": "supported",
+        "broad_retrieval": "accelerated",
+        "accelerator_claim": "vulkan"
+      }
+    ],
+    "unshipped_targets": [
+      "linux-arm64",
+      "macos-x64",
+      "windows-arm64"
+    ],
+    "unsupported": [
+      {
+        "label": "CPU-only Windows and Linux",
+        "targets": [
+          "windows-x64",
+          "linux-x64"
+        ],
+        "condition": "cpu_only"
+      },
+      {
+        "label": "Intel Mac",
+        "targets": [
+          "macos-x64"
+        ],
+        "condition": "all"
+      },
+      {
+        "label": "Windows ARM",
+        "targets": [
+          "windows-arm64"
+        ],
+        "condition": "all"
+      }
+    ],
+    "unclaimed_capabilities": [
+      "answer_quality",
+      "performance"
+    ]
+  },
   "evidence_policy": {
     "selection": "all_matching_rows_must_pass",
     "validity": "observed_at_expires_at",
@@ -148,7 +219,8 @@
       "tier": "protected_hardware",
       "proof_lanes": [
         ".github/workflows/macos-metal-proof.yml",
-        ".github/workflows/windows-vulkan-proof.yml"
+        ".github/workflows/windows-vulkan-proof.yml",
+        ".github/workflows/linux-vulkan-proof.yml"
       ],
       "required_identity": [
         "repository",
@@ -168,6 +240,7 @@
       "proof_lanes": [
         ".github/workflows/macos-metal-proof.yml",
         ".github/workflows/windows-vulkan-proof.yml",
+        ".github/workflows/linux-vulkan-proof.yml",
         ".github/workflows/post-publish-release-smoke.yml"
       ],
       "required_identity": [
@@ -186,17 +259,15 @@
       "id": "retrieval_readiness",
       "tier": "live_behavior",
       "proof_lanes": [
+        ".github/workflows/macos-metal-proof.yml",
+        ".github/workflows/windows-vulkan-proof.yml",
+        ".github/workflows/linux-vulkan-proof.yml",
         ".github/workflows/release-candidate-evidence.yml"
       ],
       "required_identity": [
         "repository",
         "commit",
-        "source_tree",
-        "profile",
-        "corpus_id",
-        "cache_id",
-        "machine_fingerprint",
-        "release_key"
+        "source_tree"
       ],
       "validity": "expires_at",
       "maximum_validity_hours": 24
@@ -382,20 +453,24 @@
     {
       "id": "retrieval_readiness",
       "minimum_tier": "live_behavior",
-      "depends_on_claims": [],
+      "depends_on_claims": [
+        "package_identity",
+        "platform_support",
+        "accelerator_execution"
+      ],
       "required_evidence": [
         "retrieval_readiness"
       ],
       "prerequisite_checks": [
         {
-          "id": "release-evidence-contract",
-          "command": "node --test scripts/tests/codestory-release-evidence-gate.test.mjs"
+          "id": "packaged-agent-contract",
+          "command": "python .github/scripts/check-packaged-agent-proof.py --self-test"
         }
       ],
       "prerequisites": [
-        "one immutable full sidecar generation is pinned",
-        "project, corpus, cache, runtime profile, and exact source SHA identities agree",
-        "packet and search operate fail closed on the measured repository"
+        "the exact packaged archive runs on protected release hardware",
+        "packet and search complete on two project-bound plugin hosts",
+        "live encoding and shared-server continuity remain observable"
       ],
       "non_claims": [
         "answer sufficiency for an unmeasured task",
@@ -408,9 +483,7 @@
     {
       "id": "performance",
       "minimum_tier": "live_behavior",
-      "depends_on_claims": [
-        "retrieval_readiness"
-      ],
+      "depends_on_claims": [],
       "required_evidence": [
         "performance"
       ],
@@ -435,9 +508,7 @@
     {
       "id": "answer_quality",
       "minimum_tier": "answer_quality",
-      "depends_on_claims": [
-        "retrieval_readiness"
-      ],
+      "depends_on_claims": [],
       "required_evidence": [
         "answer_quality"
       ],
@@ -556,6 +627,150 @@
         "archive_role": "pre_publish"
       },
       {
+        "id": "accelerator_execution",
+        "phase": "pre_publish",
+        "claim": "accelerator_execution",
+        "evidence_type": "accelerator_execution",
+        "expansion": "instances",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "runner",
+          "backend",
+          "native_engine",
+          "calibration_sha256",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch",
+          "runner",
+          "backend",
+          "native_engine"
+        ],
+        "instances": [
+          {
+            "id": "macos-arm64-metal",
+            "identity_constraints": {
+              "target": "macos-arm64",
+              "host_os": "macOS",
+              "host_arch": "ARM64",
+              "runner": "codestory-metal",
+              "backend": "Metal",
+              "producer_workflow": ".github/workflows/macos-metal-proof.yml",
+              "producer_job": "packaged-metal",
+              "producer_job_name": "Packaged Apple Silicon Metal engine",
+              "producer_artifact": "release-cell-prepublish-macos-arm64-metal-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "windows-x64-vulkan",
+            "identity_constraints": {
+              "target": "windows-x64",
+              "host_os": "Windows",
+              "host_arch": "X64",
+              "runner": "codestory-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Windows Vulkan engine",
+              "producer_artifact": "release-cell-prepublish-windows-x64-vulkan-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "linux-x64-vulkan",
+            "identity_constraints": {
+              "target": "linux-x64",
+              "host_os": "Linux",
+              "host_arch": "X64",
+              "runner": "codestory-linux-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/linux-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Linux Vulkan engine",
+              "producer_artifact": "release-cell-prepublish-linux-x64-vulkan-attempt-{attempt}"
+            }
+          }
+        ],
+        "archive_role": "none"
+      },
+      {
+        "id": "retrieval_readiness",
+        "phase": "post_publish",
+        "claim": "retrieval_readiness",
+        "evidence_type": "retrieval_readiness",
+        "expansion": "instances",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "target",
+          "runner",
+          "backend",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "runner",
+          "backend"
+        ],
+        "instances": [
+          {
+            "id": "macos-arm64",
+            "identity_constraints": {
+              "target": "macos-arm64",
+              "runner": "codestory-metal",
+              "backend": "Metal",
+              "producer_workflow": ".github/workflows/macos-metal-proof.yml",
+              "producer_job": "packaged-metal",
+              "producer_job_name": "Packaged Apple Silicon Metal engine",
+              "producer_artifact": "release-cell-postpublish-retrieval-macos-arm64-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "windows-x64",
+            "identity_constraints": {
+              "target": "windows-x64",
+              "runner": "codestory-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Windows Vulkan engine",
+              "producer_artifact": "release-cell-postpublish-retrieval-windows-x64-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "linux-x64",
+            "identity_constraints": {
+              "target": "linux-x64",
+              "runner": "codestory-linux-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/linux-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Linux Vulkan engine",
+              "producer_artifact": "release-cell-postpublish-retrieval-linux-x64-attempt-{attempt}"
+            }
+          }
+        ],
+        "archive_role": "none"
+      },
+      {
         "id": "candidate_installed_behavior",
         "phase": "pre_publish",
         "claim": "installed_runtime_behavior",
@@ -612,6 +827,19 @@
               "producer_job": "packaged-vulkan",
               "producer_job_name": "Packaged Windows Vulkan engine",
               "producer_artifact": "release-cell-prepublish-candidate-installed-windows-x64-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "linux-x64",
+            "identity_constraints": {
+              "target": "linux-x64",
+              "host_os": "Linux",
+              "host_arch": "X64",
+              "installer": "candidate_managed_plugin",
+              "producer_workflow": ".github/workflows/linux-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Linux Vulkan engine",
+              "producer_artifact": "release-cell-prepublish-candidate-installed-linux-x64-attempt-{attempt}"
             }
           }
         ],
@@ -738,6 +966,13 @@
         "asset_target": "macos-arm64",
         "exe_suffix": "",
         "extension": "tar.gz"
+      },
+      {
+        "os": "ubuntu-latest",
+        "rust_target": "x86_64-unknown-linux-gnu",
+        "asset_target": "linux-x64",
+        "exe_suffix": "",
+        "extension": "tar.gz"
       }
     ],
     "protected_jobs": [
@@ -772,6 +1007,22 @@
           "contents": "read"
         },
         "secrets": []
+      },
+      {
+        "workflow": "linux-vulkan-proof.yml",
+        "job": "packaged-vulkan",
+        "runner": [
+          "self-hosted",
+          "Linux",
+          "X64",
+          "codestory-linux-vulkan"
+        ],
+        "environment": "linux-vulkan-proof",
+        "permissions": {
+          "actions": "read",
+          "contents": "read"
+        },
+        "secrets": []
       }
     ],
     "release_chain": {
@@ -779,7 +1030,8 @@
         "source-proof",
         "packaged-proof",
         "macos-metal-proof",
-        "windows-vulkan-proof"
+        "windows-vulkan-proof",
+        "linux-vulkan-proof"
       ],
       "dependencies": {
         "preflight": [
@@ -799,12 +1051,17 @@
           "preflight",
           "packaged-proof"
         ],
+        "linux-vulkan-proof": [
+          "preflight",
+          "packaged-proof"
+        ],
         "pre-publish-closeout": [
           "preflight",
           "source-proof",
           "packaged-proof",
           "macos-metal-proof",
-          "windows-vulkan-proof"
+          "windows-vulkan-proof",
+          "linux-vulkan-proof"
         ],
         "publish": [
           "preflight",
@@ -827,6 +1084,7 @@
       "packaged-platform-proof.yml",
       "macos-metal-proof.yml",
       "windows-vulkan-proof.yml",
+      "linux-vulkan-proof.yml",
       "post-publish-release-smoke.yml",
       "release.yml",
       "repo-scale-stats.yml"

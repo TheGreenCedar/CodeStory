@@ -67,6 +67,17 @@ fn source_tree_contains(dir: &str, needle: &str) -> bool {
     })
 }
 
+fn read_source_tree(dir: &str) -> String {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join(dir), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| fs::read_to_string(path).expect("read source"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = source.find(start).expect("start marker exists");
     let tail = &source[start_index..];
@@ -233,16 +244,52 @@ fn cli_stays_thin() {
 }
 
 #[test]
+fn cli_binaries_preserve_the_library_module_graph() {
+    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let runtime_main = read("crates/codestory-cli/src/runtime_main.rs");
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    let launcher_modules = cli_main
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("mod ")
+                .and_then(|module| module.strip_suffix(';'))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        launcher_modules,
+        ["native_launcher", "native_runtime_layout"],
+        "the public CLI binary may own only its static native launcher"
+    );
+    assert!(
+        runtime_main.contains("codestory_cli::run()"),
+        "the internal runtime binary should delegate to the library entrypoint"
+    );
+    for module in ["embedding_server_transport", "sidecar_runtime"] {
+        let declaration = format!("mod {module};");
+        assert_eq!(
+            cli_lib.matches(&declaration).count(),
+            1,
+            "{module} should have one library-owned module declaration"
+        );
+        assert!(
+            !cli_main.contains(&declaration) && !runtime_main.contains(&declaration),
+            "{module} must not be compiled again by either binary"
+        );
+    }
+}
+
+#[test]
 fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");
     let cli_runtime = read("crates/codestory-cli/src/runtime.rs");
-    let cli_main = read("crates/codestory-cli/src/main.rs");
+    let cli_app = read_source_tree("crates/codestory-cli/src/app");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let stdio_transport = read("crates/codestory-cli/src/stdio_transport.rs");
     let explore = read("crates/codestory-cli/src/explore.rs");
     let cli_browser_surfaces = [
-        cli_main.as_str(),
+        cli_app.as_str(),
         http_transport.as_str(),
         stdio_transport.as_str(),
         explore.as_str(),
@@ -305,8 +352,8 @@ fn runtime_exposes_read_only_browser_service_boundary() {
             && cli_browser_surfaces.contains(".trail_context(")
             && cli_browser_surfaces.contains(".snippet_context(")
             && cli_browser_surfaces.contains(".query(&ast)")
-            && cli_main.contains("runtime.browser.ask(request)")
-            && !cli_main.contains("runtime.agent.ask(request)"),
+            && cli_app.contains("runtime.browser.ask(request)")
+            && !cli_app.contains("runtime.agent.ask(request)"),
         "CLI read-only browser operations should route through RuntimeContext.browser"
     );
 }
@@ -418,30 +465,40 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
 
 #[test]
 fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
-    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    let full_refresh = read("crates/codestory-runtime/src/index_full.rs");
+    let incremental_refresh = read("crates/codestory-runtime/src/index_incremental.rs");
+    let commit = read("crates/codestory-runtime/src/index_commit.rs");
     assert!(
-        runtime.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
-            && runtime.contains("finalize_staged()")
-            && runtime.contains("staged.publish_with_stats(storage_path)"),
+        full_refresh.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
+            && full_refresh.contains("staged.snapshots().finalize_staged()")
+            && full_refresh.contains("staged.snapshots().refresh_detail()")
+            && commit.contains(".publish_with_stats(&self.storage_path)"),
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
-        runtime.contains("SnapshotStore::clone_live_to_staged(storage_path)")
-            && runtime.contains("staged.snapshots().finalize_staged()")
-            && runtime.contains("staged.snapshots().refresh_detail()"),
+        incremental_refresh.contains("SnapshotStore::clone_live_to_staged(storage_path)")
+            && incremental_refresh.contains(".snapshots()\n        .finalize_staged()")
+            && incremental_refresh.contains(".snapshots()\n        .refresh_detail()")
+            && commit.contains(".publish_with_stats(&self.storage_path)"),
         "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
     );
-    assert!(
-        !runtime.contains("create_deferred_secondary_indexes()")
-            && !runtime.contains("refresh_grounding_summary_snapshots()")
-            && !runtime.contains("hydrate_grounding_detail_snapshots()"),
-        "snapshot lifecycle should not be orchestrated directly outside the store snapshot surface"
-    );
+    for forbidden in [
+        "create_deferred_secondary_indexes()",
+        "refresh_grounding_summary_snapshots()",
+        "hydrate_grounding_detail_snapshots()",
+    ] {
+        assert!(
+            !source_tree_contains("crates/codestory-runtime/src", forbidden),
+            "snapshot lifecycle should not be orchestrated directly outside the store snapshot surface: {forbidden}"
+        );
+    }
 }
 
 #[test]
 fn staged_publication_identity_and_fence_are_complete_before_publication() {
-    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    let full_refresh = read("crates/codestory-runtime/src/index_full.rs");
+    let incremental_refresh = read("crates/codestory-runtime/src/index_incremental.rs");
+    let commit = read("crates/codestory-runtime/src/index_commit.rs");
     let store = read("crates/codestory-store/src/storage_impl/mod.rs");
     let schema = read("crates/codestory-store/src/storage_impl/schema.rs");
 
@@ -456,32 +513,32 @@ fn staged_publication_identity_and_fence_are_complete_before_publication() {
         "publication identity should survive process restarts in the SQLite schema"
     );
     assert!(
-        runtime.contains("next_index_publication(")
-            && runtime.contains("staged.store_mut().put_index_publication(&publication)")
-            && runtime
-                .matches("staged.store_mut().finish_incremental_run()")
-                .count()
-                >= 2
-            && runtime
-                .matches("staged.publish_with_stats(storage_path)")
-                .count()
-                >= 2,
+        commit.contains("pub(super) fn next_index_publication(")
+            && commit.contains(".put_index_publication(publication)")
+            && commit.contains(".finish_incremental_run()")
+            && commit.contains(".publish_with_stats(&self.storage_path)")
+            && full_refresh.contains("next_index_publication(")
+            && full_refresh.contains("stage_core_publication_identity(")
+            && full_refresh.contains("CoreCommitMode::Full")
+            && incremental_refresh.contains("next_index_publication(")
+            && incremental_refresh.contains("stage_core_publication_identity(")
+            && incremental_refresh.contains("CoreCommitMode::Incremental"),
         "full and incremental staging should persist publication identity and clear compatibility fences before publishing"
     );
 }
 
 #[test]
 fn product_search_builds_stream_canonical_nodes_without_legacy_projection_rebuilds() {
-    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    let runtime = read("crates/codestory-runtime/src/search_state_cache.rs");
     let persisted_builder = source_between(
         &runtime,
-        "fn build_persisted_search_state_from_canonical_symbols(",
-        "#[cfg(test)]\nfn rebuild_search_state_from_storage(",
+        "pub(super) fn build_persisted_search_state_from_canonical_symbols(",
+        "#[cfg(test)]\npub(super) fn rebuild_search_state_from_storage(",
     );
     let runtime_rebuild = source_between(
         &runtime,
-        "fn rebuild_search_state_from_storage_for_runtime(",
-        "fn refresh_caches(",
+        "pub(super) fn rebuild_search_state_from_storage_for_runtime(",
+        "pub(super) fn refresh_caches(",
     );
     let retrieval = read("crates/codestory-retrieval/src/index.rs");
     let retrieval_scip = read("crates/codestory-retrieval/src/scip_index.rs");

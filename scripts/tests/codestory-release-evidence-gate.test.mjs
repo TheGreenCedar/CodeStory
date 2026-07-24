@@ -483,7 +483,7 @@ test("release evidence independently enforces the versioned claim graph", () => 
   writeFileSync(candidatePath, JSON.stringify(candidate));
   let result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /must exactly match the trusted release-evidence claim profile/u);
+  assert.match(result.stderr, /must exactly match the optional performance and answer_quality profile/u);
 
   produce(dir);
   candidate = JSON.parse(readFileSync(candidatePath));

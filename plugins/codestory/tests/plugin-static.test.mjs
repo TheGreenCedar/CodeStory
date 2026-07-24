@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { deflateRawSync, gunzipSync, gzipSync } from "node:zlib";
 import { PassThrough, Writable } from "node:stream";
@@ -28,6 +28,74 @@ const {
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("managed release provisioning rejects unshipped targets before URL construction", () => {
+  assert.deepEqual(
+    launcherTest.releaseAssetIdentity("0.16.0", "darwin", "arm64"),
+    {
+      target: "macos-arm64",
+      asset: "codestory-cli-v0.16.0-macos-arm64.tar.gz",
+    },
+  );
+  assert.deepEqual(
+    launcherTest.releaseAssetIdentity("0.16.0", "win32", "x64"),
+    {
+      target: "windows-x64",
+      asset: "codestory-cli-v0.16.0-windows-x64.zip",
+    },
+  );
+  assert.deepEqual(
+    launcherTest.releaseAssetIdentity("0.16.0", "linux", "x64"),
+    {
+      target: "linux-x64",
+      asset: "codestory-cli-v0.16.0-linux-x64.tar.gz",
+    },
+  );
+  for (const [platform, architecture] of [
+    ["darwin", "x64"],
+    ["win32", "arm64"],
+    ["linux", "arm64"],
+  ]) {
+    assert.throws(
+      () => launcherTest.releaseAssetIdentity("0.16.0", platform, architecture),
+      new RegExp(`^Error: unsupported_release_target:${platform}-${architecture}$`, "u"),
+    );
+  }
+  assert.deepEqual(
+    launcherTest.managedAssetIdentity("0.16.0", {
+      platform: "linux",
+      arch: "x64",
+      explicitSource: true,
+    }),
+    {
+      target: "linux-x64",
+      asset: "codestory-cli-v0.16.0-linux-x64.tar.gz",
+      buildSource: "explicit_package",
+    },
+  );
+});
+
+test("development receipts identify source-build targets independently of release packaging", () => {
+  assert.deepEqual(
+    [
+      ["darwin", "arm64"],
+      ["darwin", "x64"],
+      ["linux", "arm64"],
+      ["linux", "x64"],
+      ["win32", "arm64"],
+      ["win32", "x64"],
+    ].map(([platform, architecture]) =>
+      devCliContract.sourceBuildTarget(platform, architecture)),
+    [
+      "macos-arm64",
+      "macos-x64",
+      "linux-arm64",
+      "linux-x64",
+      "windows-arm64",
+      "windows-x64",
+    ],
+  );
+});
 
 function launcherHandoffInput() {
   return [
@@ -189,17 +257,11 @@ async function readPluginVersion() {
 function releaseAssetForPlatform(version) {
   const target = process.platform === "win32" && process.arch === "x64"
     ? "windows-x64"
-    : process.platform === "win32" && process.arch === "arm64"
-      ? "windows-arm64"
-      : process.platform === "linux" && process.arch === "x64"
+    : process.platform === "linux" && process.arch === "x64"
         ? "linux-x64"
-      : process.platform === "linux" && process.arch === "arm64"
-          ? "linux-arm64"
-          : process.platform === "darwin" && process.arch === "x64"
-            ? "macos-x64"
-            : process.platform === "darwin" && process.arch === "arm64"
-              ? "macos-arm64"
-              : null;
+      : process.platform === "darwin" && process.arch === "arm64"
+        ? "macos-arm64"
+        : null;
   assert.ok(target, `unsupported test platform: ${process.platform}-${process.arch}`);
   const archiveBase = `codestory-cli-v${version}-${target}`;
   const archiveName = `${archiveBase}.${target.startsWith("windows-") ? "zip" : "tar.gz"}`;
@@ -220,6 +282,16 @@ function managedReleaseManifest(version, executablePath, sha256) {
     archive_sha256: "0".repeat(64),
     target,
     stdio_initialize_verified: true,
+  };
+}
+
+function explicitPackageManifest(version, executablePath, sha256) {
+  const manifest = managedReleaseManifest(version, executablePath, sha256);
+  return {
+    ...manifest,
+    build_source: "explicit_package",
+    repo_ref: null,
+    archive_url: `explicit-package:${manifest.archive_sha256}`,
   };
 }
 
@@ -492,7 +564,7 @@ async function writeAttestedDevPluginFixture(root, version) {
       plugin_version: version,
       source_commit: "a".repeat(40),
       source_package_sha256: sourcePackageSha256,
-      target: devCliContract.assetTarget(),
+      target: devCliContract.sourceBuildTarget(),
       cli: {
         path: `bin/${cliName}`,
         name: cliName,
@@ -763,7 +835,7 @@ test("dirty marker hook command reports uninstall-required stale managed blocks"
   }
 });
 
-test("mcp launcher prefers a checksummed managed cli without PATH", async () => {
+test("mcp launcher prefers a checksummed explicit package without PATH", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-cli-"));
@@ -774,6 +846,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
   );
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const privateReleaseBaseUrl = "https://private-packages.invalid";
 
   try {
     await mkdir(cliDir, { recursive: true });
@@ -783,7 +856,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify(managedReleaseManifest(
+      JSON.stringify(explicitPackageManifest(
         version,
         process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
         sha256,
@@ -795,6 +868,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
         PLUGIN_DATA: dataDir,
         TEST_OUT: outFile,
         TEST_CODESTORY_VERSION: version,
+        CODESTORY_PLUGIN_RELEASE_BASE_URL: privateReleaseBaseUrl,
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -1000,6 +1074,91 @@ test("candidate managed CLI metadata is accepted only for the exact proof archiv
     delete process.env.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256;
     delete process.env.CODESTORY_EMBED_QUALIFICATION_DIR;
     delete process.env.CODESTORY_EMBED_QUALIFICATION_NONCE;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("explicit package provenance cannot satisfy public release verification", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-explicit-provenance-"));
+  const version = "0.0.1";
+  const target = releaseAssetForPlatform(version).archiveBase
+    .slice(`codestory-cli-v${version}-`.length);
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousBaseUrl = process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL;
+  try {
+    const fixture = await writeManagedCliFixture(dataDir, version);
+    const sha256 = createHash("sha256").update(await readFile(fixture.cliPath)).digest("hex");
+    const explicit = explicitPackageManifest(
+      version,
+      fixture.cliPath.slice(fixture.versionDir.length + 1),
+      sha256,
+    );
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(explicit),
+      "utf8",
+    );
+    const probe = () => ({
+      status: 0,
+      error: null,
+      version,
+      stdout: "",
+      stderr: "",
+    });
+
+    delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    delete process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL;
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(fixture.versionDir, version, target, probe).verified,
+      false,
+    );
+
+    process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL = "https://private-packages.invalid";
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(fixture.versionDir, version, target, probe).verified,
+      true,
+    );
+
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        fixture.cliPath.slice(fixture.versionDir.length + 1),
+        sha256,
+      )),
+      "utf8",
+    );
+    delete process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL;
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(fixture.versionDir, version, target, probe).verified,
+      true,
+    );
+    process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL = "https://private-packages.invalid";
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(fixture.versionDir, version, target, probe).verified,
+      false,
+    );
+    const mislabeledPrivate = managedReleaseManifest(
+      version,
+      fixture.cliPath.slice(fixture.versionDir.length + 1),
+      sha256,
+    );
+    mislabeledPrivate.archive_url =
+      `https://private-packages.invalid/${mislabeledPrivate.archive}`;
+    await writeFile(
+      join(fixture.versionDir, "manifest.json"),
+      JSON.stringify(mislabeledPrivate),
+      "utf8",
+    );
+    assert.equal(
+      launcherTest.verifyPublishedManagedCli(fixture.versionDir, version, target, probe).verified,
+      false,
+    );
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousBaseUrl === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL;
+    else process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL = previousBaseUrl;
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -1446,6 +1605,57 @@ test("managed cli staging bounds output and handles stream errors", async () => 
     }),
     /stdio_initialize_stdout_limit/u,
   );
+});
+
+test("managed cli staging preserves the complete pinned native generation", async () => {
+  const version = await readPluginVersion();
+  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const root = await mkdtemp(join(tmpdir(), "codestory-managed-layout-"));
+  const extractDir = join(root, "extract");
+  const packageRoot = join(extractDir, archiveBase);
+  const stagingDir = join(root, "staging");
+  const launcherName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";
+  const generation = "a".repeat(64);
+  const generationDir = join(packageRoot, "codestory-native-generations", generation);
+  try {
+    await mkdir(generationDir, { recursive: true });
+    await mkdir(stagingDir);
+    await writeFile(join(packageRoot, launcherName), "launcher");
+    await writeFile(
+      join(packageRoot, "codestory-native-current-generation-v1.txt"),
+      `${generation}\n`,
+    );
+    await writeFile(
+      join(generationDir, process.platform === "win32"
+        ? "codestory-cli-runtime.exe"
+        : "codestory-cli-runtime"),
+      "runtime",
+    );
+    await writeFile(join(generationDir, "native-library"), "library");
+
+    assert.equal(
+      launcherTest.stageExtractedManagedCli(extractDir, archiveName, stagingDir),
+      join(stagingDir, launcherName),
+    );
+    assert.equal(
+      await readFile(join(stagingDir, "codestory-native-current-generation-v1.txt"), "utf8"),
+      `${generation}\n`,
+    );
+    assert.equal(
+      await readFile(join(stagingDir, "codestory-native-generations", generation, "native-library"), "utf8"),
+      "library",
+    );
+
+    await writeFile(join(packageRoot, "manifest.json"), "hostile");
+    const rejectedStage = join(root, "rejected");
+    await mkdir(rejectedStage);
+    assert.throws(
+      () => launcherTest.stageExtractedManagedCli(extractDir, archiveName, rejectedStage),
+      /managed_cli_archive_reserved_path:manifest\.json/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("managed cli extracts zip and tar.gz with Node platform APIs", async () => {
@@ -2619,7 +2829,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
   }
 });
 
-test("mcp launcher infers Codex managed data from installed cache without env", async () => {
+test("mcp launcher infers Codex managed data from installed cache without plugin-data env", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const codexHome = await mkdtemp(join(tmpdir(), "codestory-installed-cache-"));
@@ -2632,6 +2842,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
   const pathDir = await mkdtemp(join(tmpdir(), "codestory-stale-path-"));
   const staleCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
   const launcher = join(installRoot, "scripts", "codestory-mcp.cjs");
+  const privateReleaseBaseUrl = "https://private-packages.invalid";
 
   try {
     await mkdir(join(installRoot, "scripts"), { recursive: true });
@@ -2665,15 +2876,12 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
     const sha256 = createHash("sha256")
       .update(await readFile(cliPath))
       .digest("hex");
-    await writeFile(
-      join(cliDir, "manifest.json"),
-      JSON.stringify(managedReleaseManifest(
-        version,
-        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-        sha256,
-      )),
-      "utf8",
+    const manifest = explicitPackageManifest(
+      version,
+      process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+      sha256,
     );
+    await writeFile(join(cliDir, "manifest.json"), JSON.stringify(manifest), "utf8");
     await writeFile(
       staleCli,
       process.platform === "win32"
@@ -2689,6 +2897,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
         COPILOT_PLUGIN_DATA: "",
         TEST_OUT: outFile,
         TEST_CODESTORY_VERSION: version,
+        CODESTORY_PLUGIN_RELEASE_BASE_URL: privateReleaseBaseUrl,
         PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -3046,7 +3255,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify(managedReleaseManifest(
+      JSON.stringify(explicitPackageManifest(
         version,
         process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
         sha256,
@@ -3121,7 +3330,7 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
   const archivePath = join(releaseDir, archiveName);
 
   try {
-    const priorVersion = "0.0.0";
+    const priorVersion = "0.15.0";
     const priorRelease = releaseAssetForPlatform(priorVersion);
     const priorDir = join(dataDir, "codestory-cli", priorVersion);
     const priorCli = join(priorDir, "bin", cliName);
@@ -3137,10 +3346,10 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
       path: `bin/${cliName}`,
       sha256: priorSha256,
       version: priorVersion,
-      build_source: "github_release",
-      repo_ref: `v${priorVersion}`,
+      build_source: "explicit_package",
+      repo_ref: null,
       archive: priorRelease.archiveName,
-      archive_url: pathToFileURL(join(releaseDir, priorRelease.archiveName)).toString(),
+      archive_url: `explicit-package:${"0".repeat(64)}`,
       archive_sha256: "0".repeat(64),
       target: priorRelease.archiveBase.slice(`codestory-cli-v${priorVersion}-`.length),
       provisioned_at: "1970-01-01T00:00:00.000Z",
@@ -3171,8 +3380,8 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
     const observed = JSON.parse(await readFile(outFile, "utf8"));
     assert.equal(observed.source, "managed");
     assert.equal(observed.version, version);
-    assert.equal(observed.repoRef, `v${version}`);
-    assert.equal(observed.buildSource, "github_release");
+    assert.equal(observed.repoRef, "");
+    assert.equal(observed.buildSource, "explicit_package");
     assert.equal(observed.archiveSha256, archiveSha256);
     assert.notEqual(observed.path, priorCli);
     const retention = JSON.parse(observed.retention);
@@ -3184,7 +3393,7 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
     );
     assert.match(
       observed.path,
-      new RegExp(String.raw`codestory-cli[\\/]+${version.replaceAll(".", String.raw`\.`)}[\\/]bin[\\/]codestory-cli`, "u"),
+      new RegExp(String.raw`codestory-cli[\\/]+${version.replaceAll(".", String.raw`\.`)}[\\/]codestory-cli`, "u"),
     );
     assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
 
@@ -3192,9 +3401,10 @@ test("mcp launcher upgrades a verified prior managed cli to the checksummed rele
       await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
     );
     assert.equal(manifest.version, version);
-    assert.equal(manifest.repo_ref, `v${version}`);
-    assert.equal(manifest.build_source, "github_release");
+    assert.equal(manifest.repo_ref, null);
+    assert.equal(manifest.build_source, "explicit_package");
     assert.equal(manifest.archive, archiveName);
+    assert.equal(manifest.archive_url, `explicit-package:${archiveSha256}`);
     assert.equal(manifest.archive_sha256, archiveSha256);
     assert.equal(manifest.stdio_initialize_verified, true);
     assert.equal(typeof manifest.sha256, "string");

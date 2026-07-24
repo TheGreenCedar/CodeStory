@@ -10,7 +10,11 @@ import {
   evaluateReleaseClaims,
   deriveTrustedGitIdentity,
   loadReleaseClaimGraph,
+  releaseAssetNames,
   releaseClaimGraphDigest,
+  renderPublicSupport,
+  renderReleasePlatformNotes,
+  validatePublicSupportDocuments,
   validateReleaseClaimGraph,
 } from "../codestory-release-claims.mjs";
 
@@ -98,12 +102,30 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 4);
+  assert.equal(graph.graph_version, 7);
+  assert.deepEqual(
+    [...graph.standard_release_claims].sort(),
+    [
+      "accelerator_execution",
+      "installed_runtime_behavior",
+      "package_identity",
+      "platform_support",
+      "retrieval_readiness",
+      "source_behavior",
+    ],
+  );
+  assert.deepEqual(
+    [...graph.optional_evaluations].sort(),
+    ["answer_quality", "performance"],
+  );
+  assert.ok(!graph.workflow_policy.release_chain.exact_sha_jobs.includes("release-evidence"));
+  assert.ok(Object.values(graph.workflow_policy.release_chain.dependencies)
+    .every((needs) => !needs.includes("release-evidence")));
   assert.deepEqual(graph.closeout.phases, ["pre_publish", "post_publish"]);
-  assert.equal(graph.closeout.cell_groups.length, 6);
+  assert.equal(graph.closeout.cell_groups.length, 8);
   assert.deepEqual(
     graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
-    ["macos-arm64", "windows-x64"],
+    ["linux-x64", "macos-arm64", "windows-x64"],
   );
   assert.deepEqual(
     graph.failure_controls.map(({ id }) => id).sort(),
@@ -122,6 +144,35 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.macos_source_cache_namespace, "macos-source-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+});
+
+test("public support, assets, and release notes derive from the package and closeout graph", () => {
+  assert.doesNotThrow(() => validatePublicSupportDocuments(graph, root));
+  assert.deepEqual(
+    graph.public_support.packages.map(({ target, accelerator_claim: accelerator }) =>
+      ({ target, accelerator })),
+    [
+      { target: "macos-arm64", accelerator: "metal" },
+      { target: "windows-x64", accelerator: "vulkan" },
+      { target: "linux-x64", accelerator: "vulkan" },
+    ],
+  );
+  assert.deepEqual(
+    releaseAssetNames(graph, "0.16.0"),
+    [
+      "codestory-cli-v0.16.0-windows-x64.zip",
+      "codestory-cli-v0.16.0-macos-arm64.tar.gz",
+      "codestory-cli-v0.16.0-linux-x64.tar.gz",
+      "SHA256SUMS.txt",
+    ],
+  );
+  assert.match(renderPublicSupport(graph), /Apple Silicon \\| Supported with Metal/u);
+  assert.match(renderPublicSupport(graph), /Windows x64 \\| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Linux x64 \\| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /CPU-only Windows and Linux \\| Unsupported/u);
+  assert.match(renderReleasePlatformNotes(graph), /macOS 15\+ on Apple Silicon: supported with Metal/u);
+  assert.match(renderReleasePlatformNotes(graph), /Windows x64: supported with Vulkan/u);
+  assert.match(renderReleasePlatformNotes(graph), /Linux x64: supported with Vulkan/u);
 });
 
 test("positive fixture evaluates deterministically", () => {
@@ -182,6 +233,36 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
     /identity undeclared_identity must declare a format/u,
   );
 
+  const mismatchedSupport = structuredClone(graph);
+  mismatchedSupport.public_support.packages[0].target = "macos-x64";
+  assert.throws(
+    () => validateReleaseClaimGraph(mismatchedSupport),
+    /package targets must exactly match/u,
+  );
+
+  const incompleteUnsupportedMatrix = structuredClone(graph);
+  incompleteUnsupportedMatrix.public_support.unsupported.pop();
+  assert.throws(
+    () => validateReleaseClaimGraph(incompleteUnsupportedMatrix),
+    /canonical unsupported release matrix/u,
+  );
+
+  const cpuOnlyLinuxSupported = structuredClone(graph);
+  cpuOnlyLinuxSupported.public_support.unsupported[0].targets = ["windows-x64"];
+  assert.throws(
+    () => validateReleaseClaimGraph(cpuOnlyLinuxSupported),
+    /canonical unsupported release matrix/u,
+  );
+
+  const missingAcceleratorCell = structuredClone(graph);
+  missingAcceleratorCell.closeout.cell_groups
+    .find(({ id }) => id === "accelerator_execution")
+    .instances = [];
+  assert.throws(
+    () => validateReleaseClaimGraph(missingAcceleratorCell),
+    /must be a non-empty array|no required closeout cell/u,
+  );
+
   for (const field of [
     "proof_run_sha_expression",
     "manual_pr_ref_hint",
@@ -219,18 +300,12 @@ test("performance and quality identities are bound to trusted candidate and grap
     failureClass === "incompatible_tier_identity" && id.startsWith("answer_quality-")));
 });
 
-test("risk-bearing dependencies require their own explicit request and risk acceptance", () => {
+test("optional evaluations do not inherit standard release dependencies", () => {
   const fixture = releaseEvidenceFixture();
-  fixture.requested_claims = fixture.requested_claims.filter(({ id }) => id !== "retrieval_readiness");
-  const result = evaluate(fixture);
-  assert.ok(result.failures.some(({ class: failureClass, message }) =>
-    failureClass === "accepted_risk" && /risk-bearing dependency retrieval_readiness must be explicitly requested/u.test(message)));
-
-  fixture.requested_claims.unshift({
-    id: "retrieval_readiness",
-    accepted_risks: ["measured-corpus-is-bounded"],
-  });
   assert.equal(evaluate(fixture).status, "pass");
+  for (const id of graph.optional_evaluations) {
+    assert.deepEqual(graph.claims.find((claim) => claim.id === id).depends_on_claims, []);
+  }
 });
 
 test("only bounded, release-bound model microbenchmark exceptions remain visible", () => {

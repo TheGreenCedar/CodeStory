@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use codestory_contracts::workspace::SourceIndexPolicy;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
 const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = "CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG";
+const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
 
 #[derive(Debug, Clone)]
 pub(crate) struct CliStartupConfig {
@@ -12,6 +14,7 @@ pub(crate) struct CliStartupConfig {
     pub(crate) project_network_config_allowed: bool,
     pub(crate) stdio_cache_root: Option<PathBuf>,
     pub(crate) sidecar_defaults: codestory_retrieval::SidecarProcessDefaults,
+    pub(crate) source_index_policy: SourceIndexPolicy,
 }
 
 impl CliStartupConfig {
@@ -26,8 +29,19 @@ impl CliStartupConfig {
                 .unwrap_or(false),
             stdio_cache_root: std::env::var_os("CODESTORY_STDIO_CACHE_ROOT").map(PathBuf::from),
             sidecar_defaults: crate::sidecar_runtime::process_defaults(),
+            source_index_policy: source_index_policy_from_env_value(
+                std::env::var(SOURCE_FILE_BYTE_CAP_ENV).ok().as_deref(),
+            ),
         }
     }
+}
+
+fn source_index_policy_from_env_value(raw: Option<&str>) -> SourceIndexPolicy {
+    let byte_cap = raw
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(codestory_contracts::workspace::DEFAULT_SOURCE_FILE_BYTE_CAP);
+    SourceIndexPolicy::oversized(byte_cap)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -219,6 +233,20 @@ mod tests {
             unsafe {
                 std::env::remove_var(name);
             }
+        }
+    }
+
+    #[test]
+    fn source_index_policy_parses_only_positive_process_values() {
+        assert_eq!(
+            source_index_policy_from_env_value(Some(" 65536 ")).byte_cap,
+            65_536
+        );
+        for raw in [None, Some(""), Some("0"), Some("-1"), Some("invalid")] {
+            assert_eq!(
+                source_index_policy_from_env_value(raw),
+                SourceIndexPolicy::default()
+            );
         }
     }
 

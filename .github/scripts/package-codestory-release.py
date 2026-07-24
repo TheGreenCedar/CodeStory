@@ -20,8 +20,10 @@ from native_binary_contract import (
     NativeBinaryError,
     inspect_binary,
     inspect_runtime_layout,
+    managed_native_runtime_dependencies,
     runtime_artifact_role,
 )
+from packaged_agent_proof.foundation import LOWER_TIER_NONCLAIMS, TARGET_CONTRACTS
 
 NORMALIZED_MTIME = 315532800  # 1980-01-01T00:00:00Z, valid for zip and tar.
 NATIVE_ENGINE_MARKER_PREFIX = b"codestory-native-engine-v1|"
@@ -30,95 +32,14 @@ SERVER_PROOF_MARKER_PREFIX = b"codestory-embedding-server-proof-v1|"
 SERVER_PROOF_MARKER_SUFFIX = b"|end"
 NATIVE_MANIFEST_FILE = "codestory-native-manifest.json"
 NATIVE_RUNTIME_FILE_LIST = "codestory-native-runtime-files-v1.txt"
+NATIVE_RUNTIME_SEEDS_DIR = ".codestory-native-seeds"
+NATIVE_GENERATIONS_DIR = "codestory-native-generations"
+NATIVE_CURRENT_GENERATION_FILE = "codestory-native-current-generation-v1.txt"
+NATIVE_RUNTIME_SEED_MARKER_PREFIX = b"codestory-native-runtime-seed-v1|id="
+NATIVE_RUNTIME_SEED_MARKER_SUFFIX = b"|end"
 MEASUREMENT_PROTOCOL = "docs/testing/per-user-embedding-server-measurement-protocol.json"
 SERVER_PROTOCOL = "docs/testing/per-user-embedding-server-protocol.json"
 SERVER_CONSTANT_SET = "docs/testing/per-user-embedding-server-constant-set.json"
-LOWER_TIER_NONCLAIMS = [
-    "answer_quality",
-    "bounded_bulk_starvation",
-    "cross_session_sharing",
-    "cross_user_sharing",
-    "linux_gpu_execution",
-    "release_readiness",
-    "whole_server_takeover",
-]
-
-TARGET_CONTRACTS = {
-    "linux-x64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "elf",
-        "target_triple": "x86_64-unknown-linux-gnu",
-        "target_os": "linux",
-        "target_arch": "x86_64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": None,
-        "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
-    },
-    "linux-arm64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "elf",
-        "target_triple": "aarch64-unknown-linux-gnu",
-        "target_os": "linux",
-        "target_arch": "aarch64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": None,
-        "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
-    },
-    "windows-x64": {
-        "binary_name": "codestory-cli.exe",
-        "binary_format": "pe",
-        "target_triple": "x86_64-pc-windows-msvc",
-        "target_os": "windows",
-        "target_arch": "x86_64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": "vulkan",
-        "non_claim_reason": None,
-    },
-    "windows-arm64": {
-        "binary_name": "codestory-cli.exe",
-        "binary_format": "pe",
-        "target_triple": "aarch64-pc-windows-msvc",
-        "target_os": "windows",
-        "target_arch": "aarch64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": None,
-        "non_claim_reason": "windows_arm64_accelerator_execution_is_not_protected",
-    },
-    "macos-x64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "mach-o",
-        "target_triple": "x86_64-apple-darwin",
-        "target_os": "macos",
-        "target_arch": "x86_64",
-        "compiled_backends": ["cpu", "metal"],
-        "linkage": "static",
-        "backend_loading": "builtin",
-        "expected_protected_backend": None,
-        "non_claim_reason": "macos_x64_accelerator_execution_is_not_protected",
-    },
-    "macos-arm64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "mach-o",
-        "target_triple": "aarch64-apple-darwin",
-        "target_os": "macos",
-        "target_arch": "aarch64",
-        "compiled_backends": ["cpu", "metal"],
-        "linkage": "static",
-        "backend_loading": "builtin",
-        "expected_protected_backend": "metal",
-        "non_claim_reason": None,
-    },
-}
-
-
 class PackageContractError(RuntimeError):
     pass
 
@@ -261,7 +182,7 @@ def parse_server_proof_marker(marker: str) -> dict[str, object]:
         "query_capacity": numbers["query_capacity"],
         "bulk_capacity": numbers["bulk_capacity"],
         "idle_timeout_ms": numbers["idle_timeout_ms"],
-        "lower_tier_nonclaims": LOWER_TIER_NONCLAIMS,
+        "lower_tier_nonclaims": sorted(LOWER_TIER_NONCLAIMS),
     }
 
 
@@ -374,12 +295,12 @@ def embedding_contract_digest(model: dict, embedding: dict, tokenizer: dict) -> 
 
 
 def runtime_artifacts_for(
-    binary: Path, target_os: str, backend_loading: str
+    directory: Path, target_os: str, backend_loading: str
 ) -> list[Path]:
     if backend_loading == "builtin":
         return []
     require(backend_loading == "runtime-modules", "unsupported native backend loading mode")
-    file_list = binary.parent / NATIVE_RUNTIME_FILE_LIST
+    file_list = directory / NATIVE_RUNTIME_FILE_LIST
     require(file_list.is_file(), "dynamic native runtime file list is missing")
     names = file_list.read_text(encoding="utf-8").splitlines()
     require(bool(names), "dynamic native runtime file list is empty")
@@ -400,10 +321,68 @@ def runtime_artifacts_for(
             runtime_artifact_role(name, target_os) is not None,
             f"unrecognized native runtime artifact in file list: {name}",
         )
-        path = binary.parent / name
+        path = directory / name
         require(path.is_file(), f"listed native runtime artifact is missing: {name}")
         artifacts.append(path)
     return artifacts
+
+
+def dynamic_runtime_layout(binary: Path) -> tuple[str, Path, Path, list[Path]]:
+    runtime_name = (
+        "codestory-cli-runtime.exe"
+        if binary.suffix.lower() == ".exe"
+        else "codestory-cli-runtime"
+    )
+    runtime = binary.parent / runtime_name
+    require(runtime.is_file(), "dynamic native runtime executable is missing")
+    runtime_bytes = runtime.read_bytes()
+    offsets = []
+    offset = 0
+    while True:
+        offset = runtime_bytes.find(NATIVE_RUNTIME_SEED_MARKER_PREFIX, offset)
+        if offset < 0:
+            break
+        offsets.append(offset)
+        offset += len(NATIVE_RUNTIME_SEED_MARKER_PREFIX)
+    require(
+        len(offsets) == 1,
+        "dynamic native runtime executable has no unique native seed marker",
+    )
+    id_start = offsets[0] + len(NATIVE_RUNTIME_SEED_MARKER_PREFIX)
+    id_end = id_start + 64
+    seed_id = runtime_bytes[id_start:id_end].decode("ascii", errors="ignore")
+    require(
+        len(seed_id) == 64
+        and all(char in "0123456789abcdef" for char in seed_id)
+        and runtime_bytes[id_end : id_end + len(NATIVE_RUNTIME_SEED_MARKER_SUFFIX)]
+        == NATIVE_RUNTIME_SEED_MARKER_SUFFIX,
+        "dynamic native runtime seed identity is invalid",
+    )
+    seed_dir = binary.parent / NATIVE_RUNTIME_SEEDS_DIR / seed_id
+    require(seed_dir.is_dir(), "dynamic native runtime seed directory is missing")
+    artifacts = runtime_artifacts_for(
+        seed_dir,
+        "windows" if binary.suffix.lower() == ".exe" else "linux",
+        "runtime-modules",
+    )
+    seed_hasher = hashlib.sha256()
+    seed_hasher.update(b"codestory-native-generation-v1\0")
+    for artifact in artifacts:
+        seed_hasher.update(artifact.name.encode())
+        seed_hasher.update(b"\0")
+        seed_hasher.update(bytes.fromhex(sha256_file(artifact)))
+    require(
+        seed_hasher.hexdigest() == seed_id,
+        "dynamic native runtime seed content does not match its identity",
+    )
+    runtime_sha256 = sha256_file(runtime)
+    generation_id = hashlib.sha256(
+        b"codestory-native-executable-generation-v1\0"
+        + seed_id.encode()
+        + b"\0"
+        + bytes.fromhex(runtime_sha256)
+    ).hexdigest()
+    return generation_id, runtime, seed_dir, artifacts
 
 
 def native_release_manifest(
@@ -416,14 +395,20 @@ def native_release_manifest(
     target_contract = TARGET_CONTRACTS.get(target)
     require(target_contract is not None, f"unsupported release target: {target}")
 
-    artifacts = runtime_artifacts_for(
-        binary,
-        target_contract["target_os"],
-        target_contract["backend_loading"],
-    )
+    runtime_binary = binary
+    generation_id = None
+    runtime_directory = binary.parent
+    if target_contract["backend_loading"] == "runtime-modules":
+        generation_id, runtime_binary, runtime_directory, artifacts = dynamic_runtime_layout(binary)
+    else:
+        artifacts = runtime_artifacts_for(
+            runtime_directory,
+            target_contract["target_os"],
+            target_contract["backend_loading"],
+        )
     try:
         binary_identity, artifact_descriptors = inspect_runtime_layout(
-            binary,
+            runtime_binary,
             artifacts,
             target_os=target_contract["target_os"],
             expected_format=target_contract["binary_format"],
@@ -441,12 +426,33 @@ def native_release_manifest(
         binary_identity["arch"] == target_contract["target_arch"],
         f"binary architecture {binary_identity['arch']} does not match target {target}",
     )
+    try:
+        launcher_identity = inspect_binary(binary)
+    except (OSError, NativeBinaryError) as exc:
+        raise PackageContractError(f"native launcher is invalid: {exc}") from exc
+    require(
+        launcher_identity["format"] == target_contract["binary_format"],
+        f"launcher format {launcher_identity['format']} does not match target {target}",
+    )
+    require(
+        launcher_identity["arch"] == target_contract["target_arch"],
+        f"launcher architecture {launcher_identity['arch']} does not match target {target}",
+    )
+    if generation_id is not None:
+        forbidden_launcher_dependencies = managed_native_runtime_dependencies(
+            launcher_identity["needed"]
+        )
+        require(
+            not forbidden_launcher_dependencies,
+            "public launcher imports managed native runtime dependencies: "
+            + ", ".join(forbidden_launcher_dependencies),
+        )
 
-    markers = native_engine_markers(binary)
+    markers = native_engine_markers(runtime_binary)
     require(len(markers) == 1, f"binary must contain one native engine identity; found {len(markers)}")
     marker = markers[0]
     fields = parse_native_engine_marker(marker)
-    server_markers = server_proof_markers(binary)
+    server_markers = server_proof_markers(runtime_binary)
     require(
         len(server_markers) == 1,
         f"binary must contain one embedding server proof identity; found {len(server_markers)}",
@@ -530,14 +536,24 @@ def native_release_manifest(
         "binary": {
             "name": target_contract["binary_name"],
             "sha256": sha256_file(binary),
+            **launcher_identity,
+        },
+        "runtime_executable": {
+            "name": (
+                runtime_binary.name
+                if generation_id is not None
+                else target_contract["binary_name"]
+            ),
+            "sha256": sha256_file(runtime_binary),
             "format": binary_identity["format"],
             "arch": binary_identity["arch"],
             "needed": binary_identity["needed"],
+            "generation_id": generation_id,
         },
         "runtime_artifacts": [
             {
                 **descriptor,
-                "sha256": sha256_file(binary.parent / str(descriptor["name"])),
+                "sha256": sha256_file(runtime_directory / str(descriptor["name"])),
             }
             for descriptor in artifact_descriptors
         ],
@@ -672,9 +688,26 @@ def package_release(
         binary_name = target_contract["binary_name"]
         manifest = native_release_manifest(version, target, binary, root, source)
         shutil.copy2(binary, stage_root / binary_name)
-        for descriptor in manifest["runtime_artifacts"]:
-            name = descriptor["name"]
-            shutil.copy2(binary.parent / name, stage_root / name)
+        runtime_descriptor = manifest["runtime_executable"]
+        generation_id = runtime_descriptor["generation_id"]
+        if generation_id is not None:
+            _, runtime, runtime_directory, artifacts = dynamic_runtime_layout(binary)
+            generation_dir = stage_root / NATIVE_GENERATIONS_DIR / generation_id
+            generation_dir.mkdir(parents=True)
+            shutil.copy2(runtime, generation_dir / runtime_descriptor["name"])
+            shutil.copy2(
+                runtime_directory / NATIVE_RUNTIME_FILE_LIST,
+                generation_dir / NATIVE_RUNTIME_FILE_LIST,
+            )
+            for artifact in artifacts:
+                shutil.copy2(artifact, generation_dir / artifact.name)
+            (stage_root / NATIVE_CURRENT_GENERATION_FILE).write_text(
+                generation_id + "\n", encoding="utf-8"
+            )
+        else:
+            for descriptor in manifest["runtime_artifacts"]:
+                name = descriptor["name"]
+                shutil.copy2(binary.parent / name, stage_root / name)
         (stage_root / NATIVE_MANIFEST_FILE).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -873,9 +906,6 @@ def write_synthetic_runtime(
     else:
         binary.write_bytes(synthetic_binary(binary_format, arch, marker))
         return
-    binary.write_bytes(
-        synthetic_binary(binary_format, arch, marker, (names["core_llama"], names["core_ggml"]))
-    )
     dependencies = {
         names["core_llama"]: (names["core_ggml"],),
         names["core_ggml"]: (names["core_base"],),
@@ -883,10 +913,37 @@ def write_synthetic_runtime(
         names["cpu"]: (names["core_base"],),
         names["vulkan"]: (names["core_base"], names["loader"]),
     }
-    for name, needed in dependencies.items():
-        (binary.parent / name).write_bytes(synthetic_binary(binary_format, arch, "", needed))
+    artifact_bytes = {
+        name: synthetic_binary(binary_format, arch, "", needed)
+        for name, needed in dependencies.items()
+    }
+    seed_hasher = hashlib.sha256()
+    seed_hasher.update(b"codestory-native-generation-v1\0")
+    for name in sorted(dependencies, key=str.lower):
+        seed_hasher.update(name.encode())
+        seed_hasher.update(b"\0")
+        seed_hasher.update(hashlib.sha256(artifact_bytes[name]).digest())
+    seed_id = seed_hasher.hexdigest()
+    seed_marker = f"codestory-native-runtime-seed-v1|id={seed_id}|end"
+    runtime_name = (
+        "codestory-cli-runtime.exe" if target_os == "windows" else "codestory-cli-runtime"
+    )
+    runtime = binary.parent / runtime_name
+    binary.write_bytes(synthetic_binary(binary_format, arch, ""))
+    runtime.write_bytes(
+        synthetic_binary(
+            binary_format,
+            arch,
+            marker + seed_marker,
+            (names["core_llama"], names["core_ggml"]),
+        )
+    )
+    seed_dir = binary.parent / NATIVE_RUNTIME_SEEDS_DIR / seed_id
+    seed_dir.mkdir(parents=True)
+    for name, content in artifact_bytes.items():
+        (seed_dir / name).write_bytes(content)
     runtime_names = sorted(dependencies, key=str.lower)
-    (binary.parent / NATIVE_RUNTIME_FILE_LIST).write_text(
+    (seed_dir / NATIVE_RUNTIME_FILE_LIST).write_text(
         "\n".join(runtime_names) + "\n", encoding="utf-8"
     )
 
@@ -1009,22 +1066,6 @@ def run_self_test() -> None:
             "linux",
         )
         linux_binary.chmod(0o755)
-        linux_arm_binary = temp_root / "linux-arm64-runtime/codestory-cli"
-        write_synthetic_runtime(
-            linux_arm_binary,
-            "elf",
-            "aarch64",
-            native_marker(
-                target="aarch64-unknown-linux-gnu",
-                os_name="linux",
-                arch="aarch64",
-                backends="cpu,vulkan",
-                embedding_contract_sha256=fixture_contract_sha256,
-                linkage="dynamic",
-            ),
-            "linux",
-        )
-        linux_arm_binary.chmod(0o755)
         windows_binary = temp_root / "windows-x64-runtime/codestory-cli.exe"
         write_synthetic_runtime(
             windows_binary,
@@ -1034,21 +1075,6 @@ def run_self_test() -> None:
                 target="x86_64-pc-windows-msvc",
                 os_name="windows",
                 arch="x86_64",
-                backends="cpu,vulkan",
-                embedding_contract_sha256=fixture_contract_sha256,
-                linkage="dynamic",
-            ),
-            "windows",
-        )
-        windows_arm_binary = temp_root / "windows-arm64-runtime/codestory-cli.exe"
-        write_synthetic_runtime(
-            windows_arm_binary,
-            "pe",
-            "aarch64",
-            native_marker(
-                target="aarch64-pc-windows-msvc",
-                os_name="windows",
-                arch="aarch64",
                 backends="cpu,vulkan",
                 embedding_contract_sha256=fixture_contract_sha256,
                 linkage="dynamic",
@@ -1070,28 +1096,9 @@ def run_self_test() -> None:
             )
         )
         macos_binary.chmod(0o755)
-        macos_x64_binary = temp_root / "codestory-cli-macos-x64"
-        macos_x64_binary.write_bytes(
-            synthetic_binary(
-                "mach-o",
-                "x86_64",
-                native_marker(
-                    target="x86_64-apple-darwin",
-                    os_name="macos",
-                    arch="x86_64",
-                    backends="cpu,metal",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                ),
-            )
-        )
-        macos_x64_binary.chmod(0o755)
-
         for target, binary in [
             ("linux-x64", linux_binary),
-            ("linux-arm64", linux_arm_binary),
             ("windows-x64", windows_binary),
-            ("windows-arm64", windows_arm_binary),
-            ("macos-x64", macos_x64_binary),
             ("macos-arm64", macos_binary),
         ]:
             first = package_release(
@@ -1129,6 +1136,16 @@ def run_self_test() -> None:
                 manifests = list(unpacked.rglob(NATIVE_MANIFEST_FILE))
                 require(len(manifests) == 1, "package omitted the native engine manifest")
                 manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+                from packaged_agent_proof.foundation import ProofFailure
+                from packaged_agent_proof.native_manifest import load_native_manifest
+
+                package_root = manifests[0].parent
+                packaged_cli = package_root / TARGET_CONTRACTS[target]["binary_name"]
+                load_native_manifest(
+                    package_root,
+                    packaged_cli,
+                    "0.0.0",
+                )
                 require(
                     manifest["binary"]["name"] == TARGET_CONTRACTS[target]["binary_name"],
                     "package did not canonicalize the target binary name",
@@ -1146,6 +1163,37 @@ def run_self_test() -> None:
                     manifest["accelerator"]["runtime_execution"] == "not_proven_by_package",
                     "package incorrectly claimed runtime accelerator execution",
                 )
+                if manifest["runtime_executable"]["generation_id"] is not None:
+                    dependency = (
+                        "llama.dll"
+                        if TARGET_CONTRACTS[target]["target_os"] == "windows"
+                        else "libllama.so"
+                    )
+                    packaged_cli.write_bytes(
+                        synthetic_binary(
+                            TARGET_CONTRACTS[target]["binary_format"],
+                            TARGET_CONTRACTS[target]["target_arch"],
+                            "",
+                            (dependency,),
+                        )
+                    )
+                    manifest["binary"] = {
+                        "name": packaged_cli.name,
+                        "sha256": sha256_file(packaged_cli),
+                        **inspect_binary(packaged_cli),
+                    }
+                    manifests[0].write_text(
+                        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    try:
+                        load_native_manifest(package_root, packaged_cli, "0.0.0")
+                    except ProofFailure:
+                        pass
+                    else:
+                        raise AssertionError(
+                            "packaged proof accepted managed native imports on the launcher"
+                        )
 
         stale_contract = json.loads(json.dumps(model_contract))
         stale_contract["embedding"]["query_prefix"] = "changed query: "
@@ -1188,15 +1236,8 @@ def run_self_test() -> None:
             synthetic_binary(
                 "elf",
                 "x86_64",
-                native_marker(
-                    target="x86_64-unknown-linux-gnu",
-                    os_name="linux",
-                    arch="x86_64",
-                    backends="cpu,vulkan",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                    linkage="dynamic",
-                ),
-                ("libvulkan.so.1",),
+                "",
+                ("libllama.so",),
             )
         )
         try:
@@ -1211,7 +1252,7 @@ def run_self_test() -> None:
         except PackageContractError:
             pass
         else:
-            raise AssertionError("base executable with mandatory Vulkan loader was accepted")
+            raise AssertionError("public launcher with managed native imports was accepted")
 
         missing_cpu = temp_root / "missing-cpu-runtime/codestory-cli"
         write_synthetic_runtime(
@@ -1228,7 +1269,8 @@ def run_self_test() -> None:
             ),
             "linux",
         )
-        (missing_cpu.parent / "libggml-cpu.so").unlink()
+        missing_seed = next((missing_cpu.parent / NATIVE_RUNTIME_SEEDS_DIR).iterdir())
+        (missing_seed / "libggml-cpu.so").unlink()
         try:
             package_release(
                 "0.0.0",
@@ -1258,7 +1300,8 @@ def run_self_test() -> None:
             ),
             "linux",
         )
-        (poisoned_cpu.parent / "libggml-cpu.so").write_bytes(
+        poisoned_seed = next((poisoned_cpu.parent / NATIVE_RUNTIME_SEEDS_DIR).iterdir())
+        (poisoned_seed / "libggml-cpu.so").write_bytes(
             synthetic_binary(
                 "elf", "x86_64", "", ("libggml-base.so", "libvulkan.so.1")
             )
@@ -1277,7 +1320,21 @@ def run_self_test() -> None:
         else:
             raise AssertionError("CPU backend with a Vulkan-loader import was accepted")
 
-        wrong_arch = temp_root / "wrong-arch-codestory-cli"
+        wrong_arch = temp_root / "wrong-arch-runtime/codestory-cli"
+        write_synthetic_runtime(
+            wrong_arch,
+            "elf",
+            "x86_64",
+            native_marker(
+                target="x86_64-unknown-linux-gnu",
+                os_name="linux",
+                arch="x86_64",
+                backends="cpu,vulkan",
+                embedding_contract_sha256=fixture_contract_sha256,
+                linkage="dynamic",
+            ),
+            "linux",
+        )
         wrong_arch.write_bytes(
             synthetic_binary(
                 "elf",

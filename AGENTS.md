@@ -176,13 +176,32 @@ adapter to compensate for incorrect upstream state.
 - Keep generated comparisons, ledgers, CSVs, SVGs, and pre-release evidence in
   PR bodies, issue comments, Project updates, CI artifacts, or external
   storage unless they are intended as durable product documentation.
-- Update `CHANGELOG.md` in the same change when shipped behavior, operator or
-  contributor guidance, release automation, packaging, or version metadata
-  changes. Keep current work under `Unreleased` until release preparation.
+- Update `CHANGELOG.md` only for user- or operator-visible changes. Write for
+  release-note readers: lead with what changed for them and omit implementation,
+  refactor, CI, proof, issue, and PR mechanics. Contributor-only changes and
+  internal release automation belong in their owning PR or issue unless they
+  materially change what users or operators do or can rely on. Keep current
+  release-note work under `Unreleased` until release preparation.
 - Commit messages are short, lowercase, and imperative.
 
 ## Release Rules
 
+- Freeze the selected release claim before qualification. For the standard
+  v0.16 release described in `CHANGELOG.md`, build one candidate; install its
+  exact archives on Apple Silicon macOS, Windows x64, and Linux x64; complete
+  one real project-scoped `ground` on each with Metal or Vulkan as applicable;
+  verify archive checksums and bundled runtime identity; then promote and
+  publish through the canonical workflow.
+- That standard claim does not include answer-accuracy or performance
+  thresholds, benchmark baselines, or same-attempt optional evaluation
+  alignment. Do not start, repair, or rerun those lanes unless the selected
+  claim or changed owning code requires them. A failure in optional evaluation
+  machinery is not a release blocker.
+- Reuse passing evidence for the same candidate. After two equivalent failures,
+  do not make a third attempt without new evidence and a changed approach. When
+  the selected claim is proved or the user says the evidence is sufficient,
+  preserve the artifacts and stop. Signing, notarization, checksums, and
+  publication remain owned by the canonical release workflow.
 - `crates/codestory-cli/Cargo.toml` is the release version source. Synchronize
   every `codestory-*` workspace crate, `Cargo.lock`, the
   `producer.version` in `crates/codestory-llama-sys/model-contract.json`, and

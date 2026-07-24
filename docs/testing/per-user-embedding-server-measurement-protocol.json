@@ -115,20 +115,20 @@
       "residency_state": "resident",
       "accelerator_claim": "vulkan"
     },
+    "protected_linux_x64_vulkan": {
+      "asset_target": "linux-x64",
+      "proof_tier": "protected_hardware",
+      "host_class": "protected_self_hosted_linux_x64",
+      "policy": "accelerated",
+      "backend": "vulkan",
+      "cache_state": "reused",
+      "residency_state": "resident",
+      "accelerator_claim": "vulkan"
+    },
     "installed_linux_x64_cpu": {
       "asset_target": "linux-x64",
       "proof_tier": "installed_runtime",
       "host_class": "post_publish_linux_x64",
-      "policy": "cpu_explicit",
-      "backend": "cpu",
-      "cache_state": "reused",
-      "residency_state": "resident",
-      "accelerator_claim": "none"
-    },
-    "installed_linux_arm64_cpu": {
-      "asset_target": "linux-arm64",
-      "proof_tier": "installed_runtime",
-      "host_class": "post_publish_linux_arm64",
       "policy": "cpu_explicit",
       "backend": "cpu",
       "cache_state": "reused",
@@ -145,20 +145,20 @@
       "residency_state": "resident",
       "accelerator_claim": "none"
     },
+    "candidate_installed_linux_x64_vulkan": {
+      "asset_target": "linux-x64",
+      "proof_tier": "installed_runtime",
+      "host_class": "premerge_candidate_linux_x64_vulkan",
+      "policy": "accelerated",
+      "backend": "vulkan",
+      "cache_state": "reused",
+      "residency_state": "resident",
+      "accelerator_claim": "vulkan"
+    },
     "candidate_installed_macos_arm64_cpu": {
       "asset_target": "macos-arm64",
       "proof_tier": "installed_runtime",
       "host_class": "premerge_candidate_macos_arm64",
-      "policy": "cpu_explicit",
-      "backend": "cpu",
-      "cache_state": "reused",
-      "residency_state": "resident",
-      "accelerator_claim": "none"
-    },
-    "installed_macos_x64_cpu": {
-      "asset_target": "macos-x64",
-      "proof_tier": "installed_runtime",
-      "host_class": "post_publish_macos_x64",
       "policy": "cpu_explicit",
       "backend": "cpu",
       "cache_state": "reused",
@@ -179,16 +179,6 @@
       "asset_target": "windows-x64",
       "proof_tier": "installed_runtime",
       "host_class": "post_publish_windows_x64",
-      "policy": "cpu_explicit",
-      "backend": "cpu",
-      "cache_state": "reused",
-      "residency_state": "resident",
-      "accelerator_claim": "none"
-    },
-    "installed_windows_arm64_cpu": {
-      "asset_target": "windows-arm64",
-      "proof_tier": "installed_runtime",
-      "host_class": "post_publish_windows_arm64",
       "policy": "cpu_explicit",
       "backend": "cpu",
       "cache_state": "reused",

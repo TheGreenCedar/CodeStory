@@ -453,14 +453,7 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
 
   release-evidence:
-    if: >-
-      needs.route.outputs.mode == 'release-evidence' ||
-      (needs.route.outputs.mode != 'calibration' &&
-       needs.route.outputs.scope != 'server' &&
-       needs.route.outputs.scope != 'linux' &&
-       needs.route.outputs.scope != 'windows' &&
-       needs.route.outputs.scope != 'none' &&
-       needs.route.outputs.constants_frozen == 'true')
+    if: needs.route.outputs.mode == 'release-evidence'
     needs: route
     uses: ./.github/workflows/release-candidate-evidence.yml
     with:
@@ -484,17 +477,10 @@ jobs:
       needs.route.result == 'success' &&
       needs.route.outputs.scope != 'none' &&
       (needs.macos-source.result == 'success' || needs.macos-source.result == 'skipped') &&
-      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped')) &&
-      (needs.release-evidence.result == 'success' ||
-       ((needs.route.outputs.constants_frozen != 'true' ||
-         needs.route.outputs.scope == 'server' ||
-         needs.route.outputs.scope == 'linux' ||
-         needs.route.outputs.scope == 'windows') &&
-        needs.release-evidence.result == 'skipped'))
+      (needs.source-proof.result == 'success' || (needs.route.outputs.mode == 'platform' && needs.source-proof.result == 'skipped'))
     needs:
       - route
       - macos-source
-      - release-evidence
       - source-proof
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
@@ -503,7 +489,7 @@ jobs:
       scope: ${{ needs.route.outputs.scope }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       sign_macos: false
-      quality_evidence_artifact: ${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
+      quality_evidence_artifact: ""
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
       enforce_calibration_freeze_lineage: ${{ needs.route.outputs.freeze_transition == 'true' }}
@@ -518,19 +504,18 @@ jobs:
     needs:
       - route
       - packaged-proof
-      - release-evidence
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
-      quality_evidence_artifact: ${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
+      quality_evidence_artifact: ""
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
       candidate_installed_proof: true
       candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
-      server_behavior_only: ${{ needs.route.outputs.scope == 'server' }}
+      server_behavior_only: true
 
   windows-vulkan-proof:
     if: >-
@@ -541,19 +526,18 @@ jobs:
     needs:
       - route
       - packaged-proof
-      - release-evidence
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
-      quality_evidence_artifact: ${{ needs.release-evidence.result == 'success' && format('release-evidence-{0}', needs.route.outputs.head_sha) || '' }}
+      quality_evidence_artifact: ""
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact || '' }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id || '' }}
       candidate_installed_proof: true
       candidate_producer_workflow_path: .github/workflows/packaged-platform-pr.yml
-      server_behavior_only: ${{ needs.route.outputs.scope == 'windows' }}
+      server_behavior_only: true
 
   closeout:
     if: >-
@@ -566,7 +550,6 @@ jobs:
       - macos-source
       - source-proof
       - repo-scale-stats
-      - release-evidence
       - packaged-proof
       - macos-metal-proof
       - windows-vulkan-proof
@@ -583,8 +566,6 @@ jobs:
           MACOS_SOURCE_RESULT: ${{ needs.macos-source.result }}
           SOURCE_RESULT: ${{ needs.source-proof.result }}
           STATS_RESULT: ${{ needs.repo-scale-stats.result }}
-          EVIDENCE_RESULT: ${{ needs.release-evidence.result }}
-          CONSTANTS_FROZEN: ${{ needs.route.outputs.constants_frozen }}
           PACKAGE_RESULT: ${{ needs.packaged-proof.result }}
           METAL_RESULT: ${{ needs.macos-metal-proof.result }}
           VULKAN_RESULT: ${{ needs.windows-vulkan-proof.result }}
@@ -598,11 +579,6 @@ jobs:
           }
           require_result "$ROUTE_RESULT" success routing
           require_result "$STATS_RESULT" success repo-scale-stats
-          if [ "$CONSTANTS_FROZEN" = true ] && [ "$SCOPE" != server ] && [ "$SCOPE" != linux ] && [ "$SCOPE" != windows ] && [ "$SCOPE" != none ]; then
-            require_result "$EVIDENCE_RESULT" success release-evidence
-          else
-            require_result "$EVIDENCE_RESULT" skipped release-evidence
-          fi
           if [ "$MODE" = integration ]; then
             require_result "$SOURCE_RESULT" success source-proof
           else

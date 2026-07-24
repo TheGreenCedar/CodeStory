@@ -2014,6 +2014,8 @@ mod tests {
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: None,
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: Some(score_breakdown_for_candidate(candidate)),
         }
     }

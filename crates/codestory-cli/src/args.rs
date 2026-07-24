@@ -120,8 +120,6 @@ pub(crate) enum Command {
     InternalOwnedDelete(InternalOwnedDeleteCommand),
     #[command(name = "internal-embedding-server", hide = true)]
     InternalEmbeddingServer,
-    #[command(name = "internal-embedding-qualification", hide = true)]
-    InternalEmbeddingQualification(InternalEmbeddingQualificationCommand),
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
     InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
 }
@@ -2577,24 +2575,6 @@ mod tests {
         assert!(
             !help.contains("internal-embedding-server"),
             "internal server entrypoint leaked into public help: {help}"
-        );
-
-        let qualification = Cli::try_parse_from([
-            "codestory-cli",
-            "internal-embedding-qualification",
-            "--request",
-            "/private/request.json",
-            "--output",
-            "/private/output.json",
-        ])
-        .expect("hidden embedding qualification entrypoint should parse");
-        assert!(matches!(
-            qualification.command,
-            Command::InternalEmbeddingQualification(_)
-        ));
-        assert!(
-            !help.contains("internal-embedding-qualification"),
-            "internal qualification entrypoint leaked into public help: {help}"
         );
 
         let worker = Cli::try_parse_from([

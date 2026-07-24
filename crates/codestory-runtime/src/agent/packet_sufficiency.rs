@@ -9,7 +9,8 @@ use crate::agent::packet_flow_requirements::{
 use crate::agent::packet_plan::packet_symbol_probe_queries;
 use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
 use crate::agent::packet_scoring::{
-    normalize_identifier, packet_display_name_is_test_like, packet_display_path,
+    normalize_identifier, packet_citation_key, packet_display_name_is_test_like,
+    packet_display_path,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_form_validation_flow,
@@ -168,7 +169,8 @@ fn assemble_packet_sufficiency_with_probe_context(
                 && !packet_route_claim_binds_stage(&route_stages, selected_probes, claim)
         })
         .count();
-    let has_minimum_coverage = answer.citations.len() >= min_citations;
+    let eligible_citation_count = packet_eligible_citation_count(answer);
+    let has_minimum_coverage = eligible_citation_count >= min_citations;
     let has_minimum_claims = sufficiency_claims.len() >= min_claims;
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
     let has_minimum_claim_families =
@@ -213,8 +215,8 @@ fn assemble_packet_sufficiency_with_probe_context(
         &missing_required_flow_requirements,
     );
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
-        answer,
         budget,
+        eligible_citation_count,
         has_errors,
         has_minimum_coverage,
         has_minimum_claims,
@@ -232,6 +234,7 @@ fn assemble_packet_sufficiency_with_probe_context(
         answer,
         budget,
         min_citations,
+        eligible_citation_count,
         min_claims,
         sufficiency_claims.len(),
         claim_family_count,
@@ -341,9 +344,19 @@ fn is_packet_structured_follow_up_query(query: &str) -> bool {
         || query.contains("Subcommand")
 }
 
+fn packet_eligible_citation_count(answer: &AgentAnswerDto) -> usize {
+    let mut seen = HashSet::new();
+    answer
+        .citations
+        .iter()
+        .filter(|citation| citation_sufficiency_eligible(citation))
+        .filter(|citation| seen.insert(packet_citation_key(citation)))
+        .count()
+}
+
 struct PacketSufficiencyStatusInput<'a> {
-    answer: &'a AgentAnswerDto,
     budget: &'a PacketBudgetDto,
+    eligible_citation_count: usize,
     has_errors: bool,
     has_minimum_coverage: bool,
     has_minimum_claims: bool,
@@ -359,7 +372,7 @@ struct PacketSufficiencyStatusInput<'a> {
 fn packet_sufficiency_status(
     input: PacketSufficiencyStatusInput<'_>,
 ) -> PacketSufficiencyStatusDto {
-    if input.answer.citations.is_empty() {
+    if input.eligible_citation_count == 0 {
         PacketSufficiencyStatusDto::Insufficient
     } else if input.has_errors
         || !input.has_minimum_coverage
@@ -539,10 +552,7 @@ fn packet_route_stage_labels(question: &str, selected_probes: &[String]) -> Vec<
         let from = words
             .iter()
             .position(|word| packet_route_word_is(word, "from"));
-        if from.is_some_and(|index| index != 0) {
-            return Vec::new();
-        }
-        let route_words = from.map_or(words.as_slice(), |_| &words[1..]);
+        let route_words = from.map_or(words.as_slice(), |index| &words[index + 1..]);
         let markers = route_words
             .iter()
             .enumerate()
@@ -888,6 +898,7 @@ fn packet_sufficiency_gaps(
     answer: &AgentAnswerDto,
     budget: &PacketBudgetDto,
     min_citations: usize,
+    eligible_citation_count: usize,
     min_claims: usize,
     supported_claim_count: usize,
     claim_family_count: usize,
@@ -907,16 +918,18 @@ fn packet_sufficiency_gaps(
     let mut gaps = Vec::new();
     if answer.citations.is_empty() {
         gaps.push("No cited anchors were found for the question.".to_string());
+    } else if eligible_citation_count == 0 {
+        gaps.push("No sufficiency-eligible cited anchors were found for the question.".to_string());
     }
-    if !answer.citations.is_empty() && !has_minimum_coverage {
+    if eligible_citation_count > 0 && !has_minimum_coverage {
         gaps.push(format!(
             "{:?} packet found only {} cited anchor(s); at least {} are required before treating the packet as sufficient.",
             task_class,
-            answer.citations.len(),
+            eligible_citation_count,
             min_citations
         ));
     }
-    if !answer.citations.is_empty() && !has_minimum_claims {
+    if eligible_citation_count > 0 && !has_minimum_claims {
         gaps.push(format!(
             "{:?} packet found only {} role-backed claim(s); at least {} are required before treating the packet as sufficient.",
             task_class, supported_claim_count, min_claims
@@ -927,7 +940,7 @@ fn packet_sufficiency_gaps(
             "{generic_navigation_claim_count} generic navigation claim(s) were ignored for sufficiency because they only point at evidence instead of explaining the flow."
         ));
     }
-    if !answer.citations.is_empty() && !has_minimum_claim_families {
+    if eligible_citation_count > 0 && !has_minimum_claim_families {
         gaps.push(format!(
             "{:?} packet covered only {} distinct claim families; at least {} are required before treating the packet as sufficient.",
             task_class,
@@ -935,7 +948,7 @@ fn packet_sufficiency_gaps(
             packet_sufficiency_min_claim_families(task_class)
         ));
     }
-    if !answer.citations.is_empty() && !has_required_flow_roles {
+    if eligible_citation_count > 0 && !has_required_flow_roles {
         let missing_labels = missing_required_flow_requirements
             .iter()
             .map(flow_requirement_missing_label)
@@ -3062,6 +3075,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn diagnostic_and_duplicate_citations_do_not_inflate_minimum_coverage() {
+        let question = "Locate the bug.";
+        let mut answer = answer_fixture(question);
+        let eligible = cited_anchor("only_eligible");
+        let mut diagnostic = cited_anchor("diagnostic");
+        diagnostic.eligible_for_sufficiency = Some(false);
+        answer.citations = vec![eligible.clone(), eligible.clone(), diagnostic];
+
+        assert_eq!(packet_eligible_citation_count(&answer), 1);
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::BugLocalization,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: vec![cited_claim(
+                "The cited function owns the failing behavior.",
+                Some("source evidence"),
+                eligible,
+                Some(true),
+            )],
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("only 1 cited anchor(s)"))
+        );
+    }
+
+    #[test]
+    fn diagnostic_only_citations_are_insufficient() {
+        let question = "Locate the bug.";
+        let mut answer = answer_fixture(question);
+        for citation in &mut answer.citations {
+            citation.eligible_for_sufficiency = Some(false);
+        }
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::BugLocalization,
+            answer: &answer,
+            budget: &budget_fixture(),
+            supported_claims: Vec::new(),
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Insufficient);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("No sufficiency-eligible cited anchors"))
+        );
+    }
+
     fn route_graph_node(id: &str) -> GraphNodeDto {
         GraphNodeDto {
             id: NodeId(id.to_string()),
@@ -4094,7 +4171,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_route_wording_does_not_turn_control_words_into_stages() {
+    fn normal_route_wording_parses_the_explicit_from_to_route() {
         let question = "Follow the requested execution call route from IngressHook to EgressHook.";
         let answer = route_answer(
             question,
@@ -4115,7 +4192,11 @@ mod tests {
             ],
         );
 
-        assert_unresolved_route_order(&sufficiency);
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "{sufficiency:?}"
+        );
     }
 
     #[test]

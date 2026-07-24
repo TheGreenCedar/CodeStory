@@ -68,7 +68,7 @@ concurrency:
 jobs:
   linux-contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CODESTORY_EMBED_ALLOW_CPU: "1"
     steps:

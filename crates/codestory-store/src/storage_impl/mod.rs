@@ -2093,6 +2093,133 @@ pub struct ProjectionBatch<'a> {
     pub file_errors: &'a [codestory_contracts::graph::ErrorInfo],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuralProjectionBatchSummary {
+    unit_count: u64,
+    unit_digest: String,
+}
+
+#[derive(Debug)]
+struct PreparedStructuralProjectionBatch<'a> {
+    summaries_by_file: HashMap<i64, StructuralProjectionBatchSummary>,
+    projections_by_file: HashMap<i64, &'a StructuralTextProjection>,
+    #[cfg(test)]
+    unit_visit_count: usize,
+}
+
+fn prepare_structural_projection_batch<'a>(
+    batch: &'a ProjectionBatch<'_>,
+    file_content_hashes: &HashMap<i64, &str>,
+) -> Result<PreparedStructuralProjectionBatch<'a>, StorageError> {
+    let mut units_by_file = HashMap::<i64, Vec<&StructuralTextUnit>>::new();
+    #[cfg(test)]
+    let mut unit_visit_count = 0;
+    for unit in batch.structural_text_units {
+        #[cfg(test)]
+        {
+            unit_visit_count += 1;
+        }
+        let expected_source_hash = file_content_hashes.get(&unit.file_id).ok_or_else(|| {
+            StorageError::Other(format!(
+                "structural text unit {} has no verified file hash in its projection batch",
+                unit.node_id.0
+            ))
+        })?;
+        if *expected_source_hash != unit.source_content_hash {
+            return Err(StorageError::Other(format!(
+                "structural text unit {} does not match its verified file hash",
+                unit.node_id.0
+            )));
+        }
+        units_by_file.entry(unit.file_id).or_default().push(unit);
+    }
+
+    let mut summaries_by_file = HashMap::<i64, StructuralProjectionBatchSummary>::with_capacity(
+        batch.structural_text_projections.len(),
+    );
+    for (file_id, units) in &mut units_by_file {
+        units.sort_by_key(|unit| unit.node_id.0);
+        summaries_by_file.insert(
+            *file_id,
+            StructuralProjectionBatchSummary {
+                unit_count: units.len().min(u64::MAX as usize) as u64,
+                unit_digest: structural_text_unit_digest_ordered(units),
+            },
+        );
+    }
+
+    let empty_summary = StructuralProjectionBatchSummary {
+        unit_count: 0,
+        unit_digest: structural_text_unit_digest_ordered(&[]),
+    };
+    let mut projections_by_file = HashMap::<i64, &StructuralTextProjection>::with_capacity(
+        batch.structural_text_projections.len(),
+    );
+    for projection in batch.structural_text_projections {
+        if projections_by_file
+            .insert(projection.file_id, projection)
+            .is_some()
+        {
+            return Err(StorageError::Other(format!(
+                "structural text projection {} appears more than once in its batch",
+                projection.file_id
+            )));
+        }
+        let summary = summaries_by_file
+            .entry(projection.file_id)
+            .or_insert_with(|| empty_summary.clone());
+        if projection.unit_count != summary.unit_count
+            || projection.unit_digest != summary.unit_digest
+            || file_content_hashes
+                .get(&projection.file_id)
+                .is_none_or(|hash| *hash != projection.source_content_hash.as_str())
+        {
+            return Err(StorageError::Other(format!(
+                "structural text projection {} is inconsistent with its batch",
+                projection.file_id
+            )));
+        }
+    }
+
+    if let Some(file_id) = units_by_file
+        .keys()
+        .find(|file_id| !projections_by_file.contains_key(file_id))
+    {
+        return Err(StorageError::Other(format!(
+            "structural text units for file {file_id} have no matching projection"
+        )));
+    }
+
+    let mut cache_write_file_ids = HashSet::new();
+    for write in batch.structural_text_cache_writes {
+        if !cache_write_file_ids.insert(write.file_id) {
+            return Err(StorageError::Other(format!(
+                "structural cache write {} appears more than once in its batch",
+                write.file_id
+            )));
+        }
+        if !projections_by_file.contains_key(&write.file_id) {
+            return Err(StorageError::Other(format!(
+                "structural cache write {} has no matching projection",
+                write.file_id
+            )));
+        }
+        if !structural_text_artifact_cache_key_is_valid(write.cache_key) {
+            return Err(StorageError::Other(format!(
+                "structural cache write {} has an invalid cache key",
+                write.file_id
+            )));
+        }
+    }
+
+    Ok(PreparedStructuralProjectionBatch {
+        summaries_by_file,
+        projections_by_file,
+        #[cfg(test)]
+        unit_visit_count,
+    })
+}
+
 const SQLITE_SCALAR_BIND_BYTES: u64 = 8;
 
 fn projection_text_bind_bytes(value: &str) -> u64 {
@@ -2285,31 +2412,31 @@ fn structural_text_unit_content_summary(
 }
 
 pub fn structural_text_unit_digest(units: &[StructuralTextUnit]) -> String {
-    let mut units = units.to_vec();
+    let mut units = units.iter().collect::<Vec<_>>();
     units.sort_by_key(|unit| unit.node_id.0);
+    structural_text_unit_digest_ordered(&units)
+}
+
+fn structural_text_unit_digest_ordered(units: &[&StructuralTextUnit]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codestory-structural-text-file-units-v1\0");
     for unit in units {
-        for value in [
-            unit.node_id.0.to_string(),
-            unit.file_id.to_string(),
-            unit.placement_id,
-            unit.content_hash,
-            unit.source_content_hash,
-            unit.descriptor_version.to_string(),
-            unit.producer,
-            unit.evidence_tier,
-            unit.resolution,
-            unit.language,
-            (unit.kind as i32).to_string(),
-            unit.start_line.to_string(),
-            unit.start_col.to_string(),
-            unit.end_line.to_string(),
-            unit.end_col.to_string(),
-            unit.file_role.as_str().to_string(),
-        ] {
-            hash_structural_text_unit_part(&mut hasher, value.as_bytes());
-        }
+        hash_structural_text_unit_part(&mut hasher, unit.node_id.0.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.file_id.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.placement_id.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.content_hash.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.source_content_hash.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.descriptor_version.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.producer.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.evidence_tier.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.resolution.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.language.as_bytes());
+        hash_structural_text_unit_part(&mut hasher, (unit.kind as i32).to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.start_line.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.start_col.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.end_line.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.end_col.to_string().as_bytes());
+        hash_structural_text_unit_part(&mut hasher, unit.file_role.as_str().as_bytes());
     }
     format!("{:x}", hasher.finalize())
 }
@@ -6302,11 +6429,21 @@ impl Storage {
             .collect::<HashMap<_, _>>();
         let nodes_prepare_ms = clamp_i64_to_u32(nodes_prepare_started.elapsed().as_millis() as i64);
 
-        let file_content_hashes = batch
-            .file_content_hashes
-            .iter()
-            .map(|identity| (identity.file_id, identity.content_hash.as_str()))
-            .collect::<HashMap<_, _>>();
+        let mut file_content_hashes =
+            HashMap::<i64, &str>::with_capacity(batch.file_content_hashes.len());
+        for identity in batch.file_content_hashes {
+            if file_content_hashes
+                .insert(identity.file_id, identity.content_hash.as_str())
+                .is_some()
+            {
+                return Err(StorageError::Other(format!(
+                    "file content hash {} appears more than once in its projection batch",
+                    identity.file_id
+                )));
+            }
+        }
+        let prepared_structural =
+            prepare_structural_projection_batch(&batch, &file_content_hashes)?;
         let transaction_started = std::time::Instant::now();
         let transaction_setup_started = std::time::Instant::now();
         let tx = self.conn.transaction()?;
@@ -6464,18 +6601,6 @@ impl Storage {
                  )",
             )?;
             for unit in batch.structural_text_units {
-                let Some(expected_source_hash) = file_content_hashes.get(&unit.file_id) else {
-                    return Err(StorageError::Other(format!(
-                        "structural text unit {} has no verified file hash in its projection batch",
-                        unit.node_id.0
-                    )));
-                };
-                if *expected_source_hash != unit.source_content_hash {
-                    return Err(StorageError::Other(format!(
-                        "structural text unit {} does not match its verified file hash",
-                        unit.node_id.0
-                    )));
-                }
                 stmt.execute(params![
                     unit.node_id.0,
                     unit.file_id,
@@ -6519,23 +6644,13 @@ impl Storage {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for projection in batch.structural_text_projections {
-                let units = batch
-                    .structural_text_units
-                    .iter()
-                    .filter(|unit| unit.file_id == projection.file_id)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if projection.unit_count != units.len() as u64
-                    || projection.unit_digest != structural_text_unit_digest(&units)
-                    || file_content_hashes
+                debug_assert_eq!(
+                    prepared_structural
+                        .summaries_by_file
                         .get(&projection.file_id)
-                        .is_none_or(|hash| *hash != projection.source_content_hash.as_str())
-                {
-                    return Err(StorageError::Other(format!(
-                        "structural text projection {} is inconsistent with its batch",
-                        projection.file_id
-                    )));
-                }
+                        .map(|summary| (&summary.unit_count, summary.unit_digest.as_str())),
+                    Some((&projection.unit_count, projection.unit_digest.as_str()))
+                );
                 stmt.execute(params![
                     projection.file_id,
                     &projection.source_content_hash,
@@ -6576,22 +6691,7 @@ impl Storage {
                     updated_at_epoch_ms = excluded.updated_at_epoch_ms",
             )?;
             for write in batch.structural_text_cache_writes {
-                let projection = batch
-                    .structural_text_projections
-                    .iter()
-                    .find(|projection| projection.file_id == write.file_id)
-                    .ok_or_else(|| {
-                        StorageError::Other(format!(
-                            "structural cache write {} has no matching projection",
-                            write.file_id
-                        ))
-                    })?;
-                if !structural_text_artifact_cache_key_is_valid(write.cache_key) {
-                    return Err(StorageError::Other(format!(
-                        "structural cache write {} has an invalid cache key",
-                        write.file_id
-                    )));
-                }
+                let projection = prepared_structural.projections_by_file[&write.file_id];
                 let artifact_digest = format!("{:x}", Sha256::digest(write.artifact_blob));
                 stmt.execute(params![
                     write.path.to_string_lossy().to_string(),

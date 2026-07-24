@@ -15,7 +15,7 @@ pub use codestory_contracts::workspace::{
     BuildMode, DEFAULT_SOURCE_FILE_BYTE_CAP, IndexedFileRecord, OVERSIZED_SOURCE_POLICY_VERSION,
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshInfo, RefreshInputs,
     RefreshMode, RefreshPlan, SourceIndexPolicy, StoredFileRecord, StoredFileState,
-    WorkspaceInventory, process_source_index_policy,
+    WorkspaceInventory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -512,7 +512,7 @@ impl WorkspaceManifest {
 
     /// Discover parser candidates and content-verified oversized policy exclusions.
     pub fn source_inventory_with_oversized_policy(&self) -> Result<WorkspacePolicyFileInventory> {
-        self.source_inventory_with_policy(process_source_index_policy())
+        self.source_inventory_with_policy(&SourceIndexPolicy::default())
     }
 
     /// Discover candidates using one caller-owned immutable source-index policy.
@@ -577,7 +577,7 @@ impl WorkspaceManifest {
         &self,
         inputs: &RefreshInputs,
     ) -> Result<WorkspacePolicyRefreshOutcome> {
-        self.build_execution_outcome_with_policy(inputs, process_source_index_policy())
+        self.build_execution_outcome_with_policy(inputs, &SourceIndexPolicy::default())
     }
 
     /// Build a refresh outcome using one caller-owned immutable source-index policy.
@@ -598,7 +598,7 @@ impl WorkspaceManifest {
         self.build_execution_outcome_bounded_with_policy(
             inputs,
             max_current_files,
-            process_source_index_policy(),
+            &SourceIndexPolicy::default(),
         )
     }
 

@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       scope:
-        description: Native package matrix scope (linux, windows, macos, desktop, server, or full).
+        description: Native package matrix scope (linux, windows, macos, server, or full).
         required: false
         default: full
         type: string
@@ -103,7 +103,7 @@ jobs:
       # GitHub applies matrix exclusions before includes, so an include-only
       # matrix must select the complete row set rather than trying to exclude
       # rows after the fact.
-      matrix: ${{ fromJSON(inputs.calibration_mode && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'server' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'linux' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'desktop' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-24.04-arm","rust_target":"aarch64-unknown-linux-gnu","asset_target":"linux-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","asset_target":"windows-arm64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}') }}
+      matrix: ${{ fromJSON(inputs.calibration_mode && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'server' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'linux' && '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}' || inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"}]}') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -208,6 +208,11 @@ jobs:
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"
+          cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli-runtime" \
+            "target/${{ matrix.rust_target }}/release/codestory-cli-runtime"
+          rm -rf "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
+          cp -R "target/glibc-2.31/${{ matrix.rust_target }}/release/.codestory-native-seeds" \
+            "target/${{ matrix.rust_target }}/release/.codestory-native-seeds"
           find "target/${{ matrix.rust_target }}/release" -maxdepth 1 -type f \
             \( -name 'libllama.so*' -o -name 'libggml*.so*' \) -delete
           find "target/glibc-2.31/${{ matrix.rust_target }}/release" -maxdepth 1 \
@@ -216,6 +221,10 @@ jobs:
             -exec cp -L {} "target/${{ matrix.rust_target }}/release/" \;
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt" \
             "target/${{ matrix.rust_target }}/release/codestory-native-runtime-files-v1.txt"
+
+      - name: Build qualification driver
+        if: matrix.asset_target == 'linux-x64'
+        run: cargo build --release --locked -p codestory-bench --bin codestory_embedding_qualification
 
       - name: Prove clean-cache Node-absent network-denied offline release build
         if: matrix.asset_target == 'linux-x64'
@@ -574,6 +583,7 @@ jobs:
                 "${common_args[@]}" \
                 --proof-tier calibration \
                 --produce-qualification-evidence \
+                --qualification-driver target/release/codestory_embedding_qualification \
                 --calibration-run-index "$run_index" \
                 --calibration-run-output "target/calibration-runs/linux/run-${run_index}.json" \
                 --qualification-evidence "target/calibration-runs/linux/qualification-${run_index}.json" \
@@ -603,13 +613,14 @@ jobs:
           claim_scope_args=()
           quality_path="target/release-quality-evidence/packet/packet-runtime-summary.json"
           if [ "$proof_tier" = hosted_package ]; then
-            if [ "$PROOF_SCOPE" = server ] || [ "$PROOF_SCOPE" = linux ]; then
+            if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
               claim_scope_args=(--server-behavior-only)
             else
               test -f "$quality_path"
               quality_args=(--retrieval-quality-evidence "$quality_path")
               qualification_args=(
                 --produce-qualification-evidence
+                --qualification-driver target/release/codestory_embedding_qualification
                 --qualification-evidence target/packaged-agent-proof/qualification.json
               )
             fi
@@ -647,7 +658,6 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
           !inputs.calibration_mode &&
-          (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '') &&
           inputs.calibration_bundle_artifact != '' &&
           inputs.calibration_bundle_run_id != ''
         shell: bash
@@ -673,7 +683,7 @@ jobs:
             --plugin-root plugins/codestory \
             --candidate-plugin-root-output "$candidate_root/plugin" \
             --candidate-plugin-data-output "$candidate_root/data" \
-            --installed-plugin-provenance-output target/candidate-installed-linux/provenance.json \
+            --installed-plugin-attestation-output target/candidate-installed-linux/install-attestation-v2.json \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
             --candidate-producer-run-id "$GITHUB_RUN_ID" \
@@ -685,7 +695,6 @@ jobs:
           matrix.asset_target == 'linux-x64' &&
           inputs.candidate_installed_proof &&
           !inputs.calibration_mode &&
-          (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '') &&
           inputs.calibration_bundle_artifact != '' &&
           inputs.calibration_bundle_run_id != ''
         env:
@@ -699,12 +708,13 @@ jobs:
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           claim_args=()
-          if [ "${{ inputs.scope }}" = server ] || [ "${{ inputs.scope }}" = linux ]; then
+          if [ -z "${{ inputs.quality_evidence_artifact }}" ]; then
             claim_args=(--server-behavior-only)
           else
             test -f "$quality_path"
             claim_args=(
               --produce-qualification-evidence
+              --qualification-driver target/release/codestory_embedding_qualification
               --qualification-evidence target/candidate-installed-linux/qualification.json
               --retrieval-quality-evidence "$quality_path"
             )
@@ -725,8 +735,7 @@ jobs:
             --calibration-bundle "$calibration_bundle" \
             --calibration-producer-run-id "${{ inputs.calibration_bundle_run_id }}" \
             --calibration-producer-artifact "${{ inputs.calibration_bundle_artifact }}" \
-            --installed-plugin-source candidate \
-            --installed-plugin-provenance target/candidate-installed-linux/provenance.json \
+            --installed-plugin-attestation target/candidate-installed-linux/install-attestation-v2.json \
             --installed-plugin-data "$CODESTORY_CANDIDATE_LINUX_ROOT/data" \
             --candidate-producer-repository "$GITHUB_REPOSITORY" \
             --candidate-producer-workflow-path ".github/workflows/packaged-platform-pr.yml" \
@@ -739,7 +748,7 @@ jobs:
             --out-dir target/candidate-installed-linux/proof
 
       - name: Upload candidate-installed Linux proof
-        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode && (inputs.scope == 'server' || inputs.scope == 'linux' || inputs.quality_evidence_artifact != '')
+        if: always() && matrix.asset_target == 'linux-x64' && inputs.candidate_installed_proof && !inputs.calibration_mode
         uses: actions/upload-artifact@v7.0.1
         with:
           name: candidate-installed-linux-${{ inputs.version }}-attempt-${{ github.run_attempt }}
@@ -768,31 +777,6 @@ jobs:
             --expected-version "${{ inputs.version }}" `
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Prove Intel macOS explicit CPU policy
-        if: matrix.asset_target == 'macos-x64'
-        env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: >-
-          python3 .github/scripts/check-packaged-agent-proof.py
-          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-macos-x64.tar.gz"
-          --checksum-file target/release-dist/SHA256SUMS.txt
-          --expected-version "${{ inputs.version }}"
-          --project "${{ github.workspace }}"
-          --engine-policy cpu_explicit
-          --expected-backend CPU
-          --offline
-          --proof-tier calibration
-          --out-dir target/packaged-intel-policy-proof
-
-      - name: Upload Intel macOS policy proof
-        if: always() && matrix.asset_target == 'macos-x64'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: packaged-intel-policy-proof-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}
-          path: target/packaged-intel-policy-proof
-          if-no-files-found: warn
-          retention-days: 30
 
       - name: Upload packaged version proof
         if: always()

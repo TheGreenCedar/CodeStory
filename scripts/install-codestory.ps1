@@ -191,9 +191,6 @@ function Get-WindowsReleaseTarget {
     if ($Architecture -eq [System.Runtime.InteropServices.Architecture]::X64) {
         return "windows-x64"
     }
-    if ($Architecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
-        return "windows-arm64"
-    }
     return $null
 }
 
@@ -265,7 +262,7 @@ function Install-ReleaseCli {
 
     $releaseTarget = Get-WindowsReleaseTarget
     if (-not $releaseTarget) {
-        throw "Automatic download currently supports Windows x64 and Windows ARM64 only. Pass -CodestoryCli or set CODESTORY_CLI to reuse an existing $script:RequiredVersion binary."
+        throw "Automatic download supports Windows x64 only. Windows ARM is unsupported. Pass -CodestoryCli or set CODESTORY_CLI to reuse an existing $script:RequiredVersion binary."
     }
 
     $archiveName = "codestory-cli-v$ReleaseVersion-$releaseTarget.zip"
@@ -439,7 +436,7 @@ function Assert-SelfTest {
 function Invoke-SelfTest {
     Set-RequiredVersion "v0.11.4"
     Assert-SelfTest ((Get-WindowsReleaseTarget $true ([System.Runtime.InteropServices.Architecture]::X64)) -eq "windows-x64") "Windows x64 should map to windows-x64 release assets"
-    Assert-SelfTest ((Get-WindowsReleaseTarget $true ([System.Runtime.InteropServices.Architecture]::Arm64)) -eq "windows-arm64") "Windows ARM64 should map to windows-arm64 release assets"
+    Assert-SelfTest (-not (Get-WindowsReleaseTarget $true ([System.Runtime.InteropServices.Architecture]::Arm64))) "Windows ARM64 should be rejected before release asset download"
     Assert-SelfTest (-not (Get-WindowsReleaseTarget $false ([System.Runtime.InteropServices.Architecture]::X64))) "non-Windows hosts should not auto-download Windows assets"
     Assert-SelfTest ((Convert-ReleaseTagToVersion "v0.11.4") -eq "0.11.4") "release tag parser should strip v prefix"
     $parsedVersion = Convert-VersionText "codestory-cli 0.11.4"
@@ -589,7 +586,7 @@ Set-RequiredVersion $Version
 $cliInfo = Find-ExistingCli $CodestoryCli $InstallDir
 if (-not $cliInfo) {
     if ($NoDownload) {
-        throw "No existing codestory-cli $script:RequiredVersion found. Pass -CodestoryCli, set CODESTORY_CLI, use the install directory, or rerun without -NoDownload on Windows x64 or Windows ARM64."
+        throw "No existing codestory-cli $script:RequiredVersion found. Pass -CodestoryCli, set CODESTORY_CLI, use the install directory, or rerun without -NoDownload on Windows x64."
     }
     $cliInfo = Install-ReleaseCli $InstallDir $Version
 }

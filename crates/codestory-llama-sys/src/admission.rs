@@ -93,6 +93,8 @@ pub struct EmbeddingAdmissionSnapshot {
     pub active_request: Option<EmbeddingActiveRequestSnapshot>,
     pub event_sequence: u64,
     pub progress_sequence: u64,
+    pub query_progress_sequence: u64,
+    pub bulk_progress_sequence: u64,
     pub completed_request_count: u64,
     pub cancelled_request_count: u64,
     pub failed_request_count: u64,
@@ -223,6 +225,8 @@ struct AdmissionState {
     lease_count: usize,
     event_sequence: u64,
     progress_sequence: u64,
+    query_progress_sequence: u64,
+    bulk_progress_sequence: u64,
     completed_request_count: u64,
     cancelled_request_count: u64,
     failed_request_count: u64,
@@ -236,6 +240,8 @@ impl Default for AdmissionState {
             lease_count: 0,
             event_sequence: 0,
             progress_sequence: 0,
+            query_progress_sequence: 0,
+            bulk_progress_sequence: 0,
             completed_request_count: 0,
             cancelled_request_count: 0,
             failed_request_count: 0,
@@ -272,21 +278,22 @@ impl EmbeddingAdmissionTracker {
                 phase: "native_execution",
             });
             state.event_sequence = state.event_sequence.saturating_add(1);
-            state.progress_sequence = state.progress_sequence.saturating_add(1);
+            record_progress(&mut state, request_class);
         }
         true
     }
 
-    pub(crate) fn progress(&self) {
+    pub(crate) fn progress(&self, request_class: EmbeddingRequestClass) {
         if let Ok(mut state) = self.state.lock() {
-            state.progress_sequence = state.progress_sequence.saturating_add(1);
             state.event_sequence = state.event_sequence.saturating_add(1);
+            record_progress(&mut state, request_class);
         }
     }
 
     pub(crate) fn finish(
         &self,
         context: &EmbeddingRequestContext,
+        request_class: EmbeddingRequestClass,
         succeeded: bool,
         cancelled: bool,
     ) -> u64 {
@@ -306,7 +313,7 @@ impl EmbeddingAdmissionTracker {
                 state.failed_request_count = state.failed_request_count.saturating_add(1);
             }
             state.event_sequence = state.event_sequence.saturating_add(1);
-            state.progress_sequence = state.progress_sequence.saturating_add(1);
+            record_progress(&mut state, request_class);
             return state.completed_request_count;
         }
         0
@@ -394,11 +401,22 @@ impl EmbeddingAdmissionTracker {
             active_request,
             event_sequence: state.event_sequence,
             progress_sequence: state.progress_sequence,
+            query_progress_sequence: state.query_progress_sequence,
+            bulk_progress_sequence: state.bulk_progress_sequence,
             completed_request_count: state.completed_request_count,
             cancelled_request_count: state.cancelled_request_count,
             failed_request_count: state.failed_request_count,
         }
     }
+}
+
+fn record_progress(state: &mut AdmissionState, request_class: EmbeddingRequestClass) {
+    state.progress_sequence = state.progress_sequence.saturating_add(1);
+    let class_progress = match request_class {
+        EmbeddingRequestClass::Query => &mut state.query_progress_sequence,
+        EmbeddingRequestClass::Bulk => &mut state.bulk_progress_sequence,
+    };
+    *class_progress = class_progress.saturating_add(1);
 }
 
 #[cfg(test)]
@@ -449,8 +467,38 @@ mod tests {
         assert!(tracker.begin(&failed, EmbeddingRequestClass::Bulk));
         assert!(tracker.begin(&second, EmbeddingRequestClass::Query));
 
-        assert_eq!(tracker.finish(&first, true, false), 1);
-        assert_eq!(tracker.finish(&failed, false, false), 1);
-        assert_eq!(tracker.finish(&second, true, false), 2);
+        assert_eq!(
+            tracker.finish(&first, EmbeddingRequestClass::Query, true, false),
+            1
+        );
+        assert_eq!(
+            tracker.finish(&failed, EmbeddingRequestClass::Bulk, false, false),
+            1
+        );
+        assert_eq!(
+            tracker.finish(&second, EmbeddingRequestClass::Query, true, false),
+            2
+        );
+    }
+
+    #[test]
+    fn progress_sequences_advance_independently_by_request_class() {
+        let tracker = EmbeddingAdmissionTracker::default();
+        let query = EmbeddingRequestContext::new("query", "scope", 25);
+        let bulk = EmbeddingRequestContext::new("bulk", "scope", 25);
+        assert!(tracker.begin(&query, EmbeddingRequestClass::Query));
+        assert!(tracker.begin(&bulk, EmbeddingRequestClass::Bulk));
+
+        tracker.progress(EmbeddingRequestClass::Bulk);
+        let after_bulk = tracker.snapshot(0, 0);
+        assert_eq!(after_bulk.progress_sequence, 3);
+        assert_eq!(after_bulk.query_progress_sequence, 1);
+        assert_eq!(after_bulk.bulk_progress_sequence, 2);
+
+        tracker.progress(EmbeddingRequestClass::Query);
+        let after_query = tracker.snapshot(0, 0);
+        assert_eq!(after_query.progress_sequence, 4);
+        assert_eq!(after_query.query_progress_sequence, 2);
+        assert_eq!(after_query.bulk_progress_sequence, 2);
     }
 }

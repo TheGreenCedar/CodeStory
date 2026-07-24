@@ -2032,6 +2032,280 @@ fn structural_projection_cache_write_is_atomic_with_file_and_unit_rows() -> Resu
     Ok(())
 }
 
+fn structural_unit_fixture(
+    node_id: i64,
+    file_id: i64,
+    source_content_hash: &str,
+) -> StructuralTextUnit {
+    StructuralTextUnit {
+        node_id: NodeId(node_id),
+        file_id,
+        placement_id: format!("{node_id:064x}"),
+        content_hash: format!("{:064x}", node_id.saturating_add(1_000)),
+        source_content_hash: source_content_hash.to_string(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "fixture".to_string(),
+        evidence_tier: "structural_text".to_string(),
+        resolution: "source_range_only".to_string(),
+        language: "rust".to_string(),
+        kind: NodeKind::FUNCTION,
+        start_line: u32::try_from(node_id).expect("fixture node ID fits a line number"),
+        start_col: 1,
+        end_line: u32::try_from(node_id).expect("fixture node ID fits a line number"),
+        end_col: 2,
+        file_role: FileRole::Source,
+    }
+}
+
+#[test]
+fn structural_text_unit_digest_has_stable_order_independent_bytes() {
+    let source_hash = "a".repeat(64);
+    let first = structural_unit_fixture(9, 3, &source_hash);
+    let second = structural_unit_fixture(4, 3, &source_hash);
+
+    let ordered = structural_text_unit_digest(&[second.clone(), first.clone()]);
+    let shuffled = structural_text_unit_digest(&[first, second]);
+
+    assert_eq!(
+        ordered, "7a718c4ae99dd7f2c9337315b44fedde5c7b82362b8046f67a1a3f7130aa7c4a",
+        "digest changes require an explicit publication compatibility decision"
+    );
+    assert_eq!(shuffled, ordered);
+}
+
+#[test]
+fn structural_projection_preparation_visits_each_unit_once() -> Result<(), StorageError> {
+    const FILE_COUNT: i64 = 128;
+    const UNITS_PER_FILE: i64 = 4;
+
+    let mut file_content_hashes = Vec::new();
+    let mut structural_units = Vec::new();
+    let mut structural_projections = Vec::new();
+    for file_id in 1..=FILE_COUNT {
+        let source_hash = format!("{file_id:064x}");
+        file_content_hashes.push(FileContentHash {
+            file_id,
+            content_hash: source_hash.clone(),
+        });
+        let first_unit = structural_units.len();
+        for unit_offset in 0..UNITS_PER_FILE {
+            structural_units.push(structural_unit_fixture(
+                file_id * 10 + unit_offset,
+                file_id,
+                &source_hash,
+            ));
+        }
+        structural_projections.push(StructuralTextProjection {
+            file_id,
+            source_content_hash: source_hash,
+            descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+            producer: "fixture".to_string(),
+            language: "rust".to_string(),
+            file_role: FileRole::Source,
+            unit_count: UNITS_PER_FILE as u64,
+            unit_digest: structural_text_unit_digest(&structural_units[first_unit..]),
+        });
+    }
+    let hashes_by_file = file_content_hashes
+        .iter()
+        .map(|identity| (identity.file_id, identity.content_hash.as_str()))
+        .collect::<HashMap<_, _>>();
+    let batch = ProjectionBatch {
+        files: &[],
+        file_content_hashes: &file_content_hashes,
+        nodes: &[],
+        structural_text_units: &structural_units,
+        structural_text_projections: &structural_projections,
+        structural_text_cache_writes: &[],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+        file_errors: &[],
+    };
+
+    let prepared = prepare_structural_projection_batch(&batch, &hashes_by_file)?;
+
+    assert_eq!(prepared.unit_visit_count, structural_units.len());
+    assert_eq!(prepared.summaries_by_file.len(), FILE_COUNT as usize);
+    assert!(
+        prepared
+            .summaries_by_file
+            .values()
+            .all(|summary| summary.unit_count == UNITS_PER_FILE as u64)
+    );
+    Ok(())
+}
+
+#[test]
+fn structural_projection_validation_rejects_duplicates_before_transaction()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let transactions = Arc::new(AtomicUsize::new(0));
+    let observed_transactions = Arc::clone(&transactions);
+    storage
+        .conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Transaction { .. }) {
+                observed_transactions.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            Authorization::Allow
+        }))?;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed_commits = Arc::clone(&commits);
+    storage.conn.commit_hook(Some(move || {
+        observed_commits.fetch_add(1, AtomicOrdering::SeqCst);
+        false
+    }))?;
+
+    let source_hash = "a".repeat(64);
+    let duplicate_hashes = [
+        FileContentHash {
+            file_id: 1,
+            content_hash: source_hash.clone(),
+        },
+        FileContentHash {
+            file_id: 1,
+            content_hash: source_hash.clone(),
+        },
+    ];
+    let duplicate_hash_error = storage
+        .flush_projection_batch(ProjectionBatch {
+            files: &[],
+            file_content_hashes: &duplicate_hashes,
+            nodes: &[],
+            structural_text_units: &[],
+            structural_text_projections: &[],
+            structural_text_cache_writes: &[],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+            file_errors: &[],
+        })
+        .expect_err("duplicate file content hashes must be rejected");
+    assert!(
+        duplicate_hash_error
+            .to_string()
+            .contains("appears more than once")
+    );
+
+    let file_content_hashes = [FileContentHash {
+        file_id: 1,
+        content_hash: source_hash.clone(),
+    }];
+    let invalid_projection = StructuralTextProjection {
+        file_id: 1,
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "fixture".to_string(),
+        language: "rust".to_string(),
+        file_role: FileRole::Source,
+        unit_count: 0,
+        unit_digest: "invalid".to_string(),
+    };
+    let invalid_projection_error = storage
+        .flush_projection_batch(ProjectionBatch {
+            files: &[],
+            file_content_hashes: &file_content_hashes,
+            nodes: &[],
+            structural_text_units: &[],
+            structural_text_projections: std::slice::from_ref(&invalid_projection),
+            structural_text_cache_writes: &[],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+            file_errors: &[],
+        })
+        .expect_err("invalid structural projection must be rejected");
+    assert!(
+        invalid_projection_error
+            .to_string()
+            .contains("inconsistent with its batch")
+    );
+
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    storage.conn.commit_hook(None::<fn() -> bool>)?;
+    assert_eq!(transactions.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(commits.load(AtomicOrdering::SeqCst), 0);
+    assert!(storage.get_files()?.is_empty());
+    assert!(storage.get_nodes()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn structural_projection_preparation_rejects_duplicate_projection_and_cache_write() {
+    let source_hash = "a".repeat(64);
+    let file_content_hashes = HashMap::from([(1, source_hash.as_str())]);
+    let projection = StructuralTextProjection {
+        file_id: 1,
+        source_content_hash: source_hash.clone(),
+        descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+        producer: "fixture".to_string(),
+        language: "rust".to_string(),
+        file_role: FileRole::Source,
+        unit_count: 0,
+        unit_digest: structural_text_unit_digest(&[]),
+    };
+    let duplicate_projections = [projection.clone(), projection.clone()];
+    let duplicate_projection_batch = ProjectionBatch {
+        files: &[],
+        file_content_hashes: &[],
+        nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: &duplicate_projections,
+        structural_text_cache_writes: &[],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+        file_errors: &[],
+    };
+    assert!(
+        prepare_structural_projection_batch(&duplicate_projection_batch, &file_content_hashes)
+            .expect_err("duplicate projections must be rejected")
+            .to_string()
+            .contains("appears more than once")
+    );
+
+    let cache_writes = [
+        StructuralTextArtifactCacheWrite {
+            path: Path::new("src/a.rs"),
+            file_id: 1,
+            cache_key: "v1:first",
+            artifact_blob: b"first",
+        },
+        StructuralTextArtifactCacheWrite {
+            path: Path::new("src/a.rs"),
+            file_id: 1,
+            cache_key: "v1:second",
+            artifact_blob: b"second",
+        },
+    ];
+    let duplicate_cache_batch = ProjectionBatch {
+        files: &[],
+        file_content_hashes: &[],
+        nodes: &[],
+        structural_text_units: &[],
+        structural_text_projections: std::slice::from_ref(&projection),
+        structural_text_cache_writes: &cache_writes,
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+        file_errors: &[],
+    };
+    assert!(
+        prepare_structural_projection_batch(&duplicate_cache_batch, &file_content_hashes)
+            .expect_err("duplicate cache writes must be rejected")
+            .to_string()
+            .contains("appears more than once")
+    );
+}
+
 #[test]
 fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
 -> Result<(), StorageError> {

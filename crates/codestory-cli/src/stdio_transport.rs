@@ -6346,6 +6346,8 @@ version = "0.11.20"
             loss_reason: None,
             coverage_role: None,
             eligible_for_sufficiency: Some(false),
+            source_excerpt: None,
+            verification_targets: Vec::new(),
             score_breakdown: None,
         };
         let result = codestory_contracts::api::SearchResultsDto {
@@ -6839,6 +6841,7 @@ version = "0.11.20"
                 cache.path().to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
         let runtime = crate::runtime::RuntimeContext::new_inspect_only_with_startup(
             &crate::args::ProjectArgs {
@@ -7161,6 +7164,7 @@ version = "0.11.20"
                 cache.path().to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
 
         session
@@ -7261,6 +7265,7 @@ version = "0.11.20"
                 cache.path().to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
 
         for (index, project) in projects
@@ -7413,6 +7418,7 @@ version = "0.11.20"
                 cache.path().to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
 
         let mut cases = vec![
@@ -7520,6 +7526,7 @@ version = "0.11.20"
                 cache.path().to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
 
         session
@@ -7607,6 +7614,7 @@ version = "0.11.20"
                 cache.path().to_path_buf(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
         session
             .select_project(project.path().to_str())
@@ -7721,6 +7729,7 @@ version = "0.11.20"
                 cold_cache_root.clone(),
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
 
         let response = handle_stdio_message(

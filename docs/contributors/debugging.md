@@ -178,7 +178,7 @@ Common symptoms:
 Start with:
 
 - `crates/codestory-cli/src/args.rs`
-- `crates/codestory-cli/src/main.rs`
+- `crates/codestory-cli/src/app.rs`
 - `crates/codestory-cli/src/output.rs`
 
 Check:

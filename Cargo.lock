@@ -137,6 +137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "as-slice"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,6 +512,7 @@ dependencies = [
  "codestory-workspace",
  "criterion",
  "hex",
+ "libc",
  "mach2",
  "rusqlite",
  "serde",
@@ -525,6 +532,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "codestory-contracts",
+ "codestory-llama-sys",
  "codestory-retrieval",
  "codestory-runtime",
  "codestory-workspace",
@@ -573,6 +581,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "rusqlite",
+ "saphyr-parser",
  "serde",
  "serde_json",
  "sha2",
@@ -2866,6 +2875,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "saphyr-parser"
+version = "0.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebfd783fcf1b3f6bafd557be0e1427ec54f826f513c3cdd749f9844484df2a13"
+dependencies = [
+ "arraydeque",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

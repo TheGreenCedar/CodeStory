@@ -55,12 +55,16 @@ model download, separate helper executable, TCP endpoint, port, or user
 approval. The same verified CLI automatically runs its hidden per-user server
 over private local IPC.
 
-CodeStory 0.16 publishes managed packages for Apple Silicon macOS and Windows
-x64. Those packages are qualified from isolated installs with one real
-project-scoped `ground` request and require no separate model, runtime, SDK, or
-helper executable. CPU execution is supported. Linux, Intel macOS, Windows ARM,
-physical accelerator execution, answer accuracy, and performance are not
-release claims for 0.16.
+<!-- codestory-public-support:start -->
+| Platform | Release support |
+| --- | --- |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
+<!-- codestory-public-support:end -->
 
 ## Codex install
 
