@@ -117,18 +117,92 @@ def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dic
 
 
 def _verify_host_package_matrix(matrix: dict) -> None:
-    expected_matrix = {
-        ("linux-x64", "hosted_package", "cpu_explicit", "cpu", "none"),
-        ("macos-arm64", "protected_hardware", "accelerated", "metal", "metal"),
-        ("windows-x64", "protected_hardware", "accelerated", "vulkan", "vulkan"),
-        ("linux-x64", "installed_runtime", "cpu_explicit", "cpu", "none"),
-        ("linux-arm64", "installed_runtime", "cpu_explicit", "cpu", "none"),
-        ("macos-x64", "installed_runtime", "cpu_explicit", "cpu", "none"),
-        ("macos-arm64", "installed_runtime", "cpu_explicit", "cpu", "none"),
-        ("windows-x64", "installed_runtime", "cpu_explicit", "cpu", "none"),
-        ("windows-arm64", "installed_runtime", "cpu_explicit", "cpu", "none"),
+    expected_cells = {
+        "hosted_linux_x64_cpu": (
+            "linux-x64",
+            "hosted_package",
+            "github_hosted_linux_x64",
+            "cpu_explicit",
+            "cpu",
+            "none",
+        ),
+        "protected_macos_arm64_metal": (
+            "macos-arm64",
+            "protected_hardware",
+            "protected_self_hosted_macos_arm64",
+            "accelerated",
+            "metal",
+            "metal",
+        ),
+        "protected_windows_x64_vulkan": (
+            "windows-x64",
+            "protected_hardware",
+            "protected_self_hosted_windows_x64",
+            "accelerated",
+            "vulkan",
+            "vulkan",
+        ),
+        "protected_linux_x64_vulkan": (
+            "linux-x64",
+            "protected_hardware",
+            "protected_self_hosted_linux_x64",
+            "accelerated",
+            "vulkan",
+            "vulkan",
+        ),
+        "installed_linux_x64_cpu": (
+            "linux-x64",
+            "installed_runtime",
+            "post_publish_linux_x64",
+            "cpu_explicit",
+            "cpu",
+            "none",
+        ),
+        "candidate_installed_linux_x64_cpu": (
+            "linux-x64",
+            "installed_runtime",
+            "premerge_candidate_linux_x64",
+            "cpu_explicit",
+            "cpu",
+            "none",
+        ),
+        "candidate_installed_linux_x64_vulkan": (
+            "linux-x64",
+            "installed_runtime",
+            "premerge_candidate_linux_x64_vulkan",
+            "accelerated",
+            "vulkan",
+            "vulkan",
+        ),
+        "candidate_installed_macos_arm64_cpu": (
+            "macos-arm64",
+            "installed_runtime",
+            "premerge_candidate_macos_arm64",
+            "cpu_explicit",
+            "cpu",
+            "none",
+        ),
+        "installed_macos_arm64_cpu": (
+            "macos-arm64",
+            "installed_runtime",
+            "post_publish_macos_arm64",
+            "cpu_explicit",
+            "cpu",
+            "none",
+        ),
+        "installed_windows_x64_cpu": (
+            "windows-x64",
+            "installed_runtime",
+            "post_publish_windows_x64",
+            "cpu_explicit",
+            "cpu",
+            "none",
+        ),
     }
-    observed_matrix: set[tuple[str, str, str, str, str]] = set()
+    require(
+        set(matrix) == set(expected_cells),
+        "measurement host/package matrix does not match the release proof lanes",
+    )
     for cell_id, cell in matrix.items():
         require_nonempty_string(cell_id, "measurement host/package matrix cell id")
         require(
@@ -155,31 +229,18 @@ def _verify_host_package_matrix(matrix: dict) -> None:
             cell["cache_state"] == "reused" and cell["residency_state"] == "resident",
             f"measurement matrix cell {cell_id} changed cache or residency state",
         )
-        observed_matrix.add(
-            (
-                cell["asset_target"],
-                cell["proof_tier"],
-                cell["policy"],
-                cell["backend"],
-                cell["accelerator_claim"],
-            )
+        observed = (
+            cell["asset_target"],
+            cell["proof_tier"],
+            cell["host_class"],
+            cell["policy"],
+            cell["backend"],
+            cell["accelerator_claim"],
         )
-    require(
-        observed_matrix == expected_matrix and len(matrix) == len(expected_matrix) + 2,
-        "measurement host/package matrix does not match the release proof lanes",
-    )
-    require(
-        {
-            cell_id
-            for cell_id, cell in matrix.items()
-            if cell["host_class"].startswith("premerge_candidate_")
-        }
-        == {
-            "candidate_installed_linux_x64_cpu",
-            "candidate_installed_macos_arm64_cpu",
-        },
-        "measurement matrix omitted the two candidate-installed premerge lanes",
-    )
+        require(
+            observed == expected_cells[cell_id],
+            f"measurement matrix cell {cell_id} does not match its release proof lane",
+        )
 
 
 def _verify_calibration_matrix(matrix: dict, calibration_matrix: object) -> None:

@@ -102,7 +102,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 6);
+  assert.equal(graph.graph_version, 7);
   assert.deepEqual(
     [...graph.standard_release_claims].sort(),
     [
@@ -125,7 +125,7 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.closeout.cell_groups.length, 8);
   assert.deepEqual(
     graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
-    ["macos-arm64", "windows-x64"],
+    ["linux-x64", "macos-arm64", "windows-x64"],
   );
   assert.deepEqual(
     graph.failure_controls.map(({ id }) => id).sort(),
@@ -154,6 +154,7 @@ test("public support, assets, and release notes derive from the package and clos
     [
       { target: "macos-arm64", accelerator: "metal" },
       { target: "windows-x64", accelerator: "vulkan" },
+      { target: "linux-x64", accelerator: "vulkan" },
     ],
   );
   assert.deepEqual(
@@ -161,13 +162,17 @@ test("public support, assets, and release notes derive from the package and clos
     [
       "codestory-cli-v0.16.0-windows-x64.zip",
       "codestory-cli-v0.16.0-macos-arm64.tar.gz",
+      "codestory-cli-v0.16.0-linux-x64.tar.gz",
       "SHA256SUMS.txt",
     ],
   );
-  assert.match(renderPublicSupport(graph), /Apple Silicon \\| Yes \\| Metal/u);
-  assert.match(renderPublicSupport(graph), /Windows x64 \\| Yes \\| Vulkan/u);
-  assert.match(renderReleasePlatformNotes(graph), /macOS 15\+ on Apple Silicon: Metal/u);
-  assert.match(renderReleasePlatformNotes(graph), /Windows x64: Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Apple Silicon \\| Supported with Metal/u);
+  assert.match(renderPublicSupport(graph), /Windows x64 \\| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /Linux x64 \\| Supported with Vulkan/u);
+  assert.match(renderPublicSupport(graph), /CPU-only Windows and Linux \\| Unsupported/u);
+  assert.match(renderReleasePlatformNotes(graph), /macOS 15\+ on Apple Silicon: supported with Metal/u);
+  assert.match(renderReleasePlatformNotes(graph), /Windows x64: supported with Vulkan/u);
+  assert.match(renderReleasePlatformNotes(graph), /Linux x64: supported with Vulkan/u);
 });
 
 test("positive fixture evaluates deterministically", () => {
@@ -233,6 +238,20 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(mismatchedSupport),
     /package targets must exactly match/u,
+  );
+
+  const incompleteUnsupportedMatrix = structuredClone(graph);
+  incompleteUnsupportedMatrix.public_support.unsupported.pop();
+  assert.throws(
+    () => validateReleaseClaimGraph(incompleteUnsupportedMatrix),
+    /canonical unsupported release matrix/u,
+  );
+
+  const cpuOnlyLinuxSupported = structuredClone(graph);
+  cpuOnlyLinuxSupported.public_support.unsupported[0].targets = ["windows-x64"];
+  assert.throws(
+    () => validateReleaseClaimGraph(cpuOnlyLinuxSupported),
+    /canonical unsupported release matrix/u,
   );
 
   const missingAcceleratorCell = structuredClone(graph);

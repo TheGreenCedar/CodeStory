@@ -62,14 +62,16 @@ paths more accurately.
 
 ### Availability
 
+<!-- codestory-public-support:start -->
 | Platform | Release support |
 | --- | --- |
-| Apple Silicon macOS | Supported |
-| Windows x64 with Vulkan | Supported |
-| Linux x64 with Vulkan | Supported |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
 | CPU-only Windows and Linux | Unsupported |
 | Intel Mac | Unsupported |
 | Windows ARM | Unsupported |
+<!-- codestory-public-support:end -->
 
 ### Upgrade
 

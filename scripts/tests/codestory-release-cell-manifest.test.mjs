@@ -164,8 +164,8 @@ test("Actions provenance recovers a split rerun by selecting each job's latest e
     currentRunAttempt: "2",
     ...metadata,
   });
-  assert.equal(map.producers.length, 15);
-  assert.equal(map.artifacts.length, 11);
+  assert.equal(map.producers.length, 22);
+  assert.equal(map.artifacts.length, 16);
   for (const [cellId, artifact] of [
     [
       "retrieval_readiness:macos-arm64",

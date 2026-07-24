@@ -23,6 +23,7 @@ from native_binary_contract import (
     managed_native_runtime_dependencies,
     runtime_artifact_role,
 )
+from packaged_agent_proof.foundation import LOWER_TIER_NONCLAIMS, TARGET_CONTRACTS
 
 NORMALIZED_MTIME = 315532800  # 1980-01-01T00:00:00Z, valid for zip and tar.
 NATIVE_ENGINE_MARKER_PREFIX = b"codestory-native-engine-v1|"
@@ -39,92 +40,6 @@ NATIVE_RUNTIME_SEED_MARKER_SUFFIX = b"|end"
 MEASUREMENT_PROTOCOL = "docs/testing/per-user-embedding-server-measurement-protocol.json"
 SERVER_PROTOCOL = "docs/testing/per-user-embedding-server-protocol.json"
 SERVER_CONSTANT_SET = "docs/testing/per-user-embedding-server-constant-set.json"
-LOWER_TIER_NONCLAIMS = [
-    "answer_quality",
-    "bounded_bulk_starvation",
-    "cross_session_sharing",
-    "cross_user_sharing",
-    "linux_gpu_execution",
-    "release_readiness",
-    "whole_server_takeover",
-]
-
-TARGET_CONTRACTS = {
-    "linux-x64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "elf",
-        "target_triple": "x86_64-unknown-linux-gnu",
-        "target_os": "linux",
-        "target_arch": "x86_64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": None,
-        "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
-    },
-    "linux-arm64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "elf",
-        "target_triple": "aarch64-unknown-linux-gnu",
-        "target_os": "linux",
-        "target_arch": "aarch64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": None,
-        "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
-    },
-    "windows-x64": {
-        "binary_name": "codestory-cli.exe",
-        "binary_format": "pe",
-        "target_triple": "x86_64-pc-windows-msvc",
-        "target_os": "windows",
-        "target_arch": "x86_64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": "vulkan",
-        "non_claim_reason": None,
-    },
-    "windows-arm64": {
-        "binary_name": "codestory-cli.exe",
-        "binary_format": "pe",
-        "target_triple": "aarch64-pc-windows-msvc",
-        "target_os": "windows",
-        "target_arch": "aarch64",
-        "compiled_backends": ["cpu", "vulkan"],
-        "linkage": "dynamic",
-        "backend_loading": "runtime-modules",
-        "expected_protected_backend": None,
-        "non_claim_reason": "windows_arm64_accelerator_execution_is_not_protected",
-    },
-    "macos-x64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "mach-o",
-        "target_triple": "x86_64-apple-darwin",
-        "target_os": "macos",
-        "target_arch": "x86_64",
-        "compiled_backends": ["cpu", "metal"],
-        "linkage": "static",
-        "backend_loading": "builtin",
-        "expected_protected_backend": None,
-        "non_claim_reason": "macos_x64_accelerator_execution_is_not_protected",
-    },
-    "macos-arm64": {
-        "binary_name": "codestory-cli",
-        "binary_format": "mach-o",
-        "target_triple": "aarch64-apple-darwin",
-        "target_os": "macos",
-        "target_arch": "aarch64",
-        "compiled_backends": ["cpu", "metal"],
-        "linkage": "static",
-        "backend_loading": "builtin",
-        "expected_protected_backend": "metal",
-        "non_claim_reason": None,
-    },
-}
-
-
 class PackageContractError(RuntimeError):
     pass
 
@@ -267,7 +182,7 @@ def parse_server_proof_marker(marker: str) -> dict[str, object]:
         "query_capacity": numbers["query_capacity"],
         "bulk_capacity": numbers["bulk_capacity"],
         "idle_timeout_ms": numbers["idle_timeout_ms"],
-        "lower_tier_nonclaims": LOWER_TIER_NONCLAIMS,
+        "lower_tier_nonclaims": sorted(LOWER_TIER_NONCLAIMS),
     }
 
 
@@ -1151,22 +1066,6 @@ def run_self_test() -> None:
             "linux",
         )
         linux_binary.chmod(0o755)
-        linux_arm_binary = temp_root / "linux-arm64-runtime/codestory-cli"
-        write_synthetic_runtime(
-            linux_arm_binary,
-            "elf",
-            "aarch64",
-            native_marker(
-                target="aarch64-unknown-linux-gnu",
-                os_name="linux",
-                arch="aarch64",
-                backends="cpu,vulkan",
-                embedding_contract_sha256=fixture_contract_sha256,
-                linkage="dynamic",
-            ),
-            "linux",
-        )
-        linux_arm_binary.chmod(0o755)
         windows_binary = temp_root / "windows-x64-runtime/codestory-cli.exe"
         write_synthetic_runtime(
             windows_binary,
@@ -1176,21 +1075,6 @@ def run_self_test() -> None:
                 target="x86_64-pc-windows-msvc",
                 os_name="windows",
                 arch="x86_64",
-                backends="cpu,vulkan",
-                embedding_contract_sha256=fixture_contract_sha256,
-                linkage="dynamic",
-            ),
-            "windows",
-        )
-        windows_arm_binary = temp_root / "windows-arm64-runtime/codestory-cli.exe"
-        write_synthetic_runtime(
-            windows_arm_binary,
-            "pe",
-            "aarch64",
-            native_marker(
-                target="aarch64-pc-windows-msvc",
-                os_name="windows",
-                arch="aarch64",
                 backends="cpu,vulkan",
                 embedding_contract_sha256=fixture_contract_sha256,
                 linkage="dynamic",
@@ -1212,28 +1096,9 @@ def run_self_test() -> None:
             )
         )
         macos_binary.chmod(0o755)
-        macos_x64_binary = temp_root / "codestory-cli-macos-x64"
-        macos_x64_binary.write_bytes(
-            synthetic_binary(
-                "mach-o",
-                "x86_64",
-                native_marker(
-                    target="x86_64-apple-darwin",
-                    os_name="macos",
-                    arch="x86_64",
-                    backends="cpu,metal",
-                    embedding_contract_sha256=fixture_contract_sha256,
-                ),
-            )
-        )
-        macos_x64_binary.chmod(0o755)
-
         for target, binary in [
             ("linux-x64", linux_binary),
-            ("linux-arm64", linux_arm_binary),
             ("windows-x64", windows_binary),
-            ("windows-arm64", windows_arm_binary),
-            ("macos-x64", macos_x64_binary),
             ("macos-arm64", macos_binary),
         ]:
             first = package_release(

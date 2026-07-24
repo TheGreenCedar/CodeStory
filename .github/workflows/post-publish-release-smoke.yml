@@ -74,6 +74,9 @@ jobs:
           - os: macos-15
             asset_target: macos-arm64
             extension: tar.gz
+          - os: ubuntu-latest
+            asset_target: linux-x64
+            extension: tar.gz
     steps:
       - name: Normalize release version
         id: release

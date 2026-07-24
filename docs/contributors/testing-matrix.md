@@ -216,9 +216,9 @@ fails.
 
 macOS packages keep the selected backend built in. Windows and Linux packages
 ship the runtime executable and native modules in one immutable generation
-selected by the public launcher through a single atomic pointer. Hosted Linux proof
-does not install a Vulkan loader before help, stdio initialization, or explicit
-CPU execution, and it makes no Linux acceleration claim.
+selected by the public launcher through a single atomic pointer. Hosted Linux
+proof does not install a Vulkan loader before help, stdio initialization, or
+explicit diagnostic CPU execution. It cannot replace protected Vulkan proof.
 
 Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
 to make the claim explicit. Protected and installed tiers additionally name
@@ -235,7 +235,7 @@ python .github/scripts/check-packaged-agent-proof.py --self-test
 | --- | --- |
 | `.github/workflows/macos-metal-proof.yml` | Exact Apple Silicon package, CPU disallowed, Metal, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
 | `.github/workflows/windows-vulkan-proof.yml` | Exact Windows x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, full layer offload, and complete frozen server qualification |
-| Linux protected Vulkan workflow | Required before any Linux GPU claim; hosted CPU proof is insufficient |
+| `.github/workflows/linux-vulkan-proof.yml` | Exact Linux x64 package, CPU disallowed, Vulkan, physical adapter, live smoke, and project-scoped grounding |
 
 Signing and notarization are main-release concerns, not PR gates. A PR package
 may be unsigned while still proving the named package/runtime tier.
@@ -416,20 +416,22 @@ Vulkan proof lanes.
 separates the six standard release claims from optional performance and
 answer-quality evaluations. The standard release requires
 exact source, package, native platform, protected accelerator, and installed
-runtime evidence plus bounded packet/search readiness for both desktop targets.
+runtime evidence plus bounded packet/search readiness for all three supported
+targets.
 Optional evaluation may reject its
 own run, but it is not a dependency of packaging, hardware proof, closeout, or
 publication. Workflow policy enforces that separation.
 
 The same graph declares the exact release-closeout cells. For v0.16,
-`workflow_policy.package_matrix` contains only `macos-arm64` and `windows-x64`.
+`workflow_policy.package_matrix` contains `macos-arm64`, `windows-x64`, and
+`linux-x64`.
 The coordinator retains canonical copies under `manifests/` and `evaluations/`
-beside `ledger.json` and `summary.json`. A pre-publish run accepts seven cells:
-exact source, two package identities, two accelerator-execution receipts, and
-two candidate-installed behavior receipts. A post-publish run accepts fifteen
-cells after adding platform,
-marketplace-catalog-resolved behavior, downloaded-byte proof, and the two
-protected-package retrieval-readiness receipts.
+beside `ledger.json` and `summary.json`. A pre-publish run accepts ten cells:
+exact source, three package identities, three accelerator-execution receipts,
+and three candidate-installed behavior receipts. A post-publish run accepts
+twenty-two cells after adding platform, marketplace-catalog-resolved behavior,
+downloaded-byte proof, and protected-package retrieval-readiness for all three
+targets.
 Package rows record each archive name, byte count, and SHA-256.
 A post-publish run requires
 that accepted pre-publish ledger, requires its current package manifests to

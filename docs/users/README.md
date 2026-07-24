@@ -54,8 +54,8 @@ The released CodeStory executable includes its search model and embedding
 engine. When semantic work is needed, that exact executable automatically runs
 one hidden server for the current OS user over private local IPC. It does not
 download a model or backend, expose a TCP port, or use Docker. Apple Silicon
-uses Metal; supported Windows hardware uses Vulkan. Production never silently
-changes from GPU to CPU.
+uses Metal; supported Windows and Linux systems use Vulkan. Production never
+silently changes from GPU to CPU.
 
 Each repository has its own cache and publication identity. Compatible host
 processes share one warm embedding server, but every request still names its
@@ -69,13 +69,14 @@ is disabled unless the process opts into it.
 ## Platform summary
 
 <!-- codestory-public-support:start -->
-| Released package | Local map | Broad retrieval |
-| --- | --- | --- |
-| macOS 15+ on Apple Silicon | Yes | Metal |
-| Windows x64 | Yes | Vulkan |
-
-CodeStory 0.16 publishes only these managed package targets.
-Unshipped targets: linux-arm64, linux-x64, macos-x64, windows-arm64. Answer quality and performance are separate release non-claims.
+| Platform | Release support |
+| --- | --- |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
 <!-- codestory-public-support:end -->
 
 ## Everyday use

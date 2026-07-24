@@ -74,14 +74,14 @@ flowchart LR
 ## Platform support
 
 <!-- codestory-public-support:start -->
-| Released package | Local map | Broad retrieval |
-| --- | --- | --- |
-| macOS 15+ on Apple Silicon | Yes | Metal |
-| Windows x64 | Yes | Vulkan |
-| Linux x64 | Yes | Vulkan |
-
-CPU-only Windows and Linux are unsupported. Intel Mac and Windows ARM are
-unsupported. Answer quality and performance are separate release non-claims.
+| Platform | Release support |
+| --- | --- |
+| macOS 15+ on Apple Silicon | Supported with Metal |
+| Windows x64 | Supported with Vulkan |
+| Linux x64 | Supported with Vulkan |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
 <!-- codestory-public-support:end -->
 
 ## Example prompts

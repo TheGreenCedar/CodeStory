@@ -73,8 +73,9 @@ identity to the PR before accepting a future cutover.
 
 Hosted jobs may set `CODESTORY_EMBED_ALLOW_CPU=1` and must label the policy
 `cpu_explicit`. Apple Silicon evidence must use the packaged Metal executable.
-Windows hardware evidence must use the packaged Vulkan executable. Linux makes
-no GPU claim without protected Vulkan hardware.
+Windows and Linux hardware evidence must use their packaged Vulkan executables.
+The Linux claim requires `.github/workflows/linux-vulkan-proof.yml`; hosted CPU
+proof is insufficient.
 
 The packaged proof also requires offline clean-cache execution, the exact
 embedded-model digest, ggml build identity, physical adapter identity, timed

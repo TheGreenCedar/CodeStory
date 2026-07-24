@@ -1457,8 +1457,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(violations, object(packaged.with).emit_release_cells === true, `${releaseFile} packaged-proof must emit all package release cells`);
   add(
     violations,
-    object(packaged.with).scope === "desktop",
-    `${releaseFile} packaged-proof must build only the two desktop release targets`,
+    object(packaged.with).scope === "full",
+    `${releaseFile} packaged-proof must build the graph-declared release targets`,
   );
   for (const job of [packaged]) {
     for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
@@ -1519,6 +1519,22 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, "windows-vulkan-proof.yml", at(workflows.get("windows-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Windows retrieval-readiness release cell", [
     "--cell-id retrieval_readiness:windows-x64",
     "release-cell-postpublish-retrieval-windows-x64-attempt-$GITHUB_RUN_ATTEMPT",
+  ]);
+
+  const linuxVulkan = requireJob(violations, releaseFile, release, "linux-vulkan-proof");
+  add(violations, linuxVulkan.uses === "./.github/workflows/linux-vulkan-proof.yml", `${releaseFile} must call protected Linux Vulkan proof`);
+  add(violations, sameMembers(needs(linuxVulkan), releaseChain.dependencies["linux-vulkan-proof"]), `${releaseFile} Linux Vulkan proof dependencies must match the release claim graph`);
+  add(
+    violations,
+    object(linuxVulkan.with).candidate_installed_proof === true
+      && object(linuxVulkan.with).server_behavior_only === true
+      && object(linuxVulkan.with).emit_release_cells === true,
+    `${releaseFile} Linux proof must close Vulkan, retrieval, and candidate-installed claims`,
+  );
+  requireStepRun(violations, "linux-vulkan-proof.yml", at(workflows.get("linux-vulkan-proof.yml"), "jobs", "packaged-vulkan"), "Emit authenticated Linux Vulkan release cells", [
+    "--cell-id accelerator_execution:linux-x64-vulkan",
+    "--cell-id retrieval_readiness:linux-x64",
+    "--cell-id candidate_installed_behavior:linux-x64",
   ]);
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
@@ -1622,7 +1638,8 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepUses(violations, releaseFile, postCloseout, "Upload accepted post-publish closeout", "actions/upload-artifact@v7.0.1");
   for (const [jobName, job] of [
     ["Metal proof", metal],
-    ["Vulkan proof", vulkan],
+    ["Windows Vulkan proof", vulkan],
+    ["Linux Vulkan proof", linuxVulkan],
     ["post-publish proof", post],
   ]) {
     for (const key of ["calibration_bundle_artifact", "calibration_bundle_run_id"]) {
@@ -1641,59 +1658,25 @@ function expectedPackageRows(graph) {
 
 function validatePackageMatrixExpression(violations, expression, graph) {
   const match = typeof expression === "string" && expression.match(
-    /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'server' && '([^']+)' \|\| inputs\.scope == 'linux' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| inputs\.scope == 'desktop' && '([^']+)' \|\| '([^']+)'\)/u,
+    /fromJSON\(inputs\.calibration_mode && '([^']+)' \|\| inputs\.scope == 'server' && '([^']+)' \|\| inputs\.scope == 'linux' && '([^']+)' \|\| inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
   );
   if (!match) {
     violations.push("packaged-platform-proof.yml matrix must select structural JSON by scope");
     return;
   }
-  const linuxX64 = {
-    os: "ubuntu-latest",
-    rust_target: "x86_64-unknown-linux-gnu",
-    asset_target: "linux-x64",
-    exe_suffix: "",
-    extension: "tar.gz",
-  };
+  const linuxX64 = graph.workflow_policy.package_matrix.find(({ asset_target: target }) =>
+    target === "linux-x64");
   const windowsX64 = graph.workflow_policy.package_matrix.find(({ asset_target: target }) =>
     target === "windows-x64");
   const macosArm64 = graph.workflow_policy.package_matrix.find(({ asset_target: target }) =>
     target === "macos-arm64");
-  const macosX64 = {
-    os: "macos-15-intel",
-    rust_target: "x86_64-apple-darwin",
-    asset_target: "macos-x64",
-    exe_suffix: "",
-    extension: "tar.gz",
-  };
   const expected = [
     { include: [linuxX64] },
     { include: [linuxX64, macosArm64] },
     { include: [linuxX64] },
     { include: [windowsX64] },
-    { include: [macosX64, macosArm64] },
-    { include: [windowsX64, macosArm64] },
-    {
-      include: [
-        linuxX64,
-        {
-          os: "ubuntu-24.04-arm",
-          rust_target: "aarch64-unknown-linux-gnu",
-          asset_target: "linux-arm64",
-          exe_suffix: "",
-          extension: "tar.gz",
-        },
-        windowsX64,
-        {
-          os: "windows-11-arm",
-          rust_target: "aarch64-pc-windows-msvc",
-          asset_target: "windows-arm64",
-          exe_suffix: ".exe",
-          extension: "zip",
-        },
-        macosX64,
-        macosArm64,
-      ],
-    },
+    { include: [macosArm64] },
+    { include: expectedPackageRows(graph) },
   ];
   try {
     match.slice(1).forEach((json, index) => {
@@ -2946,6 +2929,99 @@ function validateRemainingWorkflows(workflows, violations) {
     );
   }
 
+  const linuxVulkanFile = "linux-vulkan-proof.yml";
+  const linuxVulkan = workflows.get(linuxVulkanFile);
+  if (!linuxVulkan) {
+    violations.push(`${linuxVulkanFile} must exist`);
+  } else {
+    add(
+      violations,
+      trigger(linuxVulkan, "workflow_call") !== undefined
+        && trigger(linuxVulkan, "workflow_dispatch") !== undefined,
+      `${linuxVulkanFile} must support reusable and manual proof`,
+    );
+    const job = requireJob(violations, linuxVulkanFile, linuxVulkan, "packaged-vulkan");
+    requireStepUses(
+      violations,
+      linuxVulkanFile,
+      job,
+      "Install pinned Python",
+      "actions/setup-python@v7.0.0",
+    );
+    requireStepRun(violations, linuxVulkanFile, job, "Capture Linux Vulkan host evidence", [
+      "uname -m",
+      "vulkaninfo --summary",
+      "test \"$(uname -m)\" = x86_64",
+    ]);
+    const packageDownload = namedStep(job, "Download exact Linux package");
+    add(
+      violations,
+      packageDownload?.uses === "actions/download-artifact@v8.0.1"
+        && object(packageDownload.with).name === "codestory-cli-linux-x64",
+      `${linuxVulkanFile} must consume the graph-declared Linux x64 package`,
+    );
+    requireCalibrationProducerAuthentication(violations, linuxVulkanFile, job);
+    const engine = namedStep(job, "Prove offline Linux Vulkan retrieval");
+    requireStepRun(violations, linuxVulkanFile, job, "Prove offline Linux Vulkan retrieval", [
+      "--engine-policy accelerated",
+      "--expected-backend Vulkan",
+      "--offline",
+      "--proof-tier protected_hardware",
+      "--qualification-matrix-cell protected_linux_x64_vulkan",
+      "--calibration-producer-run-id",
+      "--calibration-producer-artifact",
+    ]);
+    add(
+      violations,
+      object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
+      `${linuxVulkanFile} protected proof must reject CPU fallback`,
+    );
+    requireStepRun(violations, linuxVulkanFile, job, "Stage isolated candidate-managed Linux install", [
+      "--prepare-candidate-installed-proof",
+      "--candidate-plugin-root-output",
+      "--candidate-plugin-data-output",
+      "--installed-plugin-attestation-output",
+      "--candidate-producer-workflow-path",
+      "gh api",
+      "$RUNNER_TEMP/codestory-candidate-installed-linux.",
+      "CODESTORY_CANDIDATE_LINUX_ROOT=",
+    ]);
+    const candidate = namedStep(job, "Prove candidate-installed Linux Vulkan runtime");
+    requireStepRun(violations, linuxVulkanFile, job, "Prove candidate-installed Linux Vulkan runtime", [
+      "--engine-policy accelerated",
+      "--expected-backend Vulkan",
+      "--proof-tier installed_runtime",
+      "--qualification-matrix-cell candidate_installed_linux_x64_vulkan",
+      "--installed-plugin-attestation",
+      "--installed-plugin-data",
+      "--ground-only",
+    ]);
+    add(
+      violations,
+      object(candidate?.env).CODESTORY_EMBED_ALLOW_CPU === "0",
+      `${linuxVulkanFile} candidate-installed proof must reject CPU fallback`,
+    );
+    requireStepRun(violations, linuxVulkanFile, job, "Emit authenticated Linux Vulkan release cells", [
+      "accelerator_execution:linux-x64-vulkan",
+      "retrieval_readiness:linux-x64",
+      "candidate_installed_behavior:linux-x64",
+      "--producer-job packaged-vulkan",
+    ]);
+    for (const name of [
+      "Upload authenticated Linux accelerator release cell",
+      "Upload authenticated Linux retrieval release cell",
+      "Upload authenticated candidate-installed Linux release cell",
+    ]) {
+      requireStepUses(
+        violations,
+        linuxVulkanFile,
+        job,
+        name,
+        "actions/upload-artifact@v7.0.1",
+      );
+    }
+  }
+
   const statsFile = "repo-scale-stats.yml";
   const stats = workflows.get(statsFile);
   if (!stats) {
@@ -3152,6 +3228,9 @@ function validateReleaseCellUploadOwnership(workflows, violations) {
     "windows-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-windows-x64-vulkan-attempt-${{ github.run_attempt }}",
     "windows-vulkan-proof.yml/packaged-vulkan/release-cell-postpublish-retrieval-windows-x64-attempt-${{ github.run_attempt }}",
     "windows-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-candidate-installed-windows-x64-attempt-${{ github.run_attempt }}",
+    "linux-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-linux-x64-vulkan-attempt-${{ github.run_attempt }}",
+    "linux-vulkan-proof.yml/packaged-vulkan/release-cell-postpublish-retrieval-linux-x64-attempt-${{ github.run_attempt }}",
+    "linux-vulkan-proof.yml/packaged-vulkan/release-cell-prepublish-candidate-installed-linux-x64-attempt-${{ github.run_attempt }}",
     "post-publish-release-smoke.yml/smoke/release-cell-postpublish-${{ matrix.asset_target }}-attempt-${{ github.run_attempt }}",
   ];
   add(
@@ -3171,6 +3250,7 @@ function validateReleaseArtifactRerunSafety(workflows, violations) {
     "packaged-platform-proof.yml",
     "macos-metal-proof.yml",
     "windows-vulkan-proof.yml",
+    "linux-vulkan-proof.yml",
     "post-publish-release-smoke.yml",
     "release.yml",
   ]);
