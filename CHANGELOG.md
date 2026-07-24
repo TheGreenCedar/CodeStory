@@ -14,9 +14,9 @@ No Docker. No Python setup. No model download. No separate service to babysit.
 
 ### Install it and get to work
 
-CodeStory 0.16 launches on Apple Silicon Mac and Windows x64 as one
-self-contained download. The plugin starts CodeStory when you need it and gets
-out of the way when you do not.
+CodeStory 0.16 launches on Apple Silicon Mac, Windows x64 with Vulkan, and Linux
+x64 with Vulkan as self-contained downloads. The plugin starts CodeStory when
+you need it and gets out of the way when you do not.
 
 One private local model can stay warm across compatible CodeStory sessions,
 while every repository keeps its own index and state. Moving between projects
@@ -62,9 +62,14 @@ paths more accurately.
 
 ### Availability
 
-CodeStory 0.16 is available for Apple Silicon macOS and Windows x64.
-
-Linux, Intel Mac, and Windows ARM are not part of this release.
+| Platform | Release support |
+| --- | --- |
+| Apple Silicon macOS | Supported |
+| Windows x64 with Vulkan | Supported |
+| Linux x64 with Vulkan | Supported |
+| CPU-only Windows and Linux | Unsupported |
+| Intel Mac | Unsupported |
+| Windows ARM | Unsupported |
 
 ### Upgrade
 
