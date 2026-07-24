@@ -6,14 +6,14 @@ from .contract_primitives import require_exact_keys
 from .foundation import require
 
 _EXPECTED_CONSTANT_ORDER = [
-        "connect_timeout_ms",
-        "spawn_convergence_timeout_ms",
-        "hard_native_no_progress_ms",
-        "watchdog_cadence_ms",
-        "request_deadlines_ms",
-        "capacity_retry_policy",
-        "election_backoff_policy",
-    ]
+    "connect_timeout_ms",
+    "spawn_convergence_timeout_ms",
+    "hard_native_no_progress_ms",
+    "watchdog_cadence_ms",
+    "request_deadlines_ms",
+    "capacity_retry_policy",
+    "election_backoff_policy",
+]
 
 
 def _verify_constant_sources(constant_selection: dict) -> None:
@@ -38,7 +38,10 @@ def _verify_constant_sources(constant_selection: dict) -> None:
             and cell.get("artifact") == "measurements.raw.json"
             and isinstance(cell.get("operand"), str)
             and bool(cell["operand"])
-            and (isinstance(cell.get("metric"), str) or isinstance(cell.get("metrics"), list))
+            and (
+                isinstance(cell.get("metric"), str)
+                or isinstance(cell.get("metrics"), list)
+            )
             for cell in source_cells.values()
         ),
         "production constants do not name their exact raw source cells",
@@ -60,8 +63,7 @@ def _verify_constant_sources(constant_selection: dict) -> None:
 def _verify_constant_formulas(constant_selection: dict) -> None:
     formulas = constant_selection["formulas"]
     require(
-        isinstance(formulas, dict)
-        and set(formulas) == set(_EXPECTED_CONSTANT_ORDER),
+        isinstance(formulas, dict) and set(formulas) == set(_EXPECTED_CONSTANT_ORDER),
         "production-constant formulas are incomplete",
     )
     expected_formula_fragments = {
@@ -77,17 +79,17 @@ def _verify_constant_formulas(constant_selection: dict) -> None:
             f"production-constant formula {field} changed",
         )
     require(
-        formulas["request_deadlines_ms"].get("query_request_deadline_ms", {}).get(
-            "formula"
-        )
+        formulas["request_deadlines_ms"]
+        .get("query_request_deadline_ms", {})
+        .get("formula")
         == "max(1,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
-        and formulas["request_deadlines_ms"].get("bulk_request_deadline_ms", {}).get(
-            "replay_success_budget_formula"
-        )
+        and formulas["request_deadlines_ms"]
+        .get("bulk_request_deadline_ms", {})
+        .get("replay_success_budget_formula")
         == "max(query_request_deadline_ms,ceiling(maximum_raw_value_ms_across_all_selected_samples*1.50))"
-        and formulas["request_deadlines_ms"].get("bulk_request_deadline_ms", {}).get(
-            "formula"
-        )
+        and formulas["request_deadlines_ms"]
+        .get("bulk_request_deadline_ms", {})
+        .get("formula")
         == "hard_native_no_progress_ms+watchdog_cadence_ms+spawn_convergence_timeout_ms+bulk_replay_success_budget_ms",
         "request-deadline selection formulas changed",
     )
@@ -201,7 +203,11 @@ def _verify_thresholds_and_clock(protocol: dict) -> None:
         "measurement calibration-bundle contract is incomplete or mutable",
     )
     clock_policy = protocol.get("clock_policy")
-    suspend = clock_policy.get("suspend_detection") if isinstance(clock_policy, dict) else None
+    suspend = (
+        clock_policy.get("suspend_detection")
+        if isinstance(clock_policy, dict)
+        else None
+    )
     require(
         isinstance(clock_policy, dict)
         and clock_policy.get("cross_process_timestamp_subtraction") is False

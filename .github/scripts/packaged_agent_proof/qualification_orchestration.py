@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
-from .contracts import require_exact_keys, require_nonempty_string, require_nonnegative_int, require_positive_int
+from .contracts import (
+    require_exact_keys,
+    require_nonempty_string,
+    require_nonnegative_int,
+    require_positive_int,
+    require_sha256,
+)
 from .foundation import require
 from .qualification_artifact_types import QualificationOrchestration
+
 
 def _qualification_invocations(
     value: object,

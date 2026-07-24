@@ -106,9 +106,7 @@ def calibration_run_output(
             "constant_set_sha256"
         ],
     }
-    metrics = json.loads(
-        json.dumps(measurements.measurement["payload"]["metrics"])
-    )
+    metrics = json.loads(json.dumps(measurements.measurement["payload"]["metrics"]))
     metrics["total_codestory_process_memory"] = {
         "unit": "bytes",
         "samples": _calibration_memory_samples(measurements.memory),
@@ -119,9 +117,7 @@ def calibration_run_output(
         "matrix_cell_id": runner.matrix_cell_id,
         "run_index": run_index,
         "host_fingerprint": measurements.host["fingerprint"],
-        "measurement_artifact_sha256": measurements.measurement["artifact"][
-            "sha256"
-        ],
+        "measurement_artifact_sha256": measurements.measurement["artifact"]["sha256"],
         "memory_artifact_sha256": measurements.memory["artifact"]["sha256"],
     }
     run_id = canonical_sha256(identity_seed)

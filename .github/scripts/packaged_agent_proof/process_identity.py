@@ -106,7 +106,9 @@ def _linux_process_start_identity(pid: int) -> str:
     fields = stat.rsplit(") ", 1)
     require(len(fields) == 2, f"/proc/{pid}/stat omitted process start identity")
     process_fields = fields[1].split()
-    require(len(process_fields) > 19, f"/proc/{pid}/stat omitted process start identity")
+    require(
+        len(process_fields) > 19, f"/proc/{pid}/stat omitted process start identity"
+    )
     return f"linux:{process_fields[19]}"
 
 
@@ -143,7 +145,9 @@ def process_start_identity(pid: int) -> str:
         capture_output=True,
         timeout=20,
     )
-    require(completed.returncode == 0, f"could not read process start identity for {pid}")
+    require(
+        completed.returncode == 0, f"could not read process start identity for {pid}"
+    )
     return "unix:" + require_nonempty_string(
         completed.stdout.strip(),
         "process start identity",
@@ -299,10 +303,16 @@ class ExactProcessExitWaiter:
         )
         if target_os == "windows":
             kernel = ctypes.windll.kernel32
-            kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel.OpenProcess.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            ]
             kernel.OpenProcess.restype = ctypes.c_void_p
             self.handle = kernel.OpenProcess(0x00100000 | 0x1000, 0, pid)
-            require(bool(self.handle), f"could not open exact process {pid} for exit wait")
+            require(
+                bool(self.handle), f"could not open exact process {pid} for exit wait"
+            )
         try:
             require(
                 process_start_identity(pid) == self.expected_start_id,

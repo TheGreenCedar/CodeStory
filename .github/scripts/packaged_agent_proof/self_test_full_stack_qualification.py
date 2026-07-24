@@ -82,10 +82,7 @@ def _scenario_evidence(measurement_contract: dict) -> dict:
     return {
         scenario_id: {
             "status": "pass",
-            "assertions": {
-                assertion: True
-                for assertion in contract["required"]
-            },
+            "assertions": {assertion: True for assertion in contract["required"]},
             "artifacts": [
                 {
                     "name": f"{scenario_id}.json",

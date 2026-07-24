@@ -5,10 +5,23 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .foundation import FAULT_RECOVERY_CONSISTENCY_CONTRACT, PUBLICATION_FAULT_EVIDENCE_CONTRACT, require
+from .foundation import (
+    FAULT_RECOVERY_CONSISTENCY_CONTRACT,
+    PUBLICATION_FAULT_EVIDENCE_CONTRACT,
+    require,
+)
 from .process import json_command
-from .publication_fault_types import PublicationCommands, PublicationFaultRun, PublicationFixture
-from .publication_protocol import publication_identity_from_status, run_quality_search, server_observation_from_control_event
+from .publication_fault_types import (
+    PublicationCommands,
+    PublicationFaultRun,
+    PublicationFixture,
+)
+from .publication_protocol import (
+    publication_identity_from_status,
+    run_quality_search,
+    server_observation_from_control_event,
+)
+
 
 def _post_fault_observations(
     cli: Path,
@@ -40,10 +53,10 @@ def _post_fault_observations(
         ranks.append(rank)
         if first_search_sha256 is None:
             first_search_sha256 = output_sha256
-    require(first_search_sha256 is not None, "qualification search emitted no output digest")
-    status_sha256 = hashlib.sha256(
-        status_result["stdout"].encode("utf-8")
-    ).hexdigest()
+    require(
+        first_search_sha256 is not None, "qualification search emitted no output digest"
+    )
+    status_sha256 = hashlib.sha256(status_result["stdout"].encode("utf-8")).hexdigest()
     return status, publication, ranks, status_sha256, first_search_sha256
 
 

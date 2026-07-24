@@ -6,11 +6,6 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .foundation import (
-    EXTERNAL_QUALIFICATION_METRICS,
-    TARGET_CONTRACTS,
-    require,
-)
 from .contracts import (
     qualification_measurement_sample_value,
     require_exact_keys,
@@ -19,6 +14,11 @@ from .contracts import (
     require_opaque_identifier,
     require_positive_int,
     selected_qualification_matrix_cell,
+)
+from .foundation import (
+    EXTERNAL_QUALIFICATION_METRICS,
+    TARGET_CONTRACTS,
+    require,
 )
 from .qualification_documents import (
     PrivateJsonArtifact,
@@ -195,9 +195,7 @@ def _measurement_validation_contract(
         raw_metric_names=frozenset(
             set(protocol["required_metrics"]) - EXTERNAL_QUALIFICATION_METRICS
         ),
-        allowed_awake_apis=frozenset(
-            clock_policy["platform_apis"][target_os]
-        ),
+        allowed_awake_apis=frozenset(clock_policy["platform_apis"][target_os]),
         inclusive_api=suspend_contract["platform_apis"][target_os],
         maximum_suspend_ns=require_nonnegative_int(
             suspend_contract["maximum_inclusive_minus_awake_ns"],
@@ -252,8 +250,7 @@ def _qualification_measurement_sample(
     )
     require(
         sample["cache_state"] == validation.matrix_cell["cache_state"]
-        and sample["residency_state"]
-        == validation.matrix_cell["residency_state"],
+        and sample["residency_state"] == validation.matrix_cell["residency_state"],
         f"qualification measurement {metric} changed cache or residency state",
     )
     server_identity = sample["server_identity"]
@@ -316,8 +313,7 @@ def _qualification_metric_measurement(
     samples = record["samples"]
     sample_policy = validation.protocol["metric_sampling"][metric]
     require(
-        isinstance(samples, list)
-        and len(samples) == sample_policy["sample_count"],
+        isinstance(samples, list) and len(samples) == sample_policy["sample_count"],
         f"qualification measurement {metric} sample count changed",
     )
     normalized = tuple(
@@ -361,8 +357,7 @@ def _qualification_measurements(
 ) -> tuple[QualificationMetricMeasurement, ...]:
     metrics = payload["metrics"]
     require(
-        isinstance(metrics, dict)
-        and set(metrics) == validation.raw_metric_names,
+        isinstance(metrics, dict) and set(metrics) == validation.raw_metric_names,
         "qualification measurements did not contain exactly the 12 product-path metrics",
     )
     return tuple(

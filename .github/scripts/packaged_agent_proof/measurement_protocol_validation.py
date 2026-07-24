@@ -5,8 +5,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .contract_primitives import require_exact_keys, require_nonempty_string, require_positive_int
-from .foundation import LOWER_TIER_NONCLAIMS, MIN_RETRIEVAL_QUALITY_REPEATS, QUALIFICATION_SCHEMA_VERSION, REQUIRED_SERVER_SCENARIOS, RETRIEVAL_QUALITY_EVIDENCE_CONTRACT, ProofFailure, require
+from .contract_primitives import (
+    require_exact_keys,
+    require_nonempty_string,
+    require_positive_int,
+)
+from .foundation import (
+    LOWER_TIER_NONCLAIMS,
+    MIN_RETRIEVAL_QUALITY_REPEATS,
+    QUALIFICATION_SCHEMA_VERSION,
+    REQUIRED_SERVER_SCENARIOS,
+    RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+    ProofFailure,
+    require,
+)
+
 
 def _measurement_document(path: Path) -> dict:
     require(path.is_file(), f"measurement protocol is missing: {path}")
@@ -40,7 +53,10 @@ def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dic
             and isinstance(contract["required"], list)
             and bool(contract["required"])
             and len(set(contract["required"])) == len(contract["required"])
-            and all(isinstance(assertion, str) and assertion for assertion in contract["required"]),
+            and all(
+                isinstance(assertion, str) and assertion
+                for assertion in contract["required"]
+            ),
             f"measurement scenario {scenario} assertion contract is malformed",
         )
     require(
@@ -68,13 +84,18 @@ def _verify_scenario_and_metric_contracts(protocol: dict) -> tuple[set[str], dic
         "measurement protocol metric contracts do not match its required metrics",
     )
     for metric, contract in metric_contracts.items():
-        require(isinstance(contract, dict), f"measurement metric {metric} contract is malformed")
+        require(
+            isinstance(contract, dict),
+            f"measurement metric {metric} contract is malformed",
+        )
         require(
             contract.get("comparison")
             in {"equal", "greater_than_or_equal", "less_than_or_equal"},
             f"measurement metric {metric} has an unsupported comparison",
         )
-        require_nonempty_string(contract.get("unit"), f"measurement metric {metric} unit")
+        require_nonempty_string(
+            contract.get("unit"), f"measurement metric {metric} unit"
+        )
     comparison_basis = protocol.get("comparison_basis")
     require(
         isinstance(comparison_basis, dict)
@@ -110,7 +131,9 @@ def _verify_host_package_matrix(matrix: dict) -> None:
     observed_matrix: set[tuple[str, str, str, str, str]] = set()
     for cell_id, cell in matrix.items():
         require_nonempty_string(cell_id, "measurement host/package matrix cell id")
-        require(isinstance(cell, dict), f"measurement matrix cell {cell_id} is malformed")
+        require(
+            isinstance(cell, dict), f"measurement matrix cell {cell_id} is malformed"
+        )
         require_exact_keys(
             cell,
             {
@@ -125,7 +148,9 @@ def _verify_host_package_matrix(matrix: dict) -> None:
             },
             f"measurement matrix cell {cell_id}",
         )
-        require_nonempty_string(cell["host_class"], f"measurement matrix cell {cell_id}.host_class")
+        require_nonempty_string(
+            cell["host_class"], f"measurement matrix cell {cell_id}.host_class"
+        )
         require(
             cell["cache_state"] == "reused" and cell["residency_state"] == "resident",
             f"measurement matrix cell {cell_id} changed cache or residency state",
@@ -206,7 +231,9 @@ def _verify_calibration_matrix(matrix: dict, calibration_matrix: object) -> None
 
 def _verify_measurement_matrices(protocol: dict) -> None:
     matrix = protocol.get("host_package_matrix")
-    require(isinstance(matrix, dict), "measurement protocol omitted its host/package matrix")
+    require(
+        isinstance(matrix, dict), "measurement protocol omitted its host/package matrix"
+    )
     _verify_host_package_matrix(matrix)
     _verify_calibration_matrix(matrix, protocol.get("calibration_matrix"))
 
@@ -222,10 +249,18 @@ def _verify_measurement_sampling(
         "measurement workloads do not match required metrics",
     )
     for metric, workload in workloads.items():
-        require(isinstance(workload, dict), f"measurement workload {metric} is malformed")
-        require_nonempty_string(workload.get("workload_id"), f"measurement workload {metric}.workload_id")
-        require_nonempty_string(workload.get("owner_state"), f"measurement workload {metric}.owner_state")
-        require_nonempty_string(workload.get("operation"), f"measurement workload {metric}.operation")
+        require(
+            isinstance(workload, dict), f"measurement workload {metric} is malformed"
+        )
+        require_nonempty_string(
+            workload.get("workload_id"), f"measurement workload {metric}.workload_id"
+        )
+        require_nonempty_string(
+            workload.get("owner_state"), f"measurement workload {metric}.owner_state"
+        )
+        require_nonempty_string(
+            workload.get("operation"), f"measurement workload {metric}.operation"
+        )
         require_nonempty_string(
             workload.get("input_generator"),
             f"measurement workload {metric}.input_generator",
@@ -236,7 +271,9 @@ def _verify_measurement_sampling(
         "measurement sample policy does not match required metrics",
     )
     for metric, policy in sampling.items():
-        require(isinstance(policy, dict), f"measurement sample policy {metric} is malformed")
+        require(
+            isinstance(policy, dict), f"measurement sample policy {metric} is malformed"
+        )
         count = require_positive_int(
             policy.get("sample_count"),
             f"measurement sample policy {metric}.sample_count",
@@ -249,7 +286,8 @@ def _verify_measurement_sampling(
             require(
                 count == MIN_RETRIEVAL_QUALITY_REPEATS
                 and aggregation == "all_rows_pass_rate"
-                and policy.get("external_contract") == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
+                and policy.get("external_contract")
+                == RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
                 "retrieval quality sample policy changed",
             )
         elif metric in {

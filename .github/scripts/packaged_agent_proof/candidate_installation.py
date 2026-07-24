@@ -9,7 +9,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .archive import expected_archive_digest, find_cli, load_native_manifest, unpack_archive
+from .archive import (
+    expected_archive_digest,
+    find_cli,
+    load_native_manifest,
+    unpack_archive,
+)
 from .contracts import sha256, write_json
 from .foundation import CANDIDATE_PRODUCER_WORKFLOW_PATHS, REPOSITORY_ROOT, require
 from .installation_support import directory_contract_sha256, same_existing_path
@@ -176,7 +181,8 @@ def prepare_candidate_installed_proof(args: argparse.Namespace) -> dict:
     attestation_output = args.installed_plugin_attestation_output.resolve()
     producer = _candidate_producer(args, archive)
     require(
-        sha256(archive) == expected_archive_digest(args.checksum_file.resolve(), archive),
+        sha256(archive)
+        == expected_archive_digest(args.checksum_file.resolve(), archive),
         "candidate install archive checksum mismatch",
     )
     require(

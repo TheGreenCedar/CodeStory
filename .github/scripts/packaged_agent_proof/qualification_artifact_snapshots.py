@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-from .contracts import require_exact_keys, require_nonempty_string, require_nonnegative_int, require_positive_int
+from .contracts import (
+    require_exact_keys,
+    require_nonempty_string,
+    require_nonnegative_int,
+    require_positive_int,
+)
 from .foundation import SERVER_LIFECYCLES, require
-from .qualification_artifact_types import QualificationControlEvidence, QualificationOrchestration
+from .qualification_artifact_types import (
+    QualificationControlEvidence,
+    QualificationOrchestration,
+)
+
 
 def _validate_qualification_clock(
     clock: object,
@@ -75,8 +84,7 @@ def _validate_snapshot_identity(
         f"{field}.process does not match the exact packaged executable",
     )
     require(
-        scheduler.get("query_capacity") == 64
-        and scheduler.get("bulk_capacity") == 64,
+        scheduler.get("query_capacity") == 64 and scheduler.get("bulk_capacity") == 64,
         f"{field} queue capacities differ from the bound contract",
     )
 
@@ -100,8 +108,7 @@ def _validated_qualification_snapshot(
         "scheduler",
     }
     require(
-        required <= set(snapshot)
-        and set(snapshot) <= required | {"engine", "failure"},
+        required <= set(snapshot) and set(snapshot) <= required | {"engine", "failure"},
         f"{field} fields differ from the raw snapshot contract",
     )
     require(snapshot["schema_version"] == 1, f"{field} schema is unsupported")
@@ -280,8 +287,7 @@ def _validate_present_process_observation(
         observation["server_instance_id"] == snapshot["process"]["server_instance_id"]
         and observation["pid"] == snapshot["process"]["pid"]
         and observation["process_start_id"] == snapshot["process"]["process_start_id"]
-        and observation["executable_sha256"]
-        == snapshot["process"]["executable_sha256"]
+        and observation["executable_sha256"] == snapshot["process"]["executable_sha256"]
         and observation["executable_version"]
         == snapshot["process"]["executable_version"]
         and observation["endpoint_namespace_id"]

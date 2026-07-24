@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .foundation import (
-    require,
-)
 from .contracts import (
     require_exact_keys,
     require_nonempty_string,
     require_nonnegative_int,
+)
+from .foundation import (
+    require,
 )
 
 
@@ -199,8 +199,7 @@ class ScenarioAssertionEvidence:
             materialization=materialization,
             snapshots=snapshots,
             snapshot_instances=frozenset(
-                snapshot["process"]["server_instance_id"]
-                for snapshot in snapshots
+                snapshot["process"]["server_instance_id"] for snapshot in snapshots
             ),
             snapshot_authorities=frozenset(
                 (

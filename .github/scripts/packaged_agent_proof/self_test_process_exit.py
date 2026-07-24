@@ -67,10 +67,8 @@ def _exit_budget_tests() -> dict[str, int]:
         "native server exit-wait budget self-test failed",
     )
     require(
-        remaining_native_server_exit_wait_ms(120.0, 120_000, now=0.0)
-        == 120_000
-        and remaining_native_server_exit_wait_ms(120.0, 120_000, now=60.0)
-        == 60_000,
+        remaining_native_server_exit_wait_ms(120.0, 120_000, now=0.0) == 120_000
+        and remaining_native_server_exit_wait_ms(120.0, 120_000, now=60.0) == 60_000,
         "native server shared exit-wait deadline self-test failed",
     )
     try:

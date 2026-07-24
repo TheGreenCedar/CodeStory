@@ -9,7 +9,12 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
-from .foundation import LEGACY_TOKENS, QUALIFICATION_SCHEMA_VERSION, ProofFailure, require
+from .foundation import (
+    LEGACY_TOKENS,
+    QUALIFICATION_SCHEMA_VERSION,
+    ProofFailure,
+    require,
+)
 
 
 def directory_contract_sha256(root: Path) -> str:
@@ -18,7 +23,10 @@ def directory_contract_sha256(root: Path) -> str:
     files = sorted(path for path in root.rglob("*") if path.is_file())
     require(files, "plugin package root is empty")
     for path in files:
-        require(not path.is_symlink(), f"installed plugin package contains a symlink: {path}")
+        require(
+            not path.is_symlink(),
+            f"installed plugin package contains a symlink: {path}",
+        )
         relative = path.relative_to(root).as_posix().encode("utf-8")
         payload = path.read_bytes()
         digest.update(len(relative).to_bytes(8, "little"))
@@ -63,7 +71,9 @@ def run_parallel(tasks: dict[str, Callable[[], object]]) -> dict[str, object]:
     return results
 
 
-def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[str, str]:
+def isolated_environment(
+    root: Path, policy: str | None, offline: bool
+) -> dict[str, str]:
     env = dict(os.environ)
     home = root / "home"
     cache = root / "cache"
@@ -102,7 +112,9 @@ def isolated_environment(root: Path, policy: str | None, offline: bool) -> dict[
     return env
 
 
-def qualification_environment(root: Path, env: dict[str, str]) -> tuple[dict[str, str], dict]:
+def qualification_environment(
+    root: Path, env: dict[str, str]
+) -> tuple[dict[str, str], dict]:
     proof_root = (root / "qualification").resolve()
     proof_root.mkdir(parents=True, exist_ok=True)
     proof_root.chmod(0o700)
@@ -120,9 +132,14 @@ def assert_no_legacy_state(cache_root: Path) -> None:
     offenders = []
     for path in cache_root.rglob("*"):
         lowered = path.name.lower()
-        if any(token in lowered for token in LEGACY_TOKENS) or path.suffix.lower() == ".pid":
+        if (
+            any(token in lowered for token in LEGACY_TOKENS)
+            or path.suffix.lower() == ".pid"
+        ):
             offenders.append(str(path))
-    require(not offenders, "legacy process state was created: " + ", ".join(offenders[:10]))
+    require(
+        not offenders, "legacy process state was created: " + ", ".join(offenders[:10])
+    )
 
 
 def create_second_repository(root: Path) -> Path:
@@ -133,7 +150,7 @@ def create_second_repository(root: Path) -> Path:
         encoding="utf-8",
     )
     (repo / "lib.rs").write_text(
-        "pub fn shared_engine_probe() -> &'static str { \"warm\" }\n",
+        'pub fn shared_engine_probe() -> &\'static str { "warm" }\n',
         encoding="utf-8",
     )
     return repo

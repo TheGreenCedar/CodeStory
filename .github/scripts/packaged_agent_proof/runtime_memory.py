@@ -26,7 +26,9 @@ def _write_memory_payload(
     contracts: dict,
     forbidden_values: list[str],
 ) -> tuple[str, dict, bytes]:
-    require(isinstance(raw, dict), "live runtime omitted five-process memory observations")
+    require(
+        isinstance(raw, dict), "live runtime omitted five-process memory observations"
+    )
     require_exact_keys(
         raw,
         {"evidence_contract", "metric", "unit", "samples"},
@@ -124,7 +126,9 @@ def _verify_memory_sample(
     expected_measurement_api: str,
     sample_ids: set[str],
 ) -> tuple[dict, tuple[str, str, int]]:
-    require(isinstance(sample, dict), f"five-process memory sample {index} is malformed")
+    require(
+        isinstance(sample, dict), f"five-process memory sample {index} is malformed"
+    )
     require_exact_keys(
         sample,
         {
@@ -244,9 +248,7 @@ def retain_five_process_memory_evidence(
                 phase_boundaries=protocol["phase_boundaries"],
                 allowed_awake_apis=set(clock_policy["platform_apis"][target_os]),
                 inclusive_api=suspend_contract["platform_apis"][target_os],
-                maximum_suspend_ns=suspend_contract[
-                    "maximum_inclusive_minus_awake_ns"
-                ],
+                maximum_suspend_ns=suspend_contract["maximum_inclusive_minus_awake_ns"],
                 expected_policy=expected_policy,
                 expected_backend=expected_backend,
             )

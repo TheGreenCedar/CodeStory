@@ -9,6 +9,7 @@ from .calibration_records import CalibrationAccumulator, CalibrationBundle
 from .contracts import canonical_sha256, sha256
 from .foundation import require
 
+
 def _calibration_freeze(
     bundle: CalibrationBundle,
     accumulator: CalibrationAccumulator,

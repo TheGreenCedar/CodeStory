@@ -9,9 +9,20 @@ from pathlib import Path
 
 from .contracts import write_private_json
 from .foundation import require
-from .publication_fault_types import PublicationCandidate, PublicationCommands, PublicationFaultRun, PublicationFixture
-from .publication_protocol import read_jsonl, run_publication_replacement_worker, send_server_qualification_control, wait_for_jsonl_event
 from .publication_fault_setup import _restore_fixture
+from .publication_fault_types import (
+    PublicationCandidate,
+    PublicationCommands,
+    PublicationFaultRun,
+    PublicationFixture,
+)
+from .publication_protocol import (
+    read_jsonl,
+    run_publication_replacement_worker,
+    send_server_qualification_control,
+    wait_for_jsonl_event,
+)
+
 
 def _start_fault_candidate(
     env: dict[str, str],
@@ -90,8 +101,10 @@ def _run_fault(
     try:
         wait_for_jsonl_event(
             candidate.event_path,
-            lambda event: event.get("action") == "pause_before_manifest_commit"
-            and event.get("status") == "waiting_for_resume",
+            lambda event: (
+                event.get("action") == "pause_before_manifest_commit"
+                and event.get("status") == "waiting_for_resume"
+            ),
             timeout=timeout,
             process=candidate.process,
         )

@@ -79,9 +79,7 @@ def _qualification_host(
         "runtime engine residency",
     )
     platform = (
-        f"{sys.platform}:{os.uname().machine}"
-        if hasattr(os, "uname")
-        else sys.platform
+        f"{sys.platform}:{os.uname().machine}" if hasattr(os, "uname") else sys.platform
     )
     return {
         "fingerprint": canonical_sha256(
@@ -235,9 +233,7 @@ def collect_qualification_measurements(
             memory=memory,
         )
         for metric in sorted(
-            context.measurement_contract["measurement_protocol"][
-                "required_metrics"
-            ]
+            context.measurement_contract["measurement_protocol"]["required_metrics"]
         )
     }
     return QualificationMeasurementEvidence(

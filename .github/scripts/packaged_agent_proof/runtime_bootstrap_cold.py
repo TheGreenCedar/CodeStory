@@ -8,8 +8,15 @@ import time
 from .contracts import require_nonempty_string
 from .foundation import project_node_resource_uri, require, resource_uri_matches
 from .installation import run_parallel
-from .process import assert_public_status, engine_identity, pin_temporary_package_server, server_snapshot, shared_server_identity
+from .process import (
+    assert_public_status,
+    engine_identity,
+    pin_temporary_package_server,
+    server_snapshot,
+    shared_server_identity,
+)
 from .runtime_bootstrap_types import ColdProof, HostPair, RuntimeSetup
+
 
 def _cold_shared_proof(
     args: argparse.Namespace,
@@ -50,8 +57,12 @@ def _cold_shared_proof(
     wall_ms = round((time.perf_counter() - started) * 1000, 3)
     diagnostics_a = hosts.host_a.engine_diagnostics(setup.project_a, "diagnostics-a")
     diagnostics_b = hosts.host_b.engine_diagnostics(setup.project_b, "diagnostics-b")
-    identity_a = engine_identity(diagnostics_a, args.engine_policy, args.expected_backend)
-    identity_b = engine_identity(diagnostics_b, args.engine_policy, args.expected_backend)
+    identity_a = engine_identity(
+        diagnostics_a, args.engine_policy, args.expected_backend
+    )
+    identity_b = engine_identity(
+        diagnostics_b, args.engine_policy, args.expected_backend
+    )
     snapshot_a = server_snapshot(diagnostics_a, manifest, require_resident=True)
     snapshot_b = server_snapshot(diagnostics_b, manifest, require_resident=True)
     shared_identity = shared_server_identity(snapshot_a, snapshot_b)
@@ -99,7 +110,9 @@ def _cold_shared_proof(
     )
 
 
-def _snippet_contract(setup: RuntimeSetup, hosts: HostPair, cold: ColdProof) -> tuple[dict, int]:
+def _snippet_contract(
+    setup: RuntimeSetup, hosts: HostPair, cold: ColdProof
+) -> tuple[dict, int]:
     search = cold.results["search-b"][0]["result"]["structuredContent"]
     linked_hit = next(
         (
@@ -133,7 +146,9 @@ def _snippet_contract(setup: RuntimeSetup, hosts: HostPair, cold: ColdProof) -> 
         isinstance(linked_uri, str) and resource_uri_matches(expected_uri, linked_uri),
         "packaged search returned a missing or noncanonical project-bound snippet link",
     )
-    resource_node = hosts.host_b.resource(linked_uri, "snippet-resource-contract").get("node")
+    resource_node = hosts.host_b.resource(linked_uri, "snippet-resource-contract").get(
+        "node"
+    )
     require(
         isinstance(resource_node, dict) and resource_node.get("id") == linked_node_id,
         "project-bound snippet resource returned a different node",
@@ -157,7 +172,9 @@ def _snippet_contract(setup: RuntimeSetup, hosts: HostPair, cold: ColdProof) -> 
         snippet.get("requested_context") == 0,
         f"packaged snippet ignored the bounded lines alias: {snippet!r}",
     )
-    require_nonempty_string(snippet.get("range_source"), "packaged function-body snippet range source")
+    require_nonempty_string(
+        snippet.get("range_source"), "packaged function-body snippet range source"
+    )
     require(
         setup.query_b in snippet.get("snippet", ""),
         f"packaged function-body snippet omitted the selected symbol: {snippet!r}",

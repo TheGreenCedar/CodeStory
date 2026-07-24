@@ -17,9 +17,17 @@ def verify_managed_runtime_status(
     archive_sha256: str,
 ) -> dict:
     plugin = status.get("plugin_runtime")
-    require(isinstance(plugin, dict), "installed status omitted plugin_runtime provenance")
-    require(plugin.get("cli_source") == "managed", "installed proof did not use the managed runtime")
-    require(plugin.get("local_dev_override") is False, "installed proof used a local CLI override")
+    require(
+        isinstance(plugin, dict), "installed status omitted plugin_runtime provenance"
+    )
+    require(
+        plugin.get("cli_source") == "managed",
+        "installed proof did not use the managed runtime",
+    )
+    require(
+        plugin.get("local_dev_override") is False,
+        "installed proof used a local CLI override",
+    )
     require(
         plugin.get("plugin_version") == manifest["release_version"],
         "installed plugin version does not match the package",

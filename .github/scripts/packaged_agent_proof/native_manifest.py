@@ -60,7 +60,10 @@ def _manifest_document(root: Path, expected_version: str) -> dict:
     except json.JSONDecodeError as exc:
         raise ProofFailure(f"native engine manifest is not valid JSON: {exc}") from exc
     require(isinstance(manifest, dict), "native engine manifest is not an object")
-    require(manifest.get("schema_version") == 3, "native engine manifest schema is unsupported")
+    require(
+        manifest.get("schema_version") == 3,
+        "native engine manifest schema is unsupported",
+    )
     require(
         manifest.get("release_version") == expected_version,
         "native engine manifest version does not match expected release",
@@ -81,7 +84,10 @@ def _manifest_parts(manifest: dict) -> ManifestParts:
             and all(char in "0123456789abcdef" for char in value),
             f"native engine manifest source {field} is invalid",
         )
-    require(source.get("tracked_dirty") is False, "native engine manifest was built from tracked changes")
+    require(
+        source.get("tracked_dirty") is False,
+        "native engine manifest was built from tracked changes",
+    )
     fields = (
         ("engine", "engine descriptor", dict),
         ("model", "model descriptor", dict),
@@ -119,7 +125,10 @@ def _runtime_artifact_paths(
 ) -> list[Path]:
     paths = []
     for descriptor in descriptors:
-        require(isinstance(descriptor, dict), "native runtime artifact descriptor is invalid")
+        require(
+            isinstance(descriptor, dict),
+            "native runtime artifact descriptor is invalid",
+        )
         name = descriptor.get("name")
         require(
             isinstance(name, str) and name == Path(name).name,
@@ -153,7 +162,10 @@ def _native_inventory(
         cli.name == target_contract["binary_name"],
         "packaged executable name does not match asset target",
     )
-    require(parts.binary.get("name") == cli.name, "native engine manifest names a different binary")
+    require(
+        parts.binary.get("name") == cli.name,
+        "native engine manifest names a different binary",
+    )
     cli_sha256 = sha256(cli)
     require(
         parts.binary.get("sha256") == cli_sha256,
@@ -263,8 +275,14 @@ def _verify_engine(
     target_contract: dict,
 ) -> None:
     engine = parts.engine
-    require(engine.get("linkage") == target_contract["linkage"], "packaged native engine linkage is wrong")
-    require(build_fields["linkage"] == engine["linkage"], "native build linkage contradicts manifest")
+    require(
+        engine.get("linkage") == target_contract["linkage"],
+        "packaged native engine linkage is wrong",
+    )
+    require(
+        build_fields["linkage"] == engine["linkage"],
+        "native build linkage contradicts manifest",
+    )
     require(
         engine.get("backend_loading") == target_contract["backend_loading"],
         "packaged native backend loading mode is wrong",
@@ -280,7 +298,10 @@ def _verify_engine(
         and all(isinstance(item, str) and item for item in compiled_backends),
         "native manifest has no compiled backend set",
     )
-    require(compiled_backends[0] == "cpu", "native manifest does not make CPU capability explicit")
+    require(
+        compiled_backends[0] == "cpu",
+        "native manifest does not make CPU capability explicit",
+    )
     require(
         build_fields["backends"].split(",") == compiled_backends,
         "native build backend set contradicts manifest",
@@ -323,8 +344,14 @@ def _verify_model(
         and all(char in "0123456789abcdefABCDEF" for char in model_digest),
         "native manifest lacks an exact model digest",
     )
-    require(parts.model.get("embedded") is True, "native manifest does not prove an embedded model")
-    require(build_fields["model_embedded"] == "true", "native build marker says the model is absent")
+    require(
+        parts.model.get("embedded") is True,
+        "native manifest does not prove an embedded model",
+    )
+    require(
+        build_fields["model_embedded"] == "true",
+        "native build marker says the model is absent",
+    )
     require(
         build_fields["model_sha256"] == model_digest,
         "native build model digest contradicts manifest",

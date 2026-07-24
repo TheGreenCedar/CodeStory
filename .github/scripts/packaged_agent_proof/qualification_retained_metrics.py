@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
-from .contracts import require_exact_keys, require_nonempty_string, require_positive_int, require_sha256
+from .contracts import (
+    require_exact_keys,
+    require_nonempty_string,
+    require_positive_int,
+    require_sha256,
+)
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
     MIN_RETRIEVAL_QUALITY_REPEATS,
@@ -14,7 +18,12 @@ from .foundation import (
     RETRIEVAL_QUALITY_EVIDENCE_CONTRACT,
     require,
 )
-from .qualification_retained_types import RetainedMeasurementBinding, RetainedQualificationContract
+from .qualification_retained_types import (
+    RetainedMeasurementBinding,
+    RetainedMetric,
+    RetainedQualificationContract,
+)
+
 
 def _verified_scenario_artifact_names(scenario_id: str, artifacts: object) -> set[str]:
     require(
@@ -23,7 +32,9 @@ def _verified_scenario_artifact_names(scenario_id: str, artifacts: object) -> se
     )
     names = set()
     for artifact in artifacts:
-        require(isinstance(artifact, dict), f"scenario {scenario_id} artifact is malformed")
+        require(
+            isinstance(artifact, dict), f"scenario {scenario_id} artifact is malformed"
+        )
         name = require_nonempty_string(
             artifact.get("name"),
             f"scenario {scenario_id} artifact name",
@@ -32,7 +43,9 @@ def _verified_scenario_artifact_names(scenario_id: str, artifacts: object) -> se
             Path(name).name == name and Path(name).suffix == ".json",
             f"scenario {scenario_id} artifact name is not a safe JSON basename",
         )
-        require_sha256(artifact.get("sha256"), f"scenario {scenario_id} artifact sha256")
+        require_sha256(
+            artifact.get("sha256"), f"scenario {scenario_id} artifact sha256"
+        )
         names.add(name)
     return names
 
@@ -49,7 +62,9 @@ def _verify_scenarios(contract: RetainedQualificationContract) -> None:
     for scenario_id in sorted(REQUIRED_SERVER_SCENARIOS):
         scenario = scenarios.get(scenario_id)
         require(isinstance(scenario, dict), f"scenario {scenario_id} is malformed")
-        require(scenario.get("status") == "pass", f"scenario {scenario_id} did not pass")
+        require(
+            scenario.get("status") == "pass", f"scenario {scenario_id} did not pass"
+        )
         assertions = scenario.get("assertions")
         require(
             isinstance(assertions, dict),
@@ -60,7 +75,9 @@ def _verify_scenarios(contract: RetainedQualificationContract) -> None:
             set(assertions) == required_assertions,
             f"scenario {scenario_id} assertions do not match the preregistered contract",
         )
-        failed = sorted(name for name, passed in assertions.items() if passed is not True)
+        failed = sorted(
+            name for name, passed in assertions.items() if passed is not True
+        )
         require(
             not failed,
             f"scenario {scenario_id} has failed assertions: " + ", ".join(failed),
@@ -89,15 +106,6 @@ def _verify_nonclaims(contract: RetainedQualificationContract) -> None:
             f"lower-tier evidence incorrectly claims {claim}",
         )
         require_nonempty_string(record.get("reason"), f"nonclaim {claim} reason")
-
-
-@dataclass(frozen=True)
-class RetainedMetric:
-    name: str
-    value: int | float
-    threshold: int | float
-    comparison: str
-    raw_evidence: dict
 
 
 def _normalized_retained_metrics(

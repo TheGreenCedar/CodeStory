@@ -182,7 +182,9 @@ class McpProcess:
                 },
             }
         )
-        require("error" not in response, f"MCP initialize failed: {response.get('error')}")
+        require(
+            "error" not in response, f"MCP initialize failed: {response.get('error')}"
+        )
         assert self.process.stdin
         self.process.stdin.write(
             json.dumps(
@@ -404,7 +406,6 @@ class FailurePreservingTemporaryDirectory(tempfile.TemporaryDirectory):
                 raise
             add_exception_note(
                 exc,
-                "temporary package directory cleanup also failed: "
-                f"{cleanup_error}",
+                f"temporary package directory cleanup also failed: {cleanup_error}",
             )
             return False

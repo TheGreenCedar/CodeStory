@@ -17,9 +17,9 @@ from .contracts import (
     write_json,
 )
 from .foundation import ProofFailure, require
-from .process import run
 from .qualification import require_candidate_matrix_installation_source
 from .self_test_full_stack_types import CalibrationFixture, FullStackFixture
+
 
 def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
     manifest = fixture.manifest
@@ -78,9 +78,9 @@ def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
         hostile_protocol = json.loads(
             json.dumps(measurement_contract["measurement_protocol"])
         )
-        hostile_protocol["host_package_matrix"][
-            "installed_windows_x64_cpu"
-        ][field] = hostile_value
+        hostile_protocol["host_package_matrix"]["installed_windows_x64_cpu"][field] = (
+            hostile_value
+        )
         try:
             selected_qualification_matrix_cell(
                 hostile_protocol,
@@ -97,6 +97,7 @@ def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
                 f"Windows candidate-installed alias accepted changed {field}"
             )
     return measurement_contract
+
 
 def _calibration_bundle_tests(
     fixture: FullStackFixture,
@@ -162,13 +163,12 @@ def _calibration_bundle_tests(
         frozen_measurement_contract=frozen_measurement_contract,
     )
 
+
 def _calibration_hostile_tests(
     fixture: FullStackFixture,
     calibration: CalibrationFixture,
 ) -> None:
     root = fixture.root
-    manifest = fixture.manifest
-    self_measurement_protocol = fixture.measurement_protocol
     calibration_bundle_path = calibration.bundle_path
     calibration_bundle_payload = calibration.bundle_payload
     frozen_measurement_contract = calibration.frozen_measurement_contract
@@ -191,9 +191,7 @@ def _calibration_hostile_tests(
     hostile_metric = hostile_run["raw_artifact"]["payload"]["metrics"][
         "cold_first_vector"
     ]
-    hostile_metric["samples"][0]["operands"].pop(
-        "successful_operation_duration_ns"
-    )
+    hostile_metric["samples"][0]["operands"].pop("successful_operation_duration_ns")
     hostile_run["raw_artifact"]["sha256"] = canonical_sha256(
         hostile_run["raw_artifact"]["payload"]
     )
@@ -215,9 +213,9 @@ def _calibration_hostile_tests(
         "metrics"
     ]["warm_query_ipc"]["samples"][0]["sample_id"]
     duplicate_run = hostile_calibration["runs"][1]
-    duplicate_run["raw_artifact"]["payload"]["metrics"]["warm_query_ipc"][
-        "samples"
-    ][0]["sample_id"] = first_sample_id
+    duplicate_run["raw_artifact"]["payload"]["metrics"]["warm_query_ipc"]["samples"][0][
+        "sample_id"
+    ] = first_sample_id
     duplicate_run["raw_artifact"]["sha256"] = canonical_sha256(
         duplicate_run["raw_artifact"]["payload"]
     )
@@ -246,6 +244,7 @@ def _calibration_hostile_tests(
         pass
     else:
         raise ProofFailure("post-result calibration threshold change was accepted")
+
 
 def run_calibration_self_tests(fixture: FullStackFixture) -> dict:
     measurement_contract = _qualification_matrix_tests(fixture)

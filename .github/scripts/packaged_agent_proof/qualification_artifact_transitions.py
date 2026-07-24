@@ -4,9 +4,18 @@ from __future__ import annotations
 
 from collections import Counter
 
-from .contracts import require_exact_keys, require_nonempty_string, require_nonnegative_int
+from .contracts import (
+    require_exact_keys,
+    require_nonempty_string,
+    require_nonnegative_int,
+)
 from .foundation import require
-from .qualification_artifact_types import QualificationControlEvidence, QualificationOrchestration, QualificationTransitionEvidence
+from .qualification_artifact_types import (
+    QualificationControlEvidence,
+    QualificationOrchestration,
+    QualificationTransitionEvidence,
+)
+
 
 def _qualification_transitions(
     value: object,
@@ -98,9 +107,7 @@ _REQUIRED_CONTROLS = {
     "client_death": Counter({"hold_class": 2, "release_class": 2}),
     "cold_race": Counter(),
     "frozen_owner": Counter({"freeze_owner": 1, "release_owner": 1}),
-    "incompatible_owner": Counter(
-        {"force_incompatible": 1, "clear_incompatible": 1}
-    ),
+    "incompatible_owner": Counter({"force_incompatible": 1, "clear_incompatible": 1}),
     "mixed_queue": Counter({"hold_class": 2, "release_class": 2}),
     "server_crash": Counter({"hold_class": 1, "crash_server": 1}),
     "true_idle_respawn": Counter({"hold_class": 2, "release_class": 2}),
@@ -195,7 +202,9 @@ def _qualification_events(
         )
         require_nonempty_string(event["source"], f"{field}.source")
         require_nonempty_string(event["action"], f"{field}.action")
-        observed_ns = require_nonnegative_int(event["observed_ns"], f"{field}.observed_ns")
+        observed_ns = require_nonnegative_int(
+            event["observed_ns"], f"{field}.observed_ns"
+        )
         require(
             orchestration.started_ns <= observed_ns <= orchestration.finished_ns,
             f"{field} escaped its block",

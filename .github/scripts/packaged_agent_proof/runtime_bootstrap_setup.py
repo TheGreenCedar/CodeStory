@@ -9,9 +9,14 @@ from pathlib import Path
 
 from .contracts import sha256, write_private_json
 from .foundation import TARGET_CONTRACTS, require
-from .installation import create_second_repository, installed_plugin_identity, qualification_environment
+from .installation import (
+    create_second_repository,
+    installed_plugin_identity,
+    qualification_environment,
+)
 from .process import McpProcess, process_start_identity
 from .runtime_bootstrap_types import HostPair, RuntimeSetup
+
 
 def _proof_projects(args: argparse.Namespace, root: Path) -> tuple[Path, Path, str]:
     require(args.project is not None, "--project is required for runtime proof")
@@ -75,7 +80,10 @@ def _runtime_setup(
     manifest: dict,
     cleanup_control: dict,
 ) -> RuntimeSetup:
-    require(args.plugin_handoff, "runtime proof requires the ordinary packaged plugin handoff")
+    require(
+        args.plugin_handoff,
+        "runtime proof requires the ordinary packaged plugin handoff",
+    )
     require(args.plugin_root is not None, "--plugin-handoff requires --plugin-root")
     project_a, project_b, query_b = _proof_projects(args, root)
     plugin_root = args.plugin_root.resolve()
@@ -87,7 +95,10 @@ def _runtime_setup(
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
     require(launcher.is_file(), f"plugin launcher is missing: {launcher}")
     node_raw = shutil.which("node")
-    require(node_raw is not None, "packaged plugin proof requires Node.js for the host launcher")
+    require(
+        node_raw is not None,
+        "packaged plugin proof requires Node.js for the host launcher",
+    )
     node = Path(node_raw)
     qualified_env, qualification_control = _runtime_environment(
         args,
@@ -99,14 +110,19 @@ def _runtime_setup(
     cleanup_control.update(
         {
             "qualification_cli": str(cli.resolve()),
-            "qualification_directory": qualified_env["CODESTORY_EMBED_QUALIFICATION_DIR"],
+            "qualification_directory": qualified_env[
+                "CODESTORY_EMBED_QUALIFICATION_DIR"
+            ],
             "qualification_nonce": qualified_env["CODESTORY_EMBED_QUALIFICATION_NONCE"],
             "plugin_cli_archive_sha256": None,
             "projects": [str(project_a), str(project_b)],
         }
     )
     embedded_models = Path(qualified_env["CODESTORY_CACHE_ROOT"]) / "embedded-models"
-    require(not embedded_models.exists(), "isolated proof cache was not empty before first use")
+    require(
+        not embedded_models.exists(),
+        "isolated proof cache was not empty before first use",
+    )
     return RuntimeSetup(
         project_a=project_a,
         project_b=project_b,

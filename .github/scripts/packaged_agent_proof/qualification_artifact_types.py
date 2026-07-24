@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .qualification_documents import PrivateJsonArtifact
 
+
 @dataclass(frozen=True)
 class QualificationArtifactSummary:
     name: str

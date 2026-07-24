@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from .contracts import (
+    normalized_backend,
+    require_sha256,
+)
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
     NATIVE_ENGINE_MARKER_PREFIX,
@@ -14,10 +18,6 @@ from .foundation import (
     SERVER_PROOF_SCHEMA_VERSION,
     ProofFailure,
     require,
-)
-from .contracts import (
-    normalized_backend,
-    require_sha256,
 )
 
 
@@ -46,12 +46,16 @@ def binary_markers(path: Path, marker_prefix: str, marker_suffix: str) -> list[s
         try:
             decoded.append(marker.decode("ascii"))
         except UnicodeDecodeError as exc:
-            raise ProofFailure(f"packaged marker {marker_prefix!r} is not ASCII") from exc
+            raise ProofFailure(
+                f"packaged marker {marker_prefix!r} is not ASCII"
+            ) from exc
     return decoded
 
 
 def native_engine_markers(path: Path) -> list[str]:
-    return binary_markers(path, NATIVE_ENGINE_MARKER_PREFIX, NATIVE_ENGINE_MARKER_SUFFIX)
+    return binary_markers(
+        path, NATIVE_ENGINE_MARKER_PREFIX, NATIVE_ENGINE_MARKER_SUFFIX
+    )
 
 
 def server_proof_markers(path: Path) -> list[str]:
@@ -119,7 +123,10 @@ def embedding_contract_digest(model: dict, embedding: dict, tokenizer: dict) -> 
 
 def parse_native_build_identity(identity: str) -> dict[str, str]:
     parts = identity.split("|")
-    require(parts[0] == "codestory-native-engine-v1", "native engine build schema is unsupported")
+    require(
+        parts[0] == "codestory-native-engine-v1",
+        "native engine build schema is unsupported",
+    )
     require(parts[-1] == "end", "native engine build identity terminator is missing")
     fields: dict[str, str] = {}
     for part in parts[1:-1]:
@@ -143,7 +150,10 @@ def parse_native_build_identity(identity: str) -> dict[str, str]:
         "producer",
     }
     missing = sorted(required - fields.keys())
-    require(not missing, "native engine build identity is missing fields: " + ", ".join(missing))
+    require(
+        not missing,
+        "native engine build identity is missing fields: " + ", ".join(missing),
+    )
     return fields
 
 
@@ -158,7 +168,9 @@ def parse_server_proof_identity(identity: str) -> dict[str, object]:
     for part in parts[1:-1]:
         require("=" in part, f"malformed embedding server proof field: {part!r}")
         key, value = part.split("=", 1)
-        require(bool(key) and bool(value), f"empty embedding server proof field: {part!r}")
+        require(
+            bool(key) and bool(value), f"empty embedding server proof field: {part!r}"
+        )
         require(key not in raw, f"duplicate embedding server proof field: {key}")
         raw[key] = value
     required = {
@@ -173,23 +185,57 @@ def parse_server_proof_identity(identity: str) -> dict[str, object]:
         "idle_timeout_ms",
     }
     missing = sorted(required - raw.keys())
-    require(not missing, "embedding server proof identity is missing fields: " + ", ".join(missing))
-    require(set(raw) == required, "embedding server proof identity contains unknown fields")
-    for field in ("protocol_sha256", "constant_set_sha256", "measurement_protocol_sha256"):
+    require(
+        not missing,
+        "embedding server proof identity is missing fields: " + ", ".join(missing),
+    )
+    require(
+        set(raw) == required, "embedding server proof identity contains unknown fields"
+    )
+    for field in (
+        "protocol_sha256",
+        "constant_set_sha256",
+        "measurement_protocol_sha256",
+    ):
         require_sha256(raw[field], f"embedding server proof {field}")
-    require(raw["clock_policy"] == "awake_monotonic", "embedding server proof clock policy is unsupported")
+    require(
+        raw["clock_policy"] == "awake_monotonic",
+        "embedding server proof clock policy is unsupported",
+    )
     numeric: dict[str, int] = {}
-    for field in ("bootstrap", "protocol_schema", "query_capacity", "bulk_capacity", "idle_timeout_ms"):
+    for field in (
+        "bootstrap",
+        "protocol_schema",
+        "query_capacity",
+        "bulk_capacity",
+        "idle_timeout_ms",
+    ):
         try:
             numeric[field] = int(raw[field])
         except ValueError as exc:
-            raise ProofFailure(f"embedding server proof {field} is not an integer") from exc
+            raise ProofFailure(
+                f"embedding server proof {field} is not an integer"
+            ) from exc
         require(numeric[field] > 0, f"embedding server proof {field} must be positive")
-    require(numeric["bootstrap"] == 1, "embedding server bootstrap version is unsupported")
-    require(numeric["protocol_schema"] == 1, "embedding server protocol schema is unsupported")
-    require(numeric["query_capacity"] == 64, "embedding server query capacity is not the accepted value")
-    require(numeric["bulk_capacity"] == 64, "embedding server bulk capacity is not the accepted value")
-    require(numeric["idle_timeout_ms"] == 60_000, "embedding server idle timeout is not the accepted value")
+    require(
+        numeric["bootstrap"] == 1, "embedding server bootstrap version is unsupported"
+    )
+    require(
+        numeric["protocol_schema"] == 1,
+        "embedding server protocol schema is unsupported",
+    )
+    require(
+        numeric["query_capacity"] == 64,
+        "embedding server query capacity is not the accepted value",
+    )
+    require(
+        numeric["bulk_capacity"] == 64,
+        "embedding server bulk capacity is not the accepted value",
+    )
+    require(
+        numeric["idle_timeout_ms"] == 60_000,
+        "embedding server idle timeout is not the accepted value",
+    )
     return {
         "schema_version": SERVER_PROOF_SCHEMA_VERSION,
         "bootstrap_version": numeric["bootstrap"],
@@ -203,6 +249,8 @@ def parse_server_proof_identity(identity: str) -> dict[str, object]:
         "idle_timeout_ms": numeric["idle_timeout_ms"],
         "lower_tier_nonclaims": sorted(LOWER_TIER_NONCLAIMS),
     }
+
+
 def verify_runtime_against_manifest(
     manifest: dict,
     runtime: dict,
@@ -213,13 +261,18 @@ def verify_runtime_against_manifest(
         runtime.get("second_host_identity"),
         runtime.get("rejoin_identity"),
     ]
-    require(all(isinstance(identity, dict) for identity in identities), "runtime proof omitted engine identity")
+    require(
+        all(isinstance(identity, dict) for identity in identities),
+        "runtime proof omitted engine identity",
+    )
     engine = manifest["engine"]
     model = manifest["model"]
     accelerator = manifest["accelerator"]
     compiled_backends = engine["compiled_backends"]
     observed_backend = ""
-    for label, identity in zip(("first plugin host", "second plugin host", "rejoined plugin host"), identities):
+    for label, identity in zip(
+        ("first plugin host", "second plugin host", "rejoined plugin host"), identities
+    ):
         require(
             identity.get("embedding_ggml_build_identity") == engine["build_identity"],
             f"{label} loaded a different native engine build than the package manifest",
@@ -235,10 +288,16 @@ def verify_runtime_against_manifest(
         )
         if not observed_backend:
             observed_backend = current_backend
-        require(current_backend == observed_backend, "native backend changed across process restart")
+        require(
+            current_backend == observed_backend,
+            "native backend changed across process restart",
+        )
 
     policy = str(identities[0].get("embedding_policy") or "")
-    require(policy == expected_policy, "runtime policy does not match the requested proof lane")
+    require(
+        policy == expected_policy,
+        "runtime policy does not match the requested proof lane",
+    )
     if policy == "accelerated":
         expected_backend = accelerator.get("expected_protected_backend")
         require(
@@ -252,8 +311,13 @@ def verify_runtime_against_manifest(
         execution = "proven_by_live_runtime"
         non_claim_reason = None
     else:
-        require(policy == "cpu_explicit", "runtime used neither protected acceleration nor explicit CPU")
-        require(observed_backend == "cpu", "explicit CPU proof selected a non-CPU backend")
+        require(
+            policy == "cpu_explicit",
+            "runtime used neither protected acceleration nor explicit CPU",
+        )
+        require(
+            observed_backend == "cpu", "explicit CPU proof selected a non-CPU backend"
+        )
         execution = "explicit_cpu_execution"
         non_claim_reason = (
             accelerator.get("non_claim_reason")

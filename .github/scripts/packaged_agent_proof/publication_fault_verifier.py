@@ -1,4 +1,4 @@
-"""Verification of publication-fault and rank-consistency evidence."""
+"""Verification of publication-fault raw evidence."""
 
 from __future__ import annotations
 
@@ -12,12 +12,7 @@ from .contracts import (
     require_positive_int,
     require_sha256,
 )
-from .foundation import (
-    FAULT_RECOVERY_CONSISTENCY_CASES,
-    FAULT_RECOVERY_CONSISTENCY_CONTRACT,
-    PUBLICATION_FAULT_EVIDENCE_CONTRACT,
-    require,
-)
+from .foundation import PUBLICATION_FAULT_EVIDENCE_CONTRACT, require
 from .runtime_evidence_support import load_external_raw_evidence
 
 
@@ -45,14 +40,26 @@ def _verify_publication_header(
         },
         "publication fault raw evidence",
     )
-    require(payload["schema_version"] == 1, "publication fault evidence schema is unsupported")
+    require(
+        payload["schema_version"] == 1,
+        "publication fault evidence schema is unsupported",
+    )
     require(
         payload["evidence_contract"] == PUBLICATION_FAULT_EVIDENCE_CONTRACT,
         "publication fault evidence contract is unsupported",
     )
-    require(payload["source"] == source, "publication fault evidence source identity is stale")
-    require(payload["package"] == package, "publication fault evidence package identity is stale")
-    require(payload["contracts"] == contracts, "publication fault evidence contracts are stale")
+    require(
+        payload["source"] == source,
+        "publication fault evidence source identity is stale",
+    )
+    require(
+        payload["package"] == package,
+        "publication fault evidence package identity is stale",
+    )
+    require(
+        payload["contracts"] == contracts,
+        "publication fault evidence contracts are stale",
+    )
     correlation_id = payload["correlation_id"]
     require(
         isinstance(correlation_id, str)
@@ -75,13 +82,18 @@ def _verify_server_observations(observations: object) -> None:
     for index, (observation, phase) in enumerate(
         zip(observations, ("before_crash", "after_replacement"))
     ):
-        require(isinstance(observation, dict), f"server observation {index} is malformed")
+        require(
+            isinstance(observation, dict), f"server observation {index} is malformed"
+        )
         require_exact_keys(
             observation,
             {"phase", "server_instance_id", "process_start_id", "load_generation"},
             f"server observation {index}",
         )
-        require(observation["phase"] == phase, f"server observation {index} has the wrong phase")
+        require(
+            observation["phase"] == phase,
+            f"server observation {index} has the wrong phase",
+        )
         require_opaque_identifier(
             observation["server_instance_id"],
             f"server observation {index}.server_instance_id",
@@ -108,13 +120,18 @@ def _verify_server_observations(observations: object) -> None:
 
 
 def _verify_candidate_observation(candidate: object) -> None:
-    require(isinstance(candidate, dict), "publication candidate observation is malformed")
+    require(
+        isinstance(candidate, dict), "publication candidate observation is malformed"
+    )
     require_exact_keys(
         candidate,
         {"command", "exit_code", "stdout_sha256", "stderr_sha256"},
         "publication candidate observation",
     )
-    require(candidate["command"] == "retrieval_index", "publication candidate used the wrong command")
+    require(
+        candidate["command"] == "retrieval_index",
+        "publication candidate used the wrong command",
+    )
     require(
         isinstance(candidate["exit_code"], int)
         and not isinstance(candidate["exit_code"], bool)
@@ -141,18 +158,35 @@ def _verify_hook_events(events: object, correlation_id: str) -> None:
         require(isinstance(event, dict), f"publication hook event {index} is malformed")
         require_exact_keys(
             event,
-            {"schema_version", "sequence", "correlation_id", "action", "status", "clock"},
+            {
+                "schema_version",
+                "sequence",
+                "correlation_id",
+                "action",
+                "status",
+                "clock",
+            },
             f"publication hook event {index}",
         )
-        require(event["schema_version"] == 1, f"publication hook event {index} schema is unsupported")
-        require(event["sequence"] == index, "publication hook event sequence is not exact")
-        require(event["correlation_id"] == correlation_id, "publication hook correlation changed")
+        require(
+            event["schema_version"] == 1,
+            f"publication hook event {index} schema is unsupported",
+        )
+        require(
+            event["sequence"] == index, "publication hook event sequence is not exact"
+        )
+        require(
+            event["correlation_id"] == correlation_id,
+            "publication hook correlation changed",
+        )
         require(
             (event["action"], event["status"]) == expected,
             f"publication hook event {index} does not match the fence contract",
         )
         clock = event["clock"]
-        require(isinstance(clock, dict), f"publication hook event {index} omitted its clock")
+        require(
+            isinstance(clock, dict), f"publication hook event {index} omitted its clock"
+        )
         require_exact_keys(
             clock,
             {"domain", "api", "elapsed_ns"},
@@ -167,7 +201,9 @@ def _verify_hook_events(events: object, correlation_id: str) -> None:
             clock["elapsed_ns"],
             f"publication hook event {index} elapsed_ns",
         )
-        require(elapsed >= last_elapsed, "publication hook elapsed time moved backwards")
+        require(
+            elapsed >= last_elapsed, "publication hook elapsed time moved backwards"
+        )
         last_elapsed = elapsed
 
 
@@ -182,7 +218,10 @@ def _verify_product_observations(
     for index, (observation, command) in enumerate(
         zip(observations, ("retrieval_status", "search"))
     ):
-        require(isinstance(observation, dict), f"ordinary product observation {index} is malformed")
+        require(
+            isinstance(observation, dict),
+            f"ordinary product observation {index} is malformed",
+        )
         require_exact_keys(
             observation,
             {
@@ -195,10 +234,19 @@ def _verify_product_observations(
             },
             f"ordinary product observation {index}",
         )
-        require(observation["sequence"] == index, "ordinary product observation order changed")
-        require(observation["command"] == command, "ordinary product observation used the wrong command")
+        require(
+            observation["sequence"] == index,
+            "ordinary product observation order changed",
+        )
+        require(
+            observation["command"] == command,
+            "ordinary product observation used the wrong command",
+        )
         require(observation["exit_code"] == 0, f"ordinary product {command} failed")
-        require(observation["retrieval_mode"] == "full", f"ordinary product {command} was not full")
+        require(
+            observation["retrieval_mode"] == "full",
+            f"ordinary product {command} was not full",
+        )
         require(
             require_sha256(
                 observation["publication_identity_sha256"],
@@ -246,119 +294,4 @@ def verify_publication_fault_raw_evidence(
             "lost_publication_lease_blocks_commit": True,
             "previous_publication_remains_usable": True,
         },
-    }
-
-
-def _verify_consistency_observation(
-    observation: object,
-    *,
-    index: int,
-    case_ids: set[str],
-) -> None:
-    require(
-        isinstance(observation, dict),
-        f"fault recovery consistency observation {index} is malformed",
-    )
-    require_exact_keys(
-        observation,
-        {
-            "case_id_sha256",
-            "before_server_fault_rank",
-            "after_server_replacement_rank",
-        },
-        f"fault recovery consistency observation {index}",
-    )
-    case_id = require_sha256(
-        observation["case_id_sha256"],
-        f"fault recovery consistency observation {index} case id",
-    )
-    require(
-        case_id not in case_ids,
-        "fault recovery consistency evidence contains duplicate cases",
-    )
-    case_ids.add(case_id)
-    for field in ("before_server_fault_rank", "after_server_replacement_rank"):
-        rank = observation[field]
-        require(
-            rank is None
-            or (
-                isinstance(rank, int)
-                and not isinstance(rank, bool)
-                and 1 <= rank <= 10
-            ),
-            f"fault recovery consistency observation {index} {field} "
-            "is not a rank in the fixed top 10",
-        )
-    require(
-        observation["before_server_fault_rank"]
-        == observation["after_server_replacement_rank"],
-        "fault recovery changed a search rank from the retained publication",
-    )
-
-
-def verify_fault_recovery_consistency_raw_evidence(
-    path: Path,
-    *,
-    source: dict,
-    package: dict,
-    contracts: dict,
-) -> dict:
-    payload, artifact_sha256 = load_external_raw_evidence(
-        path,
-        "fault recovery consistency raw evidence",
-    )
-    require_exact_keys(
-        payload,
-        {
-            "schema_version",
-            "evidence_contract",
-            "source",
-            "package",
-            "contracts",
-            "run_id_sha256",
-            "observations",
-        },
-        "fault recovery consistency raw evidence",
-    )
-    require(
-        payload["schema_version"] == 1,
-        "fault recovery consistency evidence schema is unsupported",
-    )
-    require(
-        payload["evidence_contract"] == FAULT_RECOVERY_CONSISTENCY_CONTRACT,
-        "fault recovery consistency evidence contract is unsupported",
-    )
-    require(
-        payload["source"] == source,
-        "fault recovery consistency source identity is stale",
-    )
-    require(
-        payload["package"] == package,
-        "fault recovery consistency package identity is stale",
-    )
-    require(
-        payload["contracts"] == contracts,
-        "fault recovery consistency contracts are stale",
-    )
-    require_sha256(payload["run_id_sha256"], "fault recovery consistency run id")
-    observations = payload["observations"]
-    require(
-        isinstance(observations, list)
-        and len(observations) == FAULT_RECOVERY_CONSISTENCY_CASES,
-        "fault recovery consistency evidence has the wrong case count",
-    )
-    case_ids: set[str] = set()
-    for index, observation in enumerate(observations):
-        _verify_consistency_observation(
-            observation,
-            index=index,
-            case_ids=case_ids,
-        )
-    return {
-        "artifact": {
-            "name": "fault-recovery-consistency.raw.json",
-            "sha256": artifact_sha256,
-        },
-        "case_count": len(observations),
-        "ranks_stable": True,
     }

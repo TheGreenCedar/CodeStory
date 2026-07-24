@@ -7,11 +7,19 @@ from pathlib import Path
 
 from .foundation import CANDIDATE_QUALIFICATION_MATRIX_ALIASES, require
 from .qualification_artifact_document import _qualification_artifact_document
-from .qualification_artifact_snapshots import _qualification_controls, _qualification_process_observations
-from .qualification_artifact_transitions import _qualification_events, _qualification_transitions, _verify_scenario_artifact_requirements
+from .qualification_artifact_snapshots import (
+    _qualification_controls,
+    _qualification_process_observations,
+)
+from .qualification_artifact_transitions import (
+    _qualification_events,
+    _qualification_transitions,
+    _verify_scenario_artifact_requirements,
+)
 from .qualification_artifact_types import QualificationArtifactEvidence
 from .qualification_orchestration import _qualification_orchestration
 from .qualification_scenarios import derive_scenario_assertions
+
 
 def _verify_qualification_summary(
     *,

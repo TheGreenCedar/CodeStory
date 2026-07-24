@@ -5,7 +5,13 @@ from __future__ import annotations
 from .contracts import require_exact_keys, require_nonempty_string, require_positive_int
 from .foundation import REQUIRED_SERVER_SCENARIOS, require
 from .qualification import qualification_artifact
-from .qualification_production_types import QualificationExternalEvidence, QualificationProducerContext, QualificationRunnerEvidence, QualificationScenarioEvidence
+from .qualification_production_types import (
+    QualificationExternalEvidence,
+    QualificationProducerContext,
+    QualificationRunnerEvidence,
+    QualificationScenarioEvidence,
+)
+
 
 def _qualification_shared_identity(context: QualificationProducerContext) -> dict:
     shared = context.runtime["shared_identity"]
@@ -53,9 +59,9 @@ def _qualification_scenario(
     external: QualificationExternalEvidence,
 ) -> dict:
     required_assertions = set(
-        context.measurement_contract["measurement_protocol"][
-            "scenario_contracts"
-        ][scenario_id]["required"]
+        context.measurement_contract["measurement_protocol"]["scenario_contracts"][
+            scenario_id
+        ]["required"]
     )
     artifact, assertions = qualification_artifact(
         context.artifact_root,
@@ -81,9 +87,7 @@ def _qualification_scenario(
             scenario_id == "server_crash"
             and external.fault_recovery_consistency is not None
         ):
-            external_artifacts.append(
-                external.fault_recovery_consistency["artifact"]
-            )
+            external_artifacts.append(external.fault_recovery_consistency["artifact"])
     require(
         set(assertions) == required_assertions,
         f"qualification scenario {scenario_id} derived assertion set differs from its preregistered contract",

@@ -24,7 +24,9 @@ def normalized_backend(value: object) -> str:
 
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def sha256(path: Path) -> str:
@@ -36,7 +38,9 @@ def sha256(path: Path) -> str:
 
 
 def canonical_sha256(value: object) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -74,13 +78,53 @@ def retained_runtime_evidence(runtime: dict) -> dict:
     )
 
 
+def _assert_private_fields(
+    value: object,
+    artifact_name: str,
+    field_path: str = "$",
+) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            require(
+                isinstance(key, str),
+                f"retained evidence {artifact_name} has a non-string field",
+            )
+            normalized = key.lower()
+            require(
+                normalized
+                not in {
+                    "directory",
+                    "output_directory",
+                    "project_path",
+                    "project_root",
+                    "repository_path",
+                    "request_text",
+                    "query_text",
+                    "question_text",
+                    "qualification_nonce",
+                },
+                f"retained evidence {artifact_name} leaked private field {field_path}.{key}",
+            )
+            _assert_private_fields(child, artifact_name, f"{field_path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _assert_private_fields(child, artifact_name, f"{field_path}[{index}]")
+    elif isinstance(value, str):
+        require(
+            not Path(value).is_absolute(),
+            f"retained evidence {artifact_name} leaked an absolute path at {field_path}",
+        )
+
+
 def assert_retained_json_privacy(target: Path, forbidden_values: list[str]) -> None:
     forbidden = sorted(
         {value for value in forbidden_values if isinstance(value, str) and value}
     )
     paths = [target] if target.is_file() else sorted(target.rglob("*.json"))
     for path in paths:
-        require(path.is_file() and not path.is_symlink(), f"retained JSON is unsafe: {path}")
+        require(
+            path.is_file() and not path.is_symlink(), f"retained JSON is unsafe: {path}"
+        )
         payload = path.read_bytes()
         for value in forbidden:
             require(
@@ -90,39 +134,11 @@ def assert_retained_json_privacy(target: Path, forbidden_values: list[str]) -> N
         try:
             document = json.loads(payload)
         except json.JSONDecodeError as exc:
-            raise ProofFailure(f"retained evidence {path.name} is not valid JSON: {exc}") from exc
+            raise ProofFailure(
+                f"retained evidence {path.name} is not valid JSON: {exc}"
+            ) from exc
 
-        def scan(value: object, field_path: str = "$") -> None:
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    require(isinstance(key, str), f"retained evidence {path.name} has a non-string field")
-                    normalized = key.lower()
-                    require(
-                        normalized
-                        not in {
-                            "directory",
-                            "output_directory",
-                            "project_path",
-                            "project_root",
-                            "repository_path",
-                            "request_text",
-                            "query_text",
-                            "question_text",
-                            "qualification_nonce",
-                        },
-                        f"retained evidence {path.name} leaked private field {field_path}.{key}",
-                    )
-                    scan(child, f"{field_path}.{key}")
-            elif isinstance(value, list):
-                for index, child in enumerate(value):
-                    scan(child, f"{field_path}[{index}]")
-            elif isinstance(value, str):
-                require(
-                    not Path(value).is_absolute(),
-                    f"retained evidence {path.name} leaked an absolute path at {field_path}",
-                )
-
-        scan(document)
+        _assert_private_fields(document, path.name)
 
 
 def require_sha256(value: object, field: str) -> str:
@@ -136,7 +152,10 @@ def require_sha256(value: object, field: str) -> str:
 
 
 def require_nonempty_string(value: object, field: str) -> str:
-    require(isinstance(value, str) and bool(value.strip()), f"{field} must be a non-empty string")
+    require(
+        isinstance(value, str) and bool(value.strip()),
+        f"{field} must be a non-empty string",
+    )
     return value
 
 

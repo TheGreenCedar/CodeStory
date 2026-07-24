@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .process import McpProcess
 
+
 @dataclass(frozen=True)
 class RuntimeSetup:
     project_a: Path
@@ -49,3 +50,15 @@ class ContinuityProof:
     survivor: dict
     rejoin_snapshot: dict
     rejoin_identity: dict
+
+
+@dataclass(frozen=True)
+class RuntimePhaseEvidence:
+    cold: ColdProof
+    snippet: dict
+    snippet_attempts: int
+    managed_runtime: dict | None
+    managed_binary: Path | None
+    memory: dict | None
+    continuity: ContinuityProof
+    materialized_model: Path

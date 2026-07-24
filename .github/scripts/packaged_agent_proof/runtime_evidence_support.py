@@ -11,8 +11,8 @@ from .foundation import ProofFailure, require
 
 
 def metric_passes(
-    value: int | float,
-    threshold: int | float,
+    value: float,
+    threshold: float,
     comparison: str,
 ) -> bool:
     return {

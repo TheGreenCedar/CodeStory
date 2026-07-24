@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .contracts import require_nonnegative_int, require_positive_int, require_sha256
-from .qualification_scenario_evidence import ScenarioAssertionEvidence, validate_replay_attempts
+from .qualification_scenario_evidence import (
+    ScenarioAssertionEvidence,
+    validate_replay_attempts,
+)
+
 
 @dataclass(frozen=True)
 class WorkerStallMeasurements:
@@ -84,12 +88,11 @@ def _worker_stall_assertions(
         old_server_instance_id=fail_stop["old_server_instance_id"],
         new_server_instance_id=replacement["new_server_instance_id"],
     )
-    replacement_observed = (
-        replacement["new_server_instance_id"] in evidence.snapshot_instances
-        and all(
-            snapshot["process"]["pid"] != measurements.old_pid
-            for snapshot in evidence.snapshots[-1:]
-        )
+    replacement_observed = replacement[
+        "new_server_instance_id"
+    ] in evidence.snapshot_instances and all(
+        snapshot["process"]["pid"] != measurements.old_pid
+        for snapshot in evidence.snapshots[-1:]
     )
     return {
         "independent_watchdog_fail_stops_server": (
@@ -101,8 +104,7 @@ def _worker_stall_assertions(
             and measurements.watchdog_observed_ns
             - measurements.watchdog_last_progress_ns
             >= measurements.hard_no_progress_ms * 1_000_000
-            and measurements.watchdog_cadence_ms
-            < measurements.hard_no_progress_ms
+            and measurements.watchdog_cadence_ms < measurements.hard_no_progress_ms
             and attempts[0].outcome == "server_loss"
             and replacement_observed
         ),
@@ -118,8 +120,7 @@ def _worker_stall_assertions(
             == replacement["new_server_instance_id"]
             and any(
                 invocation.get("pid") == survivor["pid"]
-                and invocation.get("process_start_id")
-                == survivor["process_start_id"]
+                and invocation.get("process_start_id") == survivor["process_start_id"]
                 and invocation.get("operation") == "query"
                 and invocation.get("termination") == "exited"
                 for invocation in evidence.invocations

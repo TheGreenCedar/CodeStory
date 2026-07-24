@@ -7,9 +7,16 @@ from pathlib import Path
 
 from .contracts import retained_mcp_transcript, write_json
 from .runtime_bootstrap_cold import _cold_shared_proof, _snippet_contract
-from .runtime_bootstrap_continuity import _continuity_proof, _live_retrieval, _managed_runtime, _materialized_model
+from .runtime_bootstrap_continuity import (
+    _continuity_proof,
+    _live_retrieval,
+    _managed_runtime,
+    _materialized_model,
+)
 from .runtime_bootstrap_result import _retain_public_runtime, _runtime_result
 from .runtime_bootstrap_setup import _runtime_setup, _start_hosts
+from .runtime_bootstrap_types import RuntimePhaseEvidence
+
 
 def prove_runtime(
     args: argparse.Namespace,
@@ -47,14 +54,16 @@ def prove_runtime(
             root,
             setup,
             hosts,
-            cold,
-            snippet,
-            snippet_attempts,
-            managed_runtime,
-            managed_binary,
-            memory,
-            continuity,
-            materialized,
+            RuntimePhaseEvidence(
+                cold=cold,
+                snippet=snippet,
+                snippet_attempts=snippet_attempts,
+                managed_runtime=managed_runtime,
+                managed_binary=managed_binary,
+                memory=memory,
+                continuity=continuity,
+                materialized_model=materialized,
+            ),
         )
     finally:
         write_json(

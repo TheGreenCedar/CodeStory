@@ -67,8 +67,7 @@ def run_qualification_self_tests() -> None:
         new_server_instance_id="server-new",
     )
     require(
-        attempts[0].outcome == "server_loss"
-        and attempts[1].outcome == "completed",
+        attempts[0].outcome == "server_loss" and attempts[1].outcome == "completed",
         "typed replay validation changed",
     )
     stale_replay = copy.deepcopy(replay)

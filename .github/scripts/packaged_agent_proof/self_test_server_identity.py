@@ -10,6 +10,7 @@ from .process import engine_identity, server_snapshot, shared_server_identity
 from .qualification import derive_scenario_assertions
 from .self_test_full_stack_types import FullStackFixture, ServerIdentityFixture
 
+
 def _engine_runtime_test(fixture: FullStackFixture) -> dict:
     manifest = fixture.manifest
     valid = {
@@ -42,8 +43,12 @@ def _engine_runtime_test(fixture: FullStackFixture) -> dict:
         "rejoin_identity": valid.copy(),
     }
     evidence = verify_runtime_against_manifest(manifest, runtime, "accelerated")
-    require(evidence["execution"] == "proven_by_live_runtime", "runtime contract proof failed")
+    require(
+        evidence["execution"] == "proven_by_live_runtime",
+        "runtime contract proof failed",
+    )
     return valid
+
 
 def _shared_snapshot_test(
     fixture: FullStackFixture,
@@ -113,6 +118,7 @@ def _shared_snapshot_test(
     require(shared["model_load_count"] == 1, "shared server identity self-test failed")
     return snapshot_payload, first_snapshot, shared
 
+
 def _cold_election_tests(first_snapshot: dict) -> tuple[list[dict], dict]:
     retired_snapshot = json.loads(json.dumps(first_snapshot))
     retired_snapshot["process"]["server_instance_id"] = "retired-server"
@@ -174,9 +180,7 @@ def _cold_election_tests(first_snapshot: dict) -> tuple[list[dict], dict]:
         all(cold_assertions.values()),
         "retired pre-race owner contaminated post-reset election assertions",
     )
-    duplicate_phase_observations = json.loads(
-        json.dumps(cold_process_observations)
-    )
+    duplicate_phase_observations = json.loads(json.dumps(cold_process_observations))
     duplicate_phase_observations.insert(
         -1, {"phase": "cold_race_first", "snapshot": None}
     )
@@ -202,15 +206,14 @@ def _cold_election_tests(first_snapshot: dict) -> tuple[list[dict], dict]:
         raise ProofFailure("duplicate cold-race phase observation was accepted")
     return cold_process_observations, cold_transitions
 
+
 def _cold_split_test(
     process_observations: list[dict],
     transitions: dict,
 ) -> None:
     cold_process_observations = process_observations
     cold_transitions = transitions
-    split_process_observations = json.loads(
-        json.dumps(cold_process_observations)
-    )
+    split_process_observations = json.loads(json.dumps(cold_process_observations))
     split_snapshot = split_process_observations[-1]["snapshot"]
     split_snapshot["process"]["server_instance_id"] = "split-server"
     split_snapshot["authority"]["lifetime_authority_id"] = "split-authority"
@@ -248,6 +251,7 @@ def _cold_split_test(
         raise ProofFailure(
             "post-reset cold-race split escaped its exact identity assertions"
         )
+
 
 def run_server_identity_self_tests(
     fixture: FullStackFixture,

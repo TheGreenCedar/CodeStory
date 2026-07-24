@@ -4,10 +4,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .contracts import require_exact_keys, require_nonempty_string, require_nonnegative_int
+from .contracts import (
+    require_exact_keys,
+    require_nonempty_string,
+    require_nonnegative_int,
+)
 from .foundation import require
 from .qualification_artifact_types import QualificationArtifactSummary
-from .qualification_documents import PrivateJsonArtifact, PrivateJsonMessages, _private_json_artifact
+from .qualification_documents import (
+    PrivateJsonArtifact,
+    PrivateJsonMessages,
+    _private_json_artifact,
+)
+
 
 def _normalized_qualification_summary(
     summary: object,
@@ -86,8 +95,7 @@ def _qualification_artifact_document(
         messages=PrivateJsonMessages(
             missing_or_unsafe=f"qualification artifact is missing or unsafe: {name}",
             escaped=(
-                "qualification artifact escaped its private output directory: "
-                f"{name}"
+                f"qualification artifact escaped its private output directory: {name}"
             ),
             leaked=f"qualification artifact {name} leaked private request material",
             invalid_json=f"qualification artifact {name} is not valid JSON",

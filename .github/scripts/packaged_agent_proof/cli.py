@@ -29,7 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-version")
     parser.add_argument("--project", type=Path)
     parser.add_argument("--plugin-root", type=Path)
-    parser.add_argument("--out-dir", type=Path, default=Path("target/packaged-agent-proof"))
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("target/packaged-agent-proof")
+    )
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--additional-project", type=Path, action="append", default=[])
@@ -38,7 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version-only", action="store_true")
     parser.add_argument(
         "--proof-tier",
-        choices=("calibration", "hosted_package", "protected_hardware", "installed_runtime"),
+        choices=(
+            "calibration",
+            "hosted_package",
+            "protected_hardware",
+            "installed_runtime",
+        ),
         default="hosted_package",
     )
     parser.add_argument("--plugin-handoff", action="store_true")
@@ -77,7 +84,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-producer-run-id")
     parser.add_argument("--candidate-producer-run-attempt")
     parser.add_argument("--candidate-artifact-name")
-    parser.add_argument("--measurement-protocol", type=Path, default=MEASUREMENT_PROTOCOL)
+    parser.add_argument(
+        "--measurement-protocol", type=Path, default=MEASUREMENT_PROTOCOL
+    )
     parser.add_argument("--expected-source-sha")
     parser.add_argument("--expected-source-tree")
     parser.add_argument("--self-test", action="store_true")
@@ -134,8 +143,7 @@ def _prepare_proof_arguments(args: argparse.Namespace) -> None:
     args.out_dir = args.out_dir.resolve()
     _resolve_optional_paths(args)
     require(
-        (args.calibration_run_output is None)
-        == (args.calibration_run_index is None),
+        (args.calibration_run_output is None) == (args.calibration_run_index is None),
         "--calibration-run-output and --calibration-run-index must be supplied together",
     )
     require(

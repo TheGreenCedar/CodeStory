@@ -5,12 +5,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .foundation import SERVER_LIFECYCLES, require
 from .contract_primitives import (
     require_exact_keys,
     require_nonempty_string,
     require_sha256,
 )
+from .foundation import SERVER_LIFECYCLES, require
 from .measurement_protocol import load_server_measurement_contract
 
 
@@ -20,7 +20,10 @@ def _verify_frozen_constant_set(measurement: dict, constant_set: dict) -> None:
         "embedding server constants are not frozen; calibration cannot be treated as qualification",
     )
     freeze_record = constant_set.get("freeze_record")
-    require(isinstance(freeze_record, dict), "frozen embedding server constants omit their freeze record")
+    require(
+        isinstance(freeze_record, dict),
+        "frozen embedding server constants omit their freeze record",
+    )
     require_exact_keys(
         freeze_record,
         {
@@ -74,14 +77,20 @@ def _verify_frozen_constant_set(measurement: dict, constant_set: dict) -> None:
         "constant-set freeze record must bind three distinct runs for every calibration cell",
     )
     for index, digest in enumerate(run_digests):
-        require_sha256(digest, f"constant-set freeze_record.run_artifact_sha256s[{index}]")
+        require_sha256(
+            digest, f"constant-set freeze_record.run_artifact_sha256s[{index}]"
+        )
     unresolved = [
         field
         for section in ("calibration_required_values", "qualification_thresholds")
         for field, value in constant_set.get(section, {}).items()
         if value is None
     ]
-    require(not unresolved, "frozen embedding server constants contain unresolved values: " + ", ".join(unresolved))
+    require(
+        not unresolved,
+        "frozen embedding server constants contain unresolved values: "
+        + ", ".join(unresolved),
+    )
 
 
 def verify_package_server_contracts(

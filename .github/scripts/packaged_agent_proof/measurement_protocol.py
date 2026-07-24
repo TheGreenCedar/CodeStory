@@ -7,15 +7,30 @@ import re
 from pathlib import Path
 
 from .contract_primitives import canonical_sha256, require_nonempty_string, sha256
-from .foundation import HOLDOUT_TASK_ROOT, REPOSITORY_ROOT, REQUIRED_HOLDOUT_TASK_FILES, SERVER_CONSTANT_SET, SERVER_PROTOCOL, ProofFailure, require
-from .measurement_constant_selection import _verify_constant_selection, _verify_thresholds_and_clock
-from .measurement_protocol_validation import _measurement_document, _verify_measurement_matrices, _verify_measurement_sampling, _verify_scenario_and_metric_contracts
+from .foundation import (
+    HOLDOUT_TASK_ROOT,
+    REPOSITORY_ROOT,
+    REQUIRED_HOLDOUT_TASK_FILES,
+    SERVER_CONSTANT_SET,
+    SERVER_PROTOCOL,
+    ProofFailure,
+    require,
+)
+from .measurement_constant_selection import (
+    _verify_constant_selection,
+    _verify_thresholds_and_clock,
+)
+from .measurement_protocol_validation import (
+    _measurement_document,
+    _verify_measurement_matrices,
+    _verify_measurement_sampling,
+    _verify_scenario_and_metric_contracts,
+)
+
 
 def load_measurement_protocol(path: Path) -> tuple[dict, str]:
     protocol = _measurement_document(path)
-    required_metrics, metric_contracts = _verify_scenario_and_metric_contracts(
-        protocol
-    )
+    required_metrics, metric_contracts = _verify_scenario_and_metric_contracts(protocol)
     _verify_measurement_matrices(protocol)
     _verify_measurement_sampling(protocol, required_metrics, metric_contracts)
     _verify_constant_selection(protocol)
@@ -57,7 +72,9 @@ def load_server_measurement_contract(measurement_protocol_path: Path) -> dict:
     }
 
 
-def load_holdout_task_contracts(root: Path = HOLDOUT_TASK_ROOT) -> tuple[dict[tuple[str, str], dict], str]:
+def load_holdout_task_contracts(
+    root: Path = HOLDOUT_TASK_ROOT,
+) -> tuple[dict[tuple[str, str], dict], str]:
     require(root.is_dir(), f"holdout retrieval task directory is missing: {root}")
     paths = sorted(root.glob("*.task.json"))
     require(
@@ -70,18 +87,33 @@ def load_holdout_task_contracts(root: Path = HOLDOUT_TASK_ROOT) -> tuple[dict[tu
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise ProofFailure(f"holdout task manifest is not valid JSON: {path}: {exc}") from exc
-        require(isinstance(raw, dict), f"holdout task manifest must be an object: {path}")
-        require(raw.get("version") == 1, f"holdout task manifest schema is unsupported: {path}")
+            raise ProofFailure(
+                f"holdout task manifest is not valid JSON: {path}: {exc}"
+            ) from exc
+        require(
+            isinstance(raw, dict), f"holdout task manifest must be an object: {path}"
+        )
+        require(
+            raw.get("version") == 1,
+            f"holdout task manifest schema is unsupported: {path}",
+        )
         task_id = require_nonempty_string(raw.get("id"), f"holdout task {path.name}.id")
         require(
             path.name == f"{task_id}.task.json",
             f"holdout task id does not match its checked-in filename: {path}",
         )
-        require(raw.get("suite") == "holdout-retrieval", f"holdout task {task_id} left the release suite")
+        require(
+            raw.get("suite") == "holdout-retrieval",
+            f"holdout task {task_id} left the release suite",
+        )
         repo = raw.get("repo")
-        require(isinstance(repo, dict), f"holdout task {task_id} omitted repository identity")
-        repo_name = require_nonempty_string(repo.get("name"), f"holdout task {task_id} repo.name")
+        require(
+            isinstance(repo, dict),
+            f"holdout task {task_id} omitted repository identity",
+        )
+        repo_name = require_nonempty_string(
+            repo.get("name"), f"holdout task {task_id} repo.name"
+        )
         require(
             isinstance(repo.get("url"), str)
             and re.fullmatch(
@@ -97,7 +129,10 @@ def load_holdout_task_contracts(root: Path = HOLDOUT_TASK_ROOT) -> tuple[dict[tu
             f"holdout task {task_id} repository ref is not immutable",
         )
         key = (repo_name, task_id)
-        require(key not in tasks, f"holdout task identity is duplicated: {repo_name}/{task_id}")
+        require(
+            key not in tasks,
+            f"holdout task identity is duplicated: {repo_name}/{task_id}",
+        )
         expected_snapshot = {
             "id": task_id,
             "name": raw.get("name", task_id),

@@ -9,6 +9,7 @@ from pathlib import Path
 from .contracts import require_nonempty_string
 from .foundation import require
 
+
 def verify_calibration_source_lineage(
     calibration_source: dict,
     frozen_source: dict,
@@ -89,8 +90,7 @@ def verify_calibration_source_lineage(
         if path
     ]
     require(
-        changed_paths
-        == ["docs/testing/per-user-embedding-server-constant-set.json"],
+        changed_paths == ["docs/testing/per-user-embedding-server-constant-set.json"],
         "post-calibration source drift exceeded the one allowed constant-set freeze file",
     )
     return {

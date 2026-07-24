@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from .foundation import CANDIDATE_QUALIFICATION_MATRIX_ALIASES, require
 from .contract_primitives import (
     normalized_backend,
     require_exact_keys,
@@ -11,6 +10,7 @@ from .contract_primitives import (
     require_positive_int,
     require_sha256,
 )
+from .foundation import CANDIDATE_QUALIFICATION_MATRIX_ALIASES, require
 
 
 def selected_qualification_matrix_cell(
@@ -89,8 +89,7 @@ def _measurement_process_and_clock(
         f"qualification measurement {metric} clock",
     )
     require(
-        clock["domain"] == "awake_monotonic"
-        and clock["api"] in allowed_awake_apis,
+        clock["domain"] == "awake_monotonic" and clock["api"] in allowed_awake_apis,
         f"qualification measurement {metric} used an unsupported awake clock",
     )
     require_nonnegative_int(
@@ -225,7 +224,11 @@ _DURATION_METRICS = {
 def _duration_metric_value(metric: str, operands: dict, awake_delta_ns: int) -> float:
     require_exact_keys(
         operands,
-        ({"successful_operation_duration_ns"} if metric in _SUCCESSFUL_OPERATION_METRICS else set()),
+        (
+            {"successful_operation_duration_ns"}
+            if metric in _SUCCESSFUL_OPERATION_METRICS
+            else set()
+        ),
         f"qualification measurement {metric} operands",
     )
     if metric in _SUCCESSFUL_OPERATION_METRICS:
@@ -241,7 +244,11 @@ def _duration_metric_value(metric: str, operands: dict, awake_delta_ns: int) -> 
 
 
 def _throughput_metric_value(metric: str, operands: dict, awake_delta_ns: int) -> float:
-    operand = "completed_documents" if metric == "bulk_documents_per_second" else "completed_tokens"
+    operand = (
+        "completed_documents"
+        if metric == "bulk_documents_per_second"
+        else "completed_tokens"
+    )
     require_exact_keys(
         operands,
         {operand, "successful_operation_duration_ns"},
@@ -264,7 +271,9 @@ def _throughput_metric_value(metric: str, operands: dict, awake_delta_ns: int) -
 
 
 def _memory_metric_value(operands: dict) -> int:
-    require_exact_keys(operands, {"processes"}, "qualification five-process memory operands")
+    require_exact_keys(
+        operands, {"processes"}, "qualification five-process memory operands"
+    )
     processes = operands["processes"]
     require(
         isinstance(processes, list) and len(processes) == 5,
@@ -285,7 +294,14 @@ def _memory_metric_value(operands: dict) -> int:
         require(isinstance(observed, dict), f"{field} is malformed")
         require_exact_keys(
             observed,
-            {"role", "pid", "process_start_id", "executable_sha256", "resident_bytes", "measurement_api"},
+            {
+                "role",
+                "pid",
+                "process_start_id",
+                "executable_sha256",
+                "resident_bytes",
+                "measurement_api",
+            },
             field,
         )
         roles.add(require_nonempty_string(observed["role"], f"{field}.role"))
@@ -296,7 +312,9 @@ def _memory_metric_value(operands: dict) -> int:
         )
         identities.add((pid, start_id))
         require_sha256(observed["executable_sha256"], f"{field}.executable_sha256")
-        total += require_positive_int(observed["resident_bytes"], f"{field}.resident_bytes")
+        total += require_positive_int(
+            observed["resident_bytes"], f"{field}.resident_bytes"
+        )
         require_nonempty_string(observed["measurement_api"], f"{field}.measurement_api")
     require(
         roles == expected_roles and len(identities) == 5,
@@ -344,7 +362,8 @@ def _accelerator_residency_value(
     )
     require(
         operands["policy"] == expected_policy
-        and normalized_backend(operands["backend"]) == normalized_backend(expected_backend),
+        and normalized_backend(operands["backend"])
+        == normalized_backend(expected_backend),
         "qualification accelerator-residency sample used the wrong policy or backend",
     )
     tensor_count = require_nonnegative_int(

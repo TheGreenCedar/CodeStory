@@ -8,6 +8,7 @@ from .foundation import ProofFailure, require
 from .qualification import derive_scenario_assertions
 from .self_test_full_stack_types import ServerIdentityFixture, TrueIdleFixture
 
+
 def _true_idle_snapshots(
     first_snapshot: dict,
 ) -> tuple[dict, dict, list[dict]]:
@@ -16,9 +17,7 @@ def _true_idle_snapshots(
     true_idle_respawned["process"]["server_instance_id"] = "respawned-server"
     true_idle_respawned["process"]["pid"] = 303
     true_idle_respawned["process"]["process_start_id"] = "process-start-303"
-    true_idle_respawned["authority"]["lifetime_authority_id"] = (
-        "respawned-authority"
-    )
+    true_idle_respawned["authority"]["lifetime_authority_id"] = "respawned-authority"
     true_idle_respawned["authority"]["listener_id"] = "respawned-listener"
     true_idle_respawned["engine"]["engine_owner_id"] = "respawned-engine-owner"
     true_idle_respawned["engine"]["native_worker_id"] = "respawned-native-worker"
@@ -40,6 +39,7 @@ def _true_idle_snapshots(
         },
     ]
     return true_idle_before, true_idle_respawned, true_idle_process_observations
+
 
 def _true_idle_transitions(
     before: dict,
@@ -110,7 +110,7 @@ def _true_idle_transitions(
                     "old_server_instance_id": true_idle_before["process"][
                         "server_instance_id"
                     ]
-                }
+                },
             }
         ],
         "server_respawned": [
@@ -124,17 +124,22 @@ def _true_idle_transitions(
                     "model_load_count": 1,
                     "materialized_model_sha256": materialized_sha256,
                     "materialized_reused": True,
-                }
+                },
             }
         ],
     }
     return true_idle_transitions, materialized_sha256
 
+
 def _verified_true_idle_fixture(
     first_snapshot: dict,
 ) -> TrueIdleFixture:
-    before, respawned, true_idle_process_observations = _true_idle_snapshots(first_snapshot)
-    true_idle_transitions, materialized_sha256 = _true_idle_transitions(before, respawned)
+    before, respawned, true_idle_process_observations = _true_idle_snapshots(
+        first_snapshot
+    )
+    true_idle_transitions, materialized_sha256 = _true_idle_transitions(
+        before, respawned
+    )
     true_idle_invocations = [
         {
             "operation": "query",
@@ -173,6 +178,7 @@ def _verified_true_idle_fixture(
         materialized_sha256=materialized_sha256,
     )
 
+
 def _materialization_binding_hostiles(fixture: TrueIdleFixture) -> None:
     true_idle_transitions = fixture.transitions
     true_idle_process_observations = fixture.process_observations
@@ -203,9 +209,8 @@ def _materialization_binding_hostiles(fixture: TrueIdleFixture) -> None:
                 f"hostile true-idle {field} changed its exact failure",
             )
         else:
-            raise ProofFailure(
-                f"hostile true-idle {field} escaped replacement binding"
-            )
+            raise ProofFailure(f"hostile true-idle {field} escaped replacement binding")
+
 
 def _temporal_ordering_hostiles(fixture: TrueIdleFixture) -> None:
     true_idle_transitions = fixture.transitions
@@ -286,6 +291,7 @@ def _temporal_ordering_hostiles(fixture: TrueIdleFixture) -> None:
     else:
         raise ProofFailure("historical respawn transition was accepted")
 
+
 def _absence_cardinality_hostile(fixture: TrueIdleFixture) -> None:
     true_idle_transitions = fixture.transitions
     true_idle_process_observations = fixture.process_observations
@@ -319,6 +325,7 @@ def _absence_cardinality_hostile(fixture: TrueIdleFixture) -> None:
         )
     else:
         raise ProofFailure("duplicate true-idle absence witness was accepted")
+
 
 def run_true_idle_self_tests(server: ServerIdentityFixture) -> None:
     fixture = _verified_true_idle_fixture(server.first_snapshot)

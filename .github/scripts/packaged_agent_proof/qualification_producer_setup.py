@@ -9,8 +9,17 @@ from pathlib import Path
 
 from .contracts import sha256
 from .foundation import RETRIEVAL_QUALITY_EVIDENCE_CONTRACT, ProofFailure, require
-from .qualification_production_types import QualificationExternalEvidence, QualificationProducerContext
-from .runtime import produce_product_publication_fault_evidence, verify_fault_recovery_consistency_raw_evidence, verify_publication_fault_raw_evidence, verify_retrieval_quality_raw_evidence
+from .qualification_production_types import (
+    QualificationExternalEvidence,
+    QualificationProducerContext,
+)
+from .runtime import (
+    produce_product_publication_fault_evidence,
+    verify_fault_recovery_consistency_raw_evidence,
+    verify_publication_fault_raw_evidence,
+    verify_retrieval_quality_raw_evidence,
+)
+
 
 def prepare_qualification_producer(
     args: argparse.Namespace,
@@ -65,9 +74,7 @@ def prepare_qualification_producer(
     }
     qualification_env = dict(env)
     qualification_env.pop("CODESTORY_CLI", None)
-    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(
-        private_root.resolve()
-    )
+    qualification_env["CODESTORY_EMBED_QUALIFICATION_DIR"] = str(private_root.resolve())
     qualification_env["CODESTORY_EMBED_QUALIFICATION_NONCE"] = nonce
     qualification_env["CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"] = archive_sha256
     server_cleanup_control.update(

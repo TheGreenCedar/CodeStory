@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from .contracts import require_nonnegative_int, require_positive_int
 from .foundation import HEX_SHA256
-from .qualification_scenario_evidence import ScenarioAssertionEvidence, validate_replay_attempts, validate_retry_state
+from .qualification_scenario_evidence import (
+    ScenarioAssertionEvidence,
+    validate_replay_attempts,
+    validate_retry_state,
+)
+
 
 def _client_death_assertions(
     evidence: ScenarioAssertionEvidence,
@@ -33,8 +38,7 @@ def _client_death_assertions(
             and terminated["termination"] == "terminated"
         ),
         "other_client_continues": (
-            HEX_SHA256.fullmatch(str(continued["project_identity_sha256"]))
-            is not None
+            HEX_SHA256.fullmatch(str(continued["project_identity_sha256"])) is not None
             and post["server_instance_id"] in evidence.snapshot_instances
         ),
         "no_server_replacement": len(evidence.snapshot_instances) == 1,
@@ -92,8 +96,7 @@ def _frozen_owner_assertions(
         == next(iter(evidence.snapshot_authorities))
         and all(
             snapshot["process"]["pid"] == stable_pid
-            and snapshot["process"]["process_start_id"]
-            == stable["process_start_id"]
+            and snapshot["process"]["process_start_id"] == stable["process_start_id"]
             for snapshot in evidence.snapshots
         )
         and stable["post_release_query_succeeded"] is True
@@ -133,8 +136,7 @@ def _incompatible_owner_assertions(
         {"old_server_instance_id", "new_server_instance_id"},
     )
     replaced = (
-        replacement["old_server_instance_id"]
-        != replacement["new_server_instance_id"]
+        replacement["old_server_instance_id"] != replacement["new_server_instance_id"]
         and {
             replacement["old_server_instance_id"],
             replacement["new_server_instance_id"],
@@ -162,8 +164,7 @@ def _incompatible_owner_assertions(
         ),
         "active_owner_returns_typed_retry": (
             active["compatibility_evidence"] == "injected_contract_mismatch"
-            and active["error_code"]
-            == "embedding_server_incompatible_active_owner"
+            and active["error_code"] == "embedding_server_incompatible_active_owner"
             and active_retry.code == active["error_code"]
             and active_retry.retry_class == "after_owner_idle"
             and active_retry.retry_after_ms == 0

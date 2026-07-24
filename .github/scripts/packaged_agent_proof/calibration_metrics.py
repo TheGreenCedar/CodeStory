@@ -16,6 +16,7 @@ from .calibration_records import (
 from .contracts import require_exact_keys, require_nonnegative_int
 from .foundation import require
 
+
 def _aggregate_calibration_values(
     aggregation: str,
     values: list[float | int],
@@ -133,13 +134,19 @@ def _verified_calibration_runs(
 
 
 def _selected_calibration_constants(durations: dict[str, list[float]]) -> dict:
-    connect = max(1, math.ceil(max(durations["existing_owner_connect_duration"]) * 1.50))
+    connect = max(
+        1, math.ceil(max(durations["existing_owner_connect_duration"]) * 1.50)
+    )
     spawn = max(1, math.ceil(max(durations["spawn_convergence_duration"]) * 1.50))
     query = max(1, math.ceil(max(durations["query_request_duration"]) * 1.50))
     replay = max(query, math.ceil(max(durations["bulk_request_duration"]) * 1.50))
     retry = max(1, math.floor(min(durations["capacity_condition_duration"]) * 0.50))
-    initial = max(1, math.ceil(max(durations["existing_owner_connect_duration"]) * 0.50))
-    maximum = max(initial, math.ceil(max(durations["spawn_convergence_duration"]) * 0.25))
+    initial = max(
+        1, math.ceil(max(durations["existing_owner_connect_duration"]) * 0.50)
+    )
+    maximum = max(
+        initial, math.ceil(max(durations["spawn_convergence_duration"]) * 0.25)
+    )
     hard = max(1, math.ceil(max(durations["successful_operation_duration"]) * 4.00))
     cadence = max(1, math.floor(hard / 20))
     return {

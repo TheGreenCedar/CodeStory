@@ -53,4 +53,3 @@ def _private_json_artifact(
         raise ProofFailure(f"{messages.invalid_json}: {exc}") from exc
     require(isinstance(payload, dict), messages.non_object)
     return PrivateJsonArtifact(name, payload_bytes, payload)
-

@@ -6,10 +6,19 @@ import hashlib
 import json
 from pathlib import Path
 
-from .contracts import require_exact_keys, require_nonempty_string, selected_qualification_matrix_cell, write_private_json
+from .contracts import (
+    require_exact_keys,
+    require_nonempty_string,
+    selected_qualification_matrix_cell,
+    write_private_json,
+)
 from .foundation import REQUIRED_SERVER_SCENARIOS, ProofFailure, require
 from .process import run
-from .qualification_production_types import QualificationProducerContext, QualificationRunnerEvidence
+from .qualification_production_types import (
+    QualificationProducerContext,
+    QualificationRunnerEvidence,
+)
+
 
 def _qualification_request(
     context: QualificationProducerContext,
@@ -37,9 +46,7 @@ def _qualification_request(
         "projects": list(context.projects),
         "required_scenarios": sorted(REQUIRED_SERVER_SCENARIOS),
         "required_metrics": sorted(
-            context.measurement_contract["measurement_protocol"][
-                "required_metrics"
-            ]
+            context.measurement_contract["measurement_protocol"]["required_metrics"]
         ),
         "output_directory": str(context.artifact_root.resolve()),
     }

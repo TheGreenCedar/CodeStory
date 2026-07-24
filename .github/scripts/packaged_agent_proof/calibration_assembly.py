@@ -6,17 +6,18 @@ import argparse
 import json
 from pathlib import Path
 
-from .foundation import (
-    ProofFailure,
-    require,
-)
+from .calibration_verification import verify_calibration_bundle
 from .contracts import (
     load_server_measurement_contract,
     require_nonempty_string,
     sha256,
     write_json,
 )
-from .calibration_verification import verify_calibration_bundle
+from .foundation import (
+    ProofFailure,
+    require,
+)
+
 
 def _calibration_run_documents(
     paths: list[Path],
@@ -98,9 +99,7 @@ def _frozen_calibration_constant_set(
 ) -> dict:
     frozen = json.loads(json.dumps(constant_set))
     frozen["status"] = "frozen"
-    frozen["calibration_required_values"] = selection[
-        "calibration_required_values"
-    ]
+    frozen["calibration_required_values"] = selection["calibration_required_values"]
     frozen["qualification_thresholds"] = selection["qualification_thresholds"]
     frozen["freeze_record"] = {
         "selection_source_commit": source["commit"],
@@ -127,9 +126,7 @@ def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
         and args.freeze_selected_at is not None,
         "calibration assembly requires bundle output, frozen constant-set output, and selected-at",
     )
-    measurement_contract = load_server_measurement_contract(
-        args.measurement_protocol
-    )
+    measurement_contract = load_server_measurement_contract(args.measurement_protocol)
     expected_run_count = (
         len(measurement_contract["measurement_protocol"]["calibration_matrix"]) * 3
     )
@@ -185,4 +182,3 @@ def assemble_calibration_bundle(args: argparse.Namespace) -> dict:
         "matrix_cell_count": verified["matrix_cell_count"],
         "freeze_digest": verified["freeze_digest"],
     }
-

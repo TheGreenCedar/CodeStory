@@ -7,8 +7,17 @@ from pathlib import Path
 
 from .archive import normalized_backend
 from .contracts import require_nonempty_string, require_positive_int, require_sha256
-from .foundation import CANDIDATE_PRODUCER_WORKFLOW_PATHS, PINNED_CODEX_CLI_VERSION, require
-from .qualification_retained_types import RetainedPackageBinding, RetainedQualificationContract, RetainedRuntimeBinding
+from .foundation import (
+    CANDIDATE_PRODUCER_WORKFLOW_PATHS,
+    PINNED_CODEX_CLI_VERSION,
+    require,
+)
+from .qualification_retained_types import (
+    RetainedPackageBinding,
+    RetainedQualificationContract,
+    RetainedRuntimeBinding,
+)
+
 
 def _verify_marketplace_provenance(
     contract: RetainedQualificationContract,
@@ -16,12 +25,10 @@ def _verify_marketplace_provenance(
     runtime: dict,
 ) -> None:
     require(
-        plugin.get("marketplace_repository")
-        == "TheGreenCedar/AgentPluginMarketplace"
+        plugin.get("marketplace_repository") == "TheGreenCedar/AgentPluginMarketplace"
         and plugin.get("codex_cli_version") == PINNED_CODEX_CLI_VERSION
         and runtime.get("build_source") == "github_release"
-        and runtime.get("repo_ref")
-        == f"v{contract.manifest['release_version']}",
+        and runtime.get("repo_ref") == f"v{contract.manifest['release_version']}",
         "installed evidence has invalid marketplace/release provenance",
     )
     require(
@@ -69,8 +76,7 @@ def _verify_installed_provenance(contract: RetainedQualificationContract) -> Non
     installation_source = plugin.get("installation_source")
     require(
         plugin.get("schema_version") == 2
-        and installation_source
-        in {"codex_marketplace_install", "candidate_archive"}
+        and installation_source in {"codex_marketplace_install", "candidate_archive"}
         and plugin.get("plugin_id") == "codestory"
         and plugin.get("plugin_version") == manifest["release_version"],
         "installed evidence has invalid plugin provenance",
@@ -153,7 +159,9 @@ def _verify_host(contract: RetainedQualificationContract) -> None:
     host = retained.host
     package = retained.package
     require_sha256(host.get("fingerprint"), "retained qualification host fingerprint")
-    require_nonempty_string(host.get("platform"), "retained qualification host platform")
+    require_nonempty_string(
+        host.get("platform"), "retained qualification host platform"
+    )
     require(
         host.get("target") == contract.manifest["asset_target"],
         "retained qualification host names a different package target",
@@ -166,7 +174,8 @@ def _verify_host(contract: RetainedQualificationContract) -> None:
         "retained qualification host does not match the requested matrix cell",
     )
     require(
-        normalized_backend(package.get("backend")) == normalized_backend(host["backend"]),
+        normalized_backend(package.get("backend"))
+        == normalized_backend(host["backend"]),
         "retained qualification package and host backend identities disagree",
     )
     require(

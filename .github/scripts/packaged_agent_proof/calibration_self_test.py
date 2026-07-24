@@ -10,7 +10,6 @@ from pathlib import Path
 from .contracts import canonical_sha256, sha256, write_json
 from .foundation import TARGET_CONTRACTS
 
-
 _MEMORY_ROLES = (
     "plugin_host_a",
     "plugin_cli_a",
@@ -66,9 +65,7 @@ def _self_test_operands(
                 "role": role,
                 "pid": pid + index + 1,
                 "process_start_id": f"boot:{pid + index + 1}",
-                "executable_sha256": hashlib.sha256(
-                    f"exe:{role}".encode()
-                ).hexdigest(),
+                "executable_sha256": hashlib.sha256(f"exe:{role}".encode()).hexdigest(),
                 "resident_bytes": 1,
                 "measurement_api": "self_test",
             }
@@ -102,9 +99,7 @@ def _self_test_sample(
         + metric_position * 10
         + repeat
     )
-    independent = (
-        policy.get("independence") == "distinct_server_instance_per_sample"
-    )
+    independent = policy.get("independence") == "distinct_server_instance_per_sample"
     identity_seed = (
         f"{context.seed}:{metric}:{repeat}"
         if independent
@@ -115,18 +110,14 @@ def _self_test_sample(
         f"boot:{pid}"
         if independent
         else "boot:"
-        + hashlib.sha256(
-            f"server-start:{context.seed}:{metric}".encode()
-        ).hexdigest()
+        + hashlib.sha256(f"server-start:{context.seed}:{metric}".encode()).hexdigest()
     )
     started_ns = repeat * 2_000_000
     finished_ns = started_ns + 1_000_000
     boot_id = f"boot-{context.cell_position}"
     return {
         "sample_id": "sample:"
-        + hashlib.sha256(
-            f"{context.seed}:{metric}:{repeat}".encode()
-        ).hexdigest(),
+        + hashlib.sha256(f"{context.seed}:{metric}:{repeat}".encode()).hexdigest(),
         "repeat": repeat,
         "matrix_cell_id": context.matrix_cell_id,
         "workload_id": context.protocol["workloads"][metric]["workload_id"],
@@ -172,9 +163,7 @@ def _self_test_sample(
 
 def _self_test_metrics(context: SelfTestRunContext) -> dict:
     metrics = {}
-    names = sorted(
-        set(context.protocol["required_metrics"]) - {"retrieval_quality"}
-    )
+    names = sorted(set(context.protocol["required_metrics"]) - {"retrieval_quality"})
     for position, metric in enumerate(names):
         policy = context.protocol["metric_sampling"][metric]
         metrics[metric] = {
@@ -189,9 +178,7 @@ def _self_test_metrics(context: SelfTestRunContext) -> dict:
 
 def _self_test_run(context: SelfTestRunContext) -> tuple[dict, str]:
     run_id = hashlib.sha256(f"run:{context.seed}".encode()).hexdigest()
-    host = hashlib.sha256(
-        f"host:{context.matrix_cell_id}".encode()
-    ).hexdigest()
+    host = hashlib.sha256(f"host:{context.matrix_cell_id}".encode()).hexdigest()
     package = {
         "archive_sha256": hashlib.sha256(
             f"archive:{context.matrix_cell_id}".encode()

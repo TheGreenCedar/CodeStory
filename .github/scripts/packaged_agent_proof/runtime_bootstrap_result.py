@@ -5,11 +5,21 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .contracts import assert_retained_json_privacy, retained_runtime_evidence, sha256, write_json
+from .contracts import (
+    assert_retained_json_privacy,
+    retained_runtime_evidence,
+    sha256,
+    write_json,
+)
 from .foundation import LOWER_TIER_NONCLAIMS
 from .installation import assert_no_legacy_state
 from .process import current_account_identity, opaque_repository_id
-from .runtime_bootstrap_types import ColdProof, ContinuityProof, HostPair, RuntimeSetup
+from .runtime_bootstrap_types import (
+    HostPair,
+    RuntimePhaseEvidence,
+    RuntimeSetup,
+)
+
 
 def _runtime_result(
     args: argparse.Namespace,
@@ -17,15 +27,11 @@ def _runtime_result(
     root: Path,
     setup: RuntimeSetup,
     hosts: HostPair,
-    cold: ColdProof,
-    snippet: dict,
-    snippet_attempts: int,
-    managed_runtime: dict | None,
-    managed_binary: Path | None,
-    memory: dict | None,
-    continuity: ContinuityProof,
-    materialized: Path,
+    evidence: RuntimePhaseEvidence,
 ) -> dict:
+    cold = evidence.cold
+    continuity = evidence.continuity
+    managed_binary = evidence.managed_binary
     qualification_cli = managed_binary if managed_binary is not None else cli.resolve()
     forbidden = [
         str(setup.project_a),
@@ -69,9 +75,9 @@ def _runtime_result(
         "mcp_public_contract": {
             "ground_attempts": cold.ground_attempts,
             "ground_project_bound": True,
-            "snippet_scope": snippet["scope"],
-            "requested_context": snippet["requested_context"],
-            "snippet_attempts": snippet_attempts,
+            "snippet_scope": evidence.snippet["scope"],
+            "requested_context": evidence.snippet["requested_context"],
+            "snippet_attempts": evidence.snippet_attempts,
             "named_resource": "snippet",
             "project_bound": True,
         },
@@ -84,16 +90,16 @@ def _runtime_result(
         "second_host_identity": cold.identity_b,
         "rejoin_identity": continuity.rejoin_identity,
         "materialization": {
-            "sha256": sha256(materialized),
+            "sha256": sha256(evidence.materialized_model),
             "reused_on_rejoin": continuity.rejoin_identity[
                 "embedding_materialized_reused"
             ],
         },
         "installed_plugin": setup.provenance,
-        "managed_runtime": managed_runtime,
+        "managed_runtime": evidence.managed_runtime,
         "_qualification_cli_path": str(qualification_cli),
         "_qualification_projects": [str(setup.project_a), str(setup.project_b)],
-        "_memory_observations": memory,
+        "_memory_observations": evidence.memory,
         "_qualification_forbidden_values": forbidden,
         "nonclaims": {
             claim: {

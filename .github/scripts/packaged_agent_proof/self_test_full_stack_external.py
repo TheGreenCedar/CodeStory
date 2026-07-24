@@ -5,7 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 
-from .contracts import load_holdout_task_contracts, verify_package_server_contracts, write_json
+from .contracts import (
+    load_holdout_task_contracts,
+    verify_package_server_contracts,
+    write_json,
+)
 from .foundation import (
     FAULT_RECOVERY_CONSISTENCY_CASES,
     FAULT_RECOVERY_CONSISTENCY_CONTRACT,
@@ -44,6 +48,7 @@ def _external_contracts(fixture: FullStackFixture) -> tuple[dict, dict]:
             "measurement_protocol_sha256": fixture.measurement_protocol_sha256,
         },
     )
+
 
 def _publication_fault_test(
     fixture: FullStackFixture,
@@ -135,6 +140,7 @@ def _publication_fault_test(
         external=publication_external,
     )
 
+
 def _publication_fault_hostile(
     fixture: FullStackFixture,
     publication: PublicationFixture,
@@ -158,6 +164,7 @@ def _publication_fault_hostile(
     else:
         raise ProofFailure("self-declared publication assertions were accepted")
     write_json(publication_path, publication_payload)
+
 
 def _server_crash_scenario_tests() -> None:
     scenario_observations = {
@@ -226,9 +233,9 @@ def _server_crash_scenario_tests() -> None:
         "scenario assertion self-test did not derive exact raw claims",
     )
     hostile_scenario = json.loads(json.dumps(scenario_observations))
-    hostile_scenario["query_replayed"][0]["values"]["wire_attempts"][1][
-        "outcome"
-    ] = "server_loss"
+    hostile_scenario["query_replayed"][0]["values"]["wire_attempts"][1]["outcome"] = (
+        "server_loss"
+    )
     try:
         derive_scenario_assertions(
             "server_crash",
@@ -242,6 +249,7 @@ def _server_crash_scenario_tests() -> None:
         pass
     else:
         raise ProofFailure("named scenario transitions with false values were accepted")
+
 
 def _fault_consistency_tests(fixture: FullStackFixture) -> dict:
     root = fixture.root
@@ -291,6 +299,7 @@ def _fault_consistency_tests(fixture: FullStackFixture) -> dict:
     else:
         raise ProofFailure("changed fault-recovery search ranks were accepted")
     return consistency_external
+
 
 def _quality_payload(fixture: FullStackFixture) -> dict:
     manifest = fixture.manifest
@@ -390,6 +399,7 @@ def _quality_payload(fixture: FullStackFixture) -> dict:
     }
     return quality_payload
 
+
 def _verified_quality(
     fixture: FullStackFixture,
     quality_payload: dict,
@@ -411,6 +421,7 @@ def _verified_quality(
         payload=quality_payload,
         external=quality_external,
     )
+
 
 def _quality_hostiles(
     fixture: FullStackFixture,
@@ -497,6 +508,7 @@ def _quality_hostiles(
         pass
     else:
         raise ProofFailure("unfrozen server constants were accepted for qualification")
+
 
 def run_external_evidence_self_tests(
     fixture: FullStackFixture,

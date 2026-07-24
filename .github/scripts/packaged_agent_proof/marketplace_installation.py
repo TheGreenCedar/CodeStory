@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 from .contracts import require_exact_keys
 from .foundation import PINNED_CODEX_CLI_VERSION, REPOSITORY_ROOT, require
@@ -69,7 +70,13 @@ def _validate_attestation_paths(
 ) -> tuple[Path, dict, dict]:
     require_exact_keys(
         attestation,
-        {"schema_version", "installation_source", "installation", "plugin", "marketplace"},
+        {
+            "schema_version",
+            "installation_source",
+            "installation",
+            "plugin",
+            "marketplace",
+        },
         "marketplace install attestation",
     )
     installation = attestation["installation"]

@@ -74,10 +74,7 @@ def record_calibration_qualification(
     args: argparse.Namespace,
     summary: dict[str, object],
 ) -> None:
-    if (
-        args.qualification_evidence is None
-        or not args.qualification_evidence.is_file()
-    ):
+    if args.qualification_evidence is None or not args.qualification_evidence.is_file():
         return
     calibration = load_evidence(
         args.qualification_evidence,

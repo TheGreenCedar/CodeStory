@@ -1,6 +1,5 @@
 """Public packaged-proof contract surface."""
 
-from .foundation import ProofFailure
 from .contract_primitives import (
     assert_retained_json_privacy,
     canonical_sha256,
@@ -18,6 +17,7 @@ from .contract_primitives import (
     write_json,
     write_private_json,
 )
+from .foundation import ProofFailure
 from .measurement_protocol import (
     load_holdout_task_contracts,
     load_measurement_protocol,
@@ -30,13 +30,13 @@ from .measurement_samples import (
 from .package_contracts import verify_package_server_contracts
 
 __all__ = [
+    "ProofFailure",
     "assert_retained_json_privacy",
     "canonical_sha256",
     "load_holdout_task_contracts",
     "load_measurement_protocol",
     "load_server_measurement_contract",
     "normalized_backend",
-    "ProofFailure",
     "qualification_measurement_sample_value",
     "require_exact_keys",
     "require_nonempty_string",

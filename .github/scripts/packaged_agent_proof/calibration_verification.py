@@ -13,6 +13,7 @@ from .calibration_metrics import (
 from .calibration_records import _calibration_bundle
 from .contracts import sha256
 
+
 def verify_calibration_bundle(
     path: Path,
     measurement_contract: dict,
@@ -31,9 +32,7 @@ def verify_calibration_bundle(
         expected_producer_artifact=expected_producer_artifact,
     )
     accumulator = _verified_calibration_runs(bundle)
-    selected_constants = _selected_calibration_constants(
-        accumulator.duration_values_ms
-    )
+    selected_constants = _selected_calibration_constants(accumulator.duration_values_ms)
     thresholds = _selected_calibration_thresholds(
         accumulator.metric_values,
         bundle.protocol["metric_contracts"],

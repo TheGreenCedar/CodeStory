@@ -1,10 +1,10 @@
 """Public publication-fault evidence surface."""
 
-from .publication_fault_producer import produce_product_publication_fault_evidence
-from .publication_fault_verifier import (
+from .publication_consistency_verifier import (
     verify_fault_recovery_consistency_raw_evidence,
-    verify_publication_fault_raw_evidence,
 )
+from .publication_fault_producer import produce_product_publication_fault_evidence
+from .publication_fault_verifier import verify_publication_fault_raw_evidence
 from .publication_protocol import (
     publication_identity_from_status,
     read_jsonl,

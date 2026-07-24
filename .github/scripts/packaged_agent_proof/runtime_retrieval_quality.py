@@ -89,7 +89,10 @@ def _quality_contract(
         isinstance(blockers, list) and not blockers,
         "packet quality artifact contains publishable blockers",
     )
-    require(payload.get("repeats") == repeats, "packet quality top-level repeat count changed")
+    require(
+        payload.get("repeats") == repeats,
+        "packet quality top-level repeat count changed",
+    )
     modes = payload.get("modes")
     require(
         isinstance(modes, list) and modes == list(RELEASE_QUALITY_MODES),
@@ -103,7 +106,9 @@ def _quality_contract(
         for repeat in range(1, MIN_RETRIEVAL_QUALITY_REPEATS + 1)
     }
     rows = release_evidence.get("rows")
-    require(isinstance(rows, list) and rows, "packet quality artifact has no quality rows")
+    require(
+        isinstance(rows, list) and rows, "packet quality artifact has no quality rows"
+    )
     return QualityContract(
         release_evidence,
         holdout_tasks,
@@ -236,7 +241,9 @@ def _quality_cell(
         f"packet quality row {index} has an invalid repeat",
     )
     repo = require_nonempty_string(row.get("repo"), f"packet quality row {index} repo")
-    task_id = require_nonempty_string(row.get("task_id"), f"packet quality row {index} task id")
+    task_id = require_nonempty_string(
+        row.get("task_id"), f"packet quality row {index} task id"
+    )
     mode = require_nonempty_string(row.get("mode"), f"packet quality row {index} mode")
     require(
         mode in contract.expected_modes,
@@ -252,7 +259,9 @@ def _quality_cell(
         isinstance(snapshot, dict),
         f"packet quality row {index} omitted its task manifest snapshot",
     )
-    without_path = {key: value for key, value in snapshot.items() if key != "manifest_path"}
+    without_path = {
+        key: value for key, value in snapshot.items() if key != "manifest_path"
+    }
     require(
         without_path == task["snapshot"],
         f"packet quality row {index} task snapshot differs from the checked-in manifest",

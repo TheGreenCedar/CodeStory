@@ -25,7 +25,10 @@ def expected_archive_digest(checksum_file: Path, archive: Path) -> str:
 
 def safe_target(root: Path, name: str) -> Path:
     target = (root / name).resolve()
-    require(target.is_relative_to(root.resolve()), f"archive member escapes extraction root: {name}")
+    require(
+        target.is_relative_to(root.resolve()),
+        f"archive member escapes extraction root: {name}",
+    )
     return target
 
 
@@ -42,7 +45,10 @@ def unpack_archive(archive: Path, destination: Path) -> None:
             members = handle.getmembers()
             for member in members:
                 safe_target(destination, member.name)
-                require(not member.issym() and not member.islnk(), f"archive contains link: {member.name}")
+                require(
+                    not member.issym() and not member.islnk(),
+                    f"archive contains link: {member.name}",
+                )
             handle.extractall(destination, members=members)
         return
     raise ProofFailure(f"unsupported archive format: {archive}")
@@ -50,8 +56,13 @@ def unpack_archive(archive: Path, destination: Path) -> None:
 
 def find_cli(root: Path) -> Path:
     names = {"codestory-cli", "codestory-cli.exe"}
-    matches = [path for path in root.rglob("*") if path.is_file() and path.name in names]
-    require(len(matches) == 1, f"archive must contain exactly one native CodeStory executable; found {len(matches)}")
+    matches = [
+        path for path in root.rglob("*") if path.is_file() and path.name in names
+    ]
+    require(
+        len(matches) == 1,
+        f"archive must contain exactly one native CodeStory executable; found {len(matches)}",
+    )
     cli = matches[0]
     cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
     return cli

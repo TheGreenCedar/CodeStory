@@ -5,9 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 
 from .contracts import write_private_json
-from .publication_fault_evidence import _consistency_payload, _post_fault_observations, _publication_payload
+from .publication_fault_evidence import (
+    _consistency_payload,
+    _post_fault_observations,
+    _publication_payload,
+)
 from .publication_fault_run import _run_fault
-from .publication_fault_setup import _baseline_publication, _publication_commands, _publication_fixture
+from .publication_fault_setup import (
+    _baseline_publication,
+    _publication_commands,
+    _publication_fixture,
+)
+
 
 def produce_product_publication_fault_evidence(
     cli: Path,

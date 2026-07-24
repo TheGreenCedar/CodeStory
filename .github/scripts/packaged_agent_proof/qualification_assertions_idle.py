@@ -8,6 +8,7 @@ from .contracts import require_nonnegative_int, require_positive_int, require_sh
 from .foundation import require
 from .qualification_scenario_evidence import ScenarioAssertionEvidence
 
+
 @dataclass(frozen=True)
 class TrueIdleTransitions:
     active: dict
@@ -106,9 +107,7 @@ def _true_idle_witnesses(
         and respawn_observations[0]["snapshot"].get("engine") is not None,
         "true idle must retain exactly one replacement-engine witness",
     )
-    absent_transition = evidence.observations_by_kind[
-        "owner_absent_after_true_idle"
-    ][0]
+    absent_transition = evidence.observations_by_kind["owner_absent_after_true_idle"][0]
     respawn_transition = evidence.observations_by_kind["server_respawned"][0]
     absent_transition_ns = require_nonnegative_int(
         absent_transition.get("observed_ns"),
@@ -182,9 +181,7 @@ def _true_idle_measurements(
             "true idle last diagnostic ns",
         ),
         last_idle_connection_close_client_elapsed_ns=require_nonnegative_int(
-            transitions.idle_surfaces[
-                "last_idle_connection_close_client_elapsed_ns"
-            ],
+            transitions.idle_surfaces["last_idle_connection_close_client_elapsed_ns"],
             "true idle last connection close ns",
         ),
         server_idle_elapsed_before_client_wait_ns=require_nonnegative_int(

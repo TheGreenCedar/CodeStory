@@ -10,6 +10,7 @@ from .process import json_command
 from .publication_fault_types import PublicationCommands, PublicationFixture
 from .publication_protocol import publication_identity_from_status, run_quality_search
 
+
 def _publication_fixture(private_root: Path) -> PublicationFixture:
     project = private_root / "publication-product-repository"
     project.mkdir(mode=0o700)
@@ -20,8 +21,7 @@ def _publication_fixture(private_root: Path) -> PublicationFixture:
     source_file = project / "lib.rs"
     baseline_source = (
         "\n".join(
-            f'pub fn {anchor}() -> &\'static str {{ "{anchor}" }}'
-            for anchor in anchors
+            f'pub fn {anchor}() -> &\'static str {{ "{anchor}" }}' for anchor in anchors
         )
         + "\n"
     )

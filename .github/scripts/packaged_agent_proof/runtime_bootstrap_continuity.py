@@ -5,11 +5,23 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .contracts import require_nonempty_string, retained_mcp_transcript, sha256, write_json
+from .contracts import (
+    require_nonempty_string,
+    retained_mcp_transcript,
+    sha256,
+    write_json,
+)
 from .foundation import require
 from .installation import run_parallel, verify_managed_runtime_status
-from .process import McpProcess, capture_five_process_memory, engine_identity, process_start_identity, server_snapshot
+from .process import (
+    McpProcess,
+    capture_five_process_memory,
+    engine_identity,
+    process_start_identity,
+    server_snapshot,
+)
 from .runtime_bootstrap_types import ColdProof, ContinuityProof, HostPair, RuntimeSetup
+
 
 def _managed_runtime(
     args: argparse.Namespace,
@@ -101,7 +113,8 @@ def _live_retrieval(
         "successful encode counter did not advance across two-host retrieval",
     )
     require(
-        after["process"]["server_instance_id"] == cold.shared_identity["server_instance_id"],
+        after["process"]["server_instance_id"]
+        == cold.shared_identity["server_instance_id"],
         "live retrieval replaced the shared server",
     )
     if not args.produce_qualification_evidence:
@@ -140,7 +153,8 @@ def _continuity_proof(
         require_resident=True,
     )
     require(
-        survivor["process"]["server_instance_id"] == cold.shared_identity["server_instance_id"],
+        survivor["process"]["server_instance_id"]
+        == cold.shared_identity["server_instance_id"],
         "one client exit disrupted the surviving client or replaced the server",
     )
     host_c = McpProcess(
@@ -187,7 +201,9 @@ def _continuity_proof(
 
 def _materialized_model(setup: RuntimeSetup, cold: ColdProof) -> Path:
     models = list(setup.embedded_models.rglob("*.gguf"))
-    require(len(models) == 1, "two-host first use did not materialize exactly one model")
+    require(
+        len(models) == 1, "two-host first use did not materialize exactly one model"
+    )
     require(
         sha256(models[0]) == cold.identity_a["embedding_model_sha256"],
         "materialized model digest does not match runtime identity",

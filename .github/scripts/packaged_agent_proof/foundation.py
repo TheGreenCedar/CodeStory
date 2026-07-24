@@ -7,35 +7,10 @@ behavioral owner lives in its dedicated module.
 
 from __future__ import annotations
 
-import argparse
-from collections import Counter
-import ctypes
-import hashlib
-import json
-import math
 import os
-import queue
 import re
-import secrets
-import shutil
-import stat
-import struct
-import subprocess
-import sys
-import tarfile
-import tempfile
-import threading
-import time
-import tomllib
-import zipfile
 from pathlib import Path, PureWindowsPath
 from urllib.parse import quote, unquote
-
-from native_binary_contract import (
-    NativeBinaryError,
-    inspect_runtime_layout,
-    runtime_artifact_role,
-)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
@@ -83,9 +58,9 @@ def project_resource_uri(base_uri: str, project: Path) -> str:
     if os.name == "nt":
         value = value.replace("\\", "/")
         if value.startswith("//?/UNC/"):
-            value = f"//{value[len('//?/UNC/'):]}"
+            value = f"//{value[len('//?/UNC/') :]}"
         elif value.startswith("//?/"):
-            value = value[len("//?/"):]
+            value = value[len("//?/") :]
     return f"{base_uri}?project={quote(value, safe='-._~')}"
 
 
@@ -164,14 +139,22 @@ CANDIDATE_QUALIFICATION_MATRIX_ALIASES = {
         },
     }
 }
-SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-protocol.json")
-SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name("per-user-embedding-server-constant-set.json")
-HOLDOUT_TASK_ROOT = (
-    REPOSITORY_ROOT / "benchmarks" / "tasks" / "holdout-retrieval"
+SERVER_PROTOCOL = MEASUREMENT_PROTOCOL.with_name(
+    "per-user-embedding-server-protocol.json"
 )
+SERVER_CONSTANT_SET = MEASUREMENT_PROTOCOL.with_name(
+    "per-user-embedding-server-constant-set.json"
+)
+HOLDOUT_TASK_ROOT = REPOSITORY_ROOT / "benchmarks" / "tasks" / "holdout-retrieval"
 DEFAULT_QUERY = "RuntimeContext"
 DEFAULT_QUESTION = "Explain how CodeStory prepares retrieval."
-SOFTWARE_ADAPTERS = ("llvmpipe", "lavapipe", "warp", "software rasterizer", "swiftshader")
+SOFTWARE_ADAPTERS = (
+    "llvmpipe",
+    "lavapipe",
+    "warp",
+    "software rasterizer",
+    "swiftshader",
+)
 LEGACY_TOKENS = (
     "llama-server",
     "repair-worker",

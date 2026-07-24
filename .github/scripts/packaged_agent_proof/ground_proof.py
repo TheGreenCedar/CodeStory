@@ -190,7 +190,10 @@ def prove_ground_only_runtime(
     out_dir: Path,
     manifest: dict,
 ) -> dict:
-    require(args.plugin_handoff, "ground-only proof requires the ordinary packaged plugin handoff")
+    require(
+        args.plugin_handoff,
+        "ground-only proof requires the ordinary packaged plugin handoff",
+    )
     require(args.plugin_root is not None, "--plugin-handoff requires --plugin-root")
     require(args.project is not None, "--project is required for ground-only proof")
     require(
@@ -208,7 +211,9 @@ def prove_ground_only_runtime(
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
     require(launcher.is_file(), f"plugin launcher is missing: {launcher}")
     node = shutil.which("node")
-    require(node is not None, "packaged plugin proof requires Node.js for the host launcher")
+    require(
+        node is not None, "packaged plugin proof requires Node.js for the host launcher"
+    )
     qualified_env = _qualification_environment(args, cli, env, root, provenance)
     host = McpProcess(
         [node, str(launcher)],
@@ -247,6 +252,9 @@ def prove_ground_only_runtime(
     public_runtime_evidence = out_dir / "installed-ground-proof.json"
     write_json(public_runtime_evidence, retained_runtime_evidence(result))
     forbidden_values = result.get("_qualification_forbidden_values", [])
-    for public_artifact in (out_dir / "plugin-ground-mcp.json", public_runtime_evidence):
+    for public_artifact in (
+        out_dir / "plugin-ground-mcp.json",
+        public_runtime_evidence,
+    ):
         assert_retained_json_privacy(public_artifact, forbidden_values)
     return result

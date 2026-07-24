@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .contracts import selected_qualification_matrix_cell
 from .foundation import QUALIFICATION_SCHEMA_VERSION, require
 
+
 @dataclass(frozen=True)
 class RetainedQualificationEvidence:
     raw: dict
@@ -161,6 +162,15 @@ class RetainedRuntimeBinding:
     same_account: dict
     shared_identity: dict
     timing: dict
+
+
+@dataclass(frozen=True)
+class RetainedMetric:
+    name: str
+    value: int | float
+    threshold: int | float
+    comparison: str
+    raw_evidence: dict
 
 
 @dataclass(frozen=True)

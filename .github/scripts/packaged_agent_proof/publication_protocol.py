@@ -71,7 +71,9 @@ def send_server_qualification_control(
 ) -> dict:
     nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
     command_path = directory / f"{nonce}.command.json"
-    require(not command_path.exists(), "stale embedding qualification command is present")
+    require(
+        not command_path.exists(), "stale embedding qualification command is present"
+    )
     write_private_json(
         command_path,
         {
@@ -86,8 +88,10 @@ def send_server_qualification_control(
         event_path = directory / f"{nonce}.events.jsonl"
         event = wait_for_jsonl_event(
             event_path,
-            lambda candidate: candidate.get("sequence") == sequence
-            and candidate.get("action") == action,
+            lambda candidate: (
+                candidate.get("sequence") == sequence
+                and candidate.get("action") == action
+            ),
             timeout=timeout,
         )
         require(
@@ -101,11 +105,18 @@ def send_server_qualification_control(
 
 def server_observation_from_control_event(event: dict, phase: str) -> dict:
     snapshot = event.get("snapshot")
-    require(isinstance(snapshot, dict), f"{phase} control event omitted its server snapshot")
+    require(
+        isinstance(snapshot, dict), f"{phase} control event omitted its server snapshot"
+    )
     process = snapshot.get("process")
     engine = snapshot.get("engine")
-    require(isinstance(process, dict), f"{phase} server snapshot omitted process identity")
-    require(isinstance(engine, dict), f"{phase} server snapshot omitted resident engine identity")
+    require(
+        isinstance(process, dict), f"{phase} server snapshot omitted process identity"
+    )
+    require(
+        isinstance(engine, dict),
+        f"{phase} server snapshot omitted resident engine identity",
+    )
     process_start = require_nonempty_string(
         process.get("process_start_id"), f"{phase} process start"
     )
@@ -301,4 +312,3 @@ def run_publication_replacement_worker(
         and operations[0].get("error_code") is None,
         "publication replacement worker did not complete its query",
     )
-

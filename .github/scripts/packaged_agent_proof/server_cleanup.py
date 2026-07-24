@@ -41,9 +41,13 @@ def pin_temporary_package_server(
         f"{label} process start identity",
     )
     waiters = control.setdefault("_waiters", [])
-    require(isinstance(waiters, list), "temporary package cleanup waiter state is invalid")
+    require(
+        isinstance(waiters, list), "temporary package cleanup waiter state is invalid"
+    )
     for entry in waiters:
-        require(isinstance(entry, dict), "temporary package cleanup waiter is malformed")
+        require(
+            isinstance(entry, dict), "temporary package cleanup waiter is malformed"
+        )
         if entry.get("identity") == (pid, process_start_id):
             return entry
     verified_process = verified_live_executable(
@@ -265,7 +269,9 @@ def _wait_for_pinned_servers(
         if not isinstance(waiter, ExactProcessExitWaiter):
             errors.append("temporary package cleanup waiter was malformed")
             continue
-        superseded = final_identity is not None and entry.get("identity") != final_identity
+        superseded = (
+            final_identity is not None and entry.get("identity") != final_identity
+        )
         if superseded:
             superseded_process_count += 1
         try:
@@ -299,7 +305,9 @@ def wait_for_final_temporary_package_server(
     if not native_server_exit_wait_required(target_os, args.proof_tier):
         return None
     waiters = control.setdefault("_waiters", [])
-    require(isinstance(waiters, list), "temporary package cleanup waiter state is invalid")
+    require(
+        isinstance(waiters, list), "temporary package cleanup waiter state is invalid"
+    )
     configured = all(
         control.get(field) is not None
         for field in (
@@ -344,7 +352,9 @@ def wait_for_final_temporary_package_server(
     if not require_final_server or final_entry is None:
         return None
     final_evidence = evidence.get(final_entry["identity"])
-    require(isinstance(final_evidence, dict), "final server cleanup lost its exit evidence")
+    require(
+        isinstance(final_evidence, dict), "final server cleanup lost its exit evidence"
+    )
     return retained_final_native_server_exit_evidence(
         final_evidence,
         final_entry,

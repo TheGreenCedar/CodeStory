@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .foundation import ProofFailure, REPOSITORY_ROOT, require
+from .foundation import REPOSITORY_ROOT, ProofFailure, require
 from .process import McpProcess
 
 
@@ -101,7 +101,9 @@ def _terminal_unavailable_test(query: str) -> None:
         )
     else:
         raise ProofFailure("terminal MCP unavailable response was retried or accepted")
-    require(len(unavailable.calls) == 1, "terminal MCP unavailable response was retried")
+    require(
+        len(unavailable.calls) == 1, "terminal MCP unavailable response was retried"
+    )
 
 
 def _hostile_result_tests(query: str, ready_retrieval: dict) -> None:

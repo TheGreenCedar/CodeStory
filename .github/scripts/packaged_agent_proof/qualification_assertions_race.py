@@ -8,6 +8,7 @@ from .contracts import require_positive_int
 from .foundation import HEX_SHA256, require
 from .qualification_scenario_evidence import ScenarioAssertionEvidence
 
+
 @dataclass(frozen=True)
 class ColdRaceElection:
     instances: frozenset[str]
@@ -116,19 +117,13 @@ def _cold_race_assertions(
             and converged["lifetime_authority_id"]
             == next(iter(election.authorities))[0]
         ),
-        "one_listener": (
-            len({identity[1] for identity in election.authorities}) == 1
-        ),
+        "one_listener": (len({identity[1] for identity in election.authorities}) == 1),
         "one_server": (
             len(election.instances) == 1
             and converged["server_instance_id"] == next(iter(election.instances))
         ),
-        "one_engine_owner": (
-            len({identity[0] for identity in election.engines}) == 1
-        ),
-        "one_native_worker": (
-            len({identity[1] for identity in election.engines}) == 1
-        ),
+        "one_engine_owner": (len({identity[0] for identity in election.engines}) == 1),
+        "one_native_worker": (len({identity[1] for identity in election.engines}) == 1),
         "one_load_generation": (
             len({identity[2] for identity in election.engines}) == 1
         ),

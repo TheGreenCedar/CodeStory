@@ -5,6 +5,7 @@ from __future__ import annotations
 from .foundation import HEX_SHA256
 from .qualification_scenario_evidence import ScenarioAssertionEvidence
 
+
 def _mixed_queue_capacity_is_typed(capacity: dict) -> bool:
     for queue_class in ("query", "bulk"):
         record = capacity[f"{queue_class}_65th"]
@@ -29,16 +30,10 @@ def _mixed_queue_is_fifo(class_orders: dict) -> bool:
         class_orders[f"{queue_class}_expected_queue_insertion_request_ids"]
         == class_orders[f"{queue_class}_native_completed_request_ids"]
         and isinstance(
-            class_orders[
-                f"{queue_class}_expected_queue_insertion_request_ids"
-            ],
+            class_orders[f"{queue_class}_expected_queue_insertion_request_ids"],
             list,
         )
-        and bool(
-            class_orders[
-                f"{queue_class}_expected_queue_insertion_request_ids"
-            ]
-        )
+        and bool(class_orders[f"{queue_class}_expected_queue_insertion_request_ids"])
         and isinstance(
             class_orders[f"{queue_class}_native_completion_sequences"],
             list,
@@ -48,15 +43,11 @@ def _mixed_queue_is_fifo(class_orders: dict) -> bool:
             isinstance(sequence, int)
             and not isinstance(sequence, bool)
             and sequence > 0
-            for sequence in class_orders[
-                f"{queue_class}_native_completion_sequences"
-            ]
+            for sequence in class_orders[f"{queue_class}_native_completion_sequences"]
         )
         and class_orders[f"{queue_class}_native_completion_sequences"]
         == sorted(class_orders[f"{queue_class}_native_completion_sequences"])
-        and len(
-            set(class_orders[f"{queue_class}_native_completion_sequences"])
-        )
+        and len(set(class_orders[f"{queue_class}_native_completion_sequences"]))
         == len(class_orders[f"{queue_class}_native_completion_sequences"])
         for queue_class in ("query", "bulk")
     )
@@ -64,9 +55,7 @@ def _mixed_queue_is_fifo(class_orders: dict) -> bool:
 
 def _mixed_queue_preserves_project_order(project_orders: dict) -> bool:
     return all(
-        project_orders[
-            f"{queue_class}_expected_queue_insertion_project_identities"
-        ]
+        project_orders[f"{queue_class}_expected_queue_insertion_project_identities"]
         == project_orders[f"{queue_class}_native_completed_project_identities"]
         and len(
             set(

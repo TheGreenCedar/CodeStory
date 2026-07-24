@@ -51,23 +51,20 @@ def _prepare_contract_files(root: Path) -> tuple[Path, Path, Path]:
     self_protocol = root / SERVER_PROTOCOL.name
     self_protocol.write_bytes(SERVER_PROTOCOL.read_bytes())
     self_constant_set = root / SERVER_CONSTANT_SET.name
-    unfrozen_constant_set = json.loads(
-        SERVER_CONSTANT_SET.read_text(encoding="utf-8")
-    )
+    unfrozen_constant_set = json.loads(SERVER_CONSTANT_SET.read_text(encoding="utf-8"))
     unfrozen_constant_set["status"] = "unfrozen"
     unfrozen_constant_set["calibration_required_values"] = {
-        field: None
-        for field in unfrozen_constant_set["calibration_required_values"]
+        field: None for field in unfrozen_constant_set["calibration_required_values"]
     }
     unfrozen_constant_set["qualification_thresholds"] = {
-        field: None
-        for field in unfrozen_constant_set["qualification_thresholds"]
+        field: None for field in unfrozen_constant_set["qualification_thresholds"]
     }
     unfrozen_constant_set["freeze_record"] = None
     write_json(self_constant_set, unfrozen_constant_set)
     self_measurement_protocol = root / MEASUREMENT_PROTOCOL.name
     self_measurement_protocol.write_bytes(MEASUREMENT_PROTOCOL.read_bytes())
     return self_protocol, self_constant_set, self_measurement_protocol
+
 
 def _retained_privacy_tests(root: Path) -> None:
     retained_privacy_path = root / "retained-privacy.json"
@@ -78,11 +75,14 @@ def _retained_privacy_tests(root: Path) -> None:
     assert_retained_json_privacy(retained_privacy_path, [str(root), "private query"])
     write_json(retained_privacy_path, {"request_text": "private query"})
     try:
-        assert_retained_json_privacy(retained_privacy_path, [str(root), "private query"])
+        assert_retained_json_privacy(
+            retained_privacy_path, [str(root), "private query"]
+        )
     except ProofFailure:
         pass
     else:
         raise ProofFailure("retained evidence private request text was accepted")
+
 
 def _build_native_contract(
     protocol: Path,
@@ -202,6 +202,7 @@ def _native_manifest(contract: NativeContractFixture) -> dict:
         "server_proof": contract.server_proof,
     }
 
+
 def _archive_tests(
     root: Path,
     binary_payload: bytes,
@@ -216,7 +217,10 @@ def _archive_tests(
         )
     checksum = root / "SHA256SUMS.txt"
     checksum.write_text(f"{sha256(payload)}  {payload.name}\n", encoding="utf-8")
-    require(expected_archive_digest(checksum, payload) == sha256(payload), "checksum parser failed")
+    require(
+        expected_archive_digest(checksum, payload) == sha256(payload),
+        "checksum parser failed",
+    )
     unpacked = root / "unpacked"
     unpack_archive(payload, unpacked)
     cli = find_cli(unpacked)
@@ -233,6 +237,7 @@ def _archive_tests(
     else:
         raise ProofFailure("archive traversal was accepted")
     return manifest
+
 
 def build_full_stack_fixture(root: Path) -> FullStackFixture:
     protocol, constant_set, measurement_protocol = _prepare_contract_files(root)

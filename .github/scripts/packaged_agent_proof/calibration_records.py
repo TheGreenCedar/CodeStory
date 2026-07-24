@@ -20,6 +20,7 @@ from .contracts import (
 )
 from .foundation import TARGET_CONTRACTS, ProofFailure, require
 
+
 @dataclass(frozen=True)
 class CalibrationBundle:
     path: Path
@@ -63,7 +64,9 @@ class CalibrationSample:
 
 def _calibration_source(value: object) -> dict:
     require(isinstance(value, dict), "calibration bundle source identity is malformed")
-    require_exact_keys(value, {"commit", "tree", "tracked_dirty"}, "calibration bundle source")
+    require_exact_keys(
+        value, {"commit", "tree", "tracked_dirty"}, "calibration bundle source"
+    )
     for field in ("commit", "tree"):
         require(
             isinstance(value[field], str)
@@ -292,7 +295,10 @@ def _calibration_raw_payload(
     )
     accumulator.artifact_digests.add(digest)
     payload = value["payload"]
-    require(isinstance(payload, dict), f"calibration run {position} raw payload is malformed")
+    require(
+        isinstance(payload, dict),
+        f"calibration run {position} raw payload is malformed",
+    )
     require_exact_keys(
         payload,
         {
@@ -351,7 +357,9 @@ def _calibration_run(
         "calibration bundle duplicated an independent run id",
     )
     accumulator.run_ids.add(run_id)
-    cell_id = require_nonempty_string(raw_run["matrix_cell_id"], f"{field}.matrix_cell_id")
+    cell_id = require_nonempty_string(
+        raw_run["matrix_cell_id"], f"{field}.matrix_cell_id"
+    )
     run_index = require_positive_int(raw_run["run_index"], f"{field}.run_index")
     run_cell = (cell_id, run_index)
     require(
@@ -366,8 +374,7 @@ def _calibration_run(
         f"calibration run {position} was not a clean awake run",
     )
     require(
-        raw_run["source"] == bundle.source
-        and raw_run["contracts"] == bundle.contracts,
+        raw_run["source"] == bundle.source and raw_run["contracts"] == bundle.contracts,
         f"calibration run {position} changed source, tree, or protocol identity",
     )
     matrix_cell = bundle.matrix[cell_id]
@@ -439,22 +446,28 @@ def _calibration_sample(
     require(
         sample["repeat"] == index + 1
         and sample["matrix_cell_id"] == run.matrix_cell_id
-        and sample["workload_id"]
-        == bundle.protocol["workloads"][metric]["workload_id"]
+        and sample["workload_id"] == bundle.protocol["workloads"][metric]["workload_id"]
         and sample["cache_state"] == run.matrix_cell["cache_state"]
         and sample["residency_state"] == run.matrix_cell["residency_state"],
         f"calibration run {run.position} metric {metric} sample identity changed",
     )
     server = sample["server_identity"]
-    require(isinstance(server, dict), f"calibration run {run.position} metric {metric} server identity is malformed")
+    require(
+        isinstance(server, dict),
+        f"calibration run {run.position} metric {metric} server identity is malformed",
+    )
     require_exact_keys(
         server,
         {"server_instance_id", "process_start_id", "load_generation"},
         f"calibration run {run.position} metric {metric} server identity",
     )
     identity = (
-        require_opaque_identifier(server["server_instance_id"], f"{field} server_instance_id"),
-        require_nonempty_string(server["process_start_id"], f"{field} process_start_id"),
+        require_opaque_identifier(
+            server["server_instance_id"], f"{field} server_instance_id"
+        ),
+        require_nonempty_string(
+            server["process_start_id"], f"{field} process_start_id"
+        ),
         require_positive_int(server["load_generation"], f"{field} load_generation"),
     )
     target_os = TARGET_CONTRACTS[run.matrix_cell["asset_target"]]["target_os"]
