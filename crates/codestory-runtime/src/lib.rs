@@ -4416,6 +4416,286 @@ fn inspect_full_index_live_state(
     })
 }
 
+fn validate_full_refresh_coverage(
+    root: &Path,
+    staged: &mut StagedSnapshot,
+    live_state: &FullIndexLiveState,
+) -> Result<(), ApiError> {
+    let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
+        .into_iter()
+        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .collect::<Vec<_>>();
+    if blocking_gaps.is_empty() {
+        return Ok(());
+    }
+    let sample = blocking_gaps
+        .iter()
+        .take(3)
+        .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remainder = blocking_gaps.len().saturating_sub(3);
+    let sample = if remainder > 0 {
+        format!("{sample}, and {remainder} more")
+    } else {
+        sample
+    };
+    let preserved_state = if live_state.has_verified_publication {
+        "The previous complete publication was preserved"
+    } else if live_state.recovering_incomplete_run {
+        "The existing live index and its incomplete-run recovery fence were preserved"
+    } else if live_state.previous_publication.is_some() {
+        "The existing live index was preserved and no replacement publication was created"
+    } else {
+        "No core publication was created"
+    };
+    let count = blocking_gaps.len();
+    Err(ApiError::source_coverage_failure(
+        source_coverage_failure_code(&blocking_gaps),
+        format!(
+            "Effective refresh mode `full` could not verify {count} scheduled file(s): {sample}. {preserved_state}."
+        ),
+        blocking_gaps,
+    ))
+}
+
+fn copy_forward_full_refresh_artifacts(staged: &mut StagedSnapshot, storage_path: &Path) {
+    match staged
+        .store_mut()
+        .copy_retrieval_artifact_nodes_from(storage_path)
+    {
+        Ok(copied) => tracing::debug!(
+            copied,
+            "Copied retrieval artifact nodes into staged storage"
+        ),
+        Err(error) => {
+            tracing::warn!("Failed to copy retrieval artifact nodes into staged storage: {error}")
+        }
+    }
+    match staged
+        .store_mut()
+        .copy_symbol_search_docs_from(storage_path)
+    {
+        Ok(copied) => tracing::debug!(copied, "Copied symbol docs into staged storage"),
+        Err(error) => tracing::warn!("Failed to copy symbol docs into staged storage: {error}"),
+    }
+    match staged
+        .store_mut()
+        .copy_dense_anchor_inputs_from(storage_path)
+    {
+        Ok(copied) => tracing::debug!(copied, "Copied dense anchor inputs into staged storage"),
+        Err(error) => {
+            tracing::warn!("Failed to copy dense anchor inputs into staged storage: {error}")
+        }
+    }
+}
+
+struct PreparedFullRefreshSnapshots {
+    semantic_stats: SemanticProjectionStats,
+    finalize_stats: StagedSnapshotFinalizeStats,
+    detail_snapshot_ms: u32,
+}
+
+fn prepare_full_refresh_snapshots(
+    staged: &mut StagedSnapshot,
+    source_identity: &str,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<PreparedFullRefreshSnapshots, ApiError> {
+    let semantic_stats = finalize_staged_semantic_docs_for_runtime(
+        staged.store_mut(),
+        None,
+        None,
+        source_identity,
+        cancel_token,
+        runtime,
+        SemanticProjectionDocumentSource::SourceFiles,
+    )?;
+    ensure_indexing_active(cancel_token)?;
+    let finalize_stats = staged.snapshots().finalize_staged().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to finalize staged snapshot lifecycle: {error}"
+        ))
+    })?;
+    let detail_started = Instant::now();
+    staged.snapshots().refresh_detail().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to finalize staged detail snapshots: {error}"
+        ))
+    })?;
+    ensure_indexing_active(cancel_token)?;
+    Ok(PreparedFullRefreshSnapshots {
+        semantic_stats,
+        finalize_stats,
+        detail_snapshot_ms: clamp_u128_to_u32(detail_started.elapsed().as_millis()),
+    })
+}
+
+fn stage_core_publication_identity(
+    staged: &mut StagedSnapshot,
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    publication: &IndexPublicationRecord,
+    policy_exclusions: &[OversizedSourceExclusionCandidate],
+    source_index_policy: &SourceIndexPolicy,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), ApiError> {
+    ensure_indexing_active(cancel_token)?;
+    #[cfg(test)]
+    publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)?;
+    staged
+        .store_mut()
+        .publish_dense_anchor_generation(publication, SEMANTIC_POLICY_VERSION)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to publish complete dense anchor inputs: {error}"
+            ))
+        })?;
+    #[cfg(test)]
+    run_source_policy_before_revalidate_hook();
+    let exclusions =
+        revalidate_source_policy_exclusions(workspace, policy_exclusions, source_index_policy)?;
+    publish_source_policy_exclusions(
+        staged.store_mut(),
+        root,
+        publication,
+        &exclusions,
+        source_index_policy,
+    )?;
+    staged
+        .store_mut()
+        .publish_structural_text_unit_generation(publication)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to publish complete structural text units: {error}"
+            ))
+        })?;
+    let mode = match publication.mode {
+        IndexPublicationMode::Full => "full",
+        IndexPublicationMode::Incremental => "incremental",
+        IndexPublicationMode::SemanticProjection => "semantic projection",
+    };
+    staged
+        .store_mut()
+        .put_index_publication(publication)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to persist staged {mode} publication identity: {error}"
+            ))
+        })
+}
+
+#[derive(Clone, Copy)]
+enum CoreCommitMode {
+    Full { finish_recovery_marker: bool },
+    Incremental,
+}
+
+struct PreparedCoreCommit {
+    staged: Option<StagedSnapshot>,
+    search_state: Option<SearchStateBuildResult>,
+    storage_path: PathBuf,
+    publication: IndexPublicationRecord,
+    committed: bool,
+}
+
+impl PreparedCoreCommit {
+    fn new(
+        staged: StagedSnapshot,
+        search_state: SearchStateBuildResult,
+        storage_path: &Path,
+        publication: &IndexPublicationRecord,
+    ) -> Self {
+        Self {
+            staged: Some(staged),
+            search_state: Some(search_state),
+            storage_path: storage_path.to_path_buf(),
+            publication: publication.clone(),
+            committed: false,
+        }
+    }
+
+    fn staged_mut(&mut self) -> &mut StagedSnapshot {
+        self.staged
+            .as_mut()
+            .expect("prepared core commit must own staged storage")
+    }
+
+    fn commit(
+        mut self,
+        mode: CoreCommitMode,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<(SearchStateBuildResult, StagedSnapshotPublishStats, Duration), ApiError> {
+        #[cfg(test)]
+        publication_test_checkpoint(PublicationTestBoundary::CatalogLock, cancel_token)?;
+        let _catalog_guard = SearchGenerationCatalogGuard::acquire(&self.storage_path)?;
+        ensure_indexing_active(cancel_token)?;
+        let finish_marker = match mode {
+            CoreCommitMode::Full {
+                finish_recovery_marker,
+            } => finish_recovery_marker,
+            CoreCommitMode::Incremental => true,
+        };
+        if finish_marker {
+            #[cfg(test)]
+            publication_test_checkpoint(PublicationTestBoundary::MarkerCompletion, cancel_token)?;
+            ensure_indexing_active(cancel_token)?;
+            let marker = match mode {
+                CoreCommitMode::Full { .. } => "full-recovery",
+                CoreCommitMode::Incremental => "incremental",
+            };
+            self.staged_mut()
+                .store_mut()
+                .finish_incremental_run()
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to complete staged {marker} marker: {error}"
+                    ))
+                })?;
+        }
+        #[cfg(test)]
+        publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)?;
+        ensure_indexing_active(cancel_token)?;
+        let staged_path = self.staged_mut().path().to_path_buf();
+        let staged = self
+            .staged
+            .take()
+            .expect("prepared core commit must own staged storage");
+        let publish_started = Instant::now();
+        let publish_stats = staged
+            .publish_with_stats(&self.storage_path)
+            .map_err(|error| {
+                let publication = match mode {
+                    CoreCommitMode::Full { .. } => "storage",
+                    CoreCommitMode::Incremental => "incremental storage",
+                };
+                ApiError::internal(format!(
+                    "Failed to publish staged {publication}: {error}. Preserved staged snapshot at {}",
+                    staged_path.display()
+                ))
+            })?;
+        let search_state = self
+            .search_state
+            .take()
+            .expect("prepared core commit must own search state");
+        self.committed = true;
+        Ok((search_state, publish_stats, publish_started.elapsed()))
+    }
+}
+
+impl Drop for PreparedCoreCommit {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        drop(self.search_state.take());
+        if let Some(staged) = self.staged.take() {
+            let _ = staged.discard();
+        }
+        discard_unpublished_search_generation(&self.storage_path, &self.publication);
+    }
+}
+
 fn index_full_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -4428,7 +4708,6 @@ fn index_full_for_runtime(
     let mut wall_durations = FullRefreshWallDurations::default();
     let mut wall_stage_started = Instant::now();
     let live_state = inspect_full_index_live_state(root, storage_path, source_index_policy)?;
-    let previous_publication = &live_state.previous_publication;
     let publication = &live_state.publication;
     let recovering_incomplete_run = live_state.recovering_incomplete_run;
     let has_verified_live_publication = live_state.has_verified_publication;
@@ -4517,137 +4796,37 @@ fn index_full_for_runtime(
     };
     wall_durations.indexer_execution = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let coverage_gaps = match stored_file_coverage_diagnostics(root, staged.store_mut()) {
-        Ok(coverage_gaps) => coverage_gaps,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
-    let blocking_gaps = coverage_gaps
-        .iter()
-        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !blocking_gaps.is_empty() {
-        let sample = blocking_gaps
-            .iter()
-            .take(3)
-            .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let remainder = blocking_gaps.len().saturating_sub(3);
-        let sample = if remainder > 0 {
-            format!("{sample}, and {remainder} more")
-        } else {
-            sample
-        };
-        let preserved_state = if has_verified_live_publication {
-            "The previous complete publication was preserved"
-        } else if recovering_incomplete_run {
-            "The existing live index and its incomplete-run recovery fence were preserved"
-        } else if previous_publication.is_some() {
-            "The existing live index was preserved and no replacement publication was created"
-        } else {
-            "No core publication was created"
-        };
-        let count = blocking_gaps.len();
-        let code = source_coverage_failure_code(&blocking_gaps);
+    if let Err(error) = validate_full_refresh_coverage(root, &mut staged, &live_state) {
         let _ = staged.discard();
-        return Err(ApiError::source_coverage_failure(
-            code,
-            format!(
-                "Effective refresh mode `full` could not verify {count} scheduled file(s): {sample}. {preserved_state}."
-            ),
-            blocking_gaps,
-        ));
+        return Err(error);
     }
     wall_durations.coverage_validation = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
     if can_copy_forward {
-        match staged
-            .store_mut()
-            .copy_retrieval_artifact_nodes_from(storage_path)
-        {
-            Ok(copied) => {
-                tracing::debug!(
-                    copied,
-                    "Copied retrieval artifact nodes into staged storage"
-                )
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "Failed to copy retrieval artifact nodes into staged storage: {error}"
-                )
-            }
-        }
-        match staged
-            .store_mut()
-            .copy_symbol_search_docs_from(storage_path)
-        {
-            Ok(copied) => tracing::debug!(copied, "Copied symbol docs into staged storage"),
-            Err(error) => {
-                tracing::warn!("Failed to copy symbol docs into staged storage: {error}")
-            }
-        }
-        match staged
-            .store_mut()
-            .copy_dense_anchor_inputs_from(storage_path)
-        {
-            Ok(copied) => tracing::debug!(copied, "Copied dense anchor inputs into staged storage"),
-            Err(error) => {
-                tracing::warn!("Failed to copy dense anchor inputs into staged storage: {error}")
-            }
-        }
+        copy_forward_full_refresh_artifacts(&mut staged, storage_path);
     }
     wall_durations.copy_forward = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let staged_semantic_stats = match finalize_staged_semantic_docs_for_runtime(
-        staged.store_mut(),
-        None,
-        None,
+    let prepared_snapshots = match prepare_full_refresh_snapshots(
+        &mut staged,
         &live_state.dense_anchor_source_identity,
         cancel_token,
         runtime,
-        SemanticProjectionDocumentSource::SourceFiles,
     ) {
-        Ok(stats) => stats,
+        Ok(prepared) => prepared,
         Err(error) => {
             let _ = staged.discard();
             return Err(error);
         }
     };
-    if is_indexing_cancelled(cancel_token) {
-        let _ = staged.discard();
-        return Err(indexing_cancelled_error());
-    }
     wall_durations.semantic_stage = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let staged_finalize_stats = match staged.snapshots().finalize_staged() {
-        Ok(stats) => stats,
-        Err(err) => {
-            let _ = staged.discard();
-            return Err(ApiError::internal(format!(
-                "Failed to finalize staged snapshot lifecycle: {err}"
-            )));
-        }
-    };
-    let deferred_indexes_ms = staged_finalize_stats
+    let deferred_indexes_ms = prepared_snapshots
+        .finalize_stats
         .deferred_indexes_ms
-        .saturating_add(staged_semantic_stats.semantic_context_index_ms);
-    let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
-    let detail_started = Instant::now();
-    if let Err(err) = staged.snapshots().refresh_detail() {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to finalize staged detail snapshots: {err}"
-        )));
-    }
-    let detail_snapshot_ms = Some(clamp_u128_to_u32(detail_started.elapsed().as_millis()));
-    if is_indexing_cancelled(cancel_token) {
-        let _ = staged.discard();
-        return Err(indexing_cancelled_error());
-    }
+        .saturating_add(prepared_snapshots.semantic_stats.semantic_context_index_ms);
+    let summary_snapshot_ms = prepared_snapshots.finalize_stats.summary_snapshot_ms;
+    let detail_snapshot_ms = Some(prepared_snapshots.detail_snapshot_ms);
     wall_durations.snapshot_stage = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
     if recovering_incomplete_run && let Err(err) = staged.store_mut().begin_incremental_run() {
@@ -4656,58 +4835,17 @@ fn index_full_for_runtime(
             "Failed to preserve incomplete marker through staged recovery: {err}"
         )));
     }
-    #[cfg(test)]
-    if let Err(error) = publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)
-    {
-        let _ = staged.discard();
-        return Err(error);
-    }
-    if let Err(error) = staged
-        .store_mut()
-        .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
-    {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to publish complete dense anchor inputs: {error}"
-        )));
-    }
-    #[cfg(test)]
-    run_source_policy_before_revalidate_hook();
-    let policy_exclusions = match revalidate_source_policy_exclusions(
-        &workspace,
-        &policy_exclusions,
-        source_index_policy,
-    ) {
-        Ok(exclusions) => exclusions,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
-    if let Err(error) = publish_source_policy_exclusions(
-        staged.store_mut(),
+    if let Err(error) = stage_core_publication_identity(
+        &mut staged,
         root,
-        &publication,
+        &workspace,
+        publication,
         &policy_exclusions,
         source_index_policy,
+        cancel_token,
     ) {
         let _ = staged.discard();
         return Err(error);
-    }
-    if let Err(error) = staged
-        .store_mut()
-        .publish_structural_text_unit_generation(&publication)
-    {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to publish complete structural text units: {error}"
-        )));
-    }
-    if let Err(error) = staged.store_mut().put_index_publication(&publication) {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to persist staged full publication identity: {error}"
-        )));
     }
     wall_durations.publication_prepare = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
@@ -4735,84 +4873,15 @@ fn index_full_for_runtime(
     }
     wall_durations.search_generation = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
-    let staged_path = staged.path().to_path_buf();
-    #[cfg(test)]
-    if let Err(error) =
-        publication_test_checkpoint(PublicationTestBoundary::CatalogLock, cancel_token)
-    {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(error);
-    }
-    let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
-        Ok(guard) => guard,
-        Err(error) => {
-            drop(prepared_search_state);
-            let _ = staged.discard();
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(error);
-        }
-    };
-    if is_indexing_cancelled(cancel_token) {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(indexing_cancelled_error());
-    }
-    if recovering_incomplete_run {
-        #[cfg(test)]
-        if let Err(error) =
-            publication_test_checkpoint(PublicationTestBoundary::MarkerCompletion, cancel_token)
-        {
-            drop(prepared_search_state);
-            let _ = staged.discard();
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(error);
-        }
-        if is_indexing_cancelled(cancel_token) {
-            drop(prepared_search_state);
-            let _ = staged.discard();
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(indexing_cancelled_error());
-        }
-        if let Err(error) = staged.store_mut().finish_incremental_run() {
-            drop(prepared_search_state);
-            let _ = staged.discard();
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(ApiError::internal(format!(
-                "Failed to complete staged full-recovery marker: {error}"
-            )));
-        }
-    }
-    let publish_started = std::time::Instant::now();
-    #[cfg(test)]
-    if let Err(error) =
-        publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)
-    {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(error);
-    }
-    if is_indexing_cancelled(cancel_token) {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(indexing_cancelled_error());
-    }
-    let staged_publish_stats = match staged.publish_with_stats(storage_path) {
-        Ok(stats) => stats,
-        Err(err) => {
-            drop(prepared_search_state);
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(ApiError::internal(format!(
-                "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
-                staged_path.display()
-            )));
-        }
-    };
-    let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
+    let prepared_commit =
+        PreparedCoreCommit::new(staged, prepared_search_state, storage_path, publication);
+    let (prepared_search_state, staged_publish_stats, publish_duration) = prepared_commit.commit(
+        CoreCommitMode::Full {
+            finish_recovery_marker: recovering_incomplete_run,
+        },
+        cancel_token,
+    )?;
+    let publish_ms = clamp_u128_to_u32(publish_duration.as_millis());
     wall_durations.catalog_publication = wall_stage_started.elapsed();
     let full_refresh_wall = wall_durations.finish(core_refresh_started.elapsed());
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
@@ -4998,7 +5067,7 @@ fn index_full_for_runtime(
             resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
             resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
-        staged_semantic_stats,
+        staged_semantic_stats: prepared_snapshots.semantic_stats,
         llm_refresh_scope: None,
         #[cfg(test)]
         publication: publication.clone(),
@@ -5517,64 +5586,26 @@ fn run_incremental_indexing_common(
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
 
-    if is_indexing_cancelled(cancel_token) {
-        let _ = staged.discard();
-        return Err(indexing_cancelled_error());
-    }
-    #[cfg(test)]
-    if let Err(error) = publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)
-    {
-        let _ = staged.discard();
-        return Err(error);
-    }
-    if let Err(error) = staged
-        .store_mut()
-        .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
-    {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to publish complete dense anchor inputs: {error}"
-        )));
-    }
-    #[cfg(test)]
-    run_source_policy_before_revalidate_hook();
-    let workspace = runtime_workspace_manifest(root, storage_path)
-        .map_err(|error| ApiError::internal(format!("Failed to reopen project: {error}")))?;
-    let policy_exclusions = match revalidate_source_policy_exclusions(
-        &workspace,
-        &policy_exclusions,
-        source_index_policy,
-    ) {
-        Ok(exclusions) => exclusions,
+    let workspace = match runtime_workspace_manifest(root, storage_path) {
+        Ok(workspace) => workspace,
         Err(error) => {
             let _ = staged.discard();
-            return Err(error);
+            return Err(ApiError::internal(format!(
+                "Failed to reopen project: {error}"
+            )));
         }
     };
-    if let Err(error) = publish_source_policy_exclusions(
-        staged.store_mut(),
+    if let Err(error) = stage_core_publication_identity(
+        &mut staged,
         root,
+        &workspace,
         &publication,
         &policy_exclusions,
         source_index_policy,
+        cancel_token,
     ) {
         let _ = staged.discard();
         return Err(error);
-    }
-    if let Err(error) = staged
-        .store_mut()
-        .publish_structural_text_unit_generation(&publication)
-    {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to publish complete structural text units: {error}"
-        )));
-    }
-    if let Err(error) = staged.store_mut().put_index_publication(&publication) {
-        let _ = staged.discard();
-        return Err(ApiError::internal(format!(
-            "Failed to persist staged incremental publication identity: {error}"
-        )));
     }
     let prepared_search_state = match rebuild_search_state_from_storage_for_runtime(
         staged.store_mut(),
@@ -5598,82 +5629,11 @@ fn run_incremental_indexing_common(
         discard_unpublished_search_generation(storage_path, &publication);
         return Err(indexing_cancelled_error());
     }
-    let staged_path = staged.path().to_path_buf();
-    #[cfg(test)]
-    if let Err(error) =
-        publication_test_checkpoint(PublicationTestBoundary::CatalogLock, cancel_token)
-    {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(error);
-    }
-    let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
-        Ok(guard) => guard,
-        Err(error) => {
-            drop(prepared_search_state);
-            let _ = staged.discard();
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(error);
-        }
-    };
-    if is_indexing_cancelled(cancel_token) {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(indexing_cancelled_error());
-    }
-    #[cfg(test)]
-    if let Err(error) =
-        publication_test_checkpoint(PublicationTestBoundary::MarkerCompletion, cancel_token)
-    {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(error);
-    }
-    if is_indexing_cancelled(cancel_token) {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(indexing_cancelled_error());
-    }
-    if let Err(error) = staged.store_mut().finish_incremental_run() {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(ApiError::internal(format!(
-            "Failed to complete staged incremental marker: {error}"
-        )));
-    }
-    let publish_started = Instant::now();
-    #[cfg(test)]
-    if let Err(error) =
-        publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)
-    {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(error);
-    }
-    if is_indexing_cancelled(cancel_token) {
-        drop(prepared_search_state);
-        let _ = staged.discard();
-        discard_unpublished_search_generation(storage_path, &publication);
-        return Err(indexing_cancelled_error());
-    }
-    let staged_publish_stats = match staged.publish_with_stats(storage_path) {
-        Ok(stats) => stats,
-        Err(error) => {
-            drop(prepared_search_state);
-            discard_unpublished_search_generation(storage_path, &publication);
-            return Err(ApiError::internal(format!(
-                "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
-                staged_path.display()
-            )));
-        }
-    };
-    let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
+    let prepared_commit =
+        PreparedCoreCommit::new(staged, prepared_search_state, storage_path, &publication);
+    let (prepared_search_state, staged_publish_stats, publish_duration) =
+        prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
+    let publish_ms = clamp_u128_to_u32(publish_duration.as_millis());
 
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
