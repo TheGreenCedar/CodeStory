@@ -180,6 +180,15 @@ jobs:
         if: runner.os == 'Linux'
         run: bash .github/scripts/install-linux-vulkan-build-deps.sh
 
+      - name: Test immutable native staging on Windows
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --release --locked
+          -p codestory-llama-sys
+          --test native_staging
+          --target "${{ matrix.rust_target }}"
+          stages_complete_immutable_native_seeds
+
       - name: Build codestory-cli
         if: matrix.asset_target != 'linux-x64'
         run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"

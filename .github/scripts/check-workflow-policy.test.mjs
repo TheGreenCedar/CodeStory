@@ -1189,6 +1189,10 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
     workflow.jobs.build,
     "Configure short Windows Cargo target",
   );
+  const packagedNativeStaging = workflow => draftStep(
+    workflow.jobs.build,
+    "Test immutable native staging on Windows",
+  );
   const protectedSourceTools = workflow => draftStep(
     workflow.jobs["packaged-vulkan"],
     "Capture source build tool evidence",
@@ -1238,6 +1242,12 @@ test("Windows source package builds pin Ninja and bind native tool identity", as
       packagedShortTarget(workflow).run = packagedShortTarget(workflow).run
         .replace("| Out-File -FilePath $env:GITHUB_ENV", "| Write-Output");
     }, /Configure short Windows Cargo target/u],
+    ["packaged native staging regression made cross-platform", packagedFile, workflow => {
+      packagedNativeStaging(workflow).if = "runner.os != 'Windows'";
+    }, /immutable native staging regression must run on Windows/u],
+    ["packaged native staging regression removed", packagedFile, workflow => {
+      packagedNativeStaging(workflow).run = "cargo test --release --locked";
+    }, /Test immutable native staging on Windows/u],
     ["packaged identity made conditional", packagedFile, workflow => {
       packagedIdentity(workflow).if = "runner.os != 'Windows'";
     }, /native build identity must be unique, unconditional/u],
