@@ -28,14 +28,19 @@ mod stdio_transport;
 
 use anyhow::Result;
 
+pub(crate) use app::artifacts::ensure_dot_only_for_trail;
+pub(crate) use app::diagnostics::{
+    build_readiness_lanes_for_runtime, build_summary_readiness, doctor_sidecar_status,
+};
+pub(crate) use app::rendering::{build_query_resolution_output, build_search_hit_output};
+pub(crate) use app::resolution::{
+    build_ambiguous_target_error_output, resolve_target_or_emit_ambiguity,
+};
 /// Parse arguments and run the CodeStory CLI.
 pub use app::run;
 pub(crate) use app::{
-    attach_complete_publication, build_ambiguous_target_error_output,
-    build_query_resolution_output, build_readiness_lanes_for_runtime, build_search_hit_output,
-    build_summary_readiness, doctor_sidecar_status, ensure_dot_only_for_trail,
-    local_refresh_output_from_summary, packet_sufficiency_label, preflight_output_file,
-    resolve_target_or_emit_ambiguity,
+    attach_complete_publication, local_refresh_output_from_summary, packet_sufficiency_label,
+    preflight_output_file,
 };
 
 /// Install the native same-user embedding client transport for this executable.

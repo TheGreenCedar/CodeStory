@@ -21,7 +21,10 @@ project's immutable config and never rereads or mutates process environment.
 
 ## Entry points
 
-- `src/args.rs` and `src/app.rs`: CLI schema and dispatch
+- `src/args.rs` and `src/app.rs`: CLI schema, dispatch, and lifecycle commands
+- `src/app/drill.rs` and `src/app/source_commands.rs`: drill and source-navigation command owners
+- `src/app/diagnostics.rs`, `src/app/resolution.rs`, and `src/app/rendering.rs`: readiness, target resolution, and stable output mapping
+- `src/app/artifacts.rs` and `src/app/server.rs`: bounded artifact writes and transport startup
 - `src/main.rs`: thin executable entrypoint into the library-owned module graph
 - `src/config.rs` and `src/runtime.rs`: startup config and project contexts
 - `src/stdio_catalog.rs`: MCP schema and safety metadata
