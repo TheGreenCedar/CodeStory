@@ -12,7 +12,7 @@ use crate::search_intent::{
 use crate::search_plan::{
     SearchPlanActivePathEvidence, search_plan_anchor_groups, search_plan_eligible,
     search_plan_next_actions, search_plan_path_is_test_or_bench, search_plan_rejected_hits,
-    search_plan_runtime_call_is_speculative, search_plan_subqueries, search_plan_terms,
+    search_plan_runtime_call_is_speculative, search_plan_subqueries,
 };
 use crate::search_scoring::{
     HybridHitsContext, apply_architecture_cross_source_coverage, architecture_coverage_for_hit,
@@ -22,6 +22,7 @@ use crate::search_scoring::{
     primary_source_retention_threshold, should_pretruncate_primary_source_window,
     truncate_repo_text_hits_for_query,
 };
+use crate::search_terms::search_plan_terms;
 use crate::snippets::bounded_direct_markdown_snippet;
 use codestory_contracts::graph::{
     Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,

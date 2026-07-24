@@ -3,9 +3,9 @@ use codestory_retrieval::SidecarRuntimeConfig;
 
 /// Immutable process-owned defaults injected into one runtime.
 ///
-/// Adapters capture ambient configuration once, then pass this value through
-/// every retained project context. Runtime and lower layers never reread the
-/// process environment.
+/// Adapters capture sidecar defaults and source-index policy once, then pass
+/// this value through every retained project context. Other feature and
+/// evaluation controls remain owned by their respective subsystems.
 #[derive(Debug, Clone)]
 pub struct RuntimeProcessConfig {
     pub sidecar: SidecarRuntimeConfig,

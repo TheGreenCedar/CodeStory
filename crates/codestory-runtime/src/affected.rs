@@ -1,4 +1,5 @@
 use super::*;
+use crate::workspace_state::runtime_workspace_manifest;
 
 #[cfg(test)]
 #[path = "tests/affected.rs"]

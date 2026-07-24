@@ -7,17 +7,24 @@ use super::{
 };
 #[cfg(test)]
 use super::{
-    EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP, HybridSearchConfig, HybridSearchHit,
-    LLM_DOC_RELOAD_BATCH_SIZE, RetrievalModeDto, RetrievalScoreBreakdownDto, SearchEngine,
-    apply_hybrid_limits, compare_search_hits_with_project_root, exact_symbol_query_terms,
-    is_non_primary_source_hit, looks_like_standalone_symbol_query, mixed_natural_language_query,
-    normalized_hybrid_weights, query_mentions_non_primary_source, reload_llm_docs_from_storage,
+    EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP, HybridSearchConfig, HybridSearchHit, RetrievalModeDto,
+    RetrievalScoreBreakdownDto, SearchEngine, apply_hybrid_limits,
+    compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_hit,
+    looks_like_standalone_symbol_query, mixed_natural_language_query, normalized_hybrid_weights,
+    query_mentions_non_primary_source,
+};
+#[cfg(test)]
+use crate::search_publication::{
     retrieval_state_from_engine, retrieval_state_from_engine_with_storage_contract,
     retrieval_state_from_parts, retrieval_state_from_storage,
 };
 #[cfg(test)]
-use crate::search_plan::search_plan_terms;
-use crate::search_plan::split_camel_identifier;
+use crate::search_state::reload_llm_docs_from_storage;
+#[cfg(test)]
+use crate::search_terms::search_plan_terms;
+use crate::search_terms::split_camel_identifier;
+#[cfg(test)]
+use crate::semantic_projection::LLM_DOC_RELOAD_BATCH_SIZE;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HybridSearchScoredHit {
