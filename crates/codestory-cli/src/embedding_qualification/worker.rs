@@ -1,4 +1,3 @@
-use self::contracts::{WorkerOutput, WorkerRequest};
 use self::gate::{
     current_process_start_identity, project_identity_sha256, qualification_nonce,
     read_private_request, required_absolute_directory, sha256_bytes, validate_direct_child,
@@ -13,13 +12,14 @@ use self::protocol::run_raw_protocol_exchange;
 use crate::args::InternalEmbeddingQualificationCommand;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    EmbeddingClientTransport, EmbeddingQualificationRequest,
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingClientTransport,
+    EmbeddingQualificationRequest, EmbeddingQualificationWorkerOutput as WorkerOutput,
+    EmbeddingQualificationWorkerRequest as WorkerRequest,
     PER_USER_EMBEDDING_BULK_REQUEST_DEADLINE_MS, PerUserEmbeddingClient, SidecarRuntimeOverrides,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-mod contracts;
 mod gate;
 mod operations;
 mod protocol;
@@ -31,7 +31,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     let request_bytes = read_private_request(&command.request)?;
     let request: WorkerRequest =
         serde_json::from_slice(&request_bytes).context("parse embedding qualification worker")?;
-    if request.schema_version != 1 {
+    if request.schema_version != EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION {
         bail!("embedding_qualification_worker_schema_invalid");
     }
     let directory = required_absolute_directory(QUALIFICATION_DIR_ENV)?;
@@ -138,7 +138,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
     let inclusive_finished_ns = crate::embedding_server_transport::inclusive_now_ns()?;
     let boot_id_finished = crate::embedding_server_transport::boot_id()?;
     let output = WorkerOutput {
-        schema_version: 1,
+        schema_version: EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
         pid: std::process::id(),
         process_start_id,
         executable_sha256: executable.sha256().into(),

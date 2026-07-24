@@ -1,4 +1,3 @@
-use super::super::contracts::{WorkerError, WorkerProtocolExchange};
 use super::super::gate::qualification_request_id;
 use super::super::protocol::{
     client_hello_operation, connect_until, read_protocol_frame, run_protocol_exchange_on_stream,
@@ -8,8 +7,10 @@ use super::ANTI_IDLE_PROTOCOL_DEADLINE_MS;
 use anyhow::{Result, bail};
 use codestory_retrieval::{
     AwakeMonotonicClock, EmbeddingCompatibility, EmbeddingProtocolRequest,
-    EmbeddingProtocolResponse, EmbeddingServerStream, PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
-    PER_USER_EMBEDDING_PROTOCOL_V1, SidecarRuntimeConfig,
+    EmbeddingProtocolResponse, EmbeddingQualificationWorkerError as WorkerError,
+    EmbeddingQualificationWorkerProtocolExchange as WorkerProtocolExchange, EmbeddingServerStream,
+    PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_V1,
+    SidecarRuntimeConfig,
 };
 use std::time::Duration;
 

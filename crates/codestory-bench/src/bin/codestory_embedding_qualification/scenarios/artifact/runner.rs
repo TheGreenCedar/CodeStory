@@ -5,10 +5,12 @@ use super::{
 use crate::qualification::request::{QualificationExecutable, sha256_bytes};
 use anyhow::{Result, bail};
 use codestory_retrieval::{
-    EmbeddingCapacityPressureWire, EmbeddingProtocolResponse, EmbeddingQualificationParameters,
-    EmbeddingQualificationResult, EmbeddingServerSnapshot, EmbeddingTransportIdentity,
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
+    EmbeddingQualificationWorkerOutput as WorkerOutput,
+    EmbeddingQualificationWorkerQueueOperation as WorkerQueueOperation,
+    EmbeddingQualificationWorkerRequest as WorkerRequest,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
@@ -40,100 +42,6 @@ use process::{
 struct ScenarioEvidence {
     controls: BTreeSet<String>,
     transitions: BTreeSet<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerRequest {
-    schema_version: u32,
-    nonce_sha256: String,
-    executable_sha256: String,
-    project: PathBuf,
-    operation: String,
-    parameters: EmbeddingQualificationParameters,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    start_gate: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    start_gate_timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerOutput {
-    schema_version: u32,
-    pid: u32,
-    process_start_id: String,
-    executable_sha256: String,
-    executable_version: String,
-    project_identity_sha256: String,
-    clock: codestory_retrieval::EmbeddingServerClockSnapshot,
-    started_ns: u64,
-    finished_ns: u64,
-    inclusive_clock_api: String,
-    inclusive_started_ns: u64,
-    inclusive_finished_ns: u64,
-    boot_id_started: String,
-    boot_id_finished: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    result: Option<EmbeddingQualificationResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    protocol_exchange: Option<WorkerProtocolExchange>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    queue_operations: Option<Vec<WorkerQueueOperation>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_identity: Option<codestory_retrieval::EmbeddingEngineIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<WorkerError>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerProtocolExchange {
-    request_id: String,
-    submitted_ns: u64,
-    finished_ns: u64,
-    transport_identity: EmbeddingTransportIdentity,
-    hello_snapshot: EmbeddingServerSnapshot,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    final_snapshot: Option<EmbeddingServerSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    response: Option<EmbeddingProtocolResponse>,
-    response_payload_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_transport_error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerError {
-    code: String,
-    message_head: String,
-    retry_class: String,
-    retry_after_ms: u64,
-    retry_condition: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    capacity: Option<EmbeddingCapacityPressureWire>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerQueueOperation {
-    correlation_id: String,
-    project_identity_sha256: String,
-    class: String,
-    ordinal: u32,
-    #[serde(default)]
-    submission_batch: u32,
-    submitted_ns: u64,
-    completed_ns: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    native_completion_sequence: Option<u64>,
-    status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<codestory_retrieval::EmbeddingProtocolError>,
-    response_payload_bytes: u64,
-    transport_identity: EmbeddingTransportIdentity,
-    hello_snapshot: EmbeddingServerSnapshot,
 }
 
 #[derive(Debug, Serialize)]

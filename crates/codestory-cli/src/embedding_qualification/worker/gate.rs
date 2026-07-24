@@ -1,7 +1,7 @@
-use super::contracts::WorkerError;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
-    AwakeMonotonicClock, ProcessStartProbe, SidecarRuntimeConfig, embedding_retry_state,
+    AwakeMonotonicClock, EmbeddingQualificationWorkerError as WorkerError, ProcessStartProbe,
+    SidecarRuntimeConfig, embedding_retry_state,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};

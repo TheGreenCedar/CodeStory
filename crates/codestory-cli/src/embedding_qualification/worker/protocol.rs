@@ -1,13 +1,14 @@
-use super::contracts::WorkerProtocolExchange;
 use super::gate::{elapsed, error_head, qualification_request_id, sha256_bytes};
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
     AwakeMonotonicClock, EmbeddingClientTransport, EmbeddingCompatibility, EmbeddingOperation,
-    EmbeddingProtocolRequest, EmbeddingProtocolResponse, EmbeddingResult, EmbeddingServerSnapshot,
-    EmbeddingServerStream, EmbeddingTransportIdentity, PER_USER_EMBEDDING_CONSTANT_SET_SHA256,
-    PER_USER_EMBEDDING_MAX_METADATA_BYTES, PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES,
-    PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256, PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
-    PER_USER_EMBEDDING_PROTOCOL_SHA256, PER_USER_EMBEDDING_PROTOCOL_V1, SidecarRuntimeConfig,
+    EmbeddingProtocolRequest, EmbeddingProtocolResponse,
+    EmbeddingQualificationWorkerProtocolExchange as WorkerProtocolExchange, EmbeddingResult,
+    EmbeddingServerSnapshot, EmbeddingServerStream, EmbeddingTransportIdentity,
+    PER_USER_EMBEDDING_CONSTANT_SET_SHA256, PER_USER_EMBEDDING_MAX_METADATA_BYTES,
+    PER_USER_EMBEDDING_MAX_PAYLOAD_BYTES, PER_USER_EMBEDDING_MEASUREMENT_PROTOCOL_SHA256,
+    PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION, PER_USER_EMBEDDING_PROTOCOL_SHA256,
+    PER_USER_EMBEDDING_PROTOCOL_V1, SidecarRuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

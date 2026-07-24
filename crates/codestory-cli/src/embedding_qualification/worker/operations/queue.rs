@@ -1,4 +1,3 @@
-use super::super::contracts::WorkerQueueOperation;
 use super::super::gate::{POLL, elapsed, project_identity_sha256, sha256_bytes};
 use super::super::protocol::{
     authenticate_snapshot, client_hello_operation, read_protocol_frame, write_protocol_frame,
@@ -6,7 +5,8 @@ use super::super::protocol::{
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
     AwakeMonotonicClock, EmbeddingCompatibility, EmbeddingOperation, EmbeddingProtocolRequest,
-    EmbeddingProtocolResponse, EmbeddingQualificationParameters, EmbeddingResult,
+    EmbeddingProtocolResponse, EmbeddingQualificationParameters,
+    EmbeddingQualificationWorkerQueueOperation as WorkerQueueOperation, EmbeddingResult,
     EmbeddingServerStream, PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION,
     PER_USER_EMBEDDING_PROTOCOL_V1, PerUserEmbeddingClient, SidecarRuntimeConfig,
 };

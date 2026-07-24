@@ -86,13 +86,7 @@ pub(super) fn attach_pinned_search_evidence(
             continue;
         };
         hit.verification_targets
-            .extend(sibling_implementation_targets(
-                &hit.display_name,
-                header,
-                siblings,
-            ));
-        hit.verification_targets
-            .extend(interface_implementation_targets(
+            .extend(sibling_source_text_match_targets(
                 &hit.display_name,
                 header,
                 siblings,
@@ -128,12 +122,16 @@ fn resolve_path(project_root: Option<&Path>, path: &Path) -> PathBuf {
     }
 }
 
-fn sibling_implementation_targets(
+fn sibling_source_text_match_targets(
     display_name: &str,
     header: &VerifiedSourceFile,
     siblings: &[VerifiedSourceFile],
 ) -> Vec<SearchVerificationTargetDto> {
-    if !display_name.contains("::") {
+    let qualified_name = display_name
+        .split_once('(')
+        .map_or(display_name, |(name, _)| name)
+        .trim();
+    if !qualified_name.contains("::") {
         return Vec::new();
     }
     let Some(stem) = header.path.file_stem() else {
@@ -145,84 +143,16 @@ fn sibling_implementation_targets(
             candidate.path.file_stem() == Some(stem) && is_cxx_implementation_path(&candidate.path)
         })
         .filter_map(|candidate| {
-            let line = line_containing(&candidate.content, display_name)?;
+            let line = line_containing(&candidate.content, qualified_name)?;
             Some(target(
-                "definition",
+                "source_text_match",
                 candidate,
                 line,
                 display_name,
-                "sibling implementation location for a C/C++ header hit",
+                "verified same-stem C/C++ source contains the exact qualified-name text; inspect context before assigning a semantic role",
             ))
         })
         .collect()
-}
-
-fn interface_implementation_targets(
-    display_name: &str,
-    header: &VerifiedSourceFile,
-    siblings: &[VerifiedSourceFile],
-) -> Vec<SearchVerificationTargetDto> {
-    let Some((interface_name, member_name)) = split_qualified_member(display_name) else {
-        return Vec::new();
-    };
-    if !abstract_header_declares_member(&header.content, interface_name, member_name) {
-        return Vec::new();
-    }
-
-    let mut targets = Vec::new();
-    for implementation_header in siblings
-        .iter()
-        .filter(|candidate| is_cxx_header_path(candidate.path.to_string_lossy().as_ref()))
-    {
-        let Some(class_name) = implementation_header
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-        else {
-            continue;
-        };
-        if !header_declares_public_base(&implementation_header.content, class_name, interface_name)
-        {
-            continue;
-        }
-        let declaration_line = line_containing(
-            &implementation_header.content,
-            &format!("class {class_name}"),
-        )
-        .unwrap_or(1);
-        targets.push(target(
-            "declaration",
-            implementation_header,
-            declaration_line,
-            class_name,
-            "C/C++ implementation class declaration for an abstract interface hit",
-        ));
-
-        let definition_pattern = format!("{class_name}::{member_name}");
-        if let Some((implementation, definition_line)) = siblings
-            .iter()
-            .filter(|candidate| {
-                candidate.path.file_stem() == implementation_header.path.file_stem()
-                    && is_cxx_implementation_path(&candidate.path)
-            })
-            .find_map(|candidate| {
-                line_containing(&candidate.content, &definition_pattern)
-                    .map(|line| (candidate, line))
-            })
-        {
-            targets.push(target(
-                "definition",
-                implementation,
-                definition_line,
-                &definition_pattern,
-                "C/C++ implementation method for an abstract interface hit",
-            ));
-        }
-        if targets.len() >= 4 {
-            break;
-        }
-    }
-    targets
 }
 
 fn target(
@@ -251,28 +181,6 @@ fn dedupe_targets(targets: &mut Vec<SearchVerificationTargetDto>) {
             target.display_name.clone(),
         ))
     });
-}
-
-fn split_qualified_member(display_name: &str) -> Option<(&str, &str)> {
-    let (owner, member) = display_name.rsplit_once("::")?;
-    let owner = owner.rsplit("::").next()?.trim();
-    let member = member
-        .split_once('(')
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(member)
-        .trim();
-    (!owner.is_empty() && !member.is_empty()).then_some((owner, member))
-}
-
-fn abstract_header_declares_member(content: &str, interface_name: &str, member_name: &str) -> bool {
-    content.contains(&format!("class {interface_name}"))
-        && content.contains(member_name)
-        && content.contains("= 0")
-}
-
-fn header_declares_public_base(content: &str, class_name: &str, base_name: &str) -> bool {
-    content.contains(&format!("class {class_name}"))
-        && content.contains(&format!("public {base_name}"))
 }
 
 fn line_containing(content: &str, pattern: &str) -> Option<u32> {
@@ -333,6 +241,12 @@ mod tests {
         );
         assert_eq!(hit.verification_targets.len(), 1);
         assert_eq!(hit.verification_targets[0].line, 3);
+        assert_eq!(hit.verification_targets[0].role, "source_text_match");
+        assert!(
+            !hit.verification_targets[0].reason.contains("definition")
+                && !hit.verification_targets[0].reason.contains("declaration"),
+            "byte matches must not claim parser-backed semantics"
+        );
 
         std::fs::write(
             project.path().join(&implementation_path),
@@ -357,12 +271,54 @@ mod tests {
     }
 
     #[test]
-    fn abstract_interface_targets_come_from_verified_sibling_sources() {
+    fn comments_strings_and_calls_never_receive_semantic_roles() {
+        let project = tempfile::tempdir().expect("project");
+        let header_path = PathBuf::from("src/Project.h");
+        let header = b"class Project { static void buildIndex(); };\n";
+        let sources: [(&str, &[u8]); 3] = [
+            ("src/Project.cpp", b"// void Project::buildIndex() {}\n"),
+            (
+                "src/Project.cc",
+                b"const char* name = \"Project::buildIndex()\";\n",
+            ),
+            (
+                "src/Project.cxx",
+                b"void run() { Project::buildIndex(); }\n",
+            ),
+        ];
+        std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+        std::fs::write(project.path().join(&header_path), header).expect("header");
+
+        let storage = Store::new_in_memory().expect("storage");
+        insert_file(&storage, 1, &header_path, header);
+        for (index, (path, content)) in sources.iter().enumerate() {
+            std::fs::write(project.path().join(path), content).expect("source match");
+            insert_file(&storage, index as i64 + 2, Path::new(path), content);
+        }
+        let mut hit = project_hit();
+        attach_pinned_search_evidence(
+            &storage,
+            Some(project.path()),
+            std::slice::from_mut(&mut hit),
+        );
+
+        assert_eq!(hit.verification_targets.len(), 3);
+        assert!(hit.verification_targets.iter().all(|target| {
+            target.role == "source_text_match"
+                && target.reason.contains("inspect context")
+                && !target.reason.contains("definition")
+                && !target.reason.contains("declaration")
+                && !target.reason.contains("implementation")
+        }));
+    }
+
+    #[test]
+    fn unrelated_pure_virtual_text_cannot_infer_interface_implementations() {
         let project = tempfile::tempdir().expect("project");
         let sources = [
             (
                 "src/StorageAccess.h",
-                "class StorageAccess {\npublic:\n virtual TextAccess getFileContent() const = 0;\n};\n",
+                "class StorageAccess {\npublic:\n TextAccess getFileContent() const;\n virtual void unrelated() = 0;\n};\n",
             ),
             (
                 "src/PersistentStorage.h",
@@ -400,18 +356,9 @@ mod tests {
             std::slice::from_mut(&mut hit),
         );
 
-        assert!(hit.verification_targets.iter().any(|target| {
-            target.file_path.ends_with("src/PersistentStorage.h") && target.role == "declaration"
-        }));
-        assert!(hit.verification_targets.iter().any(|target| {
-            target.file_path.ends_with("src/PersistentStorage.cpp")
-                && target.role == "definition"
-                && target.line == 3
-        }));
         assert!(
-            !hit.verification_targets
-                .iter()
-                .any(|target| target.file_path.ends_with("src/StorageCache.cpp"))
+            hit.verification_targets.is_empty(),
+            "independent byte fragments must not infer an interface relationship"
         );
     }
 

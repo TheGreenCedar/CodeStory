@@ -10,6 +10,7 @@ mod client;
 mod exchange;
 mod protocol;
 mod qualification_control;
+mod qualification_worker;
 mod scheduler;
 mod server;
 mod transport;
@@ -21,6 +22,11 @@ pub use qualification_control::{
     EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
     EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
     run_per_user_embedding_qualification,
+};
+pub use qualification_worker::{
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, EmbeddingQualificationWorkerError,
+    EmbeddingQualificationWorkerOutput, EmbeddingQualificationWorkerProtocolExchange,
+    EmbeddingQualificationWorkerQueueOperation, EmbeddingQualificationWorkerRequest,
 };
 pub use server::{
     EmbeddingServerBudgets, PerUserEmbeddingServerConfig, run_per_user_embedding_server,

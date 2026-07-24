@@ -155,11 +155,12 @@ fn renderer_uses_operation_bound_excerpt_after_source_mutation() {
         resolvable: false,
         source_excerpt: Some("class Project { void buildIndex(); };".to_string()),
         verification_targets: vec![codestory_contracts::api::SearchVerificationTargetDto {
-            role: "definition".to_string(),
+            role: "source_text_match".to_string(),
             file_path: implementation.to_string_lossy().into_owned(),
             line: 3,
             display_name: "Project::buildIndex".to_string(),
-            reason: "sibling implementation location for a C/C++ header hit".to_string(),
+            reason: "verified same-stem C/C++ source contains exact qualified-name text"
+                .to_string(),
         }],
         ..test_search_hit_defaults()
     };

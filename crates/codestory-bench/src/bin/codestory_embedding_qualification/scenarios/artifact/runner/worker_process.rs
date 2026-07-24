@@ -6,7 +6,10 @@ use super::process::{
     cleanup_worker_files, stall_worker_timeout, validate_worker_output, wait_for_child,
     wait_for_process_start,
 };
-use super::{RunningWorker, ScenarioRunner, WorkerOutput, WorkerRequest};
+use super::{
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, RunningWorker, ScenarioRunner, WorkerOutput,
+    WorkerRequest,
+};
 use crate::qualification::output::write_atomic_json;
 use crate::qualification::request::read_private_request;
 use anyhow::{Context, Result, bail};
@@ -62,7 +65,7 @@ impl<'a> ScenarioRunner<'a> {
             .output_directory
             .join(format!(".{invocation_id}.worker-output.json"));
         let request = WorkerRequest {
-            schema_version: 1,
+            schema_version: EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
             nonce_sha256: self.context.nonce_sha256.into(),
             executable_sha256: self.executable.sha256.clone(),
             project: project.clone(),

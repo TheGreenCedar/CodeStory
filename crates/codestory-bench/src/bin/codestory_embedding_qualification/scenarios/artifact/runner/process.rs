@@ -1,6 +1,8 @@
 use super::super::{CONTROL_TIMEOUT, ControlEvent, POLL, SNAPSHOT_TIMEOUT};
 use super::analysis::elapsed;
-use super::{ProcessInvocation, RunningWorker, WorkerOutput};
+use super::{
+    EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION, ProcessInvocation, RunningWorker, WorkerOutput,
+};
 use crate::qualification::request::QUALIFICATION_NONCE_ENV;
 use anyhow::{Context, Result, bail};
 use codestory_retrieval::{
@@ -111,7 +113,7 @@ pub(super) fn validate_worker_output(
     invocation: &ProcessInvocation,
     executable_sha256: &str,
 ) -> Result<()> {
-    if output.schema_version != 1
+    if output.schema_version != EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION
         || output.pid != invocation.pid
         || output.process_start_id != invocation.process_start_id
         || output.executable_sha256 != executable_sha256

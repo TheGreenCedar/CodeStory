@@ -724,7 +724,10 @@ impl SearchHit {
     }
 }
 
-/// A source location related to a search hit by indexed source evidence.
+/// A source location related to a search hit by operation-bound source evidence.
+///
+/// `role` names the evidence relationship. It must not imply parser-backed
+/// declaration or definition semantics when the producer only verified bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct SearchVerificationTargetDto {
     pub role: String,
