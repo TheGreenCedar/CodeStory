@@ -78,9 +78,10 @@ flowchart LR
 | --- | --- | --- |
 | macOS 15+ on Apple Silicon | Yes | Metal |
 | Windows x64 | Yes | Vulkan |
+| Linux x64 | Yes | Vulkan |
 
-CodeStory 0.16 publishes only these managed package targets.
-Unshipped targets: linux-arm64, linux-x64, macos-x64, windows-arm64. Answer quality and performance are separate release non-claims.
+CPU-only Windows and Linux are unsupported. Intel Mac and Windows ARM are
+unsupported. Answer quality and performance are separate release non-claims.
 <!-- codestory-public-support:end -->
 
 ## Example prompts
