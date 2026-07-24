@@ -4590,9 +4590,9 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
 fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     let mut fixture = indexed_fixture();
     fixture.local_refresh_timeout_ms = Some(0);
-    let mut warmup_client = spawn_stdio_server(&fixture);
+    let mut reader_client = spawn_stdio_server(&fixture);
     let warmup_status = send_json(
-        &mut warmup_client,
+        &mut reader_client,
         json!({
             "jsonrpc": "2.0",
             "id": "warmup-generation",
@@ -4606,7 +4606,8 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     )["index_publication"]["generation"]
         .as_u64()
         .expect("old complete generation");
-    drop(warmup_client);
+    let mut writer_client = spawn_stdio_server(&fixture);
+    initialize_stdio_server(&mut writer_client, "writer-initialize");
     thread::sleep(Duration::from_millis(25));
     for index in 0..96 {
         fs::write(
@@ -4620,8 +4621,6 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         .expect("add source file for real refresh");
     }
 
-    let mut reader_client = spawn_stdio_server(&fixture);
-    let mut writer_client = spawn_stdio_server(&fixture);
     let writer = thread::spawn(move || {
         let response = send_json(
             &mut writer_client,
