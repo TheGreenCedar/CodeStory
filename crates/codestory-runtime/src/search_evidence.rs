@@ -35,21 +35,34 @@ impl<'a> VerifiedFileIndex<'a> {
         self.directories
             .entry(directory.clone())
             .or_insert_with(|| {
-                let mut verified = self
-                    .files
-                    .iter()
-                    .filter(|file| {
-                        let path = resolve_path(self.project_root, &file.path);
-                        path.parent() == Some(directory.as_path())
-                            && (is_cxx_header_path(path.to_string_lossy().as_ref())
-                                || is_cxx_implementation_path(&path))
-                    })
-                    .filter_map(|file| verified_file(self.storage, self.project_root, file))
-                    .collect::<Vec<_>>();
-                verified.sort_by(|left, right| left.path.cmp(&right.path));
-                verified
+                verified_files_in_directory(
+                    self.storage,
+                    self.project_root,
+                    &self.files,
+                    &directory,
+                )
             })
     }
+}
+
+fn verified_files_in_directory(
+    storage: &Store,
+    project_root: Option<&Path>,
+    files: &[FileInfo],
+    directory: &Path,
+) -> Vec<VerifiedSourceFile> {
+    let mut verified = files
+        .iter()
+        .filter(|file| {
+            let path = resolve_path(project_root, &file.path);
+            path.parent() == Some(directory)
+                && (is_cxx_header_path(path.to_string_lossy().as_ref())
+                    || is_cxx_implementation_path(&path))
+        })
+        .filter_map(|file| verified_file(storage, project_root, file))
+        .collect::<Vec<_>>();
+    verified.sort_by(|left, right| left.path.cmp(&right.path));
+    verified
 }
 
 pub(super) fn attach_pinned_search_evidence(
@@ -292,9 +305,10 @@ fn is_cxx_implementation_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{FileInfo, Path, PathBuf, SearchHit, Sha256, Store, attach_pinned_search_evidence};
     use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
     use codestory_store::FileRole;
+    use sha2::Digest;
 
     #[test]
     fn counterpart_targets_are_bound_to_verified_publication_bytes() {
