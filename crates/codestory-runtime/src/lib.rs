@@ -4295,6 +4295,127 @@ fn semantic_projection_republish_for_runtime(
     }
 }
 
+struct FullIndexLiveState {
+    previous_publication: Option<IndexPublicationRecord>,
+    publication: IndexPublicationRecord,
+    dense_anchor_source_identity: String,
+    recovering_incomplete_run: bool,
+    has_verified_publication: bool,
+}
+
+fn incomplete_live_index_requires_recovery(storage_path: &Path) -> Result<bool, ApiError> {
+    if !storage_path.exists() {
+        return Ok(false);
+    }
+    match Storage::database_schema_version(storage_path) {
+        Ok(version) if version > codestory_store::CURRENT_SCHEMA_VERSION => {
+            Storage::database_has_incomplete_incremental_run(storage_path).map_err(|error| {
+                ApiError::internal(format!("Failed to inspect live storage: {error}"))
+            })
+        }
+        Ok(_) => match Storage::database_has_incomplete_incremental_run(storage_path) {
+            Ok(marked) => Ok(marked),
+            Err(error) => {
+                tracing::warn!(
+                    path = %storage_path.display(),
+                    "Live storage could not be inspected; rebuilding without copying derived state: {error}"
+                );
+                Ok(true)
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                path = %storage_path.display(),
+                "Live storage schema could not be read; rebuilding without copying derived state: {error}"
+            );
+            Ok(true)
+        }
+    }
+}
+
+fn live_publication_is_verified(
+    root: &Path,
+    storage_path: &Path,
+    expected: Option<&IndexPublicationRecord>,
+    recovering_incomplete_run: bool,
+    source_index_policy: &SourceIndexPolicy,
+) -> bool {
+    if recovering_incomplete_run {
+        return false;
+    }
+    let Some(expected) = expected else {
+        return false;
+    };
+    let live = match Store::open_read_only(storage_path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::debug!(
+                path = %storage_path.display(),
+                "Live publication could not be opened for verification: {error}"
+            );
+            return false;
+        }
+    };
+    let publication = match live.get_complete_index_publication() {
+        Ok(Some(publication)) if publication == *expected => publication,
+        Ok(_) => return false,
+        Err(error) => {
+            tracing::debug!(
+                path = %storage_path.display(),
+                "Live core publication could not be verified: {error}"
+            );
+            return false;
+        }
+    };
+    if let Err(error) = live.validate_dense_anchor_publication(&publication) {
+        tracing::debug!(
+            path = %storage_path.display(),
+            "Live dense anchor publication could not be verified: {error}"
+        );
+        return false;
+    }
+    validate_structural_text_units(&live, &publication).is_ok()
+        && validate_source_policy_exclusions(&live, root, &publication, source_index_policy).is_ok()
+}
+
+fn inspect_full_index_live_state(
+    root: &Path,
+    storage_path: &Path,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<FullIndexLiveState, ApiError> {
+    let previous_publication = if storage_path.exists() {
+        Store::database_index_publication(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect live publication identity: {error}"
+            ))
+        })?
+    } else {
+        None
+    };
+    let publication = next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Full,
+        &Uuid::new_v4().to_string(),
+    )?;
+    let dense_anchor_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let recovering_incomplete_run = incomplete_live_index_requires_recovery(storage_path)?;
+    let has_verified_publication = live_publication_is_verified(
+        root,
+        storage_path,
+        previous_publication.as_ref(),
+        recovering_incomplete_run,
+        source_index_policy,
+    );
+    Ok(FullIndexLiveState {
+        previous_publication,
+        publication,
+        dense_anchor_source_identity,
+        recovering_incomplete_run,
+        has_verified_publication,
+    })
+}
+
 fn index_full_for_runtime(
     root: &Path,
     storage_path: &Path,
@@ -4306,95 +4427,11 @@ fn index_full_for_runtime(
     let core_refresh_started = Instant::now();
     let mut wall_durations = FullRefreshWallDurations::default();
     let mut wall_stage_started = Instant::now();
-    let previous_publication = if storage_path.exists() {
-        Store::database_index_publication(storage_path).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to inspect live publication identity: {error}"
-            ))
-        })?
-    } else {
-        None
-    };
-    let publication_run_id = Uuid::new_v4().to_string();
-    let publication = next_index_publication(
-        previous_publication.as_ref(),
-        IndexPublicationMode::Full,
-        &publication_run_id,
-    )?;
-    let dense_anchor_source_identity =
-        format!("core:{}:{}", publication.generation_id, publication.run_id);
-    let recovering_incomplete_run = if storage_path.exists() {
-        match Storage::database_schema_version(storage_path) {
-            Ok(version) if version > codestory_store::CURRENT_SCHEMA_VERSION => {
-                Storage::database_has_incomplete_incremental_run(storage_path).map_err(|error| {
-                    ApiError::internal(format!("Failed to inspect live storage: {error}"))
-                })?
-            }
-            Ok(_) => match Storage::database_has_incomplete_incremental_run(storage_path) {
-                Ok(marked) => marked,
-                Err(error) => {
-                    tracing::warn!(
-                        path = %storage_path.display(),
-                        "Live storage could not be inspected; rebuilding without copying derived state: {error}"
-                    );
-                    true
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    path = %storage_path.display(),
-                    "Live storage schema could not be read; rebuilding without copying derived state: {error}"
-                );
-                true
-            }
-        }
-    } else {
-        false
-    };
-    let has_verified_live_publication = !recovering_incomplete_run
-        && previous_publication.as_ref().is_some_and(|expected| {
-            let live = match Store::open_read_only(storage_path) {
-                Ok(storage) => storage,
-                Err(error) => {
-                    tracing::debug!(
-                        path = %storage_path.display(),
-                        "Live publication could not be opened for verification: {error}"
-                    );
-                    return false;
-                }
-            };
-            match live.get_complete_index_publication() {
-                Ok(Some(publication)) if publication == *expected => {
-                    match live.validate_dense_anchor_publication(&publication) {
-                        Ok(_) => {
-                            validate_structural_text_units(&live, &publication).is_ok()
-                                && validate_source_policy_exclusions(
-                                    &live,
-                                    root,
-                                    &publication,
-                                    source_index_policy,
-                                )
-                                .is_ok()
-                        }
-                        Err(error) => {
-                            tracing::debug!(
-                                path = %storage_path.display(),
-                                "Live dense anchor publication could not be verified: {error}"
-                            );
-                            false
-                        }
-                    }
-                }
-                Ok(_) => false,
-                Err(error) => {
-                    tracing::debug!(
-                        path = %storage_path.display(),
-                        "Live core publication could not be verified: {error}"
-                    );
-                    false
-                }
-            }
-        });
+    let live_state = inspect_full_index_live_state(root, storage_path, source_index_policy)?;
+    let previous_publication = &live_state.previous_publication;
+    let publication = &live_state.publication;
+    let recovering_incomplete_run = live_state.recovering_incomplete_run;
+    let has_verified_live_publication = live_state.has_verified_publication;
     wall_durations.live_inspection = wall_stage_started.elapsed();
     wall_stage_started = Instant::now();
     let workspace = runtime_workspace_manifest(root, storage_path)
@@ -4569,7 +4606,7 @@ fn index_full_for_runtime(
         staged.store_mut(),
         None,
         None,
-        &dense_anchor_source_identity,
+        &live_state.dense_anchor_source_identity,
         cancel_token,
         runtime,
         SemanticProjectionDocumentSource::SourceFiles,
@@ -4964,7 +5001,7 @@ fn index_full_for_runtime(
         staged_semantic_stats,
         llm_refresh_scope: None,
         #[cfg(test)]
-        publication,
+        publication: publication.clone(),
         prepared_search_state: Some(prepared_search_state),
     })
 }
