@@ -21,14 +21,12 @@ pub(crate) fn stage_windows_runtime_file(source: &Path, destination: &Path) -> i
     stage_windows_runtime_files(&[(source, destination)])
 }
 
-/// Prepare every Windows runtime DLL before publishing any of them.
+/// Prepare every Windows runtime DLL before publishing the transaction.
 ///
 /// The upstream build can leave hard links in Cargo's runtime directory.
-/// Copying to unique same-directory files breaks those links. Publishing each
-/// complete copy atomically means a failed build leaves every destination that
-/// it reached as either the previous or the new complete file. Preparation is
-/// atomic for the batch; publication is deliberately only per destination, so
-/// a later publish failure can leave earlier destinations at the new version.
+/// Copying to unique same-directory files breaks those links. The publication
+/// transaction snapshots every destination before its first replacement and
+/// restores the complete previous set if a later replacement fails.
 pub(crate) fn stage_windows_runtime_files(entries: &[(&Path, &Path)]) -> io::Result<()> {
     let Some(profile_dir) = entries
         .first()
@@ -303,6 +301,16 @@ fn acquire_profile_staging_lock(profile_dir: &Path) -> io::Result<File> {
 }
 
 fn publish_all(replacements: Vec<PreparedReplacement>) -> io::Result<()> {
+    publish_all_with(replacements, replace_file)
+}
+
+fn publish_all_with<F>(
+    mut replacements: Vec<PreparedReplacement>,
+    mut publish_replacement: F,
+) -> io::Result<()>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
     let mut destinations = std::collections::HashSet::with_capacity(replacements.len());
     for replacement in &replacements {
         if !destinations.insert(destination_key(&replacement.destination)) {
@@ -315,8 +323,28 @@ fn publish_all(replacements: Vec<PreparedReplacement>) -> io::Result<()> {
             ));
         }
     }
+
+    let mut transaction = PublicationTransaction::capture(&replacements)?;
+    for (index, replacement) in replacements.iter_mut().enumerate() {
+        if let Err(error) = replacement.publish_with(&mut publish_replacement) {
+            return Err(transaction.rollback(index, error));
+        }
+    }
+    if let Err(error) = sync_destination_directories(&replacements) {
+        return Err(transaction.rollback(replacements.len(), error));
+    }
+    Ok(())
+}
+
+fn sync_destination_directories(replacements: &[PreparedReplacement]) -> io::Result<()> {
+    let mut directories = std::collections::HashSet::new();
     for replacement in replacements {
-        replacement.publish()?;
+        if let Some(parent) = replacement.destination.parent() {
+            let key = destination_key(parent);
+            if directories.insert(key) {
+                sync_parent_directory(&replacement.destination)?;
+            }
+        }
     }
     Ok(())
 }
@@ -343,14 +371,17 @@ impl PreparedReplacement {
         }
     }
 
-    fn publish(mut self) -> io::Result<()> {
+    fn publish_with<F>(&mut self, publish_replacement: &mut F) -> io::Result<()>
+    where
+        F: FnMut(&Path, &Path) -> io::Result<()>,
+    {
         let temporary = self
             .temporary
             .as_ref()
             .expect("prepared replacement has a temporary file");
-        replace_file(temporary, &self.destination)?;
+        publish_replacement(temporary, &self.destination)?;
         self.temporary = None;
-        sync_parent_directory(&self.destination)
+        Ok(())
     }
 }
 
@@ -360,6 +391,142 @@ impl Drop for PreparedReplacement {
             let _ = fs::remove_file(temporary);
         }
     }
+}
+
+struct PublicationTransaction {
+    snapshots: Vec<DestinationSnapshot>,
+}
+
+impl PublicationTransaction {
+    fn capture(replacements: &[PreparedReplacement]) -> io::Result<Self> {
+        let snapshots = replacements
+            .iter()
+            .map(|replacement| DestinationSnapshot::capture(&replacement.destination))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self { snapshots })
+    }
+
+    fn rollback(&mut self, published_count: usize, publish_error: io::Error) -> io::Error {
+        let mut rollback_errors = Vec::new();
+        for snapshot in self.snapshots[..published_count].iter_mut().rev() {
+            if let Err(error) = snapshot.restore() {
+                rollback_errors.push(format!("{}: {error}", snapshot.destination.display()));
+            }
+        }
+        if let Err(error) = sync_snapshot_directories(&self.snapshots[..published_count]) {
+            rollback_errors.push(format!("sync restored directories: {error}"));
+        }
+        if rollback_errors.is_empty() {
+            return publish_error;
+        }
+        io::Error::other(format!(
+            "{publish_error}; native runtime rollback also failed: {}",
+            rollback_errors.join("; ")
+        ))
+    }
+}
+
+struct DestinationSnapshot {
+    destination: PathBuf,
+    previous: PreviousDestination,
+}
+
+impl DestinationSnapshot {
+    fn capture(destination: &Path) -> io::Result<Self> {
+        let previous = match fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                PreviousDestination::Symlink(fs::read_link(destination)?)
+            }
+            Ok(metadata) if metadata.is_file() => {
+                PreviousDestination::File(create_unique_hard_link(destination, destination)?)
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "native runtime destination cannot be snapshotted: {}",
+                        destination.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => PreviousDestination::Absent,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            destination: destination.to_path_buf(),
+            previous,
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        match &mut self.previous {
+            PreviousDestination::Absent => match fs::remove_file(&self.destination) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+            PreviousDestination::File(temporary) => {
+                replace_file(temporary, &self.destination)?;
+                self.previous = PreviousDestination::Absent;
+                Ok(())
+            }
+            #[cfg(unix)]
+            PreviousDestination::Symlink(target) => {
+                let temporary = create_unique_symlink(target, &self.destination)?;
+                let result = replace_file(&temporary, &self.destination);
+                if result.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                result
+            }
+            #[cfg(not(unix))]
+            PreviousDestination::Symlink(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native runtime symlink rollback is unsupported on this platform",
+            )),
+        }
+    }
+}
+
+impl Drop for DestinationSnapshot {
+    fn drop(&mut self) {
+        if let PreviousDestination::File(temporary) = &self.previous {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
+enum PreviousDestination {
+    Absent,
+    File(PathBuf),
+    Symlink(PathBuf),
+}
+
+#[cfg(unix)]
+fn create_unique_symlink(target: &Path, destination: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::symlink;
+
+    loop {
+        let temporary = staging_temp_path(destination);
+        match symlink(target, &temporary) {
+            Ok(()) => return Ok(temporary),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sync_snapshot_directories(snapshots: &[DestinationSnapshot]) -> io::Result<()> {
+    let mut directories = std::collections::HashSet::new();
+    for snapshot in snapshots {
+        if let Some(parent) = snapshot.destination.parent() {
+            let key = destination_key(parent);
+            if directories.insert(key) {
+                sync_parent_directory(&snapshot.destination)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -494,7 +661,7 @@ mod windows_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        acquire_profile_staging_lock, prepare_real_hard_link, publish_all,
+        acquire_profile_staging_lock, prepare_real_hard_link, publish_all, publish_all_with,
         stage_linux_shared_libraries,
     };
     use std::fs;
@@ -719,7 +886,7 @@ mod tests {
             fs::read(&destination).expect("destination before publish"),
             b"old"
         );
-        prepared.publish().expect("publish replacement link");
+        publish_all(vec![prepared]).expect("publish replacement link");
         assert_eq!(
             fs::read(&destination).expect("destination after publish"),
             b"new"
@@ -765,6 +932,83 @@ mod tests {
         assert_eq!(
             fs::read(&destination).expect("destination after rejection"),
             b"old"
+        );
+        assert_no_staging_temps(temp.path());
+    }
+
+    #[test]
+    fn late_publication_failure_restores_the_complete_previous_batch() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let first_source = temp.path().join("libfirst.so");
+        let second_source = temp.path().join("libsecond.so");
+        let first_destination = temp.path().join("first.so");
+        let second_destination = temp.path().join("second.so");
+        fs::write(&first_source, b"new-first").expect("first source");
+        fs::write(&second_source, b"new-second").expect("second source");
+        fs::write(&first_destination, b"old-first").expect("first destination");
+        fs::write(&second_destination, b"old-second").expect("second destination");
+        let first =
+            prepare_real_hard_link(&first_source, &first_destination).expect("first replacement");
+        let second = prepare_real_hard_link(&second_source, &second_destination)
+            .expect("second replacement");
+        let mut attempt = 0;
+
+        let error = publish_all_with(vec![first, second], |source, destination| {
+            attempt += 1;
+            if attempt == 2 {
+                return Err(io::Error::other("injected late publication failure"));
+            }
+            super::replace_file(source, destination)
+        })
+        .expect_err("second publication must fail");
+
+        assert_eq!(error.to_string(), "injected late publication failure");
+        assert_eq!(
+            fs::read(&first_destination).expect("restored first destination"),
+            b"old-first"
+        );
+        assert_eq!(
+            fs::read(&second_destination).expect("unchanged second destination"),
+            b"old-second"
+        );
+        assert_no_staging_temps(temp.path());
+    }
+
+    #[test]
+    fn late_publication_failure_restores_a_previous_symlink() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let old_source = temp.path().join("libold.so");
+        let first_source = temp.path().join("libfirst.so");
+        let second_source = temp.path().join("libsecond.so");
+        let first_destination = temp.path().join("first.so");
+        let second_destination = temp.path().join("second.so");
+        fs::write(&old_source, b"old-first").expect("old source");
+        fs::write(&first_source, b"new-first").expect("first source");
+        fs::write(&second_source, b"new-second").expect("second source");
+        symlink("libold.so", &first_destination).expect("previous destination symlink");
+        fs::write(&second_destination, b"old-second").expect("second destination");
+        let first =
+            prepare_real_hard_link(&first_source, &first_destination).expect("first replacement");
+        let second = prepare_real_hard_link(&second_source, &second_destination)
+            .expect("second replacement");
+        let mut attempt = 0;
+
+        publish_all_with(vec![first, second], |source, destination| {
+            attempt += 1;
+            if attempt == 2 {
+                return Err(io::Error::other("injected late publication failure"));
+            }
+            super::replace_file(source, destination)
+        })
+        .expect_err("second publication must fail");
+
+        assert_eq!(
+            fs::read_link(&first_destination).expect("restored symlink"),
+            Path::new("libold.so")
+        );
+        assert_eq!(
+            fs::read(&first_destination).expect("restored symlink content"),
+            b"old-first"
         );
         assert_no_staging_temps(temp.path());
     }
