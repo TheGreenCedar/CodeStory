@@ -10,7 +10,11 @@ import {
   evaluateReleaseClaims,
   deriveTrustedGitIdentity,
   loadReleaseClaimGraph,
+  releaseAssetNames,
   releaseClaimGraphDigest,
+  renderPublicSupport,
+  renderReleasePlatformNotes,
+  validatePublicSupportDocuments,
   validateReleaseClaimGraph,
 } from "../codestory-release-claims.mjs";
 
@@ -98,9 +102,9 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.match(releaseClaimGraphDigest(graph), /^[0-9a-f]{64}$/u);
   assert.equal(positiveFixture().evidence[0].graph_sha256, releaseClaimGraphDigest(graph));
   assert.equal(graph.claims.length, 8);
-  assert.equal(graph.graph_version, 4);
+  assert.equal(graph.graph_version, 5);
   assert.deepEqual(graph.closeout.phases, ["pre_publish", "post_publish"]);
-  assert.equal(graph.closeout.cell_groups.length, 6);
+  assert.equal(graph.closeout.cell_groups.length, 7);
   assert.deepEqual(
     graph.workflow_policy.package_matrix.map(({ asset_target: target }) => target).sort(),
     ["macos-arm64", "windows-x64"],
@@ -122,6 +126,30 @@ test("versioned claim graph has one deterministic digest and all declared contro
   assert.equal(graph.workflow_policy.promotion.source_cache_namespace, "source-proof-v2");
   assert.equal(graph.workflow_policy.promotion.macos_source_cache_namespace, "macos-source-v2");
   assert.equal(graph.workflow_policy.promotion.packaged_cache_namespace, "codestory-cli-native-v4");
+});
+
+test("public support, assets, and release notes derive from the package and closeout graph", () => {
+  assert.doesNotThrow(() => validatePublicSupportDocuments(graph, root));
+  assert.deepEqual(
+    graph.public_support.packages.map(({ target, accelerator_claim: accelerator }) =>
+      ({ target, accelerator })),
+    [
+      { target: "macos-arm64", accelerator: "metal" },
+      { target: "windows-x64", accelerator: "vulkan" },
+    ],
+  );
+  assert.deepEqual(
+    releaseAssetNames(graph, "0.16.0"),
+    [
+      "codestory-cli-v0.16.0-windows-x64.zip",
+      "codestory-cli-v0.16.0-macos-arm64.tar.gz",
+      "SHA256SUMS.txt",
+    ],
+  );
+  assert.match(renderPublicSupport(graph), /Apple Silicon \\| Yes \\| Metal/u);
+  assert.match(renderPublicSupport(graph), /Windows x64 \\| Yes \\| Vulkan/u);
+  assert.match(renderReleasePlatformNotes(graph), /macOS 15\+ on Apple Silicon: Metal/u);
+  assert.match(renderReleasePlatformNotes(graph), /Windows x64: Vulkan/u);
 });
 
 test("positive fixture evaluates deterministically", () => {
@@ -180,6 +208,22 @@ test("graph rejects ambiguous dependencies and unstructured proof lanes", () => 
   assert.throws(
     () => validateReleaseClaimGraph(aggregateCell),
     /identity undeclared_identity must declare a format/u,
+  );
+
+  const mismatchedSupport = structuredClone(graph);
+  mismatchedSupport.public_support.packages[0].target = "macos-x64";
+  assert.throws(
+    () => validateReleaseClaimGraph(mismatchedSupport),
+    /package targets must exactly match/u,
+  );
+
+  const missingAcceleratorCell = structuredClone(graph);
+  missingAcceleratorCell.closeout.cell_groups
+    .find(({ id }) => id === "accelerator_execution")
+    .instances = [];
+  assert.throws(
+    () => validateReleaseClaimGraph(missingAcceleratorCell),
+    /must be a non-empty array|no required closeout cell/u,
   );
 
   for (const field of [

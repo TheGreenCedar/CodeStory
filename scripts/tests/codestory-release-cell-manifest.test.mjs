@@ -42,26 +42,30 @@ function producer(selected) {
 function actionsMetadata(phase, overrides = []) {
   const artifacts = [];
   const jobsByAttempt = { "1": [], "2": [] };
-  const seen = new Set();
+  const seenArtifacts = new Set();
+  const seenJobs = new Set();
   let nextId = 1000;
   const add = (selected, attempt, conclusion = "success") => {
     const constraints = resolveReleaseCellConstraints(selected, String(attempt));
-    const key = `${attempt}:${constraints.producer_job_name}:${constraints.producer_artifact}`;
-    if (seen.has(key)) return;
-    seen.add(key);
     const hour = attempt === 1 ? "12" : "13";
-    jobsByAttempt[String(attempt)].push({
-      id: nextId++,
-      run_id: 12345,
-      run_attempt: String(attempt),
-      head_sha: gitIdentity.commit,
-      name: `Release / ${constraints.producer_job_name}`,
-      status: "completed",
-      conclusion,
-      started_at: `2026-07-19T${hour}:00:00.000Z`,
-      completed_at: `2026-07-19T${hour}:10:00.000Z`,
-    });
-    if (conclusion === "success") {
+    const jobKey = `${attempt}:${constraints.producer_job_name}`;
+    if (!seenJobs.has(jobKey)) {
+      seenJobs.add(jobKey);
+      jobsByAttempt[String(attempt)].push({
+        id: nextId++,
+        run_id: 12345,
+        run_attempt: String(attempt),
+        head_sha: gitIdentity.commit,
+        name: `Release / ${constraints.producer_job_name}`,
+        status: "completed",
+        conclusion,
+        started_at: `2026-07-19T${hour}:00:00.000Z`,
+        completed_at: `2026-07-19T${hour}:10:00.000Z`,
+      });
+    }
+    const artifactKey = `${attempt}:${constraints.producer_artifact}`;
+    if (conclusion === "success" && !seenArtifacts.has(artifactKey)) {
+      seenArtifacts.add(artifactKey);
       artifacts.push({
         id: nextId++,
         name: constraints.producer_artifact,
@@ -160,8 +164,8 @@ test("Actions provenance recovers a split rerun by selecting each job's latest e
     currentRunAttempt: "2",
     ...metadata,
   });
-  assert.equal(map.producers.length, 11);
-  assert.equal(map.artifacts.length, 7);
+  assert.equal(map.producers.length, 13);
+  assert.equal(map.artifacts.length, 9);
   for (const id of [
     "platform_support:windows-x64",
     "installed_runtime_behavior:windows-x64",

@@ -199,14 +199,8 @@ function resolveManifest(manifestPath) {
   };
 }
 
-function assetTarget() {
-  const platform = process.platform;
-  const arch = process.arch;
+function assetTarget(platform = process.platform, arch = process.arch) {
   if (platform === 'win32' && arch === 'x64') return 'windows-x64';
-  if (platform === 'win32' && arch === 'arm64') return 'windows-arm64';
-  if (platform === 'linux' && arch === 'x64') return 'linux-x64';
-  if (platform === 'linux' && arch === 'arm64') return 'linux-arm64';
-  if (platform === 'darwin' && arch === 'x64') return 'macos-x64';
   if (platform === 'darwin' && arch === 'arm64') return 'macos-arm64';
   return null;
 }
@@ -215,6 +209,12 @@ function archiveName(version, target = assetTarget()) {
   if (!target) return null;
   const extension = target.startsWith('windows-') ? 'zip' : 'tar.gz';
   return `codestory-cli-v${version}-${target}.${extension}`;
+}
+
+function releaseAssetIdentity(version, platform = process.platform, arch = process.arch) {
+  const target = assetTarget(platform, arch);
+  if (!target) throw new Error(`unsupported_release_target:${platform}-${arch}`);
+  return { target, asset: archiveName(version, target) };
 }
 
 function expectedArchiveHash(sumsText, name) {
@@ -1034,9 +1034,10 @@ function managedCliFailureCode(error) {
 function verifyPublishedManagedCli(
   versionDir,
   version,
-  expectedTarget = assetTarget(),
+  expectedTarget,
   probeVersion = probeResolvedCli,
 ) {
+  const target = expectedTarget || releaseAssetIdentity(version).target;
   let bytes = 0;
   try {
     bytes = managedPathSize(versionDir);
@@ -1052,7 +1053,7 @@ function verifyPublishedManagedCli(
   }, probeVersion);
   if (!verified.verified) return verified;
   const manifest = readJson(path.join(versionDir, 'manifest.json'));
-  const expectedAsset = archiveName(version, expectedTarget);
+  const expectedAsset = archiveName(version, target);
   const candidateArchiveSha256 = candidateQualificationArchiveSha256() || '';
   const releaseMetadataValid =
     manifest.build_source === 'github_release' &&
@@ -1259,9 +1260,7 @@ function releaseManagedCliLock(lock) {
 
 async function provisionManagedCli(dataDir, version, warnings = []) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
-  const target = assetTarget();
-  const asset = archiveName(version, target);
-  if (!target || !asset) throw new Error(`unsupported_release_target:${process.platform}-${process.arch}`);
+  const { target, asset } = releaseAssetIdentity(version);
 
   const root = managedCliRoot(dataDir, true);
   const versionDir = path.join(root, version);
@@ -1345,6 +1344,13 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
 
 async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   if (!dataDir || !version) return null;
+  let target;
+  try {
+    target = releaseAssetIdentity(version).target;
+  } catch (error) {
+    warnings.push(`managed_cli_unsupported_target:${managedCliFailureCode(error)}`);
+    return null;
+  }
   try {
     managedCliRoot(dataDir);
   } catch (error) {
@@ -1353,7 +1359,7 @@ async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   }
   const versionDir = path.join(dataDir, 'codestory-cli', version);
   if (fs.existsSync(versionDir)) {
-    const existing = verifyPublishedManagedCli(versionDir, version);
+    const existing = verifyPublishedManagedCli(versionDir, version, target);
     if (existing.verified) return existing.resolved;
   }
   if (options.provision === false) return null;
@@ -2831,6 +2837,7 @@ if (require.main === module) {
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,
+      releaseAssetIdentity,
       isWindowsBatchCli,
       requireDirectCli,
       reclaimStaleManagedCliPendingOwners,

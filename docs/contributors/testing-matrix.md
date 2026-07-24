@@ -418,9 +418,10 @@ instead of copying those facts into contributor prose.
 The same graph declares the exact release-closeout cells. For v0.16,
 `workflow_policy.package_matrix` contains only `macos-arm64` and `windows-x64`.
 The coordinator retains canonical copies under `manifests/` and `evaluations/`
-beside `ledger.json` and `summary.json`. A pre-publish run accepts five cells:
-exact source, two package identities, and two candidate-installed behavior
-receipts. A post-publish run accepts eleven cells after adding platform,
+beside `ledger.json` and `summary.json`. A pre-publish run accepts seven cells:
+exact source, two package identities, two accelerator-execution receipts, and
+two candidate-installed behavior receipts. A post-publish run accepts thirteen
+cells after adding platform,
 marketplace-catalog-resolved behavior, and downloaded-byte proof for both targets.
 Package rows record each archive name, byte count, and SHA-256.
 A post-publish run requires
@@ -454,10 +455,9 @@ downloads by name use explicit replacement from a policy-owned allowlist, so a
 retried producer cannot fail on an immutable same-name artifact before it emits
 its authenticated cell. Terminal evidence is never overwriteable.
 
-Accuracy, latency, throughput, and physical accelerator evidence remain
-independent evaluator lanes. Their thresholds and exception rules are
-unchanged, but v0.16 closeout does not consume them and makes no claim from
-them.
+The v0.16 closeout consumes physical Metal and Vulkan execution evidence and
+makes those accelerator claims for the released targets. Accuracy, latency,
+and throughput remain independent evaluator lanes and release non-claims.
 
 Run the coordinator only with retained producer manifests and a fresh output
 directory:
@@ -531,7 +531,7 @@ release workflow. No version bump, tag, signing, notarization, or release is
 part of ordinary remediation or embedding-engine PRs.
 
 Maintainers may manually dispatch `release.yml` from an exact
-`dev/codestory-next` SHA to authenticate the 5-cell pre-publish ledger without
+`dev/codestory-next` SHA to authenticate the 7-cell pre-publish ledger without
 publishing. The required `expected_head_sha` must equal both the workflow SHA
 and the live dev branch head. Manual dispatch exposes no publication input;
 only the automatic reusable-workflow caller on the live `main` head passes the

@@ -247,8 +247,8 @@ function evaluate(
 test("cell inventory is derived only from the release claim graph", () => {
   const prePublish = deriveReleaseCells(graph, "pre_publish");
   const postPublish = deriveReleaseCells(graph, "post_publish");
-  assert.equal(prePublish.length, 5);
-  assert.equal(postPublish.length, 11);
+  assert.equal(prePublish.length, 7);
+  assert.equal(postPublish.length, 13);
   assert.deepEqual(
     prePublish.filter(({ group_id }) => group_id === "package_identity").map(({ identity_constraints }) => identity_constraints.target),
     graph.workflow_policy.package_matrix.map(({ asset_target: assetTarget }) => assetTarget).sort(),
@@ -280,6 +280,10 @@ test("cell inventory is derived only from the release claim graph", () => {
     prePublish.filter(({ group_id }) => group_id === "candidate_installed_behavior").length,
     2,
   );
+  assert.equal(
+    prePublish.filter(({ group_id }) => group_id === "accelerator_execution").length,
+    2,
+  );
   assert.deepEqual(
     postPublish
       .filter(({ group_id }) => group_id === "installed_runtime_behavior")
@@ -296,15 +300,15 @@ test("accepted pre-publish closeout retains one manifest and evaluation per cell
   assert.equal(first.decision, "accept");
   assert.deepEqual(first.ledger, second.ledger);
   assert.deepEqual(first.summary, second.summary);
-  assert.equal(first.summary.counts.required, 5);
-  assert.equal(first.summary.counts.passed, 5);
-  assert.equal(first.retainedManifests.size, 5);
-  assert.equal(first.evaluations.size, 5);
+  assert.equal(first.summary.counts.required, 7);
+  assert.equal(first.summary.counts.passed, 7);
+  assert.equal(first.retainedManifests.size, 7);
+  assert.equal(first.evaluations.size, 7);
 
   const out = mkdtempSync(path.join(os.tmpdir(), "codestory-release-closeout-"));
   writeReleaseCloseout(out, first);
-  assert.equal(readdirSync(path.join(out, "manifests")).length, 5);
-  assert.equal(readdirSync(path.join(out, "evaluations")).length, 5);
+  assert.equal(readdirSync(path.join(out, "manifests")).length, 7);
+  assert.equal(readdirSync(path.join(out, "evaluations")).length, 7);
   assert.deepEqual(JSON.parse(readFileSync(path.join(out, "ledger.json"))), first.ledger);
   assert.deepEqual(JSON.parse(readFileSync(path.join(out, "summary.json"))), first.summary);
 });
@@ -324,8 +328,8 @@ test("closeout rejects loose JSON and artifact bindings outside selected Actions
     );
   }
   const downloaded = readReleaseCellArtifacts(selected, trustedProducers);
-  assert.equal(downloaded.manifests.length, 5);
-  assert.equal(downloaded.artifactBindings.length, 5);
+  assert.equal(downloaded.manifests.length, 7);
+  assert.equal(downloaded.artifactBindings.length, 7);
 
   const loose = mkdtempSync(path.join(os.tmpdir(), "codestory-release-cell-loose-"));
   writeFileSync(path.join(loose, "source_behavior.json"), "{}\n");
@@ -366,7 +370,7 @@ test("post-publish closeout compares every downloaded archive with the retained 
   const manifests = manifestsFor("post_publish", prePublish.ledger);
   const postPublish = evaluate("post_publish", manifests, prePublish.ledger);
   assert.equal(postPublish.decision, "accept");
-  assert.equal(postPublish.summary.counts.required, 11);
+  assert.equal(postPublish.summary.counts.required, 13);
   assert.equal(
     postPublish.ledger.cells.filter(({ id }) => id.startsWith("post_publish_bytes:")).length,
     graph.workflow_policy.package_matrix.length,

@@ -1472,6 +1472,27 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ];
   add(violations, sameMembers(Object.keys(object(packaged.secrets)), expectedSecrets), `${releaseFile} packaged-proof must pass exactly the Apple signing secrets`);
 
+  const releaseEvidence = requireJob(violations, releaseFile, release, "release-evidence");
+  add(
+    violations,
+    releaseEvidence.uses === "./.github/workflows/release-candidate-evidence.yml",
+    `${releaseFile} must produce exact-head release evidence before hardware qualification`,
+  );
+  add(
+    violations,
+    sameMembers(needs(releaseEvidence), releaseChain.dependencies["release-evidence"]),
+    `${releaseFile} release-evidence dependencies must match the release claim graph`,
+  );
+  add(
+    violations,
+    object(releaseEvidence.with).ref === "${{ github.sha }}"
+      && object(releaseEvidence.with).proof_key === "release-${{ needs.preflight.outputs.version }}"
+      && object(releaseEvidence.with).profile === "codestory-release-evidence-linux-arm64-v2"
+      && object(releaseEvidence.with).drill_manifest
+      === "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
+    `${releaseFile} release evidence must measure the exact release head on the approved profile`,
+  );
+
   const metal = requireJob(violations, releaseFile, release, "macos-metal-proof");
   add(violations, metal.uses === "./.github/workflows/macos-metal-proof.yml", `${releaseFile} must call protected Metal proof`);
   add(violations, sameMembers(needs(metal), releaseChain.dependencies["macos-metal-proof"]), `${releaseFile} Metal proof dependencies must match the release claim graph`);
@@ -1480,9 +1501,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     object(metal.with).candidate_installed_proof === true
-      && object(metal.with).candidate_installed_only === true
-      && object(metal.with).server_behavior_only === true,
-    `${releaseFile} Mac proof must run only the candidate-installed server behavior gate`,
+      && object(metal.with).candidate_installed_only === undefined
+      && object(metal.with).server_behavior_only === undefined
+      && object(metal.with).quality_evidence_artifact
+      === "release-evidence-${{ github.sha }}",
+    `${releaseFile} Mac proof must close both Metal and candidate-installed claims`,
   );
 
   const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
@@ -1493,9 +1516,11 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   add(
     violations,
     object(vulkan.with).candidate_installed_proof === true
-      && object(vulkan.with).candidate_installed_only === true
-      && object(vulkan.with).server_behavior_only === true,
-    `${releaseFile} Windows proof must run only the candidate-installed server behavior gate`,
+      && object(vulkan.with).candidate_installed_only === undefined
+      && object(vulkan.with).server_behavior_only === undefined
+      && object(vulkan.with).quality_evidence_artifact
+      === "release-evidence-${{ github.sha }}",
+    `${releaseFile} Windows proof must close both Vulkan and candidate-installed claims`,
   );
 
   const preCloseout = requireJob(violations, releaseFile, release, "pre-publish-closeout");
@@ -1541,6 +1566,7 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
+    "node scripts/codestory-release-claims.mjs release-platform-notes",
   ]);
   requireStepRun(violations, releaseFile, publish, "Refuse existing tag or release", [
     'git ls-remote --exit-code --tags origin "refs/tags/$TAG"',
@@ -1549,7 +1575,10 @@ function validateReleaseCoordinator(workflows, violations, graph) {
   ]);
   requireStepRun(violations, releaseFile, publish, "Create GitHub release", [
     "--notes-file target/release-assets/release-notes.md",
-    'if [ "${#assets[@]}" -ne 3 ]; then',
+    "node scripts/codestory-release-claims.mjs release-assets",
+    'for name in "${expected_names[@]}"; do',
+    'if [ ! -f "$asset" ]; then',
+    "Release assets differ from the release claim graph",
     "repos/$GITHUB_REPOSITORY/git/ref/heads/main",
     '"$live_head" != "$GITHUB_SHA"',
     "main moved from publishable head",

@@ -29,6 +29,56 @@ const {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+test("managed release provisioning rejects unshipped targets before URL construction", () => {
+  assert.deepEqual(
+    launcherTest.releaseAssetIdentity("0.16.0", "darwin", "arm64"),
+    {
+      target: "macos-arm64",
+      asset: "codestory-cli-v0.16.0-macos-arm64.tar.gz",
+    },
+  );
+  assert.deepEqual(
+    launcherTest.releaseAssetIdentity("0.16.0", "win32", "x64"),
+    {
+      target: "windows-x64",
+      asset: "codestory-cli-v0.16.0-windows-x64.zip",
+    },
+  );
+  for (const [platform, architecture] of [
+    ["darwin", "x64"],
+    ["win32", "arm64"],
+    ["linux", "x64"],
+    ["linux", "arm64"],
+  ]) {
+    assert.throws(
+      () => launcherTest.releaseAssetIdentity("0.16.0", platform, architecture),
+      new RegExp(`^Error: unsupported_release_target:${platform}-${architecture}$`, "u"),
+    );
+  }
+});
+
+test("development receipts identify source-build targets independently of release packaging", () => {
+  assert.deepEqual(
+    [
+      ["darwin", "arm64"],
+      ["darwin", "x64"],
+      ["linux", "arm64"],
+      ["linux", "x64"],
+      ["win32", "arm64"],
+      ["win32", "x64"],
+    ].map(([platform, architecture]) =>
+      devCliContract.sourceBuildTarget(platform, architecture)),
+    [
+      "macos-arm64",
+      "macos-x64",
+      "linux-arm64",
+      "linux-x64",
+      "windows-arm64",
+      "windows-x64",
+    ],
+  );
+});
+
 function launcherHandoffInput() {
   return [
     {
@@ -492,7 +542,7 @@ async function writeAttestedDevPluginFixture(root, version) {
       plugin_version: version,
       source_commit: "a".repeat(40),
       source_package_sha256: sourcePackageSha256,
-      target: devCliContract.assetTarget(),
+      target: devCliContract.sourceBuildTarget(),
       cli: {
         path: `bin/${cliName}`,
         name: cliName,

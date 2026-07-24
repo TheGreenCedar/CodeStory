@@ -95,8 +95,8 @@ Backend, adapter, model, and smoke details are in the
 
 Apple Silicon selects Metal automatically. The first broad request may take
 longer while the embedded model initializes; later repositories reuse that warm
-engine. Intel Macs retain local navigation but do not claim Metal. Production
-does not silently switch to CPU when acceleration is unavailable.
+engine. Production does not silently switch to CPU when acceleration is
+unavailable.
 
 No macOS user needs to start a server, choose an endpoint, approve retrieval
 infrastructure, or install a model.

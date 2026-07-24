@@ -199,10 +199,20 @@ jobs:
       APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
+  release-evidence:
+    needs: preflight
+    uses: ./.github/workflows/release-candidate-evidence.yml
+    with:
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      profile: codestory-release-evidence-linux-arm64-v2
+      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
+
   macos-metal-proof:
     needs:
       - preflight
       - packaged-proof
+      - release-evidence
     uses: ./.github/workflows/macos-metal-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -211,16 +221,16 @@ jobs:
       use_packaged_cli_artifact: true
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      quality_evidence_artifact: release-evidence-${{ github.sha }}
       candidate_installed_proof: true
-      candidate_installed_only: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
-      server_behavior_only: true
       emit_release_cells: true
 
   windows-vulkan-proof:
     needs:
       - preflight
       - packaged-proof
+      - release-evidence
     uses: ./.github/workflows/windows-vulkan-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -229,10 +239,9 @@ jobs:
       use_packaged_cli_artifact: true
       calibration_bundle_artifact: ${{ inputs.calibration_bundle_artifact }}
       calibration_bundle_run_id: ${{ inputs.calibration_bundle_run_id }}
+      quality_evidence_artifact: release-evidence-${{ github.sha }}
       candidate_installed_proof: true
-      candidate_installed_only: true
       candidate_producer_workflow_path: ${{ inputs.publish_release && '.github/workflows/auto-release.yml' || '.github/workflows/release.yml' }}
-      server_behavior_only: true
       emit_release_cells: true
 
   pre-publish-closeout:
@@ -241,6 +250,7 @@ jobs:
       - preflight
       - source-proof
       - packaged-proof
+      - release-evidence
       - macos-metal-proof
       - windows-vulkan-proof
     runs-on: ubuntu-latest
@@ -374,20 +384,11 @@ jobs:
           node .github/scripts/extract-codestory-release-notes.mjs \
             --version "$VERSION" \
             --output target/release-assets/release-notes.md
-          cat >> target/release-assets/release-notes.md <<'EOF'
-
-          ## Platform proof boundaries
-
-          This release ships self-contained managed CLI assets for Windows x64
-          and Apple Silicon macOS.
-
-          Each archive is checksum-verified and gated on an isolated candidate
-          install that initializes MCP, starts the bundled local runtime, and
-          completes one real ground request without extra dependencies. CPU
-          execution is acceptable. This release does not claim Linux, Intel
-          macOS, Windows ARM, physical Metal/Vulkan execution, answer accuracy,
-          or performance thresholds.
-          EOF
+          {
+            printf '\n'
+            node scripts/codestory-release-claims.mjs release-platform-notes
+            printf '\n'
+          } >> target/release-assets/release-notes.md
 
       - name: Refuse existing tag or release
         env:
@@ -411,17 +412,26 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          # Release globs must expand into individual assets.
-          # shellcheck disable=SC2206
-          assets=(
-            target/release-assets/codestory-cli-v${VERSION}-*.tar.gz
-            target/release-assets/codestory-cli-v${VERSION}-*.zip
-            target/release-assets/SHA256SUMS.txt
+          mapfile -t expected_names < <(
+            node scripts/codestory-release-claims.mjs release-assets --version "$VERSION"
           )
-          if [ "${#assets[@]}" -ne 3 ]; then
-            echo "::error::Expected two desktop archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
-            printf '%s\n' "${assets[@]}"
+          assets=()
+          for name in "${expected_names[@]}"; do
+            asset="target/release-assets/$name"
+            if [ ! -f "$asset" ]; then
+              echo "::error::Missing graph-declared release asset $name."
+              exit 1
+            fi
+            assets+=("$asset")
+          done
+          expected_file="$(mktemp)"
+          actual_file="$(mktemp)"
+          printf '%s\n' "${expected_names[@]}" | sort > "$expected_file"
+          find target/release-assets -maxdepth 1 -type f \
+            \( -name 'codestory-cli-v*.tar.gz' -o -name 'codestory-cli-v*.zip' -o -name 'SHA256SUMS.txt' \) \
+            -exec basename {} \; | sort > "$actual_file"
+          if ! diff -u "$expected_file" "$actual_file"; then
+            echo "::error::Release assets differ from the release claim graph."
             exit 1
           fi
           live_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"

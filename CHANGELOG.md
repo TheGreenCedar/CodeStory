@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Fail closed when runtime evidence is insufficient, capture source-index policy once at startup, and keep embedding work bounded under sustained queue pressure.
+- Bound the v0.16 package matrix, public support claims, release assets, and
+  Metal/Vulkan closeout to one validated release graph.
 
 ## 0.16.0
 

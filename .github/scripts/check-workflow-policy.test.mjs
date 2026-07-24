@@ -1391,10 +1391,13 @@ test("Windows candidate-installed proof remains distinct and provenance-bound", 
     }, /Windows quality evidence must come only from the successful protected producer/u],
     ["release disables candidate-installed proof", releaseFile, workflow => {
       workflow.jobs["windows-vulkan-proof"].with.candidate_installed_proof = false;
-    }, /candidate-installed server behavior gate/u],
-    ["release enables physical Vulkan proof", releaseFile, workflow => {
-      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = false;
-    }, /candidate-installed server behavior gate/u],
+    }, /close both Vulkan and candidate-installed claims/u],
+    ["release suppresses physical Vulkan proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.candidate_installed_only = true;
+    }, /close both Vulkan and candidate-installed claims/u],
+    ["release downgrades to server-only proof", releaseFile, workflow => {
+      workflow.jobs["windows-vulkan-proof"].with.server_behavior_only = true;
+    }, /close both Vulkan and candidate-installed claims/u],
     ["explicit opt-in removed", protectedFile, workflow => {
       delete workflow.on.workflow_call.inputs.candidate_installed_proof;
     }, /candidate-installed proof must be an explicit opt-in/u],

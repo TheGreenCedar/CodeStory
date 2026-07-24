@@ -1,7 +1,36 @@
 {
   "schema": "codestory.release-claims/v1",
-  "graph_version": 4,
+  "graph_version": 5,
   "graph_id": "codestory-release-claims",
+  "public_support": {
+    "release_line": "0.16",
+    "packages": [
+      {
+        "target": "macos-arm64",
+        "label": "macOS 15+ on Apple Silicon",
+        "local_map": "supported",
+        "broad_retrieval": "accelerated",
+        "accelerator_claim": "metal"
+      },
+      {
+        "target": "windows-x64",
+        "label": "Windows x64",
+        "local_map": "supported",
+        "broad_retrieval": "accelerated",
+        "accelerator_claim": "vulkan"
+      }
+    ],
+    "unshipped_targets": [
+      "linux-arm64",
+      "linux-x64",
+      "macos-x64",
+      "windows-arm64"
+    ],
+    "unclaimed_capabilities": [
+      "answer_quality",
+      "performance"
+    ]
+  },
   "evidence_policy": {
     "selection": "all_matching_rows_must_pass",
     "validity": "observed_at_expires_at",
@@ -556,6 +585,71 @@
         "archive_role": "pre_publish"
       },
       {
+        "id": "accelerator_execution",
+        "phase": "pre_publish",
+        "claim": "accelerator_execution",
+        "evidence_type": "accelerator_execution",
+        "expansion": "instances",
+        "required_identity": [
+          "repository",
+          "commit",
+          "source_tree",
+          "artifact_sha256",
+          "producer_version",
+          "target",
+          "host_os",
+          "host_arch",
+          "runner",
+          "backend",
+          "native_engine",
+          "calibration_sha256",
+          "producer_workflow",
+          "producer_job",
+          "producer_job_name",
+          "producer_run_id",
+          "producer_run_attempt",
+          "producer_artifact"
+        ],
+        "singleton_identity": [
+          "host_os",
+          "host_arch",
+          "runner",
+          "backend",
+          "native_engine"
+        ],
+        "instances": [
+          {
+            "id": "macos-arm64-metal",
+            "identity_constraints": {
+              "target": "macos-arm64",
+              "host_os": "macOS",
+              "host_arch": "ARM64",
+              "runner": "codestory-metal",
+              "backend": "Metal",
+              "producer_workflow": ".github/workflows/macos-metal-proof.yml",
+              "producer_job": "packaged-metal",
+              "producer_job_name": "Packaged Apple Silicon Metal engine",
+              "producer_artifact": "release-cell-prepublish-macos-arm64-metal-attempt-{attempt}"
+            }
+          },
+          {
+            "id": "windows-x64-vulkan",
+            "identity_constraints": {
+              "target": "windows-x64",
+              "host_os": "Windows",
+              "host_arch": "X64",
+              "runner": "codestory-vulkan",
+              "backend": "Vulkan",
+              "producer_workflow": ".github/workflows/windows-vulkan-proof.yml",
+              "producer_job": "packaged-vulkan",
+              "producer_job_name": "Packaged Windows Vulkan engine",
+              "producer_artifact": "release-cell-prepublish-windows-x64-vulkan-attempt-{attempt}"
+            }
+          }
+        ],
+        "archive_role": "none"
+      },
+      {
         "id": "candidate_installed_behavior",
         "phase": "pre_publish",
         "claim": "installed_runtime_behavior",
@@ -778,6 +872,7 @@
       "exact_sha_jobs": [
         "source-proof",
         "packaged-proof",
+        "release-evidence",
         "macos-metal-proof",
         "windows-vulkan-proof"
       ],
@@ -791,18 +886,24 @@
         "packaged-proof": [
           "preflight"
         ],
+        "release-evidence": [
+          "preflight"
+        ],
         "macos-metal-proof": [
           "preflight",
-          "packaged-proof"
+          "packaged-proof",
+          "release-evidence"
         ],
         "windows-vulkan-proof": [
           "preflight",
-          "packaged-proof"
+          "packaged-proof",
+          "release-evidence"
         ],
         "pre-publish-closeout": [
           "preflight",
           "source-proof",
           "packaged-proof",
+          "release-evidence",
           "macos-metal-proof",
           "windows-vulkan-proof"
         ],
