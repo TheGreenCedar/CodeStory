@@ -15,7 +15,6 @@ from pathlib import Path
 
 from .foundation import (
     LOWER_TIER_NONCLAIMS,
-    REQUIRED_SERVER_SCENARIOS,
     TARGET_CONTRACTS,
     ProofFailure,
     require,
@@ -42,11 +41,11 @@ from .runtime import (
     retain_five_process_memory_evidence,
 )
 from .qualification import (
-    qualification_artifact,
     qualification_measurement_artifact,
 )
 from .qualification_production import (
     collect_qualification_external_evidence,
+    collect_qualification_scenarios,
     prepare_qualification_producer,
     run_qualification_producer,
 )
@@ -1133,12 +1132,9 @@ def produce_qualification_evidence(
     external = collect_qualification_external_evidence(context)
     artifact_root = context.artifact_root
     nonce = context.nonce
-    nonce_sha256 = context.nonce_sha256
     projects = list(context.projects)
     contracts = context.contracts
     package = context.package
-    publication_fault_evidence = external.publication_fault
-    fault_recovery_consistency_evidence = external.fault_recovery_consistency
     retrieval_quality_evidence = external.retrieval_quality
     runner = run_qualification_producer(context)
     identity = runtime["identity"]
@@ -1148,89 +1144,14 @@ def produce_qualification_evidence(
     output = runner.output
     expected_status = runner.expected_status
     constants_frozen = measurement_contract["constant_set"]["status"] == "frozen"
-    shared = runtime["shared_identity"]
-    require_exact_keys(
-        shared,
-        {
-            "endpoint_namespace_id",
-            "lifetime_authority_id",
-            "listener_id",
-            "server_instance_id",
-            "server_process_start_id",
-            "engine_owner_id",
-            "native_worker_id",
-            "load_generation",
-            "model_load_count",
-        },
-        "live two-host shared identity",
+    scenario_evidence = collect_qualification_scenarios(
+        context,
+        runner,
+        external,
     )
-    for field in (
-        "endpoint_namespace_id",
-        "lifetime_authority_id",
-        "listener_id",
-        "server_instance_id",
-        "server_process_start_id",
-        "engine_owner_id",
-        "native_worker_id",
-    ):
-        require_nonempty_string(shared[field], f"live shared_identity.{field}")
-    require_positive_int(shared["load_generation"], "live shared_identity.load_generation")
-    require(
-        shared["model_load_count"] == 1,
-        "qualification runner cold race did not preserve one model load",
-    )
-
-    scenario_contracts = measurement_contract["measurement_protocol"]["scenario_contracts"]
-    raw_scenarios = output["scenarios"]
-    require(
-        isinstance(raw_scenarios, dict) and set(raw_scenarios) == REQUIRED_SERVER_SCENARIOS,
-        "qualification runner returned an incomplete scenario set",
-    )
-    retained_scenarios: dict[str, dict] = {}
+    shared = scenario_evidence.shared_identity
+    retained_scenarios = scenario_evidence.scenarios
     forbidden_values = [nonce, *projects]
-    for scenario_id in sorted(REQUIRED_SERVER_SCENARIOS):
-        required_assertions = set(scenario_contracts[scenario_id]["required"])
-        artifact, assertions = qualification_artifact(
-            artifact_root,
-            raw_scenarios[scenario_id],
-            scenario_id=scenario_id,
-            contracts=contracts,
-            package=package,
-            same_account=runtime["same_account"],
-            materialization=runtime["materialization"],
-            nonce_sha256=nonce_sha256,
-            forbidden_values=forbidden_values,
-        )
-        external_artifacts = []
-        if scenario_id in {"server_crash", "worker_stall"}:
-            for assertion, value in publication_fault_evidence["assertions"].items():
-                require(
-                    assertion in required_assertions,
-                    f"publication fault evidence derived unknown assertion {assertion}",
-                )
-                assertions[assertion] = value
-            external_artifacts.append(publication_fault_evidence["artifact"])
-            if (
-                scenario_id == "server_crash"
-                and fault_recovery_consistency_evidence is not None
-            ):
-                external_artifacts.append(
-                    fault_recovery_consistency_evidence["artifact"]
-                )
-        require(
-            set(assertions) == required_assertions,
-            f"qualification scenario {scenario_id} derived assertion set differs from its preregistered contract",
-        )
-        require(
-            all(value is True for value in assertions.values()),
-            f"qualification scenario {scenario_id} has a failed assertion",
-        )
-        retained_scenarios[scenario_id] = {
-            "status": "pass",
-            "assertions": assertions,
-            "artifacts": [artifact, *external_artifacts],
-        }
-
     measurement = qualification_measurement_artifact(
         artifact_root,
         output["measurements"],
