@@ -5344,34 +5344,307 @@ fn ensure_incremental_refresh_compatible(root: &Path, storage_path: &Path) -> Re
     Ok(())
 }
 
-fn run_incremental_indexing_common(
+fn incremental_execution_plan(
+    staged: &mut StagedSnapshot,
+    root: &Path,
+    storage_path: &Path,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<(RefreshExecutionPlan, Vec<OversizedSourceExclusionCandidate>), ApiError> {
+    let workspace = runtime_workspace_manifest(root, storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+    let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
+    let policy_refresh = workspace
+        .build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
+        .map_err(|error| ApiError::internal(format!("Failed to generate refresh info: {error}")))?;
+    if policy_refresh.refresh.inventory_outcome == WorkspaceInventoryOutcome::Complete {
+        return Ok((
+            policy_refresh.refresh.plan,
+            policy_refresh.policy_exclusions,
+        ));
+    }
+    let reason =
+        if policy_refresh.refresh.inventory_outcome == WorkspaceInventoryOutcome::Unreadable {
+            FileCoverageReason::Unreadable
+        } else {
+            FileCoverageReason::DiscoveryIncomplete
+        };
+    let mut gaps = policy_refresh
+        .refresh
+        .inventory_issues
+        .iter()
+        .map(|issue| FileCoverageDiagnosticDto {
+            path: runtime_relative_path(root, &issue.path),
+            reason,
+            retryable: file_coverage_retryable(reason),
+            verified_source: false,
+            projection_available: false,
+        })
+        .collect::<Vec<_>>();
+    if gaps.is_empty() {
+        gaps.push(FileCoverageDiagnosticDto {
+            path: ".".into(),
+            reason,
+            retryable: file_coverage_retryable(reason),
+            verified_source: false,
+            projection_available: false,
+        });
+    }
+    Err(ApiError::source_coverage_failure(
+        source_coverage_failure_code(&gaps),
+        format!(
+            "Incremental refresh requires a complete source inventory; discovery was {:?}.",
+            policy_refresh.refresh.inventory_outcome
+        ),
+        gaps,
+    ))
+}
+
+struct IncrementalSemanticPlan {
+    previous_indexed_file_ids_by_path: HashMap<String, codestory_contracts::graph::NodeId>,
+    policy_excluded_seed_file_ids: HashSet<codestory_contracts::graph::NodeId>,
+    previous_dependents_by_seed:
+        HashMap<codestory_contracts::graph::NodeId, HashSet<codestory_contracts::graph::NodeId>>,
+    component_reports: ComponentReportRefreshScope,
+}
+
+fn plan_incremental_semantics(
+    staged: &mut StagedSnapshot,
+    root: &Path,
+    execution_plan: &RefreshExecutionPlan,
+) -> Result<IncrementalSemanticPlan, ApiError> {
+    let mut planned_seed_file_ids = execution_plan
+        .files_to_remove
+        .iter()
+        .copied()
+        .map(codestory_contracts::graph::NodeId)
+        .collect::<HashSet<_>>();
+    let mut previous_indexed_file_ids_by_path = HashMap::new();
+    for path in &execution_plan.files_to_index {
+        let normalized_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        if let Some(file_info) = staged
+            .store_mut()
+            .get_file_by_path(&normalized_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve previous semantic scope for {}: {error}",
+                    normalized_path.display()
+                ))
+            })?
+        {
+            let file_id = codestory_contracts::graph::NodeId(file_info.id);
+            planned_seed_file_ids.insert(file_id);
+            previous_indexed_file_ids_by_path
+                .insert(runtime_relative_path(root, &normalized_path), file_id);
+        }
+    }
+    let previous_dependents_by_seed =
+        semantic_graph_dependent_file_ids_by_seed(staged.store_mut(), &planned_seed_file_ids)?;
+    let existing_file_paths = semantic_file_table_path_map(
+        staged
+            .store_mut()
+            .get_files()
+            .map_err(|error| ApiError::internal(format!("Failed to load files: {error}")))?,
+    );
+    let mut removed_component_keys = HashSet::new();
+    for file_id in &execution_plan.files_to_remove {
+        let path = existing_file_paths
+            .get(&codestory_contracts::graph::NodeId(*file_id))
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "Removed file is missing from staged component scope: {file_id}"
+                ))
+            })?;
+        if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
+            removed_component_keys.insert(component_key);
+        }
+    }
+    Ok(IncrementalSemanticPlan {
+        previous_indexed_file_ids_by_path,
+        policy_excluded_seed_file_ids: HashSet::new(),
+        previous_dependents_by_seed,
+        component_reports: ComponentReportRefreshScope {
+            previous_file_paths: existing_file_paths,
+            removed_component_keys,
+        },
+    })
+}
+
+fn run_incremental_indexer(
+    staged: &mut StagedSnapshot,
+    root: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    source_index_policy: &SourceIndexPolicy,
+    execution_plan: &RefreshExecutionPlan,
+    semantic_plan: &mut IncrementalSemanticPlan,
+    policy_exclusions: &mut Vec<OversizedSourceExclusionCandidate>,
+) -> Result<IncrementalIndexingStats, ApiError> {
+    let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
+    let _ = events_tx.send(AppEventPayload::IndexingStarted {
+        file_count: total_files,
+    });
+    #[cfg(test)]
+    run_incremental_staged_store_hook(staged.store_mut());
+    let bus = EventBus::new();
+    let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+    if let Err(error) = ensure_indexing_active(cancel_token) {
+        drop(bus);
+        let _ = forwarder.join();
+        return Err(error);
+    }
+    let result = V2WorkspaceIndexer::new(root.to_path_buf())
+        .with_source_index_policy(source_index_policy.clone())
+        .run_with_policy_exclusions(staged.store_mut(), execution_plan, &bus, cancel_token);
+    drop(bus);
+    let _ = forwarder.join();
+    let outcome = match result {
+        Ok(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
+        Ok(outcome) => outcome,
+        Err(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
+        Err(error) => return Err(ApiError::internal(format!("Indexing failed: {error}"))),
+    };
+    for exclusion in &outcome.policy_exclusions {
+        if let Some(file_id) = semantic_plan
+            .previous_indexed_file_ids_by_path
+            .get(&exclusion.normalized_path)
+        {
+            semantic_plan.policy_excluded_seed_file_ids.insert(*file_id);
+            if let Some(component_key) = semantic_plan
+                .component_reports
+                .previous_file_paths
+                .get(file_id)
+                .and_then(|path| semantic_component_key_for_path(Some(path)))
+            {
+                semantic_plan
+                    .component_reports
+                    .removed_component_keys
+                    .insert(component_key);
+            }
+        }
+    }
+    policy_exclusions.extend(outcome.policy_exclusions);
+    Ok(outcome.stats)
+}
+
+fn validate_incremental_refresh_coverage(
+    staged: &mut StagedSnapshot,
+    root: &Path,
+) -> Result<(), ApiError> {
+    let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
+        .into_iter()
+        .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
+        .collect::<Vec<_>>();
+    if blocking_gaps.is_empty() {
+        return Ok(());
+    }
+    let count = blocking_gaps.len();
+    let sample = blocking_gaps
+        .iter()
+        .take(3)
+        .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ApiError::source_coverage_failure(
+        source_coverage_failure_code(&blocking_gaps),
+        format!(
+            "Incremental refresh could not verify {count} scheduled file(s): {sample}. The previous complete publication was preserved."
+        ),
+        blocking_gaps,
+    ))
+}
+
+fn incremental_semantic_refresh_scope(
+    staged: &mut StagedSnapshot,
+    root: &Path,
+    execution_plan: &RefreshExecutionPlan,
+    semantic_plan: &IncrementalSemanticPlan,
+) -> Result<HashSet<codestory_contracts::graph::NodeId>, ApiError> {
+    let mut refresh_seed_file_ids = HashSet::new();
+    for path in &execution_plan.files_to_index {
+        let normalized_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        let file_info = staged
+            .store_mut()
+            .get_file_by_path(&normalized_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve indexed semantic scope for {}: {error}",
+                    normalized_path.display()
+                ))
+            })?;
+        if let Some(file_info) = file_info
+            && file_info.complete
+        {
+            refresh_seed_file_ids.insert(codestory_contracts::graph::NodeId(file_info.id));
+        }
+    }
+    refresh_seed_file_ids.extend(
+        execution_plan
+            .files_to_remove
+            .iter()
+            .copied()
+            .map(codestory_contracts::graph::NodeId),
+    );
+    refresh_seed_file_ids.extend(&semantic_plan.policy_excluded_seed_file_ids);
+    let current_dependents_by_seed =
+        semantic_graph_dependent_file_ids_by_seed(staged.store_mut(), &refresh_seed_file_ids)?;
+    let mut refresh_scope = refresh_seed_file_ids.clone();
+    for seed_file_id in &refresh_seed_file_ids {
+        if let Some(file_ids) = semantic_plan.previous_dependents_by_seed.get(seed_file_id) {
+            refresh_scope.extend(file_ids);
+        }
+        if let Some(file_ids) = current_dependents_by_seed.get(seed_file_id) {
+            refresh_scope.extend(file_ids);
+        }
+    }
+    Ok(refresh_scope)
+}
+
+struct PreparedIncrementalRefresh {
+    staged: StagedSnapshot,
+    publication: IndexPublicationRecord,
+    stats: IncrementalIndexingStats,
+    finalize_stats: StagedSnapshotFinalizeStats,
+    detail_snapshot_ms: u32,
+    semantic_stats: SemanticProjectionStats,
+    semantic_refresh_scope: HashSet<codestory_contracts::graph::NodeId>,
+    policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
+}
+
+fn prepare_incremental_refresh(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
-) -> Result<IndexingRunSummary, ApiError> {
+) -> Result<PreparedIncrementalRefresh, ApiError> {
     ensure_incremental_refresh_compatible(root, storage_path)?;
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
-
-    let mut staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
+    ensure_indexing_active(cancel_token)?;
+    let staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|error| {
         ApiError::internal(format!(
-            "Failed to clone live storage for incremental build: {e}"
+            "Failed to clone live storage for incremental build: {error}"
         ))
     })?;
-    let previous_publication = match staged.store_mut().get_index_publication() {
-        Ok(publication) => publication,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(ApiError::internal(format!(
+    let mut preparation = StagedPreparation::new(staged);
+    let previous_publication = preparation
+        .staged_mut()
+        .store_mut()
+        .get_index_publication()
+        .map_err(|error| {
+            ApiError::internal(format!(
                 "Failed to read staged publication identity: {error}"
-            )));
-        }
-    };
-    let rebuild_complete_dense_anchor_set = staged
+            ))
+        })?;
+    let rebuild_complete_dense_anchor_set = preparation
+        .staged_mut()
         .store_mut()
         .get_dense_anchor_publication_manifest()
         .map_err(|error| {
@@ -5380,306 +5653,122 @@ fn run_incremental_indexing_common(
             ))
         })?
         .is_none();
-    let publication_run_id = Uuid::new_v4().to_string();
     let publication = next_index_publication(
         previous_publication.as_ref(),
         IndexPublicationMode::Incremental,
-        &publication_run_id,
+        &Uuid::new_v4().to_string(),
     )?;
-    let dense_anchor_source_identity =
-        format!("core:{}:{}", publication.generation_id, publication.run_id);
-    let staged_result = (|| {
-        staged.store_mut().begin_incremental_run().map_err(|e| {
+    let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
+    preparation
+        .staged_mut()
+        .store_mut()
+        .begin_incremental_run()
+        .map_err(|error| {
             ApiError::internal(format!(
-                "Failed to persist staged incomplete index marker: {e}"
+                "Failed to persist staged incomplete index marker: {error}"
             ))
         })?;
-        staged
-            .store_mut()
-            .invalidate_grounding_snapshots()
-            .map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to invalidate staged derived index snapshots: {e}"
-                ))
-            })?;
-
-        let workspace = runtime_workspace_manifest(root, storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
-        let policy_refresh = workspace
-            .build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
-            .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))?;
-        if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
-            let reason = if policy_refresh.refresh.inventory_outcome
-                == WorkspaceInventoryOutcome::Unreadable
-            {
-                FileCoverageReason::Unreadable
-            } else {
-                FileCoverageReason::DiscoveryIncomplete
-            };
-            let mut gaps = policy_refresh
-                .refresh
-                .inventory_issues
-                .iter()
-                .map(|issue| FileCoverageDiagnosticDto {
-                    path: runtime_relative_path(root, &issue.path),
-                    reason,
-                    retryable: file_coverage_retryable(reason),
-                    verified_source: false,
-                    projection_available: false,
-                })
-                .collect::<Vec<_>>();
-            if gaps.is_empty() {
-                gaps.push(FileCoverageDiagnosticDto {
-                    path: ".".into(),
-                    reason,
-                    retryable: file_coverage_retryable(reason),
-                    verified_source: false,
-                    projection_available: false,
-                });
-            }
-            return Err(ApiError::source_coverage_failure(
-                source_coverage_failure_code(&gaps),
-                format!(
-                    "Incremental refresh requires a complete source inventory; discovery was {:?}.",
-                    policy_refresh.refresh.inventory_outcome
-                ),
-                gaps,
-            ));
-        }
-        let execution_plan = policy_refresh.refresh.plan;
-        let mut policy_exclusions = policy_refresh.policy_exclusions;
-        let mut planned_semantic_seed_file_ids = execution_plan
-            .files_to_remove
-            .iter()
-            .copied()
-            .map(codestory_contracts::graph::NodeId)
-            .collect::<HashSet<_>>();
-        let mut previous_indexed_file_ids_by_path = HashMap::new();
-        let mut policy_excluded_semantic_seed_file_ids = HashSet::new();
-        for path in &execution_plan.files_to_index {
-            let normalized_path = if path.is_absolute() {
-                path.clone()
-            } else {
-                root.join(path)
-            };
-            if let Some(file_info) = staged
-                .store_mut()
-                .get_file_by_path(&normalized_path)
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "Failed to resolve previous semantic scope for {}: {error}",
-                        normalized_path.display()
-                    ))
-                })?
-            {
-                let file_id = codestory_contracts::graph::NodeId(file_info.id);
-                planned_semantic_seed_file_ids.insert(file_id);
-                previous_indexed_file_ids_by_path
-                    .insert(runtime_relative_path(root, &normalized_path), file_id);
-            }
-        }
-        let previous_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
-            staged.store_mut(),
-            &planned_semantic_seed_file_ids,
-        )?;
-        let existing_file_paths = semantic_file_table_path_map(
-            staged
-                .store_mut()
-                .get_files()
-                .map_err(|error| ApiError::internal(format!("Failed to load files: {error}")))?,
-        );
-        let mut removed_component_keys = HashSet::new();
-        for file_id in &execution_plan.files_to_remove {
-            let path = existing_file_paths
-                .get(&codestory_contracts::graph::NodeId(*file_id))
-                .ok_or_else(|| {
-                    ApiError::internal(format!(
-                        "Removed file is missing from staged component scope: {file_id}"
-                    ))
-                })?;
-            if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
-                removed_component_keys.insert(component_key);
-            }
-        }
-        let mut component_report_refresh = ComponentReportRefreshScope {
-            previous_file_paths: existing_file_paths,
-            removed_component_keys,
-        };
-
-        let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
-        let _ = events_tx.send(AppEventPayload::IndexingStarted {
-            file_count: total_files,
-        });
-
-        #[cfg(test)]
-        run_incremental_staged_store_hook(staged.store_mut());
-        let bus = EventBus::new();
-        let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
-        if is_indexing_cancelled(cancel_token) {
-            drop(bus);
-            let _ = forwarder.join();
-            return Err(indexing_cancelled_error());
-        }
-        let indexer = V2WorkspaceIndexer::new(root.to_path_buf())
-            .with_source_index_policy(source_index_policy.clone());
-        let result = indexer.run_with_policy_exclusions(
-            staged.store_mut(),
-            &execution_plan,
-            &bus,
-            cancel_token,
-        );
-
-        // Drop bus so forwarder unblocks.
-        drop(bus);
-        let _ = forwarder.join();
-
-        let index_stats = match result {
-            Ok(_) if is_indexing_cancelled(cancel_token) => {
-                return Err(indexing_cancelled_error());
-            }
-            Ok(outcome) => {
-                for exclusion in &outcome.policy_exclusions {
-                    if let Some(file_id) =
-                        previous_indexed_file_ids_by_path.get(&exclusion.normalized_path)
-                    {
-                        policy_excluded_semantic_seed_file_ids.insert(*file_id);
-                        if let Some(component_key) = component_report_refresh
-                            .previous_file_paths
-                            .get(file_id)
-                            .and_then(|path| semantic_component_key_for_path(Some(path)))
-                        {
-                            component_report_refresh
-                                .removed_component_keys
-                                .insert(component_key);
-                        }
-                    }
-                }
-                policy_exclusions.extend(outcome.policy_exclusions);
-                outcome.stats
-            }
-            Err(_) if is_indexing_cancelled(cancel_token) => {
-                return Err(indexing_cancelled_error());
-            }
-            Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
-        };
-        let blocking_gaps = stored_file_coverage_diagnostics(root, staged.store_mut())?
-            .into_iter()
-            .filter(|entry| entry.reason != FileCoverageReason::ParserPartial)
-            .collect::<Vec<_>>();
-        if !blocking_gaps.is_empty() {
-            let count = blocking_gaps.len();
-            let sample = blocking_gaps
-                .iter()
-                .take(3)
-                .map(|entry| format!("{} ({})", entry.path, entry.reason.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ApiError::source_coverage_failure(
-                source_coverage_failure_code(&blocking_gaps),
-                format!(
-                    "Incremental refresh could not verify {count} scheduled file(s): {sample}. The previous complete publication was preserved."
-                ),
-                blocking_gaps,
-            ));
-        }
-        let mut semantic_refresh_seed_file_ids = HashSet::new();
-        for path in &execution_plan.files_to_index {
-            let normalized_path = if path.is_absolute() {
-                path.clone()
-            } else {
-                root.join(path)
-            };
-            let file_info = staged
-                .store_mut()
-                .get_file_by_path(&normalized_path)
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "Failed to resolve indexed semantic scope for {}: {error}",
-                        normalized_path.display()
-                    ))
-                })?;
-            // Workspace refresh plans include discovered files that have no graph
-            // collector, while incomplete reads preserve the last verified graph.
-            // Only complete files can prove that their semantic projection changed.
-            if let Some(file_info) = file_info
-                && file_info.complete
-            {
-                semantic_refresh_seed_file_ids
-                    .insert(codestory_contracts::graph::NodeId(file_info.id));
-            }
-        }
-        semantic_refresh_seed_file_ids.extend(
-            execution_plan
-                .files_to_remove
-                .iter()
-                .copied()
-                .map(codestory_contracts::graph::NodeId),
-        );
-        semantic_refresh_seed_file_ids.extend(policy_excluded_semantic_seed_file_ids);
-        let current_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
-            staged.store_mut(),
-            &semantic_refresh_seed_file_ids,
-        )?;
-        let mut llm_refresh_scope = semantic_refresh_seed_file_ids.clone();
-        for seed_file_id in &semantic_refresh_seed_file_ids {
-            if let Some(file_ids) = previous_semantic_dependents_by_seed.get(seed_file_id) {
-                llm_refresh_scope.extend(file_ids.iter().copied());
-            }
-            if let Some(file_ids) = current_semantic_dependents_by_seed.get(seed_file_id) {
-                llm_refresh_scope.extend(file_ids.iter().copied());
-            }
-        }
-        let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
-            staged.store_mut(),
-            (!rebuild_complete_dense_anchor_set).then_some(&llm_refresh_scope),
-            (!rebuild_complete_dense_anchor_set).then_some(&component_report_refresh),
-            &dense_anchor_source_identity,
-            cancel_token,
-            runtime,
-            SemanticProjectionDocumentSource::SourceFiles,
-        )?;
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
+    preparation
+        .staged_mut()
+        .store_mut()
+        .invalidate_grounding_snapshots()
+        .map_err(|error| {
             ApiError::internal(format!(
-                "Failed to finalize staged incremental storage: {e}"
+                "Failed to invalidate staged derived index snapshots: {error}"
             ))
         })?;
-        let detail_started = Instant::now();
-        staged.snapshots().refresh_detail().map_err(|e| {
+    let (execution_plan, mut policy_exclusions) = incremental_execution_plan(
+        preparation.staged_mut(),
+        root,
+        storage_path,
+        source_index_policy,
+    )?;
+    let mut semantic_plan =
+        plan_incremental_semantics(preparation.staged_mut(), root, &execution_plan)?;
+    let stats = run_incremental_indexer(
+        preparation.staged_mut(),
+        root,
+        events_tx,
+        cancel_token,
+        source_index_policy,
+        &execution_plan,
+        &mut semantic_plan,
+        &mut policy_exclusions,
+    )?;
+    validate_incremental_refresh_coverage(preparation.staged_mut(), root)?;
+    let semantic_refresh_scope = incremental_semantic_refresh_scope(
+        preparation.staged_mut(),
+        root,
+        &execution_plan,
+        &semantic_plan,
+    )?;
+    let semantic_stats = finalize_staged_semantic_docs_for_runtime(
+        preparation.staged_mut().store_mut(),
+        (!rebuild_complete_dense_anchor_set).then_some(&semantic_refresh_scope),
+        (!rebuild_complete_dense_anchor_set).then_some(&semantic_plan.component_reports),
+        &source_identity,
+        cancel_token,
+        runtime,
+        SemanticProjectionDocumentSource::SourceFiles,
+    )?;
+    ensure_indexing_active(cancel_token)?;
+    let finalize_stats = preparation
+        .staged_mut()
+        .snapshots()
+        .finalize_staged()
+        .map_err(|error| {
             ApiError::internal(format!(
-                "Failed to refresh staged grounding detail snapshot: {e}"
+                "Failed to finalize staged incremental storage: {error}"
             ))
         })?;
-        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
-        }
-        Ok((
-            index_stats,
-            staged_finalize_stats,
-            detail_snapshot_ms,
-            llm_refresh_scope,
-            staged_semantic_stats,
-            policy_exclusions,
-        ))
-    })();
-    let (
-        index_stats,
-        staged_finalize_stats,
-        detail_snapshot_ms,
-        llm_refresh_scope,
-        staged_semantic_stats,
+    let detail_started = Instant::now();
+    preparation
+        .staged_mut()
+        .snapshots()
+        .refresh_detail()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to refresh staged grounding detail snapshot: {error}"
+            ))
+        })?;
+    ensure_indexing_active(cancel_token)?;
+    Ok(PreparedIncrementalRefresh {
+        staged: preparation.release(),
+        publication,
+        stats,
+        finalize_stats,
+        detail_snapshot_ms: clamp_u128_to_u32(detail_started.elapsed().as_millis()),
+        semantic_stats,
+        semantic_refresh_scope,
         policy_exclusions,
-    ) = match staged_result {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
+    })
+}
+
+fn run_incremental_indexing_common(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+) -> Result<IndexingRunSummary, ApiError> {
+    let PreparedIncrementalRefresh {
+        mut staged,
+        publication,
+        stats: index_stats,
+        finalize_stats: staged_finalize_stats,
+        detail_snapshot_ms,
+        semantic_stats: staged_semantic_stats,
+        semantic_refresh_scope: llm_refresh_scope,
+        policy_exclusions,
+    } = prepare_incremental_refresh(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        runtime,
+        source_index_policy,
+    )?;
     let workspace = match runtime_workspace_manifest(root, storage_path) {
         Ok(workspace) => workspace,
         Err(error) => {
