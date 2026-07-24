@@ -81,7 +81,6 @@ pub(in crate::embedding_qualification::worker) fn run_queue_load(
                         class,
                         ordinal,
                         correlation_id,
-                        measured_input: None,
                         submitted_tx,
                     })
                 })?;
@@ -155,7 +154,6 @@ struct QueueOperation {
     class: &'static str,
     ordinal: u32,
     correlation_id: String,
-    measured_input: Option<String>,
     submitted_tx: std::sync::mpsc::SyncSender<u64>,
 }
 
@@ -168,7 +166,6 @@ fn run_queue_operation(operation: QueueOperation) -> Result<WorkerQueueOperation
         class,
         ordinal,
         correlation_id,
-        measured_input,
         submitted_tx,
     } = operation;
     let mut stream = match transport.connect(Duration::from_secs(2))? {
@@ -219,18 +216,14 @@ fn run_queue_operation(operation: QueueOperation) -> Result<WorkerQueueOperation
             deadline_ms,
             retry_after_ms: 100,
             cancel_token: None,
-            input: measured_input
-                .clone()
-                .unwrap_or_else(|| format!("qualification-queue-{ordinal}")),
+            input: format!("qualification-queue-{ordinal}"),
         },
         "bulk" => EmbeddingOperation::EmbedDocuments {
             scope_id,
             deadline_ms,
             retry_after_ms: 100,
             cancel_token: None,
-            inputs: vec![
-                measured_input.unwrap_or_else(|| format!("qualification-queue-{ordinal}")),
-            ],
+            inputs: vec![format!("qualification-queue-{ordinal}")],
         },
         _ => bail!("embedding_qualification_queue_class_invalid"),
     };
