@@ -90,12 +90,11 @@ use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{packet_step_trace_json, plan_packet};
 use index_commit::*;
 pub(crate) use index_coverage::{
-    current_epoch_ms, file_coverage_detail, file_coverage_reason, file_coverage_retryable,
-    full_refresh_execution_plan_with_coverage, indexed_file_role, normalize_path_key,
-    path_role_from_key, publish_source_policy_exclusions, revalidate_source_policy_exclusions,
-    runtime_relative_path, source_coverage_failure_code, source_policy_exclusion_candidate,
-    stored_file_coverage_diagnostics, validate_source_policy_exclusions,
-    validate_structural_text_units,
+    current_epoch_ms, file_coverage_retryable, full_refresh_execution_plan_with_coverage,
+    indexed_file_role, normalize_path_key, path_role_from_key, publish_source_policy_exclusions,
+    revalidate_source_policy_exclusions, runtime_relative_path, source_coverage_failure_code,
+    source_policy_exclusion_candidate, stored_file_coverage_diagnostics,
+    validate_source_policy_exclusions, validate_structural_text_units,
 };
 use index_freshness::{
     CachedIndexFreshness, index_freshness_observation_from_storage_with_identities,

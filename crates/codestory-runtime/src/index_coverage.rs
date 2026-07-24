@@ -1,5 +1,13 @@
 use crate::symbol_query::{RetrievalFileRole, retrieval_file_role_from_path};
-use codestory_contracts::api::{ApiError, FileCoverageDiagnosticDto, IndexedFileRoleDto};
+use crate::{
+    route_coverage::framework_route_coverage_matrix,
+    search_intent::indexed_file_matches_language_filter,
+};
+use codestory_contracts::api::{
+    ApiError, FileCoverageDiagnosticDto, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
+    IndexedFilesSummaryDto, SourcePolicyExclusionDto,
+};
 use codestory_contracts::graph::FileCoverageReason;
 use codestory_store::{
     FileInfo, IndexPublicationRecord, SourcePolicyExclusionPolicyIdentity,
@@ -9,7 +17,7 @@ use codestory_workspace::{
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshMode, SourceIndexPolicy,
     WorkspaceInventoryOutcome, WorkspaceManifest, project_identity_v3,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,7 +46,7 @@ pub(crate) fn indexed_file_role(path: &Path) -> IndexedFileRoleDto {
     path_role_from_key(&normalize_path_key(&path.to_string_lossy()))
 }
 
-pub(crate) fn file_coverage_reason(
+fn file_coverage_reason(
     file: &FileInfo,
     errors_by_file: &HashMap<i64, Vec<FileCoverageReason>>,
     has_verified_content: bool,
@@ -68,7 +76,7 @@ pub(crate) fn file_coverage_retryable(reason: FileCoverageReason) -> bool {
     )
 }
 
-pub(crate) fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
+fn file_coverage_detail(reason: FileCoverageReason) -> &'static str {
     match reason {
         FileCoverageReason::ParserPartial => {
             "stable verified source published with partial parser coverage"
@@ -372,4 +380,318 @@ pub(crate) fn path_role_from_key(path: &str) -> IndexedFileRoleDto {
             IndexedFileRoleDto::Source
         }
     }
+}
+
+struct IndexedFilesInventory {
+    files: Vec<FileInfo>,
+    source_policy_exclusions: Vec<SourcePolicyExclusionRecord>,
+    errors_by_file: HashMap<i64, u32>,
+    coverage_reasons_by_file: HashMap<i64, Vec<FileCoverageReason>>,
+    verified_file_ids: HashSet<i64>,
+}
+
+impl IndexedFilesInventory {
+    fn load(
+        storage: &Store,
+        root: &Path,
+        source_index_policy: &SourceIndexPolicy,
+    ) -> Result<Self, ApiError> {
+        let publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read source policy exclusion publication identity: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "source_verification_failed",
+                    "Indexed-file coverage requires a complete core publication.",
+                )
+            })?;
+        validate_source_policy_exclusions(storage, root, &publication, source_index_policy)?;
+        validate_structural_text_units(storage, &publication)?;
+
+        let source_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
+            ApiError::internal(format!("Failed to load source policy exclusions: {error}"))
+        })?;
+        let mut files = storage.get_files().map_err(|error| {
+            ApiError::internal(format!("Failed to load indexed files: {error}"))
+        })?;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let verified_file_ids = storage
+            .files()
+            .inventory()
+            .map_err(|error| ApiError::internal(format!("Failed to load file inventory: {error}")))?
+            .into_iter()
+            .filter_map(|file| file.content_hash.map(|_| file.id))
+            .collect::<HashSet<_>>();
+        let errors = storage
+            .get_errors(None)
+            .map_err(|error| ApiError::internal(format!("Failed to load index errors: {error}")))?;
+        let mut errors_by_file = HashMap::<i64, u32>::new();
+        let mut coverage_reasons_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
+        for error in errors {
+            let Some(file_id) = error.file_id else {
+                continue;
+            };
+            *errors_by_file.entry(file_id.0).or_default() += 1;
+            coverage_reasons_by_file.entry(file_id.0).or_default().push(
+                error
+                    .coverage_reason
+                    .unwrap_or(FileCoverageReason::CollectorFailure),
+            );
+        }
+
+        Ok(Self {
+            files,
+            source_policy_exclusions,
+            errors_by_file,
+            coverage_reasons_by_file,
+            verified_file_ids,
+        })
+    }
+}
+
+struct IndexedFilesAggregation {
+    indexed_file_count: u32,
+    incomplete_file_count: u32,
+    error_file_count: u32,
+    language_counts: Vec<IndexedFileLanguageCountDto>,
+    incomplete_reason_counts: Vec<IndexedFileIncompleteReasonCountDto>,
+    coverage_gaps: Vec<FileCoverageDiagnosticDto>,
+}
+
+impl IndexedFilesAggregation {
+    fn from_inventory(root: &Path, inventory: &IndexedFilesInventory) -> Self {
+        let mut language_counts = BTreeMap::<String, u32>::new();
+        let mut incomplete_reason_counts = BTreeMap::<String, (u32, String)>::new();
+        let mut indexed_file_count = 0_u32;
+        let mut incomplete_file_count = 0_u32;
+        let mut error_file_count = 0_u32;
+
+        for file in &inventory.files {
+            *language_counts.entry(file.language.clone()).or_default() += 1;
+            indexed_file_count += u32::from(file.indexed);
+            incomplete_file_count += u32::from(!file.complete);
+            error_file_count += u32::from(inventory.errors_by_file.contains_key(&file.id));
+            if let Some(reason) = file_coverage_reason(
+                file,
+                &inventory.coverage_reasons_by_file,
+                inventory.verified_file_ids.contains(&file.id),
+            ) {
+                let entry = incomplete_reason_counts
+                    .entry(reason.as_str().to_string())
+                    .or_insert_with(|| (0, file_coverage_detail(reason).to_string()));
+                entry.0 += 1;
+            }
+        }
+
+        let coverage_gaps = inventory
+            .files
+            .iter()
+            .filter_map(|file| {
+                let verified_source = inventory.verified_file_ids.contains(&file.id);
+                file_coverage_reason(file, &inventory.coverage_reasons_by_file, verified_source)
+                    .map(|reason| FileCoverageDiagnosticDto {
+                        path: runtime_relative_path(root, &file.path),
+                        reason,
+                        retryable: file_coverage_retryable(reason),
+                        verified_source,
+                        projection_available: file.indexed && verified_source,
+                    })
+            })
+            .collect();
+        let language_counts = language_counts
+            .into_iter()
+            .map(|(language, file_count)| {
+                let support =
+                    crate::route_coverage::language_support_summary_for_language(&language);
+                IndexedFileLanguageCountDto {
+                    language,
+                    file_count,
+                    support_mode: support.support_mode,
+                    evidence_tier: support.evidence_tier,
+                    claim_label: support.claim_label,
+                }
+            })
+            .collect();
+        let incomplete_reason_counts = incomplete_reason_counts
+            .into_iter()
+            .map(
+                |(reason, (file_count, detail))| IndexedFileIncompleteReasonCountDto {
+                    reason,
+                    file_count,
+                    detail,
+                },
+            )
+            .collect();
+
+        Self {
+            indexed_file_count,
+            incomplete_file_count,
+            error_file_count,
+            language_counts,
+            incomplete_reason_counts,
+            coverage_gaps,
+        }
+    }
+}
+
+struct IndexedFilesSelection {
+    filtered_file_count: u32,
+    visible_file_count: u32,
+    policy_exclusion_count: u32,
+    truncated: bool,
+    files: Vec<IndexedFileDto>,
+    policy_exclusions: Vec<SourcePolicyExclusionDto>,
+}
+
+impl IndexedFilesSelection {
+    fn from_inventory(
+        root: &Path,
+        inventory: IndexedFilesInventory,
+        req: IndexedFilesRequest,
+    ) -> Self {
+        let path_filter = req.path_contains.as_deref().map(normalize_path_key);
+        let language_filter = req.language.as_deref().map(str::to_ascii_lowercase);
+        let policy_exclusion_count = inventory
+            .source_policy_exclusions
+            .len()
+            .min(u32::MAX as usize) as u32;
+        let mut policy_exclusions = inventory
+            .source_policy_exclusions
+            .into_iter()
+            .filter(|entry| {
+                let normalized_path = normalize_path_key(&entry.normalized_path);
+                let role = path_role_from_key(&normalized_path);
+                req.role.is_none_or(|requested| requested == role)
+                    && path_filter
+                        .as_deref()
+                        .is_none_or(|needle| normalized_path.contains(needle))
+                    && language_filter.as_deref().is_none_or(|language| {
+                        indexed_file_matches_language_filter(
+                            "unknown",
+                            Path::new(&entry.normalized_path),
+                            language,
+                        )
+                    })
+            })
+            .map(|entry| SourcePolicyExclusionDto {
+                role: path_role_from_key(&normalize_path_key(&entry.normalized_path)),
+                path: entry.normalized_path,
+                content_hash: entry.content_hash,
+                observed_size: entry.observed_size,
+                observed_unit_count: entry.observed_unit_count,
+                policy_version: entry.policy_version,
+                byte_cap: entry.byte_cap,
+                structural_unit_cap: entry.structural_unit_cap,
+                project_id: entry.project_id,
+                workspace_id: entry.workspace_id,
+                core_generation_id: entry.core_generation_id,
+                core_run_id: entry.core_run_id,
+                graph_coverage: false,
+                semantic_coverage: false,
+            })
+            .collect::<Vec<_>>();
+        policy_exclusions.truncate(5_000);
+
+        let mut files = inventory
+            .files
+            .into_iter()
+            .filter(|file| {
+                let role = indexed_file_role(&file.path);
+                req.role.is_none_or(|requested| requested == role)
+                    && path_filter.as_deref().is_none_or(|needle| {
+                        normalize_path_key(&runtime_relative_path(root, &file.path))
+                            .contains(needle)
+                    })
+                    && language_filter.as_deref().is_none_or(|language| {
+                        indexed_file_matches_language_filter(&file.language, &file.path, language)
+                    })
+            })
+            .map(|file| IndexedFileDto {
+                path: runtime_relative_path(root, &file.path),
+                language: file.language,
+                indexed: file.indexed,
+                complete: file.complete,
+                line_count: file.line_count,
+                role: indexed_file_role(&file.path),
+                error_count: inventory
+                    .errors_by_file
+                    .get(&file.id)
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        let limit = req.limit.unwrap_or(500).clamp(1, 5000) as usize;
+        let filtered_file_count = files.len().min(u32::MAX as usize) as u32;
+        let truncated = files.len() > limit;
+        files.truncate(limit);
+        let visible_file_count = files.len().min(u32::MAX as usize) as u32;
+
+        Self {
+            filtered_file_count,
+            visible_file_count,
+            policy_exclusion_count,
+            truncated,
+            files,
+            policy_exclusions,
+        }
+    }
+}
+
+pub(crate) fn indexed_files_from_storage(
+    root: &Path,
+    storage: &Store,
+    source_index_policy: &SourceIndexPolicy,
+    req: IndexedFilesRequest,
+) -> Result<IndexedFilesDto, ApiError> {
+    let inventory = IndexedFilesInventory::load(storage, root, source_index_policy)?;
+    let aggregation = IndexedFilesAggregation::from_inventory(root, &inventory);
+    let selection = IndexedFilesSelection::from_inventory(root, inventory, req);
+    let file_count = aggregation
+        .language_counts
+        .iter()
+        .map(|entry| entry.file_count)
+        .sum();
+
+    let mut coverage_notes =
+        if aggregation.incomplete_file_count > 0 || aggregation.error_file_count > 0 {
+            vec![format!(
+                "index usable with {} incomplete files and {} files carrying index errors",
+                aggregation.incomplete_file_count, aggregation.error_file_count
+            )]
+        } else {
+            vec!["index usable; no file-level index errors recorded".to_string()]
+        };
+    if selection.policy_exclusion_count > 0 {
+        coverage_notes.push(format!(
+            "{} verified source policy exclusions have no parser-backed graph or semantic coverage",
+            selection.policy_exclusion_count
+        ));
+    }
+
+    Ok(IndexedFilesDto {
+        project_root: root.to_string_lossy().to_string(),
+        usable: aggregation.indexed_file_count > 0,
+        summary: IndexedFilesSummaryDto {
+            file_count,
+            indexed_file_count: aggregation.indexed_file_count,
+            filtered_file_count: selection.filtered_file_count,
+            visible_file_count: selection.visible_file_count,
+            incomplete_file_count: aggregation.incomplete_file_count,
+            error_file_count: aggregation.error_file_count,
+            policy_exclusion_count: selection.policy_exclusion_count,
+            incomplete_reason_counts: aggregation.incomplete_reason_counts,
+            truncated: selection.truncated,
+            language_counts: aggregation.language_counts,
+            framework_route_coverage: framework_route_coverage_matrix(),
+            coverage_notes,
+        },
+        coverage_gaps: aggregation.coverage_gaps,
+        policy_exclusions: selection.policy_exclusions,
+        files: selection.files,
+    })
 }

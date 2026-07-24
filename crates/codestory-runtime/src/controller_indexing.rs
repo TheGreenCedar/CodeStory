@@ -1,4 +1,5 @@
 use crate::index_commit::{IndexWriterGuard, index_publication_dto};
+use crate::index_coverage::indexed_files_from_storage;
 use crate::index_freshness::{
     CachedIndexFreshness, index_freshness_cache_ttl_secs, index_freshness_from_storage_with_policy,
     open_storage_for_read, storage_fingerprint, workspace_member_index_summaries,
@@ -14,10 +15,6 @@ use crate::publication::{
     PublicationTestBoundary, publication_test_checkpoint,
     run_activation_search_before_revalidate_hook,
 };
-use crate::route_coverage::{
-    framework_route_coverage_matrix, language_support_summary_for_language,
-};
-use crate::search_intent::indexed_file_matches_language_filter;
 use crate::search_publication::{
     load_persisted_search_state_for_runtime, retrieval_state_from_storage_for_runtime,
 };
@@ -33,24 +30,19 @@ use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::support::{clamp_i64_to_u32, clamp_u128_to_u32};
 use crate::workspace_state::runtime_workspace_manifest;
 use crate::{
-    AppController, Storage, clear_search_engine, current_epoch_ms, file_coverage_detail,
-    file_coverage_reason, file_coverage_retryable, full_refresh_execution_plan_with_coverage,
-    indexed_file_role, no_project_error, normalize_path_key, path_role_from_key,
-    publish_search_engine, runtime_relative_path, validate_source_policy_exclusions,
-    validate_structural_text_units,
+    AppController, Storage, clear_search_engine, current_epoch_ms,
+    full_refresh_execution_plan_with_coverage, no_project_error, publish_search_engine,
+    runtime_relative_path, validate_source_policy_exclusions,
 };
 use codestory_contracts::api::{
-    ApiError, AppEventPayload, FileCoverageDiagnosticDto, IndexDryRunDto, IndexFreshnessDto,
-    IndexMode, IndexPublicationDto, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
-    IndexedFileLanguageCountDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
-    IndexingPhaseTimings, OpenProjectRequest, ProjectSummary, SourcePolicyExclusionDto,
+    ApiError, AppEventPayload, IndexDryRunDto, IndexFreshnessDto, IndexMode, IndexPublicationDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, OpenProjectRequest, ProjectSummary,
     StartIndexingRequest, StorageStatsDto, SummaryGenerationDto,
 };
-use codestory_contracts::graph::FileCoverageReason;
 use codestory_indexer::CancellationToken;
 use codestory_store::{CURRENT_SCHEMA_VERSION, IndexPublicationRecord, Store, SymbolSummaryRecord};
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1028,222 +1020,7 @@ impl AppController {
         self.ensure_consistent_read_state("Files")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
-        let publication = storage
-            .get_complete_index_publication()
-            .map_err(|error| {
-                ApiError::internal(format!(
-                    "Failed to read source policy exclusion publication identity: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                ApiError::new(
-                    "source_verification_failed",
-                    "Indexed-file coverage requires a complete core publication.",
-                )
-            })?;
-        validate_source_policy_exclusions(
-            &storage,
-            &root,
-            &publication,
-            &self.source_index_policy,
-        )?;
-        validate_structural_text_units(&storage, &publication)?;
-        let source_policy_exclusions = storage.get_source_policy_exclusions().map_err(|error| {
-            ApiError::internal(format!("Failed to load source policy exclusions: {error}"))
-        })?;
-        let mut files = storage
-            .get_files()
-            .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-
-        let errors = storage
-            .get_errors(None)
-            .map_err(|e| ApiError::internal(format!("Failed to load index errors: {e}")))?;
-        let verified_file_ids = storage
-            .files()
-            .inventory()
-            .map_err(|e| ApiError::internal(format!("Failed to load file inventory: {e}")))?
-            .into_iter()
-            .filter_map(|file| file.content_hash.map(|_| file.id))
-            .collect::<HashSet<_>>();
-        let mut errors_by_file = HashMap::<i64, u32>::new();
-        let mut coverage_reasons_by_file = HashMap::<i64, Vec<FileCoverageReason>>::new();
-        for error in errors {
-            if let Some(file_id) = error.file_id {
-                *errors_by_file.entry(file_id.0).or_default() += 1;
-                coverage_reasons_by_file.entry(file_id.0).or_default().push(
-                    error
-                        .coverage_reason
-                        .unwrap_or(FileCoverageReason::CollectorFailure),
-                );
-            }
-        }
-
-        let mut language_counts = BTreeMap::<String, u32>::new();
-        let mut incomplete_reason_counts = BTreeMap::<String, (u32, String)>::new();
-        let mut indexed_file_count = 0_u32;
-        let mut incomplete_file_count = 0_u32;
-        let mut error_file_count = 0_u32;
-        for file in &files {
-            *language_counts.entry(file.language.clone()).or_default() += 1;
-            indexed_file_count += u32::from(file.indexed);
-            incomplete_file_count += u32::from(!file.complete);
-            error_file_count += u32::from(errors_by_file.contains_key(&file.id));
-            if let Some(reason) = file_coverage_reason(
-                file,
-                &coverage_reasons_by_file,
-                verified_file_ids.contains(&file.id),
-            ) {
-                let entry = incomplete_reason_counts
-                    .entry(reason.as_str().to_string())
-                    .or_insert_with(|| (0, file_coverage_detail(reason).to_string()));
-                entry.0 += 1;
-            }
-        }
-        let coverage_gaps = files
-            .iter()
-            .filter_map(|file| {
-                let verified_source = verified_file_ids.contains(&file.id);
-                file_coverage_reason(file, &coverage_reasons_by_file, verified_source).map(
-                    |reason| FileCoverageDiagnosticDto {
-                        path: runtime_relative_path(&root, &file.path),
-                        reason,
-                        retryable: file_coverage_retryable(reason),
-                        verified_source,
-                        projection_available: file.indexed && verified_source,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let path_filter = req.path_contains.as_deref().map(normalize_path_key);
-        let language_filter = req.language.as_deref().map(str::to_ascii_lowercase);
-        let policy_exclusion_count = source_policy_exclusions.len().min(u32::MAX as usize) as u32;
-        let mut policy_exclusions = source_policy_exclusions
-            .into_iter()
-            .filter(|entry| {
-                let role = path_role_from_key(&normalize_path_key(&entry.normalized_path));
-                req.role.is_none_or(|requested| requested == role)
-                    && path_filter.as_deref().is_none_or(|needle| {
-                        normalize_path_key(&entry.normalized_path).contains(needle)
-                    })
-                    && language_filter.as_deref().is_none_or(|language| {
-                        indexed_file_matches_language_filter(
-                            "unknown",
-                            Path::new(&entry.normalized_path),
-                            language,
-                        )
-                    })
-            })
-            .map(|entry| SourcePolicyExclusionDto {
-                role: path_role_from_key(&normalize_path_key(&entry.normalized_path)),
-                path: entry.normalized_path,
-                content_hash: entry.content_hash,
-                observed_size: entry.observed_size,
-                observed_unit_count: entry.observed_unit_count,
-                policy_version: entry.policy_version,
-                byte_cap: entry.byte_cap,
-                structural_unit_cap: entry.structural_unit_cap,
-                project_id: entry.project_id,
-                workspace_id: entry.workspace_id,
-                core_generation_id: entry.core_generation_id,
-                core_run_id: entry.core_run_id,
-                graph_coverage: false,
-                semantic_coverage: false,
-            })
-            .collect::<Vec<_>>();
-        policy_exclusions.truncate(5_000);
-        let mut visible = files
-            .into_iter()
-            .filter(|file| {
-                let role = indexed_file_role(&file.path);
-                req.role.is_none_or(|requested| requested == role)
-                    && path_filter.as_deref().is_none_or(|needle| {
-                        normalize_path_key(&runtime_relative_path(&root, &file.path))
-                            .contains(needle)
-                    })
-                    && language_filter.as_deref().is_none_or(|language| {
-                        indexed_file_matches_language_filter(&file.language, &file.path, language)
-                    })
-            })
-            .map(|file| IndexedFileDto {
-                path: runtime_relative_path(&root, &file.path),
-                language: file.language,
-                indexed: file.indexed,
-                complete: file.complete,
-                line_count: file.line_count,
-                role: indexed_file_role(&file.path),
-                error_count: errors_by_file.get(&file.id).copied().unwrap_or_default(),
-            })
-            .collect::<Vec<_>>();
-        let limit = req.limit.unwrap_or(500).clamp(1, 5000) as usize;
-        let filtered_file_count = visible.len().min(u32::MAX as usize) as u32;
-        let truncated = visible.len() > limit;
-        visible.truncate(limit);
-        let visible_file_count = visible.len().min(u32::MAX as usize) as u32;
-
-        let mut coverage_notes = Vec::new();
-        if incomplete_file_count > 0 || error_file_count > 0 {
-            coverage_notes.push(format!(
-                "index usable with {incomplete_file_count} incomplete files and {error_file_count} files carrying index errors"
-            ));
-        } else {
-            coverage_notes.push("index usable; no file-level index errors recorded".to_string());
-        }
-        if policy_exclusion_count > 0 {
-            coverage_notes.push(format!(
-                "{policy_exclusion_count} verified source policy exclusions have no parser-backed graph or semantic coverage"
-            ));
-        }
-        let language_counts = language_counts
-            .into_iter()
-            .map(|(language, file_count)| {
-                let support = language_support_summary_for_language(&language);
-                IndexedFileLanguageCountDto {
-                    language,
-                    file_count,
-                    support_mode: support.support_mode,
-                    evidence_tier: support.evidence_tier,
-                    claim_label: support.claim_label,
-                }
-            })
-            .collect::<Vec<_>>();
-        let incomplete_reason_counts = incomplete_reason_counts
-            .into_iter()
-            .map(
-                |(reason, (file_count, detail))| IndexedFileIncompleteReasonCountDto {
-                    reason,
-                    file_count,
-                    detail,
-                },
-            )
-            .collect::<Vec<_>>();
-        let file_count = language_counts
-            .iter()
-            .map(|entry| entry.file_count)
-            .sum::<u32>();
-
-        Ok(IndexedFilesDto {
-            project_root: root.to_string_lossy().to_string(),
-            usable: indexed_file_count > 0,
-            summary: IndexedFilesSummaryDto {
-                file_count,
-                indexed_file_count,
-                filtered_file_count,
-                visible_file_count,
-                incomplete_file_count,
-                error_file_count,
-                policy_exclusion_count,
-                incomplete_reason_counts,
-                truncated,
-                language_counts,
-                framework_route_coverage: framework_route_coverage_matrix(),
-                coverage_notes,
-            },
-            coverage_gaps,
-            policy_exclusions,
-            files: visible,
-        })
+        indexed_files_from_storage(&root, &storage, &self.source_index_policy, req)
     }
 
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
